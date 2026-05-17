@@ -1,0 +1,19 @@
+[telegram]
+token = "123456789:replace-with-your-token"
+allowed_chat_ids = [123456789]
+allow_all_chats = false
+
+[downloads]
+video_dir = "/Users/joey/Movies/Downloads"
+pdf_dir = "/Users/joey/Documents/Downloads"
+
+[tools]
+bbdown = "/Users/joey/.dotnet/tools/BBDown"
+yt_dlp = "/Users/joey/.local/bin/yt-dlp"
+uv = "uv"
+pdf_helper = "scripts/pdf_helper.py"
+chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+[bot]
+concurrency = 2
+poll_timeout_seconds = 50

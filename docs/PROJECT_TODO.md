@@ -1,3 +1,3 @@
 # Project TODO
 
-- [in_progress] 实现 Telegram 本地下载 bot 的第一版：Rust 主服务、uv Python PDF helper、配置示例、README、自动化验证。
+- [pending] 使用真实 `config.toml` 和 Telegram bot token 做 live smoke test：Bilibili、YouTube、`/pdf` 各跑一条真实消息。

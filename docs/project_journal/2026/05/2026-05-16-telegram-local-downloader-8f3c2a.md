@@ -1,7 +1,7 @@
 ---
 id: 20260516-8f3c2a
 title: Telegram Local Downloader Bot
-status: active
+status: completed
 created: 2026-05-16
 updated: 2026-05-16
 branch:
@@ -40,14 +40,19 @@ superseded_by:
 - Python: `uv run python -m unittest`
 
 ## Current State
-- 设计与计划已记录在 journal 中。
-- 下一步是在一个后续提交中实现项目骨架、bot 逻辑、PDF helper、README 和测试。
+- 第一版实现已完成。
+- Rust 主服务已包含配置加载、Telegram `getUpdates` polling、消息路由、全局并发限制、外部命令执行和状态回复。
+- Python helper 已包含 Chrome 页面加载、lazy-loading 滚动等待、PDF 输出路径生成和文件名清理。
+- README、`config.example.toml`、Cargo/uv 依赖文件和自动化测试已补齐。
 
 ## Next Steps
-- 提交本 journal checkpoint。
-- 继续实现代码与测试。
-- 运行验证；如 Cargo/uv 需要网络或沙箱外缓存访问，按需申请窄授权。
+- 使用真实 `config.toml` 和 Telegram bot token 做 live smoke test。
+- 如需要下载登录态，继续在本机 BBDown/yt-dlp CLI 层配置 cookie 或登录信息；第一版 bot 不托管 cookie。
 
 ## Evidence
 - 本机已确认存在 `BBDown`、`yt-dlp`、Chrome、Rust/Cargo、clippy、rustfmt、uv、pnpm、ffmpeg。
 - 计划来源：用户在 2026-05-16 要求实现 Telegram Local Downloader Bot，并随后要求先按 project-journal 记录设计和计划并提交。
+- Journal checkpoint commit: `cbecd1b Document downloader bot plan`.
+- 自动化验证通过：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`uv run ruff format --check`、`uv run ruff check`、`uv run python -m unittest discover -s tests`。
+- 未执行 live Telegram 验收，因为仓库不提交真实 `config.toml` 和 bot token。
+- Review gate: helper-backed `codex-readonly` found and fixes were applied for chat allowlist, child process cleanup, PDF output path races, Telegram HTTP timeouts, and bot token leakage in reqwest error logs. Final `codex-readonly` rerun returned `LGTM`.

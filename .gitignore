@@ -1,0 +1,12 @@
+target/
+.venv/
+.ruff_cache/
+.codex-tmp/
+__pycache__/
+*.py[cod]
+
+# Local secrets and machine-specific runtime config.
+config.toml
+
+# Local generated journal index.
+docs/project_journal/INDEX.md
