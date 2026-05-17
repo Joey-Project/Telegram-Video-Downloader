@@ -14,6 +14,14 @@ uv = "uv"
 pdf_helper = "scripts/pdf_helper.py"
 chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
+[pdf]
+auto_domains = ["mp.weixin.qq.com"]
+
+[video]
+subtitle_languages = ["zh-Hans", "zh-Hant", "zh", "zh-CN", "zh-TW", "en", "ja"]
+write_nfo = true
+keep_sidecars = true
+
 [bot]
 concurrency = 2
 poll_timeout_seconds = 50

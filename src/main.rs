@@ -99,7 +99,7 @@ async fn handle_message(
         return;
     }
 
-    match route_message(text) {
+    match route_message(text, &config.pdf.auto_domains) {
         RouteResult::Jobs(jobs) => {
             for job in jobs {
                 let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
@@ -132,7 +132,7 @@ async fn handle_message(
             send_or_log(
                 &telegram,
                 chat_id,
-                "No supported links found. Send Bilibili/YouTube links directly, or use /pdf URL."
+                "No supported links found. Send Bilibili/YouTube links directly, use /pdf URL, or configure a PDF auto-domain."
                     .to_string(),
             )
             .await;

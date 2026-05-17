@@ -12,6 +12,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub tools: ToolsConfig,
     #[serde(default)]
+    pub pdf: PdfConfig,
+    #[serde(default)]
+    pub video: VideoConfig,
+    #[serde(default)]
     pub bot: BotConfig,
     #[serde(skip)]
     project_dir: PathBuf,
@@ -46,6 +50,22 @@ pub struct ToolsConfig {
     pub pdf_helper: PathBuf,
     #[serde(default = "default_chrome")]
     pub chrome: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PdfConfig {
+    #[serde(default = "default_auto_pdf_domains")]
+    pub auto_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VideoConfig {
+    #[serde(default = "default_subtitle_languages")]
+    pub subtitle_languages: Vec<String>,
+    #[serde(default = "default_true")]
+    pub write_nfo: bool,
+    #[serde(default = "default_true")]
+    pub keep_sidecars: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,6 +163,24 @@ impl Default for ToolsConfig {
     }
 }
 
+impl Default for PdfConfig {
+    fn default() -> Self {
+        Self {
+            auto_domains: default_auto_pdf_domains(),
+        }
+    }
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        Self {
+            subtitle_languages: default_subtitle_languages(),
+            write_nfo: true,
+            keep_sidecars: true,
+        }
+    }
+}
+
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
@@ -188,6 +226,21 @@ fn default_poll_timeout_seconds() -> u64 {
     50
 }
 
+fn default_auto_pdf_domains() -> Vec<String> {
+    vec!["mp.weixin.qq.com".to_string()]
+}
+
+fn default_subtitle_languages() -> Vec<String> {
+    ["zh-Hans", "zh-Hant", "zh", "zh-CN", "zh-TW", "en", "ja"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +271,13 @@ mod tests {
         );
         assert_eq!(config.bot.concurrency, 2);
         assert_eq!(config.bot.poll_timeout_seconds, 50);
+        assert_eq!(config.pdf.auto_domains, vec!["mp.weixin.qq.com"]);
+        assert_eq!(
+            config.video.subtitle_languages,
+            vec!["zh-Hans", "zh-Hant", "zh", "zh-CN", "zh-TW", "en", "ja"]
+        );
+        assert!(config.video.write_nfo);
+        assert!(config.video.keep_sidecars);
     }
 
     #[test]
