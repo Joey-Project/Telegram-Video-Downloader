@@ -9,6 +9,7 @@
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
 - `/pdf URL` 调用 uv 管理的 Python Playwright helper，使用系统 Chrome 打印 PDF；`pdf.auto_domains` 里的域名会自动走 PDF。
 - 全局并发由配置控制，超出的任务会排队。
+- 外部命令会流式采集 stdout/stderr，并监控输出目录文件大小；长时间无输出且无文件增长会自动失败，避免任务一直停在 `Started`。
 
 ## 配置
 
@@ -29,6 +30,10 @@ cp config.example.toml config.toml
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
+`bilibili.extra_args` 默认包含 `--video-ascending`。这会让 BBDown 在同一清晰度下优先选择更小的视频编码；对后台非 TTY 下载更稳。需要追求更高码率时可以在 `config.toml` 里设置为空数组。
+
+`bot.progress_update_seconds` 控制进度回复频率；`bot.command_timeout_seconds` 是单个外部命令的总超时；`bot.command_idle_timeout_seconds` 是没有 stdout/stderr 且输出目录文件也没有增长的 idle 超时。
+
 ## 运行
 
 ```sh
@@ -43,6 +48,12 @@ Title https://www.bilibili.com/video/BV...
 https://youtu.be/...
 /pdf https://example.com/article
 https://mp.weixin.qq.com/s?...
+```
+
+本地重放一条 Telegram 文本、不走真实 Telegram API：
+
+```sh
+cargo run -- --replay-message config.toml "Title https://b23.tv/..."
 ```
 
 ## 验证

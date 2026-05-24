@@ -1,17 +1,30 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::sync::{Mutex, MutexGuard};
+use tokio::time::{Instant, sleep_until, timeout as tokio_timeout};
+use tracing::info;
 
 use crate::config::AppConfig;
 use crate::router::JobRequest;
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const OUTPUT_CLOSE_GRACE: Duration = Duration::from_secs(2);
+const OUTPUT_ABORT_GRACE: Duration = Duration::from_secs(3);
+
+#[cfg(unix)]
+type CommandProcessGroup = Option<libc::pid_t>;
+#[cfg(not(unix))]
+type CommandProcessGroup = Option<()>;
 
 #[derive(Debug, Clone)]
 pub struct JobReport {
@@ -20,10 +33,16 @@ pub struct JobReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobProgress {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub cwd: PathBuf,
+    pub activity_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,17 +102,25 @@ struct BilibiliMetadata {
     id: Option<String>,
 }
 
-pub async fn run_job(config: &AppConfig, job: &JobRequest) -> Result<JobReport> {
+pub async fn run_job(
+    config: &AppConfig,
+    job: &JobRequest,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<JobReport> {
     match job {
-        JobRequest::Bilibili { url } => run_bilibili_job(config, url).await,
-        JobRequest::Youtube { url } => run_youtube_job(config, url).await,
-        JobRequest::Pdf { .. } => run_simple_job(config, job).await,
+        JobRequest::Bilibili { url } => run_bilibili_job(config, url, progress).await,
+        JobRequest::Youtube { url } => run_youtube_job(config, url, progress).await,
+        JobRequest::Pdf { .. } => run_simple_job(config, job, progress).await,
     }
 }
 
-async fn run_simple_job(config: &AppConfig, job: &JobRequest) -> Result<JobReport> {
+async fn run_simple_job(
+    config: &AppConfig,
+    job: &JobRequest,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<JobReport> {
     let spec = command_spec(config, job);
-    let output = run_command(&spec).await?;
+    let output = run_command(config, &spec, progress).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -115,7 +142,11 @@ async fn run_simple_job(config: &AppConfig, job: &JobRequest) -> Result<JobRepor
     })
 }
 
-async fn run_bilibili_job(config: &AppConfig, url: &str) -> Result<JobReport> {
+async fn run_bilibili_job(
+    config: &AppConfig,
+    url: &str,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<JobReport> {
     let _guard = video_output_lock().await;
     let mut nfo_warnings = Vec::new();
     let before = if config.video.write_nfo {
@@ -132,7 +163,7 @@ async fn run_bilibili_job(config: &AppConfig, url: &str) -> Result<JobReport> {
         None
     };
     let spec = bilibili_command_spec(config, url);
-    let output = run_command(&spec).await?;
+    let output = run_command(config, &spec, progress).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -182,12 +213,16 @@ async fn run_bilibili_job(config: &AppConfig, url: &str) -> Result<JobReport> {
     })
 }
 
-async fn run_youtube_job(config: &AppConfig, url: &str) -> Result<JobReport> {
-    let metadata = fetch_youtube_metadata(config, url).await?;
+async fn run_youtube_job(
+    config: &AppConfig,
+    url: &str,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<JobReport> {
+    let metadata = fetch_youtube_metadata(config, url, progress.clone()).await?;
     let subtitle_plan = select_subtitles(&metadata, &config.video.subtitle_languages);
     let _guard = video_output_lock().await;
     let spec = youtube_download_command_spec(config, url, &subtitle_plan);
-    let output = run_command(&spec).await?;
+    let output = run_command(config, &spec, progress).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -251,10 +286,14 @@ pub fn command_spec(config: &AppConfig, job: &JobRequest) -> CommandSpec {
 }
 
 pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> CommandSpec {
+    let mut args = vec![url.to_string(), "--skip-ai".to_string()];
+    args.extend(config.bilibili.extra_args.iter().cloned());
+
     CommandSpec {
         program: config.tools.bbdown.clone(),
-        args: vec![url.to_string(), "--skip-ai".to_string()],
+        args,
         cwd: config.downloads.video_dir.clone(),
+        activity_dir: Some(config.downloads.video_dir.clone()),
     }
 }
 
@@ -268,6 +307,7 @@ pub fn youtube_metadata_command_spec(config: &AppConfig, url: &str) -> CommandSp
             url.to_string(),
         ],
         cwd: config.downloads.video_dir.clone(),
+        activity_dir: None,
     }
 }
 
@@ -326,6 +366,7 @@ pub fn youtube_download_command_spec(
         program: config.tools.yt_dlp.clone(),
         args,
         cwd: config.downloads.video_dir.clone(),
+        activity_dir: Some(config.downloads.video_dir.clone()),
     }
 }
 
@@ -347,12 +388,17 @@ pub fn pdf_command_spec(config: &AppConfig, url: &str) -> CommandSpec {
             config.tools.chrome.display().to_string(),
         ],
         cwd: config.resolve_project_path(Path::new(".")),
+        activity_dir: Some(config.downloads.pdf_dir.clone()),
     }
 }
 
-async fn fetch_youtube_metadata(config: &AppConfig, url: &str) -> Result<YoutubeMetadata> {
+async fn fetch_youtube_metadata(
+    config: &AppConfig,
+    url: &str,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<YoutubeMetadata> {
     let spec = youtube_metadata_command_spec(config, url);
-    let output = run_command(&spec).await?;
+    let output = run_command(config, &spec, progress).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -376,14 +422,549 @@ async fn video_output_lock() -> MutexGuard<'static, ()> {
         .await
 }
 
-async fn run_command(spec: &CommandSpec) -> Result<std::process::Output> {
-    Command::new(&spec.program)
+#[derive(Debug)]
+struct CommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug)]
+struct CommandChunk {
+    stream: CommandStream,
+    bytes: Vec<u8>,
+}
+
+async fn run_command(
+    config: &AppConfig,
+    spec: &CommandSpec,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<CommandOutput> {
+    let mut command = Command::new(&spec.program);
+    command
         .args(&spec.args)
         .current_dir(&spec.cwd)
-        .kill_on_drop(true)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to run {}", spec.program.display()))?;
+    let process_group = command_process_group(&child);
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture {} stdout", spec.program.display()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("failed to capture {} stderr", spec.program.display()))?;
+
+    let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+    let stdout_handle = tokio::spawn(read_command_stream(
+        stdout,
+        CommandStream::Stdout,
+        chunk_tx.clone(),
+    ));
+    let stderr_handle = tokio::spawn(read_command_stream(stderr, CommandStream::Stderr, chunk_tx));
+
+    let total_timeout = Duration::from_secs(config.bot.command_timeout_seconds);
+    let idle_timeout = Duration::from_secs(config.bot.command_idle_timeout_seconds);
+    let started_at = Instant::now();
+    let total_deadline = started_at + total_timeout;
+    let mut last_activity_at = started_at;
+    let progress_interval = Duration::from_secs(config.bot.progress_update_seconds);
+    let activity_poll_interval = file_activity_poll_interval(progress_interval, idle_timeout);
+    let mut next_activity_poll = started_at + activity_poll_interval;
+    let mut file_activity = match &spec.activity_dir {
+        Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
+            Ok(tracker) => Some(tracker),
+            Err(err) => {
+                info!(
+                    command = %spec.program.display(),
+                    activity_dir = %activity_dir.display(),
+                    error = %err,
+                    "file activity tracking disabled"
+                );
+                None
+            }
+        },
+        None => {
+            info!(command = %spec.program.display(), "file activity tracking disabled");
+            None
+        }
+    };
+    let mut progress_tracker = ProgressTracker::new(
+        spec.program
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .unwrap_or("command")
+            .to_string(),
+        progress_interval,
+        progress,
+    );
+
+    let mut output_closed = false;
+    let status = loop {
+        let idle_deadline = last_activity_at + idle_timeout;
+        tokio::select! {
+            maybe_chunk = chunk_rx.recv(), if !output_closed => {
+                match maybe_chunk {
+                    Some(chunk) => {
+                        last_activity_at = Instant::now();
+                        progress_tracker.observe(chunk.stream, &chunk.bytes);
+                    }
+                    None => output_closed = true,
+                }
+            }
+            wait_result = child.wait() => {
+                break wait_result
+                    .with_context(|| format!("failed to wait for {}", spec.program.display()))?;
+            }
+            _ = sleep_until(total_deadline) => {
+                terminate_command_tree(&mut child, process_group).await;
+                let (stdout, stderr) =
+                    collect_stream_outputs(stdout_handle, stderr_handle, process_group).await;
+                bail!(
+                    "{} timed out after {}s\n{}",
+                    spec.program.display(),
+                    config.bot.command_timeout_seconds,
+                    summarize_output(&String::from_utf8_lossy(&stdout), &String::from_utf8_lossy(&stderr))
+                );
+            }
+            _ = sleep_until(idle_deadline) => {
+                terminate_command_tree(&mut child, process_group).await;
+                let (stdout, stderr) =
+                    collect_stream_outputs(stdout_handle, stderr_handle, process_group).await;
+                bail!(
+                    "{} had no output or file activity for {}s\n{}",
+                    spec.program.display(),
+                    config.bot.command_idle_timeout_seconds,
+                    summarize_output(&String::from_utf8_lossy(&stdout), &String::from_utf8_lossy(&stderr))
+                );
+            }
+            _ = sleep_until(next_activity_poll), if file_activity.is_some() => {
+                next_activity_poll = Instant::now() + activity_poll_interval;
+                let tracker = file_activity.as_mut().expect("guarded by is_some");
+                match tracker.poll().await {
+                    Ok(Some(message)) => {
+                        last_activity_at = Instant::now();
+                        progress_tracker.emit(message);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        info!(
+                            command = %spec.program.display(),
+                            activity_dir = %tracker.root.display(),
+                            error = %err,
+                            "file activity tracking stopped"
+                        );
+                        file_activity = None;
+                    }
+                }
+            }
+        }
+    };
+
+    let (stdout, stderr) =
+        collect_stream_outputs(stdout_handle, stderr_handle, process_group).await;
+    Ok(CommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn file_activity_poll_interval(progress_interval: Duration, idle_timeout: Duration) -> Duration {
+    let half_idle_timeout = idle_timeout / 2;
+    progress_interval.min(if half_idle_timeout.is_zero() {
+        idle_timeout
+    } else {
+        half_idle_timeout
+    })
+}
+
+fn command_process_group(child: &tokio::process::Child) -> CommandProcessGroup {
+    #[cfg(unix)]
+    {
+        child.id().map(|id| id as libc::pid_t)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        None
+    }
+}
+
+async fn terminate_command_tree(
+    child: &mut tokio::process::Child,
+    process_group: CommandProcessGroup,
+) {
+    #[cfg(unix)]
+    if let Some(process_group_id) = process_group {
+        signal_process_group(process_group_id, libc::SIGTERM);
+        let direct_child_exited = tokio_timeout(Duration::from_secs(5), child.wait())
+            .await
+            .is_ok();
+        signal_process_group(process_group_id, libc::SIGKILL);
+        if !direct_child_exited {
+            let _ = child.wait().await;
+        }
+        return;
+    }
+
+    let _ = child.kill().await;
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group_id: libc::pid_t, signal: libc::c_int) {
+    unsafe {
+        libc::kill(-process_group_id, signal);
+    }
+}
+
+fn force_terminate_process_group(process_group: CommandProcessGroup) {
+    #[cfg(unix)]
+    if let Some(process_group_id) = process_group {
+        signal_process_group(process_group_id, libc::SIGKILL);
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = process_group;
+    }
+}
+
+async fn read_command_stream<R>(
+    mut reader: R,
+    stream: CommandStream,
+    progress: mpsc::UnboundedSender<CommandChunk>,
+) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let size = reader.read(&mut buffer).await?;
+        if size == 0 {
+            break;
+        }
+        let bytes = buffer[..size].to_vec();
+        output.extend_from_slice(&bytes);
+        let _ = progress.send(CommandChunk { stream, bytes });
+    }
+    Ok(output)
+}
+
+async fn collect_stream_outputs(
+    mut stdout_handle: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    mut stderr_handle: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    process_group: CommandProcessGroup,
+) -> (Vec<u8>, Vec<u8>) {
+    let close_deadline = Instant::now() + OUTPUT_CLOSE_GRACE;
+    let mut abort_deadline = close_deadline + OUTPUT_ABORT_GRACE;
+    let mut did_terminate_group = false;
+    let mut stdout = None;
+    let mut stderr = None;
+
+    loop {
+        if stdout.is_some() && stderr.is_some() {
+            break;
+        }
+
+        tokio::select! {
+            result = &mut stdout_handle, if stdout.is_none() => {
+                stdout = Some(join_stream_output(result));
+            }
+            result = &mut stderr_handle, if stderr.is_none() => {
+                stderr = Some(join_stream_output(result));
+            }
+            _ = sleep_until(close_deadline), if !did_terminate_group => {
+                force_terminate_process_group(process_group);
+                did_terminate_group = true;
+                abort_deadline = Instant::now() + OUTPUT_ABORT_GRACE;
+            }
+            _ = sleep_until(abort_deadline), if did_terminate_group => {
+                if stdout.is_none() {
+                    stdout_handle.abort();
+                    stdout = Some(b"stdout reader did not close after process termination".to_vec());
+                }
+                if stderr.is_none() {
+                    stderr_handle.abort();
+                    stderr = Some(b"stderr reader did not close after process termination".to_vec());
+                }
+            }
+        }
+    }
+
+    (
+        stdout.expect("stdout is set before loop exits"),
+        stderr.expect("stderr is set before loop exits"),
+    )
+}
+
+fn join_stream_output(result: Result<std::io::Result<Vec<u8>>, tokio::task::JoinError>) -> Vec<u8> {
+    match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => format!("failed to read command output: {err}").into_bytes(),
+        Err(err) => format!("failed to join command output reader: {err}").into_bytes(),
+    }
+}
+
+struct FileActivityTracker {
+    root: PathBuf,
+    baseline: BTreeMap<PathBuf, u64>,
+    last_changed_file_count: usize,
+    last_changed_size: u64,
+}
+
+impl FileActivityTracker {
+    async fn new(root: &Path) -> Result<Self> {
+        let root = root.to_path_buf();
+        let baseline = collect_file_sizes(root.clone()).await?;
+        Ok(Self {
+            root,
+            baseline,
+            last_changed_file_count: 0,
+            last_changed_size: 0,
+        })
+    }
+
+    async fn poll(&mut self) -> Result<Option<String>> {
+        let current = collect_file_sizes(self.root.clone()).await?;
+        let changed = current
+            .iter()
+            .filter(|(path, size)| self.baseline.get(*path) != Some(*size));
+        let mut changed_file_count = 0;
+        let mut changed_size = 0;
+        for (_, size) in changed {
+            changed_file_count += 1;
+            changed_size += size;
+        }
+
+        if changed_file_count == self.last_changed_file_count
+            && changed_size == self.last_changed_size
+        {
+            return Ok(None);
+        }
+
+        self.last_changed_file_count = changed_file_count;
+        self.last_changed_size = changed_size;
+        if changed_file_count == 0 {
+            return Ok(None);
+        }
+
+        Ok(Some(format!(
+            "files: {changed_file_count} changed, {} written",
+            human_bytes(changed_size)
+        )))
+    }
+}
+
+async fn collect_file_sizes(root: PathBuf) -> Result<BTreeMap<PathBuf, u64>> {
+    tokio::task::spawn_blocking(move || collect_direct_file_sizes(&root))
         .await
-        .with_context(|| format!("failed to run {}", spec.program.display()))
+        .context("failed to join file activity scan")?
+}
+
+fn collect_direct_file_sizes(root: &Path) -> Result<BTreeMap<PathBuf, u64>> {
+    let mut files = BTreeMap::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+
+    for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_file() {
+            files.insert(path, entry.metadata()?.len());
+        }
+    }
+
+    Ok(files)
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
+}
+
+struct ProgressTracker {
+    command_name: String,
+    min_interval: Duration,
+    next_send_at: Instant,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    last_message: Option<String>,
+}
+
+impl ProgressTracker {
+    fn new(
+        command_name: String,
+        min_interval: Duration,
+        progress: Option<mpsc::UnboundedSender<JobProgress>>,
+    ) -> Self {
+        Self {
+            command_name,
+            min_interval,
+            next_send_at: Instant::now(),
+            progress,
+            last_message: None,
+        }
+    }
+
+    fn observe(&mut self, stream: CommandStream, bytes: &[u8]) {
+        let Some(progress) = &self.progress else {
+            return;
+        };
+
+        let text = normalize_terminal_text(&String::from_utf8_lossy(bytes));
+        let Some(message) = summarize_progress_chunk(&self.command_name, stream, &text) else {
+            return;
+        };
+
+        let message_changed = self.last_message.as_ref() != Some(&message);
+        let now = Instant::now();
+        if now < self.next_send_at {
+            return;
+        }
+        if !message_changed {
+            return;
+        }
+
+        self.send(progress.clone(), message, now);
+    }
+
+    fn emit(&mut self, message: String) {
+        let Some(progress) = &self.progress else {
+            return;
+        };
+
+        let now = Instant::now();
+        if now < self.next_send_at {
+            return;
+        }
+        if self.last_message.as_ref() == Some(&message) {
+            return;
+        }
+        self.send(progress.clone(), message, now);
+    }
+
+    fn send(
+        &mut self,
+        progress: mpsc::UnboundedSender<JobProgress>,
+        message: String,
+        now: Instant,
+    ) {
+        self.last_message = Some(message.clone());
+        self.next_send_at = now + self.min_interval;
+        info!(command = %self.command_name, message = %message, "command progress");
+        let _ = progress.send(JobProgress { message });
+    }
+}
+
+fn summarize_progress_chunk(
+    command_name: &str,
+    stream: CommandStream,
+    text: &str,
+) -> Option<String> {
+    if let Some(percent) = extract_last_percent(text) {
+        return Some(format!("{command_name}: {percent}%"));
+    }
+
+    let line = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("Response:"))
+        .filter(|line| !line.starts_with('{'))
+        .filter(|line| !line.contains("baseUrl"))
+        .rfind(|line| line.chars().count() <= 180)?;
+
+    let normalized = line
+        .trim_start_matches(|ch: char| ch == '-' || ch.is_ascii_whitespace())
+        .to_string();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let stream_name = match stream {
+        CommandStream::Stdout => "stdout",
+        CommandStream::Stderr => "stderr",
+    };
+    Some(format!("{command_name} {stream_name}: {normalized}"))
+}
+
+fn normalize_terminal_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\r' || ch == '\n' {
+            normalized.push('\n');
+        } else if ch.is_control() {
+            normalized.push(' ');
+        } else {
+            normalized.push(ch);
+        }
+    }
+    normalized
+}
+
+fn extract_last_percent(text: &str) -> Option<u8> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut last = None;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+
+        if index < bytes.len() && bytes[index] == b'.' {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+        }
+
+        if index < bytes.len()
+            && bytes[index] == b'%'
+            && let Ok(value) = text[start..index].parse::<f64>()
+            && (0.0..=100.0).contains(&value)
+        {
+            last = Some(value.floor() as u8);
+        }
+    }
+    last
 }
 
 fn select_subtitles(metadata: &YoutubeMetadata, preferred_languages: &[String]) -> SubtitlePlan {
@@ -673,6 +1254,7 @@ mod tests {
             PathBuf::from("/Users/joey/.dotnet/tools/BBDown")
         );
         assert!(spec.args.contains(&"--skip-ai".to_string()));
+        assert!(spec.args.contains(&"--video-ascending".to_string()));
         assert_eq!(spec.cwd, PathBuf::from("/Users/joey/Movies/Downloads"));
     }
 
@@ -685,6 +1267,7 @@ mod tests {
         assert!(spec.args.contains(&"--dump-json".to_string()));
         assert!(spec.args.contains(&"--skip-download".to_string()));
         assert!(spec.args.contains(&"--no-playlist".to_string()));
+        assert_eq!(spec.activity_dir, None);
     }
 
     #[test]
@@ -814,6 +1397,203 @@ mod tests {
         assert!(nfo.contains("<title>A &amp; B</title>"));
         assert!(nfo.contains("<plot>x &lt; y</plot>"));
         assert!(nfo.contains("<year>2026</year>"));
+    }
+
+    #[test]
+    fn extracts_latest_terminal_percent() {
+        assert_eq!(
+            extract_last_percent("[-----]  12% \u{0008}\u{0008}[###--]  87%"),
+            Some(87)
+        );
+        assert_eq!(
+            extract_last_percent("[download] 42.3% of 1.00MiB"),
+            Some(42)
+        );
+        assert_eq!(
+            extract_last_percent("[download] 100.0% of 1.00MiB"),
+            Some(100)
+        );
+        assert_eq!(extract_last_percent("no progress"), None);
+    }
+
+    #[test]
+    fn summarizes_command_progress_percent() {
+        assert_eq!(
+            summarize_progress_chunk("BBDown", CommandStream::Stdout, "  42% | - 1.2 MB/s"),
+            Some("BBDown: 42%".to_string())
+        );
+    }
+
+    #[test]
+    fn summarizes_short_command_lines() {
+        assert_eq!(
+            summarize_progress_chunk("BBDown", CommandStream::Stdout, "开始合并音视频...\n"),
+            Some("BBDown stdout: 开始合并音视频...".to_string())
+        );
+    }
+
+    #[test]
+    fn formats_file_activity_bytes() {
+        assert_eq!(human_bytes(42), "42 B");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MiB");
+    }
+
+    #[test]
+    fn keeps_file_activity_polling_ahead_of_idle_timeout() {
+        assert_eq!(
+            file_activity_poll_interval(Duration::from_secs(30), Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            file_activity_poll_interval(Duration::from_secs(600), Duration::from_secs(300)),
+            Duration::from_secs(150)
+        );
+        assert_eq!(
+            file_activity_poll_interval(Duration::from_secs(30), Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn throttles_percent_progress_updates() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tracker =
+            ProgressTracker::new("yt-dlp".to_string(), Duration::from_secs(30), Some(tx));
+
+        tracker.observe(CommandStream::Stdout, b"[download] 1.0%");
+        assert_eq!(rx.try_recv().unwrap().message, "yt-dlp: 1%");
+
+        tracker.observe(CommandStream::Stdout, b"[download] 2.0%");
+        assert!(rx.try_recv().is_err());
+
+        tracker.next_send_at = Instant::now() - Duration::from_secs(1);
+        tracker.observe(CommandStream::Stdout, b"[download] 2.0%");
+        assert_eq!(rx.try_recv().unwrap().message, "yt-dlp: 2%");
+    }
+
+    #[test]
+    fn throttles_file_activity_progress_updates() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tracker =
+            ProgressTracker::new("BBDown".to_string(), Duration::from_secs(30), Some(tx));
+
+        tracker.emit("files: 1 changed, 1.0 MiB written".to_string());
+        assert_eq!(
+            rx.try_recv().unwrap().message,
+            "files: 1 changed, 1.0 MiB written"
+        );
+
+        tracker.emit("files: 1 changed, 2.0 MiB written".to_string());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_terminates_descendant_processes() {
+        let root = temp_test_dir("process-group");
+        let pid_file = root.join("child.pid");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 2;
+        config.bot.command_idle_timeout_seconds = 30;
+        config.bot.progress_update_seconds = 1;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "sleep 30 & echo $! > \"$0\"; wait".to_string(),
+                pid_file.display().to_string(),
+            ],
+            cwd: root.clone(),
+            activity_dir: Some(root.clone()),
+        };
+
+        let result = run_command(&config, &spec, None).await;
+
+        assert!(result.is_err());
+        let pid = fs::read_to_string(&pid_file)
+            .expect("child pid should be written")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("child pid should parse");
+        for _ in 0..20 {
+            if !process_exists(pid) {
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = fs::remove_dir_all(&root);
+        panic!("descendant process {pid} survived command timeout");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn direct_child_exit_does_not_hang_on_background_pipe_holder() {
+        let root = temp_test_dir("background-pipe");
+        let pid_file = root.join("child.pid");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 30;
+        config.bot.command_idle_timeout_seconds = 30;
+        config.bot.progress_update_seconds = 1;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "sleep 30 & echo $! > \"$0\"; exit 0".to_string(),
+                pid_file.display().to_string(),
+            ],
+            cwd: root.clone(),
+            activity_dir: Some(root.clone()),
+        };
+
+        let result = tokio_timeout(Duration::from_secs(8), run_command(&config, &spec, None))
+            .await
+            .expect("run_command should not hang on inherited pipes");
+
+        result.expect("direct child exit status should be successful");
+        let pid = fs::read_to_string(&pid_file)
+            .expect("child pid should be written")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("child pid should parse");
+        for _ in 0..20 {
+            if !process_exists(pid) {
+                let _ = fs::remove_dir_all(&root);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = fs::remove_dir_all(&root);
+        panic!("background pipe holder {pid} survived command collection");
+    }
+
+    #[cfg(unix)]
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after UNIX_EPOCH")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "telegram-video-downloader-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).expect("test temp dir should be created");
+        root
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: libc::pid_t) -> bool {
+        (unsafe { libc::kill(pid, 0) == 0 })
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 
     #[test]

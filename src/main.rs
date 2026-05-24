@@ -10,12 +10,12 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use tokio::sync::Semaphore;
+use anyhow::{Context, Result, bail};
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
 
 use crate::config::AppConfig;
-use crate::downloader::run_job;
+use crate::downloader::{JobProgress, run_job};
 use crate::router::{RouteResult, route_message};
 use crate::telegram::TelegramClient;
 
@@ -28,8 +28,27 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config_path = std::env::args_os()
-        .nth(1)
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|arg| arg == std::ffi::OsStr::new("--replay-message"))
+    {
+        let config_path = args
+            .get(1)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("config.toml"));
+        let message = args
+            .get(2..)
+            .unwrap_or(&[])
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        return replay_message(config_path, message).await;
+    }
+
+    let config_path = args
+        .first()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
     let config = Arc::new(AppConfig::load(&config_path)?);
@@ -80,6 +99,62 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
+    if text.trim().is_empty() {
+        bail!("usage: telegram-video-downloader --replay-message config.toml <message>");
+    }
+
+    let config = AppConfig::load(&config_path)?;
+    config.ensure_runtime_dirs()?;
+
+    match route_message(&text, &config.pdf.auto_domains) {
+        RouteResult::Jobs(jobs) => {
+            let mut failed_jobs = Vec::new();
+            for (index, job) in jobs.iter().enumerate() {
+                let job_id = index + 1;
+                println!("Queued replay job #{job_id}: {}", job.label());
+                println!("Started replay job #{job_id}: {}", job.label());
+                let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<JobProgress>();
+                let progress_handle = tokio::spawn(async move {
+                    while let Some(progress) = progress_rx.recv().await {
+                        println!("Progress replay job #{job_id}: {}", progress.message);
+                    }
+                });
+                let result = run_job(&config, job, Some(progress_tx)).await;
+                let _ = progress_handle.await;
+                match result {
+                    Ok(report) => {
+                        println!(
+                            "Finished replay job #{job_id}: {}\nSaved: {}",
+                            job.label(),
+                            report.saved_location
+                        );
+                        if !report.details.is_empty() {
+                            println!("{}", report.details);
+                        }
+                    }
+                    Err(err) => {
+                        println!("Failed replay job #{job_id}: {}\n{err}", job.label());
+                        failed_jobs.push(format!("#{job_id} {}", job.label()));
+                    }
+                }
+            }
+            if failed_jobs.is_empty() {
+                Ok(())
+            } else {
+                bail!(
+                    "{} replay job(s) failed: {}",
+                    failed_jobs.len(),
+                    failed_jobs.join(", ")
+                )
+            }
+        }
+        RouteResult::PdfUsage => bail!("usage: /pdf https://example.com"),
+        RouteResult::UnsupportedLinks => bail!("no supported links found"),
+        RouteResult::Empty => bail!("message did not contain text to route"),
+    }
 }
 
 async fn handle_message(
@@ -164,7 +239,15 @@ async fn run_queued_job(
     )
     .await;
 
-    let result = run_job(&config, &job).await;
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let progress_task = tokio::spawn(forward_progress(
+        telegram.clone(),
+        chat_id,
+        job_id,
+        progress_rx,
+    ));
+    let result = run_job(&config, &job, Some(progress_tx)).await;
+    let _ = progress_task.await;
     drop(permit);
 
     let message = match result {
@@ -189,6 +272,22 @@ async fn run_queued_job(
     };
 
     send_or_log(&telegram, chat_id, message).await;
+}
+
+async fn forward_progress(
+    telegram: TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    mut progress_rx: mpsc::UnboundedReceiver<JobProgress>,
+) {
+    while let Some(progress) = progress_rx.recv().await {
+        send_or_log(
+            &telegram,
+            chat_id,
+            format!("Progress job #{job_id}: {}", progress.message),
+        )
+        .await;
+    }
 }
 
 async fn send_or_log(telegram: &TelegramClient, chat_id: i64, text: String) {

@@ -16,6 +16,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub video: VideoConfig,
     #[serde(default)]
+    pub bilibili: BilibiliConfig,
+    #[serde(default)]
     pub bot: BotConfig,
     #[serde(skip)]
     project_dir: PathBuf,
@@ -69,11 +71,23 @@ pub struct VideoConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct BilibiliConfig {
+    #[serde(default = "default_bilibili_extra_args")]
+    pub extra_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct BotConfig {
     #[serde(default = "default_concurrency")]
     pub concurrency: usize,
     #[serde(default = "default_poll_timeout_seconds")]
     pub poll_timeout_seconds: u64,
+    #[serde(default = "default_progress_update_seconds")]
+    pub progress_update_seconds: u64,
+    #[serde(default = "default_command_timeout_seconds")]
+    pub command_timeout_seconds: u64,
+    #[serde(default = "default_command_idle_timeout_seconds")]
+    pub command_idle_timeout_seconds: u64,
 }
 
 impl AppConfig {
@@ -132,6 +146,15 @@ impl AppConfig {
         if self.bot.poll_timeout_seconds == 0 {
             bail!("bot.poll_timeout_seconds must be at least 1");
         }
+        if self.bot.progress_update_seconds == 0 {
+            bail!("bot.progress_update_seconds must be at least 1");
+        }
+        if self.bot.command_timeout_seconds == 0 {
+            bail!("bot.command_timeout_seconds must be at least 1");
+        }
+        if self.bot.command_idle_timeout_seconds == 0 {
+            bail!("bot.command_idle_timeout_seconds must be at least 1");
+        }
         Ok(())
     }
 }
@@ -186,6 +209,17 @@ impl Default for BotConfig {
         Self {
             concurrency: default_concurrency(),
             poll_timeout_seconds: default_poll_timeout_seconds(),
+            progress_update_seconds: default_progress_update_seconds(),
+            command_timeout_seconds: default_command_timeout_seconds(),
+            command_idle_timeout_seconds: default_command_idle_timeout_seconds(),
+        }
+    }
+}
+
+impl Default for BilibiliConfig {
+    fn default() -> Self {
+        Self {
+            extra_args: default_bilibili_extra_args(),
         }
     }
 }
@@ -226,6 +260,18 @@ fn default_poll_timeout_seconds() -> u64 {
     50
 }
 
+fn default_progress_update_seconds() -> u64 {
+    30
+}
+
+fn default_command_timeout_seconds() -> u64 {
+    7200
+}
+
+fn default_command_idle_timeout_seconds() -> u64 {
+    300
+}
+
 fn default_auto_pdf_domains() -> Vec<String> {
     vec!["mp.weixin.qq.com".to_string()]
 }
@@ -239,6 +285,10 @@ fn default_subtitle_languages() -> Vec<String> {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_bilibili_extra_args() -> Vec<String> {
+    vec!["--video-ascending".to_string()]
 }
 
 #[cfg(test)]
@@ -271,6 +321,9 @@ mod tests {
         );
         assert_eq!(config.bot.concurrency, 2);
         assert_eq!(config.bot.poll_timeout_seconds, 50);
+        assert_eq!(config.bot.progress_update_seconds, 30);
+        assert_eq!(config.bot.command_timeout_seconds, 7200);
+        assert_eq!(config.bot.command_idle_timeout_seconds, 300);
         assert_eq!(config.pdf.auto_domains, vec!["mp.weixin.qq.com"]);
         assert_eq!(
             config.video.subtitle_languages,
@@ -278,6 +331,7 @@ mod tests {
         );
         assert!(config.video.write_nfo);
         assert!(config.video.keep_sidecars);
+        assert_eq!(config.bilibili.extra_args, vec!["--video-ascending"]);
     }
 
     #[test]
@@ -296,6 +350,24 @@ mod tests {
         .expect_err("zero concurrency should fail");
 
         assert!(err.to_string().contains("bot.concurrency"));
+    }
+
+    #[test]
+    fn rejects_zero_command_timeout() {
+        let err = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bot]
+            command_timeout_seconds = 0
+            "#,
+            PathBuf::from("."),
+        )
+        .expect_err("zero command timeout should fail");
+
+        assert!(err.to_string().contains("bot.command_timeout_seconds"));
     }
 
     #[test]
