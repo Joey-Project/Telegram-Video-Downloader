@@ -446,6 +446,25 @@ async fn run_command(
     spec: &CommandSpec,
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<CommandOutput> {
+    let mut file_activity = match &spec.activity_dir {
+        Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
+            Ok(tracker) => Some(tracker),
+            Err(err) => {
+                info!(
+                    command = %spec.program.display(),
+                    activity_dir = %activity_dir.display(),
+                    error = %err,
+                    "file activity tracking disabled"
+                );
+                None
+            }
+        },
+        None => {
+            info!(command = %spec.program.display(), "file activity tracking disabled");
+            None
+        }
+    };
+
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -487,24 +506,6 @@ async fn run_command(
     let progress_interval = Duration::from_secs(config.bot.progress_update_seconds);
     let activity_poll_interval = file_activity_poll_interval(progress_interval, idle_timeout);
     let mut next_activity_poll = started_at + activity_poll_interval;
-    let mut file_activity = match &spec.activity_dir {
-        Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
-            Ok(tracker) => Some(tracker),
-            Err(err) => {
-                info!(
-                    command = %spec.program.display(),
-                    activity_dir = %activity_dir.display(),
-                    error = %err,
-                    "file activity tracking disabled"
-                );
-                None
-            }
-        },
-        None => {
-            info!(command = %spec.program.display(), "file activity tracking disabled");
-            None
-        }
-    };
     let mut progress_tracker = ProgressTracker::new(
         spec.program
             .file_name()
@@ -726,15 +727,20 @@ fn join_stream_output(result: Result<std::io::Result<Vec<u8>>, tokio::task::Join
 
 struct FileActivityTracker {
     root: PathBuf,
-    baseline: BTreeMap<PathBuf, u64>,
+    baseline: FileActivitySnapshot,
     last_changed_file_count: usize,
     last_changed_size: u64,
+}
+
+struct FileActivitySnapshot {
+    files: BTreeMap<PathBuf, u64>,
+    direct_dirs: BTreeSet<PathBuf>,
 }
 
 impl FileActivityTracker {
     async fn new(root: &Path) -> Result<Self> {
         let root = root.to_path_buf();
-        let baseline = collect_file_sizes(root.clone()).await?;
+        let baseline = collect_file_activity(root.clone(), None).await?;
         Ok(Self {
             root,
             baseline,
@@ -744,10 +750,13 @@ impl FileActivityTracker {
     }
 
     async fn poll(&mut self) -> Result<Option<String>> {
-        let current = collect_file_sizes(self.root.clone()).await?;
+        let current =
+            collect_file_activity(self.root.clone(), Some(self.baseline.direct_dirs.clone()))
+                .await?;
         let changed = current
+            .files
             .iter()
-            .filter(|(path, size)| self.baseline.get(*path) != Some(*size));
+            .filter(|(path, size)| self.baseline.files.get(*path) != Some(*size));
         let mut changed_file_count = 0;
         let mut changed_size = 0;
         for (_, size) in changed {
@@ -774,28 +783,89 @@ impl FileActivityTracker {
     }
 }
 
-async fn collect_file_sizes(root: PathBuf) -> Result<BTreeMap<PathBuf, u64>> {
-    tokio::task::spawn_blocking(move || collect_direct_file_sizes(&root))
+async fn collect_file_activity(
+    root: PathBuf,
+    baseline_direct_dirs: Option<BTreeSet<PathBuf>>,
+) -> Result<FileActivitySnapshot> {
+    tokio::task::spawn_blocking(move || collect_file_activity_blocking(&root, baseline_direct_dirs))
         .await
         .context("failed to join file activity scan")?
 }
 
-fn collect_direct_file_sizes(root: &Path) -> Result<BTreeMap<PathBuf, u64>> {
+fn collect_file_activity_blocking(
+    root: &Path,
+    baseline_direct_dirs: Option<BTreeSet<PathBuf>>,
+) -> Result<FileActivitySnapshot> {
     let mut files = BTreeMap::new();
+    let mut direct_dirs = BTreeSet::new();
     if !root.exists() {
-        return Ok(files);
+        return Ok(FileActivitySnapshot { files, direct_dirs });
     }
 
-    for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FileActivitySnapshot { files, direct_dirs });
+        }
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", root.display())),
+    };
+
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let file_type = entry.file_type()?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
         if file_type.is_file() {
-            files.insert(path, entry.metadata()?.len());
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            files.insert(path, metadata.len());
+        } else if file_type.is_dir() {
+            direct_dirs.insert(path.clone());
+            if baseline_direct_dirs
+                .as_ref()
+                .is_some_and(|baseline| !baseline.contains(&path))
+            {
+                collect_file_sizes_recursive(&path, &mut files)?;
+            }
         }
     }
 
-    Ok(files)
+    Ok(FileActivitySnapshot { files, direct_dirs })
+}
+
+fn collect_file_sizes_recursive(root: &Path, files: &mut BTreeMap<PathBuf, u64>) -> Result<()> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", root.display())),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if file_type.is_file() {
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            files.insert(path, metadata.len());
+        } else if file_type.is_dir() {
+            collect_file_sizes_recursive(&path, files)?;
+        }
+    }
+    Ok(())
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -1486,6 +1556,29 @@ mod tests {
 
         tracker.emit("files: 1 changed, 2.0 MiB written".to_string());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tracks_files_in_new_direct_subdirectories() {
+        let root = temp_test_dir("file-activity");
+        let existing = root.join("existing");
+        fs::create_dir_all(&existing).expect("existing dir should be created");
+        fs::write(existing.join("old.part"), b"old").expect("existing file should be written");
+        let mut tracker = FileActivityTracker::new(&root)
+            .await
+            .expect("tracker should initialize");
+
+        fs::write(existing.join("old.part"), b"changed").expect("existing file should change");
+        assert_eq!(tracker.poll().await.expect("poll should work"), None);
+
+        let created = root.join("created");
+        fs::create_dir_all(&created).expect("new dir should be created");
+        fs::write(created.join("new.part"), b"new bytes").expect("new file should be written");
+        let message = tracker.poll().await.expect("poll should work");
+
+        assert_eq!(message, Some("files: 1 changed, 9 B written".to_string()));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]
