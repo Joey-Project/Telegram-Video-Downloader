@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -100,6 +100,7 @@ struct BilibiliMetadata {
     uploader_url: Option<String>,
     publish_date: Option<String>,
     id: Option<String>,
+    aid: Option<String>,
 }
 
 pub async fn run_job(
@@ -120,7 +121,7 @@ async fn run_simple_job(
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<JobReport> {
     let spec = command_spec(config, job);
-    let output = run_command(config, &spec, progress).await?;
+    let output = run_command(config, &spec, progress.clone()).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -149,21 +150,26 @@ async fn run_bilibili_job(
 ) -> Result<JobReport> {
     let _guard = video_output_lock().await;
     let mut nfo_warnings = Vec::new();
-    let before = if config.video.write_nfo {
-        match list_video_files(&config.downloads.video_dir) {
-            Ok(files) => Some(files),
-            Err(err) => {
-                nfo_warnings.push(format!(
-                    "NFO skipped: failed to scan before download: {err}"
-                ));
-                None
-            }
+    let needs_mux = config
+        .bilibili
+        .extra_args
+        .iter()
+        .any(|arg| arg == "--skip-mux");
+    let before = match list_video_files(&config.downloads.video_dir) {
+        Ok(files) => Some(files),
+        Err(err) if needs_mux => {
+            bail!("Bilibili post-processing failed: failed to scan before download: {err}");
         }
-    } else {
-        None
+        Err(err) => {
+            nfo_warnings.push(format!(
+                "Bilibili post-processing skipped: failed to scan before download: {err}"
+            ));
+            None
+        }
     };
     let spec = bilibili_command_spec(config, url);
-    let output = run_command(config, &spec, progress).await?;
+    let command_started_at = SystemTime::now();
+    let output = run_command(config, &spec, progress.clone()).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -184,24 +190,46 @@ async fn run_bilibili_job(
         match list_video_files(&config.downloads.video_dir) {
             Ok(after) => {
                 let created_videos: Vec<_> = after.difference(&before).cloned().collect();
-                match write_nfos_for_videos(
-                    &created_videos,
-                    &MediaNfo {
-                        title: metadata.title.as_deref(),
-                        plot: None,
-                        unique_id_type: "bilibili",
-                        unique_id: metadata.id.as_deref().unwrap_or(url),
-                        source_url: &metadata.source_url,
-                        studio: metadata.uploader_url.as_deref(),
-                        premiered: metadata.publish_date.as_deref(),
-                    },
-                ) {
-                    Ok(created_nfos) if !created_nfos.is_empty() => {
-                        details.push(format!("NFO: {}", join_paths(&created_nfos)));
-                    }
-                    Ok(_) => {}
-                    Err(err) => details.push(format!("NFO skipped: {err}")),
+                let videos_to_process = if needs_mux {
+                    bilibili_mux_candidates(config, &metadata, created_videos, command_started_at)?
+                } else {
+                    created_videos
+                };
+                if needs_mux && videos_to_process.is_empty() {
+                    bail!("Bilibili post-processing failed: no video/audio stream pairs found");
                 }
+                let final_videos = if needs_mux {
+                    merge_bilibili_streams(config, &videos_to_process, &metadata, progress).await?
+                } else {
+                    videos_to_process
+                };
+                if config.video.write_nfo {
+                    match write_nfos_for_videos(
+                        &final_videos,
+                        &MediaNfo {
+                            title: metadata.title.as_deref(),
+                            plot: None,
+                            unique_id_type: "bilibili",
+                            unique_id: metadata
+                                .id
+                                .as_deref()
+                                .or(metadata.aid.as_deref())
+                                .unwrap_or(url),
+                            source_url: &metadata.source_url,
+                            studio: metadata.uploader_url.as_deref(),
+                            premiered: metadata.publish_date.as_deref(),
+                        },
+                    ) {
+                        Ok(created_nfos) if !created_nfos.is_empty() => {
+                            details.push(format!("NFO: {}", join_paths(&created_nfos)));
+                        }
+                        Ok(_) => {}
+                        Err(err) => details.push(format!("NFO skipped: {err}")),
+                    }
+                }
+            }
+            Err(err) if needs_mux => {
+                bail!("Bilibili post-processing failed: failed to scan after download: {err}");
             }
             Err(err) => details.push(format!("NFO skipped: failed to scan after download: {err}")),
         }
@@ -211,6 +239,88 @@ async fn run_bilibili_job(
         saved_location: config.downloads.video_dir.display().to_string(),
         details: nonempty_join(details),
     })
+}
+
+fn bilibili_mux_candidates(
+    config: &AppConfig,
+    metadata: &BilibiliMetadata,
+    created_videos: Vec<PathBuf>,
+    since: SystemTime,
+) -> Result<Vec<PathBuf>> {
+    let mut candidates = created_videos;
+    if let Some(aid) = metadata.aid.as_deref() {
+        let aid_dir = config.downloads.video_dir.join(aid);
+        if aid_dir.is_dir() {
+            for video in list_video_files(&aid_dir)? {
+                let audio = video.with_extension("m4a");
+                if audio.is_file()
+                    && (modified_since(&video, since) || modified_since(&audio, since))
+                    && !candidates.contains(&video)
+                {
+                    candidates.push(video);
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn modified_since(path: &Path, since: SystemTime) -> bool {
+    path.metadata()
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| modified >= since)
+}
+
+async fn merge_bilibili_streams(
+    config: &AppConfig,
+    videos: &[PathBuf],
+    metadata: &BilibiliMetadata,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<Vec<PathBuf>> {
+    let mut merged = Vec::new();
+    let video_only = config
+        .bilibili
+        .extra_args
+        .iter()
+        .any(|arg| arg == "--video-only");
+    for video in videos {
+        let audio = video.with_extension("m4a");
+        if !audio.is_file() {
+            if !video_only {
+                bail!(
+                    "Bilibili post-processing failed: expected audio stream {}",
+                    audio.display()
+                );
+            }
+            merged.push(video.clone());
+            continue;
+        }
+
+        let title = metadata
+            .title
+            .as_deref()
+            .or_else(|| video.file_stem().and_then(|stem| stem.to_str()))
+            .unwrap_or("bilibili");
+        let output = unique_output_path(&config.downloads.video_dir, title, "mp4");
+        let spec = ffmpeg_mux_command_spec(config, video, &audio, &output);
+        let output_result = run_command(config, &spec, progress.clone()).await?;
+        if !output_result.status.success() {
+            bail!(
+                "{} exited with status {}\n{}",
+                spec.program.display(),
+                output_result.status,
+                summarize_output(
+                    &String::from_utf8_lossy(&output_result.stdout),
+                    &String::from_utf8_lossy(&output_result.stderr)
+                )
+            );
+        }
+
+        let _ = fs::remove_file(video);
+        let _ = fs::remove_file(&audio);
+        merged.push(output);
+    }
+    Ok(merged)
 }
 
 async fn run_youtube_job(
@@ -390,6 +500,47 @@ pub fn pdf_command_spec(config: &AppConfig, url: &str) -> CommandSpec {
         cwd: config.resolve_project_path(Path::new(".")),
         activity_dir: Some(config.downloads.pdf_dir.clone()),
     }
+}
+
+fn ffmpeg_mux_command_spec(
+    config: &AppConfig,
+    video: &Path,
+    audio: &Path,
+    output: &Path,
+) -> CommandSpec {
+    CommandSpec {
+        program: config.tools.ffmpeg.clone(),
+        args: vec![
+            "-hide_banner".to_string(),
+            "-y".to_string(),
+            "-i".to_string(),
+            command_path_arg(video),
+            "-i".to_string(),
+            command_path_arg(audio),
+            "-map".to_string(),
+            "0:v:0".to_string(),
+            "-map".to_string(),
+            "1:a:0".to_string(),
+            "-c".to_string(),
+            "copy".to_string(),
+            "-movflags".to_string(),
+            "+faststart".to_string(),
+            command_path_arg(output),
+        ],
+        cwd: config.downloads.video_dir.clone(),
+        activity_dir: Some(config.downloads.video_dir.clone()),
+    }
+}
+
+fn command_path_arg(path: &Path) -> String {
+    if path.is_absolute() {
+        return path.display().to_string();
+    }
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(path)
+        .display()
+        .to_string()
 }
 
 async fn fetch_youtube_metadata(
@@ -1091,6 +1242,8 @@ fn parse_bilibili_metadata(url: &str, stdout: &str) -> BilibiliMetadata {
     for line in stdout.lines() {
         if let Some((_, title)) = line.split_once("视频标题:") {
             metadata.title = Some(title.trim().to_string());
+        } else if let Some((_, aid)) = line.split_once("获取aid结束:") {
+            metadata.aid = Some(aid.trim().to_string());
         } else if let Some((_, published)) = line.split_once("发布时间:") {
             let published = published.trim();
             metadata.publish_date = published.get(..10).map(str::to_string);
@@ -1146,6 +1299,36 @@ fn is_video_file(path: &Path) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn unique_output_path(root: &Path, title: &str, extension: &str) -> PathBuf {
+    let stem = safe_file_stem(title);
+    let mut candidate = root.join(format!("{stem}.{extension}"));
+    let mut index = 2;
+    while candidate.exists() {
+        candidate = root.join(format!("{stem} ({index}).{extension}"));
+        index += 1;
+    }
+    candidate
+}
+
+fn safe_file_stem(title: &str) -> String {
+    let sanitized = title
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .collect::<String>()
+        .trim()
+        .trim_matches('.')
+        .to_string();
+    if sanitized.is_empty() {
+        "bilibili".to_string()
+    } else {
+        sanitized
+    }
 }
 
 struct MediaNfo<'a> {
@@ -1325,7 +1508,27 @@ mod tests {
         );
         assert!(spec.args.contains(&"--skip-ai".to_string()));
         assert!(spec.args.contains(&"--video-ascending".to_string()));
+        assert!(spec.args.contains(&"--skip-mux".to_string()));
         assert_eq!(spec.cwd, PathBuf::from("/Users/joey/Movies/Downloads"));
+    }
+
+    #[test]
+    fn builds_ffmpeg_mux_command() {
+        let config = test_config();
+        let spec = ffmpeg_mux_command_spec(
+            &config,
+            Path::new("/tmp/video.mp4"),
+            Path::new("/tmp/audio.m4a"),
+            Path::new("/tmp/output.mp4"),
+        );
+
+        assert_eq!(spec.program, PathBuf::from("/opt/homebrew/bin/ffmpeg"));
+        for expected in ["-i", "/tmp/video.mp4", "/tmp/audio.m4a", "-c", "copy"] {
+            assert!(
+                spec.args.contains(&expected.to_string()),
+                "missing {expected}"
+            );
+        }
     }
 
     #[test]
@@ -1437,7 +1640,7 @@ mod tests {
     fn parses_bilibili_metadata() {
         let metadata = parse_bilibili_metadata(
             "https://www.bilibili.com/video/BV12TRrBcEP8/",
-            "[2026] - 视频标题: Workout\n[2026] - 发布时间: 2026-05-05 05:24:12 +01:00\n[2026] - UP主页: https://space.bilibili.com/604003146",
+            "[2026] - 获取aid结束: 1556453868\n[2026] - 视频标题: Workout\n[2026] - 发布时间: 2026-05-05 05:24:12 +01:00\n[2026] - UP主页: https://space.bilibili.com/604003146",
         );
 
         assert_eq!(metadata.title.as_deref(), Some("Workout"));
@@ -1447,6 +1650,32 @@ mod tests {
             Some("https://space.bilibili.com/604003146")
         );
         assert_eq!(metadata.id.as_deref(), Some("BV12TRrBcEP8"));
+        assert_eq!(metadata.aid.as_deref(), Some("1556453868"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_bilibili_mux_candidates_in_aid_directory() {
+        let root = temp_test_dir("mux-candidates");
+        let aid_dir = root.join("1556453868");
+        fs::create_dir_all(&aid_dir).expect("aid dir should be created");
+        let since = SystemTime::now();
+        let video = aid_dir.join("1556453868.P1.1625322228.mp4");
+        fs::write(&video, b"video").expect("video should be written");
+        fs::write(aid_dir.join("1556453868.P1.1625322228.m4a"), b"audio")
+            .expect("audio should be written");
+        let mut config = test_config();
+        config.downloads.video_dir = root.clone();
+        let metadata = BilibiliMetadata {
+            aid: Some("1556453868".to_string()),
+            ..BilibiliMetadata::default()
+        };
+
+        let candidates = bilibili_mux_candidates(&config, &metadata, Vec::new(), since)
+            .expect("candidates should scan");
+
+        assert_eq!(candidates, vec![video]);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

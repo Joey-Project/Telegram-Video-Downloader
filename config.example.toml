@@ -13,6 +13,7 @@ yt_dlp = "/Users/joey/.local/bin/yt-dlp"
 uv = "uv"
 pdf_helper = "scripts/pdf_helper.py"
 chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+ffmpeg = "/opt/homebrew/bin/ffmpeg"
 
 [pdf]
 auto_domains = ["mp.weixin.qq.com"]
@@ -23,7 +24,7 @@ write_nfo = true
 keep_sidecars = true
 
 [bilibili]
-extra_args = ["--video-ascending"]
+extra_args = ["--video-ascending", "--skip-mux"]
 
 [bot]
 concurrency = 2

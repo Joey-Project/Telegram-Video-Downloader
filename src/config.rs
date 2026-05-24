@@ -52,6 +52,8 @@ pub struct ToolsConfig {
     pub pdf_helper: PathBuf,
     #[serde(default = "default_chrome")]
     pub chrome: PathBuf,
+    #[serde(default = "default_ffmpeg")]
+    pub ffmpeg: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -182,6 +184,7 @@ impl Default for ToolsConfig {
             uv: default_uv(),
             pdf_helper: default_pdf_helper(),
             chrome: default_chrome(),
+            ffmpeg: default_ffmpeg(),
         }
     }
 }
@@ -252,6 +255,10 @@ fn default_chrome() -> PathBuf {
     PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
 }
 
+fn default_ffmpeg() -> PathBuf {
+    PathBuf::from("/opt/homebrew/bin/ffmpeg")
+}
+
 fn default_concurrency() -> usize {
     2
 }
@@ -288,7 +295,7 @@ fn default_true() -> bool {
 }
 
 fn default_bilibili_extra_args() -> Vec<String> {
-    vec!["--video-ascending".to_string()]
+    vec!["--video-ascending".to_string(), "--skip-mux".to_string()]
 }
 
 #[cfg(test)]
@@ -319,6 +326,10 @@ mod tests {
             config.tools.pdf_helper,
             PathBuf::from("scripts/pdf_helper.py")
         );
+        assert_eq!(
+            config.tools.ffmpeg,
+            PathBuf::from("/opt/homebrew/bin/ffmpeg")
+        );
         assert_eq!(config.bot.concurrency, 2);
         assert_eq!(config.bot.poll_timeout_seconds, 50);
         assert_eq!(config.bot.progress_update_seconds, 30);
@@ -331,7 +342,10 @@ mod tests {
         );
         assert!(config.video.write_nfo);
         assert!(config.video.keep_sidecars);
-        assert_eq!(config.bilibili.extra_args, vec!["--video-ascending"]);
+        assert_eq!(
+            config.bilibili.extra_args,
+            vec!["--video-ascending", "--skip-mux"]
+        );
     }
 
     #[test]
