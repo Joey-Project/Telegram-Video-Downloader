@@ -5,6 +5,7 @@
 ## 功能
 
 - 普通消息中的 Bilibili 链接调用 `BBDown`，保存到视频下载目录。
+- 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
 - `/pdf URL` 调用 uv 管理的 Python Playwright helper，使用系统 Chrome 打印 PDF；`pdf.auto_domains` 里的域名会自动走 PDF。
@@ -26,7 +27,7 @@ cp config.example.toml config.toml
 
 `telegram.allowed_chat_ids` 必须配置为允许使用这个 bot 的 chat id。个人私聊通常是你的用户 chat id；群组使用群组 chat id。确实需要临时放开时，可以显式设置 `allow_all_chats = true`。
 
-`pdf.auto_domains` 默认包含 `mp.weixin.qq.com`。Bilibili 和 YouTube 链接始终优先按视频处理，不会被 PDF 白名单吞掉。
+`pdf.auto_domains` 默认包含 `mp.weixin.qq.com`。Bilibili 视频和 YouTube 链接始终优先按视频处理，不会被 PDF 白名单吞掉；Bilibili `opus` 文章链接会自动走 PDF，并丢弃分享 query 参数。
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
@@ -48,6 +49,7 @@ Title https://www.bilibili.com/video/BV...
 https://youtu.be/...
 /pdf https://example.com/article
 https://mp.weixin.qq.com/s?...
+https://m.bilibili.com/opus/1206098216310800386?share_source=COPY
 ```
 
 本地重放一条 Telegram 文本、不走真实 Telegram API：

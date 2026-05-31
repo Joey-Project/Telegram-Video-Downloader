@@ -80,14 +80,40 @@ pub fn extract_http_urls(text: &str) -> Vec<String> {
 }
 
 fn classify_url(raw_url: &str, auto_pdf_domains: &[String]) -> Option<JobRequest> {
-    classify_video_url(raw_url).or_else(|| classify_auto_pdf_url(raw_url, auto_pdf_domains))
+    classify_bilibili_opus_url(raw_url)
+        .or_else(|| classify_video_url(raw_url))
+        .or_else(|| classify_auto_pdf_url(raw_url, auto_pdf_domains))
+}
+
+fn classify_bilibili_opus_url(raw_url: &str) -> Option<JobRequest> {
+    let url = Url::parse(raw_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if !domain_or_subdomain(&host, "bilibili.com") {
+        return None;
+    }
+
+    let mut segments = url.path_segments()?;
+    if !is_bilibili_opus_path(&mut segments) {
+        return None;
+    }
+
+    let opus_id = segments.next()?;
+    if opus_id.is_empty() || !opus_id.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+
+    Some(JobRequest::Pdf {
+        url: format!("https://www.bilibili.com/opus/{opus_id}"),
+    })
 }
 
 fn classify_video_url(raw_url: &str) -> Option<JobRequest> {
     let url = Url::parse(raw_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
 
-    if host == "b23.tv" || domain_or_subdomain(&host, "bilibili.com") {
+    if host == "b23.tv"
+        || (domain_or_subdomain(&host, "bilibili.com") && !has_bilibili_opus_path(&url))
+    {
         Some(JobRequest::Bilibili {
             url: raw_url.to_string(),
         })
@@ -98,6 +124,18 @@ fn classify_video_url(raw_url: &str) -> Option<JobRequest> {
     } else {
         None
     }
+}
+
+fn has_bilibili_opus_path(url: &Url) -> bool {
+    url.path_segments()
+        .is_some_and(|mut segments| is_bilibili_opus_path(&mut segments))
+}
+
+fn is_bilibili_opus_path<'a, I>(segments: &mut I) -> bool
+where
+    I: Iterator<Item = &'a str>,
+{
+    segments.next().is_some_and(|segment| segment == "opus")
 }
 
 fn classify_auto_pdf_url(raw_url: &str, auto_pdf_domains: &[String]) -> Option<JobRequest> {
@@ -276,6 +314,39 @@ mod tests {
             RouteResult::Jobs(vec![JobRequest::Bilibili {
                 url: "https://www.bilibili.com/video/BV12TRrBcEP8/?share_source=copy_web&vd_source=abc".to_string()
             }])
+        );
+    }
+
+    #[test]
+    fn routes_bilibili_opus_as_canonical_pdf() {
+        assert_eq!(
+            route_message(
+                "https://m.bilibili.com/opus/1206098216310800386?from_spmid=united.player-video-detail.0.0&share_source=COPY",
+                &auto_pdf_domains()
+            ),
+            RouteResult::Jobs(vec![JobRequest::Pdf {
+                url: "https://www.bilibili.com/opus/1206098216310800386".to_string()
+            }])
+        );
+        assert_eq!(
+            route_message(
+                "https://www.bilibili.com/opus/1206098216310800386?spmid=dt.opus-detail.0.0#reply",
+                &auto_pdf_domains()
+            ),
+            RouteResult::Jobs(vec![JobRequest::Pdf {
+                url: "https://www.bilibili.com/opus/1206098216310800386".to_string()
+            }])
+        );
+    }
+
+    #[test]
+    fn leaves_malformed_bilibili_opus_unsupported() {
+        assert_eq!(
+            route_message(
+                "https://www.bilibili.com/opus/not-a-number",
+                &auto_pdf_domains()
+            ),
+            RouteResult::UnsupportedLinks
         );
     }
 

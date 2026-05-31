@@ -48,6 +48,20 @@ def is_wechat_article_url(url: str) -> bool:
     return urlparse(url).netloc.lower() == "mp.weixin.qq.com"
 
 
+def is_bilibili_opus_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    if host != "bilibili.com" and not host.endswith(".bilibili.com"):
+        return False
+
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    return len(segments) >= 2 and segments[0] == "opus" and segments[1].isdigit()
+
+
+def should_render_snapshot(url: str) -> bool:
+    return is_wechat_article_url(url) or is_bilibili_opus_url(url)
+
+
 def ensure_base_tag(html: str, url: str) -> str:
     parsed = urlparse(url)
     if not parsed.scheme or not parsed.netloc:
@@ -304,6 +318,9 @@ async def print_page_pdf(page, output_dir: Path, title: str, url: str) -> Path:
             prefer_css_page_size=True,
         )
         return reservation.path
+    except Exception:
+        reservation.path.unlink(missing_ok=True)
+        raise
     finally:
         reservation.release()
 
@@ -395,6 +412,8 @@ async def wait_for_images(page, timeout_ms: int = 15_000) -> None:
 
 
 async def render_snapshot_pdf(browser, url: str, output_dir: Path) -> Path:
+    from playwright.async_api import Error as PlaywrightError
+
     html = fetch_page_html(url)
     title = extract_title_from_html(html, url)
     html = rewrite_lazy_image_sources(ensure_base_tag(strip_scripts(html), url))
@@ -412,7 +431,8 @@ async def render_snapshot_pdf(browser, url: str, output_dir: Path) -> Path:
         await scroll_until_stable(snapshot_page, max_rounds=12, stable_rounds=2)
         return await print_page_pdf(snapshot_page, output_dir, title, url)
     finally:
-        await snapshot_context.close()
+        with suppress(PlaywrightError):
+            await snapshot_context.close()
 
 
 async def render_pdf(url: str, output_dir: Path, chrome: Path) -> Path:
@@ -432,7 +452,7 @@ async def render_pdf(url: str, output_dir: Path, chrome: Path) -> Path:
 
         browser = await playwright.chromium.launch(**launch_options)
         try:
-            if is_wechat_article_url(url):
+            if should_render_snapshot(url):
                 return await render_snapshot_pdf(browser, url, output_dir)
 
             page = await browser.new_page(viewport={"width": 1440, "height": 1000})
@@ -454,7 +474,7 @@ async def render_pdf(url: str, output_dir: Path, chrome: Path) -> Path:
         try:
             return await render_with_browser(chrome)
         except PlaywrightError:
-            if not is_wechat_article_url(url):
+            if not should_render_snapshot(url):
                 raise
 
             return await render_with_browser(None)

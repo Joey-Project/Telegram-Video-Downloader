@@ -3,7 +3,7 @@ id: 20260516-8f3c2a
 title: Telegram Local Downloader Bot
 status: completed
 created: 2026-05-16
-updated: 2026-05-24
+updated: 2026-05-31
 branch:
 pr:
 supersedes: []
@@ -48,6 +48,7 @@ superseded_by:
 - YouTube 下载会预取 yt-dlp metadata，优先人工字幕、fallback 自动字幕，并启用 metadata、封面、字幕、info JSON、description 和 NFO 输出。
 - Bilibili 下载继续由 BBDown 负责，显式跳过 AI 字幕，默认追加 `--video-ascending` 以避开当前复现链接在后台模式下的高码率流卡住问题，并对新增视频生成 best-effort NFO。
 - PDF 支持 `mp.weixin.qq.com` 自动白名单，`/pdf URL` 继续保留。
+- Bilibili `opus` 文章链接现在会规范化为 `https://www.bilibili.com/opus/<id>` 并走 PDF；PDF helper 对这类页面使用静态 HTML 快照渲染，避开页面脚本在 headless Chrome 中主动关闭页面的问题。
 
 ## Next Steps
 - 使用真实 `config.toml` 和 Telegram bot token 做最终 live smoke test：Bilibili、标题+Bilibili、YouTube、微信文章自动 PDF。
@@ -74,3 +75,5 @@ superseded_by:
 - 2026-05-24 BBDown root-cause pass: `https://b23.tv/mlTVYet` succeeded in a TTY direct run but stalled in non-TTY background mode with the default AVC stream; adding `--video-ascending` selected the smaller 480P HEVC stream and completed in both direct and replay tests.
 - Replay validation passed: `cargo run -- --replay-message .codex-tmp/replay-config.toml https://b23.tv/mlTVYet` completed, emitted file-growth progress, wrote a 7.7 MiB MP4 and same-basename NFO under `.codex-tmp/replay-video`.
 - Local environment repair: `uv tool install --force yt-dlp` fixed a broken `yt-dlp` shebang; `yt-dlp --dump-json --skip-download --no-playlist` succeeded for the prior YouTube sample URL, with a remaining JS runtime warning.
+- 2026-05-31 Bilibili opus follow-up: route tests cover `m.bilibili.com/opus/<id>` and `www.bilibili.com/opus/<id>` canonicalization, malformed opus URLs remain unsupported, and PDF helper tests cover Bilibili snapshot routing plus cleanup of partial PDFs after print failures.
+- Bilibili opus replay validation passed with the user-provided sample URL: `cargo run -- --replay-message .codex-tmp/opus-replay-config.toml 'Bilibili 文章可以看 https://m.bilibili.com/opus/1206098216310800386?...'` wrote a single 4-page PDF under `.codex-tmp/opus-pdf-final`.
