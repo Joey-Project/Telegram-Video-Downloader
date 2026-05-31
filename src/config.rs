@@ -1,5 +1,5 @@
-use std::fs;
 use std::path::{Path, PathBuf};
+use std::{env, fs};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -131,8 +131,20 @@ impl AppConfig {
     fn from_toml_str(content: &str, project_dir: PathBuf) -> Result<Self> {
         let mut config: Self = toml::from_str(content).context("failed to parse config TOML")?;
         config.project_dir = project_dir;
+        config.expand_config_paths();
         config.validate()?;
         Ok(config)
+    }
+
+    fn expand_config_paths(&mut self) {
+        self.downloads.video_dir = expand_home_path(&self.downloads.video_dir);
+        self.downloads.pdf_dir = expand_home_path(&self.downloads.pdf_dir);
+        self.tools.bbdown = expand_home_path(&self.tools.bbdown);
+        self.tools.yt_dlp = expand_home_path(&self.tools.yt_dlp);
+        self.tools.uv = expand_home_path(&self.tools.uv);
+        self.tools.pdf_helper = expand_home_path(&self.tools.pdf_helper);
+        self.tools.chrome = expand_home_path(&self.tools.chrome);
+        self.tools.ffmpeg = expand_home_path(&self.tools.ffmpeg);
     }
 
     fn validate(&self) -> Result<()> {
@@ -228,19 +240,19 @@ impl Default for BilibiliConfig {
 }
 
 fn default_video_dir() -> PathBuf {
-    PathBuf::from("/Users/joey/Movies/Downloads")
+    home_path(&["Movies", "Downloads"], "video-downloads")
 }
 
 fn default_pdf_dir() -> PathBuf {
-    PathBuf::from("/Users/joey/Documents/Downloads")
+    home_path(&["Documents", "Downloads"], "pdf-downloads")
 }
 
 fn default_bbdown() -> PathBuf {
-    PathBuf::from("/Users/joey/.dotnet/tools/BBDown")
+    PathBuf::from("BBDown")
 }
 
 fn default_yt_dlp() -> PathBuf {
-    PathBuf::from("/Users/joey/.local/bin/yt-dlp")
+    PathBuf::from("yt-dlp")
 }
 
 fn default_uv() -> PathBuf {
@@ -256,7 +268,44 @@ fn default_chrome() -> PathBuf {
 }
 
 fn default_ffmpeg() -> PathBuf {
-    PathBuf::from("/opt/homebrew/bin/ffmpeg")
+    PathBuf::from("ffmpeg")
+}
+
+fn home_path(parts: &[&str], fallback: &str) -> PathBuf {
+    let Some(mut path) = home_dir() else {
+        return PathBuf::from(fallback);
+    };
+
+    for part in parts {
+        path.push(part);
+    }
+    path
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+fn expand_home_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let Some(home) = home_dir() else {
+        return path.to_path_buf();
+    };
+
+    let value = text.as_ref();
+    if matches!(value, "~" | "$HOME" | "${HOME}") {
+        return home;
+    }
+
+    for prefix in ["~/", "$HOME/", "${HOME}/"] {
+        if let Some(suffix) = value.strip_prefix(prefix) {
+            return home.join(suffix);
+        }
+    }
+
+    path.to_path_buf()
 }
 
 fn default_concurrency() -> usize {
@@ -304,6 +353,7 @@ mod tests {
 
     #[test]
     fn loads_defaults() {
+        let home = home_dir().expect("HOME should be set during tests");
         let config = AppConfig::from_toml_str(
             r#"
             [telegram]
@@ -316,20 +366,19 @@ mod tests {
 
         assert_eq!(
             config.downloads.video_dir,
-            PathBuf::from("/Users/joey/Movies/Downloads")
+            home.join("Movies").join("Downloads")
         );
         assert_eq!(
             config.downloads.pdf_dir,
-            PathBuf::from("/Users/joey/Documents/Downloads")
+            home.join("Documents").join("Downloads")
         );
+        assert_eq!(config.tools.bbdown, PathBuf::from("BBDown"));
+        assert_eq!(config.tools.yt_dlp, PathBuf::from("yt-dlp"));
         assert_eq!(
             config.tools.pdf_helper,
             PathBuf::from("scripts/pdf_helper.py")
         );
-        assert_eq!(
-            config.tools.ffmpeg,
-            PathBuf::from("/opt/homebrew/bin/ffmpeg")
-        );
+        assert_eq!(config.tools.ffmpeg, PathBuf::from("ffmpeg"));
         assert_eq!(config.bot.concurrency, 2);
         assert_eq!(config.bot.poll_timeout_seconds, 50);
         assert_eq!(config.bot.progress_update_seconds, 30);
@@ -399,6 +448,34 @@ mod tests {
         assert_eq!(
             config.resolve_project_path(Path::new("scripts/pdf_helper.py")),
             PathBuf::from("/tmp/project/scripts/pdf_helper.py")
+        );
+    }
+
+    #[test]
+    fn expands_home_paths() {
+        let home = home_dir().expect("HOME should be set during tests");
+        let config = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [downloads]
+            video_dir = "~/Movies/Bot"
+            pdf_dir = "$HOME/Documents/Bot"
+
+            [tools]
+            bbdown = "${HOME}/.dotnet/tools/BBDown"
+            "#,
+            PathBuf::from("."),
+        )
+        .expect("config should parse");
+
+        assert_eq!(config.downloads.video_dir, home.join("Movies").join("Bot"));
+        assert_eq!(config.downloads.pdf_dir, home.join("Documents").join("Bot"));
+        assert_eq!(
+            config.tools.bbdown,
+            home.join(".dotnet").join("tools").join("BBDown")
         );
     }
 

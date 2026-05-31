@@ -19,10 +19,10 @@
 cp config.example.toml config.toml
 ```
 
-`config.toml` 包含本机路径和 token，已经被 `.gitignore` 忽略。默认目录是：
+`config.toml` 包含本机路径和 token，已经被 `.gitignore` 忽略。示例配置使用 `~` 表示当前用户 home；程序也支持在路径开头使用 `~`、`$HOME` 或 `${HOME}`。默认下载目录是：
 
-- 视频：`/Users/joey/Movies/Downloads`
-- PDF：`/Users/joey/Documents/Downloads`
+- 视频：`~/Movies/Downloads`
+- PDF：`~/Documents/Downloads`
 
 `telegram.allowed_chat_ids` 必须配置为允许使用这个 bot 的 chat id。个人私聊通常是你的用户 chat id；群组使用群组 chat id。确实需要临时放开时，可以显式设置 `allow_all_chats = true`。
 
@@ -54,6 +54,37 @@ https://mp.weixin.qq.com/s?...
 
 ```sh
 cargo run -- --replay-message config.toml "Title https://b23.tv/..."
+```
+
+## macOS 自启动
+
+用户级 LaunchAgent 可以让 bot 在当前用户的 launchd session 里自动启动和保活。安装脚本会构建 release binary，并把 plist 写入 `~/Library/LaunchAgents`：
+
+```sh
+scripts/launch_agent.sh install
+```
+
+常用操作：
+
+```sh
+scripts/launch_agent.sh status
+scripts/launch_agent.sh restart
+scripts/launch_agent.sh logs
+scripts/launch_agent.sh uninstall
+```
+
+脚本默认使用：
+
+- label：`io.github.telegram-local-downloader.bot`
+- config：`./config.toml`
+- binary：`./target/release/telegram-video-downloader`
+- logs：`~/Library/Logs/TelegramVideoDownloader/`
+- launchd domain：`user/$(id -u)`
+
+这些都可以通过环境变量覆盖，例如：
+
+```sh
+BOT_LABEL=com.example.telegram-downloader BOT_CONFIG=/path/to/config.toml scripts/launch_agent.sh install
 ```
 
 ## 验证

@@ -4,16 +4,16 @@ allowed_chat_ids = [123456789]
 allow_all_chats = false
 
 [downloads]
-video_dir = "/Users/joey/Movies/Downloads"
-pdf_dir = "/Users/joey/Documents/Downloads"
+video_dir = "~/Movies/Downloads"
+pdf_dir = "~/Documents/Downloads"
 
 [tools]
-bbdown = "/Users/joey/.dotnet/tools/BBDown"
-yt_dlp = "/Users/joey/.local/bin/yt-dlp"
+bbdown = "BBDown"
+yt_dlp = "yt-dlp"
 uv = "uv"
 pdf_helper = "scripts/pdf_helper.py"
 chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-ffmpeg = "/opt/homebrew/bin/ffmpeg"
+ffmpeg = "ffmpeg"
 
 [pdf]
 auto_domains = ["mp.weixin.qq.com"]

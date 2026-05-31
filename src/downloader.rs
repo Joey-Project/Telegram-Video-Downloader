@@ -1467,6 +1467,7 @@ fn join_paths(paths: &[PathBuf]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::path::PathBuf;
 
     use crate::config::AppConfig;
@@ -1475,6 +1476,12 @@ mod tests {
 
     fn test_config() -> AppConfig {
         AppConfig::load(Path::new("config.example.toml")).expect("example config should parse")
+    }
+
+    fn test_home() -> PathBuf {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME should be set during tests")
     }
 
     fn metadata_with_subtitles() -> YoutubeMetadata {
@@ -1502,14 +1509,11 @@ mod tests {
             },
         );
 
-        assert_eq!(
-            spec.program,
-            PathBuf::from("/Users/joey/.dotnet/tools/BBDown")
-        );
+        assert_eq!(spec.program, PathBuf::from("BBDown"));
         assert!(spec.args.contains(&"--skip-ai".to_string()));
         assert!(spec.args.contains(&"--video-ascending".to_string()));
         assert!(spec.args.contains(&"--skip-mux".to_string()));
-        assert_eq!(spec.cwd, PathBuf::from("/Users/joey/Movies/Downloads"));
+        assert_eq!(spec.cwd, test_home().join("Movies").join("Downloads"));
     }
 
     #[test]
@@ -1522,7 +1526,7 @@ mod tests {
             Path::new("/tmp/output.mp4"),
         );
 
-        assert_eq!(spec.program, PathBuf::from("/opt/homebrew/bin/ffmpeg"));
+        assert_eq!(spec.program, PathBuf::from("ffmpeg"));
         for expected in ["-i", "/tmp/video.mp4", "/tmp/audio.m4a", "-c", "copy"] {
             assert!(
                 spec.args.contains(&expected.to_string()),
@@ -1536,7 +1540,7 @@ mod tests {
         let config = test_config();
         let spec = youtube_metadata_command_spec(&config, "https://youtu.be/abc");
 
-        assert_eq!(spec.program, PathBuf::from("/Users/joey/.local/bin/yt-dlp"));
+        assert_eq!(spec.program, PathBuf::from("yt-dlp"));
         assert!(spec.args.contains(&"--dump-json".to_string()));
         assert!(spec.args.contains(&"--skip-download".to_string()));
         assert!(spec.args.contains(&"--no-playlist".to_string()));
@@ -1552,7 +1556,7 @@ mod tests {
         };
         let spec = youtube_download_command_spec(&config, "https://youtu.be/abc", &subtitle_plan);
 
-        assert_eq!(spec.program, PathBuf::from("/Users/joey/.local/bin/yt-dlp"));
+        assert_eq!(spec.program, PathBuf::from("yt-dlp"));
         for expected in [
             "--merge-output-format",
             "mkv",
@@ -1575,7 +1579,7 @@ mod tests {
                 "missing {expected}"
             );
         }
-        assert_eq!(spec.cwd, PathBuf::from("/Users/joey/Movies/Downloads"));
+        assert_eq!(spec.cwd, test_home().join("Movies").join("Downloads"));
     }
 
     #[test]
