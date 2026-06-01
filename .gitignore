@@ -1,7 +1,14 @@
+.DS_Store
+.env
+.env.*
 target/
 .venv/
 .ruff_cache/
 .codex-tmp/
+node_modules/
+dist/
+build/
+out/
 __pycache__/
 *.py[cod]
 
