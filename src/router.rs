@@ -111,9 +111,7 @@ fn classify_video_url(raw_url: &str) -> Option<JobRequest> {
     let url = Url::parse(raw_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
 
-    if host == "b23.tv"
-        || (domain_or_subdomain(&host, "bilibili.com") && !has_bilibili_opus_path(&url))
-    {
+    if host == "b23.tv" || is_bilibili_video_url(&host, &url) {
         Some(JobRequest::Bilibili {
             url: raw_url.to_string(),
         })
@@ -129,6 +127,23 @@ fn classify_video_url(raw_url: &str) -> Option<JobRequest> {
 fn has_bilibili_opus_path(url: &Url) -> bool {
     url.path_segments()
         .is_some_and(|mut segments| is_bilibili_opus_path(&mut segments))
+}
+
+fn is_bilibili_video_url(host: &str, url: &Url) -> bool {
+    if !domain_or_subdomain(host, "bilibili.com") || has_bilibili_opus_path(url) {
+        return false;
+    }
+
+    let Some(mut segments) = url.path_segments() else {
+        return false;
+    };
+    match segments.next() {
+        Some("video") => segments
+            .next()
+            .is_some_and(|id| id.starts_with("BV") || id.starts_with("av")),
+        Some("bangumi") => matches!(segments.next(), Some("play")),
+        _ => false,
+    }
 }
 
 fn is_bilibili_opus_path<'a, I>(segments: &mut I) -> bool
@@ -301,6 +316,32 @@ mod tests {
             RouteResult::Jobs(vec![JobRequest::Bilibili {
                 url: "https://b23.tv/abc".to_string()
             }])
+        );
+        assert_eq!(
+            route_message(
+                "https://www.bilibili.com/bangumi/play/ep123456",
+                &auto_pdf_domains()
+            ),
+            RouteResult::Jobs(vec![JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ep123456".to_string()
+            }])
+        );
+    }
+
+    #[test]
+    fn routes_non_video_bilibili_to_auto_pdf_or_unsupported() {
+        assert_eq!(
+            route_message(
+                "https://www.bilibili.com/read/cv123",
+                &["bilibili.com".to_string()]
+            ),
+            RouteResult::Jobs(vec![JobRequest::Pdf {
+                url: "https://www.bilibili.com/read/cv123".to_string()
+            }])
+        );
+        assert_eq!(
+            route_message("https://space.bilibili.com/123", &auto_pdf_domains()),
+            RouteResult::UnsupportedLinks
         );
     }
 

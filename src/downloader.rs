@@ -429,7 +429,7 @@ pub fn youtube_download_command_spec(
     let mut args = vec![
         "--no-playlist".to_string(),
         "-P".to_string(),
-        config.downloads.video_dir.display().to_string(),
+        ".".to_string(),
         "--merge-output-format".to_string(),
         "mkv".to_string(),
         "--remux-video".to_string(),
@@ -1535,6 +1535,22 @@ mod tests {
     }
 
     #[test]
+    fn builds_youtube_download_command_without_repeating_relative_output_dir() {
+        let mut config = test_config();
+        config.downloads.video_dir = PathBuf::from("downloads");
+        let spec =
+            youtube_download_command_spec(&config, "https://youtu.be/abc", &SubtitlePlan::none());
+
+        assert_eq!(spec.cwd, PathBuf::from("downloads"));
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|args| args == ["-P".to_string(), ".".to_string()])
+        );
+        assert!(!spec.args.contains(&"downloads".to_string()));
+    }
+
+    #[test]
     fn builds_ffmpeg_mux_command() {
         let config = test_config();
         let spec = ffmpeg_mux_command_spec(
@@ -1598,6 +1614,11 @@ mod tests {
             );
         }
         assert_eq!(spec.cwd, test_home().join("Movies").join("Downloads"));
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|args| args == ["-P".to_string(), ".".to_string()])
+        );
     }
 
     #[test]
