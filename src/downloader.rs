@@ -148,7 +148,7 @@ async fn run_bilibili_job(
     url: &str,
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<JobReport> {
-    let _guard = video_output_lock().await;
+    let _guard = video_output_lock("Bilibili download", progress.as_ref()).await;
     let mut nfo_warnings = Vec::new();
     let needs_mux = config
         .bilibili
@@ -330,7 +330,7 @@ async fn run_youtube_job(
 ) -> Result<JobReport> {
     let metadata = fetch_youtube_metadata(config, url, progress.clone()).await?;
     let subtitle_plan = select_subtitles(&metadata, &config.video.subtitle_languages);
-    let _guard = video_output_lock().await;
+    let _guard = video_output_lock("YouTube download", progress.as_ref()).await;
     let spec = youtube_download_command_spec(config, url, &subtitle_plan);
     let output = run_command(config, &spec, progress).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -566,11 +566,29 @@ async fn fetch_youtube_metadata(
     serde_json::from_str(json).context("failed to parse yt-dlp metadata JSON")
 }
 
-async fn video_output_lock() -> MutexGuard<'static, ()> {
-    VIDEO_OUTPUT_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .await
+async fn video_output_lock(
+    job_label: &str,
+    progress: Option<&mpsc::UnboundedSender<JobProgress>>,
+) -> MutexGuard<'static, ()> {
+    let lock = VIDEO_OUTPUT_LOCK.get_or_init(|| Mutex::new(()));
+    match lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            send_progress(
+                progress,
+                format!("{job_label}: waiting for video output slot"),
+            );
+            let guard = lock.lock().await;
+            send_progress(progress, format!("{job_label}: video output slot acquired"));
+            guard
+        }
+    }
+}
+
+fn send_progress(progress: Option<&mpsc::UnboundedSender<JobProgress>>, message: String) {
+    if let Some(progress) = progress {
+        let _ = progress.send(JobProgress { message });
+    }
 }
 
 #[derive(Debug)]
@@ -1789,6 +1807,38 @@ mod tests {
 
         tracker.emit("files: 1 changed, 2.0 MiB written".to_string());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reports_only_contended_video_output_lock_waits() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let guard = video_output_lock("Bilibili download", Some(&tx)).await;
+        assert!(rx.try_recv().is_err());
+        drop(guard);
+
+        let held_guard = VIDEO_OUTPUT_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .await;
+        let waiter = tokio::spawn(async move {
+            let _guard = video_output_lock("Bilibili download", Some(&tx)).await;
+        });
+
+        assert_eq!(
+            rx.recv().await.expect("waiting progress should be sent"),
+            JobProgress {
+                message: "Bilibili download: waiting for video output slot".to_string()
+            }
+        );
+
+        drop(held_guard);
+        assert_eq!(
+            rx.recv().await.expect("acquired progress should be sent"),
+            JobProgress {
+                message: "Bilibili download: video output slot acquired".to_string()
+            }
+        );
+        waiter.await.expect("waiter should finish");
     }
 
     #[cfg(unix)]
