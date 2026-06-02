@@ -1,12 +1,19 @@
 .DS_Store
 .env
 .env.*
-config.toml
+target/
+.venv/
+.ruff_cache/
 .codex-tmp/
 node_modules/
 dist/
 build/
 out/
-target/
 __pycache__/
 *.py[cod]
+
+# Local secrets and machine-specific runtime config.
+config.toml
+
+# Local generated journal index.
+docs/project_journal/INDEX.md

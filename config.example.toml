@@ -1,0 +1,34 @@
+[telegram]
+token = "123456789:replace-with-your-token"
+allowed_chat_ids = [123456789]
+allow_all_chats = false
+
+[downloads]
+video_dir = "~/Movies/Downloads"
+pdf_dir = "~/Documents/Downloads"
+
+[tools]
+bbdown = "BBDown"
+yt_dlp = "yt-dlp"
+uv = "uv"
+pdf_helper = "scripts/pdf_helper.py"
+chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+ffmpeg = "ffmpeg"
+
+[pdf]
+auto_domains = ["mp.weixin.qq.com"]
+
+[video]
+subtitle_languages = ["zh-Hans", "zh-Hant", "zh", "zh-CN", "zh-TW", "en", "ja"]
+write_nfo = true
+keep_sidecars = true
+
+[bilibili]
+extra_args = ["--video-ascending", "--skip-mux"]
+
+[bot]
+concurrency = 2
+poll_timeout_seconds = 50
+progress_update_seconds = 30
+command_timeout_seconds = 7200
+command_idle_timeout_seconds = 300

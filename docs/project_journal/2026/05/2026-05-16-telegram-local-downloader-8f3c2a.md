@@ -1,9 +1,9 @@
 ---
 id: 20260516-8f3c2a
 title: Telegram Local Downloader Bot
-status: active
+status: completed
 created: 2026-05-16
-updated: 2026-05-16
+updated: 2026-05-31
 branch:
 pr:
 supersedes: []
@@ -16,6 +16,7 @@ superseded_by:
 - 第一版目标是个人本机长驻 Telegram bot：把支持的链接发给 bot 后，本机自动保存视频或网页 PDF。
 - 主服务使用 Rust；PDF 打印 helper 使用 uv 管理的 Python Playwright，以降低 Chrome 自动化和 lazy-loading 滚动处理成本。
 - 真实 `config.toml` 会包含 Telegram token，但必须被忽略；仓库只提交 `config.example.toml`。
+- 第二轮增强目标是从 Telegram 文本中提取真实 URL，并为视频下载补齐播放器内嵌 metadata 与媒体库 sidecar。
 
 ## Confirmed Design
 - Bilibili 路由：普通消息里的 `bilibili.com`、其子域名、`b23.tv` 链接调用本机 `BBDown`，工作目录为 `/Users/joey/Movies/Downloads`。
@@ -40,14 +41,39 @@ superseded_by:
 - Python: `uv run python -m unittest`
 
 ## Current State
-- 设计与计划已记录在 journal 中。
-- 下一步是在一个后续提交中实现项目骨架、bot 逻辑、PDF helper、README 和测试。
+- 第二轮增强和 downloader 可观测性 follow-up 已实现。
+- Rust 主服务已包含配置加载、Telegram `getUpdates` polling、全文 URL 扫描、消息路由、全局并发限制、外部命令执行和状态回复。
+- 外部命令现在流式采集 stdout/stderr、监控输出目录文件增长，并支持总超时与 idle timeout；Telegram 任务会转发节流后的进度消息。
+- 新增 `--replay-message` 本地入口，可用真实消息文本重放路由和下载组件，不依赖 Telegram ingress。
+- YouTube 下载会预取 yt-dlp metadata，优先人工字幕、fallback 自动字幕，并启用 metadata、封面、字幕、info JSON、description 和 NFO 输出。
+- Bilibili 下载继续由 BBDown 负责，显式跳过 AI 字幕，默认追加 `--video-ascending` 以避开当前复现链接在后台模式下的高码率流卡住问题，并对新增视频生成 best-effort NFO。
+- PDF 支持 `mp.weixin.qq.com` 自动白名单，`/pdf URL` 继续保留。
+- Bilibili `opus` 文章链接现在会规范化为 `https://www.bilibili.com/opus/<id>` 并走 PDF；PDF helper 对这类页面使用静态 HTML 快照渲染，避开页面脚本在 headless Chrome 中主动关闭页面的问题。
 
 ## Next Steps
-- 提交本 journal checkpoint。
-- 继续实现代码与测试。
-- 运行验证；如 Cargo/uv 需要网络或沙箱外缓存访问，按需申请窄授权。
+- 使用真实 `config.toml` 和 Telegram bot token 做最终 live smoke test：Bilibili、标题+Bilibili、YouTube、微信文章自动 PDF。
+- 如需要下载登录态，继续在本机 BBDown/yt-dlp CLI 层配置 cookie 或登录信息；第一版 bot 不托管 cookie。
+- 如果 YouTube 下载遇到 yt-dlp JS runtime warning 变成实际失败，安装 deno 或 node 并在 yt-dlp 配置里启用。
 
 ## Evidence
 - 本机已确认存在 `BBDown`、`yt-dlp`、Chrome、Rust/Cargo、clippy、rustfmt、uv、pnpm、ffmpeg。
 - 计划来源：用户在 2026-05-16 要求实现 Telegram Local Downloader Bot，并随后要求先按 project-journal 记录设计和计划并提交。
+- Journal checkpoint commit: `cbecd1b Document downloader bot plan`.
+- 自动化验证通过：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、`uv run ruff format --check`、`uv run ruff check`、`uv run python -m unittest discover -s tests`。
+- 未执行 live Telegram 验收，因为仓库不提交真实 `config.toml` 和 bot token。
+- Review gate: helper-backed `codex-readonly` found and fixes were applied for chat allowlist, child process cleanup, PDF output path races, Telegram HTTP timeouts, and bot token leakage in reqwest error logs. Final `codex-readonly` rerun returned `LGTM`.
+- 第二轮新增单元覆盖：全文 URL 提取、PDF 白名单、YouTube 字幕选择、metadata 下载命令、Bilibili `--skip-ai` 和 NFO 渲染。
+- 第二轮 review gate found a video output race in Bilibili directory-diff NFO generation; all video-output writes are now serialized inside the bot process while PDF work can still run concurrently.
+- Follow-up review found URL pollution when CJK punctuation directly follows a URL without whitespace; URL scanning now treats CJK punctuation as a boundary and has a regression test.
+- Final review follow-up fixed two edge cases: YouTube NFO generation now skips directory fallback paths, and URL scanning no longer treats ASCII parentheses inside URLs as hard boundaries.
+- Additional review follow-up avoids Bilibili directory scans when NFO generation is disabled and handles fullwidth wrapped URLs without whitespace.
+- URL scanner now keeps balanced ASCII parentheses inside URLs while stopping at unmatched ASCII closing wrappers.
+- URL scheme scanning is now ASCII case-insensitive, matching `HTTP://` and `HTTPS://` variants before normalizing through `url::Url`.
+- Quoted URLs followed immediately by captions now stop at ASCII or smart quote boundaries.
+- NFO generation is now best-effort: scan/write failures are reported as job details but do not fail an otherwise successful video download.
+- URL cleanup no longer strips balanced ASCII closing parentheses from legitimate URLs such as Wikipedia paths.
+- 2026-05-24 BBDown root-cause pass: `https://b23.tv/mlTVYet` succeeded in a TTY direct run but stalled in non-TTY background mode with the default AVC stream; adding `--video-ascending` selected the smaller 480P HEVC stream and completed in both direct and replay tests.
+- Replay validation passed: `cargo run -- --replay-message .codex-tmp/replay-config.toml https://b23.tv/mlTVYet` completed, emitted file-growth progress, wrote a 7.7 MiB MP4 and same-basename NFO under `.codex-tmp/replay-video`.
+- Local environment repair: `uv tool install --force yt-dlp` fixed a broken `yt-dlp` shebang; `yt-dlp --dump-json --skip-download --no-playlist` succeeded for the prior YouTube sample URL, with a remaining JS runtime warning.
+- 2026-05-31 Bilibili opus follow-up: route tests cover `m.bilibili.com/opus/<id>` and `www.bilibili.com/opus/<id>` canonicalization, malformed opus URLs remain unsupported, and PDF helper tests cover Bilibili snapshot routing plus cleanup of partial PDFs after print failures.
+- Bilibili opus replay validation passed with the user-provided sample URL: `cargo run -- --replay-message .codex-tmp/opus-replay-config.toml 'Bilibili 文章可以看 https://m.bilibili.com/opus/1206098216310800386?...'` wrote a single 4-page PDF under `.codex-tmp/opus-pdf-final`.
