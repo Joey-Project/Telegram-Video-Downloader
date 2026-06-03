@@ -94,7 +94,11 @@ impl TelegramClient {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: String) -> Result<()> {
-        info!(chat_id, text = %text, "telegram outbound message");
+        info!(
+            chat_id,
+            text = %redact_sensitive_text(&text),
+            "telegram outbound message"
+        );
         let payload = SendMessageRequest {
             chat_id,
             text,
@@ -133,7 +137,7 @@ impl TelegramClient {
     pub async fn send_photo(&self, chat_id: i64, caption: String, png: Vec<u8>) -> Result<()> {
         info!(
             chat_id,
-            caption = %caption,
+            caption = %redact_sensitive_text(&caption),
             image_bytes = png.len(),
             "telegram outbound photo"
         );
@@ -190,6 +194,21 @@ fn strip_reqwest_url(error: reqwest::Error) -> reqwest::Error {
     error.without_url()
 }
 
+fn redact_sensitive_text(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    for line in text.lines() {
+        if !redacted.is_empty() {
+            redacted.push('\n');
+        }
+        if line.contains("passport.bilibili.com") && line.contains("qrcode_key=") {
+            redacted.push_str("<redacted Bilibili login QR URL>");
+        } else {
+            redacted.push_str(line);
+        }
+    }
+    redacted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +230,19 @@ mod tests {
             .is_private()
         );
         assert!(!Chat { id: 1, kind: None }.is_private());
+    }
+
+    #[test]
+    fn redacts_bilibili_login_qr_urls() {
+        assert_eq!(
+            redact_sensitive_text(
+                "Open:\nhttps://passport.bilibili.com/h5-app/passport/login/scan?qrcode_key=secret"
+            ),
+            "Open:\n<redacted Bilibili login QR URL>"
+        );
+        assert_eq!(
+            redact_sensitive_text("https://www.bilibili.com/video/BV123"),
+            "https://www.bilibili.com/video/BV123"
+        );
     }
 }

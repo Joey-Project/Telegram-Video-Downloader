@@ -108,12 +108,6 @@ struct NavData {
     uname: Option<String>,
 }
 
-#[derive(Serialize)]
-struct BbdownConfig<'a> {
-    #[serde(rename = "Cookie")]
-    cookie: &'a str,
-}
-
 pub async fn generate_login_qr(client: &Client) -> Result<LoginQr> {
     let response = client
         .get(QRCODE_GENERATE_URL)
@@ -421,8 +415,7 @@ fn write_bbdown_config(path: &Path, cookie: &str) -> Result<()> {
         set_dir_private(parent);
     }
 
-    let content = serde_json::to_vec_pretty(&BbdownConfig { cookie })
-        .context("failed to encode BBDown auth config")?;
+    let content = format!("--cookie {cookie}\n").into_bytes();
     let temp_path = temp_state_path(path);
     let _ = fs::remove_file(&temp_path);
     {
@@ -702,8 +695,7 @@ mod tests {
             .expect("BBDown config should save")
             .expect("BBDown config should be present");
         let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
-        assert!(content.contains("\"Cookie\""));
-        assert!(content.contains("SESSDATA=secret; bili_jct=csrf"));
+        assert_eq!(content, "--cookie SESSDATA=secret; bili_jct=csrf\n");
         assert!(delete_auth_state(&path).expect("auth delete should succeed"));
         assert!(!path.exists());
         assert!(!config_path.exists());

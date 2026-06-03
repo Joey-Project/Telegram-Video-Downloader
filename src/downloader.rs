@@ -1598,8 +1598,7 @@ mod tests {
         );
         let config_content =
             fs::read_to_string(&config_path).expect("BBDown auth config should exist");
-        assert!(config_content.contains("\"Cookie\""));
-        assert!(config_content.contains("SESSDATA=secret; bili_jct=csrf"));
+        assert_eq!(config_content, "--cookie SESSDATA=secret; bili_jct=csrf\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

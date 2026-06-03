@@ -83,3 +83,4 @@ superseded_by:
 - Follow-up review found and fixed a login/logout race: `/bbdown logout` now invalidates pending login flows before they can write a later successful QR-login cookie back to disk.
 - Final helper-backed `codex-readonly` rerun returned `LGTM` after the auth fixes.
 - PR review follow-up fixed two auth hardening issues: BBDown now receives cookies through a protected `--config-file` instead of argv, and login polling sleep is bounded by the configured timeout deadline.
+- PR review rerun corrected the BBDown config-file format to BBDown's line-oriented argument syntax and redacts Bilibili QR login URLs from outbound-message logs.
