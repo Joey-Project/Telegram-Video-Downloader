@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use tokio::sync::{Mutex, Semaphore, mpsc};
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
 
 use crate::config::AppConfig;
@@ -285,9 +285,7 @@ async fn handle_bilibili_auth_command(
             });
         }
         BilibiliAuthCommand::Logout => {
-            tokio::spawn(async move {
-                run_bbdown_logout(telegram, config, chat_id).await;
-            });
+            run_bbdown_logout(telegram, config, chat_id).await;
         }
     }
 }
@@ -353,7 +351,15 @@ async fn bbdown_login_flow(
             bail!("Bilibili login QR timed out");
         }
 
-        match bilibili_auth::poll_login(&client, &login_qr.qrcode_key).await? {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let poll = tokio_timeout(
+            remaining,
+            bilibili_auth::poll_login(&client, &login_qr.qrcode_key),
+        )
+        .await
+        .context("Bilibili login QR timed out")??;
+
+        match poll {
             bilibili_auth::LoginPoll::Waiting => {}
             bilibili_auth::LoginPoll::Scanned => {
                 if !sent_scanned_notice {
