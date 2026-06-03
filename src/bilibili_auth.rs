@@ -122,11 +122,14 @@ pub async fn generate_login_qr(client: &Client) -> Result<LoginQr> {
         .header(USER_AGENT, USER_AGENT_VALUE)
         .send()
         .await
+        .map_err(strip_reqwest_url)
         .context("failed to request Bilibili login QR")?
         .error_for_status()
+        .map_err(strip_reqwest_url)
         .context("Bilibili login QR request returned HTTP error")?
         .json::<BilibiliApiResponse<QrGenerateData>>()
         .await
+        .map_err(strip_reqwest_url)
         .context("failed to decode Bilibili login QR response")?;
 
     if response.code != 0 {
@@ -152,14 +155,17 @@ pub async fn poll_login(client: &Client, qrcode_key: &str) -> Result<LoginPoll> 
         .header(USER_AGENT, USER_AGENT_VALUE)
         .send()
         .await
+        .map_err(strip_reqwest_url)
         .context("failed to poll Bilibili login QR")?
         .error_for_status()
+        .map_err(strip_reqwest_url)
         .context("Bilibili login poll returned HTTP error")?;
 
     let cookie = extract_cookie_header(response.headers());
     let body = response
         .json::<BilibiliApiResponse<QrPollData>>()
         .await
+        .map_err(strip_reqwest_url)
         .context("failed to decode Bilibili login poll response")?;
 
     login_poll_from_response(body, cookie)
@@ -172,11 +178,14 @@ pub async fn verify_cookie(client: &Client, cookie: &str) -> Result<AuthState> {
         .header(COOKIE, cookie)
         .send()
         .await
+        .map_err(strip_reqwest_url)
         .context("failed to verify Bilibili login")?
         .error_for_status()
+        .map_err(strip_reqwest_url)
         .context("Bilibili login verification returned HTTP error")?
         .json::<BilibiliApiResponse<NavData>>()
         .await
+        .map_err(strip_reqwest_url)
         .context("failed to decode Bilibili login verification response")?;
 
     auth_state_from_nav_response(response, cookie)
@@ -214,6 +223,10 @@ fn login_poll_from_response(
             code
         ),
     }
+}
+
+fn strip_reqwest_url(error: reqwest::Error) -> reqwest::Error {
+    error.without_url()
 }
 
 fn merge_login_cookie_sources(

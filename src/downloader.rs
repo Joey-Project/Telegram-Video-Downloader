@@ -651,21 +651,6 @@ async fn run_command(
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<CommandOutput> {
     let _cleanup = CommandCleanup::new(spec.cleanup_paths.clone());
-    let mut command = Command::new(&spec.program);
-    command
-        .args(&spec.args)
-        .current_dir(&spec.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to run {}", spec.program.display()))?;
-    let process_group = command_process_group(&child);
     let mut file_activity = match &spec.activity_dir {
         Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
             Ok(tracker) => Some(tracker),
@@ -684,6 +669,22 @@ async fn run_command(
             None
         }
     };
+
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to run {}", spec.program.display()))?;
+    let process_group = command_process_group(&child);
 
     let stdout = child
         .stdout
@@ -1505,7 +1506,7 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
 }
 
 fn redact_sensitive_output(text: &str) -> String {
-    let mut redacted = redact_flag_values(text, "--cookie", "<redacted Bilibili cookie>");
+    let mut redacted = redact_flag_line_values(text, "--cookie", "<redacted Bilibili cookie>");
     for name in [
         "SESSDATA",
         "bili_jct",
@@ -1521,7 +1522,7 @@ fn redact_sensitive_output(text: &str) -> String {
     redact_bilibili_qrcode_urls(&redacted)
 }
 
-fn redact_flag_values(text: &str, flag: &str, replacement: &str) -> String {
+fn redact_flag_line_values(text: &str, flag: &str, replacement: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(index) = rest.find(flag) {
@@ -1539,20 +1540,21 @@ fn redact_flag_values(text: &str, flag: &str, replacement: &str) -> String {
 
         output.push_str(&rest[..index]);
         output.push_str(flag);
-        if after == Some('=') {
+        let separator = after.expect("is_flag requires a separator");
+        if separator == '=' {
             output.push('=');
             output.push_str(replacement);
             let value_start = after_index + 1;
             let value_end = rest[value_start..]
-                .find(char::is_whitespace)
+                .find(['\r', '\n'])
                 .map_or(rest.len(), |offset| value_start + offset);
             rest = &rest[value_end..];
         } else {
-            output.push_str(&rest[after_index..after_index + after.unwrap().len_utf8()]);
+            output.push_str(&rest[after_index..after_index + separator.len_utf8()]);
             output.push_str(replacement);
-            let value_start = after_index + after.unwrap().len_utf8();
+            let value_start = after_index + separator.len_utf8();
             let value_end = rest[value_start..]
-                .find(char::is_whitespace)
+                .find(['\r', '\n'])
                 .map_or(rest.len(), |offset| value_start + offset);
             rest = &rest[value_end..];
         }
@@ -1974,7 +1976,7 @@ mod tests {
     #[test]
     fn redacts_bilibili_cookie_values_from_command_output() {
         let summary = summarize_output(
-            "safe stdout\n--cookie SESSDATA=secret%2Cvalue; bili_jct=csrf\n",
+            "safe stdout\n--cookie SESSDATA=secret%2Cvalue; bili_jct=csrf; ac_time_value=token\n",
             "debug: SESSDATA=secret&bili_jct=csrf\nsafe stderr",
         );
 
@@ -1982,6 +1984,7 @@ mod tests {
         assert!(summary.contains("safe stderr"));
         assert!(!summary.contains("secret"));
         assert!(!summary.contains("csrf"));
+        assert!(!summary.contains("token"));
         assert!(summary.contains("SESSDATA=<redacted>"));
         assert!(summary.contains("bili_jct=<redacted>"));
         assert!(summary.contains("--cookie <redacted Bilibili cookie>"));
@@ -1995,14 +1998,27 @@ mod tests {
 
         tracker.observe(
             CommandStream::Stdout,
-            b"Debug: --cookie SESSDATA=secret; bili_jct=csrf",
+            b"Debug: --cookie SESSDATA=secret; bili_jct=csrf; ac_time_value=token",
         );
 
         let message = rx.try_recv().expect("progress should be sent").message;
         assert!(!message.contains("secret"));
         assert!(!message.contains("csrf"));
+        assert!(!message.contains("token"));
         assert!(message.contains("--cookie <redacted Bilibili cookie>"));
-        assert!(message.contains("bili_jct=<redacted>"));
+    }
+
+    #[test]
+    fn redacts_multiline_bilibili_cookie_flag_values() {
+        let redacted = redact_sensitive_output(
+            "config:\n--cookie\nSESSDATA=secret; bili_jct=csrf; ac_time_value=token\nsafe",
+        );
+
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("csrf"));
+        assert!(!redacted.contains("token"));
+        assert!(redacted.contains("--cookie\n<redacted Bilibili cookie>"));
+        assert!(redacted.contains("safe"));
     }
 
     #[test]

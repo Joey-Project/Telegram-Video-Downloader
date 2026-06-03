@@ -307,7 +307,10 @@ async fn run_bbdown_login(
     let result = bbdown_login_flow(&telegram, &config, chat_id, auth_generation).await;
     let message = match result {
         Ok(state) => format!("BBDown logged in as {} (mid: {}).", state.uname, state.mid),
-        Err(err) => format!("BBDown login failed:\n{}", truncate(&err.to_string())),
+        Err(err) => format!(
+            "BBDown login failed:\n{}",
+            summarize_bbdown_auth_error(&err)
+        ),
     };
     send_or_log(&telegram, chat_id, message).await;
 }
@@ -568,5 +571,40 @@ fn truncate(text: &str) -> String {
         format!("{truncated}\n... <truncated>")
     } else {
         truncated
+    }
+}
+
+fn summarize_bbdown_auth_error(error: &anyhow::Error) -> String {
+    truncate(&redact_bilibili_login_qr_urls(&error.to_string()))
+}
+
+fn redact_bilibili_login_qr_urls(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.contains("passport.bilibili.com") && line.contains("qrcode_key=") {
+                "<redacted Bilibili login QR URL>"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::anyhow;
+
+    use super::*;
+
+    #[test]
+    fn redacts_bilibili_login_qr_urls_from_auth_errors() {
+        let summary = summarize_bbdown_auth_error(&anyhow!(
+            "failed after https://passport.bilibili.com/h5-app/passport/login/scan?qrcode_key=secret"
+        ));
+
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("qrcode_key="));
+        assert!(summary.contains("<redacted Bilibili login QR URL>"));
     }
 }
