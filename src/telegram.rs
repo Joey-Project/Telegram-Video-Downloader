@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct TelegramClient {
@@ -93,6 +94,7 @@ impl TelegramClient {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: String) -> Result<()> {
+        info!(chat_id, text = %text, "telegram outbound message");
         let payload = SendMessageRequest {
             chat_id,
             text,
@@ -129,6 +131,12 @@ impl TelegramClient {
     }
 
     pub async fn send_photo(&self, chat_id: i64, caption: String, png: Vec<u8>) -> Result<()> {
+        info!(
+            chat_id,
+            caption = %caption,
+            image_bytes = png.len(),
+            "telegram outbound photo"
+        );
         let photo = Part::bytes(png)
             .file_name("bbdown-login.png")
             .mime_str("image/png")
