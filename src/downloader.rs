@@ -44,6 +44,7 @@ pub struct CommandSpec {
     pub args: Vec<String>,
     pub cwd: PathBuf,
     pub activity_dir: Option<PathBuf>,
+    pub cleanup_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -401,9 +402,8 @@ pub fn command_spec(config: &AppConfig, job: &JobRequest) -> Result<CommandSpec>
 pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
     let mut args = vec![url.to_string(), "--skip-ai".to_string()];
     args.extend(config.bilibili.extra_args.iter().cloned());
-    if let Some(config_path) =
-        bilibili_auth::ensure_bbdown_config_file(&config.bilibili.auth.state_path)?
-    {
+    let config_path = bilibili_auth::ensure_bbdown_config_file(&config.bilibili.auth.state_path)?;
+    if let Some(config_path) = &config_path {
         args.extend([
             "--config-file".to_string(),
             config_path.display().to_string(),
@@ -415,6 +415,7 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
         args,
         cwd: config.downloads.video_dir.clone(),
         activity_dir: Some(config.downloads.video_dir.clone()),
+        cleanup_paths: config_path.into_iter().collect(),
     })
 }
 
@@ -429,6 +430,7 @@ pub fn youtube_metadata_command_spec(config: &AppConfig, url: &str) -> CommandSp
         ],
         cwd: config.downloads.video_dir.clone(),
         activity_dir: None,
+        cleanup_paths: Vec::new(),
     }
 }
 
@@ -488,6 +490,7 @@ pub fn youtube_download_command_spec(
         args,
         cwd: config.downloads.video_dir.clone(),
         activity_dir: Some(config.downloads.video_dir.clone()),
+        cleanup_paths: Vec::new(),
     }
 }
 
@@ -510,6 +513,7 @@ pub fn pdf_command_spec(config: &AppConfig, url: &str) -> CommandSpec {
         ],
         cwd: config.resolve_project_path(Path::new(".")),
         activity_dir: Some(config.downloads.pdf_dir.clone()),
+        cleanup_paths: Vec::new(),
     }
 }
 
@@ -540,6 +544,7 @@ fn ffmpeg_mux_command_spec(
         ],
         cwd: config.downloads.video_dir.clone(),
         activity_dir: Some(config.downloads.video_dir.clone()),
+        cleanup_paths: Vec::new(),
     }
 }
 
@@ -609,6 +614,25 @@ struct CommandOutput {
     stderr: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct CommandCleanup {
+    paths: Vec<PathBuf>,
+}
+
+impl CommandCleanup {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self { paths }
+    }
+}
+
+impl Drop for CommandCleanup {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandStream {
     Stdout,
@@ -626,6 +650,7 @@ async fn run_command(
     spec: &CommandSpec,
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<CommandOutput> {
+    let _cleanup = CommandCleanup::new(spec.cleanup_paths.clone());
     let mut file_activity = match &spec.activity_dir {
         Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
             Ok(tracker) => Some(tracker),
@@ -1599,6 +1624,7 @@ mod tests {
         let config_content =
             fs::read_to_string(&config_path).expect("BBDown auth config should exist");
         assert_eq!(config_content, "--cookie SESSDATA=secret; bili_jct=csrf\n");
+        assert_eq!(spec.cleanup_paths, vec![config_path.clone()]);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1983,6 +2009,7 @@ mod tests {
             ],
             cwd: root.clone(),
             activity_dir: Some(root.clone()),
+            cleanup_paths: Vec::new(),
         };
 
         let result = run_command(&config, &spec, None).await;
@@ -2013,6 +2040,8 @@ mod tests {
     async fn direct_child_exit_does_not_hang_on_background_pipe_holder() {
         let root = temp_test_dir("background-pipe");
         let pid_file = root.join("child.pid");
+        let cleanup_file = root.join("command-secret.txt");
+        fs::write(&cleanup_file, b"secret").expect("cleanup file should be written");
         let mut config = test_config();
         config.bot.command_timeout_seconds = 30;
         config.bot.command_idle_timeout_seconds = 30;
@@ -2026,6 +2055,7 @@ mod tests {
             ],
             cwd: root.clone(),
             activity_dir: Some(root.clone()),
+            cleanup_paths: vec![cleanup_file.clone()],
         };
 
         let result = tokio_timeout(Duration::from_secs(8), run_command(&config, &spec, None))
@@ -2033,6 +2063,7 @@ mod tests {
             .expect("run_command should not hang on inherited pipes");
 
         result.expect("direct child exit status should be successful");
+        assert!(!cleanup_file.exists());
         let pid = fs::read_to_string(&pid_file)
             .expect("child pid should be written")
             .trim()

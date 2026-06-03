@@ -420,7 +420,7 @@ pub fn ensure_bbdown_config_file(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let config_path = bbdown_config_path(path);
+    let config_path = temp_state_path(&bbdown_config_path(path));
     write_bbdown_config(&config_path, &state.cookie)?;
     Ok(Some(config_path))
 }
@@ -744,14 +744,20 @@ mod tests {
         let config_path = ensure_bbdown_config_file(&path)
             .expect("BBDown config should save")
             .expect("BBDown config should be present");
-        assert!(config_path.ends_with("state.json.bbdown.config"));
+        assert!(
+            config_path
+                .display()
+                .to_string()
+                .contains(".bbdown.config.")
+        );
         let legacy_config_path = legacy_bbdown_config_path(&path);
         fs::write(&legacy_config_path, "--cookie legacy\n").expect("legacy config should write");
         let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
         assert_eq!(content, "--cookie SESSDATA=secret; bili_jct=csrf\n");
         assert!(delete_auth_state(&path).expect("auth delete should succeed"));
         assert!(!path.exists());
-        assert!(!config_path.exists());
+        assert!(config_path.exists());
+        fs::remove_file(&config_path).expect("per-command config should delete");
         assert!(!legacy_config_path.exists());
 
         if let Some(parent) = path.parent() {
