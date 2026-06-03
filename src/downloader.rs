@@ -152,11 +152,9 @@ async fn run_bilibili_job(
 ) -> Result<JobReport> {
     let _guard = video_output_lock("Bilibili download", progress.as_ref()).await;
     let mut nfo_warnings = Vec::new();
-    let needs_mux = config
-        .bilibili
-        .extra_args
-        .iter()
-        .any(|arg| arg == "--skip-mux");
+    let effective_args = bilibili_effective_args(config)?;
+    let needs_mux = has_bilibili_flag(&effective_args, "--skip-mux");
+    let video_only = has_bilibili_flag(&effective_args, "--video-only");
     let before = match list_video_files(&config.downloads.video_dir) {
         Ok(files) => Some(files),
         Err(err) if needs_mux => {
@@ -201,7 +199,14 @@ async fn run_bilibili_job(
                     bail!("Bilibili post-processing failed: no video/audio stream pairs found");
                 }
                 let final_videos = if needs_mux {
-                    merge_bilibili_streams(config, &videos_to_process, &metadata, progress).await?
+                    merge_bilibili_streams(
+                        config,
+                        &videos_to_process,
+                        &metadata,
+                        video_only,
+                        progress,
+                    )
+                    .await?
                 } else {
                     videos_to_process
                 };
@@ -277,14 +282,10 @@ async fn merge_bilibili_streams(
     config: &AppConfig,
     videos: &[PathBuf],
     metadata: &BilibiliMetadata,
+    video_only: bool,
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<Vec<PathBuf>> {
     let mut merged = Vec::new();
-    let video_only = config
-        .bilibili
-        .extra_args
-        .iter()
-        .any(|arg| arg == "--video-only");
     for video in videos {
         let audio = video.with_extension("m4a");
         if !audio.is_file() {
@@ -401,8 +402,7 @@ pub fn command_spec(config: &AppConfig, job: &JobRequest) -> Result<CommandSpec>
 
 pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
     let mut args = vec![url.to_string(), "--skip-ai".to_string()];
-    let (auth_extra_args, explicit_config_path) =
-        split_bilibili_extra_args(&config.bilibili.extra_args);
+    let (auth_extra_args, explicit_config_path) = bilibili_extra_args_without_config_file(config);
     let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
     let config_path = bilibili_auth::ensure_bbdown_config_file(
         &config.bilibili.auth.state_path,
@@ -427,6 +427,36 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
         activity_dir: Some(config.downloads.video_dir.clone()),
         cleanup_paths: config_path.into_iter().collect(),
     })
+}
+
+fn bilibili_effective_args(config: &AppConfig) -> Result<Vec<String>> {
+    let (filtered_args, explicit_config_path) = bilibili_extra_args_without_config_file(config);
+    let mut args = Vec::new();
+    if let Some(base_config_path) = bbdown_base_config_path(config, explicit_config_path.as_deref())
+    {
+        args.extend(read_bbdown_config_args(&base_config_path)?);
+    }
+    args.extend(filtered_args);
+    Ok(args)
+}
+
+fn bilibili_extra_args_without_config_file(config: &AppConfig) -> (Vec<String>, Option<PathBuf>) {
+    split_bilibili_extra_args(&config.bilibili.extra_args)
+}
+
+fn read_bbdown_config_args(path: &Path) -> Result<Vec<String>> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("failed to read BBDown config {}", path.display()))?;
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect())
+}
+
+fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
 }
 
 fn split_bilibili_extra_args(extra_args: &[String]) -> (Vec<String>, Option<PathBuf>) {
@@ -1898,6 +1928,48 @@ mod tests {
         );
 
         bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn reads_effective_bilibili_flags_from_default_config() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-default-config");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec!["--video-ascending".to_string()];
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--skip-mux\n--video-only\n",
+        )
+        .expect("default BBDown config should write");
+
+        let args = bilibili_effective_args(&config).expect("effective args should read");
+
+        assert!(has_bilibili_flag(&args, "--skip-mux"));
+        assert!(has_bilibili_flag(&args, "--video-only"));
+        assert!(has_bilibili_flag(&args, "--video-ascending"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn reads_effective_bilibili_flags_from_explicit_config() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-explicit-config");
+        let explicit_config = video_dir.join("custom.config");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec![
+            "--config-file=custom.config".to_string(),
+            "--video-ascending".to_string(),
+        ];
+        fs::write(&explicit_config, "# comment\n--skip-mux\n--video-only\n")
+            .expect("explicit BBDown config should write");
+
+        let args = bilibili_effective_args(&config).expect("effective args should read");
+
+        assert!(has_bilibili_flag(&args, "--skip-mux"));
+        assert!(has_bilibili_flag(&args, "--video-only"));
+        assert!(has_bilibili_flag(&args, "--video-ascending"));
+        assert!(!args.iter().any(|arg| arg == "--config-file=custom.config"));
         let _ = fs::remove_dir_all(video_dir);
     }
 

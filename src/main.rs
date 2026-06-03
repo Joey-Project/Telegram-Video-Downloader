@@ -322,24 +322,19 @@ async fn bbdown_login_flow(
     auth_generation: u64,
 ) -> Result<bilibili_auth::AuthState> {
     let client = bbdown_auth_client(config)?;
-    ensure_bbdown_login_active(auth_generation)?;
-    let login_qr = tokio::select! {
-        result = bilibili_auth::generate_login_qr(&client) => result?,
-        () = bbdown_login_cancel_notify().notified() => {
-            bail!("BBDown login was canceled by a later /bbdown logout");
-        }
-    };
+    let login_qr =
+        await_bbdown_login_active(auth_generation, bilibili_auth::generate_login_qr(&client))
+            .await??;
     ensure_bbdown_login_active(auth_generation)?;
     let caption = format!(
         "Scan this Bilibili QR code in the app to authorize BBDown. It expires in {} seconds.",
         config.bilibili.auth.login_timeout_seconds
     );
-    let send_photo_result = tokio::select! {
-        result = telegram.send_photo(chat_id, caption, login_qr.png.clone()) => result,
-        () = bbdown_login_cancel_notify().notified() => {
-            bail!("BBDown login was canceled by a later /bbdown logout");
-        }
-    };
+    let send_photo_result = await_bbdown_login_active(
+        auth_generation,
+        telegram.send_photo(chat_id, caption, login_qr.png.clone()),
+    )
+    .await?;
     if let Err(err) = send_photo_result {
         warn!(chat_id, error = %err, "failed to send BBDown login QR image");
         send_or_log(telegram, chat_id, bbdown_qr_photo_failed_message()).await;
@@ -360,21 +355,22 @@ async fn bbdown_login_flow(
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let poll = tokio::select! {
-            result = tokio_timeout(
+        let poll = await_bbdown_login_active(
+            auth_generation,
+            tokio_timeout(
                 remaining,
                 bilibili_auth::poll_login(&client, &login_qr.qrcode_key),
-            ) => result.context("Bilibili login QR timed out")??,
-            () = bbdown_login_cancel_notify().notified() => {
-                bail!("BBDown login was canceled by a later /bbdown logout");
-            }
-        };
+            ),
+        )
+        .await?
+        .context("Bilibili login QR timed out")??;
 
         match poll {
             bilibili_auth::LoginPoll::Waiting => {}
             bilibili_auth::LoginPoll::Scanned => {
                 if !sent_scanned_notice {
                     sent_scanned_notice = true;
+                    ensure_bbdown_login_active(auth_generation)?;
                     send_or_log(
                         telegram,
                         chat_id,
@@ -399,13 +395,26 @@ async fn bbdown_login_flow(
         if now >= deadline {
             bail!("Bilibili login QR timed out");
         }
-        tokio::select! {
-            () = sleep(poll_interval.min(deadline - now)) => {}
-            () = bbdown_login_cancel_notify().notified() => {
-                bail!("BBDown login was canceled by a later /bbdown logout");
-            }
-        }
+        await_bbdown_login_active(auth_generation, sleep(poll_interval.min(deadline - now)))
+            .await?;
     }
+}
+
+async fn await_bbdown_login_active<F, T>(auth_generation: u64, future: F) -> Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let cancel = bbdown_login_cancel_notify().notified();
+    tokio::pin!(cancel);
+    ensure_bbdown_login_active(auth_generation)?;
+    let result = tokio::select! {
+        result = future => result,
+        () = &mut cancel => {
+            bail!("BBDown login was canceled by a later /bbdown logout");
+        }
+    };
+    ensure_bbdown_login_active(auth_generation)?;
+    Ok(result)
 }
 
 fn ensure_bbdown_login_active(auth_generation: u64) -> Result<()> {
