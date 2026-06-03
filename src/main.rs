@@ -346,12 +346,6 @@ async fn bbdown_login_flow(
     let mut sent_scanned_notice = false;
 
     loop {
-        let now = Instant::now();
-        if now >= deadline {
-            bail!("Bilibili login QR timed out");
-        }
-
-        sleep(poll_interval.min(deadline - now)).await;
         if Instant::now() >= deadline {
             bail!("Bilibili login QR timed out");
         }
@@ -380,6 +374,12 @@ async fn bbdown_login_flow(
                 return Ok(state);
             }
         }
+
+        let now = Instant::now();
+        if now >= deadline {
+            bail!("Bilibili login QR timed out");
+        }
+        sleep(poll_interval.min(deadline - now)).await;
     }
 }
 

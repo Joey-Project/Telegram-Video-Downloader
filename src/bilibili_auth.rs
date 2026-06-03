@@ -2,7 +2,10 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,6 +21,7 @@ const QRCODE_GENERATE_URL: &str =
     "https://passport.bilibili.com/x/passport-login/web/qrcode/generate";
 const QRCODE_POLL_URL: &str = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll";
 const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
+static AUTH_FILE_LOCK: Mutex<()> = Mutex::new(());
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "SESSDATA",
@@ -311,6 +315,13 @@ fn encode_cookie_value_for_bbdown(value: &str) -> String {
 }
 
 pub fn load_auth_state(path: &Path) -> Result<Option<AuthState>> {
+    let _guard = AUTH_FILE_LOCK
+        .lock()
+        .expect("auth file lock should not poison");
+    load_auth_state_unlocked(path)
+}
+
+fn load_auth_state_unlocked(path: &Path) -> Result<Option<AuthState>> {
     match fs::read(path) {
         Ok(content) => serde_json::from_slice(&content)
             .with_context(|| format!("failed to parse Bilibili auth state {}", path.display()))
@@ -322,6 +333,13 @@ pub fn load_auth_state(path: &Path) -> Result<Option<AuthState>> {
 }
 
 pub fn save_auth_state(path: &Path, state: &AuthState) -> Result<()> {
+    let _guard = AUTH_FILE_LOCK
+        .lock()
+        .expect("auth file lock should not poison");
+    save_auth_state_unlocked(path, state)
+}
+
+fn save_auth_state_unlocked(path: &Path, state: &AuthState) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -360,6 +378,9 @@ pub fn save_auth_state(path: &Path, state: &AuthState) -> Result<()> {
 }
 
 pub fn delete_auth_state(path: &Path) -> Result<bool> {
+    let _guard = AUTH_FILE_LOCK
+        .lock()
+        .expect("auth file lock should not poison");
     let config_path = bbdown_config_path(path);
     let legacy_config_path = legacy_bbdown_config_path(path);
     let mut removed = false;
@@ -389,7 +410,10 @@ pub fn delete_auth_state(path: &Path) -> Result<bool> {
 }
 
 pub fn ensure_bbdown_config_file(path: &Path) -> Result<Option<PathBuf>> {
-    let Some(state) = load_auth_state(path)? else {
+    let _guard = AUTH_FILE_LOCK
+        .lock()
+        .expect("auth file lock should not poison");
+    let Some(state) = load_auth_state_unlocked(path)? else {
         return Ok(None);
     };
     if state.cookie.trim().is_empty() {

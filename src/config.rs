@@ -157,7 +157,8 @@ impl AppConfig {
         self.tools.pdf_helper = expand_home_path(&self.tools.pdf_helper);
         self.tools.chrome = expand_home_path(&self.tools.chrome);
         self.tools.ffmpeg = expand_home_path(&self.tools.ffmpeg);
-        self.bilibili.auth.state_path = expand_home_path(&self.bilibili.auth.state_path);
+        let state_path = expand_home_path(&self.bilibili.auth.state_path);
+        self.bilibili.auth.state_path = self.resolve_project_path(&state_path);
     }
 
     fn validate(&self) -> Result<()> {
@@ -187,6 +188,11 @@ impl AppConfig {
         }
         if self.bilibili.auth.poll_interval_seconds == 0 {
             bail!("bilibili.auth.poll_interval_seconds must be at least 1");
+        }
+        if self.bilibili.auth.poll_interval_seconds >= self.bilibili.auth.login_timeout_seconds {
+            bail!(
+                "bilibili.auth.poll_interval_seconds must be less than bilibili.auth.login_timeout_seconds"
+            );
         }
         Ok(())
     }
@@ -514,6 +520,28 @@ mod tests {
     }
 
     #[test]
+    fn rejects_bilibili_auth_poll_interval_at_or_above_timeout() {
+        let err = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.auth]
+            login_timeout_seconds = 5
+            poll_interval_seconds = 5
+            "#,
+            PathBuf::from("."),
+        )
+        .expect_err("slow auth polling should fail");
+
+        assert!(
+            err.to_string()
+                .contains("bilibili.auth.poll_interval_seconds")
+        );
+    }
+
+    #[test]
     fn resolves_relative_project_path() {
         let config = AppConfig::from_toml_str(
             r#"
@@ -528,6 +556,27 @@ mod tests {
         assert_eq!(
             config.resolve_project_path(Path::new("scripts/pdf_helper.py")),
             PathBuf::from("/tmp/project/scripts/pdf_helper.py")
+        );
+    }
+
+    #[test]
+    fn resolves_relative_bilibili_auth_state_path_to_project_dir() {
+        let config = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.auth]
+            state_path = "state/bilibili-auth.json"
+            "#,
+            PathBuf::from("/tmp/project"),
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.bilibili.auth.state_path,
+            PathBuf::from("/tmp/project/state/bilibili-auth.json")
         );
     }
 
