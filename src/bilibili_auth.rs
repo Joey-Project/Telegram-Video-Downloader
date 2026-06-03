@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,6 +18,7 @@ const QRCODE_GENERATE_URL: &str =
     "https://passport.bilibili.com/x/passport-login/web/qrcode/generate";
 const QRCODE_POLL_URL: &str = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll";
 const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "SESSDATA",
     "bili_jct",
@@ -299,9 +301,13 @@ fn append_login_cookie_pairs(query: Option<&str>, pairs: &mut Vec<String>) {
 
     for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
         if LOGIN_URL_COOKIE_NAMES.contains(&name.as_ref()) && !value.trim().is_empty() {
-            pairs.push(format!("{name}={value}"));
+            pairs.push(format!("{name}={}", encode_cookie_value_for_bbdown(&value)));
         }
     }
+}
+
+fn encode_cookie_value_for_bbdown(value: &str) -> String {
+    value.replace(',', "%2C")
 }
 
 pub fn load_auth_state(path: &Path) -> Result<Option<AuthState>> {
@@ -355,6 +361,7 @@ pub fn save_auth_state(path: &Path, state: &AuthState) -> Result<()> {
 
 pub fn delete_auth_state(path: &Path) -> Result<bool> {
     let config_path = bbdown_config_path(path);
+    let legacy_config_path = legacy_bbdown_config_path(path);
     let mut removed = false;
     match fs::remove_file(path) {
         Ok(()) => removed = true,
@@ -366,16 +373,15 @@ pub fn delete_auth_state(path: &Path) -> Result<bool> {
         }
     }
 
-    match fs::remove_file(&config_path) {
-        Ok(()) => removed = true,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "failed to delete BBDown auth config {}",
-                    config_path.display()
-                )
-            });
+    for path in [config_path, legacy_config_path] {
+        match fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("failed to delete BBDown auth config {}", path.display())
+                });
+            }
         }
     }
 
@@ -397,6 +403,12 @@ pub fn ensure_bbdown_config_file(path: &Path) -> Result<Option<PathBuf>> {
 
 pub fn bbdown_config_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
+    value.push(".bbdown.config");
+    PathBuf::from(value)
+}
+
+fn legacy_bbdown_config_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
     value.push(".bbdown.config.json");
     PathBuf::from(value)
 }
@@ -417,7 +429,6 @@ fn write_bbdown_config(path: &Path, cookie: &str) -> Result<()> {
 
     let content = format!("--cookie {cookie}\n").into_bytes();
     let temp_path = temp_state_path(path);
-    let _ = fs::remove_file(&temp_path);
     {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -454,7 +465,12 @@ fn write_bbdown_config(path: &Path, cookie: &str) -> Result<()> {
 
 fn temp_state_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
-    value.push(format!(".{}.tmp", std::process::id()));
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    value.push(format!(".{}.{}.{}.tmp", std::process::id(), counter, nanos));
     PathBuf::from(value)
 }
 
@@ -532,6 +548,16 @@ mod tests {
                 "https://passport.bilibili.com/account/security?SESSDATA=secret%2Fvalue&bili_jct=csrf&DedeUserID=123&Expires=999&gourl=https%3A%2F%2Fexample.com",
             ),
             Some("SESSDATA=secret/value; bili_jct=csrf; DedeUserID=123".to_string())
+        );
+    }
+
+    #[test]
+    fn preserves_login_url_cookie_commas_for_bbdown() {
+        assert_eq!(
+            cookie_from_login_url(
+                "https://passport.bilibili.com/account/security?SESSDATA=secret%2Cvalue&bili_jct=csrf",
+            ),
+            Some("SESSDATA=secret%2Cvalue; bili_jct=csrf".to_string())
         );
     }
 
@@ -694,15 +720,25 @@ mod tests {
         let config_path = ensure_bbdown_config_file(&path)
             .expect("BBDown config should save")
             .expect("BBDown config should be present");
+        assert!(config_path.ends_with("state.json.bbdown.config"));
+        let legacy_config_path = legacy_bbdown_config_path(&path);
+        fs::write(&legacy_config_path, "--cookie legacy\n").expect("legacy config should write");
         let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
         assert_eq!(content, "--cookie SESSDATA=secret; bili_jct=csrf\n");
         assert!(delete_auth_state(&path).expect("auth delete should succeed"));
         assert!(!path.exists());
         assert!(!config_path.exists());
+        assert!(!legacy_config_path.exists());
 
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    #[test]
+    fn temp_state_paths_are_unique_per_call() {
+        let path = temp_state_file("temp-state-unique");
+        assert_ne!(temp_state_path(&path), temp_state_path(&path));
     }
 
     #[cfg(unix)]
