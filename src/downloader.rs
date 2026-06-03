@@ -1024,12 +1024,13 @@ struct FileActivityTracker {
 
 struct FileActivitySnapshot {
     files: BTreeMap<PathBuf, u64>,
+    direct_dirs: BTreeSet<PathBuf>,
 }
 
 impl FileActivityTracker {
     async fn new(root: &Path) -> Result<Self> {
         let root = root.to_path_buf();
-        let baseline = collect_file_activity(root.clone()).await?;
+        let baseline = collect_file_activity(root.clone(), None).await?;
         Ok(Self {
             root,
             baseline,
@@ -1039,7 +1040,9 @@ impl FileActivityTracker {
     }
 
     async fn poll(&mut self) -> Result<Option<String>> {
-        let current = collect_file_activity(self.root.clone()).await?;
+        let current =
+            collect_file_activity(self.root.clone(), Some(self.baseline.direct_dirs.clone()))
+                .await?;
         let changed = current
             .files
             .iter()
@@ -1070,22 +1073,29 @@ impl FileActivityTracker {
     }
 }
 
-async fn collect_file_activity(root: PathBuf) -> Result<FileActivitySnapshot> {
-    tokio::task::spawn_blocking(move || collect_file_activity_blocking(&root))
+async fn collect_file_activity(
+    root: PathBuf,
+    baseline_direct_dirs: Option<BTreeSet<PathBuf>>,
+) -> Result<FileActivitySnapshot> {
+    tokio::task::spawn_blocking(move || collect_file_activity_blocking(&root, baseline_direct_dirs))
         .await
         .context("failed to join file activity scan")?
 }
 
-fn collect_file_activity_blocking(root: &Path) -> Result<FileActivitySnapshot> {
+fn collect_file_activity_blocking(
+    root: &Path,
+    baseline_direct_dirs: Option<BTreeSet<PathBuf>>,
+) -> Result<FileActivitySnapshot> {
     let mut files = BTreeMap::new();
+    let mut direct_dirs = BTreeSet::new();
     if !root.exists() {
-        return Ok(FileActivitySnapshot { files });
+        return Ok(FileActivitySnapshot { files, direct_dirs });
     }
 
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(FileActivitySnapshot { files });
+            return Ok(FileActivitySnapshot { files, direct_dirs });
         }
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", root.display())),
     };
@@ -1106,11 +1116,25 @@ fn collect_file_activity_blocking(root: &Path) -> Result<FileActivitySnapshot> {
             };
             files.insert(path, metadata.len());
         } else if file_type.is_dir() {
-            collect_file_sizes_recursive(&path, &mut files)?;
+            direct_dirs.insert(path.clone());
+            if should_scan_activity_dir(&path, baseline_direct_dirs.as_ref()) {
+                collect_file_sizes_recursive(&path, &mut files)?;
+            }
         }
     }
 
-    Ok(FileActivitySnapshot { files })
+    Ok(FileActivitySnapshot { files, direct_dirs })
+}
+
+fn should_scan_activity_dir(path: &Path, baseline_direct_dirs: Option<&BTreeSet<PathBuf>>) -> bool {
+    baseline_direct_dirs.is_some_and(|baseline| !baseline.contains(path))
+        || is_likely_bilibili_aid_dir(path)
+}
+
+fn is_likely_bilibili_aid_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| !name.is_empty() && name.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 fn collect_file_sizes_recursive(root: &Path, files: &mut BTreeMap<PathBuf, u64>) -> Result<()> {
@@ -2378,13 +2402,19 @@ mod tests {
     async fn tracks_files_in_direct_subdirectories() {
         let root = temp_test_dir("file-activity");
         let existing = root.join("existing");
+        let existing_aid = root.join("1556453868");
         fs::create_dir_all(&existing).expect("existing dir should be created");
+        fs::create_dir_all(&existing_aid).expect("existing aid dir should be created");
         fs::write(existing.join("old.part"), b"old").expect("existing file should be written");
+        fs::write(existing_aid.join("old.part"), b"old")
+            .expect("existing aid file should be written");
         let mut tracker = FileActivityTracker::new(&root)
             .await
             .expect("tracker should initialize");
 
         fs::write(existing.join("old.part"), b"changed").expect("existing file should change");
+        fs::write(existing_aid.join("old.part"), b"changed")
+            .expect("existing aid file should change");
         assert_eq!(
             tracker.poll().await.expect("poll should work"),
             Some("files: 1 changed, 7 B written".to_string())
