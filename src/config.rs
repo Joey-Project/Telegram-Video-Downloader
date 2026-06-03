@@ -108,7 +108,9 @@ impl AppConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let project_dir = path
+        let config_path = fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve config file {}", path.display()))?;
+        let project_dir = config_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
@@ -405,7 +407,35 @@ fn default_bilibili_poll_interval_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn change_to(path: &Path) -> Self {
+            let original = env::current_dir().expect("current dir should be available");
+            env::set_current_dir(path).expect("current dir should change");
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = env::set_current_dir(&self.original);
+        }
+    }
+
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after UNIX_EPOCH")
+            .as_nanos();
+        env::temp_dir().join(format!("telegram-video-downloader-config-{label}-{nanos}"))
+    }
 
     #[test]
     fn loads_defaults() {
@@ -578,6 +608,36 @@ mod tests {
             config.bilibili.auth.state_path,
             PathBuf::from("/tmp/project/state/bilibili-auth.json")
         );
+    }
+
+    #[test]
+    fn load_resolves_relative_config_and_auth_state_to_absolute_paths() {
+        let root = temp_test_dir("relative-load");
+        fs::create_dir_all(&root).expect("temp config dir should be created");
+        fs::write(
+            root.join("config.toml"),
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.auth]
+            state_path = "state/bilibili-auth.json"
+            "#,
+        )
+        .expect("config should be written");
+        let expected_root = fs::canonicalize(&root).expect("temp config dir should canonicalize");
+        let guard = CurrentDirGuard::change_to(&root);
+
+        let config = AppConfig::load(Path::new("config.toml")).expect("config should load");
+
+        assert!(config.bilibili.auth.state_path.is_absolute());
+        assert_eq!(
+            config.bilibili.auth.state_path,
+            expected_root.join("state/bilibili-auth.json")
+        );
+        drop(guard);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
