@@ -11,8 +11,17 @@ pub enum JobRequest {
 pub enum RouteResult {
     Jobs(Vec<JobRequest>),
     PdfUsage,
+    BilibiliAuth(BilibiliAuthCommand),
+    BilibiliAuthUsage,
     UnsupportedLinks,
     Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BilibiliAuthCommand {
+    Login,
+    Status,
+    Logout,
 }
 
 impl JobRequest {
@@ -29,6 +38,16 @@ pub fn route_message(text: &str, auto_pdf_domains: &[String]) -> RouteResult {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return RouteResult::Empty;
+    }
+
+    if let Some(args) = bbdown_command_args(trimmed) {
+        let mut parts = args.split_whitespace();
+        return match (parts.next(), parts.next()) {
+            (Some("login"), None) => RouteResult::BilibiliAuth(BilibiliAuthCommand::Login),
+            (Some("status"), None) => RouteResult::BilibiliAuth(BilibiliAuthCommand::Status),
+            (Some("logout"), None) => RouteResult::BilibiliAuth(BilibiliAuthCommand::Logout),
+            _ => RouteResult::BilibiliAuthUsage,
+        };
     }
 
     if let Some(pdf_args) = pdf_command_args(trimmed) {
@@ -171,6 +190,15 @@ fn classify_auto_pdf_url(raw_url: &str, auto_pdf_domains: &[String]) -> Option<J
 fn pdf_command_args(text: &str) -> Option<&str> {
     let first = text.split_whitespace().next()?;
     if first == "/pdf" || first.starts_with("/pdf@") {
+        Some(text[first.len()..].trim())
+    } else {
+        None
+    }
+}
+
+fn bbdown_command_args(text: &str) -> Option<&str> {
+    let first = text.split_whitespace().next()?;
+    if first == "/bbdown" || first.starts_with("/bbdown@") {
         Some(text[first.len()..].trim())
     } else {
         None
@@ -441,6 +469,42 @@ mod tests {
             RouteResult::Jobs(vec![JobRequest::Pdf {
                 url: "https://mp.weixin.qq.com/s?__biz=abc&mid=1&idx=1#rd".to_string()
             }])
+        );
+    }
+
+    #[test]
+    fn routes_bbdown_auth_commands() {
+        assert_eq!(
+            route_message("/bbdown login", &auto_pdf_domains()),
+            RouteResult::BilibiliAuth(BilibiliAuthCommand::Login)
+        );
+        assert_eq!(
+            route_message("/bbdown status", &auto_pdf_domains()),
+            RouteResult::BilibiliAuth(BilibiliAuthCommand::Status)
+        );
+        assert_eq!(
+            route_message("/bbdown logout", &auto_pdf_domains()),
+            RouteResult::BilibiliAuth(BilibiliAuthCommand::Logout)
+        );
+        assert_eq!(
+            route_message("/bbdown@DownloaderBot status", &auto_pdf_domains()),
+            RouteResult::BilibiliAuth(BilibiliAuthCommand::Status)
+        );
+    }
+
+    #[test]
+    fn routes_bbdown_auth_usage() {
+        assert_eq!(
+            route_message("/bbdown", &auto_pdf_domains()),
+            RouteResult::BilibiliAuthUsage
+        );
+        assert_eq!(
+            route_message("/bbdown status extra", &auto_pdf_domains()),
+            RouteResult::BilibiliAuthUsage
+        );
+        assert_eq!(
+            route_message("/bbdown unknown", &auto_pdf_domains()),
+            RouteResult::BilibiliAuthUsage
         );
     }
 

@@ -6,6 +6,7 @@
 
 - 普通消息中的 Bilibili 链接调用 `BBDown`，保存到视频下载目录。
 - 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
+- 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
 - `/pdf URL` 调用 uv 管理的 Python Playwright helper，使用系统 Chrome 打印 PDF；`pdf.auto_domains` 里的域名会自动走 PDF。
@@ -33,6 +34,8 @@ cp config.example.toml config.toml
 
 `bilibili.extra_args` 默认包含 `--video-ascending` 和 `--skip-mux`。BBDown 负责下载音视频流，bot 再调用 `tools.ffmpeg` 做受控混流；这样混流也会受到同一套进度、idle timeout 和进程清理保护。需要追求更高码率时可以调整 `--video-ascending`，但建议保留 `--skip-mux`。
 
+`bilibili.auth.state_path` 是 bot 管理的 Bilibili Web cookie 状态文件，默认写到 `~/.local/state/telegram-video-downloader/bilibili-auth.json`。`/bbdown login` 会发送 Bilibili 扫码二维码，登录成功后 Bilibili 下载会通过私有临时 `--config-file` 给 BBDown 注入 `--cookie`；如果视频下载目录存在 `BBDown.config`，或 `bilibili.extra_args` 显式指定了 `--config-file`，bot 会先合并原配置再追加 cookie。`/bbdown logout` 只清理本机状态，不远端注销账号。
+
 `bot.progress_update_seconds` 控制进度回复频率；`bot.command_timeout_seconds` 是单个外部命令的总超时；`bot.command_idle_timeout_seconds` 是没有 stdout/stderr 且输出目录文件也没有增长的 idle 超时。
 
 ## 运行
@@ -50,6 +53,7 @@ https://youtu.be/...
 /pdf https://example.com/article
 https://mp.weixin.qq.com/s?...
 https://m.bilibili.com/opus/1206098216310800386?share_source=COPY
+/bbdown status
 ```
 
 本地重放一条 Telegram 文本、不走真实 Telegram API：
