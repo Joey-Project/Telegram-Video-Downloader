@@ -639,4 +639,15 @@ mod tests {
         assert!(!message.contains("passport.bilibili.com"));
         assert!(!message.contains("qrcode_key="));
     }
+
+    #[tokio::test]
+    async fn login_cancel_check_handles_future_notify_waiters() {
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+        BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let result = await_bbdown_login_active(generation, async { "completed" }).await;
+        BILIBILI_AUTH_GENERATION.store(generation, Ordering::SeqCst);
+
+        let err = result.expect_err("stale generation should cancel immediately");
+        assert!(err.to_string().contains("canceled"));
+    }
 }
