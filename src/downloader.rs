@@ -1156,6 +1156,7 @@ impl ProgressTracker {
         message: String,
         now: Instant,
     ) {
+        let message = redact_sensitive_output(&message);
         self.last_message = Some(message.clone());
         self.next_send_at = now + self.min_interval;
         info!(command = %self.command_name, message = %message, "command progress");
@@ -1476,8 +1477,8 @@ fn format_yt_date(upload_date: &str) -> Option<String> {
 }
 
 fn summarize_output(stdout: &str, stderr: &str) -> String {
-    let stderr_tail = tail_lines(stderr, 10);
-    let stdout_tail = tail_lines(stdout, 10);
+    let stderr_tail = tail_lines(&redact_sensitive_output(stderr), 10);
+    let stdout_tail = tail_lines(&redact_sensitive_output(stdout), 10);
     match (stderr_tail.is_empty(), stdout_tail.is_empty()) {
         (true, true) => "no command output captured".to_string(),
         (false, true) => format!("stderr:\n{stderr_tail}"),
@@ -1494,13 +1495,104 @@ fn last_nonempty_line(text: &str) -> Option<&str> {
 }
 
 fn tail_lines(text: &str, max_lines: usize) -> String {
-    let lines: Vec<_> = text
+    let redacted = redact_sensitive_output(text);
+    let lines: Vec<_> = redacted
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect();
     let start = lines.len().saturating_sub(max_lines);
     lines[start..].join("\n")
+}
+
+fn redact_sensitive_output(text: &str) -> String {
+    let mut redacted = redact_flag_values(text, "--cookie", "<redacted Bilibili cookie>");
+    for name in [
+        "SESSDATA",
+        "bili_jct",
+        "DedeUserID",
+        "DedeUserID__ckMd5",
+        "sid",
+        "buvid3",
+        "buvid4",
+        "b_nut",
+    ] {
+        redacted = redact_cookie_pair_values(&redacted, name, "<redacted>");
+    }
+    redact_bilibili_qrcode_urls(&redacted)
+}
+
+fn redact_flag_values(text: &str, flag: &str, replacement: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find(flag) {
+        let absolute_start = text.len() - rest.len() + index;
+        let before = text[..absolute_start].chars().next_back();
+        let after_index = index + flag.len();
+        let after = rest[after_index..].chars().next();
+        let is_token_start = before.is_none_or(char::is_whitespace);
+        let is_flag = after.is_some_and(|ch| ch == '=' || ch.is_whitespace());
+        if !is_token_start || !is_flag {
+            output.push_str(&rest[..after_index]);
+            rest = &rest[after_index..];
+            continue;
+        }
+
+        output.push_str(&rest[..index]);
+        output.push_str(flag);
+        if after == Some('=') {
+            output.push('=');
+            output.push_str(replacement);
+            let value_start = after_index + 1;
+            let value_end = rest[value_start..]
+                .find(char::is_whitespace)
+                .map_or(rest.len(), |offset| value_start + offset);
+            rest = &rest[value_end..];
+        } else {
+            output.push_str(&rest[after_index..after_index + after.unwrap().len_utf8()]);
+            output.push_str(replacement);
+            let value_start = after_index + after.unwrap().len_utf8();
+            let value_end = rest[value_start..]
+                .find(char::is_whitespace)
+                .map_or(rest.len(), |offset| value_start + offset);
+            rest = &rest[value_end..];
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+fn redact_cookie_pair_values(text: &str, name: &str, replacement: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut rest = text;
+    let prefix = format!("{name}=");
+    while let Some(index) = rest.find(&prefix) {
+        redacted.push_str(&rest[..index]);
+        redacted.push_str(&prefix);
+        redacted.push_str(replacement);
+        let value_start = index + prefix.len();
+        let value_end = rest[value_start..]
+            .find(|ch: char| {
+                ch == ';' || ch == '&' || ch.is_ascii_whitespace() || ch == '"' || ch == '\''
+            })
+            .map_or(rest.len(), |offset| value_start + offset);
+        rest = &rest[value_end..];
+    }
+    redacted.push_str(rest);
+    redacted
+}
+
+fn redact_bilibili_qrcode_urls(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.contains("passport.bilibili.com") && line.contains("qrcode_key=") {
+                "<redacted Bilibili login QR URL>"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn nonempty_join(lines: Vec<String>) -> String {
@@ -1878,6 +1970,40 @@ mod tests {
             summarize_progress_chunk("BBDown", CommandStream::Stdout, "开始合并音视频...\n"),
             Some("BBDown stdout: 开始合并音视频...".to_string())
         );
+    }
+
+    #[test]
+    fn redacts_bilibili_cookie_values_from_command_output() {
+        let summary = summarize_output(
+            "safe stdout\n--cookie SESSDATA=secret%2Cvalue; bili_jct=csrf\n",
+            "debug: SESSDATA=secret&bili_jct=csrf\nsafe stderr",
+        );
+
+        assert!(summary.contains("safe stdout"));
+        assert!(summary.contains("safe stderr"));
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("csrf"));
+        assert!(summary.contains("SESSDATA=<redacted>"));
+        assert!(summary.contains("bili_jct=<redacted>"));
+        assert!(summary.contains("--cookie <redacted Bilibili cookie>"));
+    }
+
+    #[test]
+    fn redacts_bilibili_cookie_values_from_progress() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tracker =
+            ProgressTracker::new("BBDown".to_string(), Duration::from_secs(30), Some(tx));
+
+        tracker.observe(
+            CommandStream::Stdout,
+            b"Debug: --cookie SESSDATA=secret; bili_jct=csrf",
+        );
+
+        let message = rx.try_recv().expect("progress should be sent").message;
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("csrf"));
+        assert!(message.contains("--cookie <redacted Bilibili cookie>"));
+        assert!(message.contains("bili_jct=<redacted>"));
     }
 
     #[test]
