@@ -153,7 +153,7 @@ async fn run_bilibili_job(
     let _guard = video_output_lock("Bilibili download", progress.as_ref()).await;
     let mut nfo_warnings = Vec::new();
     let effective_args = bilibili_effective_args(config)?;
-    let needs_mux = has_bilibili_flag(&effective_args, "--skip-mux");
+    let needs_mux = bilibili_needs_mux(&effective_args);
     let video_only = has_bilibili_flag(&effective_args, "--video-only");
     let before = match list_video_files(&config.downloads.video_dir) {
         Ok(files) => Some(files),
@@ -464,6 +464,10 @@ fn read_bbdown_config_args(path: &Path) -> Result<Vec<String>> {
 
 fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
+}
+
+fn bilibili_needs_mux(args: &[String]) -> bool {
+    has_bilibili_flag(args, "--skip-mux") && !has_bilibili_flag(args, "--audio-only")
 }
 
 fn split_bilibili_extra_args(extra_args: &[String]) -> (Vec<String>, Option<PathBuf>) {
@@ -2002,6 +2006,15 @@ mod tests {
         assert!(has_bilibili_flag(&args, "--video-ascending"));
         assert!(!args.iter().any(|arg| arg == "--config-file=custom.config"));
         let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn audio_only_disables_bilibili_mux_postprocessing() {
+        assert!(bilibili_needs_mux(&["--skip-mux".to_string()]));
+        assert!(!bilibili_needs_mux(&[
+            "--skip-mux".to_string(),
+            "--audio-only".to_string(),
+        ]));
     }
 
     #[test]
