@@ -34,6 +34,7 @@ const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "buvid3",
     "buvid4",
     "b_nut",
+    "ac_time_value",
 ];
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,6 +255,9 @@ fn append_cookie_header_pairs(cookie: Option<&str>, pairs: &mut Vec<String>) {
         let Some((name, _)) = pair.split_once('=') else {
             continue;
         };
+        if !LOGIN_URL_COOKIE_NAMES.contains(&name) {
+            continue;
+        }
         if let Some(existing) = pairs.iter().position(|value| {
             value
                 .split_once('=')
@@ -330,6 +334,11 @@ pub fn set_cookie_values_to_cookie<'a>(
         .filter_map(|value| value.split(';').next())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .filter(|value| {
+            value
+                .split_once('=')
+                .is_some_and(|(name, _)| LOGIN_URL_COOKIE_NAMES.contains(&name))
+        })
         .map(str::to_string)
         .collect::<Vec<_>>();
 
@@ -707,9 +716,11 @@ mod tests {
             set_cookie_values_to_cookie([
                 "SESSDATA=abc; Path=/; HttpOnly",
                 "bili_jct=def; Path=/",
+                "ac_time_value=token; Path=/",
+                "unknown_cookie=secret; Path=/",
                 "",
             ]),
-            Some("SESSDATA=abc; bili_jct=def".to_string())
+            Some("SESSDATA=abc; bili_jct=def; ac_time_value=token".to_string())
         );
     }
 

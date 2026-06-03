@@ -994,13 +994,12 @@ struct FileActivityTracker {
 
 struct FileActivitySnapshot {
     files: BTreeMap<PathBuf, u64>,
-    direct_dirs: BTreeSet<PathBuf>,
 }
 
 impl FileActivityTracker {
     async fn new(root: &Path) -> Result<Self> {
         let root = root.to_path_buf();
-        let baseline = collect_file_activity(root.clone(), None).await?;
+        let baseline = collect_file_activity(root.clone()).await?;
         Ok(Self {
             root,
             baseline,
@@ -1010,9 +1009,7 @@ impl FileActivityTracker {
     }
 
     async fn poll(&mut self) -> Result<Option<String>> {
-        let current =
-            collect_file_activity(self.root.clone(), Some(self.baseline.direct_dirs.clone()))
-                .await?;
+        let current = collect_file_activity(self.root.clone()).await?;
         let changed = current
             .files
             .iter()
@@ -1043,29 +1040,22 @@ impl FileActivityTracker {
     }
 }
 
-async fn collect_file_activity(
-    root: PathBuf,
-    baseline_direct_dirs: Option<BTreeSet<PathBuf>>,
-) -> Result<FileActivitySnapshot> {
-    tokio::task::spawn_blocking(move || collect_file_activity_blocking(&root, baseline_direct_dirs))
+async fn collect_file_activity(root: PathBuf) -> Result<FileActivitySnapshot> {
+    tokio::task::spawn_blocking(move || collect_file_activity_blocking(&root))
         .await
         .context("failed to join file activity scan")?
 }
 
-fn collect_file_activity_blocking(
-    root: &Path,
-    baseline_direct_dirs: Option<BTreeSet<PathBuf>>,
-) -> Result<FileActivitySnapshot> {
+fn collect_file_activity_blocking(root: &Path) -> Result<FileActivitySnapshot> {
     let mut files = BTreeMap::new();
-    let mut direct_dirs = BTreeSet::new();
     if !root.exists() {
-        return Ok(FileActivitySnapshot { files, direct_dirs });
+        return Ok(FileActivitySnapshot { files });
     }
 
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(FileActivitySnapshot { files, direct_dirs });
+            return Ok(FileActivitySnapshot { files });
         }
         Err(err) => return Err(err).with_context(|| format!("failed to read {}", root.display())),
     };
@@ -1086,17 +1076,11 @@ fn collect_file_activity_blocking(
             };
             files.insert(path, metadata.len());
         } else if file_type.is_dir() {
-            direct_dirs.insert(path.clone());
-            if baseline_direct_dirs
-                .as_ref()
-                .is_some_and(|baseline| !baseline.contains(&path))
-            {
-                collect_file_sizes_recursive(&path, &mut files)?;
-            }
+            collect_file_sizes_recursive(&path, &mut files)?;
         }
     }
 
-    Ok(FileActivitySnapshot { files, direct_dirs })
+    Ok(FileActivitySnapshot { files })
 }
 
 fn collect_file_sizes_recursive(root: &Path, files: &mut BTreeMap<PathBuf, u64>) -> Result<()> {
@@ -1578,6 +1562,7 @@ const BILIBILI_COOKIE_NAMES: &[&str] = &[
     "buvid3",
     "buvid4",
     "b_nut",
+    "ac_time_value",
 ];
 
 fn redact_flag_line_values(text: &str, flag: &str, replacement: &str) -> String {
@@ -1711,11 +1696,11 @@ mod tests {
     use super::*;
 
     fn test_config() -> AppConfig {
-        let mut config =
-            AppConfig::load(Path::new("config.example.toml")).expect("example config should parse");
-        config.bilibili.auth.state_path = test_home()
-            .join(".cache")
-            .join("telegram-video-downloader-test-auth-missing.json");
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut config = AppConfig::load(&manifest_dir.join("config.example.toml"))
+            .expect("example config should parse");
+        config.bilibili.auth.state_path =
+            temp_test_dir("telegram-video-downloader-test-auth-missing").join("auth.json");
         config
     }
 
@@ -2220,6 +2205,15 @@ mod tests {
     }
 
     #[test]
+    fn redacts_standalone_bilibili_session_cookie_pairs() {
+        let redacted = redact_sensitive_output("debug ac_time_value=token safe");
+
+        assert!(!redacted.contains("token"));
+        assert!(redacted.contains("ac_time_value=<redacted>"));
+        assert!(redacted.contains("safe"));
+    }
+
+    #[test]
     fn formats_file_activity_bytes() {
         assert_eq!(human_bytes(42), "42 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
@@ -2309,7 +2303,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn tracks_files_in_new_direct_subdirectories() {
+    async fn tracks_files_in_direct_subdirectories() {
         let root = temp_test_dir("file-activity");
         let existing = root.join("existing");
         fs::create_dir_all(&existing).expect("existing dir should be created");
@@ -2319,14 +2313,17 @@ mod tests {
             .expect("tracker should initialize");
 
         fs::write(existing.join("old.part"), b"changed").expect("existing file should change");
-        assert_eq!(tracker.poll().await.expect("poll should work"), None);
+        assert_eq!(
+            tracker.poll().await.expect("poll should work"),
+            Some("files: 1 changed, 7 B written".to_string())
+        );
 
         let created = root.join("created");
         fs::create_dir_all(&created).expect("new dir should be created");
         fs::write(created.join("new.part"), b"new bytes").expect("new file should be written");
         let message = tracker.poll().await.expect("poll should work");
 
-        assert_eq!(message, Some("files: 1 changed, 9 B written".to_string()));
+        assert_eq!(message, Some("files: 2 changed, 16 B written".to_string()));
         let _ = fs::remove_dir_all(&root);
     }
 
