@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use reqwest::Client;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio::time::{Instant, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
 
@@ -24,6 +24,7 @@ use crate::router::{BilibiliAuthCommand, RouteResult, route_message};
 use crate::telegram::TelegramClient;
 
 static BILIBILI_LOGIN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static BILIBILI_LOGIN_CANCEL_NOTIFY: OnceLock<Notify> = OnceLock::new();
 static BILIBILI_AUTH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_AUTH_GENERATION: AtomicU64 = AtomicU64::new(0);
 const BILIBILI_AUTH_MAX_HTTP_TIMEOUT_SECONDS: u64 = 30;
@@ -352,12 +353,15 @@ async fn bbdown_login_flow(
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let poll = tokio_timeout(
-            remaining,
-            bilibili_auth::poll_login(&client, &login_qr.qrcode_key),
-        )
-        .await
-        .context("Bilibili login QR timed out")??;
+        let poll = tokio::select! {
+            result = tokio_timeout(
+                remaining,
+                bilibili_auth::poll_login(&client, &login_qr.qrcode_key),
+            ) => result.context("Bilibili login QR timed out")??,
+            () = bbdown_login_cancel_notify().notified() => {
+                bail!("BBDown login was canceled by a later /bbdown logout");
+            }
+        };
 
         match poll {
             bilibili_auth::LoginPoll::Waiting => {}
@@ -388,7 +392,12 @@ async fn bbdown_login_flow(
         if now >= deadline {
             bail!("Bilibili login QR timed out");
         }
-        sleep(poll_interval.min(deadline - now)).await;
+        tokio::select! {
+            () = sleep(poll_interval.min(deadline - now)) => {}
+            () = bbdown_login_cancel_notify().notified() => {
+                bail!("BBDown login was canceled by a later /bbdown logout");
+            }
+        }
     }
 }
 
@@ -448,8 +457,13 @@ fn bbdown_auth_state_lock() -> &'static Mutex<()> {
     BILIBILI_AUTH_STATE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn bbdown_login_cancel_notify() -> &'static Notify {
+    BILIBILI_LOGIN_CANCEL_NOTIFY.get_or_init(Notify::new)
+}
+
 async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
     BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
+    bbdown_login_cancel_notify().notify_waiters();
     let _state_guard = bbdown_auth_state_lock().lock().await;
     let message = match bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path) {
         Ok(true) => "BBDown login state cleared.".to_string(),

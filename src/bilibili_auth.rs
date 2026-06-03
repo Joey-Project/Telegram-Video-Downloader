@@ -196,8 +196,10 @@ fn login_poll_from_response(
 
     match response.data.code {
         0 => {
-            let cookie =
-                cookie.or_else(|| response.data.url.as_deref().and_then(cookie_from_login_url));
+            let cookie = merge_login_cookie_sources(
+                cookie.as_deref(),
+                response.data.url.as_deref().and_then(cookie_from_login_url),
+            );
             let Some(cookie) = cookie else {
                 bail!("Bilibili login succeeded without returning cookies");
             };
@@ -212,6 +214,48 @@ fn login_poll_from_response(
             code
         ),
     }
+}
+
+fn merge_login_cookie_sources(
+    header_cookie: Option<&str>,
+    url_cookie: Option<String>,
+) -> Option<String> {
+    let mut pairs = Vec::new();
+    append_cookie_header_pairs(header_cookie, &mut pairs);
+    append_cookie_header_pairs(url_cookie.as_deref(), &mut pairs);
+    if !cookie_pairs_include_login_keys(&pairs) {
+        return None;
+    }
+    Some(pairs.join("; "))
+}
+
+fn append_cookie_header_pairs(cookie: Option<&str>, pairs: &mut Vec<String>) {
+    let Some(cookie) = cookie else {
+        return;
+    };
+    for pair in cookie
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+    {
+        let Some((name, _)) = pair.split_once('=') else {
+            continue;
+        };
+        if let Some(existing) = pairs.iter().position(|value| {
+            value
+                .split_once('=')
+                .is_some_and(|(existing_name, _)| existing_name == name)
+        }) {
+            pairs[existing] = pair.to_string();
+        } else {
+            pairs.push(pair.to_string());
+        }
+    }
+}
+
+fn cookie_pairs_include_login_keys(pairs: &[String]) -> bool {
+    pairs.iter().any(|pair| pair.starts_with("SESSDATA="))
+        && pairs.iter().any(|pair| pair.starts_with("bili_jct="))
 }
 
 fn auth_state_from_nav_response(
@@ -689,9 +733,9 @@ mod tests {
         assert_eq!(test_poll(86_090, None), LoginPoll::Scanned);
         assert_eq!(test_poll(86_038, None), LoginPoll::Expired);
         assert_eq!(
-            test_poll(0, Some("SESSDATA=secret".to_string())),
+            test_poll(0, Some("SESSDATA=secret; bili_jct=csrf".to_string())),
             LoginPoll::Success {
-                cookie: "SESSDATA=secret".to_string()
+                cookie: "SESSDATA=secret; bili_jct=csrf".to_string()
             }
         );
     }
@@ -711,6 +755,25 @@ mod tests {
             poll,
             LoginPoll::Success {
                 cookie: "SESSDATA=secret; bili_jct=csrf".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn combines_non_login_header_cookie_with_login_url_cookie() {
+        let poll = login_poll_from_response(
+            test_poll_response_with_url(
+                0,
+                "https://passport.bilibili.com/account/security#/home?SESSDATA=secret&bili_jct=csrf",
+            ),
+            Some("buvid3=device; b_nut=nut".to_string()),
+        )
+        .expect("success URL cookies should not be shadowed by device headers");
+
+        assert_eq!(
+            poll,
+            LoginPoll::Success {
+                cookie: "buvid3=device; b_nut=nut; SESSDATA=secret; bili_jct=csrf".to_string()
             }
         );
     }
