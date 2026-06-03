@@ -1,9 +1,10 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Mutex,
+    Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +23,7 @@ const QRCODE_GENERATE_URL: &str =
 const QRCODE_POLL_URL: &str = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll";
 const NAV_URL: &str = "https://api.bilibili.com/x/web-interface/nav";
 static AUTH_FILE_LOCK: Mutex<()> = Mutex::new(());
+static ACTIVE_BBDOWN_CONFIG_FILES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LOGIN_URL_COOKIE_NAMES: &[&str] = &[
     "SESSDATA",
@@ -404,6 +406,9 @@ pub fn delete_auth_state(path: &Path) -> Result<bool> {
             }
         }
     }
+    if cleanup_stale_bbdown_config_files_unlocked(path)? {
+        removed = true;
+    }
 
     Ok(removed)
 }
@@ -419,8 +424,13 @@ pub fn ensure_bbdown_config_file(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let config_path = temp_state_path(&bbdown_config_path(path));
+    cleanup_stale_bbdown_config_files_unlocked(path)?;
+    let config_path = temp_state_path(&bbdown_config_dir(path).join("cookie.config"));
     write_bbdown_config(&config_path, &state.cookie)?;
+    active_bbdown_config_files()
+        .lock()
+        .expect("active BBDown config lock should not poison")
+        .insert(config_path.clone());
     Ok(Some(config_path))
 }
 
@@ -430,10 +440,27 @@ pub fn bbdown_config_path(path: &Path) -> PathBuf {
     PathBuf::from(value)
 }
 
+fn bbdown_config_dir(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".bbdown.config.d");
+    PathBuf::from(value)
+}
+
 fn legacy_bbdown_config_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(".bbdown.config.json");
     PathBuf::from(value)
+}
+
+pub fn release_bbdown_config_file(path: &Path) {
+    let _guard = AUTH_FILE_LOCK
+        .lock()
+        .expect("auth file lock should not poison");
+    let _ = fs::remove_file(path);
+    active_bbdown_config_files()
+        .lock()
+        .expect("active BBDown config lock should not poison")
+        .remove(path);
 }
 
 fn write_bbdown_config(path: &Path, cookie: &str) -> Result<()> {
@@ -449,7 +476,7 @@ fn write_bbdown_config(path: &Path, cookie: &str) -> Result<()> {
         })?;
     }
 
-    let content = format!("--cookie {cookie}\n").into_bytes();
+    let content = format!("--cookie\n{cookie}\n").into_bytes();
     let temp_path = temp_state_path(path);
     {
         let mut options = OpenOptions::new();
@@ -483,6 +510,53 @@ fn write_bbdown_config(path: &Path, cookie: &str) -> Result<()> {
         .with_context(|| format!("failed to replace BBDown auth config {}", path.display()))?;
     set_file_private(path);
     Ok(())
+}
+
+fn cleanup_stale_bbdown_config_files_unlocked(path: &Path) -> Result<bool> {
+    let config_dir = bbdown_config_dir(path);
+    let entries = match fs::read_dir(&config_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", config_dir.display()));
+        }
+    };
+    let active_files = active_bbdown_config_files()
+        .lock()
+        .expect("active BBDown config lock should not poison")
+        .clone();
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if active_files.contains(&path) {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_file() => {}
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to delete stale BBDown auth config {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    let _ = fs::remove_dir(&config_dir);
+    Ok(removed)
+}
+
+fn active_bbdown_config_files() -> &'static Mutex<HashSet<PathBuf>> {
+    ACTIVE_BBDOWN_CONFIG_FILES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn temp_state_path(path: &Path) -> PathBuf {
@@ -755,16 +829,21 @@ mod tests {
             config_path
                 .display()
                 .to_string()
-                .contains(".bbdown.config.")
+                .contains(".bbdown.config.d")
         );
         let legacy_config_path = legacy_bbdown_config_path(&path);
         fs::write(&legacy_config_path, "--cookie legacy\n").expect("legacy config should write");
         let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
-        assert_eq!(content, "--cookie SESSDATA=secret; bili_jct=csrf\n");
+        assert_eq!(content, "--cookie\nSESSDATA=secret; bili_jct=csrf\n");
         assert!(delete_auth_state(&path).expect("auth delete should succeed"));
         assert!(!path.exists());
         assert!(config_path.exists());
-        fs::remove_file(&config_path).expect("per-command config should delete");
+        release_bbdown_config_file(&config_path);
+        assert!(!config_path.exists());
+        let stale_config_path = bbdown_config_dir(&path).join("stale.config.tmp");
+        fs::write(&stale_config_path, "--cookie\nstale\n").expect("stale config should write");
+        assert!(delete_auth_state(&path).expect("stale config should delete"));
+        assert!(!stale_config_path.exists());
         assert!(!legacy_config_path.exists());
 
         if let Some(parent) = path.parent() {

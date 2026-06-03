@@ -346,6 +346,9 @@ async fn bbdown_login_flow(
     let mut sent_scanned_notice = false;
 
     loop {
+        if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != auth_generation {
+            bail!("BBDown login was canceled by a later /bbdown logout");
+        }
         if Instant::now() >= deadline {
             bail!("Bilibili login QR timed out");
         }

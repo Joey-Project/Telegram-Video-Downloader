@@ -628,7 +628,7 @@ impl CommandCleanup {
 impl Drop for CommandCleanup {
     fn drop(&mut self) {
         for path in &self.paths {
-            let _ = fs::remove_file(path);
+            bilibili_auth::release_bbdown_config_file(path);
         }
     }
 }
@@ -651,6 +651,21 @@ async fn run_command(
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<CommandOutput> {
     let _cleanup = CommandCleanup::new(spec.cleanup_paths.clone());
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.args)
+        .current_dir(&spec.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to run {}", spec.program.display()))?;
+    let process_group = command_process_group(&child);
     let mut file_activity = match &spec.activity_dir {
         Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
             Ok(tracker) => Some(tracker),
@@ -669,22 +684,6 @@ async fn run_command(
             None
         }
     };
-
-    let mut command = Command::new(&spec.program);
-    command
-        .args(&spec.args)
-        .current_dir(&spec.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to run {}", spec.program.display()))?;
-    let process_group = command_process_group(&child);
 
     let stdout = child
         .stdout
@@ -1715,7 +1714,7 @@ mod tests {
         );
         let config_content =
             fs::read_to_string(&config_path).expect("BBDown auth config should exist");
-        assert_eq!(config_content, "--cookie SESSDATA=secret; bili_jct=csrf\n");
+        assert_eq!(config_content, "--cookie\nSESSDATA=secret; bili_jct=csrf\n");
         assert_eq!(spec.cleanup_paths, vec![config_path.clone()]);
         #[cfg(unix)]
         {
@@ -1728,7 +1727,7 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(config_path);
+        bilibili_auth::release_bbdown_config_file(&config_path);
     }
 
     #[test]
