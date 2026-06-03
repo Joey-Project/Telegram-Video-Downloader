@@ -344,10 +344,9 @@ fn save_auth_state_unlocked(path: &Path, state: &AuthState) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent).with_context(|| {
+        create_private_dir_if_missing(parent).with_context(|| {
             format!("failed to create auth state directory {}", parent.display())
         })?;
-        set_dir_private(parent);
     }
 
     let content =
@@ -442,13 +441,12 @@ fn write_bbdown_config(path: &Path, cookie: &str) -> Result<()> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
-        fs::create_dir_all(parent).with_context(|| {
+        create_private_dir_if_missing(parent).with_context(|| {
             format!(
                 "failed to create BBDown auth config directory {}",
                 parent.display()
             )
         })?;
-        set_dir_private(parent);
     }
 
     let content = format!("--cookie {cookie}\n").into_bytes();
@@ -503,6 +501,15 @@ fn now_unix_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn create_private_dir_if_missing(path: &Path) -> Result<()> {
+    let existed = path.exists();
+    fs::create_dir_all(path)?;
+    if !existed {
+        set_dir_private(path);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -789,5 +796,34 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_chmod_existing_auth_parent_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_state_file("state-existing-parent-permissions");
+        let parent = path.parent().expect("state should have parent");
+        fs::create_dir_all(parent).expect("parent should be created");
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755))
+            .expect("parent permissions should be set");
+
+        save_auth_state(&path, &test_state()).expect("state should save");
+
+        let parent_mode = fs::metadata(parent)
+            .expect("parent metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = fs::metadata(&path)
+            .expect("state metadata should exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(parent_mode, 0o755);
+        assert_eq!(file_mode, 0o600);
+
+        let _ = fs::remove_dir_all(parent);
     }
 }
