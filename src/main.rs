@@ -1,9 +1,11 @@
+mod bilibili_auth;
 mod config;
 mod downloader;
 mod router;
 mod telegram;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -11,13 +13,20 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use tokio::sync::{Semaphore, mpsc};
+use reqwest::Client;
+use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::time::{Instant, sleep};
 use tracing::{error, info, warn};
 
 use crate::config::AppConfig;
 use crate::downloader::{JobProgress, run_job};
-use crate::router::{RouteResult, route_message};
+use crate::router::{BilibiliAuthCommand, RouteResult, route_message};
 use crate::telegram::TelegramClient;
+
+static BILIBILI_LOGIN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static BILIBILI_AUTH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static BILIBILI_AUTH_GENERATION: AtomicU64 = AtomicU64::new(0);
+const BILIBILI_AUTH_MAX_HTTP_TIMEOUT_SECONDS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -83,6 +92,7 @@ async fn main() -> Result<()> {
                                     Arc::clone(&semaphore),
                                     Arc::clone(&next_job_id),
                                     message.chat.id,
+                                    message.chat.is_private(),
                                     message.text.as_deref(),
                                 )
                                 .await;
@@ -152,6 +162,9 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
             }
         }
         RouteResult::PdfUsage => bail!("usage: /pdf https://example.com"),
+        RouteResult::BilibiliAuth(_) | RouteResult::BilibiliAuthUsage => {
+            bail!("bbdown auth commands require Telegram bot chat")
+        }
         RouteResult::UnsupportedLinks => bail!("no supported links found"),
         RouteResult::Empty => bail!("message did not contain text to route"),
     }
@@ -163,6 +176,7 @@ async fn handle_message(
     semaphore: Arc<Semaphore>,
     next_job_id: Arc<AtomicU64>,
     chat_id: i64,
+    is_private_chat: bool,
     text: Option<&str>,
 ) {
     let Some(text) = text else {
@@ -195,6 +209,17 @@ async fn handle_message(
                 ));
             }
         }
+        RouteResult::BilibiliAuth(command) => {
+            handle_bilibili_auth_command(telegram, config, chat_id, is_private_chat, command).await;
+        }
+        RouteResult::BilibiliAuthUsage => {
+            let message = if is_private_chat {
+                bbdown_auth_usage()
+            } else {
+                "Please manage BBDown login state in a private chat with this bot.".to_string()
+            };
+            send_or_log(&telegram, chat_id, message).await;
+        }
         RouteResult::PdfUsage => {
             send_or_log(
                 &telegram,
@@ -214,6 +239,217 @@ async fn handle_message(
         }
         RouteResult::Empty => {}
     }
+}
+
+async fn handle_bilibili_auth_command(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    chat_id: i64,
+    is_private_chat: bool,
+    command: BilibiliAuthCommand,
+) {
+    if !is_private_chat {
+        send_or_log(
+            &telegram,
+            chat_id,
+            "Please manage BBDown login state in a private chat with this bot.".to_string(),
+        )
+        .await;
+        return;
+    }
+
+    match command {
+        BilibiliAuthCommand::Login => {
+            let lock = BILIBILI_LOGIN_LOCK.get_or_init(|| Mutex::new(()));
+            let guard = match lock.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    send_or_log(
+                        &telegram,
+                        chat_id,
+                        "BBDown login is already in progress. Finish or wait for the current QR login to expire.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let auth_generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _guard = guard;
+                run_bbdown_login(telegram, config, chat_id, auth_generation).await;
+            });
+        }
+        BilibiliAuthCommand::Status => {
+            tokio::spawn(async move {
+                run_bbdown_status(telegram, config, chat_id).await;
+            });
+        }
+        BilibiliAuthCommand::Logout => {
+            tokio::spawn(async move {
+                run_bbdown_logout(telegram, config, chat_id).await;
+            });
+        }
+    }
+}
+
+async fn run_bbdown_login(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    chat_id: i64,
+    auth_generation: u64,
+) {
+    send_or_log(
+        &telegram,
+        chat_id,
+        "Preparing BBDown Bilibili login QR...".to_string(),
+    )
+    .await;
+
+    let result = bbdown_login_flow(&telegram, &config, chat_id, auth_generation).await;
+    let message = match result {
+        Ok(state) => format!("BBDown logged in as {} (mid: {}).", state.uname, state.mid),
+        Err(err) => format!("BBDown login failed:\n{}", truncate(&err.to_string())),
+    };
+    send_or_log(&telegram, chat_id, message).await;
+}
+
+async fn bbdown_login_flow(
+    telegram: &TelegramClient,
+    config: &AppConfig,
+    chat_id: i64,
+    auth_generation: u64,
+) -> Result<bilibili_auth::AuthState> {
+    let client = bbdown_auth_client(config)?;
+    let login_qr = bilibili_auth::generate_login_qr(&client).await?;
+    let caption = format!(
+        "Scan this Bilibili QR code in the app to authorize BBDown. It expires in {} seconds.",
+        config.bilibili.auth.login_timeout_seconds
+    );
+    if let Err(err) = telegram
+        .send_photo(chat_id, caption, login_qr.png.clone())
+        .await
+    {
+        warn!(chat_id, error = %err, "failed to send BBDown login QR image");
+        send_or_log(
+            telegram,
+            chat_id,
+            format!(
+                "Could not send the QR image. Open this URL to scan instead:\n{}",
+                login_qr.url
+            ),
+        )
+        .await;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(config.bilibili.auth.login_timeout_seconds);
+    let poll_interval = Duration::from_secs(config.bilibili.auth.poll_interval_seconds);
+    let mut sent_scanned_notice = false;
+
+    loop {
+        sleep(poll_interval).await;
+        if Instant::now() >= deadline {
+            bail!("Bilibili login QR timed out");
+        }
+
+        match bilibili_auth::poll_login(&client, &login_qr.qrcode_key).await? {
+            bilibili_auth::LoginPoll::Waiting => {}
+            bilibili_auth::LoginPoll::Scanned => {
+                if !sent_scanned_notice {
+                    sent_scanned_notice = true;
+                    send_or_log(
+                        telegram,
+                        chat_id,
+                        "QR scanned. Confirm the login in the Bilibili app.".to_string(),
+                    )
+                    .await;
+                }
+            }
+            bilibili_auth::LoginPoll::Expired => bail!("Bilibili login QR expired"),
+            bilibili_auth::LoginPoll::Success { cookie } => {
+                let state = bilibili_auth::verify_cookie(&client, &cookie).await?;
+                let _state_guard = bbdown_auth_state_lock().lock().await;
+                if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != auth_generation {
+                    bail!("BBDown login was canceled by a later /bbdown logout");
+                }
+                bilibili_auth::save_auth_state(&config.bilibili.auth.state_path, &state)?;
+                return Ok(state);
+            }
+        }
+    }
+}
+
+async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
+    let message = match bilibili_auth::load_auth_state(&config.bilibili.auth.state_path) {
+        Ok(None) => "BBDown is not logged in. Use /bbdown login in private chat.".to_string(),
+        Ok(Some(state)) => {
+            let client = match bbdown_auth_client(&config) {
+                Ok(client) => client,
+                Err(err) => {
+                    return send_or_log(
+                        &telegram,
+                        chat_id,
+                        format!(
+                            "Failed to prepare BBDown status check:\n{}",
+                            truncate(&err.to_string())
+                        ),
+                    )
+                    .await;
+                }
+            };
+            match bilibili_auth::verify_cookie(&client, &state.cookie).await {
+                Ok(verified) => {
+                    format!(
+                        "BBDown is logged in as {} (mid: {}).",
+                        verified.uname, verified.mid
+                    )
+                }
+                Err(err) => format!(
+                    "Saved BBDown login is invalid or expired. Use /bbdown login again.\n{}",
+                    truncate(&err.to_string())
+                ),
+            }
+        }
+        Err(err) => format!(
+            "Failed to read BBDown login state:\n{}",
+            truncate(&err.to_string())
+        ),
+    };
+    send_or_log(&telegram, chat_id, message).await;
+}
+
+fn bbdown_auth_client(config: &AppConfig) -> Result<Client> {
+    let timeout_seconds = config
+        .bilibili
+        .auth
+        .login_timeout_seconds
+        .clamp(1, BILIBILI_AUTH_MAX_HTTP_TIMEOUT_SECONDS);
+    Client::builder()
+        .timeout(Duration::from_secs(timeout_seconds))
+        .connect_timeout(Duration::from_secs(timeout_seconds.min(10)))
+        .build()
+        .context("failed to create Bilibili auth HTTP client")
+}
+
+fn bbdown_auth_state_lock() -> &'static Mutex<()> {
+    BILIBILI_AUTH_STATE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
+    BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
+    let _state_guard = bbdown_auth_state_lock().lock().await;
+    let message = match bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path) {
+        Ok(true) => "BBDown login state cleared.".to_string(),
+        Ok(false) => "BBDown is not logged in.".to_string(),
+        Err(err) => format!(
+            "Failed to clear BBDown login state:\n{}",
+            truncate(&err.to_string())
+        ),
+    };
+    send_or_log(&telegram, chat_id, message).await;
+}
+
+fn bbdown_auth_usage() -> String {
+    "Usage: /bbdown login | /bbdown status | /bbdown logout".to_string()
 }
 
 async fn run_queued_job(

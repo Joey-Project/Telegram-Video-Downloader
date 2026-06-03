@@ -76,6 +76,18 @@ pub struct VideoConfig {
 pub struct BilibiliConfig {
     #[serde(default = "default_bilibili_extra_args")]
     pub extra_args: Vec<String>,
+    #[serde(default)]
+    pub auth: BilibiliAuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BilibiliAuthConfig {
+    #[serde(default = "default_bilibili_auth_state_path")]
+    pub state_path: PathBuf,
+    #[serde(default = "default_bilibili_login_timeout_seconds")]
+    pub login_timeout_seconds: u64,
+    #[serde(default = "default_bilibili_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -145,6 +157,7 @@ impl AppConfig {
         self.tools.pdf_helper = expand_home_path(&self.tools.pdf_helper);
         self.tools.chrome = expand_home_path(&self.tools.chrome);
         self.tools.ffmpeg = expand_home_path(&self.tools.ffmpeg);
+        self.bilibili.auth.state_path = expand_home_path(&self.bilibili.auth.state_path);
     }
 
     fn validate(&self) -> Result<()> {
@@ -168,6 +181,12 @@ impl AppConfig {
         }
         if self.bot.command_idle_timeout_seconds == 0 {
             bail!("bot.command_idle_timeout_seconds must be at least 1");
+        }
+        if self.bilibili.auth.login_timeout_seconds == 0 {
+            bail!("bilibili.auth.login_timeout_seconds must be at least 1");
+        }
+        if self.bilibili.auth.poll_interval_seconds == 0 {
+            bail!("bilibili.auth.poll_interval_seconds must be at least 1");
         }
         Ok(())
     }
@@ -235,6 +254,17 @@ impl Default for BilibiliConfig {
     fn default() -> Self {
         Self {
             extra_args: default_bilibili_extra_args(),
+            auth: BilibiliAuthConfig::default(),
+        }
+    }
+}
+
+impl Default for BilibiliAuthConfig {
+    fn default() -> Self {
+        Self {
+            state_path: default_bilibili_auth_state_path(),
+            login_timeout_seconds: default_bilibili_login_timeout_seconds(),
+            poll_interval_seconds: default_bilibili_poll_interval_seconds(),
         }
     }
 }
@@ -347,6 +377,26 @@ fn default_bilibili_extra_args() -> Vec<String> {
     vec!["--video-ascending".to_string(), "--skip-mux".to_string()]
 }
 
+fn default_bilibili_auth_state_path() -> PathBuf {
+    home_path(
+        &[
+            ".local",
+            "state",
+            "telegram-video-downloader",
+            "bilibili-auth.json",
+        ],
+        "bilibili-auth.json",
+    )
+}
+
+fn default_bilibili_login_timeout_seconds() -> u64 {
+    180
+}
+
+fn default_bilibili_poll_interval_seconds() -> u64 {
+    2
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,6 +445,15 @@ mod tests {
             config.bilibili.extra_args,
             vec!["--video-ascending", "--skip-mux"]
         );
+        assert_eq!(
+            config.bilibili.auth.state_path,
+            home.join(".local")
+                .join("state")
+                .join("telegram-video-downloader")
+                .join("bilibili-auth.json")
+        );
+        assert_eq!(config.bilibili.auth.login_timeout_seconds, 180);
+        assert_eq!(config.bilibili.auth.poll_interval_seconds, 2);
     }
 
     #[test]
@@ -434,6 +493,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_zero_bilibili_auth_timeout() {
+        let err = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.auth]
+            login_timeout_seconds = 0
+            "#,
+            PathBuf::from("."),
+        )
+        .expect_err("zero auth timeout should fail");
+
+        assert!(
+            err.to_string()
+                .contains("bilibili.auth.login_timeout_seconds")
+        );
+    }
+
+    #[test]
     fn resolves_relative_project_path() {
         let config = AppConfig::from_toml_str(
             r#"
@@ -466,6 +546,9 @@ mod tests {
 
             [tools]
             bbdown = "${HOME}/.dotnet/tools/BBDown"
+
+            [bilibili.auth]
+            state_path = "~/Library/Application Support/Bot/bilibili-auth.json"
             "#,
             PathBuf::from("."),
         )
@@ -476,6 +559,13 @@ mod tests {
         assert_eq!(
             config.tools.bbdown,
             home.join(".dotnet").join("tools").join("BBDown")
+        );
+        assert_eq!(
+            config.bilibili.auth.state_path,
+            home.join("Library")
+                .join("Application Support")
+                .join("Bot")
+                .join("bilibili-auth.json")
         );
     }
 

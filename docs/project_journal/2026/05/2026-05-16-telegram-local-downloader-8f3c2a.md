@@ -3,7 +3,7 @@ id: 20260516-8f3c2a
 title: Telegram Local Downloader Bot
 status: completed
 created: 2026-05-16
-updated: 2026-05-31
+updated: 2026-06-03
 branch:
 pr:
 supersedes: []
@@ -49,10 +49,10 @@ superseded_by:
 - Bilibili 下载继续由 BBDown 负责，显式跳过 AI 字幕，默认追加 `--video-ascending` 以避开当前复现链接在后台模式下的高码率流卡住问题，并对新增视频生成 best-effort NFO。
 - PDF 支持 `mp.weixin.qq.com` 自动白名单，`/pdf URL` 继续保留。
 - Bilibili `opus` 文章链接现在会规范化为 `https://www.bilibili.com/opus/<id>` 并走 PDF；PDF helper 对这类页面使用静态 HTML 快照渲染，避开页面脚本在 headless Chrome 中主动关闭页面的问题。
+- BBDown 登录态现在由 bot 通过 Bilibili Web QR API 管理：私聊 `/bbdown login/status/logout` 可扫码登录、查看账号、清理本机状态；Bilibili 下载会自动把 bot-managed cookie 注入 BBDown。
 
 ## Next Steps
-- 使用真实 `config.toml` 和 Telegram bot token 做最终 live smoke test：Bilibili、标题+Bilibili、YouTube、微信文章自动 PDF。
-- 如需要下载登录态，继续在本机 BBDown/yt-dlp CLI 层配置 cookie 或登录信息；第一版 bot 不托管 cookie。
+- 使用真实 `config.toml` 和 Telegram bot token 做最终 live smoke test：BBDown 登录态管理、Bilibili、标题+Bilibili、YouTube、微信文章自动 PDF。
 - 如果 YouTube 下载遇到 yt-dlp JS runtime warning 变成实际失败，安装 deno 或 node 并在 yt-dlp 配置里启用。
 
 ## Evidence
@@ -77,3 +77,8 @@ superseded_by:
 - Local environment repair: `uv tool install --force yt-dlp` fixed a broken `yt-dlp` shebang; `yt-dlp --dump-json --skip-download --no-playlist` succeeded for the prior YouTube sample URL, with a remaining JS runtime warning.
 - 2026-05-31 Bilibili opus follow-up: route tests cover `m.bilibili.com/opus/<id>` and `www.bilibili.com/opus/<id>` canonicalization, malformed opus URLs remain unsupported, and PDF helper tests cover Bilibili snapshot routing plus cleanup of partial PDFs after print failures.
 - Bilibili opus replay validation passed with the user-provided sample URL: `cargo run -- --replay-message .codex-tmp/opus-replay-config.toml 'Bilibili 文章可以看 https://m.bilibili.com/opus/1206098216310800386?...'` wrote a single 4-page PDF under `.codex-tmp/opus-pdf-final`.
+- 2026-06-03 BBDown auth follow-up: planned from updated `master`, using direct Bilibili Web QR API instead of `BBDown login` because local BBDown 1.6.3 currently fails before QR generation with `System.Net.CookieContainer`.
+- BBDown auth unit coverage includes command routing, chat type detection, QR PNG rendering, cookie extraction, auth state save/load/delete, private file permissions, and BBDown `--cookie` command construction.
+- Internal review found and fixed two BBDown auth-path issues: Bilibili can return successful QR-login cookies in poll response `data.url` instead of `Set-Cookie`, and Bilibili auth HTTP calls now have bounded request/connect timeouts.
+- Follow-up review found and fixed a login/logout race: `/bbdown logout` now invalidates pending login flows before they can write a later successful QR-login cookie back to disk.
+- Final helper-backed `codex-readonly` rerun returned `LGTM` after the auth fixes.

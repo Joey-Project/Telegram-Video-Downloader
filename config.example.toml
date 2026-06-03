@@ -26,6 +26,11 @@ keep_sidecars = true
 [bilibili]
 extra_args = ["--video-ascending", "--skip-mux"]
 
+[bilibili.auth]
+state_path = "~/.local/state/telegram-video-downloader/bilibili-auth.json"
+login_timeout_seconds = 180
+poll_interval_seconds = 2
+
 [bot]
 concurrency = 2
 poll_timeout_seconds = 50

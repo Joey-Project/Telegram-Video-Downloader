@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, MutexGuard};
 use tokio::time::{Instant, sleep_until, timeout as tokio_timeout};
 use tracing::info;
 
+use crate::bilibili_auth;
 use crate::config::AppConfig;
 use crate::router::JobRequest;
 
@@ -398,6 +399,9 @@ pub fn command_spec(config: &AppConfig, job: &JobRequest) -> CommandSpec {
 pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> CommandSpec {
     let mut args = vec![url.to_string(), "--skip-ai".to_string()];
     args.extend(config.bilibili.extra_args.iter().cloned());
+    if let Some(cookie) = bilibili_auth::load_cookie_for_bbdown(&config.bilibili.auth.state_path) {
+        args.extend(["--cookie".to_string(), cookie]);
+    }
 
     CommandSpec {
         program: config.tools.bbdown.clone(),
@@ -1488,12 +1492,18 @@ mod tests {
     use std::env;
     use std::path::PathBuf;
 
+    use crate::bilibili_auth::{AuthState, save_auth_state};
     use crate::config::AppConfig;
 
     use super::*;
 
     fn test_config() -> AppConfig {
-        AppConfig::load(Path::new("config.example.toml")).expect("example config should parse")
+        let mut config =
+            AppConfig::load(Path::new("config.example.toml")).expect("example config should parse");
+        config.bilibili.auth.state_path = test_home()
+            .join(".cache")
+            .join("telegram-video-downloader-test-auth-missing.json");
+        config
     }
 
     fn test_home() -> PathBuf {
@@ -1531,7 +1541,46 @@ mod tests {
         assert!(spec.args.contains(&"--skip-ai".to_string()));
         assert!(spec.args.contains(&"--video-ascending".to_string()));
         assert!(spec.args.contains(&"--skip-mux".to_string()));
+        assert!(!spec.args.contains(&"--cookie".to_string()));
         assert_eq!(spec.cwd, test_home().join("Movies").join("Downloads"));
+    }
+
+    #[test]
+    fn builds_bilibili_command_with_cookie() {
+        let mut config = test_config();
+        let path = std::env::temp_dir().join(format!(
+            "telegram-video-downloader-bilibili-cookie-{}.json",
+            std::process::id()
+        ));
+        config.bilibili.auth.state_path = path.clone();
+        save_auth_state(
+            &path,
+            &AuthState {
+                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
+                mid: 123,
+                uname: "Joey".to_string(),
+                stored_at_unix: 1,
+            },
+        )
+        .expect("auth state should save");
+
+        let spec = command_spec(
+            &config,
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV123".to_string(),
+            },
+        );
+
+        let cookie_index = spec
+            .args
+            .iter()
+            .position(|arg| arg == "--cookie")
+            .expect("cookie arg should be present");
+        assert_eq!(
+            spec.args.get(cookie_index + 1).map(String::as_str),
+            Some("SESSDATA=secret; bili_jct=csrf")
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
