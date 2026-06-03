@@ -82,3 +82,4 @@ superseded_by:
 - Internal review found and fixed two BBDown auth-path issues: Bilibili can return successful QR-login cookies in poll response `data.url` instead of `Set-Cookie`, and Bilibili auth HTTP calls now have bounded request/connect timeouts.
 - Follow-up review found and fixed a login/logout race: `/bbdown logout` now invalidates pending login flows before they can write a later successful QR-login cookie back to disk.
 - Final helper-backed `codex-readonly` rerun returned `LGTM` after the auth fixes.
+- PR review follow-up fixed two auth hardening issues: BBDown now receives cookies through a protected `--config-file` instead of argv, and login polling sleep is bounded by the configured timeout deadline.

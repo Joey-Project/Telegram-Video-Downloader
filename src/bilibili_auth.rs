@@ -108,6 +108,12 @@ struct NavData {
     uname: Option<String>,
 }
 
+#[derive(Serialize)]
+struct BbdownConfig<'a> {
+    #[serde(rename = "Cookie")]
+    cookie: &'a str,
+}
+
 pub async fn generate_login_qr(client: &Client) -> Result<LoginQr> {
     let response = client
         .get(QRCODE_GENERATE_URL)
@@ -354,20 +360,103 @@ pub fn save_auth_state(path: &Path, state: &AuthState) -> Result<()> {
 }
 
 pub fn delete_auth_state(path: &Path) -> Result<bool> {
+    let config_path = bbdown_config_path(path);
+    let mut removed = false;
     match fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed to delete Bilibili auth state {}", path.display())),
+        Ok(()) => removed = true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("failed to delete Bilibili auth state {}", path.display())
+            });
+        }
     }
+
+    match fs::remove_file(&config_path) {
+        Ok(()) => removed = true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to delete BBDown auth config {}",
+                    config_path.display()
+                )
+            });
+        }
+    }
+
+    Ok(removed)
 }
 
-pub fn load_cookie_for_bbdown(path: &Path) -> Option<String> {
-    load_auth_state(path)
-        .ok()
-        .flatten()
-        .map(|state| state.cookie)
-        .filter(|cookie| !cookie.trim().is_empty())
+pub fn ensure_bbdown_config_file(path: &Path) -> Result<Option<PathBuf>> {
+    let Some(state) = load_auth_state(path)? else {
+        return Ok(None);
+    };
+    if state.cookie.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let config_path = bbdown_config_path(path);
+    write_bbdown_config(&config_path, &state.cookie)?;
+    Ok(Some(config_path))
+}
+
+pub fn bbdown_config_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".bbdown.config.json");
+    PathBuf::from(value)
+}
+
+fn write_bbdown_config(path: &Path, cookie: &str) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create BBDown auth config directory {}",
+                parent.display()
+            )
+        })?;
+        set_dir_private(parent);
+    }
+
+    let content = serde_json::to_vec_pretty(&BbdownConfig { cookie })
+        .context("failed to encode BBDown auth config")?;
+    let temp_path = temp_state_path(path);
+    let _ = fs::remove_file(&temp_path);
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp_path).with_context(|| {
+            format!(
+                "failed to create temp BBDown auth config {}",
+                temp_path.display()
+            )
+        })?;
+        std::io::Write::write_all(&mut file, &content).with_context(|| {
+            format!(
+                "failed to write temp BBDown auth config {}",
+                temp_path.display()
+            )
+        })?;
+        std::io::Write::flush(&mut file).with_context(|| {
+            format!(
+                "failed to flush temp BBDown auth config {}",
+                temp_path.display()
+            )
+        })?;
+    }
+    set_file_private(&temp_path);
+    fs::rename(&temp_path, path)
+        .with_context(|| format!("failed to replace BBDown auth config {}", path.display()))?;
+    set_file_private(path);
+    Ok(())
 }
 
 fn temp_state_path(path: &Path) -> PathBuf {
@@ -605,14 +694,19 @@ mod tests {
     }
 
     #[test]
-    fn loads_cookie_for_bbdown() {
-        let path = temp_state_file("cookie-load");
+    fn creates_and_deletes_bbdown_config_file() {
+        let path = temp_state_file("bbdown-config");
         save_auth_state(&path, &test_state()).expect("state should save");
 
-        assert_eq!(
-            load_cookie_for_bbdown(&path),
-            Some("SESSDATA=secret; bili_jct=csrf".to_string())
-        );
+        let config_path = ensure_bbdown_config_file(&path)
+            .expect("BBDown config should save")
+            .expect("BBDown config should be present");
+        let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
+        assert!(content.contains("\"Cookie\""));
+        assert!(content.contains("SESSDATA=secret; bili_jct=csrf"));
+        assert!(delete_auth_state(&path).expect("auth delete should succeed"));
+        assert!(!path.exists());
+        assert!(!config_path.exists());
 
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir_all(parent);

@@ -121,7 +121,7 @@ async fn run_simple_job(
     job: &JobRequest,
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<JobReport> {
-    let spec = command_spec(config, job);
+    let spec = command_spec(config, job)?;
     let output = run_command(config, &spec, progress.clone()).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -168,7 +168,7 @@ async fn run_bilibili_job(
             None
         }
     };
-    let spec = bilibili_command_spec(config, url);
+    let spec = bilibili_command_spec(config, url)?;
     let command_started_at = SystemTime::now();
     let output = run_command(config, &spec, progress.clone()).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -386,29 +386,36 @@ async fn run_youtube_job(
     })
 }
 
-pub fn command_spec(config: &AppConfig, job: &JobRequest) -> CommandSpec {
+pub fn command_spec(config: &AppConfig, job: &JobRequest) -> Result<CommandSpec> {
     match job {
         JobRequest::Bilibili { url } => bilibili_command_spec(config, url),
-        JobRequest::Youtube { url } => {
-            youtube_download_command_spec(config, url, &SubtitlePlan::none())
-        }
-        JobRequest::Pdf { url } => pdf_command_spec(config, url),
+        JobRequest::Youtube { url } => Ok(youtube_download_command_spec(
+            config,
+            url,
+            &SubtitlePlan::none(),
+        )),
+        JobRequest::Pdf { url } => Ok(pdf_command_spec(config, url)),
     }
 }
 
-pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> CommandSpec {
+pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
     let mut args = vec![url.to_string(), "--skip-ai".to_string()];
     args.extend(config.bilibili.extra_args.iter().cloned());
-    if let Some(cookie) = bilibili_auth::load_cookie_for_bbdown(&config.bilibili.auth.state_path) {
-        args.extend(["--cookie".to_string(), cookie]);
+    if let Some(config_path) =
+        bilibili_auth::ensure_bbdown_config_file(&config.bilibili.auth.state_path)?
+    {
+        args.extend([
+            "--config-file".to_string(),
+            config_path.display().to_string(),
+        ]);
     }
 
-    CommandSpec {
+    Ok(CommandSpec {
         program: config.tools.bbdown.clone(),
         args,
         cwd: config.downloads.video_dir.clone(),
         activity_dir: Some(config.downloads.video_dir.clone()),
-    }
+    })
 }
 
 pub fn youtube_metadata_command_spec(config: &AppConfig, url: &str) -> CommandSpec {
@@ -1535,7 +1542,8 @@ mod tests {
             &JobRequest::Bilibili {
                 url: "https://www.bilibili.com/video/BV123".to_string(),
             },
-        );
+        )
+        .expect("Bilibili command should build");
 
         assert_eq!(spec.program, PathBuf::from("BBDown"));
         assert!(spec.args.contains(&"--skip-ai".to_string()));
@@ -1569,18 +1577,41 @@ mod tests {
             &JobRequest::Bilibili {
                 url: "https://www.bilibili.com/video/BV123".to_string(),
             },
-        );
+        )
+        .expect("Bilibili command should build");
 
-        let cookie_index = spec
+        assert!(!spec.args.contains(&"--cookie".to_string()));
+        assert!(
+            !spec
+                .args
+                .contains(&"SESSDATA=secret; bili_jct=csrf".to_string())
+        );
+        let config_index = spec
             .args
             .iter()
-            .position(|arg| arg == "--cookie")
-            .expect("cookie arg should be present");
-        assert_eq!(
-            spec.args.get(cookie_index + 1).map(String::as_str),
-            Some("SESSDATA=secret; bili_jct=csrf")
+            .position(|arg| arg == "--config-file")
+            .expect("config file arg should be present");
+        let config_path = PathBuf::from(
+            spec.args
+                .get(config_index + 1)
+                .expect("config file path should be present"),
         );
+        let config_content =
+            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
+        assert!(config_content.contains("\"Cookie\""));
+        assert!(config_content.contains("SESSDATA=secret; bili_jct=csrf"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&config_path)
+                .expect("BBDown auth config metadata should exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(config_path);
     }
 
     #[test]
@@ -1678,7 +1709,8 @@ mod tests {
             &JobRequest::Pdf {
                 url: "https://example.com".to_string(),
             },
-        );
+        )
+        .expect("PDF command should build");
 
         assert_eq!(spec.program, PathBuf::from("uv"));
         assert_eq!(spec.args[0], "run");
