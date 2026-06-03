@@ -191,7 +191,13 @@ async fn run_bilibili_job(
             Ok(after) => {
                 let created_videos: Vec<_> = after.difference(&before).cloned().collect();
                 let videos_to_process = if needs_mux {
-                    bilibili_mux_candidates(config, &metadata, created_videos, command_started_at)?
+                    bilibili_mux_candidates(
+                        config,
+                        &metadata,
+                        created_videos,
+                        command_started_at,
+                        video_only,
+                    )?
                 } else {
                     created_videos
                 };
@@ -253,6 +259,7 @@ fn bilibili_mux_candidates(
     metadata: &BilibiliMetadata,
     created_videos: Vec<PathBuf>,
     since: SystemTime,
+    video_only: bool,
 ) -> Result<Vec<PathBuf>> {
     let mut candidates = created_videos;
     if let Some(aid) = metadata.aid.as_deref() {
@@ -260,10 +267,10 @@ fn bilibili_mux_candidates(
         if aid_dir.is_dir() {
             for video in list_video_files(&aid_dir)? {
                 let audio = video.with_extension("m4a");
-                if audio.is_file()
-                    && (modified_since(&video, since) || modified_since(&audio, since))
-                    && !candidates.contains(&video)
-                {
+                let stream_modified = modified_since(&video, since)
+                    || (!video_only && audio.is_file() && modified_since(&audio, since));
+                let has_required_streams = video_only || audio.is_file();
+                if has_required_streams && stream_modified && !candidates.contains(&video) {
                     candidates.push(video);
                 }
             }
@@ -2178,8 +2185,31 @@ mod tests {
             ..BilibiliMetadata::default()
         };
 
-        let candidates = bilibili_mux_candidates(&config, &metadata, Vec::new(), since)
+        let candidates = bilibili_mux_candidates(&config, &metadata, Vec::new(), since, false)
             .expect("candidates should scan");
+
+        assert_eq!(candidates, vec![video]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finds_video_only_bilibili_candidates_in_aid_directory() {
+        let root = temp_test_dir("video-only-mux-candidates");
+        let aid_dir = root.join("1556453868");
+        fs::create_dir_all(&aid_dir).expect("aid dir should be created");
+        let since = SystemTime::now();
+        let video = aid_dir.join("1556453868.P1.1625322228.mp4");
+        fs::write(&video, b"video").expect("video should be written");
+        let mut config = test_config();
+        config.downloads.video_dir = root.clone();
+        let metadata = BilibiliMetadata {
+            aid: Some("1556453868".to_string()),
+            ..BilibiliMetadata::default()
+        };
+
+        let candidates = bilibili_mux_candidates(&config, &metadata, Vec::new(), since, true)
+            .expect("video-only candidates should scan");
 
         assert_eq!(candidates, vec![video]);
         let _ = fs::remove_dir_all(&root);
