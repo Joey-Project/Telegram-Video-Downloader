@@ -322,26 +322,30 @@ async fn bbdown_login_flow(
     auth_generation: u64,
 ) -> Result<bilibili_auth::AuthState> {
     let client = bbdown_auth_client(config)?;
-    let login_qr = bilibili_auth::generate_login_qr(&client).await?;
+    ensure_bbdown_login_active(auth_generation)?;
+    let login_qr = tokio::select! {
+        result = bilibili_auth::generate_login_qr(&client) => result?,
+        () = bbdown_login_cancel_notify().notified() => {
+            bail!("BBDown login was canceled by a later /bbdown logout");
+        }
+    };
+    ensure_bbdown_login_active(auth_generation)?;
     let caption = format!(
         "Scan this Bilibili QR code in the app to authorize BBDown. It expires in {} seconds.",
         config.bilibili.auth.login_timeout_seconds
     );
-    if let Err(err) = telegram
-        .send_photo(chat_id, caption, login_qr.png.clone())
-        .await
-    {
+    let send_photo_result = tokio::select! {
+        result = telegram.send_photo(chat_id, caption, login_qr.png.clone()) => result,
+        () = bbdown_login_cancel_notify().notified() => {
+            bail!("BBDown login was canceled by a later /bbdown logout");
+        }
+    };
+    if let Err(err) = send_photo_result {
         warn!(chat_id, error = %err, "failed to send BBDown login QR image");
-        send_or_log(
-            telegram,
-            chat_id,
-            format!(
-                "Could not send the QR image. Open this URL to scan instead:\n{}",
-                login_qr.url
-            ),
-        )
-        .await;
+        send_or_log(telegram, chat_id, bbdown_qr_photo_failed_message()).await;
+        bail!("failed to send Bilibili login QR image");
     }
+    ensure_bbdown_login_active(auth_generation)?;
 
     let deadline = Instant::now() + Duration::from_secs(config.bilibili.auth.login_timeout_seconds);
     let poll_interval = Duration::from_secs(config.bilibili.auth.poll_interval_seconds);
@@ -402,6 +406,13 @@ async fn bbdown_login_flow(
             }
         }
     }
+}
+
+fn ensure_bbdown_login_active(auth_generation: u64) -> Result<()> {
+    if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != auth_generation {
+        bail!("BBDown login was canceled by a later /bbdown logout");
+    }
+    Ok(())
 }
 
 async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
@@ -481,6 +492,10 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
 
 fn bbdown_auth_usage() -> String {
     "Usage: /bbdown login | /bbdown status | /bbdown logout".to_string()
+}
+
+fn bbdown_qr_photo_failed_message() -> String {
+    "Could not send the QR image. BBDown login canceled; try /bbdown login again after Telegram photo delivery is working.".to_string()
 }
 
 async fn run_queued_job(
@@ -606,5 +621,13 @@ mod tests {
         assert!(!summary.contains("secret"));
         assert!(!summary.contains("qrcode_key="));
         assert!(summary.contains("<redacted Bilibili login QR URL>"));
+    }
+
+    #[test]
+    fn qr_photo_failure_message_does_not_include_login_url() {
+        let message = bbdown_qr_photo_failed_message();
+
+        assert!(!message.contains("passport.bilibili.com"));
+        assert!(!message.contains("qrcode_key="));
     }
 }

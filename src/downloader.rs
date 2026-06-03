@@ -401,8 +401,18 @@ pub fn command_spec(config: &AppConfig, job: &JobRequest) -> Result<CommandSpec>
 
 pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
     let mut args = vec![url.to_string(), "--skip-ai".to_string()];
-    args.extend(config.bilibili.extra_args.iter().cloned());
-    let config_path = bilibili_auth::ensure_bbdown_config_file(&config.bilibili.auth.state_path)?;
+    let (auth_extra_args, explicit_config_path) =
+        split_bilibili_extra_args(&config.bilibili.extra_args);
+    let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
+    let config_path = bilibili_auth::ensure_bbdown_config_file(
+        &config.bilibili.auth.state_path,
+        base_config_path.as_deref(),
+    )?;
+    if config_path.is_some() {
+        args.extend(auth_extra_args);
+    } else {
+        args.extend(config.bilibili.extra_args.iter().cloned());
+    }
     if let Some(config_path) = &config_path {
         args.extend([
             "--config-file".to_string(),
@@ -417,6 +427,51 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
         activity_dir: Some(config.downloads.video_dir.clone()),
         cleanup_paths: config_path.into_iter().collect(),
     })
+}
+
+fn split_bilibili_extra_args(extra_args: &[String]) -> (Vec<String>, Option<PathBuf>) {
+    let mut filtered = Vec::with_capacity(extra_args.len());
+    let mut config_path = None;
+    let mut index = 0;
+    while index < extra_args.len() {
+        let arg = &extra_args[index];
+        if arg == "--config-file" {
+            if let Some(value) = extra_args.get(index + 1) {
+                config_path = Some(PathBuf::from(value));
+                index += 2;
+            } else {
+                filtered.push(arg.clone());
+                index += 1;
+            }
+        } else if let Some(value) = arg.strip_prefix("--config-file=") {
+            config_path = Some(PathBuf::from(value));
+            index += 1;
+        } else {
+            filtered.push(arg.clone());
+            index += 1;
+        }
+    }
+    (filtered, config_path)
+}
+
+fn bbdown_base_config_path(
+    config: &AppConfig,
+    explicit_config_path: Option<&Path>,
+) -> Option<PathBuf> {
+    explicit_config_path
+        .map(|path| resolve_bbdown_config_path(&config.downloads.video_dir, path))
+        .or_else(|| {
+            let default_path = config.downloads.video_dir.join("BBDown.config");
+            default_path.exists().then_some(default_path)
+        })
+}
+
+fn resolve_bbdown_config_path(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
 }
 
 pub fn youtube_metadata_command_spec(config: &AppConfig, url: &str) -> CommandSpec {
@@ -1507,20 +1562,23 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
 
 fn redact_sensitive_output(text: &str) -> String {
     let mut redacted = redact_flag_line_values(text, "--cookie", "<redacted Bilibili cookie>");
-    for name in [
-        "SESSDATA",
-        "bili_jct",
-        "DedeUserID",
-        "DedeUserID__ckMd5",
-        "sid",
-        "buvid3",
-        "buvid4",
-        "b_nut",
-    ] {
+    redacted = redact_bilibili_cookie_lines(&redacted);
+    for name in BILIBILI_COOKIE_NAMES {
         redacted = redact_cookie_pair_values(&redacted, name, "<redacted>");
     }
     redact_bilibili_qrcode_urls(&redacted)
 }
+
+const BILIBILI_COOKIE_NAMES: &[&str] = &[
+    "SESSDATA",
+    "bili_jct",
+    "DedeUserID",
+    "DedeUserID__ckMd5",
+    "sid",
+    "buvid3",
+    "buvid4",
+    "b_nut",
+];
 
 fn redact_flag_line_values(text: &str, flag: &str, replacement: &str) -> String {
     let mut output = String::with_capacity(text.len());
@@ -1583,6 +1641,36 @@ fn redact_cookie_pair_values(text: &str, name: &str, replacement: &str) -> Strin
     redacted
 }
 
+fn redact_bilibili_cookie_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if is_bilibili_cookie_line(line) {
+                "<redacted Bilibili cookie line>"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_bilibili_cookie_line(line: &str) -> bool {
+    if !line.contains(';') {
+        return false;
+    }
+    let has_known_cookie = BILIBILI_COOKIE_NAMES
+        .iter()
+        .any(|name| line.contains(&format!("{name}=")));
+    if !has_known_cookie {
+        return false;
+    }
+    line.split(';')
+        .filter(|part| part.trim().contains('='))
+        .take(2)
+        .count()
+        >= 2
+}
+
 fn redact_bilibili_qrcode_urls(text: &str) -> String {
     text.lines()
         .map(|line| {
@@ -1637,6 +1725,14 @@ mod tests {
             .expect("HOME should be set during tests")
     }
 
+    fn command_config_path(spec: &CommandSpec) -> Option<PathBuf> {
+        spec.args
+            .iter()
+            .position(|arg| arg == "--config-file")
+            .and_then(|index| spec.args.get(index + 1))
+            .map(PathBuf::from)
+    }
+
     fn metadata_with_subtitles() -> YoutubeMetadata {
         YoutubeMetadata {
             subtitles: BTreeMap::from([
@@ -1674,11 +1770,13 @@ mod tests {
     #[test]
     fn builds_bilibili_command_with_cookie() {
         let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-cookie-command");
         let path = std::env::temp_dir().join(format!(
             "telegram-video-downloader-bilibili-cookie-{}.json",
             std::process::id()
         ));
         config.bilibili.auth.state_path = path.clone();
+        config.downloads.video_dir = video_dir.clone();
         save_auth_state(
             &path,
             &AuthState {
@@ -1730,6 +1828,92 @@ mod tests {
         }
         let _ = std::fs::remove_file(path);
         bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn merges_default_bbdown_config_when_cookie_is_present() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-default-config");
+        let path = video_dir.join("bilibili-auth.json");
+        config.bilibili.auth.state_path = path.clone();
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(video_dir.join("BBDown.config"), "--dfn-priority\n1080P\n")
+            .expect("default BBDown config should write");
+        save_auth_state(
+            &path,
+            &AuthState {
+                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
+                mid: 123,
+                uname: "Joey".to_string(),
+                stored_at_unix: 1,
+            },
+        )
+        .expect("auth state should save");
+
+        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        let config_path = command_config_path(&spec).expect("config file arg should be present");
+        let config_content =
+            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
+        assert_eq!(
+            config_content,
+            "--dfn-priority\n1080P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
+        );
+
+        bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn merges_explicit_bbdown_config_and_filters_duplicate_config_arg() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-explicit-config");
+        let path = video_dir.join("bilibili-auth.json");
+        let explicit_config = video_dir.join("custom.config");
+        config.bilibili.auth.state_path = path.clone();
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec![
+            "--config-file".to_string(),
+            "custom.config".to_string(),
+            "--skip-cover".to_string(),
+        ];
+        fs::write(&explicit_config, "--dfn-priority\n720P")
+            .expect("explicit BBDown config should write");
+        save_auth_state(
+            &path,
+            &AuthState {
+                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
+                mid: 123,
+                uname: "Joey".to_string(),
+                stored_at_unix: 1,
+            },
+        )
+        .expect("auth state should save");
+
+        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        assert_eq!(
+            spec.args
+                .iter()
+                .filter(|arg| *arg == "--config-file")
+                .count(),
+            1
+        );
+        assert!(spec.args.contains(&"--skip-cover".to_string()));
+        assert!(!spec.args.contains(&"custom.config".to_string()));
+        let config_path = command_config_path(&spec).expect("config file arg should be present");
+        let config_content =
+            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
+        assert_eq!(
+            config_content,
+            "--dfn-priority\n720P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
+        );
+
+        bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[test]
@@ -2022,6 +2206,20 @@ mod tests {
     }
 
     #[test]
+    fn redacts_unknown_bilibili_cookie_pairs_from_cookie_lines() {
+        let redacted = redact_sensitive_output(
+            "Cookie: SESSDATA=secret; bili_jct=csrf; ac_time_value=token; unknown_cookie=value\nsafe",
+        );
+
+        assert!(!redacted.contains("secret"));
+        assert!(!redacted.contains("csrf"));
+        assert!(!redacted.contains("token"));
+        assert!(!redacted.contains("value"));
+        assert!(redacted.contains("<redacted Bilibili cookie line>"));
+        assert!(redacted.contains("safe"));
+    }
+
+    #[test]
     fn formats_file_activity_bytes() {
         assert_eq!(human_bytes(42), "42 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
@@ -2225,7 +2423,6 @@ mod tests {
         panic!("background pipe holder {pid} survived command collection");
     }
 
-    #[cfg(unix)]
     fn temp_test_dir(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

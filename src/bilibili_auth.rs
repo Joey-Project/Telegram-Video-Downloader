@@ -470,7 +470,10 @@ pub fn delete_auth_state(path: &Path) -> Result<bool> {
     Ok(removed)
 }
 
-pub fn ensure_bbdown_config_file(path: &Path) -> Result<Option<PathBuf>> {
+pub fn ensure_bbdown_config_file(
+    path: &Path,
+    base_config_path: Option<&Path>,
+) -> Result<Option<PathBuf>> {
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
@@ -483,7 +486,7 @@ pub fn ensure_bbdown_config_file(path: &Path) -> Result<Option<PathBuf>> {
 
     cleanup_stale_bbdown_config_files_unlocked(path)?;
     let config_path = temp_state_path(&bbdown_config_dir(path).join("cookie.config"));
-    write_bbdown_config(&config_path, &state.cookie)?;
+    write_bbdown_config(&config_path, &state.cookie, base_config_path)?;
     active_bbdown_config_files()
         .lock()
         .expect("active BBDown config lock should not poison")
@@ -520,7 +523,7 @@ pub fn release_bbdown_config_file(path: &Path) {
         .remove(path);
 }
 
-fn write_bbdown_config(path: &Path, cookie: &str) -> Result<()> {
+fn write_bbdown_config(path: &Path, cookie: &str, base_config_path: Option<&Path>) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -533,7 +536,19 @@ fn write_bbdown_config(path: &Path, cookie: &str) -> Result<()> {
         })?;
     }
 
-    let content = format!("--cookie\n{cookie}\n").into_bytes();
+    let mut content = match base_config_path {
+        Some(base_config_path) => fs::read(base_config_path).with_context(|| {
+            format!(
+                "failed to read BBDown config {}",
+                base_config_path.display()
+            )
+        })?,
+        None => Vec::new(),
+    };
+    if !content.is_empty() && !content.ends_with(b"\n") {
+        content.push(b'\n');
+    }
+    content.extend_from_slice(format!("--cookie\n{cookie}\n").as_bytes());
     let temp_path = temp_state_path(path);
     {
         let mut options = OpenOptions::new();
@@ -898,7 +913,7 @@ mod tests {
         let path = temp_state_file("bbdown-config");
         save_auth_state(&path, &test_state()).expect("state should save");
 
-        let config_path = ensure_bbdown_config_file(&path)
+        let config_path = ensure_bbdown_config_file(&path, None)
             .expect("BBDown config should save")
             .expect("BBDown config should be present");
         assert!(
@@ -923,6 +938,40 @@ mod tests {
         assert!(!legacy_config_path.exists());
 
         if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn merges_base_bbdown_config_with_cookie_file() {
+        let path = temp_state_file("bbdown-config-merge");
+        let base_config_path = temp_state_file("bbdown-base-config");
+        save_auth_state(&path, &test_state()).expect("state should save");
+        fs::create_dir_all(
+            base_config_path
+                .parent()
+                .expect("base config should have parent"),
+        )
+        .expect("base config parent should be created");
+        fs::write(&base_config_path, "--dfn-priority\n1080P\n").expect("base config should write");
+
+        let config_path = ensure_bbdown_config_file(&path, Some(&base_config_path))
+            .expect("BBDown config should save")
+            .expect("BBDown config should be present");
+        let content = fs::read_to_string(&config_path).expect("BBDown config should be readable");
+
+        assert_eq!(
+            content,
+            "--dfn-priority\n1080P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
+        );
+
+        release_bbdown_config_file(&config_path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&base_config_path);
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+        if let Some(parent) = base_config_path.parent() {
             let _ = fs::remove_dir_all(parent);
         }
     }

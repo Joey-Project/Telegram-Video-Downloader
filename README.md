@@ -34,7 +34,7 @@ cp config.example.toml config.toml
 
 `bilibili.extra_args` 默认包含 `--video-ascending` 和 `--skip-mux`。BBDown 负责下载音视频流，bot 再调用 `tools.ffmpeg` 做受控混流；这样混流也会受到同一套进度、idle timeout 和进程清理保护。需要追求更高码率时可以调整 `--video-ascending`，但建议保留 `--skip-mux`。
 
-`bilibili.auth.state_path` 是 bot 管理的 Bilibili Web cookie 状态文件，默认写到 `~/.local/state/telegram-video-downloader/bilibili-auth.json`。`/bbdown login` 会发送 Bilibili 扫码二维码，登录成功后 Bilibili 下载会自动给 BBDown 追加 `--cookie`；`/bbdown logout` 只清理本机状态，不远端注销账号。
+`bilibili.auth.state_path` 是 bot 管理的 Bilibili Web cookie 状态文件，默认写到 `~/.local/state/telegram-video-downloader/bilibili-auth.json`。`/bbdown login` 会发送 Bilibili 扫码二维码，登录成功后 Bilibili 下载会通过私有临时 `--config-file` 给 BBDown 注入 `--cookie`；如果视频下载目录存在 `BBDown.config`，或 `bilibili.extra_args` 显式指定了 `--config-file`，bot 会先合并原配置再追加 cookie。`/bbdown logout` 只清理本机状态，不远端注销账号。
 
 `bot.progress_update_seconds` 控制进度回复频率；`bot.command_timeout_seconds` 是单个外部命令的总超时；`bot.command_idle_timeout_seconds` 是没有 stdout/stderr 且输出目录文件也没有增长的 idle 超时。
 
