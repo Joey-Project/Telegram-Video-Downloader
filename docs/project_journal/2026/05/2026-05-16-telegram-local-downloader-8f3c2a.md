@@ -92,3 +92,4 @@ superseded_by:
 - Duplicate-video offline review found audio-only duplicates were still missed during pre-download scans; duplicate detection now scans audio primary files when Bilibili effective args include `--audio-only`, with `.m4a` duplicate coverage.
 - Duplicate-video offline review found overwrite could remove extra duplicate hits not replaced by staged media; overwrite now only backs up existing paths mapped to staged primary media, with coverage that unmapped duplicates remain.
 - Duplicate-video offline review found staged Bilibili could still pass a relative explicit `--config-file` when `downloads.video_dir` itself is relative; staging now writes an absolute config path and has regression coverage for that shape.
+- Duplicate-video offline review found staging early-return paths could leave job directories behind; staged video downloads now use a cleanup guard that removes the job staging directory on any exit path.

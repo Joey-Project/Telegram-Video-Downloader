@@ -554,6 +554,7 @@ async fn run_staged_video_job(
     let final_dir = config.downloads.video_dir.clone();
     let primary_media_kind = staged_primary_media_kind(config, job)?;
     let staging_dir = create_video_staging_dir(&final_dir)?;
+    let _staging_cleanup = RemoveDirOnDrop::new(staging_dir.clone());
     copy_bbdown_config_for_staging(&final_dir, &staging_dir)?;
     send_progress(
         progress.as_ref(),
@@ -590,10 +591,7 @@ async fn run_staged_video_job(
 
     let report = match result {
         Ok(report) => report,
-        Err(err) => {
-            let _ = fs::remove_dir_all(&staging_dir);
-            return Err(err);
-        }
+        Err(err) => return Err(err),
     };
 
     let staged_files = collect_regular_files(&staging_dir)?
@@ -606,7 +604,6 @@ async fn run_staged_video_job(
         .cloned()
         .collect::<Vec<_>>();
     if staged_media.is_empty() {
-        let _ = fs::remove_dir_all(&staging_dir);
         bail!(
             "staged video download finished but no primary media files were found in {}",
             staging_dir.display()
@@ -622,7 +619,6 @@ async fn run_staged_video_job(
         primary_media_kind,
     )
     .with_context(|| format!("failed to move staged files from {}", staging_dir.display()));
-    let _ = fs::remove_dir_all(&staging_dir);
     let moved_media = move_report?;
     send_progress(
         progress.as_ref(),
@@ -2004,6 +2000,23 @@ struct MoveStep {
 struct FileBackup {
     original: PathBuf,
     backup: PathBuf,
+}
+
+#[derive(Debug)]
+struct RemoveDirOnDrop {
+    path: PathBuf,
+}
+
+impl RemoveDirOnDrop {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn move_staged_video_files(
