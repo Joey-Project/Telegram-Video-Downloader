@@ -7,6 +7,7 @@
 - 普通消息中的 Bilibili 链接调用 `BBDown`，保存到视频下载目录。
 - 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
+- `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
 - `/pdf URL` 调用 uv 管理的 Python Playwright helper，使用系统 Chrome 打印 PDF；`pdf.auto_domains` 里的域名会自动走 PDF。
@@ -53,6 +54,7 @@ https://youtu.be/...
 /pdf https://example.com/article
 https://mp.weixin.qq.com/s?...
 https://m.bilibili.com/opus/1206098216310800386?share_source=COPY
+/help
 /bbdown status
 ```
 

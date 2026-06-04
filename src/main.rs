@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 use crate::config::AppConfig;
 use crate::downloader::{JobProgress, run_job};
 use crate::router::{BilibiliAuthCommand, RouteResult, route_message};
-use crate::telegram::TelegramClient;
+use crate::telegram::{BotCommand, TelegramClient};
 
 static BILIBILI_LOGIN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_LOGIN_CANCEL_NOTIFY: OnceLock<Notify> = OnceLock::new();
@@ -65,6 +65,9 @@ async fn main() -> Result<()> {
     config.ensure_runtime_dirs()?;
 
     let telegram = TelegramClient::new(config.telegram.token.clone());
+    if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
+        warn!(error = %err, "failed to register Telegram bot commands");
+    }
     let semaphore = Arc::new(Semaphore::new(config.bot.concurrency));
     let next_job_id = Arc::new(AtomicU64::new(1));
     let mut offset = None;
@@ -163,6 +166,10 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
             }
         }
         RouteResult::PdfUsage => bail!("usage: /pdf https://example.com"),
+        RouteResult::Help => {
+            println!("{}", help_message());
+            Ok(())
+        }
         RouteResult::BilibiliAuth(_) | RouteResult::BilibiliAuthUsage => {
             bail!("bbdown auth commands require Telegram bot chat")
         }
@@ -213,6 +220,9 @@ async fn handle_message(
         RouteResult::BilibiliAuth(command) => {
             handle_bilibili_auth_command(telegram, config, chat_id, is_private_chat, command).await;
         }
+        RouteResult::Help => {
+            send_or_log(&telegram, chat_id, help_message()).await;
+        }
         RouteResult::BilibiliAuthUsage => {
             let message = if is_private_chat {
                 bbdown_auth_usage()
@@ -240,6 +250,40 @@ async fn handle_message(
         }
         RouteResult::Empty => {}
     }
+}
+
+fn default_bot_commands() -> Vec<BotCommand> {
+    vec![
+        BotCommand {
+            command: "help".to_string(),
+            description: "Show supported commands and link handling.".to_string(),
+        },
+        BotCommand {
+            command: "pdf".to_string(),
+            description: "Save a webpage as PDF.".to_string(),
+        },
+        BotCommand {
+            command: "bbdown".to_string(),
+            description: "Manage BBDown Bilibili login state.".to_string(),
+        },
+    ]
+}
+
+fn help_message() -> String {
+    [
+        "Telegram Local Downloader Bot",
+        "",
+        "Send Bilibili or YouTube links directly to download videos.",
+        "Bilibili opus links and configured PDF domains are saved as PDF automatically.",
+        "",
+        "Commands:",
+        "/help - Show this help.",
+        "/pdf URL - Save a webpage as PDF.",
+        "/bbdown login - Log in to Bilibili for BBDown downloads.",
+        "/bbdown status - Show the saved BBDown login account.",
+        "/bbdown logout - Clear the local BBDown login state.",
+    ]
+    .join("\n")
 }
 
 async fn handle_bilibili_auth_command(
@@ -638,6 +682,28 @@ mod tests {
 
         assert!(!message.contains("passport.bilibili.com"));
         assert!(!message.contains("qrcode_key="));
+    }
+
+    #[test]
+    fn help_message_lists_supported_commands() {
+        let message = help_message();
+
+        for expected in ["/help", "/pdf URL", "/bbdown login", "/bbdown status"] {
+            assert!(message.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn default_bot_commands_match_supported_commands() {
+        let commands = default_bot_commands();
+
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| command.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["help", "pdf", "bbdown"]
+        );
     }
 
     #[tokio::test]
