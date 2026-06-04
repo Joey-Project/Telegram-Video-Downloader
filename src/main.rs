@@ -623,18 +623,47 @@ async fn forward_progress(
     status_message_id: Option<i64>,
     mut progress_rx: mpsc::UnboundedReceiver<JobProgress>,
 ) {
+    let mut delivery = ProgressDelivery::from_message_id(status_message_id);
     while let Some(progress) = progress_rx.recv().await {
         let message = job_status_message(job_id, job_label, "Running", Some(&progress.message));
-        if let Some(message_id) = status_message_id {
-            edit_or_log(&telegram, chat_id, message_id, message).await;
-        } else {
-            send_or_log(
-                &telegram,
-                chat_id,
-                format!("Progress job #{job_id}: {}", progress.message),
-            )
-            .await;
+        match delivery {
+            ProgressDelivery::Edit(message_id) => {
+                if edit_or_log(&telegram, chat_id, message_id, message).await {
+                    continue;
+                }
+                delivery = delivery.after_edit_result(false);
+                send_or_log(
+                    &telegram,
+                    chat_id,
+                    progress_fallback_message(job_id, &progress.message),
+                )
+                .await;
+            }
+            ProgressDelivery::Send => {
+                send_or_log(
+                    &telegram,
+                    chat_id,
+                    progress_fallback_message(job_id, &progress.message),
+                )
+                .await;
+            }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProgressDelivery {
+    Edit(i64),
+    Send,
+}
+
+impl ProgressDelivery {
+    fn from_message_id(message_id: Option<i64>) -> Self {
+        message_id.map_or(Self::Send, Self::Edit)
+    }
+
+    fn after_edit_result(self, succeeded: bool) -> Self {
+        if succeeded { self } else { Self::Send }
     }
 }
 
@@ -656,17 +685,26 @@ async fn send_or_log_message_id(
     }
 }
 
-async fn edit_or_log(telegram: &TelegramClient, chat_id: i64, message_id: i64, text: String) {
-    if let Err(err) = telegram
+async fn edit_or_log(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    message_id: i64,
+    text: String,
+) -> bool {
+    match telegram
         .edit_message_text(chat_id, message_id, truncate(&text))
         .await
     {
-        warn!(
-            chat_id,
-            message_id,
-            error = %err,
-            "failed to edit telegram message"
-        );
+        Ok(()) => true,
+        Err(err) => {
+            warn!(
+                chat_id,
+                message_id,
+                error = %err,
+                "failed to edit telegram message"
+            );
+            false
+        }
     }
 }
 
@@ -692,6 +730,10 @@ fn job_status_message(job_id: u64, job_label: &str, state: &str, progress: Optio
         message.push_str(progress);
     }
     message
+}
+
+fn progress_fallback_message(job_id: u64, progress: &str) -> String {
+    format!("Progress job #{job_id}: {progress}")
 }
 
 fn truncate(text: &str) -> String {
@@ -778,6 +820,26 @@ mod tests {
         assert_eq!(
             job_status_message(7, "Bilibili download", "Running", Some("BBDown: 42%")),
             "Running job #7: Bilibili download\nBBDown: 42%"
+        );
+    }
+
+    #[test]
+    fn progress_delivery_falls_back_to_send_after_edit_failure() {
+        assert_eq!(
+            ProgressDelivery::from_message_id(Some(42)),
+            ProgressDelivery::Edit(42)
+        );
+        assert_eq!(
+            ProgressDelivery::Edit(42).after_edit_result(true),
+            ProgressDelivery::Edit(42)
+        );
+        assert_eq!(
+            ProgressDelivery::Edit(42).after_edit_result(false),
+            ProgressDelivery::Send
+        );
+        assert_eq!(
+            progress_fallback_message(7, "BBDown: 42%"),
+            "Progress job #7: BBDown: 42%"
         );
     }
 
