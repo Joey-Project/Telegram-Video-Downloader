@@ -20,6 +20,18 @@ use crate::router::JobRequest;
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
+const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
+    "nfo",
+    "json",
+    "description",
+    "jpg",
+    "jpeg",
+    "png",
+    "webp",
+    "srt",
+    "vtt",
+    "ass",
+];
 const OUTPUT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_ABORT_GRACE: Duration = Duration::from_secs(3);
 
@@ -2126,15 +2138,26 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
         if path == video {
             continue;
         }
-        if path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(&prefix))
+        if is_known_video_sidecar(&path)
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
         {
             artifacts.push(path);
         }
     }
     Ok(artifacts)
+}
+
+fn is_known_video_sidecar(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            VIDEO_SIDECAR_EXTENSIONS
+                .iter()
+                .any(|known| extension.eq_ignore_ascii_case(known))
+        })
 }
 
 fn unique_backup_path(original: &Path) -> PathBuf {
@@ -2675,6 +2698,10 @@ mod tests {
         let existing = final_dir.join("Old Title [PHH1wTDF-1M].mkv");
         fs::write(&existing, "old-video").expect("existing file should write");
         fs::write(existing.with_extension("nfo"), "old-nfo").expect("old nfo should write");
+        let unrelated_video = final_dir.join("Old Title [PHH1wTDF-1M].trailer.mp4");
+        fs::write(&unrelated_video, "trailer").expect("unrelated video should write");
+        let unrelated_part = final_dir.join("Old Title [PHH1wTDF-1M].part2.mkv");
+        fs::write(&unrelated_part, "part2").expect("unrelated part should write");
         let staged = staging_dir.join("New Title [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
@@ -2704,6 +2731,14 @@ mod tests {
         assert_eq!(
             fs::read_to_string(existing.with_extension("nfo")).expect("nfo should be replaced"),
             "new-nfo"
+        );
+        assert_eq!(
+            fs::read_to_string(unrelated_video).expect("unrelated video should remain"),
+            "trailer"
+        );
+        assert_eq!(
+            fs::read_to_string(unrelated_part).expect("unrelated part should remain"),
+            "part2"
         );
         let replaced_files = fs::read_dir(&final_dir)
             .expect("final dir should read")
