@@ -1977,12 +1977,15 @@ fn staged_move_plan(
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
 ) -> Result<Vec<MoveStep>> {
-    let primary_staged_video = staged_files.iter().find(|path| is_video_file(path));
-    let primary_existing_video = duplicate.existing_videos.first();
     let mut reserved = BTreeSet::new();
-    let primary_video_destination =
-        primary_staged_video.map(|staged_video| match (&action, primary_existing_video) {
-            (VideoDuplicateAction::Overwrite, Some(existing_video)) => unique_path_avoiding(
+    let staged_videos = staged_files
+        .iter()
+        .filter(|path| is_video_file(path))
+        .collect::<Vec<_>>();
+    let mut video_destinations = Vec::with_capacity(staged_videos.len());
+    for (index, staged_video) in staged_videos.iter().enumerate() {
+        let preferred = match (&action, duplicate.existing_videos.first(), index) {
+            (VideoDuplicateAction::Overwrite, Some(existing_video), 0) => unique_path_avoiding(
                 overwrite_video_destination(existing_video, staged_video),
                 &reserved,
             ),
@@ -1990,30 +1993,29 @@ fn staged_move_plan(
                 relative_destination(staging_dir, final_dir, staged_video),
                 &reserved,
             ),
-        });
-    if let Some(destination) = &primary_video_destination {
-        reserved.insert(destination.clone());
+        };
+        reserved.insert(preferred.clone());
+        video_destinations.push((*staged_video, preferred));
     }
+
     let mut steps = Vec::with_capacity(staged_files.len());
 
     for source in staged_files {
-        let destination = if primary_staged_video.is_some_and(|staged_video| source == staged_video)
+        let destination = if let Some((_, destination)) = video_destinations
+            .iter()
+            .find(|(staged_video, _)| source == *staged_video)
         {
-            primary_video_destination
-                .clone()
-                .unwrap_or_else(|| relative_destination(staging_dir, final_dir, source))
-        } else if let (Some(staged_video), Some(primary_destination)) =
-            (primary_staged_video, primary_video_destination.as_ref())
+            destination.clone()
+        } else if let Some(preferred) =
+            video_destinations
+                .iter()
+                .find_map(|(staged_video, video_destination)| {
+                    sidecar_suffix_for_video(source, staged_video).and_then(|suffix| {
+                        sidecar_destination_for_target_video(video_destination, &suffix)
+                    })
+                })
         {
-            match sidecar_suffix_for_video(source, staged_video).and_then(|suffix| {
-                sidecar_destination_for_target_video(primary_destination, &suffix)
-            }) {
-                Some(preferred) => unique_path_avoiding(preferred, &reserved),
-                None => unique_path_avoiding(
-                    relative_destination(staging_dir, final_dir, source),
-                    &reserved,
-                ),
-            }
+            unique_path_avoiding(preferred, &reserved)
         } else {
             unique_path_avoiding(
                 relative_destination(staging_dir, final_dir, source),
@@ -2748,6 +2750,52 @@ mod tests {
             fs::read_to_string(final_dir.join("Example [PHH1wTDF-1M] (2).info.json"))
                 .expect("new info json should follow kept video basename"),
             "new-json"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn keep_both_moves_secondary_sidecars_with_their_video() {
+        let final_dir = temp_test_dir("keep-both-secondary-sidecar");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(final_dir.join("Part 2.mkv"), "old-part2").expect("old part2 should write");
+        let staged_part1 = staging_dir.join("Part 1.mkv");
+        fs::write(&staged_part1, "new-part1").expect("part1 should write");
+        fs::write(staged_part1.with_extension("nfo"), "new-part1-nfo")
+            .expect("part1 nfo should write");
+        let staged_part2 = staging_dir.join("Part 2.mkv");
+        fs::write(&staged_part2, "new-part2").expect("part2 should write");
+        fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
+            .expect("part2 nfo should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV123".to_string(),
+            },
+            existing_videos: Vec::new(),
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+        )
+        .expect("staged files should move");
+
+        assert!(moved.contains(&final_dir.join("Part 1.mkv")));
+        assert!(moved.contains(&final_dir.join("Part 2 (2).mkv")));
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Part 2 (2).nfo"))
+                .expect("part2 nfo should follow renamed video"),
+            "new-part2-nfo"
+        );
+        assert!(
+            !final_dir.join("Part 2.nfo").exists(),
+            "new sidecar should not attach to the old colliding video"
         );
         let _ = fs::remove_dir_all(final_dir);
     }

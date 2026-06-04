@@ -177,7 +177,12 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
                         println!("Progress replay job #{job_id}: {}", progress.message);
                     }
                 });
-                let result = run_job(&config, job, Some(progress_tx)).await;
+                let result = match job {
+                    JobRequest::Bilibili { .. } | JobRequest::Youtube { .. } => {
+                        run_video_job_staged_keep_both(&config, job, Some(progress_tx)).await
+                    }
+                    JobRequest::Pdf { .. } => run_job(&config, job, Some(progress_tx)).await,
+                };
                 let _ = progress_handle.await;
                 match result {
                     Ok(report) => {
