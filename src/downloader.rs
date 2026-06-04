@@ -2373,7 +2373,7 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
         return Ok(artifacts);
     };
     let mut entries = Vec::new();
-    let mut other_primary_stems = BTreeSet::new();
+    let mut primary_stems = BTreeSet::new();
     for entry in
         fs::read_dir(parent).with_context(|| format!("failed to read {}", parent.display()))?
     {
@@ -2382,11 +2382,10 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
         let path = entry.path();
-        if path != video
-            && (is_video_file(&path) || is_audio_file(&path))
+        if (is_video_file(&path) || is_audio_file(&path))
             && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
         {
-            other_primary_stems.insert(stem.to_string());
+            primary_stems.insert(stem.to_string());
         }
         entries.push(path);
     }
@@ -2400,7 +2399,7 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(&prefix))
-            && !sidecar_matches_any_primary_stem(&path, &other_primary_stems)
+            && best_primary_stem_for_sidecar(&path, &primary_stems).as_deref() == Some(stem)
         {
             artifacts.push(path);
         }
@@ -2408,14 +2407,13 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
     Ok(artifacts)
 }
 
-fn sidecar_matches_any_primary_stem(path: &Path, primary_stems: &BTreeSet<String>) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            primary_stems
-                .iter()
-                .any(|stem| name.starts_with(&format!("{stem}.")))
-        })
+fn best_primary_stem_for_sidecar(path: &Path, primary_stems: &BTreeSet<String>) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    primary_stems
+        .iter()
+        .filter(|stem| name.starts_with(&format!("{stem}.")))
+        .max_by_key(|stem| stem.len())
+        .cloned()
 }
 
 fn is_known_video_sidecar(path: &Path) -> bool {
@@ -3319,6 +3317,58 @@ mod tests {
             fs::read_to_string(final_dir.join("Second [PHH1wTDF-1M].nfo"))
                 .expect("second nfo should remain"),
             "old-second-nfo"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_uses_most_specific_primary_for_existing_sidecars() {
+        let final_dir = temp_test_dir("overwrite-dot-prefix-sidecar");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let sibling = final_dir.join("Movie.mkv");
+        fs::write(&sibling, "sibling-video").expect("sibling video should write");
+        fs::write(sibling.with_extension("nfo"), "sibling-nfo").expect("sibling nfo should write");
+        let existing_part2 = final_dir.join("Movie.part2.mkv");
+        fs::write(&existing_part2, "old-part2").expect("existing part2 should write");
+        fs::write(existing_part2.with_extension("nfo"), "old-part2-nfo")
+            .expect("existing part2 nfo should write");
+        let staged_part2 = staging_dir.join("New Movie.part2.mkv");
+        fs::write(&staged_part2, "new-part2").expect("staged part2 should write");
+        fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
+            .expect("staged part2 nfo should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Youtube,
+                id: "PHH1wTDF-1M".to_string(),
+            },
+            existing_videos: vec![existing_part2.clone()],
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged files should overwrite existing part2 files");
+
+        assert_eq!(moved, vec![existing_part2.clone()]);
+        assert_eq!(
+            fs::read_to_string(&existing_part2).expect("part2 should be replaced"),
+            "new-part2"
+        );
+        assert_eq!(
+            fs::read_to_string(existing_part2.with_extension("nfo"))
+                .expect("part2 nfo should be replaced"),
+            "new-part2-nfo"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Movie.nfo")).expect("sibling nfo should remain"),
+            "sibling-nfo"
         );
         let _ = fs::remove_dir_all(final_dir);
     }

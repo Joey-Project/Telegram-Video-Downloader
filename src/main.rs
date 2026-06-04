@@ -732,6 +732,22 @@ async fn prompt_duplicate_choice(
 ) {
     let token = next_duplicate_callback_token(job_id);
     let prompt = duplicate_choice_message(job_id, job.label(), &duplicate);
+    let now = Instant::now();
+    {
+        let mut pending_jobs = pending_duplicate_jobs().lock().await;
+        prune_expired_pending_duplicate_jobs(&mut pending_jobs, now);
+        pending_jobs.insert(
+            token,
+            PendingDuplicateJob {
+                chat_id,
+                job_id,
+                job,
+                duplicate,
+                created_at: now,
+            },
+        );
+        cap_pending_duplicate_jobs(&mut pending_jobs);
+    }
     match telegram
         .send_message_with_inline_keyboard(
             chat_id,
@@ -740,23 +756,9 @@ async fn prompt_duplicate_choice(
         )
         .await
     {
-        Ok(_) => {
-            let now = Instant::now();
-            let mut pending_jobs = pending_duplicate_jobs().lock().await;
-            prune_expired_pending_duplicate_jobs(&mut pending_jobs, now);
-            pending_jobs.insert(
-                token,
-                PendingDuplicateJob {
-                    chat_id,
-                    job_id,
-                    job,
-                    duplicate,
-                    created_at: now,
-                },
-            );
-            cap_pending_duplicate_jobs(&mut pending_jobs);
-        }
+        Ok(_) => {}
         Err(err) => {
+            pending_duplicate_jobs().lock().await.remove(&token);
             warn!(chat_id, job_id, error = %err, "failed to send duplicate choice prompt");
             send_or_log(
                 telegram,
