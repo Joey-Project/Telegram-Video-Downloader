@@ -234,10 +234,12 @@ pub fn find_video_duplicate(
         return Ok(None);
     };
 
-    let existing_videos = list_video_files(&config.downloads.video_dir)?
-        .into_iter()
-        .filter(|video| video_matches_identity(video, &identity))
-        .collect::<Vec<_>>();
+    let primary_media_kind = staged_primary_media_kind(config, job)?;
+    let existing_videos =
+        list_primary_media_files(&config.downloads.video_dir, primary_media_kind)?
+            .into_iter()
+            .filter(|video| video_matches_identity(video, &identity))
+            .collect::<Vec<_>>();
 
     Ok((!existing_videos.is_empty()).then_some(VideoDuplicate {
         identity,
@@ -1839,12 +1841,23 @@ fn metadata_sidecar_paths(video: &Path) -> Vec<PathBuf> {
 }
 
 fn list_video_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
+    list_primary_media_files(root, StagedPrimaryMediaKind::Video)
+}
+
+fn list_primary_media_files(
+    root: &Path,
+    primary_media_kind: StagedPrimaryMediaKind,
+) -> Result<BTreeSet<PathBuf>> {
     let mut files = BTreeSet::new();
-    collect_video_files(root, &mut files)?;
+    collect_primary_media_files(root, primary_media_kind, &mut files)?;
     Ok(files)
 }
 
-fn collect_video_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()> {
+fn collect_primary_media_files(
+    path: &Path,
+    primary_media_kind: StagedPrimaryMediaKind,
+    files: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -1861,8 +1874,8 @@ fn collect_video_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()>
             {
                 continue;
             }
-            collect_video_files(&path, files)?;
-        } else if file_type.is_file() && is_video_file(&path) {
+            collect_primary_media_files(&path, primary_media_kind, files)?;
+        } else if file_type.is_file() && is_primary_media_file(&path, primary_media_kind) {
             files.insert(path);
         }
     }
@@ -2771,6 +2784,29 @@ mod tests {
         .expect("duplicate scan should succeed");
 
         assert_eq!(duplicate, None);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn bilibili_audio_only_duplicate_detection_includes_audio_primary_files() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-bilibili-audio-only");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec!["--audio-only".to_string()];
+        let audio_path = video_dir.join("Example [BV12TRrBcEP8].m4a");
+        fs::write(&audio_path, "audio").expect("audio file should write");
+
+        let duplicate = find_video_duplicate(
+            &config,
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+            },
+        )
+        .expect("duplicate scan should succeed")
+        .expect("audio-only duplicate should be found");
+
+        assert_eq!(duplicate.existing_videos, vec![audio_path]);
         let _ = fs::remove_dir_all(video_dir);
     }
 
