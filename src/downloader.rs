@@ -102,6 +102,12 @@ impl VideoProvider {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StagedPrimaryMediaKind {
+    Video,
+    VideoOrAudio,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub program: PathBuf,
@@ -544,6 +550,7 @@ async fn run_staged_video_job(
 ) -> Result<JobReport> {
     let _guard = video_output_lock("Staged video download", progress.as_ref()).await;
     let final_dir = config.downloads.video_dir.clone();
+    let primary_media_kind = staged_primary_media_kind(config, job)?;
     let staging_dir = create_video_staging_dir(&final_dir)?;
     copy_bbdown_config_for_staging(&final_dir, &staging_dir)?;
     send_progress(
@@ -591,42 +598,60 @@ async fn run_staged_video_job(
         .into_iter()
         .filter(|path| !is_staging_support_file(&staging_dir, path))
         .collect::<Vec<_>>();
-    let staged_videos = staged_files
+    let staged_media = staged_files
         .iter()
-        .filter(|path| is_video_file(path))
+        .filter(|path| is_primary_media_file(path, primary_media_kind))
         .cloned()
         .collect::<Vec<_>>();
-    if staged_videos.is_empty() {
+    if staged_media.is_empty() {
         let _ = fs::remove_dir_all(&staging_dir);
         bail!(
-            "staged video download finished but no video files were found in {}",
+            "staged video download finished but no primary media files were found in {}",
             staging_dir.display()
         );
     }
 
-    let move_report =
-        move_staged_video_files(&staging_dir, &final_dir, &staged_files, action, duplicate)
-            .with_context(|| format!("failed to move staged files from {}", staging_dir.display()));
+    let move_report = move_staged_video_files(
+        &staging_dir,
+        &final_dir,
+        &staged_files,
+        action,
+        duplicate,
+        primary_media_kind,
+    )
+    .with_context(|| format!("failed to move staged files from {}", staging_dir.display()));
     let _ = fs::remove_dir_all(&staging_dir);
-    let moved_videos = move_report?;
+    let moved_media = move_report?;
     send_progress(
         progress.as_ref(),
-        format!("staging: moved {} video file(s)", moved_videos.len()),
+        format!("staging: moved {} media file(s)", moved_media.len()),
     );
 
-    let saved_location = if moved_videos.len() == 1 {
-        moved_videos[0].display().to_string()
+    let saved_location = if moved_media.len() == 1 {
+        moved_media[0].display().to_string()
     } else {
-        join_paths(&moved_videos)
+        join_paths(&moved_media)
     };
     let details = nonempty_join(vec![
         remove_staging_detail_lines(&report.details, &staging_dir),
-        format!("Moved: {}", join_paths(&moved_videos)),
+        format!("Moved: {}", join_paths(&moved_media)),
     ]);
     Ok(JobReport {
         saved_location,
         details,
     })
+}
+
+fn staged_primary_media_kind(
+    config: &AppConfig,
+    job: &JobRequest,
+) -> Result<StagedPrimaryMediaKind> {
+    match job {
+        JobRequest::Bilibili { .. } if bilibili_downloads_audio_only(config)? => {
+            Ok(StagedPrimaryMediaKind::VideoOrAudio)
+        }
+        _ => Ok(StagedPrimaryMediaKind::Video),
+    }
 }
 
 fn remove_staging_detail_lines(details: &str, staging_dir: &Path) -> String {
@@ -725,6 +750,13 @@ fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
 
 fn bilibili_needs_mux(args: &[String]) -> bool {
     has_bilibili_flag(args, "--skip-mux") && !has_bilibili_flag(args, "--audio-only")
+}
+
+fn bilibili_downloads_audio_only(config: &AppConfig) -> Result<bool> {
+    Ok(has_bilibili_flag(
+        &bilibili_effective_args(config)?,
+        "--audio-only",
+    ))
 }
 
 fn split_bilibili_extra_args(extra_args: &[String]) -> (Vec<String>, Option<PathBuf>) {
@@ -1848,6 +1880,23 @@ fn is_video_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_audio_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "m4a" | "mp3" | "aac" | "flac" | "ogg" | "opus" | "wav"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn is_primary_media_file(path: &Path, kind: StagedPrimaryMediaKind) -> bool {
+    is_video_file(path)
+        || (matches!(kind, StagedPrimaryMediaKind::VideoOrAudio) && is_audio_file(path))
+}
+
 fn create_video_staging_dir(final_dir: &Path) -> Result<PathBuf> {
     let parent = final_dir.join(VIDEO_STAGING_DIR_NAME);
     fs::create_dir_all(&parent)
@@ -1937,14 +1986,21 @@ fn move_staged_video_files(
     staged_files: &[PathBuf],
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
+    primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
     let backups = match action {
         VideoDuplicateAction::Overwrite => backup_existing_duplicate_artifacts(duplicate)?,
         VideoDuplicateAction::KeepBoth => Vec::new(),
     };
 
-    let move_result =
-        move_staged_video_files_inner(staging_dir, final_dir, staged_files, action, duplicate);
+    let move_result = move_staged_video_files_inner(
+        staging_dir,
+        final_dir,
+        staged_files,
+        action,
+        duplicate,
+        primary_media_kind,
+    );
     match move_result {
         Ok(moved_videos) => {
             if matches!(action, VideoDuplicateAction::Overwrite) {
@@ -1965,9 +2021,17 @@ fn move_staged_video_files_inner(
     staged_files: &[PathBuf],
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
+    primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
-    let plan = staged_move_plan(staging_dir, final_dir, staged_files, action, duplicate)?;
-    execute_move_plan(plan)
+    let plan = staged_move_plan(
+        staging_dir,
+        final_dir,
+        staged_files,
+        action,
+        duplicate,
+        primary_media_kind,
+    )?;
+    execute_move_plan(plan, primary_media_kind)
 }
 
 fn staged_move_plan(
@@ -1976,11 +2040,12 @@ fn staged_move_plan(
     staged_files: &[PathBuf],
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
+    primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<MoveStep>> {
     let mut reserved = BTreeSet::new();
     let staged_videos = staged_files
         .iter()
-        .filter(|path| is_video_file(path))
+        .filter(|path| is_primary_media_file(path, primary_media_kind))
         .collect::<Vec<_>>();
     let mut video_destinations = Vec::with_capacity(staged_videos.len());
     for (index, staged_video) in staged_videos.iter().enumerate() {
@@ -2109,7 +2174,10 @@ fn unique_path_avoiding(candidate: PathBuf, reserved: &BTreeSet<PathBuf>) -> Pat
     unreachable!("unbounded loop returns once it finds a unique path")
 }
 
-fn execute_move_plan(plan: Vec<MoveStep>) -> Result<Vec<PathBuf>> {
+fn execute_move_plan(
+    plan: Vec<MoveStep>,
+    primary_media_kind: StagedPrimaryMediaKind,
+) -> Result<Vec<PathBuf>> {
     let mut moved = Vec::new();
     let mut moved_videos = Vec::new();
     for step in plan {
@@ -2137,7 +2205,7 @@ fn execute_move_plan(plan: Vec<MoveStep>) -> Result<Vec<PathBuf>> {
                 )
             });
         }
-        if is_video_file(&step.destination) {
+        if is_primary_media_file(&step.destination, primary_media_kind) {
             moved_videos.push(step.destination.clone());
         }
         moved.push((step.source, step.destination));
@@ -2728,6 +2796,7 @@ mod tests {
             &staged_files,
             VideoDuplicateAction::KeepBoth,
             &duplicate,
+            StagedPrimaryMediaKind::Video,
         )
         .expect("staged files should move");
 
@@ -2783,6 +2852,7 @@ mod tests {
             &staged_files,
             VideoDuplicateAction::KeepBoth,
             &duplicate,
+            StagedPrimaryMediaKind::Video,
         )
         .expect("staged files should move");
 
@@ -2796,6 +2866,48 @@ mod tests {
         assert!(
             !final_dir.join("Part 2.nfo").exists(),
             "new sidecar should not attach to the old colliding video"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn keep_both_moves_audio_only_primary_file() {
+        let final_dir = temp_test_dir("keep-both-audio-only");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(final_dir.join("Episode.m4a"), "old-audio").expect("old audio should write");
+        let staged_audio = staging_dir.join("Episode.m4a");
+        fs::write(&staged_audio, "new-audio").expect("audio should write");
+        fs::write(staged_audio.with_extension("nfo"), "new-nfo").expect("nfo should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV123".to_string(),
+            },
+            existing_videos: Vec::new(),
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+            StagedPrimaryMediaKind::VideoOrAudio,
+        )
+        .expect("staged files should move");
+
+        let kept = final_dir.join("Episode (2).m4a");
+        assert_eq!(moved, vec![kept.clone()]);
+        assert_eq!(
+            fs::read_to_string(kept).expect("new audio should move"),
+            "new-audio"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Episode (2).nfo"))
+                .expect("nfo should follow kept audio basename"),
+            "new-nfo"
         );
         let _ = fs::remove_dir_all(final_dir);
     }
@@ -2830,6 +2942,7 @@ mod tests {
             &staged_files,
             VideoDuplicateAction::Overwrite,
             &duplicate,
+            StagedPrimaryMediaKind::Video,
         )
         .expect("staged files should overwrite existing files");
 

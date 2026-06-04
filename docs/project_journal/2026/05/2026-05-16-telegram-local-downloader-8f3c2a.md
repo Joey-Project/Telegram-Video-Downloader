@@ -87,3 +87,4 @@ superseded_by:
 - PR review follow-up fixed two auth hardening issues: BBDown now receives cookies through a protected `--config-file` instead of argv, and login polling sleep is bounded by the configured timeout deadline.
 - PR review rerun corrected the BBDown config-file format to BBDown's line-oriented argument syntax and redacts Bilibili QR login URLs from outbound-message logs.
 - 2026-06-04 duplicate-video follow-up: added pre-download duplicate prompts for direct YouTube and Bilibili IDs, Telegram callback query handling with per-prompt nonce tokens, default keep-both staging for all video downloads, overwrite backup/rollback semantics, and staging-directory exclusion from duplicate scans.
+- Duplicate-video offline review found that Bilibili `--audio-only` downloads could be misclassified as failed after staging; staging now accepts audio primary media for that effective BBDown mode and has regression coverage for audio-only keep-both moves.
