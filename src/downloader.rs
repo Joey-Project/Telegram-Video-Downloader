@@ -2003,8 +2003,20 @@ fn move_staged_video_files(
     duplicate: &VideoDuplicate,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
+    let staged_media_count = staged_files
+        .iter()
+        .filter(|path| is_primary_media_file(path, primary_media_kind))
+        .count();
+    let overwritten_existing_videos = duplicate
+        .existing_videos
+        .iter()
+        .take(staged_media_count)
+        .cloned()
+        .collect::<Vec<_>>();
     let backups = match action {
-        VideoDuplicateAction::Overwrite => backup_existing_duplicate_artifacts(duplicate)?,
+        VideoDuplicateAction::Overwrite => {
+            backup_existing_duplicate_artifacts(&overwritten_existing_videos)?
+        }
         VideoDuplicateAction::KeepBoth => Vec::new(),
     };
 
@@ -2064,8 +2076,8 @@ fn staged_move_plan(
         .collect::<Vec<_>>();
     let mut video_destinations = Vec::with_capacity(staged_videos.len());
     for (index, staged_video) in staged_videos.iter().enumerate() {
-        let preferred = match (&action, duplicate.existing_videos.first(), index) {
-            (VideoDuplicateAction::Overwrite, Some(existing_video), 0) => unique_path_avoiding(
+        let preferred = match (&action, duplicate.existing_videos.get(index)) {
+            (VideoDuplicateAction::Overwrite, Some(existing_video)) => unique_path_avoiding(
                 overwrite_video_destination(existing_video, staged_video),
                 &reserved,
             ),
@@ -2228,9 +2240,9 @@ fn execute_move_plan(
     Ok(moved_videos)
 }
 
-fn backup_existing_duplicate_artifacts(duplicate: &VideoDuplicate) -> Result<Vec<FileBackup>> {
+fn backup_existing_duplicate_artifacts(existing_videos: &[PathBuf]) -> Result<Vec<FileBackup>> {
     let mut artifacts = BTreeSet::new();
-    for video in &duplicate.existing_videos {
+    for video in existing_videos {
         for path in existing_video_artifacts(video)? {
             artifacts.insert(path);
         }
@@ -3033,6 +3045,55 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".replaced-"))
             .count();
         assert_eq!(replaced_files, 0);
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_keeps_unmapped_duplicate_videos() {
+        let final_dir = temp_test_dir("overwrite-unmapped-duplicates");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let first_existing = final_dir.join("First [PHH1wTDF-1M].mkv");
+        fs::write(&first_existing, "old-first").expect("first existing should write");
+        let second_existing = final_dir.join("Second [PHH1wTDF-1M].mkv");
+        fs::write(&second_existing, "old-second").expect("second existing should write");
+        fs::write(second_existing.with_extension("nfo"), "old-second-nfo")
+            .expect("second nfo should write");
+        let staged = staging_dir.join("New [PHH1wTDF-1M].mkv");
+        fs::write(&staged, "new-video").expect("staged file should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Youtube,
+                id: "PHH1wTDF-1M".to_string(),
+            },
+            existing_videos: vec![first_existing.clone(), second_existing.clone()],
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged files should overwrite only mapped existing files");
+
+        assert_eq!(moved, vec![first_existing.clone()]);
+        assert_eq!(
+            fs::read_to_string(first_existing).expect("first existing should be replaced"),
+            "new-video"
+        );
+        assert_eq!(
+            fs::read_to_string(second_existing).expect("second existing should remain"),
+            "old-second"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Second [PHH1wTDF-1M].nfo"))
+                .expect("second nfo should remain"),
+            "old-second-nfo"
+        );
         let _ = fs::remove_dir_all(final_dir);
     }
 
