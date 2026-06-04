@@ -2271,6 +2271,9 @@ fn sidecar_suffix_for_video(sidecar: &Path, video: &Path) -> Option<String> {
     if sidecar == video || is_video_file(sidecar) {
         return None;
     }
+    if sidecar.parent() != video.parent() {
+        return None;
+    }
     let sidecar_name = sidecar.file_name()?.to_str()?;
     let video_stem = video.file_stem()?.to_str()?;
     sidecar_name
@@ -3220,6 +3223,54 @@ mod tests {
         assert!(
             !final_dir.join("Movie.nfo").exists(),
             "part2 sidecar should not attach to the shorter Movie stem"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn keep_both_keeps_recursive_same_stem_sidecars_with_same_directory_primary() {
+        let final_dir = temp_test_dir("keep-both-recursive-same-stem-sidecar");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        let staged_a_dir = staging_dir.join("a");
+        let staged_b_dir = staging_dir.join("b");
+        fs::create_dir_all(&staged_a_dir).expect("staging a dir should create");
+        fs::create_dir_all(&staged_b_dir).expect("staging b dir should create");
+        let staged_a = staged_a_dir.join("Movie.mkv");
+        let staged_b = staged_b_dir.join("Movie.mkv");
+        fs::write(&staged_a, "new-a").expect("movie a should write");
+        fs::write(staged_a.with_extension("nfo"), "new-a-nfo").expect("movie a nfo should write");
+        fs::write(&staged_b, "new-b").expect("movie b should write");
+        fs::write(staged_b.with_extension("nfo"), "new-b-nfo").expect("movie b nfo should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Youtube,
+                id: "PHH1wTDF-1M".to_string(),
+            },
+            existing_videos: Vec::new(),
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged files should move");
+
+        assert!(moved.contains(&final_dir.join("a/Movie.mkv")));
+        assert!(moved.contains(&final_dir.join("b/Movie.mkv")));
+        assert_eq!(
+            fs::read_to_string(final_dir.join("a/Movie.nfo"))
+                .expect("movie a nfo should stay with movie a"),
+            "new-a-nfo"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("b/Movie.nfo"))
+                .expect("movie b nfo should stay with movie b"),
+            "new-b-nfo"
         );
         let _ = fs::remove_dir_all(final_dir);
     }
