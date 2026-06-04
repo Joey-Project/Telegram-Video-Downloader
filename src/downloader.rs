@@ -2707,7 +2707,7 @@ mod tests {
         );
         let replaced_files = fs::read_dir(&final_dir)
             .expect("final dir should read")
-            .filter_map(Result::ok)
+            .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_name().to_string_lossy().contains(".replaced-"))
             .count();
         assert_eq!(replaced_files, 0);
