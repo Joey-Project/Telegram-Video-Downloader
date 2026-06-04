@@ -198,6 +198,28 @@ pub async fn run_job_with_duplicate_action(
     run_staged_video_job(config, job, action, duplicate, progress).await
 }
 
+pub async fn run_video_job_staged_keep_both(
+    config: &AppConfig,
+    job: &JobRequest,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<JobReport> {
+    let Some(identity) = fallback_video_identity(job) else {
+        return run_job(config, job, progress).await;
+    };
+    let duplicate = VideoDuplicate {
+        identity,
+        existing_videos: Vec::new(),
+    };
+    run_staged_video_job(
+        config,
+        job,
+        VideoDuplicateAction::KeepBoth,
+        &duplicate,
+        progress,
+    )
+    .await
+}
+
 pub fn find_video_duplicate(
     config: &AppConfig,
     job: &JobRequest,
@@ -617,6 +639,20 @@ pub fn command_spec(config: &AppConfig, job: &JobRequest) -> Result<CommandSpec>
         )),
         JobRequest::Pdf { url } => Ok(pdf_command_spec(config, url)),
     }
+}
+
+fn fallback_video_identity(job: &JobRequest) -> Option<VideoIdentity> {
+    video_identity(job).or_else(|| match job {
+        JobRequest::Bilibili { .. } => Some(VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: "unknown".to_string(),
+        }),
+        JobRequest::Youtube { .. } => Some(VideoIdentity {
+            provider: VideoProvider::Youtube,
+            id: "unknown".to_string(),
+        }),
+        JobRequest::Pdf { .. } => None,
+    })
 }
 
 pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
@@ -1724,7 +1760,7 @@ fn domain_or_subdomain(host: &str, domain: &str) -> bool {
 
 fn video_matches_identity(video: &Path, identity: &VideoIdentity) -> bool {
     let id = identity.id.to_ascii_lowercase();
-    if path_name_contains(video, &id) {
+    if video_file_stem_matches_id(video, &id) {
         return true;
     }
 
@@ -1736,10 +1772,20 @@ fn video_matches_identity(video: &Path, identity: &VideoIdentity) -> bool {
     })
 }
 
-fn path_name_contains(path: &Path, needle: &str) -> bool {
+fn video_file_stem_matches_id(path: &Path, id: &str) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.to_ascii_lowercase().contains(needle))
+        .map(|name| name.to_ascii_lowercase())
+        .is_some_and(|name| {
+            let stem = match path.file_stem().and_then(|stem| stem.to_str()) {
+                Some(stem) => stem.to_ascii_lowercase(),
+                None => name,
+            };
+            stem == id
+                || stem.ends_with(&format!("[{id}]"))
+                || stem.ends_with(&format!("({id})"))
+                || stem.ends_with(id)
+        })
 }
 
 fn metadata_sidecar_paths(video: &Path) -> Vec<PathBuf> {
@@ -2583,6 +2629,13 @@ mod tests {
         config.downloads.video_dir = video_dir.clone();
         let youtube_path = video_dir.join("Example [PHH1wTDF-1M].mkv");
         fs::write(&youtube_path, "video").expect("youtube file should write");
+        fs::write(
+            video_dir.join("Example [PHH1wTDF-1M].trailer.mp4"),
+            "trailer",
+        )
+        .expect("related trailer should write");
+        fs::write(video_dir.join("Example [PHH1wTDF-1M].part2.mkv"), "part2")
+            .expect("related part should write");
         let bilibili_path = video_dir.join("bilibili-title.mp4");
         fs::write(&bilibili_path, "video").expect("bilibili file should write");
         fs::write(

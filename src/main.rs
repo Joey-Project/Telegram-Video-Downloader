@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 use crate::config::AppConfig;
 use crate::downloader::{
     JobProgress, VideoDuplicate, VideoDuplicateAction, find_video_duplicate, run_job,
-    run_job_with_duplicate_action,
+    run_job_with_duplicate_action, run_video_job_staged_keep_both,
 };
 use crate::router::{BilibiliAuthCommand, JobRequest, RouteResult, route_message};
 use crate::telegram::{
@@ -34,6 +34,7 @@ static BILIBILI_LOGIN_CANCEL_NOTIFY: OnceLock<Notify> = OnceLock::new();
 static BILIBILI_AUTH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_AUTH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static PENDING_DUPLICATE_JOBS: OnceLock<Mutex<HashMap<u64, PendingDuplicateJob>>> = OnceLock::new();
+static DUPLICATE_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 const BILIBILI_AUTH_MAX_HTTP_TIMEOUT_SECONDS: u64 = 30;
 const DUPLICATE_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_PENDING_DUPLICATE_JOBS: usize = 256;
@@ -51,6 +52,13 @@ struct PendingDuplicateJob {
 struct DuplicateRun {
     action: VideoDuplicateAction,
     duplicate: VideoDuplicate,
+}
+
+#[derive(Debug, Clone)]
+enum JobRunMode {
+    Direct,
+    StagedKeepBoth,
+    Duplicate(DuplicateRun),
 }
 
 #[tokio::main]
@@ -591,7 +599,8 @@ async fn queue_or_prompt_job(
             prompt_duplicate_choice(&telegram, chat_id, job_id, job, duplicate).await;
         }
         Ok(None) => {
-            queue_job(telegram, config, semaphore, chat_id, job_id, job, None).await;
+            let run_mode = default_run_mode(&job);
+            queue_job(telegram, config, semaphore, chat_id, job_id, job, run_mode).await;
         }
         Err(err) => {
             send_or_log(
@@ -603,7 +612,8 @@ async fn queue_or_prompt_job(
                 ),
             )
             .await;
-            queue_job(telegram, config, semaphore, chat_id, job_id, job, None).await;
+            let run_mode = default_run_mode(&job);
+            queue_job(telegram, config, semaphore, chat_id, job_id, job, run_mode).await;
         }
     }
 }
@@ -625,12 +635,13 @@ async fn prompt_duplicate_choice(
     job: JobRequest,
     duplicate: VideoDuplicate,
 ) {
+    let token = next_duplicate_callback_token(job_id);
     let prompt = duplicate_choice_message(job_id, job.label(), &duplicate);
     match telegram
         .send_message_with_inline_keyboard(
             chat_id,
             truncate(&prompt),
-            duplicate_choice_keyboard(job_id),
+            duplicate_choice_keyboard(token),
         )
         .await
     {
@@ -639,7 +650,7 @@ async fn prompt_duplicate_choice(
             let mut pending_jobs = pending_duplicate_jobs().lock().await;
             prune_expired_pending_duplicate_jobs(&mut pending_jobs, now);
             pending_jobs.insert(
-                job_id,
+                token,
                 PendingDuplicateJob {
                     chat_id,
                     job_id,
@@ -669,7 +680,7 @@ async fn queue_job(
     chat_id: i64,
     job_id: u64,
     job: JobRequest,
-    duplicate_run: Option<DuplicateRun>,
+    run_mode: JobRunMode,
 ) {
     send_or_log(
         &telegram,
@@ -679,13 +690,7 @@ async fn queue_job(
     .await;
 
     tokio::spawn(run_queued_job(
-        telegram,
-        config,
-        semaphore,
-        chat_id,
-        job_id,
-        job,
-        duplicate_run,
+        telegram, config, semaphore, chat_id, job_id, job, run_mode,
     ));
 }
 
@@ -720,7 +725,7 @@ async fn handle_callback_query(
         return;
     }
 
-    let pending = take_pending_duplicate_job(callback.job_id, chat_id).await;
+    let pending = take_pending_duplicate_job(callback.token, chat_id).await;
     let Some(pending) = pending else {
         answer_callback_or_log(
             &telegram,
@@ -766,7 +771,7 @@ async fn handle_callback_query(
                 chat_id,
                 pending.job_id,
                 pending.job,
-                Some(DuplicateRun {
+                JobRunMode::Duplicate(DuplicateRun {
                     action,
                     duplicate: pending.duplicate,
                 }),
@@ -776,15 +781,28 @@ async fn handle_callback_query(
     }
 }
 
+fn default_run_mode(job: &JobRequest) -> JobRunMode {
+    match job {
+        JobRequest::Bilibili { .. } | JobRequest::Youtube { .. } => JobRunMode::StagedKeepBoth,
+        JobRequest::Pdf { .. } => JobRunMode::Direct,
+    }
+}
+
+impl From<DuplicateRun> for JobRunMode {
+    fn from(value: DuplicateRun) -> Self {
+        Self::Duplicate(value)
+    }
+}
+
 fn pending_duplicate_jobs() -> &'static Mutex<HashMap<u64, PendingDuplicateJob>> {
     PENDING_DUPLICATE_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-async fn take_pending_duplicate_job(job_id: u64, chat_id: i64) -> Option<PendingDuplicateJob> {
+async fn take_pending_duplicate_job(token: u64, chat_id: i64) -> Option<PendingDuplicateJob> {
     let mut jobs = pending_duplicate_jobs().lock().await;
     prune_expired_pending_duplicate_jobs(&mut jobs, Instant::now());
-    match jobs.get(&job_id) {
-        Some(job) if job.chat_id == chat_id => jobs.remove(&job_id),
+    match jobs.get(&token) {
+        Some(job) if job.chat_id == chat_id => jobs.remove(&token),
         _ => None,
     }
 }
@@ -811,7 +829,7 @@ fn cap_pending_duplicate_jobs(jobs: &mut HashMap<u64, PendingDuplicateJob>) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DuplicateCallback {
-    job_id: u64,
+    token: u64,
     action: DuplicateCallbackAction,
 }
 
@@ -824,7 +842,7 @@ enum DuplicateCallbackAction {
 fn parse_duplicate_callback_data(data: &str) -> Option<DuplicateCallback> {
     let mut parts = data.split(':');
     let prefix = parts.next()?;
-    let job_id = parts.next()?.parse().ok()?;
+    let token = u64::from_str_radix(parts.next()?, 16).ok()?;
     let action = parts.next()?;
     if parts.next().is_some() || prefix != "dup" {
         return None;
@@ -835,29 +853,38 @@ fn parse_duplicate_callback_data(data: &str) -> Option<DuplicateCallback> {
         "cancel" => DuplicateCallbackAction::Cancel,
         _ => return None,
     };
-    Some(DuplicateCallback { job_id, action })
+    Some(DuplicateCallback { token, action })
 }
 
-fn duplicate_callback_data(job_id: u64, action: &str) -> String {
-    format!("dup:{job_id}:{action}")
+fn next_duplicate_callback_token(job_id: u64) -> u64 {
+    let counter = DUPLICATE_CALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    nanos ^ counter.rotate_left(17) ^ job_id.rotate_left(32) ^ (std::process::id() as u64)
 }
 
-fn duplicate_choice_keyboard(job_id: u64) -> InlineKeyboardMarkup {
+fn duplicate_callback_data(token: u64, action: &str) -> String {
+    format!("dup:{token:016x}:{action}")
+}
+
+fn duplicate_choice_keyboard(token: u64) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
         inline_keyboard: vec![
             vec![
                 InlineKeyboardButton {
                     text: "Overwrite".to_string(),
-                    callback_data: duplicate_callback_data(job_id, "overwrite"),
+                    callback_data: duplicate_callback_data(token, "overwrite"),
                 },
                 InlineKeyboardButton {
                     text: "Keep both".to_string(),
-                    callback_data: duplicate_callback_data(job_id, "keep"),
+                    callback_data: duplicate_callback_data(token, "keep"),
                 },
             ],
             vec![InlineKeyboardButton {
                 text: "Cancel".to_string(),
-                callback_data: duplicate_callback_data(job_id, "cancel"),
+                callback_data: duplicate_callback_data(token, "cancel"),
             }],
         ],
     }
@@ -892,7 +919,7 @@ async fn run_queued_job(
     chat_id: i64,
     job_id: u64,
     job: JobRequest,
-    duplicate_run: Option<DuplicateRun>,
+    run_mode: JobRunMode,
 ) {
     let permit = match semaphore.acquire_owned().await {
         Ok(permit) => permit,
@@ -918,8 +945,8 @@ async fn run_queued_job(
         status_message_id,
         progress_rx,
     ));
-    let result = match duplicate_run {
-        Some(duplicate_run) => {
+    let result = match run_mode {
+        JobRunMode::Duplicate(duplicate_run) => {
             run_job_with_duplicate_action(
                 &config,
                 &job,
@@ -929,7 +956,10 @@ async fn run_queued_job(
             )
             .await
         }
-        None => run_job(&config, &job, Some(progress_tx)).await,
+        JobRunMode::StagedKeepBoth => {
+            run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
+        }
+        JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
     };
     let _ = progress_task.await;
     drop(permit);
@@ -1213,27 +1243,27 @@ mod tests {
     #[test]
     fn parses_duplicate_callback_data() {
         assert_eq!(
-            parse_duplicate_callback_data("dup:42:overwrite"),
+            parse_duplicate_callback_data("dup:000000000000002a:overwrite"),
             Some(DuplicateCallback {
-                job_id: 42,
+                token: 42,
                 action: DuplicateCallbackAction::Run(VideoDuplicateAction::Overwrite)
             })
         );
         assert_eq!(
-            parse_duplicate_callback_data("dup:42:keep"),
+            parse_duplicate_callback_data("dup:000000000000002a:keep"),
             Some(DuplicateCallback {
-                job_id: 42,
+                token: 42,
                 action: DuplicateCallbackAction::Run(VideoDuplicateAction::KeepBoth)
             })
         );
         assert_eq!(
-            parse_duplicate_callback_data("dup:42:cancel"),
+            parse_duplicate_callback_data("dup:000000000000002a:cancel"),
             Some(DuplicateCallback {
-                job_id: 42,
+                token: 42,
                 action: DuplicateCallbackAction::Cancel
             })
         );
-        assert_eq!(parse_duplicate_callback_data("dup:bad:keep"), None);
+        assert_eq!(parse_duplicate_callback_data("dup:nothex:keep"), None);
         assert_eq!(parse_duplicate_callback_data("other:42:keep"), None);
         assert_eq!(parse_duplicate_callback_data("dup:42:unknown"), None);
     }
@@ -1250,8 +1280,13 @@ mod tests {
 
         assert_eq!(
             data,
-            vec!["dup:42:overwrite", "dup:42:keep", "dup:42:cancel"]
+            vec![
+                "dup:000000000000002a:overwrite",
+                "dup:000000000000002a:keep",
+                "dup:000000000000002a:cancel"
+            ]
         );
+        assert!(data.iter().all(|value| value.len() <= 64));
     }
 
     fn pending_duplicate_job(job_id: u64, created_at: Instant) -> PendingDuplicateJob {

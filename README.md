@@ -10,7 +10,7 @@
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
-- 如果可从视频 URL 识别到本地已有相同 YouTube 或 Bilibili 视频，bot 会先提供覆盖、两者并存或取消的按钮选择；覆盖和并存都会先下载到 staging 目录，成功后再移动到最终目录。
+- 视频下载会先写入隐藏 staging 目录，成功后再移动到最终目录；如果可从 URL 识别到本地已有相同 YouTube 或 Bilibili 视频，bot 会先提供覆盖、两者并存或取消的按钮选择。
 - `/pdf URL` 调用 uv 管理的 Python Playwright helper，使用系统 Chrome 打印 PDF；`pdf.auto_domains` 里的域名会自动走 PDF。
 - 全局并发由配置控制，超出的任务会排队。
 - 外部命令会流式采集 stdout/stderr，并监控输出目录文件大小；长时间无输出且无文件增长会自动失败，避免任务一直停在 `Started`。
@@ -35,7 +35,7 @@ cp config.example.toml config.toml
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
-重复视频检测使用 URL 中可直接提取的媒体 ID，例如 YouTube video id、Bilibili `BV...` 或 `av...`，并扫描视频文件名与同 basename sidecar。`b23.tv` 短链在下载前无法离线解析真实视频 ID，所以不会提前弹出重复选择，但 staging 移动仍会避免覆盖同名文件。
+重复视频检测使用 URL 中可直接提取的媒体 ID，例如 YouTube video id、Bilibili `BV...` 或 `av...`，并扫描视频文件名与同 basename sidecar。`b23.tv` 短链在下载前无法离线解析真实视频 ID，所以不会提前弹出重复选择；这类视频仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
 `bilibili.extra_args` 默认包含 `--video-ascending` 和 `--skip-mux`。BBDown 负责下载音视频流，bot 再调用 `tools.ffmpeg` 做受控混流；这样混流也会受到同一套进度、idle timeout 和进程清理保护。需要追求更高码率时可以调整 `--video-ascending`，但建议保留 `--skip-mux`。
 

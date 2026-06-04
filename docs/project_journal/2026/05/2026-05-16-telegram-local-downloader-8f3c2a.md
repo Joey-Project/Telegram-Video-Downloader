@@ -50,7 +50,7 @@ superseded_by:
 - PDF 支持 `mp.weixin.qq.com` 自动白名单，`/pdf URL` 继续保留。
 - Bilibili `opus` 文章链接现在会规范化为 `https://www.bilibili.com/opus/<id>` 并走 PDF；PDF helper 对这类页面使用静态 HTML 快照渲染，避开页面脚本在 headless Chrome 中主动关闭页面的问题。
 - BBDown 登录态现在由 bot 通过 Bilibili Web QR API 管理：私聊 `/bbdown login/status/logout` 可扫码登录、查看账号、清理本机状态；Bilibili 下载会自动把 bot-managed cookie 注入 BBDown。
-- 重复视频处理支持 Telegram inline keyboard 选择：对可直接提取媒体 ID 的 YouTube/Bilibili URL，若本地已有匹配视频或 sidecar，用户可选择覆盖、两者并存或取消；覆盖和并存都先下载到隐藏 staging 目录，成功后再移动到最终视频目录。
+- 视频下载现在默认先进入隐藏 staging 目录，成功后再移动到最终目录；对可直接提取媒体 ID 的 YouTube/Bilibili URL，若本地已有匹配视频或 sidecar，用户可通过 Telegram inline keyboard 选择覆盖、两者并存或取消。
 
 ## Next Steps
 - 继续追查 BBDown 下载 stall/合并阶段问题，基于现有失败摘要和进度日志做可复现 debug。
@@ -86,4 +86,4 @@ superseded_by:
 - Final helper-backed `codex-readonly` rerun returned `LGTM` after the auth fixes.
 - PR review follow-up fixed two auth hardening issues: BBDown now receives cookies through a protected `--config-file` instead of argv, and login polling sleep is bounded by the configured timeout deadline.
 - PR review rerun corrected the BBDown config-file format to BBDown's line-oriented argument syntax and redacts Bilibili QR login URLs from outbound-message logs.
-- 2026-06-04 duplicate-video follow-up: added pre-download duplicate prompts for direct YouTube and Bilibili IDs, Telegram callback query handling, keep-both unique moves, overwrite backup/rollback semantics, and staging-directory exclusion from duplicate scans.
+- 2026-06-04 duplicate-video follow-up: added pre-download duplicate prompts for direct YouTube and Bilibili IDs, Telegram callback query handling with per-prompt nonce tokens, default keep-both staging for all video downloads, overwrite backup/rollback semantics, and staging-directory exclusion from duplicate scans.
