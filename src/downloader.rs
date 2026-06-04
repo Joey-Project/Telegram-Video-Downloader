@@ -795,7 +795,7 @@ fn preserve_bilibili_config_paths_for_staging(config: &mut AppConfig, final_vide
             args.push(arg.clone());
             if let Some(value) = config.bilibili.extra_args.get(index + 1) {
                 args.push(
-                    resolve_bbdown_config_path(final_video_dir, Path::new(value))
+                    absolute_bbdown_config_path(final_video_dir, Path::new(value))
                         .display()
                         .to_string(),
                 );
@@ -806,7 +806,7 @@ fn preserve_bilibili_config_paths_for_staging(config: &mut AppConfig, final_vide
         } else if let Some(value) = arg.strip_prefix("--config-file=") {
             args.push(format!(
                 "--config-file={}",
-                resolve_bbdown_config_path(final_video_dir, Path::new(value)).display()
+                absolute_bbdown_config_path(final_video_dir, Path::new(value)).display()
             ));
             index += 1;
         } else {
@@ -834,6 +834,17 @@ fn resolve_bbdown_config_path(cwd: &Path, path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         cwd.join(path)
+    }
+}
+
+fn absolute_bbdown_config_path(cwd: &Path, path: &Path) -> PathBuf {
+    let resolved = resolve_bbdown_config_path(cwd, path);
+    if resolved.is_absolute() {
+        resolved
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(resolved)
     }
 }
 
@@ -3305,6 +3316,37 @@ mod tests {
         assert_eq!(spec.cwd, staging_dir);
         assert!(spec.args.contains(&"--skip-cover".to_string()));
         let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn staging_absolutizes_relative_download_dir_config_path() {
+        let mut config = test_config();
+        let video_dir = PathBuf::from("downloads");
+        let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec![
+            "--config-file".to_string(),
+            "custom.config".to_string(),
+            "--skip-cover".to_string(),
+        ];
+
+        let mut staging_config = config.clone();
+        staging_config.downloads.video_dir = staging_dir.clone();
+        preserve_bilibili_config_paths_for_staging(&mut staging_config, &video_dir);
+        let spec = bilibili_command_spec(&staging_config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        let config_path = command_config_path(&spec).expect("config file arg should be preserved");
+        assert!(config_path.is_absolute());
+        assert_eq!(
+            config_path,
+            std::env::current_dir()
+                .expect("current dir should be available")
+                .join("downloads")
+                .join("custom.config")
+        );
+        assert_eq!(spec.cwd, staging_dir);
+        assert!(spec.args.contains(&"--skip-cover".to_string()));
     }
 
     #[test]
