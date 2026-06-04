@@ -620,13 +620,22 @@ async fn run_staged_video_job(
         join_paths(&moved_videos)
     };
     let details = nonempty_join(vec![
-        report.details,
+        remove_staging_detail_lines(&report.details, &staging_dir),
         format!("Moved: {}", join_paths(&moved_videos)),
     ]);
     Ok(JobReport {
         saved_location,
         details,
     })
+}
+
+fn remove_staging_detail_lines(details: &str, staging_dir: &Path) -> String {
+    let staging_marker = staging_dir.display().to_string();
+    details
+        .lines()
+        .filter(|line| !line.contains(&staging_marker))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn command_spec(config: &AppConfig, job: &JobRequest) -> Result<CommandSpec> {
@@ -2800,6 +2809,22 @@ mod tests {
             .count();
         assert_eq!(replaced_files, 0);
         let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn removes_staging_paths_from_report_details() {
+        let staging_dir = PathBuf::from("/tmp/videos/.telegram-video-downloader-staging/job-1");
+        let details = [
+            "Subtitles: manual en",
+            "NFO: /tmp/videos/.telegram-video-downloader-staging/job-1/video.nfo",
+            "stderr tail",
+        ]
+        .join("\n");
+
+        assert_eq!(
+            remove_staging_detail_lines(&details, &staging_dir),
+            "Subtitles: manual en\nstderr tail"
+        );
     }
 
     #[test]
