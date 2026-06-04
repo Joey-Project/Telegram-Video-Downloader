@@ -253,8 +253,7 @@ async fn handle_message(
                     chat_id,
                     job_id,
                     job,
-                )
-                .await;
+                );
             }
         }
         RouteResult::BilibiliAuth(command) => {
@@ -591,7 +590,20 @@ fn bbdown_qr_photo_failed_message() -> String {
     "Could not send the QR image. BBDown login canceled; try /bbdown login again after Telegram photo delivery is working.".to_string()
 }
 
-async fn queue_or_prompt_job(
+fn queue_or_prompt_job(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    semaphore: Arc<Semaphore>,
+    chat_id: i64,
+    job_id: u64,
+    job: JobRequest,
+) {
+    tokio::spawn(process_job_after_duplicate_check(
+        telegram, config, semaphore, chat_id, job_id, job,
+    ));
+}
+
+async fn process_job_after_duplicate_check(
     telegram: TelegramClient,
     config: Arc<AppConfig>,
     semaphore: Arc<Semaphore>,
