@@ -93,3 +93,4 @@ superseded_by:
 - Duplicate-video offline review found overwrite could remove extra duplicate hits not replaced by staged media; overwrite now only backs up existing paths mapped to staged primary media, with coverage that unmapped duplicates remain.
 - Duplicate-video offline review found staged Bilibili could still pass a relative explicit `--config-file` when `downloads.video_dir` itself is relative; staging now writes an absolute config path and has regression coverage for that shape.
 - Duplicate-video offline review found staging early-return paths could leave job directories behind; staged video downloads now use a cleanup guard that removes the job staging directory on any exit path.
+- Independent PR review found overwrite sidecar backup could remove sidecars belonging to sibling primary media such as `Show.part2.mkv`; artifact collection now excludes sidecars that match another primary media stem and has regression coverage for `part2.nfo`.

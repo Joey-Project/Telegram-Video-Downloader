@@ -2302,7 +2302,8 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
     let Some(stem) = video.file_stem().and_then(|stem| stem.to_str()) else {
         return Ok(artifacts);
     };
-    let prefix = format!("{stem}.");
+    let mut entries = Vec::new();
+    let mut other_primary_stems = BTreeSet::new();
     for entry in
         fs::read_dir(parent).with_context(|| format!("failed to read {}", parent.display()))?
     {
@@ -2311,6 +2312,16 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
         let path = entry.path();
+        if path != video
+            && (is_video_file(&path) || is_audio_file(&path))
+            && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+        {
+            other_primary_stems.insert(stem.to_string());
+        }
+        entries.push(path);
+    }
+    let prefix = format!("{stem}.");
+    for path in entries {
         if path == video {
             continue;
         }
@@ -2319,11 +2330,22 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(&prefix))
+            && !sidecar_matches_any_primary_stem(&path, &other_primary_stems)
         {
             artifacts.push(path);
         }
     }
     Ok(artifacts)
+}
+
+fn sidecar_matches_any_primary_stem(path: &Path, primary_stems: &BTreeSet<String>) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            primary_stems
+                .iter()
+                .any(|stem| name.starts_with(&format!("{stem}.")))
+        })
 }
 
 fn is_known_video_sidecar(path: &Path) -> bool {
@@ -3024,6 +3046,8 @@ mod tests {
         fs::write(&unrelated_video, "trailer").expect("unrelated video should write");
         let unrelated_part = final_dir.join("Old Title [PHH1wTDF-1M].part2.mkv");
         fs::write(&unrelated_part, "part2").expect("unrelated part should write");
+        fs::write(unrelated_part.with_extension("nfo"), "part2-nfo")
+            .expect("unrelated part nfo should write");
         let staged = staging_dir.join("New Title [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
@@ -3062,6 +3086,11 @@ mod tests {
         assert_eq!(
             fs::read_to_string(unrelated_part).expect("unrelated part should remain"),
             "part2"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Old Title [PHH1wTDF-1M].part2.nfo"))
+                .expect("unrelated part nfo should remain"),
+            "part2-nfo"
         );
         let replaced_files = fs::read_dir(&final_dir)
             .expect("final dir should read")
