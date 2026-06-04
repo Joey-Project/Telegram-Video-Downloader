@@ -35,6 +35,8 @@ static BILIBILI_AUTH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_AUTH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static PENDING_DUPLICATE_JOBS: OnceLock<Mutex<HashMap<u64, PendingDuplicateJob>>> = OnceLock::new();
 const BILIBILI_AUTH_MAX_HTTP_TIMEOUT_SECONDS: u64 = 30;
+const DUPLICATE_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_PENDING_DUPLICATE_JOBS: usize = 256;
 
 #[derive(Debug, Clone)]
 struct PendingDuplicateJob {
@@ -42,6 +44,7 @@ struct PendingDuplicateJob {
     job_id: u64,
     job: JobRequest,
     duplicate: VideoDuplicate,
+    created_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -583,7 +586,7 @@ async fn queue_or_prompt_job(
     job_id: u64,
     job: JobRequest,
 ) {
-    match find_video_duplicate(&config, &job) {
+    match find_video_duplicate_async(Arc::clone(&config), job.clone()).await {
         Ok(Some(duplicate)) => {
             prompt_duplicate_choice(&telegram, chat_id, job_id, job, duplicate).await;
         }
@@ -605,6 +608,16 @@ async fn queue_or_prompt_job(
     }
 }
 
+async fn find_video_duplicate_async(
+    config: Arc<AppConfig>,
+    job: JobRequest,
+) -> Result<Option<VideoDuplicate>> {
+    let scan_config = (*config).clone();
+    tokio::task::spawn_blocking(move || find_video_duplicate(&scan_config, &job))
+        .await
+        .context("duplicate scan task failed")?
+}
+
 async fn prompt_duplicate_choice(
     telegram: &TelegramClient,
     chat_id: i64,
@@ -622,15 +635,20 @@ async fn prompt_duplicate_choice(
         .await
     {
         Ok(_) => {
-            pending_duplicate_jobs().lock().await.insert(
+            let now = Instant::now();
+            let mut pending_jobs = pending_duplicate_jobs().lock().await;
+            prune_expired_pending_duplicate_jobs(&mut pending_jobs, now);
+            pending_jobs.insert(
                 job_id,
                 PendingDuplicateJob {
                     chat_id,
                     job_id,
                     job,
                     duplicate,
+                    created_at: now,
                 },
             );
+            cap_pending_duplicate_jobs(&mut pending_jobs);
         }
         Err(err) => {
             warn!(chat_id, job_id, error = %err, "failed to send duplicate choice prompt");
@@ -764,9 +782,30 @@ fn pending_duplicate_jobs() -> &'static Mutex<HashMap<u64, PendingDuplicateJob>>
 
 async fn take_pending_duplicate_job(job_id: u64, chat_id: i64) -> Option<PendingDuplicateJob> {
     let mut jobs = pending_duplicate_jobs().lock().await;
+    prune_expired_pending_duplicate_jobs(&mut jobs, Instant::now());
     match jobs.get(&job_id) {
         Some(job) if job.chat_id == chat_id => jobs.remove(&job_id),
         _ => None,
+    }
+}
+
+fn prune_expired_pending_duplicate_jobs(
+    jobs: &mut HashMap<u64, PendingDuplicateJob>,
+    now: Instant,
+) {
+    jobs.retain(|_, job| now.duration_since(job.created_at) <= DUPLICATE_DECISION_TTL);
+}
+
+fn cap_pending_duplicate_jobs(jobs: &mut HashMap<u64, PendingDuplicateJob>) {
+    while jobs.len() > MAX_PENDING_DUPLICATE_JOBS {
+        let Some(oldest_job_id) = jobs
+            .iter()
+            .min_by_key(|(_, job)| job.created_at)
+            .map(|(job_id, _)| *job_id)
+        else {
+            break;
+        };
+        jobs.remove(&oldest_job_id);
     }
 }
 
@@ -1213,6 +1252,46 @@ mod tests {
             data,
             vec!["dup:42:overwrite", "dup:42:keep", "dup:42:cancel"]
         );
+    }
+
+    fn pending_duplicate_job(job_id: u64, created_at: Instant) -> PendingDuplicateJob {
+        PendingDuplicateJob {
+            chat_id: 1,
+            job_id,
+            job: JobRequest::Youtube {
+                url: format!("https://youtu.be/{job_id}"),
+            },
+            duplicate: VideoDuplicate {
+                identity: crate::downloader::VideoIdentity {
+                    provider: crate::downloader::VideoProvider::Youtube,
+                    id: job_id.to_string(),
+                },
+                existing_videos: Vec::new(),
+            },
+            created_at,
+        }
+    }
+
+    #[test]
+    fn pending_duplicate_jobs_expire_and_cap() {
+        let now = Instant::now();
+        let expired = now
+            .checked_sub(DUPLICATE_DECISION_TTL + Duration::from_secs(1))
+            .expect("test instant should support subtraction");
+        let mut jobs = HashMap::from([
+            (1, pending_duplicate_job(1, expired)),
+            (2, pending_duplicate_job(2, now)),
+        ]);
+
+        prune_expired_pending_duplicate_jobs(&mut jobs, now);
+        assert!(!jobs.contains_key(&1));
+        assert!(jobs.contains_key(&2));
+
+        for index in 3..=(MAX_PENDING_DUPLICATE_JOBS as u64 + 3) {
+            jobs.insert(index, pending_duplicate_job(index, now));
+        }
+        cap_pending_duplicate_jobs(&mut jobs);
+        assert!(jobs.len() <= MAX_PENDING_DUPLICATE_JOBS);
     }
 
     #[tokio::test]

@@ -519,6 +519,7 @@ async fn run_staged_video_job(
 
     let mut staging_config = config.clone();
     staging_config.downloads.video_dir = staging_dir.clone();
+    preserve_bilibili_config_paths_for_staging(&mut staging_config, &final_dir);
     let result = match job {
         JobRequest::Bilibili { url } => {
             run_bilibili_job_locked(&staging_config, url, progress.clone()).await
@@ -692,6 +693,37 @@ fn split_bilibili_extra_args(extra_args: &[String]) -> (Vec<String>, Option<Path
         }
     }
     (filtered, config_path)
+}
+
+fn preserve_bilibili_config_paths_for_staging(config: &mut AppConfig, final_video_dir: &Path) {
+    let mut args = Vec::with_capacity(config.bilibili.extra_args.len());
+    let mut index = 0;
+    while index < config.bilibili.extra_args.len() {
+        let arg = &config.bilibili.extra_args[index];
+        if arg == "--config-file" {
+            args.push(arg.clone());
+            if let Some(value) = config.bilibili.extra_args.get(index + 1) {
+                args.push(
+                    resolve_bbdown_config_path(final_video_dir, Path::new(value))
+                        .display()
+                        .to_string(),
+                );
+                index += 2;
+            } else {
+                index += 1;
+            }
+        } else if let Some(value) = arg.strip_prefix("--config-file=") {
+            args.push(format!(
+                "--config-file={}",
+                resolve_bbdown_config_path(final_video_dir, Path::new(value)).display()
+            ));
+            index += 1;
+        } else {
+            args.push(arg.clone());
+            index += 1;
+        }
+    }
+    config.bilibili.extra_args = args;
 }
 
 fn bbdown_base_config_path(
@@ -2847,6 +2879,67 @@ mod tests {
         );
 
         bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn staging_preserves_relative_explicit_bbdown_config_path() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-staging-explicit-config");
+        let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec![
+            "--config-file".to_string(),
+            "custom.config".to_string(),
+            "--skip-cover".to_string(),
+        ];
+
+        let mut staging_config = config.clone();
+        staging_config.downloads.video_dir = staging_dir.clone();
+        preserve_bilibili_config_paths_for_staging(&mut staging_config, &video_dir);
+        let spec = bilibili_command_spec(&staging_config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        let config_path = command_config_path(&spec).expect("config file arg should be preserved");
+        assert_eq!(config_path, video_dir.join("custom.config"));
+        assert_eq!(spec.cwd, staging_dir);
+        assert!(spec.args.contains(&"--skip-cover".to_string()));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn staging_preserves_relative_equals_bbdown_config_path() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-staging-equals-config");
+        let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec![
+            "--config-file=custom.config".to_string(),
+            "--skip-cover".to_string(),
+        ];
+
+        let mut staging_config = config.clone();
+        staging_config.downloads.video_dir = staging_dir.clone();
+        preserve_bilibili_config_paths_for_staging(&mut staging_config, &video_dir);
+        let spec = bilibili_command_spec(&staging_config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        let config_arg = spec
+            .args
+            .iter()
+            .find(|arg| arg.starts_with("--config-file="))
+            .expect("config file arg should be preserved");
+        assert_eq!(
+            config_arg,
+            &format!(
+                "--config-file={}",
+                video_dir.join("custom.config").display()
+            )
+        );
+        assert_eq!(spec.cwd, staging_dir);
+        assert!(spec.args.contains(&"--skip-cover".to_string()));
         let _ = fs::remove_dir_all(video_dir);
     }
 
