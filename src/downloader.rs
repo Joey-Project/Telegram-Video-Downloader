@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -19,6 +19,7 @@ use crate::config::AppConfig;
 use crate::router::JobRequest;
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
 const OUTPUT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_ABORT_GRACE: Duration = Duration::from_secs(3);
 
@@ -36,6 +37,57 @@ pub struct JobReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobProgress {
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoDuplicateAction {
+    Overwrite,
+    KeepBoth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoDuplicate {
+    pub identity: VideoIdentity,
+    pub existing_videos: Vec<PathBuf>,
+}
+
+impl VideoDuplicate {
+    pub fn describe_existing_videos(&self, limit: usize) -> String {
+        let mut lines = self
+            .existing_videos
+            .iter()
+            .take(limit)
+            .map(|path| format!("- {}", path.display()))
+            .collect::<Vec<_>>();
+        if self.existing_videos.len() > limit {
+            lines.push(format!(
+                "- ... and {} more",
+                self.existing_videos.len() - limit
+            ));
+        }
+        lines.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoIdentity {
+    pub provider: VideoProvider,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoProvider {
+    Bilibili,
+    Youtube,
+}
+
+impl VideoProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bilibili => "bilibili",
+            Self::Youtube => "youtube",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +169,42 @@ pub async fn run_job(
     }
 }
 
+pub async fn run_job_with_duplicate_action(
+    config: &AppConfig,
+    job: &JobRequest,
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<JobReport> {
+    if !matches!(
+        job,
+        JobRequest::Bilibili { .. } | JobRequest::Youtube { .. }
+    ) {
+        return run_job(config, job, progress).await;
+    }
+
+    run_staged_video_job(config, job, action, duplicate, progress).await
+}
+
+pub fn find_video_duplicate(
+    config: &AppConfig,
+    job: &JobRequest,
+) -> Result<Option<VideoDuplicate>> {
+    let Some(identity) = video_identity(job) else {
+        return Ok(None);
+    };
+
+    let existing_videos = list_video_files(&config.downloads.video_dir)?
+        .into_iter()
+        .filter(|video| video_matches_identity(video, &identity))
+        .collect::<Vec<_>>();
+
+    Ok((!existing_videos.is_empty()).then_some(VideoDuplicate {
+        identity,
+        existing_videos,
+    }))
+}
+
 async fn run_simple_job(
     config: &AppConfig,
     job: &JobRequest,
@@ -151,6 +239,14 @@ async fn run_bilibili_job(
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<JobReport> {
     let _guard = video_output_lock("Bilibili download", progress.as_ref()).await;
+    run_bilibili_job_locked(config, url, progress).await
+}
+
+async fn run_bilibili_job_locked(
+    config: &AppConfig,
+    url: &str,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<JobReport> {
     let mut nfo_warnings = Vec::new();
     let effective_args = bilibili_effective_args(config)?;
     let needs_mux = bilibili_needs_mux(&effective_args);
@@ -341,6 +437,16 @@ async fn run_youtube_job(
     let metadata = fetch_youtube_metadata(config, url, progress.clone()).await?;
     let subtitle_plan = select_subtitles(&metadata, &config.video.subtitle_languages);
     let _guard = video_output_lock("YouTube download", progress.as_ref()).await;
+    run_youtube_job_locked(config, url, metadata, subtitle_plan, progress).await
+}
+
+async fn run_youtube_job_locked(
+    config: &AppConfig,
+    url: &str,
+    metadata: YoutubeMetadata,
+    subtitle_plan: SubtitlePlan,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<JobReport> {
     let spec = youtube_download_command_spec(config, url, &subtitle_plan);
     let output = run_command(config, &spec, progress).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -392,6 +498,99 @@ async fn run_youtube_job(
     Ok(JobReport {
         saved_location,
         details: nonempty_join(details),
+    })
+}
+
+async fn run_staged_video_job(
+    config: &AppConfig,
+    job: &JobRequest,
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<JobReport> {
+    let _guard = video_output_lock("Staged video download", progress.as_ref()).await;
+    let final_dir = config.downloads.video_dir.clone();
+    let staging_dir = create_video_staging_dir(&final_dir)?;
+    copy_bbdown_config_for_staging(&final_dir, &staging_dir)?;
+    send_progress(
+        progress.as_ref(),
+        format!("staging: downloading into {}", staging_dir.display()),
+    );
+
+    let mut staging_config = config.clone();
+    staging_config.downloads.video_dir = staging_dir.clone();
+    let result = match job {
+        JobRequest::Bilibili { url } => {
+            run_bilibili_job_locked(&staging_config, url, progress.clone()).await
+        }
+        JobRequest::Youtube { url } => {
+            let metadata = fetch_youtube_metadata(&staging_config, url, progress.clone()).await;
+            match metadata {
+                Ok(metadata) => {
+                    let subtitle_plan =
+                        select_subtitles(&metadata, &staging_config.video.subtitle_languages);
+                    run_youtube_job_locked(
+                        &staging_config,
+                        url,
+                        metadata,
+                        subtitle_plan,
+                        progress.clone(),
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            }
+        }
+        JobRequest::Pdf { .. } => run_job(config, job, progress.clone()).await,
+    };
+
+    let report = match result {
+        Ok(report) => report,
+        Err(err) => {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Err(err);
+        }
+    };
+
+    let staged_files = collect_regular_files(&staging_dir)?
+        .into_iter()
+        .filter(|path| !is_staging_support_file(&staging_dir, path))
+        .collect::<Vec<_>>();
+    let staged_videos = staged_files
+        .iter()
+        .filter(|path| is_video_file(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if staged_videos.is_empty() {
+        let _ = fs::remove_dir_all(&staging_dir);
+        bail!(
+            "staged video download finished but no video files were found in {}",
+            staging_dir.display()
+        );
+    }
+
+    let move_report =
+        move_staged_video_files(&staging_dir, &final_dir, &staged_files, action, duplicate)
+            .with_context(|| format!("failed to move staged files from {}", staging_dir.display()));
+    let _ = fs::remove_dir_all(&staging_dir);
+    let moved_videos = move_report?;
+    send_progress(
+        progress.as_ref(),
+        format!("staging: moved {} video file(s)", moved_videos.len()),
+    );
+
+    let saved_location = if moved_videos.len() == 1 {
+        moved_videos[0].display().to_string()
+    } else {
+        join_paths(&moved_videos)
+    };
+    let details = nonempty_join(vec![
+        report.details,
+        format!("Moved: {}", join_paths(&moved_videos)),
+    ]);
+    Ok(JobReport {
+        saved_location,
+        details,
     })
 }
 
@@ -1423,6 +1622,89 @@ fn bilibili_id_from_url(raw_url: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn video_identity(job: &JobRequest) -> Option<VideoIdentity> {
+    match job {
+        JobRequest::Bilibili { url } => bilibili_id_from_url(url).map(|id| VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id,
+        }),
+        JobRequest::Youtube { url } => youtube_id_from_url(url).map(|id| VideoIdentity {
+            provider: VideoProvider::Youtube,
+            id,
+        }),
+        JobRequest::Pdf { .. } => None,
+    }
+}
+
+fn youtube_id_from_url(raw_url: &str) -> Option<String> {
+    let url = url::Url::parse(raw_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host == "youtu.be" {
+        return url
+            .path_segments()?
+            .find(|segment| !segment.is_empty())
+            .map(str::to_string);
+    }
+
+    if !domain_or_subdomain(&host, "youtube.com")
+        && !domain_or_subdomain(&host, "youtube-nocookie.com")
+    {
+        return None;
+    }
+
+    if let Some(video_id) = url
+        .query_pairs()
+        .find(|(key, _)| key == "v")
+        .map(|(_, value)| value.to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(video_id);
+    }
+
+    let mut segments = url.path_segments()?;
+    match segments.next()? {
+        "embed" | "shorts" | "live" => segments
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn domain_or_subdomain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn video_matches_identity(video: &Path, identity: &VideoIdentity) -> bool {
+    let id = identity.id.to_ascii_lowercase();
+    if path_name_contains(video, &id) {
+        return true;
+    }
+
+    metadata_sidecar_paths(video).iter().any(|path| {
+        fs::read_to_string(path).is_ok_and(|content| {
+            let content = content.to_ascii_lowercase();
+            content.contains(&id) && content.contains(identity.provider.as_str())
+        })
+    })
+}
+
+fn path_name_contains(path: &Path, needle: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().contains(needle))
+}
+
+fn metadata_sidecar_paths(video: &Path) -> Vec<PathBuf> {
+    ["nfo", "info.json", "description"]
+        .into_iter()
+        .map(|extension| video.with_extension(extension))
+        .collect()
+}
+
 fn list_video_files(root: &Path) -> Result<BTreeSet<PathBuf>> {
     let mut files = BTreeSet::new();
     collect_video_files(root, &mut files)?;
@@ -1439,6 +1721,13 @@ fn collect_video_files(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()>
         let path = entry.path();
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == VIDEO_STAGING_DIR_NAME)
+            {
+                continue;
+            }
             collect_video_files(&path, files)?;
         } else if file_type.is_file() && is_video_file(&path) {
             files.insert(path);
@@ -1458,6 +1747,398 @@ fn is_video_file(path: &Path) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn create_video_staging_dir(final_dir: &Path) -> Result<PathBuf> {
+    let parent = final_dir.join(VIDEO_STAGING_DIR_NAME);
+    fs::create_dir_all(&parent)
+        .with_context(|| format!("failed to create staging directory {}", parent.display()))?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for index in 0..1000 {
+        let candidate = parent.join(format!("job-{}-{nanos}-{index}", std::process::id()));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to create {}", candidate.display()));
+            }
+        }
+    }
+    bail!(
+        "failed to allocate a unique staging directory under {}",
+        parent.display()
+    )
+}
+
+fn copy_bbdown_config_for_staging(final_dir: &Path, staging_dir: &Path) -> Result<()> {
+    let source = final_dir.join("BBDown.config");
+    if !source.is_file() {
+        return Ok(());
+    }
+    let destination = staging_dir.join("BBDown.config");
+    fs::copy(&source, &destination).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
+    path == staging_dir.join("BBDown.config")
+}
+
+fn collect_regular_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_regular_files_recursive(root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_regular_files_recursive(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_regular_files_recursive(&path, files)?;
+        } else if file_type.is_file() {
+            files.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct MoveStep {
+    source: PathBuf,
+    destination: PathBuf,
+}
+
+#[derive(Debug)]
+struct FileBackup {
+    original: PathBuf,
+    backup: PathBuf,
+}
+
+fn move_staged_video_files(
+    staging_dir: &Path,
+    final_dir: &Path,
+    staged_files: &[PathBuf],
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
+) -> Result<Vec<PathBuf>> {
+    let backups = match action {
+        VideoDuplicateAction::Overwrite => backup_existing_duplicate_artifacts(duplicate)?,
+        VideoDuplicateAction::KeepBoth => Vec::new(),
+    };
+
+    let move_result =
+        move_staged_video_files_inner(staging_dir, final_dir, staged_files, action, duplicate);
+    match move_result {
+        Ok(moved_videos) => {
+            if matches!(action, VideoDuplicateAction::Overwrite) {
+                remove_backups(&backups);
+            }
+            Ok(moved_videos)
+        }
+        Err(err) => {
+            restore_backups(&backups);
+            Err(err)
+        }
+    }
+}
+
+fn move_staged_video_files_inner(
+    staging_dir: &Path,
+    final_dir: &Path,
+    staged_files: &[PathBuf],
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
+) -> Result<Vec<PathBuf>> {
+    let plan = staged_move_plan(staging_dir, final_dir, staged_files, action, duplicate)?;
+    execute_move_plan(plan)
+}
+
+fn staged_move_plan(
+    staging_dir: &Path,
+    final_dir: &Path,
+    staged_files: &[PathBuf],
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
+) -> Result<Vec<MoveStep>> {
+    let primary_staged_video = staged_files.iter().find(|path| is_video_file(path));
+    let primary_existing_video = duplicate.existing_videos.first();
+    let mut reserved = BTreeSet::new();
+    let primary_video_destination =
+        primary_staged_video.map(|staged_video| match (&action, primary_existing_video) {
+            (VideoDuplicateAction::Overwrite, Some(existing_video)) => unique_path_avoiding(
+                overwrite_video_destination(existing_video, staged_video),
+                &reserved,
+            ),
+            _ => unique_path_avoiding(
+                relative_destination(staging_dir, final_dir, staged_video),
+                &reserved,
+            ),
+        });
+    if let Some(destination) = &primary_video_destination {
+        reserved.insert(destination.clone());
+    }
+    let mut steps = Vec::with_capacity(staged_files.len());
+
+    for source in staged_files {
+        let destination = if primary_staged_video.is_some_and(|staged_video| source == staged_video)
+        {
+            primary_video_destination
+                .clone()
+                .unwrap_or_else(|| relative_destination(staging_dir, final_dir, source))
+        } else if let (Some(staged_video), Some(primary_destination)) =
+            (primary_staged_video, primary_video_destination.as_ref())
+        {
+            match sidecar_suffix_for_video(source, staged_video).and_then(|suffix| {
+                sidecar_destination_for_target_video(primary_destination, &suffix)
+            }) {
+                Some(preferred) => unique_path_avoiding(preferred, &reserved),
+                None => unique_path_avoiding(
+                    relative_destination(staging_dir, final_dir, source),
+                    &reserved,
+                ),
+            }
+        } else {
+            unique_path_avoiding(
+                relative_destination(staging_dir, final_dir, source),
+                &reserved,
+            )
+        };
+        reserved.insert(destination.clone());
+        steps.push(MoveStep {
+            source: source.clone(),
+            destination,
+        });
+    }
+
+    Ok(steps)
+}
+
+fn relative_destination(staging_dir: &Path, final_dir: &Path, source: &Path) -> PathBuf {
+    source
+        .strip_prefix(staging_dir)
+        .map(|relative| final_dir.join(relative))
+        .unwrap_or_else(|_| {
+            final_dir.join(
+                source
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("download")),
+            )
+        })
+}
+
+fn overwrite_video_destination(existing_video: &Path, staged_video: &Path) -> PathBuf {
+    match staged_video
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some(extension)
+            if existing_video
+                .extension()
+                .and_then(|existing| existing.to_str())
+                .is_none_or(|existing| !existing.eq_ignore_ascii_case(extension)) =>
+        {
+            existing_video.with_extension(extension)
+        }
+        _ => existing_video.to_path_buf(),
+    }
+}
+
+fn sidecar_destination_for_target_video(target_video: &Path, suffix: &str) -> Option<PathBuf> {
+    let target_stem = target_video.file_stem()?.to_str()?;
+    Some(
+        target_video
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{target_stem}{suffix}")),
+    )
+}
+
+fn sidecar_suffix_for_video(sidecar: &Path, video: &Path) -> Option<String> {
+    if sidecar == video || is_video_file(sidecar) {
+        return None;
+    }
+    let sidecar_name = sidecar.file_name()?.to_str()?;
+    let video_stem = video.file_stem()?.to_str()?;
+    sidecar_name
+        .strip_prefix(video_stem)
+        .filter(|suffix| suffix.starts_with('.'))
+        .map(str::to_string)
+}
+
+fn unique_path_avoiding(candidate: PathBuf, reserved: &BTreeSet<PathBuf>) -> PathBuf {
+    if !candidate.exists() && !reserved.contains(&candidate) {
+        return candidate;
+    }
+    let parent = candidate.parent().unwrap_or_else(|| Path::new("."));
+    let stem = candidate
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("download");
+    let extension = candidate
+        .extension()
+        .and_then(|extension| extension.to_str());
+    for index in 2.. {
+        let file_name = match extension {
+            Some(extension) => format!("{stem} ({index}).{extension}"),
+            None => format!("{stem} ({index})"),
+        };
+        let next = parent.join(file_name);
+        if !next.exists() && !reserved.contains(&next) {
+            return next;
+        }
+    }
+    unreachable!("unbounded loop returns once it finds a unique path")
+}
+
+fn execute_move_plan(plan: Vec<MoveStep>) -> Result<Vec<PathBuf>> {
+    let mut moved = Vec::new();
+    let mut moved_videos = Vec::new();
+    for step in plan {
+        if step.destination.exists() {
+            rollback_moves(&moved);
+            bail!(
+                "destination already exists while moving staged file: {}",
+                step.destination.display()
+            );
+        }
+        if let Some(parent) = step.destination.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            rollback_moves(&moved);
+            return Err(err).with_context(|| format!("failed to create {}", parent.display()));
+        }
+        if let Err(err) = fs::rename(&step.source, &step.destination) {
+            rollback_moves(&moved);
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to move {} to {}",
+                    step.source.display(),
+                    step.destination.display()
+                )
+            });
+        }
+        if is_video_file(&step.destination) {
+            moved_videos.push(step.destination.clone());
+        }
+        moved.push((step.source, step.destination));
+    }
+    Ok(moved_videos)
+}
+
+fn backup_existing_duplicate_artifacts(duplicate: &VideoDuplicate) -> Result<Vec<FileBackup>> {
+    let mut artifacts = BTreeSet::new();
+    for video in &duplicate.existing_videos {
+        for path in existing_video_artifacts(video)? {
+            artifacts.insert(path);
+        }
+    }
+
+    let mut backups = Vec::new();
+    for original in artifacts {
+        if !original.exists() {
+            continue;
+        }
+        let backup = unique_backup_path(&original);
+        if let Err(err) = fs::rename(&original, &backup) {
+            restore_backups(&backups);
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to back up existing file {} to {}",
+                    original.display(),
+                    backup.display()
+                )
+            });
+        }
+        backups.push(FileBackup { original, backup });
+    }
+
+    Ok(backups)
+}
+
+fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
+    let mut artifacts = vec![video.to_path_buf()];
+    let Some(parent) = video.parent() else {
+        return Ok(artifacts);
+    };
+    let Some(stem) = video.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(artifacts);
+    };
+    let prefix = format!("{stem}.");
+    for entry in
+        fs::read_dir(parent).with_context(|| format!("failed to read {}", parent.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path == video {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(&prefix))
+        {
+            artifacts.push(path);
+        }
+    }
+    Ok(artifacts)
+}
+
+fn unique_backup_path(original: &Path) -> PathBuf {
+    let parent = original.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = original
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("download");
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let candidate = parent.join(format!("{file_name}.replaced-{stamp}"));
+    unique_path_avoiding(candidate, &BTreeSet::new())
+}
+
+fn rollback_moves(moved: &[(PathBuf, PathBuf)]) {
+    for (source, destination) in moved.iter().rev() {
+        if destination.exists() && !source.exists() {
+            let _ = fs::rename(destination, source);
+        }
+    }
+}
+
+fn restore_backups(backups: &[FileBackup]) {
+    for backup in backups.iter().rev() {
+        if backup.backup.exists() {
+            let _ = fs::rename(&backup.backup, &backup.original);
+        }
+    }
+}
+
+fn remove_backups(backups: &[FileBackup]) {
+    for backup in backups {
+        let _ = fs::remove_file(&backup.backup);
+    }
 }
 
 fn unique_output_path(root: &Path, title: &str, extension: &str) -> PathBuf {
@@ -1796,6 +2477,209 @@ mod tests {
             ]),
             ..YoutubeMetadata::default()
         }
+    }
+
+    #[test]
+    fn extracts_video_identity_from_supported_urls() {
+        assert_eq!(
+            video_identity(&JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=PHH1wTDF-1M&t=47s".to_string()
+            }),
+            Some(VideoIdentity {
+                provider: VideoProvider::Youtube,
+                id: "PHH1wTDF-1M".to_string()
+            })
+        );
+        assert_eq!(
+            video_identity(&JobRequest::Youtube {
+                url: "https://youtu.be/PHH1wTDF-1M?t=47".to_string()
+            }),
+            Some(VideoIdentity {
+                provider: VideoProvider::Youtube,
+                id: "PHH1wTDF-1M".to_string()
+            })
+        );
+        assert_eq!(
+            video_identity(&JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string()
+            }),
+            Some(VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV12TRrBcEP8".to_string()
+            })
+        );
+        assert_eq!(
+            video_identity(&JobRequest::Bilibili {
+                url: "https://b23.tv/abc".to_string()
+            }),
+            None
+        );
+        assert_eq!(
+            youtube_id_from_url("https://notyoutube.com/watch?v=PHH1wTDF-1M"),
+            None
+        );
+    }
+
+    #[test]
+    fn finds_duplicate_video_from_filename_and_sidecar_metadata() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-detection");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let youtube_path = video_dir.join("Example [PHH1wTDF-1M].mkv");
+        fs::write(&youtube_path, "video").expect("youtube file should write");
+        let bilibili_path = video_dir.join("bilibili-title.mp4");
+        fs::write(&bilibili_path, "video").expect("bilibili file should write");
+        fs::write(
+            bilibili_path.with_extension("nfo"),
+            "<movie><uniqueid type=\"bilibili\">BV12TRrBcEP8</uniqueid></movie>",
+        )
+        .expect("nfo should write");
+
+        let youtube_duplicate = find_video_duplicate(
+            &config,
+            &JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
+            },
+        )
+        .expect("duplicate scan should succeed")
+        .expect("youtube duplicate should be found");
+        assert_eq!(youtube_duplicate.existing_videos, vec![youtube_path]);
+
+        let bilibili_duplicate = find_video_duplicate(
+            &config,
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+            },
+        )
+        .expect("duplicate scan should succeed")
+        .expect("bilibili duplicate should be found");
+        assert_eq!(bilibili_duplicate.existing_videos, vec![bilibili_path]);
+
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_staging_directory() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-staging-ignore");
+        let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(staging_dir.join("Example [PHH1wTDF-1M].mkv"), "video")
+            .expect("staged file should write");
+        config.downloads.video_dir = video_dir.clone();
+
+        let duplicate = find_video_duplicate(
+            &config,
+            &JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
+            },
+        )
+        .expect("duplicate scan should succeed");
+
+        assert_eq!(duplicate, None);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn keep_both_moves_staged_video_to_unique_path() {
+        let final_dir = temp_test_dir("keep-both-final");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let existing = final_dir.join("Example [PHH1wTDF-1M].mkv");
+        fs::write(&existing, "old").expect("existing file should write");
+        fs::write(existing.with_extension("nfo"), "old-nfo").expect("old nfo should write");
+        fs::write(existing.with_extension("info.json"), "old-json").expect("old json should write");
+        let staged = staging_dir.join("Example [PHH1wTDF-1M].mkv");
+        fs::write(&staged, "new").expect("staged file should write");
+        fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
+        fs::write(staged.with_extension("info.json"), "new-json").expect("new json should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Youtube,
+                id: "PHH1wTDF-1M".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+        )
+        .expect("staged files should move");
+
+        let kept = final_dir.join("Example [PHH1wTDF-1M] (2).mkv");
+        assert_eq!(moved, vec![kept.clone()]);
+        assert_eq!(
+            fs::read_to_string(existing).expect("old file should remain"),
+            "old"
+        );
+        assert_eq!(
+            fs::read_to_string(kept).expect("new file should move"),
+            "new"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Example [PHH1wTDF-1M] (2).nfo"))
+                .expect("new nfo should follow kept video basename"),
+            "new-nfo"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Example [PHH1wTDF-1M] (2).info.json"))
+                .expect("new info json should follow kept video basename"),
+            "new-json"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_replaces_existing_video_and_sidecar() {
+        let final_dir = temp_test_dir("overwrite-final");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let existing = final_dir.join("Old Title [PHH1wTDF-1M].mkv");
+        fs::write(&existing, "old-video").expect("existing file should write");
+        fs::write(existing.with_extension("nfo"), "old-nfo").expect("old nfo should write");
+        let staged = staging_dir.join("New Title [PHH1wTDF-1M].mkv");
+        fs::write(&staged, "new-video").expect("staged file should write");
+        fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Youtube,
+                id: "PHH1wTDF-1M".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+        )
+        .expect("staged files should overwrite existing files");
+
+        assert_eq!(moved, vec![existing.clone()]);
+        assert_eq!(
+            fs::read_to_string(&existing).expect("video should be replaced"),
+            "new-video"
+        );
+        assert_eq!(
+            fs::read_to_string(existing.with_extension("nfo")).expect("nfo should be replaced"),
+            "new-nfo"
+        );
+        let replaced_files = fs::read_dir(&final_dir)
+            .expect("final dir should read")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".replaced-"))
+            .count();
+        assert_eq!(replaced_files, 0);
+        let _ = fs::remove_dir_all(final_dir);
     }
 
     #[test]

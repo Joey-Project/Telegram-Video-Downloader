@@ -16,6 +16,7 @@ pub struct TelegramClient {
 pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
+    pub callback_query: Option<CallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -33,6 +34,13 @@ pub struct Chat {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct CallbackQuery {
+    pub id: String,
+    pub message: Option<Message>,
+    pub data: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ApiResponse<T> {
     ok: bool,
     result: Option<T>,
@@ -44,6 +52,8 @@ struct SendMessageRequest {
     chat_id: i64,
     text: String,
     disable_web_page_preview: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +62,8 @@ struct EditMessageTextRequest {
     message_id: i64,
     text: String,
     disable_web_page_preview: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -63,6 +75,25 @@ pub struct BotCommand {
 #[derive(Debug, Serialize)]
 struct SetMyCommandsRequest {
     commands: Vec<BotCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InlineKeyboardMarkup {
+    pub inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct InlineKeyboardButton {
+    pub text: String,
+    pub callback_data: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AnswerCallbackQueryRequest {
+    callback_query_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    show_alert: bool,
 }
 
 impl TelegramClient {
@@ -114,6 +145,25 @@ impl TelegramClient {
     }
 
     pub async fn send_message(&self, chat_id: i64, text: String) -> Result<i64> {
+        self.send_message_payload(chat_id, text, None).await
+    }
+
+    pub async fn send_message_with_inline_keyboard(
+        &self,
+        chat_id: i64,
+        text: String,
+        reply_markup: InlineKeyboardMarkup,
+    ) -> Result<i64> {
+        self.send_message_payload(chat_id, text, Some(reply_markup))
+            .await
+    }
+
+    async fn send_message_payload(
+        &self,
+        chat_id: i64,
+        text: String,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> Result<i64> {
         info!(
             chat_id,
             text = %redact_sensitive_text(&text),
@@ -123,6 +173,7 @@ impl TelegramClient {
             chat_id,
             text,
             disable_web_page_preview: true,
+            reply_markup,
         };
 
         let response = self
@@ -151,6 +202,34 @@ impl TelegramClient {
         message_id: i64,
         text: String,
     ) -> Result<()> {
+        self.edit_message_text_payload(chat_id, message_id, text, None)
+            .await
+    }
+
+    pub async fn edit_message_text_without_inline_keyboard(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+    ) -> Result<()> {
+        self.edit_message_text_payload(
+            chat_id,
+            message_id,
+            text,
+            Some(InlineKeyboardMarkup {
+                inline_keyboard: Vec::new(),
+            }),
+        )
+        .await
+    }
+
+    async fn edit_message_text_payload(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> Result<()> {
         info!(
             chat_id,
             message_id,
@@ -162,6 +241,7 @@ impl TelegramClient {
             message_id,
             text,
             disable_web_page_preview: true,
+            reply_markup,
         };
 
         let response = self
@@ -204,6 +284,36 @@ impl TelegramClient {
             .context("failed to decode telegram setMyCommands response")?;
 
         telegram_optional_result(response, "setMyCommands")
+    }
+
+    pub async fn answer_callback_query(
+        &self,
+        callback_query_id: String,
+        text: String,
+    ) -> Result<()> {
+        let payload = AnswerCallbackQueryRequest {
+            callback_query_id,
+            text: (!text.trim().is_empty()).then_some(text),
+            show_alert: false,
+        };
+        let response = self
+            .client
+            .post(self.api_url("answerCallbackQuery"))
+            .json(&payload)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(strip_reqwest_url)
+            .context("telegram answerCallbackQuery request failed")?
+            .error_for_status()
+            .map_err(strip_reqwest_url)
+            .context("telegram answerCallbackQuery returned HTTP error")?
+            .json::<ApiResponse<serde::de::IgnoredAny>>()
+            .await
+            .map_err(strip_reqwest_url)
+            .context("failed to decode telegram answerCallbackQuery response")?;
+
+        telegram_optional_result(response, "answerCallbackQuery")
     }
 
     pub async fn send_photo(&self, chat_id: i64, caption: String, png: Vec<u8>) -> Result<()> {
