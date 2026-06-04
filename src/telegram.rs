@@ -45,6 +45,17 @@ struct SendMessageRequest {
     disable_web_page_preview: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BotCommand {
+    pub command: String,
+    pub description: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SetMyCommandsRequest {
+    commands: Vec<BotCommand>,
+}
+
 impl TelegramClient {
     pub fn new(token: String) -> Self {
         Self {
@@ -127,6 +138,37 @@ impl TelegramClient {
         } else {
             bail!(
                 "telegram sendMessage failed: {}",
+                response
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+    }
+
+    pub async fn set_my_commands(&self, commands: Vec<BotCommand>) -> Result<()> {
+        let payload = SetMyCommandsRequest { commands };
+        let response = self
+            .client
+            .post(self.api_url("setMyCommands"))
+            .json(&payload)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(strip_reqwest_url)
+            .context("telegram setMyCommands request failed")?
+            .error_for_status()
+            .map_err(strip_reqwest_url)
+            .context("telegram setMyCommands returned HTTP error")?
+            .json::<ApiResponse<serde::de::IgnoredAny>>()
+            .await
+            .map_err(strip_reqwest_url)
+            .context("failed to decode telegram setMyCommands response")?;
+
+        if response.ok {
+            Ok(())
+        } else {
+            bail!(
+                "telegram setMyCommands failed: {}",
                 response
                     .description
                     .unwrap_or_else(|| "unknown error".to_string())

@@ -10,6 +10,7 @@ pub enum JobRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteResult {
     Jobs(Vec<JobRequest>),
+    Help,
     PdfUsage,
     BilibiliAuth(BilibiliAuthCommand),
     BilibiliAuthUsage,
@@ -38,6 +39,10 @@ pub fn route_message(text: &str, auto_pdf_domains: &[String]) -> RouteResult {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return RouteResult::Empty;
+    }
+
+    if is_help_command(trimmed) {
+        return RouteResult::Help;
     }
 
     if let Some(args) = bbdown_command_args(trimmed) {
@@ -185,6 +190,11 @@ fn classify_auto_pdf_url(raw_url: &str, auto_pdf_domains: &[String]) -> Option<J
     } else {
         None
     }
+}
+
+fn is_help_command(text: &str) -> bool {
+    let first = text.split_whitespace().next();
+    first == Some("/help") || first.is_some_and(|command| command.starts_with("/help@"))
 }
 
 fn pdf_command_args(text: &str) -> Option<&str> {
@@ -469,6 +479,22 @@ mod tests {
             RouteResult::Jobs(vec![JobRequest::Pdf {
                 url: "https://mp.weixin.qq.com/s?__biz=abc&mid=1&idx=1#rd".to_string()
             }])
+        );
+    }
+
+    #[test]
+    fn routes_help_command() {
+        assert_eq!(
+            route_message("/help", &auto_pdf_domains()),
+            RouteResult::Help
+        );
+        assert_eq!(
+            route_message("/help@DownloaderBot", &auto_pdf_domains()),
+            RouteResult::Help
+        );
+        assert_eq!(
+            route_message("/help anything", &auto_pdf_domains()),
+            RouteResult::Help
         );
     }
 
