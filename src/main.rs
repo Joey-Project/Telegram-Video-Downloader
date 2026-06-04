@@ -61,6 +61,12 @@ enum JobRunMode {
     Duplicate(DuplicateRun),
 }
 
+#[derive(Clone)]
+struct JobDispatch {
+    download_semaphore: Arc<Semaphore>,
+    duplicate_scan_semaphore: Arc<Semaphore>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -100,7 +106,10 @@ async fn main() -> Result<()> {
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
         warn!(error = %err, "failed to register Telegram bot commands");
     }
-    let semaphore = Arc::new(Semaphore::new(config.bot.concurrency));
+    let job_dispatch = JobDispatch {
+        download_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
+        duplicate_scan_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
+    };
     let next_job_id = Arc::new(AtomicU64::new(1));
     let mut offset = None;
 
@@ -125,7 +134,7 @@ async fn main() -> Result<()> {
                                 handle_message(
                                     telegram.clone(),
                                     Arc::clone(&config),
-                                    Arc::clone(&semaphore),
+                                    job_dispatch.clone(),
                                     Arc::clone(&next_job_id),
                                     message.chat.id,
                                     message.chat.is_private(),
@@ -137,7 +146,7 @@ async fn main() -> Result<()> {
                                 handle_callback_query(
                                     telegram.clone(),
                                     Arc::clone(&config),
-                                    Arc::clone(&semaphore),
+                                    Arc::clone(&job_dispatch.download_semaphore),
                                     callback_query,
                                 )
                                 .await;
@@ -227,7 +236,7 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
 async fn handle_message(
     telegram: TelegramClient,
     config: Arc<AppConfig>,
-    semaphore: Arc<Semaphore>,
+    job_dispatch: JobDispatch,
     next_job_id: Arc<AtomicU64>,
     chat_id: i64,
     is_private_chat: bool,
@@ -249,7 +258,7 @@ async fn handle_message(
                 queue_or_prompt_job(
                     telegram.clone(),
                     Arc::clone(&config),
-                    Arc::clone(&semaphore),
+                    job_dispatch.clone(),
                     chat_id,
                     job_id,
                     job,
@@ -593,31 +602,91 @@ fn bbdown_qr_photo_failed_message() -> String {
 fn queue_or_prompt_job(
     telegram: TelegramClient,
     config: Arc<AppConfig>,
-    semaphore: Arc<Semaphore>,
+    job_dispatch: JobDispatch,
     chat_id: i64,
     job_id: u64,
     job: JobRequest,
 ) {
     tokio::spawn(process_job_after_duplicate_check(
-        telegram, config, semaphore, chat_id, job_id, job,
+        telegram,
+        config,
+        job_dispatch,
+        chat_id,
+        job_id,
+        job,
     ));
 }
 
 async fn process_job_after_duplicate_check(
     telegram: TelegramClient,
     config: Arc<AppConfig>,
-    semaphore: Arc<Semaphore>,
+    job_dispatch: JobDispatch,
     chat_id: i64,
     job_id: u64,
     job: JobRequest,
 ) {
-    match find_video_duplicate_async(Arc::clone(&config), job.clone()).await {
+    if matches!(job, JobRequest::Pdf { .. }) {
+        queue_job(
+            telegram,
+            config,
+            Arc::clone(&job_dispatch.download_semaphore),
+            chat_id,
+            job_id,
+            job,
+            JobRunMode::Direct,
+        )
+        .await;
+        return;
+    }
+
+    let duplicate_scan_permit = match Arc::clone(&job_dispatch.duplicate_scan_semaphore)
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(err) => {
+            send_or_log(
+                &telegram,
+                chat_id,
+                format!(
+                    "Duplicate check unavailable for job #{job_id}; continuing without duplicate prompt.\n{}",
+                    truncate(&err.to_string())
+                ),
+            )
+            .await;
+            let run_mode = default_run_mode(&job);
+            queue_job(
+                telegram,
+                config,
+                Arc::clone(&job_dispatch.download_semaphore),
+                chat_id,
+                job_id,
+                job,
+                run_mode,
+            )
+            .await;
+            return;
+        }
+    };
+    let duplicate_scan_result = find_video_duplicate_async(Arc::clone(&config), job.clone()).await;
+    drop(duplicate_scan_permit);
+
+    match duplicate_scan_result {
         Ok(Some(duplicate)) => {
             prompt_duplicate_choice(&telegram, chat_id, job_id, job, duplicate).await;
         }
         Ok(None) => {
             let run_mode = default_run_mode(&job);
-            queue_job(telegram, config, semaphore, chat_id, job_id, job, run_mode).await;
+            queue_job(
+                telegram,
+                config,
+                Arc::clone(&job_dispatch.download_semaphore),
+                chat_id,
+                job_id,
+                job,
+                run_mode,
+            )
+            .await;
         }
         Err(err) => {
             send_or_log(
@@ -630,7 +699,16 @@ async fn process_job_after_duplicate_check(
             )
             .await;
             let run_mode = default_run_mode(&job);
-            queue_job(telegram, config, semaphore, chat_id, job_id, job, run_mode).await;
+            queue_job(
+                telegram,
+                config,
+                Arc::clone(&job_dispatch.download_semaphore),
+                chat_id,
+                job_id,
+                job,
+                run_mode,
+            )
+            .await;
         }
     }
 }

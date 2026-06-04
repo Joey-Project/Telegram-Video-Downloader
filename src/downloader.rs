@@ -1834,14 +1834,72 @@ fn video_file_stem_matches_id(path: &Path, id: &str) -> bool {
 }
 
 fn metadata_matches_identity(content: &str, identity: &VideoIdentity) -> bool {
-    content.contains(&identity.id)
-        && content
-            .to_ascii_lowercase()
-            .contains(identity.provider.as_str())
+    serde_json::from_str::<serde_json::Value>(content)
+        .is_ok_and(|metadata| info_json_matches_identity(&metadata, identity))
+        || nfo_matches_identity(content, identity)
+}
+
+fn info_json_matches_identity(metadata: &serde_json::Value, identity: &VideoIdentity) -> bool {
+    json_string_field(metadata, "id") == Some(identity.id.as_str())
+        && (["extractor", "extractor_key", "ie_key"]
+            .into_iter()
+            .filter_map(|key| json_string_field(metadata, key))
+            .any(|value| {
+                value
+                    .to_ascii_lowercase()
+                    .contains(identity.provider.as_str())
+            })
+            || json_string_field(metadata, "webpage_url")
+                .is_some_and(|url| provider_url_matches_identity(url, identity.provider)))
+}
+
+fn json_string_field<'a>(metadata: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    metadata.get(key)?.as_str()
+}
+
+fn provider_url_matches_identity(url: &str, provider: VideoProvider) -> bool {
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return false;
+    };
+    match provider {
+        VideoProvider::Bilibili => domain_or_subdomain(&host, "bilibili.com") || host == "b23.tv",
+        VideoProvider::Youtube => {
+            domain_or_subdomain(&host, "youtube.com")
+                || domain_or_subdomain(&host, "youtube-nocookie.com")
+                || host == "youtu.be"
+        }
+    }
+}
+
+fn nfo_matches_identity(content: &str, identity: &VideoIdentity) -> bool {
+    for chunk in content.split("<uniqueid").skip(1) {
+        let Some((tag, rest)) = chunk.split_once('>') else {
+            continue;
+        };
+        if !uniqueid_tag_matches_provider(tag, identity.provider) {
+            continue;
+        }
+        let Some((value, _)) = rest.split_once("</uniqueid>") else {
+            continue;
+        };
+        if value.trim() == identity.id {
+            return true;
+        }
+    }
+    false
+}
+
+fn uniqueid_tag_matches_provider(tag: &str, provider: VideoProvider) -> bool {
+    let tag = tag.to_ascii_lowercase();
+    let provider = provider.as_str();
+    tag.contains(&format!("type=\"{provider}\"")) || tag.contains(&format!("type='{provider}'"))
 }
 
 fn metadata_sidecar_paths(video: &Path) -> Vec<PathBuf> {
-    ["nfo", "info.json", "description"]
+    ["nfo", "info.json"]
         .into_iter()
         .map(|extension| video.with_extension(extension))
         .collect()
@@ -2849,6 +2907,64 @@ mod tests {
             &config,
             &JobRequest::Youtube {
                 url: "https://www.youtube.com/watch?v=ABCDEF12345".to_string(),
+            },
+        )
+        .expect("duplicate scan should succeed");
+
+        assert_eq!(duplicate, None);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn duplicate_detection_uses_structured_info_json_identity() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-info-json");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let video_path = video_dir.join("Unrelated title.mkv");
+        fs::write(&video_path, "video").expect("video file should write");
+        fs::write(
+            video_path.with_extension("info.json"),
+            serde_json::json!({
+                "id": "PHH1wTDF-1M",
+                "extractor": "youtube",
+                "webpage_url": "https://www.youtube.com/watch?v=PHH1wTDF-1M"
+            })
+            .to_string(),
+        )
+        .expect("info json should write");
+
+        let duplicate = find_video_duplicate(
+            &config,
+            &JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
+            },
+        )
+        .expect("duplicate scan should succeed")
+        .expect("info json duplicate should be found");
+
+        assert_eq!(duplicate.existing_videos, vec![video_path]);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_description_references() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-description-reference");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let video_path = video_dir.join("Unrelated title.mkv");
+        fs::write(&video_path, "video").expect("video file should write");
+        fs::write(
+            video_path.with_extension("description"),
+            "This video mentions https://www.youtube.com/watch?v=PHH1wTDF-1M",
+        )
+        .expect("description should write");
+
+        let duplicate = find_video_duplicate(
+            &config,
+            &JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
             },
         )
         .expect("duplicate scan should succeed");
