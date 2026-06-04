@@ -7,11 +7,14 @@ from datetime import datetime
 from pathlib import Path
 
 from scripts.pdf_helper import (
+    archive_print_css,
     ensure_base_tag,
     extract_title_from_html,
+    inject_head_style,
     is_bilibili_opus_url,
     is_placeholder_image_source,
     is_wechat_article_url,
+    prepare_snapshot_html,
     print_page_pdf,
     reserve_unique_pdf_path,
     rewrite_lazy_image_sources,
@@ -60,6 +63,51 @@ class PdfHelperTests(unittest.TestCase):
     def test_ensure_base_tag_preserves_existing_base(self) -> None:
         html = '<html><head><base href="https://cdn.example/"></head></html>'
         self.assertEqual(ensure_base_tag(html, "https://mp.weixin.qq.com/s?x=1"), html)
+
+    def test_inject_head_style_inserts_before_head_close(self) -> None:
+        self.assertEqual(
+            inject_head_style("<html><head><title>x</title></head></html>", "body{color:red}"),
+            "<html><head><title>x</title><style>body{color:red}</style></head></html>",
+        )
+
+    def test_inject_head_style_handles_missing_head(self) -> None:
+        self.assertEqual(
+            inject_head_style("<main>Article</main>", "body{color:red}"),
+            "<style>body{color:red}</style><main>Article</main>",
+        )
+
+    def test_bilibili_opus_archive_print_css_hides_page_chrome(self) -> None:
+        css = archive_print_css("https://www.bilibili.com/opus/1206098216310800386")
+        self.assertIn("#bili-header-container", css)
+        self.assertIn(".opus-toc", css)
+        self.assertIn(".opus-module-bottom__share", css)
+        self.assertIn("max-width: 820px", css)
+        self.assertEqual(archive_print_css("https://mp.weixin.qq.com/s?__biz=abc"), "")
+
+    def test_prepare_snapshot_html_injects_bilibili_archive_css(self) -> None:
+        html = (
+            "<html><head><title>x</title></head><body>"
+            "<script>window.close()</script>"
+            '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" '
+            'data-src="//i0.hdslb.com/article.jpg">'
+            "</body></html>"
+        )
+
+        prepared = prepare_snapshot_html(html, "https://www.bilibili.com/opus/1206098216310800386")
+
+        self.assertIn('<base href="https://www.bilibili.com/">', prepared)
+        self.assertIn("#bili-header-container", prepared)
+        self.assertIn('src="//i0.hdslb.com/article.jpg"', prepared)
+        self.assertNotIn("window.close()", prepared)
+
+    def test_prepare_snapshot_html_keeps_wechat_without_bilibili_css(self) -> None:
+        prepared = prepare_snapshot_html(
+            "<html><head></head><body>Article</body></html>",
+            "https://mp.weixin.qq.com/s?__biz=abc",
+        )
+
+        self.assertIn('<base href="https://mp.weixin.qq.com/">', prepared)
+        self.assertNotIn("#bili-header-container", prepared)
 
     def test_extract_title_from_wechat_html(self) -> None:
         html = '<h1 id="activity-name"> Example&nbsp;Title </h1><title>Fallback</title>'
