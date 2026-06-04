@@ -20,6 +20,7 @@ pub struct Update {
 
 #[derive(Debug, Deserialize)]
 pub struct Message {
+    pub message_id: i64,
     pub chat: Chat,
     pub text: Option<String>,
 }
@@ -41,6 +42,14 @@ struct ApiResponse<T> {
 #[derive(Debug, Serialize)]
 struct SendMessageRequest {
     chat_id: i64,
+    text: String,
+    disable_web_page_preview: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct EditMessageTextRequest {
+    chat_id: i64,
+    message_id: i64,
     text: String,
     disable_web_page_preview: bool,
 }
@@ -104,7 +113,7 @@ impl TelegramClient {
         }
     }
 
-    pub async fn send_message(&self, chat_id: i64, text: String) -> Result<()> {
+    pub async fn send_message(&self, chat_id: i64, text: String) -> Result<i64> {
         info!(
             chat_id,
             text = %redact_sensitive_text(&text),
@@ -128,21 +137,51 @@ impl TelegramClient {
             .error_for_status()
             .map_err(strip_reqwest_url)
             .context("telegram sendMessage returned HTTP error")?
-            .json::<ApiResponse<serde::de::IgnoredAny>>()
+            .json::<ApiResponse<Message>>()
             .await
             .map_err(strip_reqwest_url)
             .context("failed to decode telegram sendMessage response")?;
 
-        if response.ok {
-            Ok(())
-        } else {
-            bail!(
-                "telegram sendMessage failed: {}",
-                response
-                    .description
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
-        }
+        telegram_required_result(response, "sendMessage").map(|message| message.message_id)
+    }
+
+    pub async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+    ) -> Result<()> {
+        info!(
+            chat_id,
+            message_id,
+            text = %redact_sensitive_text(&text),
+            "telegram outbound message edit"
+        );
+        let payload = EditMessageTextRequest {
+            chat_id,
+            message_id,
+            text,
+            disable_web_page_preview: true,
+        };
+
+        let response = self
+            .client
+            .post(self.api_url("editMessageText"))
+            .json(&payload)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await
+            .map_err(strip_reqwest_url)
+            .context("telegram editMessageText request failed")?
+            .error_for_status()
+            .map_err(strip_reqwest_url)
+            .context("telegram editMessageText returned HTTP error")?
+            .json::<ApiResponse<serde::de::IgnoredAny>>()
+            .await
+            .map_err(strip_reqwest_url)
+            .context("failed to decode telegram editMessageText response")?;
+
+        telegram_optional_result(response, "editMessageText")
     }
 
     pub async fn set_my_commands(&self, commands: Vec<BotCommand>) -> Result<()> {
@@ -164,16 +203,7 @@ impl TelegramClient {
             .map_err(strip_reqwest_url)
             .context("failed to decode telegram setMyCommands response")?;
 
-        if response.ok {
-            Ok(())
-        } else {
-            bail!(
-                "telegram setMyCommands failed: {}",
-                response
-                    .description
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
-        }
+        telegram_optional_result(response, "setMyCommands")
     }
 
     pub async fn send_photo(&self, chat_id: i64, caption: String, png: Vec<u8>) -> Result<()> {
@@ -209,20 +239,39 @@ impl TelegramClient {
             .map_err(strip_reqwest_url)
             .context("failed to decode telegram sendPhoto response")?;
 
-        if response.ok {
-            Ok(())
-        } else {
-            bail!(
-                "telegram sendPhoto failed: {}",
-                response
-                    .description
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
-        }
+        telegram_optional_result(response, "sendPhoto")
     }
 
     fn api_url(&self, method: &str) -> String {
         format!("https://api.telegram.org/bot{}/{method}", self.token)
+    }
+}
+
+fn telegram_required_result<T>(response: ApiResponse<T>, method: &str) -> Result<T> {
+    if response.ok {
+        response
+            .result
+            .with_context(|| format!("telegram {method} response did not include result"))
+    } else {
+        bail!(
+            "telegram {method} failed: {}",
+            response
+                .description
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+}
+
+fn telegram_optional_result<T>(response: ApiResponse<T>, method: &str) -> Result<()> {
+    if response.ok {
+        Ok(())
+    } else {
+        bail!(
+            "telegram {method} failed: {}",
+            response
+                .description
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
     }
 }
 
@@ -286,5 +335,35 @@ mod tests {
             redact_sensitive_text("https://www.bilibili.com/video/BV123"),
             "https://www.bilibili.com/video/BV123"
         );
+    }
+
+    #[test]
+    fn extracts_required_telegram_result() {
+        let result = telegram_required_result(
+            ApiResponse {
+                ok: true,
+                result: Some(123),
+                description: None,
+            },
+            "sendMessage",
+        )
+        .expect("result should parse");
+
+        assert_eq!(result, 123);
+    }
+
+    #[test]
+    fn rejects_missing_required_telegram_result() {
+        let err = telegram_required_result::<i64>(
+            ApiResponse {
+                ok: true,
+                result: None,
+                description: None,
+            },
+            "sendMessage",
+        )
+        .expect_err("missing result should fail");
+
+        assert!(err.to_string().contains("did not include result"));
     }
 }

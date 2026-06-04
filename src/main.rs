@@ -567,10 +567,10 @@ async fn run_queued_job(
         }
     };
 
-    send_or_log(
+    let status_message_id = send_or_log_message_id(
         &telegram,
         chat_id,
-        format!("Started job #{job_id}: {}", job.label()),
+        job_status_message(job_id, job.label(), "Started", None),
     )
     .await;
 
@@ -579,6 +579,8 @@ async fn run_queued_job(
         telegram.clone(),
         chat_id,
         job_id,
+        job.label(),
+        status_message_id,
         progress_rx,
     ));
     let result = run_job(&config, &job, Some(progress_tx)).await;
@@ -606,29 +608,90 @@ async fn run_queued_job(
         ),
     };
 
-    send_or_log(&telegram, chat_id, message).await;
+    if let Some(message_id) = status_message_id {
+        edit_or_send(&telegram, chat_id, message_id, message).await;
+    } else {
+        send_or_log(&telegram, chat_id, message).await;
+    }
 }
 
 async fn forward_progress(
     telegram: TelegramClient,
     chat_id: i64,
     job_id: u64,
+    job_label: &'static str,
+    status_message_id: Option<i64>,
     mut progress_rx: mpsc::UnboundedReceiver<JobProgress>,
 ) {
     while let Some(progress) = progress_rx.recv().await {
-        send_or_log(
-            &telegram,
-            chat_id,
-            format!("Progress job #{job_id}: {}", progress.message),
-        )
-        .await;
+        let message = job_status_message(job_id, job_label, "Running", Some(&progress.message));
+        if let Some(message_id) = status_message_id {
+            edit_or_log(&telegram, chat_id, message_id, message).await;
+        } else {
+            send_or_log(
+                &telegram,
+                chat_id,
+                format!("Progress job #{job_id}: {}", progress.message),
+            )
+            .await;
+        }
     }
 }
 
 async fn send_or_log(telegram: &TelegramClient, chat_id: i64, text: String) {
-    if let Err(err) = telegram.send_message(chat_id, truncate(&text)).await {
-        warn!(chat_id, error = %err, "failed to send telegram message");
+    let _ = send_or_log_message_id(telegram, chat_id, text).await;
+}
+
+async fn send_or_log_message_id(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    text: String,
+) -> Option<i64> {
+    match telegram.send_message(chat_id, truncate(&text)).await {
+        Ok(message_id) => Some(message_id),
+        Err(err) => {
+            warn!(chat_id, error = %err, "failed to send telegram message");
+            None
+        }
     }
+}
+
+async fn edit_or_log(telegram: &TelegramClient, chat_id: i64, message_id: i64, text: String) {
+    if let Err(err) = telegram
+        .edit_message_text(chat_id, message_id, truncate(&text))
+        .await
+    {
+        warn!(
+            chat_id,
+            message_id,
+            error = %err,
+            "failed to edit telegram message"
+        );
+    }
+}
+
+async fn edit_or_send(telegram: &TelegramClient, chat_id: i64, message_id: i64, text: String) {
+    if let Err(err) = telegram
+        .edit_message_text(chat_id, message_id, truncate(&text))
+        .await
+    {
+        warn!(
+            chat_id,
+            message_id,
+            error = %err,
+            "failed to edit telegram message; sending a new message"
+        );
+        send_or_log(telegram, chat_id, text).await;
+    }
+}
+
+fn job_status_message(job_id: u64, job_label: &str, state: &str, progress: Option<&str>) -> String {
+    let mut message = format!("{state} job #{job_id}: {job_label}");
+    if let Some(progress) = progress.filter(|progress| !progress.trim().is_empty()) {
+        message.push('\n');
+        message.push_str(progress);
+    }
+    message
 }
 
 fn truncate(text: &str) -> String {
@@ -703,6 +766,18 @@ mod tests {
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
             vec!["help", "pdf", "bbdown"]
+        );
+    }
+
+    #[test]
+    fn job_status_message_includes_progress_when_present() {
+        assert_eq!(
+            job_status_message(7, "Bilibili download", "Started", None),
+            "Started job #7: Bilibili download"
+        );
+        assert_eq!(
+            job_status_message(7, "Bilibili download", "Running", Some("BBDown: 42%")),
+            "Running job #7: Bilibili download\nBBDown: 42%"
         );
     }
 
