@@ -1800,26 +1800,21 @@ fn domain_or_subdomain(host: &str, domain: &str) -> bool {
 }
 
 fn video_matches_identity(video: &Path, identity: &VideoIdentity) -> bool {
-    let id = identity.id.to_ascii_lowercase();
-    if video_file_stem_matches_id(video, &id) {
+    if video_file_stem_matches_id(video, &identity.id) {
         return true;
     }
 
     metadata_sidecar_paths(video).iter().any(|path| {
-        fs::read_to_string(path).is_ok_and(|content| {
-            let content = content.to_ascii_lowercase();
-            content.contains(&id) && content.contains(identity.provider.as_str())
-        })
+        fs::read_to_string(path).is_ok_and(|content| metadata_matches_identity(&content, identity))
     })
 }
 
 fn video_file_stem_matches_id(path: &Path, id: &str) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name.to_ascii_lowercase())
         .is_some_and(|name| {
             let stem = match path.file_stem().and_then(|stem| stem.to_str()) {
-                Some(stem) => stem.to_ascii_lowercase(),
+                Some(stem) => stem,
                 None => name,
             };
             stem == id
@@ -1827,6 +1822,13 @@ fn video_file_stem_matches_id(path: &Path, id: &str) -> bool {
                 || stem.ends_with(&format!("({id})"))
                 || stem.ends_with(id)
         })
+}
+
+fn metadata_matches_identity(content: &str, identity: &VideoIdentity) -> bool {
+    content.contains(&identity.id)
+        && content
+            .to_ascii_lowercase()
+            .contains(identity.provider.as_str())
 }
 
 fn metadata_sidecar_paths(video: &Path) -> Vec<PathBuf> {
@@ -2743,6 +2745,32 @@ mod tests {
         .expect("bilibili duplicate should be found");
         assert_eq!(bilibili_duplicate.existing_videos, vec![bilibili_path]);
 
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn youtube_duplicate_detection_keeps_id_case_sensitive() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-youtube-id-case");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let video_path = video_dir.join("Example [abcdef12345].mkv");
+        fs::write(&video_path, "video").expect("video file should write");
+        fs::write(
+            video_path.with_extension("nfo"),
+            r#"<movie><uniqueid type="youtube">abcdef12345</uniqueid></movie>"#,
+        )
+        .expect("nfo should write");
+
+        let duplicate = find_video_duplicate(
+            &config,
+            &JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=ABCDEF12345".to_string(),
+            },
+        )
+        .expect("duplicate scan should succeed");
+
+        assert_eq!(duplicate, None);
         let _ = fs::remove_dir_all(video_dir);
     }
 
