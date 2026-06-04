@@ -2122,15 +2122,12 @@ fn staged_move_plan(
             .find(|(staged_video, _)| source == *staged_video)
         {
             destination.clone()
-        } else if let Some(preferred) =
+        } else if let Some(preferred) = sidecar_destination_for_best_primary(
+            source,
             video_destinations
                 .iter()
-                .find_map(|(staged_video, video_destination)| {
-                    sidecar_suffix_for_video(source, staged_video).and_then(|suffix| {
-                        sidecar_destination_for_target_video(video_destination, &suffix)
-                    })
-                })
-        {
+                .map(|(staged_video, destination)| (*staged_video, destination.as_path())),
+        ) {
             unique_path_avoiding(preferred, &reserved)
         } else {
             unique_path_avoiding(
@@ -2146,6 +2143,21 @@ fn staged_move_plan(
     }
 
     Ok(steps)
+}
+
+fn sidecar_destination_for_best_primary<'a>(
+    source: &Path,
+    video_destinations: impl Iterator<Item = (&'a PathBuf, &'a Path)>,
+) -> Option<PathBuf> {
+    video_destinations
+        .filter_map(|(staged_video, video_destination)| {
+            let suffix = sidecar_suffix_for_video(source, staged_video)?;
+            let stem_len = staged_video.file_stem()?.to_str()?.len();
+            let destination = sidecar_destination_for_target_video(video_destination, &suffix)?;
+            Some((stem_len, destination))
+        })
+        .max_by_key(|(stem_len, _)| *stem_len)
+        .map(|(_, destination)| destination)
 }
 
 fn relative_destination(staging_dir: &Path, final_dir: &Path, source: &Path) -> PathBuf {
@@ -2988,6 +3000,51 @@ mod tests {
         assert!(
             !final_dir.join("Part 2.nfo").exists(),
             "new sidecar should not attach to the old colliding video"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn keep_both_uses_most_specific_primary_for_dot_prefixed_sidecars() {
+        let final_dir = temp_test_dir("keep-both-dot-prefix-sidecar");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(final_dir.join("Movie.part2.mkv"), "old-part2").expect("old part2 should write");
+        let staged_movie = staging_dir.join("Movie.mkv");
+        fs::write(&staged_movie, "new-movie").expect("movie should write");
+        let staged_part2 = staging_dir.join("Movie.part2.mkv");
+        fs::write(&staged_part2, "new-part2").expect("part2 should write");
+        fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
+            .expect("part2 nfo should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Youtube,
+                id: "PHH1wTDF-1M".to_string(),
+            },
+            existing_videos: Vec::new(),
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged files should move");
+
+        assert!(moved.contains(&final_dir.join("Movie.mkv")));
+        assert!(moved.contains(&final_dir.join("Movie.part2 (2).mkv")));
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Movie.part2 (2).nfo"))
+                .expect("part2 nfo should follow the most specific renamed video"),
+            "new-part2-nfo"
+        );
+        assert!(
+            !final_dir.join("Movie.nfo").exists(),
+            "part2 sidecar should not attach to the shorter Movie stem"
         );
         let _ = fs::remove_dir_all(final_dir);
     }
