@@ -1814,7 +1814,8 @@ fn video_matches_identity(video: &Path, identity: &VideoIdentity) -> bool {
     }
 
     metadata_sidecar_paths(video).iter().any(|path| {
-        fs::read_to_string(path).is_ok_and(|content| metadata_matches_identity(&content, identity))
+        fs::read_to_string(path)
+            .is_ok_and(|content| metadata_sidecar_matches_identity(path, &content, identity))
     })
 }
 
@@ -1826,17 +1827,25 @@ fn video_file_stem_matches_id(path: &Path, id: &str) -> bool {
                 Some(stem) => stem,
                 None => name,
             };
-            stem == id
-                || stem.ends_with(&format!("[{id}]"))
-                || stem.ends_with(&format!("({id})"))
-                || stem.ends_with(id)
+            stem == id || stem.ends_with(&format!("[{id}]")) || stem.ends_with(&format!("({id})"))
         })
 }
 
-fn metadata_matches_identity(content: &str, identity: &VideoIdentity) -> bool {
-    serde_json::from_str::<serde_json::Value>(content)
-        .is_ok_and(|metadata| info_json_matches_identity(&metadata, identity))
-        || nfo_matches_identity(content, identity)
+fn metadata_sidecar_matches_identity(path: &Path, content: &str, identity: &VideoIdentity) -> bool {
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".info.json"))
+    {
+        return serde_json::from_str::<serde_json::Value>(content)
+            .is_ok_and(|metadata| info_json_matches_identity(&metadata, identity));
+    }
+
+    if path.extension().and_then(|extension| extension.to_str()) == Some("nfo") {
+        return nfo_matches_identity(content, identity);
+    }
+
+    false
 }
 
 fn info_json_matches_identity(metadata: &serde_json::Value, identity: &VideoIdentity) -> bool {
@@ -2958,6 +2967,58 @@ mod tests {
             "This video mentions https://www.youtube.com/watch?v=PHH1wTDF-1M",
         )
         .expect("description should write");
+
+        let duplicate = find_video_duplicate(
+            &config,
+            &JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
+            },
+        )
+        .expect("duplicate scan should succeed");
+
+        assert_eq!(duplicate, None);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_info_json_free_text_references() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-info-json-free-text");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let video_path = video_dir.join("Unrelated title.mkv");
+        fs::write(&video_path, "video").expect("video file should write");
+        fs::write(
+            video_path.with_extension("info.json"),
+            serde_json::json!({
+                "id": "different-id",
+                "extractor": "youtube",
+                "description": "<uniqueid type='youtube'>PHH1wTDF-1M</uniqueid>"
+            })
+            .to_string(),
+        )
+        .expect("info json should write");
+
+        let duplicate = find_video_duplicate(
+            &config,
+            &JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
+            },
+        )
+        .expect("duplicate scan should succeed");
+
+        assert_eq!(duplicate, None);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_bare_id_filename_suffixes() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-bare-suffix");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(video_dir.join("Unrelated PHH1wTDF-1M.mkv"), "video")
+            .expect("video file should write");
 
         let duplicate = find_video_duplicate(
             &config,

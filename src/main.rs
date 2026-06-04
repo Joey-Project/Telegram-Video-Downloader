@@ -746,7 +746,7 @@ async fn prompt_duplicate_choice(
                 created_at: now,
             },
         );
-        cap_pending_duplicate_jobs(&mut pending_jobs);
+        cap_pending_duplicate_jobs(&mut pending_jobs, Some(token));
     }
     match telegram
         .send_message_with_inline_keyboard(
@@ -911,10 +911,14 @@ fn prune_expired_pending_duplicate_jobs(
     jobs.retain(|_, job| now.duration_since(job.created_at) <= DUPLICATE_DECISION_TTL);
 }
 
-fn cap_pending_duplicate_jobs(jobs: &mut HashMap<u64, PendingDuplicateJob>) {
+fn cap_pending_duplicate_jobs(
+    jobs: &mut HashMap<u64, PendingDuplicateJob>,
+    protected_token: Option<u64>,
+) {
     while jobs.len() > MAX_PENDING_DUPLICATE_JOBS {
         let Some(oldest_job_id) = jobs
             .iter()
+            .filter(|(token, _)| Some(**token) != protected_token)
             .min_by_key(|(_, job)| job.created_at)
             .map(|(job_id, _)| *job_id)
         else {
@@ -1422,8 +1426,23 @@ mod tests {
         for index in 3..=(MAX_PENDING_DUPLICATE_JOBS as u64 + 3) {
             jobs.insert(index, pending_duplicate_job(index, now));
         }
-        cap_pending_duplicate_jobs(&mut jobs);
+        cap_pending_duplicate_jobs(&mut jobs, None);
         assert!(jobs.len() <= MAX_PENDING_DUPLICATE_JOBS);
+    }
+
+    #[test]
+    fn pending_duplicate_jobs_cap_preserves_protected_token() {
+        let now = Instant::now();
+        let protected_token = 1;
+        let mut jobs = HashMap::new();
+        for token in 1..=(MAX_PENDING_DUPLICATE_JOBS as u64 + 1) {
+            jobs.insert(token, pending_duplicate_job(token, now));
+        }
+
+        cap_pending_duplicate_jobs(&mut jobs, Some(protected_token));
+
+        assert_eq!(jobs.len(), MAX_PENDING_DUPLICATE_JOBS);
+        assert!(jobs.contains_key(&protected_token));
     }
 
     #[tokio::test]
