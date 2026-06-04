@@ -4,6 +4,7 @@ mod downloader;
 mod router;
 mod telegram;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::{
@@ -19,15 +20,52 @@ use tokio::time::{Instant, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
 
 use crate::config::AppConfig;
-use crate::downloader::{JobProgress, run_job};
-use crate::router::{BilibiliAuthCommand, RouteResult, route_message};
-use crate::telegram::{BotCommand, TelegramClient};
+use crate::downloader::{
+    JobProgress, VideoDuplicate, VideoDuplicateAction, find_video_duplicate, run_job,
+    run_job_with_duplicate_action, run_video_job_staged_keep_both,
+};
+use crate::router::{BilibiliAuthCommand, JobRequest, RouteResult, route_message};
+use crate::telegram::{
+    BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient,
+};
 
 static BILIBILI_LOGIN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_LOGIN_CANCEL_NOTIFY: OnceLock<Notify> = OnceLock::new();
 static BILIBILI_AUTH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_AUTH_GENERATION: AtomicU64 = AtomicU64::new(0);
+static PENDING_DUPLICATE_JOBS: OnceLock<Mutex<HashMap<u64, PendingDuplicateJob>>> = OnceLock::new();
+static DUPLICATE_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 const BILIBILI_AUTH_MAX_HTTP_TIMEOUT_SECONDS: u64 = 30;
+const DUPLICATE_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_PENDING_DUPLICATE_JOBS: usize = 256;
+
+#[derive(Debug, Clone)]
+struct PendingDuplicateJob {
+    chat_id: i64,
+    job_id: u64,
+    job: JobRequest,
+    duplicate: VideoDuplicate,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct DuplicateRun {
+    action: VideoDuplicateAction,
+    duplicate: VideoDuplicate,
+}
+
+#[derive(Debug, Clone)]
+enum JobRunMode {
+    Direct,
+    StagedKeepBoth,
+    Duplicate(DuplicateRun),
+}
+
+#[derive(Clone)]
+struct JobDispatch {
+    download_semaphore: Arc<Semaphore>,
+    duplicate_scan_semaphore: Arc<Semaphore>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -68,7 +106,10 @@ async fn main() -> Result<()> {
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
         warn!(error = %err, "failed to register Telegram bot commands");
     }
-    let semaphore = Arc::new(Semaphore::new(config.bot.concurrency));
+    let job_dispatch = JobDispatch {
+        download_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
+        duplicate_scan_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
+    };
     let next_job_id = Arc::new(AtomicU64::new(1));
     let mut offset = None;
 
@@ -93,11 +134,20 @@ async fn main() -> Result<()> {
                                 handle_message(
                                     telegram.clone(),
                                     Arc::clone(&config),
-                                    Arc::clone(&semaphore),
+                                    job_dispatch.clone(),
                                     Arc::clone(&next_job_id),
                                     message.chat.id,
                                     message.chat.is_private(),
                                     message.text.as_deref(),
+                                )
+                                .await;
+                            }
+                            if let Some(callback_query) = update.callback_query {
+                                handle_callback_query(
+                                    telegram.clone(),
+                                    Arc::clone(&config),
+                                    Arc::clone(&job_dispatch.download_semaphore),
+                                    callback_query,
                                 )
                                 .await;
                             }
@@ -136,7 +186,12 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
                         println!("Progress replay job #{job_id}: {}", progress.message);
                     }
                 });
-                let result = run_job(&config, job, Some(progress_tx)).await;
+                let result = match job {
+                    JobRequest::Bilibili { .. } | JobRequest::Youtube { .. } => {
+                        run_video_job_staged_keep_both(&config, job, Some(progress_tx)).await
+                    }
+                    JobRequest::Pdf { .. } => run_job(&config, job, Some(progress_tx)).await,
+                };
                 let _ = progress_handle.await;
                 match result {
                     Ok(report) => {
@@ -181,7 +236,7 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
 async fn handle_message(
     telegram: TelegramClient,
     config: Arc<AppConfig>,
-    semaphore: Arc<Semaphore>,
+    job_dispatch: JobDispatch,
     next_job_id: Arc<AtomicU64>,
     chat_id: i64,
     is_private_chat: bool,
@@ -200,21 +255,14 @@ async fn handle_message(
         RouteResult::Jobs(jobs) => {
             for job in jobs {
                 let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
-                send_or_log(
-                    &telegram,
-                    chat_id,
-                    format!("Queued job #{job_id}: {}", job.label()),
-                )
-                .await;
-
-                tokio::spawn(run_queued_job(
+                queue_or_prompt_job(
                     telegram.clone(),
                     Arc::clone(&config),
-                    Arc::clone(&semaphore),
+                    job_dispatch.clone(),
                     chat_id,
                     job_id,
                     job,
-                ));
+                );
             }
         }
         RouteResult::BilibiliAuth(command) => {
@@ -551,13 +599,428 @@ fn bbdown_qr_photo_failed_message() -> String {
     "Could not send the QR image. BBDown login canceled; try /bbdown login again after Telegram photo delivery is working.".to_string()
 }
 
+fn queue_or_prompt_job(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    job_dispatch: JobDispatch,
+    chat_id: i64,
+    job_id: u64,
+    job: JobRequest,
+) {
+    tokio::spawn(process_job_after_duplicate_check(
+        telegram,
+        config,
+        job_dispatch,
+        chat_id,
+        job_id,
+        job,
+    ));
+}
+
+async fn process_job_after_duplicate_check(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    job_dispatch: JobDispatch,
+    chat_id: i64,
+    job_id: u64,
+    job: JobRequest,
+) {
+    if matches!(job, JobRequest::Pdf { .. }) {
+        queue_job(
+            telegram,
+            config,
+            Arc::clone(&job_dispatch.download_semaphore),
+            chat_id,
+            job_id,
+            job,
+            JobRunMode::Direct,
+        )
+        .await;
+        return;
+    }
+
+    let duplicate_scan_permit = match Arc::clone(&job_dispatch.duplicate_scan_semaphore)
+        .acquire_owned()
+        .await
+    {
+        Ok(permit) => permit,
+        Err(err) => {
+            send_or_log(
+                &telegram,
+                chat_id,
+                format!(
+                    "Duplicate check unavailable for job #{job_id}; continuing without duplicate prompt.\n{}",
+                    truncate(&err.to_string())
+                ),
+            )
+            .await;
+            let run_mode = default_run_mode(&job);
+            queue_job(
+                telegram,
+                config,
+                Arc::clone(&job_dispatch.download_semaphore),
+                chat_id,
+                job_id,
+                job,
+                run_mode,
+            )
+            .await;
+            return;
+        }
+    };
+    let duplicate_scan_result = find_video_duplicate_async(Arc::clone(&config), job.clone()).await;
+    drop(duplicate_scan_permit);
+
+    match duplicate_scan_result {
+        Ok(Some(duplicate)) => {
+            prompt_duplicate_choice(&telegram, chat_id, job_id, job, duplicate).await;
+        }
+        Ok(None) => {
+            let run_mode = default_run_mode(&job);
+            queue_job(
+                telegram,
+                config,
+                Arc::clone(&job_dispatch.download_semaphore),
+                chat_id,
+                job_id,
+                job,
+                run_mode,
+            )
+            .await;
+        }
+        Err(err) => {
+            send_or_log(
+                &telegram,
+                chat_id,
+                format!(
+                    "Duplicate check failed for job #{job_id}; continuing without duplicate prompt.\n{}",
+                    truncate(&err.to_string())
+                ),
+            )
+            .await;
+            let run_mode = default_run_mode(&job);
+            queue_job(
+                telegram,
+                config,
+                Arc::clone(&job_dispatch.download_semaphore),
+                chat_id,
+                job_id,
+                job,
+                run_mode,
+            )
+            .await;
+        }
+    }
+}
+
+async fn find_video_duplicate_async(
+    config: Arc<AppConfig>,
+    job: JobRequest,
+) -> Result<Option<VideoDuplicate>> {
+    let scan_config = (*config).clone();
+    tokio::task::spawn_blocking(move || find_video_duplicate(&scan_config, &job))
+        .await
+        .context("duplicate scan task failed")?
+}
+
+async fn prompt_duplicate_choice(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    job: JobRequest,
+    duplicate: VideoDuplicate,
+) {
+    let token = next_duplicate_callback_token(job_id);
+    let prompt = duplicate_choice_message(job_id, job.label(), &duplicate);
+    let now = Instant::now();
+    {
+        let mut pending_jobs = pending_duplicate_jobs().lock().await;
+        prune_expired_pending_duplicate_jobs(&mut pending_jobs, now);
+        pending_jobs.insert(
+            token,
+            PendingDuplicateJob {
+                chat_id,
+                job_id,
+                job,
+                duplicate,
+                created_at: now,
+            },
+        );
+        cap_pending_duplicate_jobs(&mut pending_jobs, Some(token));
+    }
+    match telegram
+        .send_message_with_inline_keyboard(
+            chat_id,
+            truncate(&prompt),
+            duplicate_choice_keyboard(token),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(err) => {
+            pending_duplicate_jobs().lock().await.remove(&token);
+            warn!(chat_id, job_id, error = %err, "failed to send duplicate choice prompt");
+            send_or_log(
+                telegram,
+                chat_id,
+                format!("Duplicate found for job #{job_id}, but Telegram choice prompt failed. Job canceled; send the link again to retry."),
+            )
+            .await;
+        }
+    }
+}
+
+async fn queue_job(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    semaphore: Arc<Semaphore>,
+    chat_id: i64,
+    job_id: u64,
+    job: JobRequest,
+    run_mode: JobRunMode,
+) {
+    send_or_log(
+        &telegram,
+        chat_id,
+        format!("Queued job #{job_id}: {}", job.label()),
+    )
+    .await;
+
+    tokio::spawn(run_queued_job(
+        telegram, config, semaphore, chat_id, job_id, job, run_mode,
+    ));
+}
+
+async fn handle_callback_query(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    semaphore: Arc<Semaphore>,
+    callback_query: CallbackQuery,
+) {
+    let callback_id = callback_query.id.clone();
+    let Some(data) = callback_query.data.as_deref() else {
+        answer_callback_or_log(&telegram, callback_id, "Unsupported button.".to_string()).await;
+        return;
+    };
+    let Some(callback) = parse_duplicate_callback_data(data) else {
+        answer_callback_or_log(&telegram, callback_id, "Unsupported button.".to_string()).await;
+        return;
+    };
+    let Some(message) = callback_query.message else {
+        answer_callback_or_log(
+            &telegram,
+            callback_id,
+            "This choice has expired.".to_string(),
+        )
+        .await;
+        return;
+    };
+    let chat_id = message.chat.id;
+    if !config.telegram.is_chat_allowed(chat_id) {
+        warn!(chat_id, "ignoring callback from unauthorized chat");
+        answer_callback_or_log(&telegram, callback_id, "Unauthorized chat.".to_string()).await;
+        return;
+    }
+
+    let pending = take_pending_duplicate_job(callback.token, chat_id).await;
+    let Some(pending) = pending else {
+        answer_callback_or_log(
+            &telegram,
+            callback_id,
+            "This choice has expired.".to_string(),
+        )
+        .await;
+        return;
+    };
+
+    match callback.action {
+        DuplicateCallbackAction::Cancel => {
+            answer_callback_or_log(&telegram, callback_id, "Canceled.".to_string()).await;
+            edit_without_keyboard_or_send(
+                &telegram,
+                chat_id,
+                message.message_id,
+                format!("Canceled job #{}: {}", pending.job_id, pending.job.label()),
+            )
+            .await;
+        }
+        DuplicateCallbackAction::Run(action) => {
+            let action_label = match action {
+                VideoDuplicateAction::Overwrite => "overwrite",
+                VideoDuplicateAction::KeepBoth => "keep both",
+            };
+            answer_callback_or_log(&telegram, callback_id, "Queued.".to_string()).await;
+            edit_without_keyboard_or_send(
+                &telegram,
+                chat_id,
+                message.message_id,
+                format!(
+                    "Selected {action_label} for job #{}: {}",
+                    pending.job_id,
+                    pending.job.label()
+                ),
+            )
+            .await;
+            queue_job(
+                telegram,
+                config,
+                semaphore,
+                chat_id,
+                pending.job_id,
+                pending.job,
+                JobRunMode::Duplicate(DuplicateRun {
+                    action,
+                    duplicate: pending.duplicate,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+fn default_run_mode(job: &JobRequest) -> JobRunMode {
+    match job {
+        JobRequest::Bilibili { .. } | JobRequest::Youtube { .. } => JobRunMode::StagedKeepBoth,
+        JobRequest::Pdf { .. } => JobRunMode::Direct,
+    }
+}
+
+impl From<DuplicateRun> for JobRunMode {
+    fn from(value: DuplicateRun) -> Self {
+        Self::Duplicate(value)
+    }
+}
+
+fn pending_duplicate_jobs() -> &'static Mutex<HashMap<u64, PendingDuplicateJob>> {
+    PENDING_DUPLICATE_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn take_pending_duplicate_job(token: u64, chat_id: i64) -> Option<PendingDuplicateJob> {
+    let mut jobs = pending_duplicate_jobs().lock().await;
+    prune_expired_pending_duplicate_jobs(&mut jobs, Instant::now());
+    match jobs.get(&token) {
+        Some(job) if job.chat_id == chat_id => jobs.remove(&token),
+        _ => None,
+    }
+}
+
+fn prune_expired_pending_duplicate_jobs(
+    jobs: &mut HashMap<u64, PendingDuplicateJob>,
+    now: Instant,
+) {
+    jobs.retain(|_, job| now.duration_since(job.created_at) <= DUPLICATE_DECISION_TTL);
+}
+
+fn cap_pending_duplicate_jobs(
+    jobs: &mut HashMap<u64, PendingDuplicateJob>,
+    protected_token: Option<u64>,
+) {
+    while jobs.len() > MAX_PENDING_DUPLICATE_JOBS {
+        let Some(oldest_job_id) = jobs
+            .iter()
+            .filter(|(token, _)| Some(**token) != protected_token)
+            .min_by_key(|(_, job)| job.created_at)
+            .map(|(job_id, _)| *job_id)
+        else {
+            break;
+        };
+        jobs.remove(&oldest_job_id);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DuplicateCallback {
+    token: u64,
+    action: DuplicateCallbackAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuplicateCallbackAction {
+    Run(VideoDuplicateAction),
+    Cancel,
+}
+
+fn parse_duplicate_callback_data(data: &str) -> Option<DuplicateCallback> {
+    let mut parts = data.split(':');
+    let prefix = parts.next()?;
+    let token = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let action = parts.next()?;
+    if parts.next().is_some() || prefix != "dup" {
+        return None;
+    }
+    let action = match action {
+        "overwrite" => DuplicateCallbackAction::Run(VideoDuplicateAction::Overwrite),
+        "keep" => DuplicateCallbackAction::Run(VideoDuplicateAction::KeepBoth),
+        "cancel" => DuplicateCallbackAction::Cancel,
+        _ => return None,
+    };
+    Some(DuplicateCallback { token, action })
+}
+
+fn next_duplicate_callback_token(job_id: u64) -> u64 {
+    let counter = DUPLICATE_CALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    nanos ^ counter.rotate_left(17) ^ job_id.rotate_left(32) ^ (std::process::id() as u64)
+}
+
+fn duplicate_callback_data(token: u64, action: &str) -> String {
+    format!("dup:{token:016x}:{action}")
+}
+
+fn duplicate_choice_keyboard(token: u64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![
+            vec![
+                InlineKeyboardButton {
+                    text: "Overwrite".to_string(),
+                    callback_data: duplicate_callback_data(token, "overwrite"),
+                },
+                InlineKeyboardButton {
+                    text: "Keep both".to_string(),
+                    callback_data: duplicate_callback_data(token, "keep"),
+                },
+            ],
+            vec![InlineKeyboardButton {
+                text: "Cancel".to_string(),
+                callback_data: duplicate_callback_data(token, "cancel"),
+            }],
+        ],
+    }
+}
+
+fn duplicate_choice_message(job_id: u64, job_label: &str, duplicate: &VideoDuplicate) -> String {
+    format!(
+        "Existing video found for job #{job_id}: {job_label}\nIdentity: {} {}\n\nChoose how to handle it:\n{}",
+        duplicate.identity.provider.as_str(),
+        duplicate.identity.id,
+        duplicate.describe_existing_videos(5)
+    )
+}
+
+async fn answer_callback_or_log(
+    telegram: &TelegramClient,
+    callback_query_id: String,
+    text: String,
+) {
+    if let Err(err) = telegram
+        .answer_callback_query(callback_query_id, text)
+        .await
+    {
+        warn!(error = %err, "failed to answer telegram callback query");
+    }
+}
+
 async fn run_queued_job(
     telegram: TelegramClient,
     config: Arc<AppConfig>,
     semaphore: Arc<Semaphore>,
     chat_id: i64,
     job_id: u64,
-    job: router::JobRequest,
+    job: JobRequest,
+    run_mode: JobRunMode,
 ) {
     let permit = match semaphore.acquire_owned().await {
         Ok(permit) => permit,
@@ -583,7 +1046,22 @@ async fn run_queued_job(
         status_message_id,
         progress_rx,
     ));
-    let result = run_job(&config, &job, Some(progress_tx)).await;
+    let result = match run_mode {
+        JobRunMode::Duplicate(duplicate_run) => {
+            run_job_with_duplicate_action(
+                &config,
+                &job,
+                duplicate_run.action,
+                &duplicate_run.duplicate,
+                Some(progress_tx),
+            )
+            .await
+        }
+        JobRunMode::StagedKeepBoth => {
+            run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
+        }
+        JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
+    };
     let _ = progress_task.await;
     drop(permit);
 
@@ -723,6 +1201,26 @@ async fn edit_or_send(telegram: &TelegramClient, chat_id: i64, message_id: i64, 
     }
 }
 
+async fn edit_without_keyboard_or_send(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    message_id: i64,
+    text: String,
+) {
+    if let Err(err) = telegram
+        .edit_message_text_without_inline_keyboard(chat_id, message_id, truncate(&text))
+        .await
+    {
+        warn!(
+            chat_id,
+            message_id,
+            error = %err,
+            "failed to edit telegram message without inline keyboard; sending a new message"
+        );
+        send_or_log(telegram, chat_id, text).await;
+    }
+}
+
 fn job_status_message(job_id: u64, job_label: &str, state: &str, progress: Option<&str>) -> String {
     let mut message = format!("{state} job #{job_id}: {job_label}");
     if let Some(progress) = progress.filter(|progress| !progress.trim().is_empty()) {
@@ -841,6 +1339,110 @@ mod tests {
             progress_fallback_message(7, "BBDown: 42%"),
             "Progress job #7: BBDown: 42%"
         );
+    }
+
+    #[test]
+    fn parses_duplicate_callback_data() {
+        assert_eq!(
+            parse_duplicate_callback_data("dup:000000000000002a:overwrite"),
+            Some(DuplicateCallback {
+                token: 42,
+                action: DuplicateCallbackAction::Run(VideoDuplicateAction::Overwrite)
+            })
+        );
+        assert_eq!(
+            parse_duplicate_callback_data("dup:000000000000002a:keep"),
+            Some(DuplicateCallback {
+                token: 42,
+                action: DuplicateCallbackAction::Run(VideoDuplicateAction::KeepBoth)
+            })
+        );
+        assert_eq!(
+            parse_duplicate_callback_data("dup:000000000000002a:cancel"),
+            Some(DuplicateCallback {
+                token: 42,
+                action: DuplicateCallbackAction::Cancel
+            })
+        );
+        assert_eq!(parse_duplicate_callback_data("dup:nothex:keep"), None);
+        assert_eq!(parse_duplicate_callback_data("other:42:keep"), None);
+        assert_eq!(parse_duplicate_callback_data("dup:42:unknown"), None);
+    }
+
+    #[test]
+    fn builds_duplicate_choice_keyboard() {
+        let keyboard = duplicate_choice_keyboard(42);
+        let data = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .map(|button| button.callback_data.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            data,
+            vec![
+                "dup:000000000000002a:overwrite",
+                "dup:000000000000002a:keep",
+                "dup:000000000000002a:cancel"
+            ]
+        );
+        assert!(data.iter().all(|value| value.len() <= 64));
+    }
+
+    fn pending_duplicate_job(job_id: u64, created_at: Instant) -> PendingDuplicateJob {
+        PendingDuplicateJob {
+            chat_id: 1,
+            job_id,
+            job: JobRequest::Youtube {
+                url: format!("https://youtu.be/{job_id}"),
+            },
+            duplicate: VideoDuplicate {
+                identity: crate::downloader::VideoIdentity {
+                    provider: crate::downloader::VideoProvider::Youtube,
+                    id: job_id.to_string(),
+                },
+                existing_videos: Vec::new(),
+            },
+            created_at,
+        }
+    }
+
+    #[test]
+    fn pending_duplicate_jobs_expire_and_cap() {
+        let now = Instant::now();
+        let expired = now
+            .checked_sub(DUPLICATE_DECISION_TTL + Duration::from_secs(1))
+            .expect("test instant should support subtraction");
+        let mut jobs = HashMap::from([
+            (1, pending_duplicate_job(1, expired)),
+            (2, pending_duplicate_job(2, now)),
+        ]);
+
+        prune_expired_pending_duplicate_jobs(&mut jobs, now);
+        assert!(!jobs.contains_key(&1));
+        assert!(jobs.contains_key(&2));
+
+        for index in 3..=(MAX_PENDING_DUPLICATE_JOBS as u64 + 3) {
+            jobs.insert(index, pending_duplicate_job(index, now));
+        }
+        cap_pending_duplicate_jobs(&mut jobs, None);
+        assert!(jobs.len() <= MAX_PENDING_DUPLICATE_JOBS);
+    }
+
+    #[test]
+    fn pending_duplicate_jobs_cap_preserves_protected_token() {
+        let now = Instant::now();
+        let protected_token = 1;
+        let mut jobs = HashMap::new();
+        for token in 1..=(MAX_PENDING_DUPLICATE_JOBS as u64 + 1) {
+            jobs.insert(token, pending_duplicate_job(token, now));
+        }
+
+        cap_pending_duplicate_jobs(&mut jobs, Some(protected_token));
+
+        assert_eq!(jobs.len(), MAX_PENDING_DUPLICATE_JOBS);
+        assert!(jobs.contains_key(&protected_token));
     }
 
     #[tokio::test]

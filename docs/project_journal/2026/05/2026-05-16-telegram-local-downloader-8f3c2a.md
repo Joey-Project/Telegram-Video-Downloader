@@ -3,7 +3,7 @@ id: 20260516-8f3c2a
 title: Telegram Local Downloader Bot
 status: completed
 created: 2026-05-16
-updated: 2026-06-03
+updated: 2026-06-04
 branch:
 pr:
 supersedes: []
@@ -50,9 +50,11 @@ superseded_by:
 - PDF 支持 `mp.weixin.qq.com` 自动白名单，`/pdf URL` 继续保留。
 - Bilibili `opus` 文章链接现在会规范化为 `https://www.bilibili.com/opus/<id>` 并走 PDF；PDF helper 对这类页面使用静态 HTML 快照渲染，避开页面脚本在 headless Chrome 中主动关闭页面的问题。
 - BBDown 登录态现在由 bot 通过 Bilibili Web QR API 管理：私聊 `/bbdown login/status/logout` 可扫码登录、查看账号、清理本机状态；Bilibili 下载会自动把 bot-managed cookie 注入 BBDown。
+- 视频下载现在默认先进入隐藏 staging 目录，成功后再移动到最终目录；对可直接提取媒体 ID 的 YouTube/Bilibili URL，若本地已有匹配视频或 sidecar，用户可通过 Telegram inline keyboard 选择覆盖、两者并存或取消。
 
 ## Next Steps
-- 使用真实 `config.toml` 和 Telegram bot token 做最终 live smoke test：BBDown 登录态管理、Bilibili、标题+Bilibili、YouTube、微信文章自动 PDF。
+- 继续追查 BBDown 下载 stall/合并阶段问题，基于现有失败摘要和进度日志做可复现 debug。
+- 完善 Bilibili 专栏/opus PDF archive 行为。
 - 如果 YouTube 下载遇到 yt-dlp JS runtime warning 变成实际失败，安装 deno 或 node 并在 yt-dlp 配置里启用。
 
 ## Evidence
@@ -84,3 +86,18 @@ superseded_by:
 - Final helper-backed `codex-readonly` rerun returned `LGTM` after the auth fixes.
 - PR review follow-up fixed two auth hardening issues: BBDown now receives cookies through a protected `--config-file` instead of argv, and login polling sleep is bounded by the configured timeout deadline.
 - PR review rerun corrected the BBDown config-file format to BBDown's line-oriented argument syntax and redacts Bilibili QR login URLs from outbound-message logs.
+- 2026-06-04 duplicate-video follow-up: added pre-download duplicate prompts for direct YouTube and Bilibili IDs, Telegram callback query handling with per-prompt nonce tokens, default keep-both staging for all video downloads, overwrite backup/rollback semantics, and staging-directory exclusion from duplicate scans.
+- Duplicate-video offline review found that Bilibili `--audio-only` downloads could be misclassified as failed after staging; staging now accepts audio primary media for that effective BBDown mode and has regression coverage for audio-only keep-both moves.
+- Duplicate-video offline review also found that YouTube IDs were being duplicate-matched case-insensitively; duplicate detection now keeps media IDs case-sensitive while matching provider markers case-insensitively, with a YouTube case regression test.
+- Duplicate-video offline review found audio-only duplicates were still missed during pre-download scans; duplicate detection now scans audio primary files when Bilibili effective args include `--audio-only`, with `.m4a` duplicate coverage.
+- Duplicate-video offline review found overwrite could remove extra duplicate hits not replaced by staged media; overwrite now only backs up existing paths mapped to staged primary media, with coverage that unmapped duplicates remain.
+- Duplicate-video offline review found staged Bilibili could still pass a relative explicit `--config-file` when `downloads.video_dir` itself is relative; staging now writes an absolute config path and has regression coverage for that shape.
+- Duplicate-video offline review found staging early-return paths could leave job directories behind; staged video downloads now use a cleanup guard that removes the job staging directory on any exit path.
+- Independent PR review found overwrite sidecar backup could remove sidecars belonging to sibling primary media such as `Show.part2.mkv`; artifact collection now excludes sidecars that match another primary media stem and has regression coverage for `part2.nfo`.
+- Follow-up PR reviews found staged sidecar mapping had the same dot-prefix ambiguity for outputs like `Movie.mkv` plus `Movie.part2.mkv`; staged sidecars now choose the longest matching primary stem and have regression coverage for this keep-both case.
+- Follow-up offline review found the Telegram polling loop still awaited duplicate scans; URL jobs now dispatch duplicate checks and subsequent prompt/queue handling in background tasks so callbacks and other updates are not blocked by filesystem scans.
+- Follow-up independent review found duplicate scans could fan out without bounds after being dispatched; duplicate scans now use a bounded semaphore sized to `bot.concurrency` while downloads keep their existing semaphore.
+- Follow-up offline review found duplicate detection treated `.description` free text as identity metadata; duplicate matching now uses structured `.nfo` unique IDs and `.info.json` identity fields only, with coverage for info JSON matches and ignored description references.
+- Follow-up reviews found two duplicate-prompt/sidecar edge cases: pending duplicate choices are now registered before sending the inline keyboard, and overwrite sidecar ownership now uses longest primary stem matching so `Movie.part2.nfo` is replaced with `Movie.part2.mkv` instead of being excluded by `Movie.mkv`.
+- Final triple-review follow-up found duplicate matching could still treat bare filename suffixes and `.info.json` free text as identities, and pending prompt capping could evict a just-sent token on timestamp ties; duplicate matching now requires explicit filename ID markers or typed sidecar parsing, and pending caps preserve the newly issued token.
+- Final independent review found recursive staging directories with same-stem videos could cross-attach sidecars; staged sidecar matching now requires the sidecar and primary media to share the same staging parent directory, with regression coverage for `a/Movie.mkv` and `b/Movie.mkv`.
