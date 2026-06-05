@@ -744,6 +744,7 @@ fn read_bbdown_config_args(path: &Path) -> Result<Vec<String>> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .flat_map(str::split_whitespace)
         .map(str::to_string)
         .collect())
 }
@@ -3661,7 +3662,7 @@ mod tests {
         config.downloads.video_dir = video_dir.clone();
         fs::write(
             video_dir.join("BBDown.config"),
-            "--multi-thread\ntrue\n--dfn-priority\n1080P\n",
+            "--multi-thread true\n--dfn-priority\n1080P\n",
         )
         .expect("default BBDown config should write");
         save_auth_state(
@@ -3689,7 +3690,7 @@ mod tests {
             fs::read_to_string(&config_path).expect("BBDown auth config should exist");
         assert_eq!(
             config_content,
-            "--multi-thread\ntrue\n--dfn-priority\n1080P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
+            "--multi-thread true\n--dfn-priority\n1080P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
         );
 
         bilibili_auth::release_bbdown_config_file(&config_path);
@@ -3869,7 +3870,7 @@ mod tests {
         config.downloads.video_dir = video_dir.clone();
         fs::write(
             video_dir.join("BBDown.config"),
-            "--multi-thread\ntrue\n--skip-mux\n",
+            "--multi-thread true\n--skip-mux\n",
         )
         .expect("default BBDown config should write");
 
@@ -3886,6 +3887,26 @@ mod tests {
         );
         assert!(has_bilibili_flag(&args, "--skip-mux"));
         assert!(has_bilibili_flag(&args, "--video-ascending"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn reads_effective_bilibili_flags_respects_short_config_multi_thread() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-short-config-multi-thread");
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(video_dir.join("BBDown.config"), "-mt true\n--skip-mux\n")
+            .expect("default BBDown config should write");
+
+        let args = bilibili_effective_args(&config).expect("effective args should read");
+
+        assert!(args.windows(2).any(|args| args == ["-mt", "true"]));
+        assert!(
+            !args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        assert!(has_bilibili_flag(&args, "--skip-mux"));
         let _ = fs::remove_dir_all(video_dir);
     }
 
