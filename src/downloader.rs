@@ -544,23 +544,51 @@ fn cleanup_bilibili_json_danmaku_sidecars(
     output_video: &Path,
     since: SystemTime,
 ) -> Result<()> {
-    let mut candidates = vec![
-        source_video.with_extension("json"),
-        output_video.with_extension("json"),
-    ];
-    candidates.sort();
-    candidates.dedup();
-    for candidate in candidates {
-        if candidate.is_file() && modified_since(&candidate, since) {
-            fs::remove_file(&candidate).with_context(|| {
-                format!(
-                    "failed to remove Bilibili JSON danmaku sidecar {}",
-                    candidate.display()
-                )
-            })?;
-        }
+    for candidate in current_bilibili_json_danmaku_sidecars(output_video, since, source_video)? {
+        fs::remove_file(&candidate).with_context(|| {
+            format!(
+                "failed to remove Bilibili JSON danmaku sidecar {}",
+                candidate.display()
+            )
+        })?;
     }
     Ok(())
+}
+
+fn current_bilibili_json_danmaku_sidecars(
+    output_video: &Path,
+    since: SystemTime,
+    source_video: &Path,
+) -> Result<Vec<PathBuf>> {
+    let source = source_video.with_extension("json");
+    let output = output_video.with_extension("json");
+    let mut candidates = Vec::new();
+    for candidate in [&source, &output] {
+        if is_bare_json_sidecar(candidate)
+            && candidate.is_file()
+            && modified_since(candidate, since)
+        {
+            candidates.push(candidate.clone());
+        }
+    }
+    let root = output_video.parent().unwrap_or_else(|| Path::new("."));
+    collect_current_bilibili_json_danmaku_sidecars(root, since, &mut candidates)?;
+    candidates = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            if candidate == source || candidate == output {
+                return Some(Ok(candidate));
+            }
+            match sidecar_has_current_primary_media(&candidate, since) {
+                Ok(true) => None,
+                Ok(false) => Some(Ok(candidate)),
+                Err(err) => Some(Err(err)),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
 }
 
 fn current_bilibili_danmaku_sidecars(
@@ -620,6 +648,44 @@ fn sidecar_has_current_primary_media(sidecar: &Path, since: SystemTime) -> Resul
         }
     }
     Ok(false)
+}
+
+fn is_bare_json_sidecar(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+        && !path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.ends_with(".info.json"))
+}
+
+fn collect_current_bilibili_json_danmaku_sidecars(
+    root: &Path,
+    since: SystemTime,
+    candidates: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", root.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if file_type.is_dir() {
+            collect_current_bilibili_json_danmaku_sidecars(&path, since, candidates)?;
+        } else if file_type.is_file() && is_bare_json_sidecar(&path) && modified_since(&path, since)
+        {
+            candidates.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn collect_current_bilibili_danmaku_sidecars(
@@ -4100,6 +4166,90 @@ mod tests {
 
         assert!(!source_video.with_extension("json").exists());
         assert!(!output_video.with_extension("json").exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn removes_current_custom_json_danmaku_sidecar_after_mux() {
+        let final_dir = temp_test_dir("bilibili-json-danmaku-custom-cleanup");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        let custom_json = final_dir.join("Custom Pattern.json");
+        fs::write(&custom_json, "custom-json").expect("custom json should write");
+        let output_video = final_dir.join("Final Title.mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+
+        cleanup_bilibili_json_danmaku_sidecars(&source_video, &output_video, UNIX_EPOCH)
+            .expect("custom json danmaku sidecar should be removed");
+
+        assert!(!custom_json.exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn removes_current_root_json_danmaku_sidecar_for_unique_mux_output() {
+        let final_dir = temp_test_dir("bilibili-json-danmaku-unique-cleanup");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        let root_json = final_dir.join("Final Title.json");
+        fs::write(&root_json, "root-json").expect("root json should write");
+        let output_video = final_dir.join("Final Title (2).mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+
+        cleanup_bilibili_json_danmaku_sidecars(&source_video, &output_video, UNIX_EPOCH)
+            .expect("root json danmaku sidecar should be removed");
+
+        assert!(!root_json.exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn preserves_bound_root_json_danmaku_sidecar_for_later_mux_output() {
+        let final_dir = temp_test_dir("bilibili-json-danmaku-bound-root");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 2.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        let first_output = final_dir.join("Final Title.mp4");
+        fs::write(&first_output, "first-output").expect("first output should write");
+        let root_json = first_output.with_extension("json");
+        fs::write(&root_json, "first-json").expect("root json should write");
+        let second_output = final_dir.join("Final Title (2).mp4");
+        fs::write(&second_output, "second-output").expect("second output should write");
+
+        cleanup_bilibili_json_danmaku_sidecars(&source_video, &second_output, UNIX_EPOCH)
+            .expect("bound root json sidecar should be preserved");
+
+        assert_eq!(
+            fs::read_to_string(root_json).expect("bound root json should remain"),
+            "first-json"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn preserves_info_json_sidecars_during_json_danmaku_cleanup() {
+        let final_dir = temp_test_dir("bilibili-json-danmaku-info-json");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        let output_video = final_dir.join("Final Title.mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+        let info_json = final_dir.join("Final Title.info.json");
+        fs::write(&info_json, "info-json").expect("info json should write");
+
+        cleanup_bilibili_json_danmaku_sidecars(&source_video, &output_video, UNIX_EPOCH)
+            .expect("json danmaku cleanup should succeed");
+
+        assert_eq!(
+            fs::read_to_string(info_json).expect("info json should remain"),
+            "info-json"
+        );
         let _ = fs::remove_dir_all(final_dir);
     }
 
