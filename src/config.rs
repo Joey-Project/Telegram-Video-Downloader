@@ -493,6 +493,27 @@ mod tests {
     }
 
     #[test]
+    fn preserves_explicit_bilibili_multi_thread_setting() {
+        let config = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili]
+            extra_args = ["--video-ascending", "--skip-mux", "--multi-thread", "true"]
+            "#,
+            PathBuf::from("/tmp/project"),
+        )
+        .expect("config should parse");
+
+        assert_eq!(
+            config.bilibili.extra_args,
+            vec!["--video-ascending", "--skip-mux", "--multi-thread", "true"]
+        );
+    }
+
+    #[test]
     fn rejects_zero_concurrency() {
         let err = AppConfig::from_toml_str(
             r#"

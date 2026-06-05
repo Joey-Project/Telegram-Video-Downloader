@@ -689,16 +689,32 @@ fn fallback_video_identity(job: &JobRequest) -> Option<VideoIdentity> {
 
 pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
     let mut args = vec![url.to_string(), "--skip-ai".to_string()];
-    let (auth_extra_args, explicit_config_path) = bilibili_extra_args_without_config_file(config);
+    let (mut auth_extra_args, explicit_config_path) =
+        bilibili_extra_args_without_config_file(config);
     let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
+    let base_config_args =
+        read_bbdown_base_config_args(base_config_path.as_deref(), explicit_config_path.is_some())?;
     let config_path = bilibili_auth::ensure_bbdown_config_file(
         &config.bilibili.auth.state_path,
         base_config_path.as_deref(),
     )?;
     if config_path.is_some() {
+        append_bilibili_single_thread_default_if_missing(&mut auth_extra_args, &base_config_args);
         args.extend(auth_extra_args);
     } else {
-        args.extend(config.bilibili.extra_args.iter().cloned());
+        let mut extra_args = config.bilibili.extra_args.clone();
+        append_bilibili_single_thread_default_if_missing(&mut extra_args, &base_config_args);
+        args.extend(extra_args);
+        if explicit_config_path.is_none()
+            && let Some(base_config_path) = &base_config_path
+        {
+            args.extend([
+                "--config-file".to_string(),
+                absolute_process_path(base_config_path)
+                    .display()
+                    .to_string(),
+            ]);
+        }
     }
     if let Some(config_path) = &config_path {
         args.extend([
@@ -719,11 +735,13 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
 fn bilibili_effective_args(config: &AppConfig) -> Result<Vec<String>> {
     let (filtered_args, explicit_config_path) = bilibili_extra_args_without_config_file(config);
     let mut args = Vec::new();
-    if let Some(base_config_path) = bbdown_base_config_path(config, explicit_config_path.as_deref())
-    {
-        args.extend(read_bbdown_config_args(&base_config_path)?);
-    }
+    let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
+    args.extend(read_bbdown_base_config_args(
+        base_config_path.as_deref(),
+        explicit_config_path.is_some(),
+    )?);
     args.extend(filtered_args);
+    append_bilibili_single_thread_default_if_missing(&mut args, &[]);
     Ok(args)
 }
 
@@ -738,12 +756,72 @@ fn read_bbdown_config_args(path: &Path) -> Result<Vec<String>> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .flat_map(str::split_whitespace)
         .map(str::to_string)
         .collect())
 }
 
+fn read_bbdown_base_config_args(path: Option<&Path>, required: bool) -> Result<Vec<String>> {
+    match path {
+        Some(path) if required || path.exists() => read_bbdown_config_args(path),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn append_bilibili_single_thread_default_if_missing(args: &mut Vec<String>, base_args: &[String]) {
+    if !has_bilibili_multi_thread_setting(base_args) && !has_bilibili_multi_thread_setting(args) {
+        args.extend(["--multi-thread".to_string(), "false".to_string()]);
+    }
+}
+
+fn has_bilibili_multi_thread_setting(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        arg == "--multi-thread"
+            || arg == "-mt"
+            || arg.starts_with("--multi-thread=")
+            || arg.starts_with("-mt=")
+            || arg.starts_with("--multi-thread:")
+            || arg.starts_with("-mt:")
+    })
+}
+
 fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|arg| arg == flag)
+    let mut enabled = false;
+    let equals_prefix = format!("{flag}=");
+    let colon_prefix = format!("{flag}:");
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == flag {
+            if let Some(value) = args
+                .get(index + 1)
+                .and_then(|value| parse_bool_token(value))
+            {
+                enabled = value;
+                index += 2;
+            } else {
+                enabled = true;
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(value) = arg
+            .strip_prefix(&equals_prefix)
+            .or_else(|| arg.strip_prefix(&colon_prefix))
+        {
+            enabled = parse_bool_token(value).unwrap_or(true);
+        }
+        index += 1;
+    }
+    enabled
+}
+
+fn parse_bool_token(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn bilibili_needs_mux(args: &[String]) -> bool {
@@ -835,12 +913,16 @@ fn resolve_bbdown_config_path(cwd: &Path, path: &Path) -> PathBuf {
 
 fn absolute_bbdown_config_path(cwd: &Path, path: &Path) -> PathBuf {
     let resolved = resolve_bbdown_config_path(cwd, path);
-    if resolved.is_absolute() {
-        resolved
+    absolute_process_path(&resolved)
+}
+
+fn absolute_process_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join(resolved)
+            .join(path)
     }
 }
 
@@ -3516,8 +3598,62 @@ mod tests {
         assert!(spec.args.contains(&"--skip-ai".to_string()));
         assert!(spec.args.contains(&"--video-ascending".to_string()));
         assert!(spec.args.contains(&"--skip-mux".to_string()));
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
         assert!(!spec.args.contains(&"--cookie".to_string()));
         assert_eq!(spec.cwd, test_home().join("Movies").join("Downloads"));
+    }
+
+    #[test]
+    fn builds_bilibili_command_respects_inline_multi_thread_setting() {
+        for inline_arg in ["--multi-thread:true", "-mt:true"] {
+            let mut config = test_config();
+            config.bilibili.extra_args = vec![
+                "--video-ascending".to_string(),
+                "--skip-mux".to_string(),
+                inline_arg.to_string(),
+            ];
+
+            let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+                .expect("Bilibili command should build");
+
+            assert!(spec.args.contains(&inline_arg.to_string()));
+            assert!(
+                !spec
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--multi-thread", "false"])
+            );
+        }
+    }
+
+    #[test]
+    fn passes_default_bbdown_config_without_cookie() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-default-config-no-cookie");
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--multi-thread true\n--dfn-priority\n1080P\n",
+        )
+        .expect("default BBDown config should write");
+
+        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        let config_path = command_config_path(&spec).expect("config file arg should be present");
+        assert_eq!(config_path, video_dir.join("BBDown.config"));
+        assert!(
+            !spec
+                .args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        assert!(spec.cleanup_paths.is_empty());
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[test]
@@ -3620,6 +3756,50 @@ mod tests {
     }
 
     #[test]
+    fn keeps_bbdown_config_multi_thread_setting_when_cookie_is_present() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-default-config-multi-thread");
+        let path = video_dir.join("bilibili-auth.json");
+        config.bilibili.auth.state_path = path.clone();
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--multi-thread true\n--dfn-priority\n1080P\n",
+        )
+        .expect("default BBDown config should write");
+        save_auth_state(
+            &path,
+            &AuthState {
+                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
+                mid: 123,
+                uname: "Joey".to_string(),
+                stored_at_unix: 1,
+            },
+        )
+        .expect("auth state should save");
+
+        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        assert!(
+            !spec
+                .args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        let config_path = command_config_path(&spec).expect("config file arg should be present");
+        let config_content =
+            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
+        assert_eq!(
+            config_content,
+            "--multi-thread true\n--dfn-priority\n1080P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
+        );
+
+        bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
     fn merges_explicit_bbdown_config_and_filters_duplicate_config_arg() {
         let mut config = test_config();
         let video_dir = temp_test_dir("bilibili-explicit-config");
@@ -3670,11 +3850,33 @@ mod tests {
     }
 
     #[test]
+    fn fails_bilibili_command_on_missing_explicit_bbdown_config() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-missing-explicit-config-command");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec![
+            "--config-file".to_string(),
+            "missing.config".to_string(),
+            "--skip-cover".to_string(),
+        ];
+
+        let error = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+            .expect_err("missing explicit BBDown config should fail");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to read BBDown config"));
+        assert!(message.contains("missing.config"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
     fn staging_preserves_relative_explicit_bbdown_config_path() {
         let mut config = test_config();
         let video_dir = temp_test_dir("bilibili-staging-explicit-config");
         let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
         fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(video_dir.join("custom.config"), "--skip-cover\n")
+            .expect("explicit BBDown config should write");
         config.downloads.video_dir = video_dir.clone();
         config.bilibili.extra_args = vec![
             "--config-file".to_string(),
@@ -3698,8 +3900,18 @@ mod tests {
     #[test]
     fn staging_absolutizes_relative_download_dir_config_path() {
         let mut config = test_config();
-        let video_dir = PathBuf::from("downloads");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after UNIX_EPOCH")
+            .as_nanos();
+        let video_dir = PathBuf::from(format!(
+            "downloads-bilibili-staging-explicit-config-{}-{nanos}",
+            std::process::id()
+        ));
         let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&video_dir).expect("relative video dir should create");
+        fs::write(video_dir.join("custom.config"), "--skip-cover\n")
+            .expect("explicit BBDown config should write");
         config.downloads.video_dir = video_dir.clone();
         config.bilibili.extra_args = vec![
             "--config-file".to_string(),
@@ -3719,11 +3931,12 @@ mod tests {
             config_path,
             std::env::current_dir()
                 .expect("current dir should be available")
-                .join("downloads")
+                .join(&video_dir)
                 .join("custom.config")
         );
         assert_eq!(spec.cwd, staging_dir);
         assert!(spec.args.contains(&"--skip-cover".to_string()));
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[test]
@@ -3732,6 +3945,8 @@ mod tests {
         let video_dir = temp_test_dir("bilibili-staging-equals-config");
         let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
         fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(video_dir.join("custom.config"), "--skip-cover\n")
+            .expect("explicit BBDown config should write");
         config.downloads.video_dir = video_dir.clone();
         config.bilibili.extra_args = vec![
             "--config-file=custom.config".to_string(),
@@ -3778,6 +3993,100 @@ mod tests {
         assert!(has_bilibili_flag(&args, "--skip-mux"));
         assert!(has_bilibili_flag(&args, "--video-only"));
         assert!(has_bilibili_flag(&args, "--video-ascending"));
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn reads_effective_bilibili_flags_respects_config_multi_thread() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-config-multi-thread");
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--multi-thread true\n--skip-mux\n",
+        )
+        .expect("default BBDown config should write");
+
+        let args = bilibili_effective_args(&config).expect("effective args should read");
+
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--multi-thread", "true"])
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        assert!(has_bilibili_flag(&args, "--skip-mux"));
+        assert!(has_bilibili_flag(&args, "--video-ascending"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn reads_effective_bilibili_flags_respects_short_config_multi_thread() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-short-config-multi-thread");
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(video_dir.join("BBDown.config"), "-mt true\n--skip-mux\n")
+            .expect("default BBDown config should write");
+
+        let args = bilibili_effective_args(&config).expect("effective args should read");
+
+        assert!(args.windows(2).any(|args| args == ["-mt", "true"]));
+        assert!(
+            !args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        assert!(has_bilibili_flag(&args, "--skip-mux"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn reads_effective_bilibili_flags_respects_inline_config_multi_thread() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-inline-config-multi-thread");
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--multi-thread:true\n--skip-mux\n",
+        )
+        .expect("default BBDown config should write");
+
+        let args = bilibili_effective_args(&config).expect("effective args should read");
+
+        assert!(args.iter().any(|arg| arg == "--multi-thread:true"));
+        assert!(
+            !args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        assert!(has_bilibili_flag(&args, "--skip-mux"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn reads_effective_bilibili_flags_respects_false_bool_config_values() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-false-bool-config");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec!["--video-ascending".to_string()];
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--skip-mux false\n--audio-only=false\n--video-only:false\n",
+        )
+        .expect("default BBDown config should write");
+
+        let args = bilibili_effective_args(&config).expect("effective args should read");
+
+        assert!(!bilibili_needs_mux(&args));
+        assert!(!has_bilibili_flag(&args, "--audio-only"));
+        assert!(!has_bilibili_flag(&args, "--video-only"));
         let _ = fs::remove_dir_all(video_dir);
     }
 
@@ -3804,11 +4113,41 @@ mod tests {
     }
 
     #[test]
+    fn reads_effective_bilibili_flags_fails_on_missing_explicit_config() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-missing-explicit-config");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec![
+            "--config-file=missing.config".to_string(),
+            "--video-ascending".to_string(),
+        ];
+
+        let error =
+            bilibili_effective_args(&config).expect_err("missing explicit config should fail");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to read BBDown config"));
+        assert!(message.contains("missing.config"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
     fn audio_only_disables_bilibili_mux_postprocessing() {
         assert!(bilibili_needs_mux(&["--skip-mux".to_string()]));
         assert!(!bilibili_needs_mux(&[
             "--skip-mux".to_string(),
             "--audio-only".to_string(),
+        ]));
+        assert!(!bilibili_needs_mux(&[
+            "--skip-mux".to_string(),
+            "false".to_string(),
+        ]));
+        assert!(!bilibili_needs_mux(&["--skip-mux=false".to_string()]));
+        assert!(bilibili_needs_mux(&["--skip-mux:true".to_string()]));
+        assert!(!bilibili_needs_mux(&[
+            "--skip-mux:true".to_string(),
+            "--skip-mux".to_string(),
+            "false".to_string(),
         ]));
     }
 
