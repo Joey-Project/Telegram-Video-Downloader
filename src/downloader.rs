@@ -776,7 +776,42 @@ fn has_bilibili_multi_thread_setting(args: &[String]) -> bool {
 }
 
 fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|arg| arg == flag)
+    let mut enabled = false;
+    let equals_prefix = format!("{flag}=");
+    let colon_prefix = format!("{flag}:");
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == flag {
+            if let Some(value) = args
+                .get(index + 1)
+                .and_then(|value| parse_bool_token(value))
+            {
+                enabled = value;
+                index += 2;
+            } else {
+                enabled = true;
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(value) = arg
+            .strip_prefix(&equals_prefix)
+            .or_else(|| arg.strip_prefix(&colon_prefix))
+        {
+            enabled = parse_bool_token(value).unwrap_or(true);
+        }
+        index += 1;
+    }
+    enabled
+}
+
+fn parse_bool_token(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 fn bilibili_needs_mux(args: &[String]) -> bool {
@@ -3996,6 +4031,26 @@ mod tests {
     }
 
     #[test]
+    fn reads_effective_bilibili_flags_respects_false_bool_config_values() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-false-bool-config");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec!["--video-ascending".to_string()];
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--skip-mux false\n--audio-only=false\n--video-only:false\n",
+        )
+        .expect("default BBDown config should write");
+
+        let args = bilibili_effective_args(&config).expect("effective args should read");
+
+        assert!(!bilibili_needs_mux(&args));
+        assert!(!has_bilibili_flag(&args, "--audio-only"));
+        assert!(!has_bilibili_flag(&args, "--video-only"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
     fn reads_effective_bilibili_flags_from_explicit_config() {
         let mut config = test_config();
         let video_dir = temp_test_dir("bilibili-effective-explicit-config");
@@ -4042,6 +4097,17 @@ mod tests {
         assert!(!bilibili_needs_mux(&[
             "--skip-mux".to_string(),
             "--audio-only".to_string(),
+        ]));
+        assert!(!bilibili_needs_mux(&[
+            "--skip-mux".to_string(),
+            "false".to_string(),
+        ]));
+        assert!(!bilibili_needs_mux(&["--skip-mux=false".to_string()]));
+        assert!(bilibili_needs_mux(&["--skip-mux:true".to_string()]));
+        assert!(!bilibili_needs_mux(&[
+            "--skip-mux:true".to_string(),
+            "--skip-mux".to_string(),
+            "false".to_string(),
         ]));
     }
 
