@@ -483,21 +483,12 @@ fn move_bilibili_danmaku_sidecars(
     let mut moved = Vec::new();
     for extension in ["xml", "ass"] {
         let destination = output_video.with_extension(extension);
-        let alternate_sources =
-            current_bilibili_danmaku_sidecars(output_video, extension, since, source_video)?;
         if destination.is_file() && modified_since(&destination, since) {
-            for source in alternate_sources {
-                if source != destination && source.is_file() {
-                    fs::remove_file(&source).with_context(|| {
-                        format!(
-                            "failed to remove duplicate Bilibili danmaku sidecar {}",
-                            source.display()
-                        )
-                    })?;
-                }
-            }
+            remove_direct_bilibili_danmaku_duplicate(source_video, extension, &destination, since)?;
             continue;
         }
+        let alternate_sources =
+            current_bilibili_danmaku_sidecars(output_video, extension, since, source_video)?;
         let Some(source) = select_bilibili_danmaku_source(
             output_video,
             source_video,
@@ -527,6 +518,24 @@ fn move_bilibili_danmaku_sidecars(
         moved.push(destination);
     }
     Ok(moved)
+}
+
+fn remove_direct_bilibili_danmaku_duplicate(
+    source_video: &Path,
+    extension: &str,
+    destination: &Path,
+    since: SystemTime,
+) -> Result<()> {
+    let source = source_video.with_extension(extension);
+    if source != destination && source.is_file() && modified_since(&source, since) {
+        fs::remove_file(&source).with_context(|| {
+            format!(
+                "failed to remove duplicate Bilibili danmaku sidecar {}",
+                source.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn current_bilibili_danmaku_sidecars(
@@ -3952,6 +3961,7 @@ mod tests {
         let source_video = stream_dir.join("Part 1.mp4");
         fs::write(&source_video, "video").expect("source video should write");
         fs::write(source_video.with_extension("xml"), "raw-xml").expect("source xml should write");
+        fs::write(stream_dir.join("Part 2.xml"), "part-2-xml").expect("part 2 xml should write");
         let output_video = final_dir.join("Final Title.mp4");
         fs::write(&output_video, "merged").expect("output video should write");
         fs::write(output_video.with_extension("xml"), "current-xml")
@@ -3970,6 +3980,10 @@ mod tests {
         assert!(
             !source_video.with_extension("xml").exists(),
             "duplicate raw sidecar should be removed when the root sidecar is from the same download"
+        );
+        assert!(
+            stream_dir.join("Part 2.xml").exists(),
+            "sibling sidecars should remain for later mux outputs"
         );
         let _ = fs::remove_dir_all(final_dir);
     }
