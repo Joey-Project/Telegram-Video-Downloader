@@ -146,7 +146,6 @@ impl AppConfig {
         let mut config: Self = toml::from_str(content).context("failed to parse config TOML")?;
         config.project_dir = project_dir;
         config.expand_config_paths();
-        config.normalize_bilibili_extra_args();
         config.validate()?;
         Ok(config)
     }
@@ -162,14 +161,6 @@ impl AppConfig {
         self.tools.ffmpeg = expand_home_path(&self.tools.ffmpeg);
         let state_path = expand_home_path(&self.bilibili.auth.state_path);
         self.bilibili.auth.state_path = self.resolve_project_path(&state_path);
-    }
-
-    fn normalize_bilibili_extra_args(&mut self) {
-        if !has_bilibili_multi_thread_setting(&self.bilibili.extra_args) {
-            self.bilibili
-                .extra_args
-                .extend(["--multi-thread".to_string(), "false".to_string()]);
-        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -399,12 +390,6 @@ fn default_bilibili_extra_args() -> Vec<String> {
     ]
 }
 
-fn has_bilibili_multi_thread_setting(extra_args: &[String]) -> bool {
-    extra_args
-        .iter()
-        .any(|arg| arg == "--multi-thread" || arg == "-mt" || arg.starts_with("--multi-thread="))
-}
-
 fn default_bilibili_auth_state_path() -> PathBuf {
     home_path(
         &[
@@ -510,27 +495,6 @@ mod tests {
         );
         assert_eq!(config.bilibili.auth.login_timeout_seconds, 180);
         assert_eq!(config.bilibili.auth.poll_interval_seconds, 2);
-    }
-
-    #[test]
-    fn adds_single_thread_fallback_to_legacy_bilibili_extra_args() {
-        let config = AppConfig::from_toml_str(
-            r#"
-            [telegram]
-            token = "token"
-            allow_all_chats = true
-
-            [bilibili]
-            extra_args = ["--video-ascending", "--skip-mux"]
-            "#,
-            PathBuf::from("/tmp/project"),
-        )
-        .expect("config should parse");
-
-        assert_eq!(
-            config.bilibili.extra_args,
-            vec!["--video-ascending", "--skip-mux", "--multi-thread", "false"]
-        );
     }
 
     #[test]

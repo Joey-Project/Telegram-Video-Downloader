@@ -689,16 +689,21 @@ fn fallback_video_identity(job: &JobRequest) -> Option<VideoIdentity> {
 
 pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
     let mut args = vec![url.to_string(), "--skip-ai".to_string()];
-    let (auth_extra_args, explicit_config_path) = bilibili_extra_args_without_config_file(config);
+    let (mut auth_extra_args, explicit_config_path) =
+        bilibili_extra_args_without_config_file(config);
     let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
+    let base_config_args = read_optional_bbdown_config_args(base_config_path.as_deref())?;
     let config_path = bilibili_auth::ensure_bbdown_config_file(
         &config.bilibili.auth.state_path,
         base_config_path.as_deref(),
     )?;
     if config_path.is_some() {
+        append_bilibili_single_thread_default_if_missing(&mut auth_extra_args, &base_config_args);
         args.extend(auth_extra_args);
     } else {
-        args.extend(config.bilibili.extra_args.iter().cloned());
+        let mut extra_args = config.bilibili.extra_args.clone();
+        append_bilibili_single_thread_default_if_missing(&mut extra_args, &base_config_args);
+        args.extend(extra_args);
     }
     if let Some(config_path) = &config_path {
         args.extend([
@@ -719,11 +724,12 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
 fn bilibili_effective_args(config: &AppConfig) -> Result<Vec<String>> {
     let (filtered_args, explicit_config_path) = bilibili_extra_args_without_config_file(config);
     let mut args = Vec::new();
-    if let Some(base_config_path) = bbdown_base_config_path(config, explicit_config_path.as_deref())
-    {
-        args.extend(read_bbdown_config_args(&base_config_path)?);
-    }
+    let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
+    args.extend(read_optional_bbdown_config_args(
+        base_config_path.as_deref(),
+    )?);
     args.extend(filtered_args);
+    append_bilibili_single_thread_default_if_missing(&mut args, &[]);
     Ok(args)
 }
 
@@ -740,6 +746,28 @@ fn read_bbdown_config_args(path: &Path) -> Result<Vec<String>> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_string)
         .collect())
+}
+
+fn read_optional_bbdown_config_args(path: Option<&Path>) -> Result<Vec<String>> {
+    match path {
+        Some(path) if path.exists() => read_bbdown_config_args(path),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn append_bilibili_single_thread_default_if_missing(args: &mut Vec<String>, base_args: &[String]) {
+    if !has_bilibili_multi_thread_setting(base_args) && !has_bilibili_multi_thread_setting(args) {
+        args.extend(["--multi-thread".to_string(), "false".to_string()]);
+    }
+}
+
+fn has_bilibili_multi_thread_setting(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        arg == "--multi-thread"
+            || arg == "-mt"
+            || arg.starts_with("--multi-thread=")
+            || arg.starts_with("-mt=")
+    })
 }
 
 fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
@@ -3625,6 +3653,51 @@ mod tests {
     }
 
     #[test]
+    fn keeps_bbdown_config_multi_thread_setting_when_cookie_is_present() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-default-config-multi-thread");
+        let path = video_dir.join("bilibili-auth.json");
+        config.bilibili.auth.state_path = path.clone();
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec!["--video-ascending".to_string()];
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--multi-thread\ntrue\n--dfn-priority\n1080P\n",
+        )
+        .expect("default BBDown config should write");
+        save_auth_state(
+            &path,
+            &AuthState {
+                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
+                mid: 123,
+                uname: "Joey".to_string(),
+                stored_at_unix: 1,
+            },
+        )
+        .expect("auth state should save");
+
+        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        assert!(
+            !spec
+                .args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        let config_path = command_config_path(&spec).expect("config file arg should be present");
+        let config_content =
+            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
+        assert_eq!(
+            config_content,
+            "--multi-thread\ntrue\n--dfn-priority\n1080P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
+        );
+
+        bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
     fn merges_explicit_bbdown_config_and_filters_duplicate_config_arg() {
         let mut config = test_config();
         let video_dir = temp_test_dir("bilibili-explicit-config");
@@ -3782,6 +3855,38 @@ mod tests {
 
         assert!(has_bilibili_flag(&args, "--skip-mux"));
         assert!(has_bilibili_flag(&args, "--video-only"));
+        assert!(has_bilibili_flag(&args, "--video-ascending"));
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn reads_effective_bilibili_flags_respects_config_multi_thread() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-config-multi-thread");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec!["--video-ascending".to_string()];
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--multi-thread\ntrue\n--skip-mux\n",
+        )
+        .expect("default BBDown config should write");
+
+        let args = bilibili_effective_args(&config).expect("effective args should read");
+
+        assert!(
+            args.windows(2)
+                .any(|args| args == ["--multi-thread", "true"])
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        assert!(has_bilibili_flag(&args, "--skip-mux"));
         assert!(has_bilibili_flag(&args, "--video-ascending"));
         let _ = fs::remove_dir_all(video_dir);
     }
