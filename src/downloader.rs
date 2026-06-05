@@ -454,7 +454,12 @@ async fn merge_bilibili_streams(
             .as_deref()
             .or_else(|| video.file_stem().and_then(|stem| stem.to_str()))
             .unwrap_or("bilibili");
-        let output = unique_output_path(&config.downloads.video_dir, title, "mp4");
+        let output = unique_bilibili_mux_output_path(
+            &config.downloads.video_dir,
+            title,
+            "mp4",
+            command_started_at,
+        );
         let spec = ffmpeg_mux_command_spec(config, video, &audio, &output);
         let output_result = run_command(config, &spec, progress.clone()).await?;
         if !output_result.status.success() {
@@ -2893,11 +2898,16 @@ fn remove_backups(backups: &[FileBackup]) {
     }
 }
 
-fn unique_output_path(root: &Path, title: &str, extension: &str) -> PathBuf {
+fn unique_bilibili_mux_output_path(
+    root: &Path,
+    title: &str,
+    extension: &str,
+    since: SystemTime,
+) -> PathBuf {
     let stem = safe_file_stem(title);
     let mut candidate = root.join(format!("{stem}.{extension}"));
     let mut index = 2;
-    while candidate.exists() || output_sidecar_exists(&candidate) {
+    while candidate.exists() || stale_output_sidecar_exists(&candidate, since) {
         candidate = root.join(format!("{stem} ({index}).{extension}"));
         index += 1;
     }
@@ -2905,6 +2915,14 @@ fn unique_output_path(root: &Path, title: &str, extension: &str) -> PathBuf {
 }
 
 fn output_sidecar_exists(output: &Path) -> bool {
+    output_sidecar_exists_matching(output, |_| true)
+}
+
+fn stale_output_sidecar_exists(output: &Path, since: SystemTime) -> bool {
+    output_sidecar_exists_matching(output, |path| !modified_since(path, since))
+}
+
+fn output_sidecar_exists_matching(output: &Path, include: impl Fn(&Path) -> bool) -> bool {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     let Some(output_stem) = output.file_stem().and_then(|stem| stem.to_str()) else {
         return false;
@@ -2932,7 +2950,11 @@ fn output_sidecar_exists(output: &Path) -> bool {
     }
 
     paths.into_iter().any(|path| {
-        if path == output || is_video_file(&path) || !is_known_video_sidecar(&path) {
+        if path == output
+            || is_video_file(&path)
+            || !is_known_video_sidecar(&path)
+            || !include(&path)
+        {
             return false;
         }
         best_primary_stem_for_sidecar(&path, &primary_stems).as_deref() == Some(output_stem)
@@ -4369,15 +4391,33 @@ mod tests {
     }
 
     #[test]
-    fn bilibili_mux_output_avoids_root_danmaku_sidecars_without_replacement() {
+    fn bilibili_mux_output_avoids_stale_root_danmaku_sidecars_without_replacement() {
         let final_dir = temp_test_dir("bilibili-output-current-sidecar");
         fs::create_dir_all(&final_dir).expect("final dir should create");
         fs::write(final_dir.join("Final Title.xml"), "current-xml")
             .expect("current xml should write");
 
-        let output = unique_output_path(&final_dir, "Final Title", "mp4");
+        let output = unique_bilibili_mux_output_path(
+            &final_dir,
+            "Final Title",
+            "mp4",
+            SystemTime::now() + Duration::from_secs(1),
+        );
 
         assert_eq!(output, final_dir.join("Final Title (2).mp4"));
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn bilibili_mux_output_uses_current_root_danmaku_sidecar_stem() {
+        let final_dir = temp_test_dir("bilibili-output-current-sidecar-stem");
+        fs::create_dir_all(&final_dir).expect("final dir should create");
+        fs::write(final_dir.join("Final Title.xml"), "current-xml")
+            .expect("current xml should write");
+
+        let output = unique_bilibili_mux_output_path(&final_dir, "Final Title", "mp4", UNIX_EPOCH);
+
+        assert_eq!(output, final_dir.join("Final Title.mp4"));
         let _ = fs::remove_dir_all(final_dir);
     }
 
