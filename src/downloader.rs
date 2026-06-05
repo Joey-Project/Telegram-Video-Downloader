@@ -482,23 +482,23 @@ fn move_bilibili_danmaku_sidecars(
 ) -> Result<Vec<PathBuf>> {
     let mut moved = Vec::new();
     for extension in ["xml", "ass"] {
-        let source = source_video.with_extension(extension);
         let destination = output_video.with_extension(extension);
-        if source == destination {
-            continue;
-        }
+        let alternate_sources =
+            current_bilibili_danmaku_sidecars(output_video, extension, since, source_video)?;
         if destination.is_file() && modified_since(&destination, since) {
-            if source.is_file() {
-                fs::remove_file(&source).with_context(|| {
-                    format!(
-                        "failed to remove duplicate Bilibili danmaku sidecar {}",
-                        source.display()
-                    )
-                })?;
+            for source in alternate_sources {
+                if source != destination && source.is_file() {
+                    fs::remove_file(&source).with_context(|| {
+                        format!(
+                            "failed to remove duplicate Bilibili danmaku sidecar {}",
+                            source.display()
+                        )
+                    })?;
+                }
             }
             continue;
         }
-        if !source.is_file() {
+        let Some(source) = select_bilibili_danmaku_source(output_video, alternate_sources) else {
             if destination.exists() {
                 fs::remove_file(&destination).with_context(|| {
                     format!(
@@ -507,6 +507,9 @@ fn move_bilibili_danmaku_sidecars(
                     )
                 })?;
             }
+            continue;
+        };
+        if source == destination {
             continue;
         }
         if destination.exists() {
@@ -527,6 +530,99 @@ fn move_bilibili_danmaku_sidecars(
         moved.push(destination);
     }
     Ok(moved)
+}
+
+fn current_bilibili_danmaku_sidecars(
+    output_video: &Path,
+    extension: &str,
+    since: SystemTime,
+    source_video: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut candidates = Vec::new();
+    let source = source_video.with_extension(extension);
+    if source.is_file() {
+        candidates.push(source);
+    }
+    let root = output_video.parent().unwrap_or_else(|| Path::new("."));
+    collect_current_bilibili_danmaku_sidecars(root, extension, since, &mut candidates)?;
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn collect_current_bilibili_danmaku_sidecars(
+    root: &Path,
+    extension: &str,
+    since: SystemTime,
+    candidates: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", root.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if file_type.is_dir() {
+            collect_current_bilibili_danmaku_sidecars(&path, extension, since, candidates)?;
+        } else if file_type.is_file()
+            && path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(extension))
+            && modified_since(&path, since)
+        {
+            candidates.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn select_bilibili_danmaku_source(
+    output_video: &Path,
+    candidates: Vec<PathBuf>,
+) -> Option<PathBuf> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let output_stem = output_video.file_stem()?.to_str()?;
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate.file_stem().and_then(|stem| stem.to_str()) == Some(output_stem))
+    {
+        return Some(candidate.clone());
+    }
+    let base_stem = stem_without_unique_suffix(output_stem);
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate.file_stem().and_then(|stem| stem.to_str()) == Some(base_stem))
+    {
+        return Some(candidate.clone());
+    }
+    if candidates.len() == 1 {
+        return candidates.into_iter().next();
+    }
+    None
+}
+
+fn stem_without_unique_suffix(stem: &str) -> &str {
+    let Some(stripped) = stem.strip_suffix(')') else {
+        return stem;
+    };
+    let Some((base, suffix)) = stripped.rsplit_once(" (") else {
+        return stem;
+    };
+    if suffix.parse::<usize>().is_ok_and(|index| index >= 2) {
+        base
+    } else {
+        stem
+    }
 }
 
 async fn run_youtube_job(
@@ -3747,6 +3843,68 @@ mod tests {
             "new-xml"
         );
         assert!(!source_video.with_extension("xml").exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn moves_root_danmaku_sidecars_to_unique_mux_output() {
+        let final_dir = temp_test_dir("bilibili-danmaku-unique-output");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        fs::write(final_dir.join("Final Title.xml"), "root-xml").expect("root xml should write");
+        fs::write(final_dir.join("Final Title.ass"), "root-ass").expect("root ass should write");
+        let output_video = final_dir.join("Final Title (2).mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+
+        let moved = move_bilibili_danmaku_sidecars(&source_video, &output_video, UNIX_EPOCH)
+            .expect("root danmaku sidecars should move");
+
+        assert_eq!(
+            moved,
+            vec![
+                output_video.with_extension("xml"),
+                output_video.with_extension("ass")
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(output_video.with_extension("xml"))
+                .expect("unique output xml should exist"),
+            "root-xml"
+        );
+        assert_eq!(
+            fs::read_to_string(output_video.with_extension("ass"))
+                .expect("unique output ass should exist"),
+            "root-ass"
+        );
+        assert!(!final_dir.join("Final Title.xml").exists());
+        assert!(!final_dir.join("Final Title.ass").exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn moves_single_custom_danmaku_sidecar_to_mux_output() {
+        let final_dir = temp_test_dir("bilibili-danmaku-custom-output");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        fs::write(final_dir.join("Custom Pattern.xml"), "custom-xml")
+            .expect("custom xml should write");
+        let output_video = final_dir.join("Final Title.mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+
+        let moved = move_bilibili_danmaku_sidecars(&source_video, &output_video, UNIX_EPOCH)
+            .expect("single custom danmaku sidecar should move");
+
+        assert_eq!(moved, vec![output_video.with_extension("xml")]);
+        assert_eq!(
+            fs::read_to_string(output_video.with_extension("xml"))
+                .expect("output xml should exist"),
+            "custom-xml"
+        );
+        assert!(!final_dir.join("Custom Pattern.xml").exists());
         let _ = fs::remove_dir_all(final_dir);
     }
 
