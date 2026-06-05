@@ -79,6 +79,102 @@ def ensure_base_tag(html: str, url: str) -> str:
     return f"{base_tag}{html}"
 
 
+def inject_head_style(html: str, css: str) -> str:
+    if not css.strip():
+        return html
+
+    style_tag = f"<style>{css}</style>"
+    head_end = re.search(r"</head\s*>", html, flags=re.IGNORECASE)
+    if head_end:
+        insert_at = head_end.start()
+        return f"{html[:insert_at]}{style_tag}{html[insert_at:]}"
+
+    head_start = re.search(r"<head\b[^>]*>", html, flags=re.IGNORECASE)
+    if head_start:
+        insert_at = head_start.end()
+        return f"{html[:insert_at]}{style_tag}{html[insert_at:]}"
+
+    return f"{style_tag}{html}"
+
+
+def archive_print_css(url: str) -> str:
+    if not is_bilibili_opus_url(url):
+        return ""
+
+    return """
+@media screen, print {
+  html,
+  body {
+    background: #fff !important;
+  }
+
+  body {
+    margin: 0 !important;
+  }
+
+  #bili-header-container,
+  .bg,
+  .bgc,
+  .opus-toc,
+  .opus-more,
+  .opus-module-bottom__feedback,
+  .opus-module-bottom__share,
+  .opus-module-author__more {
+    display: none !important;
+  }
+
+  #app,
+  .opus-detail,
+  .bili-opus-view-wrap {
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    background: #fff !important;
+    box-shadow: none !important;
+  }
+
+  .bili-opus-view {
+    max-width: 820px !important;
+    margin: 0 auto !important;
+    padding: 0 !important;
+    background: #fff !important;
+  }
+
+  .opus-module-title__text {
+    color: #18191c !important;
+    font-size: 28px !important;
+    line-height: 1.35 !important;
+  }
+
+  .opus-module-content {
+    color: #18191c !important;
+    font-size: 16px !important;
+    line-height: 1.75 !important;
+  }
+
+  .opus-para-pic,
+  .bili-dyn-pic,
+  .opus-pic-view {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+
+  img,
+  video {
+    max-width: 100% !important;
+    height: auto !important;
+  }
+}
+"""
+
+
+def prepare_snapshot_html(html: str, url: str) -> str:
+    html = strip_scripts(html)
+    html = ensure_base_tag(html, url)
+    html = rewrite_lazy_image_sources(html)
+    return inject_head_style(html, archive_print_css(url))
+
+
 def strip_scripts(html: str) -> str:
     return re.sub(r"(?is)<script\b[^>]*>.*?</script>", "", html)
 
@@ -416,7 +512,7 @@ async def render_snapshot_pdf(browser, url: str, output_dir: Path) -> Path:
 
     html = fetch_page_html(url)
     title = extract_title_from_html(html, url)
-    html = rewrite_lazy_image_sources(ensure_base_tag(strip_scripts(html), url))
+    html = prepare_snapshot_html(html, url)
 
     snapshot_context = await browser.new_context(
         user_agent=DESKTOP_CHROME_USER_AGENT,

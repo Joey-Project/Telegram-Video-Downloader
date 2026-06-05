@@ -54,7 +54,6 @@ superseded_by:
 
 ## Next Steps
 - 继续追查 BBDown 下载 stall/合并阶段问题，基于现有失败摘要和进度日志做可复现 debug。
-- 完善 Bilibili 专栏/opus PDF archive 行为。
 - 如果 YouTube 下载遇到 yt-dlp JS runtime warning 变成实际失败，安装 deno 或 node 并在 yt-dlp 配置里启用。
 
 ## Evidence
@@ -101,3 +100,4 @@ superseded_by:
 - Follow-up reviews found two duplicate-prompt/sidecar edge cases: pending duplicate choices are now registered before sending the inline keyboard, and overwrite sidecar ownership now uses longest primary stem matching so `Movie.part2.nfo` is replaced with `Movie.part2.mkv` instead of being excluded by `Movie.mkv`.
 - Final triple-review follow-up found duplicate matching could still treat bare filename suffixes and `.info.json` free text as identities, and pending prompt capping could evict a just-sent token on timestamp ties; duplicate matching now requires explicit filename ID markers or typed sidecar parsing, and pending caps preserve the newly issued token.
 - Final independent review found recursive staging directories with same-stem videos could cross-attach sidecars; staged sidecar matching now requires the sidecar and primary media to share the same staging parent directory, with regression coverage for `a/Movie.mkv` and `b/Movie.mkv`.
+- 2026-06-04 Bilibili opus archive polish: snapshot rendering now injects Bilibili opus print CSS to hide navigation, TOC, share/feedback controls, and page backgrounds while preserving author, title, content, images, and copyright information. Real sample validation wrote a 1.7 MiB PDF with 5 page markers under `.codex-tmp/opus-archive-check`.
