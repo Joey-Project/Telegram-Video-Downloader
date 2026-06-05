@@ -3516,6 +3516,11 @@ mod tests {
         assert!(spec.args.contains(&"--skip-ai".to_string()));
         assert!(spec.args.contains(&"--video-ascending".to_string()));
         assert!(spec.args.contains(&"--skip-mux".to_string()));
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
         assert!(!spec.args.contains(&"--cookie".to_string()));
         assert_eq!(spec.cwd, test_home().join("Movies").join("Downloads"));
     }

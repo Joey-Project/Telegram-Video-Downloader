@@ -382,7 +382,12 @@ fn default_true() -> bool {
 }
 
 fn default_bilibili_extra_args() -> Vec<String> {
-    vec!["--video-ascending".to_string(), "--skip-mux".to_string()]
+    vec![
+        "--video-ascending".to_string(),
+        "--skip-mux".to_string(),
+        "--multi-thread".to_string(),
+        "false".to_string(),
+    ]
 }
 
 fn default_bilibili_auth_state_path() -> PathBuf {
@@ -479,7 +484,7 @@ mod tests {
         assert!(config.video.keep_sidecars);
         assert_eq!(
             config.bilibili.extra_args,
-            vec!["--video-ascending", "--skip-mux"]
+            vec!["--video-ascending", "--skip-mux", "--multi-thread", "false"]
         );
         assert_eq!(
             config.bilibili.auth.state_path,

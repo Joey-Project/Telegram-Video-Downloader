@@ -3,7 +3,7 @@ id: 20260516-8f3c2a
 title: Telegram Local Downloader Bot
 status: completed
 created: 2026-05-16
-updated: 2026-06-04
+updated: 2026-06-05
 branch:
 pr:
 supersedes: []
@@ -46,14 +46,14 @@ superseded_by:
 - 外部命令现在流式采集 stdout/stderr、监控输出目录文件增长，并支持总超时与 idle timeout；Telegram 任务会转发节流后的进度消息。
 - 新增 `--replay-message` 本地入口，可用真实消息文本重放路由和下载组件，不依赖 Telegram ingress。
 - YouTube 下载会预取 yt-dlp metadata，优先人工字幕、fallback 自动字幕，并启用 metadata、封面、字幕、info JSON、description 和 NFO 输出。
-- Bilibili 下载继续由 BBDown 负责，显式跳过 AI 字幕，默认追加 `--video-ascending` 以避开当前复现链接在后台模式下的高码率流卡住问题，并对新增视频生成 best-effort NFO。
+- Bilibili 下载继续由 BBDown 负责，显式跳过 AI 字幕，默认追加 `--video-ascending --skip-mux --multi-thread false` 以避开当前复现链接在后台模式下的高码率流和多线程分片卡住问题，并对新增视频生成 best-effort NFO。
 - PDF 支持 `mp.weixin.qq.com` 自动白名单，`/pdf URL` 继续保留。
 - Bilibili `opus` 文章链接现在会规范化为 `https://www.bilibili.com/opus/<id>` 并走 PDF；PDF helper 对这类页面使用静态 HTML 快照渲染，避开页面脚本在 headless Chrome 中主动关闭页面的问题。
 - BBDown 登录态现在由 bot 通过 Bilibili Web QR API 管理：私聊 `/bbdown login/status/logout` 可扫码登录、查看账号、清理本机状态；Bilibili 下载会自动把 bot-managed cookie 注入 BBDown。
 - 视频下载现在默认先进入隐藏 staging 目录，成功后再移动到最终目录；对可直接提取媒体 ID 的 YouTube/Bilibili URL，若本地已有匹配视频或 sidecar，用户可通过 Telegram inline keyboard 选择覆盖、两者并存或取消。
 
 ## Next Steps
-- 继续追查 BBDown 下载 stall/合并阶段问题，基于现有失败摘要和进度日志做可复现 debug。
+- 调研 Bilibili 弹幕归档：利用 BBDown 下载 XML/ASS 弹幕，并评估提前渲染为播放器可加载的 ASS/PGO/PGS 等 sidecar。
 - 如果 YouTube 下载遇到 yt-dlp JS runtime warning 变成实际失败，安装 deno 或 node 并在 yt-dlp 配置里启用。
 
 ## Evidence
@@ -101,3 +101,5 @@ superseded_by:
 - Final triple-review follow-up found duplicate matching could still treat bare filename suffixes and `.info.json` free text as identities, and pending prompt capping could evict a just-sent token on timestamp ties; duplicate matching now requires explicit filename ID markers or typed sidecar parsing, and pending caps preserve the newly issued token.
 - Final independent review found recursive staging directories with same-stem videos could cross-attach sidecars; staged sidecar matching now requires the sidecar and primary media to share the same staging parent directory, with regression coverage for `a/Movie.mkv` and `b/Movie.mkv`.
 - 2026-06-04 Bilibili opus archive polish: snapshot rendering now injects Bilibili opus print CSS to hide navigation, TOC, share/feedback controls, and page backgrounds while preserving author, title, content, images, and copyright information. Real sample validation wrote a 1.7 MiB PDF with 5 page markers under `.codex-tmp/opus-archive-check`.
+- 2026-06-05 BBDown stall triage: replaying the user-provided title plus `BV12TRrBcEP8` URL with the prior default args stalled inside BBDown after `开始下载P1视频...`; staging files stopped at 12.4 MiB and ffmpeg never started. Adding `--multi-thread false` to the same replay completed BBDown video and audio downloads, ffmpeg mux, staging move, and MP4 output under `.codex-tmp/bbdown-debug/video`.
+- 2026-06-05 BBDown mirror check: local BBDown already supports `--download-danmaku`, `--download-danmaku-formats`, `--danmaku-only`, XML download from `comment.bilibili.com/{cid}.xml`, and ASS writing via `DanmakuUtil.SaveAsAssAsync`; future work can preserve XML/ASS sidecars first, then evaluate pre-rendered graphics subtitle sidecars for target players.
