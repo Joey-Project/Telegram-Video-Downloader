@@ -354,6 +354,7 @@ async fn run_bilibili_job_locked(
                     )
                     .await?
                 } else {
+                    cleanup_bilibili_download_outputs(&videos_to_process, command_started_at)?;
                     videos_to_process
                 };
                 if config.video.write_nfo {
@@ -558,6 +559,14 @@ fn cleanup_bilibili_json_danmaku_sidecars(
                 candidate.display()
             )
         })?;
+    }
+    Ok(())
+}
+
+fn cleanup_bilibili_download_outputs(videos: &[PathBuf], since: SystemTime) -> Result<()> {
+    for video in videos {
+        move_bilibili_danmaku_sidecars(video, video, since)?;
+        cleanup_bilibili_json_danmaku_sidecars(video, video, since)?;
     }
     Ok(())
 }
@@ -1005,10 +1014,10 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
 }
 
 fn append_bilibili_danmaku_args(config: &AppConfig, args: &mut Vec<String>) {
-    if config.bilibili.danmaku.enabled {
-        args.push("--download-danmaku".to_string());
-    } else {
+    if !config.bilibili.danmaku.enabled {
         args.extend(["--download-danmaku".to_string(), "false".to_string()]);
+    } else if !has_bilibili_danmaku_setting(args) {
+        args.push("--download-danmaku".to_string());
     }
 }
 
@@ -1094,6 +1103,17 @@ fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
         index += 1;
     }
     enabled
+}
+
+fn has_bilibili_option(args: &[String], flag: &str) -> bool {
+    let equals_prefix = format!("{flag}=");
+    let colon_prefix = format!("{flag}:");
+    args.iter()
+        .any(|arg| arg == flag || arg.starts_with(&equals_prefix) || arg.starts_with(&colon_prefix))
+}
+
+fn has_bilibili_danmaku_setting(args: &[String]) -> bool {
+    has_bilibili_option(args, "--download-danmaku") || has_bilibili_option(args, "-dd")
 }
 
 fn parse_bool_token(value: &str) -> Option<bool> {
@@ -4295,6 +4315,25 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_bilibili_download_outputs_removes_json_without_mux() {
+        let final_dir = temp_test_dir("bilibili-json-danmaku-no-mux-cleanup");
+        fs::create_dir_all(&final_dir).expect("final dir should create");
+        let video = final_dir.join("Final Title.mp4");
+        fs::write(&video, "video").expect("video should write");
+        fs::write(video.with_extension("xml"), "xml").expect("xml should write");
+        fs::write(video.with_extension("ass"), "ass").expect("ass should write");
+        fs::write(video.with_extension("json"), "json").expect("json should write");
+
+        cleanup_bilibili_download_outputs(std::slice::from_ref(&video), UNIX_EPOCH)
+            .expect("non-mux output cleanup should succeed");
+
+        assert!(video.with_extension("xml").exists());
+        assert!(video.with_extension("ass").exists());
+        assert!(!video.with_extension("json").exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
     fn preserves_stale_json_danmaku_sidecars_after_mux() {
         let final_dir = temp_test_dir("bilibili-json-danmaku-stale");
         let stream_dir = final_dir.join("1556453868");
@@ -4629,6 +4668,45 @@ mod tests {
             .rposition(|arg| arg == "--download-danmaku")
             .expect("managed danmaku flag should be present");
         assert_eq!(spec.args.get(danmaku_index + 1), Some(&"false".to_string()));
+    }
+
+    #[test]
+    fn preserves_explicit_bilibili_danmaku_extra_args() {
+        for explicit_args in [
+            vec!["--download-danmaku", "false"],
+            vec!["--download-danmaku=false"],
+            vec!["--download-danmaku:false"],
+        ] {
+            let mut config = test_config();
+            config
+                .bilibili
+                .extra_args
+                .extend(explicit_args.iter().map(|arg| arg.to_string()));
+
+            let spec = command_spec(
+                &config,
+                &JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV123".to_string(),
+                },
+            )
+            .expect("Bilibili command should build");
+
+            let danmaku_args = spec
+                .args
+                .iter()
+                .filter(|arg| arg.starts_with("--download-danmaku"))
+                .collect::<Vec<_>>();
+            assert_eq!(danmaku_args.len(), 1);
+            assert_eq!(danmaku_args[0], explicit_args[0]);
+            if explicit_args.len() == 2 {
+                let danmaku_index = spec
+                    .args
+                    .iter()
+                    .position(|arg| arg == "--download-danmaku")
+                    .expect("explicit danmaku flag should be present");
+                assert_eq!(spec.args.get(danmaku_index + 1), Some(&"false".to_string()));
+            }
+        }
     }
 
     #[test]
