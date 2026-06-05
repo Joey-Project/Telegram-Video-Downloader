@@ -607,14 +607,23 @@ fn current_bilibili_danmaku_sidecars(
     since: SystemTime,
     source_video: &Path,
 ) -> Result<Vec<PathBuf>> {
-    let mut candidates = Vec::new();
+    let mut candidates = BTreeSet::new();
     let source = source_video.with_extension(extension);
     if source.is_file() && modified_since(&source, since) {
-        candidates.push(source.clone());
+        candidates.insert(source.clone());
     }
-    let root = output_video.parent().unwrap_or_else(|| Path::new("."));
-    collect_current_bilibili_danmaku_sidecars(root, extension, since, &mut candidates)?;
-    candidates = candidates
+    for directory in [source_video.parent(), output_video.parent()]
+        .into_iter()
+        .flatten()
+    {
+        collect_current_bilibili_danmaku_sidecars_in_dir(
+            directory,
+            extension,
+            since,
+            &mut candidates,
+        )?;
+    }
+    candidates
         .into_iter()
         .filter_map(|candidate| {
             if candidate == source {
@@ -626,10 +635,7 @@ fn current_bilibili_danmaku_sidecars(
                 Err(err) => Some(Err(err)),
             }
         })
-        .collect::<Result<Vec<_>>>()?;
-    candidates.sort();
-    candidates.dedup();
-    Ok(candidates)
+        .collect::<Result<Vec<_>>>()
 }
 
 fn sidecar_has_current_primary_media(sidecar: &Path, since: SystemTime) -> Result<bool> {
@@ -667,16 +673,18 @@ fn base_bilibili_json_danmaku_sidecar(output_video: &Path) -> Option<PathBuf> {
     (base_stem != output_stem).then(|| parent.join(format!("{base_stem}.json")))
 }
 
-fn collect_current_bilibili_danmaku_sidecars(
-    root: &Path,
+fn collect_current_bilibili_danmaku_sidecars_in_dir(
+    directory: &Path,
     extension: &str,
     since: SystemTime,
-    candidates: &mut Vec<PathBuf>,
+    candidates: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
-    let entries = match fs::read_dir(root) {
+    let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err).with_context(|| format!("failed to read {}", root.display())),
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", directory.display()));
+        }
     };
     for entry in entries {
         let entry = entry?;
@@ -686,16 +694,14 @@ fn collect_current_bilibili_danmaku_sidecars(
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err.into()),
         };
-        if file_type.is_dir() {
-            collect_current_bilibili_danmaku_sidecars(&path, extension, since, candidates)?;
-        } else if file_type.is_file()
+        if file_type.is_file()
             && path
                 .extension()
                 .and_then(|value| value.to_str())
                 .is_some_and(|value| value.eq_ignore_ascii_case(extension))
             && modified_since(&path, since)
         {
-            candidates.push(path);
+            candidates.insert(path);
         }
     }
     Ok(())
@@ -4113,6 +4119,32 @@ mod tests {
             "custom-xml"
         );
         assert!(!final_dir.join("Custom Pattern.xml").exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn ignores_nested_unrelated_danmaku_sidecars_after_mux() {
+        let final_dir = temp_test_dir("bilibili-danmaku-nested-unrelated");
+        let stream_dir = final_dir.join("1556453868");
+        let unrelated_dir = final_dir.join("unrelated").join("nested");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        fs::create_dir_all(&unrelated_dir).expect("unrelated dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        let unrelated = unrelated_dir.join("Only Candidate.xml");
+        fs::write(&unrelated, "unrelated-xml").expect("unrelated xml should write");
+        let output_video = final_dir.join("Final Title.mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+
+        let moved = move_bilibili_danmaku_sidecars(&source_video, &output_video, UNIX_EPOCH)
+            .expect("unrelated nested sidecars should be ignored");
+
+        assert!(moved.is_empty());
+        assert_eq!(
+            fs::read_to_string(&unrelated).expect("unrelated xml should remain"),
+            "unrelated-xml"
+        );
+        assert!(!output_video.with_extension("xml").exists());
         let _ = fs::remove_dir_all(final_dir);
     }
 
