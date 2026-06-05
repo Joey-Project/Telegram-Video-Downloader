@@ -444,7 +444,12 @@ async fn merge_bilibili_streams(
                     audio.display()
                 );
             }
-            move_bilibili_danmaku_sidecars(video, video, command_started_at)?;
+            move_bilibili_danmaku_sidecars_with_extra_dirs(
+                video,
+                video,
+                command_started_at,
+                &[config.downloads.video_dir.as_path()],
+            )?;
             cleanup_bilibili_json_danmaku_sidecars(video, video, command_started_at)?;
             merged.push(video.clone());
             continue;
@@ -489,6 +494,15 @@ fn move_bilibili_danmaku_sidecars(
     output_video: &Path,
     since: SystemTime,
 ) -> Result<Vec<PathBuf>> {
+    move_bilibili_danmaku_sidecars_with_extra_dirs(source_video, output_video, since, &[])
+}
+
+fn move_bilibili_danmaku_sidecars_with_extra_dirs(
+    source_video: &Path,
+    output_video: &Path,
+    since: SystemTime,
+    extra_directories: &[&Path],
+) -> Result<Vec<PathBuf>> {
     let mut moved = Vec::new();
     for extension in ["xml", "ass"] {
         let destination = output_video.with_extension(extension);
@@ -496,8 +510,13 @@ fn move_bilibili_danmaku_sidecars(
             remove_direct_bilibili_danmaku_duplicate(source_video, extension, &destination, since)?;
             continue;
         }
-        let alternate_sources =
-            current_bilibili_danmaku_sidecars(output_video, extension, since, source_video)?;
+        let alternate_sources = current_bilibili_danmaku_sidecars(
+            output_video,
+            extension,
+            since,
+            source_video,
+            extra_directories,
+        )?;
         let Some(source) = select_bilibili_danmaku_source(
             output_video,
             source_video,
@@ -524,9 +543,30 @@ fn move_bilibili_danmaku_sidecars(
                 destination.display()
             )
         })?;
+        remove_matching_bilibili_json_danmaku_sidecar(&source, since)?;
         moved.push(destination);
     }
     Ok(moved)
+}
+
+fn remove_matching_bilibili_json_danmaku_sidecar(sidecar: &Path, since: SystemTime) -> Result<()> {
+    let candidate = sidecar.with_extension("json");
+    if candidate
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".info.json"))
+    {
+        return Ok(());
+    }
+    if candidate.is_file() && modified_since(&candidate, since) {
+        fs::remove_file(&candidate).with_context(|| {
+            format!(
+                "failed to remove matching Bilibili JSON danmaku sidecar {}",
+                candidate.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn remove_direct_bilibili_danmaku_duplicate(
@@ -606,18 +646,26 @@ fn current_bilibili_danmaku_sidecars(
     extension: &str,
     since: SystemTime,
     source_video: &Path,
+    extra_directories: &[&Path],
 ) -> Result<Vec<PathBuf>> {
     let mut candidates = BTreeSet::new();
     let source = source_video.with_extension(extension);
     if source.is_file() && modified_since(&source, since) {
         candidates.insert(source.clone());
     }
+    let mut directories = BTreeSet::new();
     for directory in [source_video.parent(), output_video.parent()]
         .into_iter()
         .flatten()
     {
+        directories.insert(directory.to_path_buf());
+    }
+    for directory in extra_directories {
+        directories.insert((*directory).to_path_buf());
+    }
+    for directory in directories {
         collect_current_bilibili_danmaku_sidecars_in_dir(
-            directory,
+            &directory,
             extension,
             since,
             &mut candidates,
@@ -5590,6 +5638,54 @@ mod tests {
         assert!(video.with_extension("xml").exists());
         assert!(!video.with_extension("json").exists());
         assert!(custom_json.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn video_only_bilibili_cleanup_moves_root_danmaku_without_audio() {
+        let root = temp_test_dir("video-only-root-danmaku-cleanup");
+        let aid_dir = root.join("1556453868");
+        fs::create_dir_all(&aid_dir).expect("aid dir should be created");
+        let video = aid_dir.join("Part 1.mp4");
+        fs::write(&video, b"video").expect("video should be written");
+        let root_xml = root.join("Custom Pattern.xml");
+        let root_ass = root.join("Custom Pattern.ass");
+        let root_json = root.join("Custom Pattern.json");
+        let state_json = root.join("state.json");
+        fs::write(&root_xml, b"root-xml").expect("root xml should be written");
+        fs::write(&root_ass, b"root-ass").expect("root ass should be written");
+        fs::write(&root_json, b"root-json").expect("root json should be written");
+        fs::write(&state_json, b"state-json").expect("state json should be written");
+        let mut config = test_config();
+        config.downloads.video_dir = root.clone();
+
+        let merged = merge_bilibili_streams(
+            &config,
+            std::slice::from_ref(&video),
+            &BilibiliMetadata::default(),
+            true,
+            UNIX_EPOCH,
+            None,
+        )
+        .await
+        .expect("video-only stream should move root danmaku sidecars");
+
+        assert_eq!(merged, vec![video.clone()]);
+        assert_eq!(
+            fs::read_to_string(video.with_extension("xml")).expect("video xml should exist"),
+            "root-xml"
+        );
+        assert_eq!(
+            fs::read_to_string(video.with_extension("ass")).expect("video ass should exist"),
+            "root-ass"
+        );
+        assert!(!root_xml.exists());
+        assert!(!root_ass.exists());
+        assert!(!root_json.exists());
+        assert_eq!(
+            fs::read_to_string(state_json).expect("state json should remain"),
+            "state-json"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
