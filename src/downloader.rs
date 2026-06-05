@@ -31,6 +31,7 @@ const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
     "srt",
     "vtt",
     "ass",
+    "xml",
 ];
 const OUTPUT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_ABORT_GRACE: Duration = Duration::from_secs(3);
@@ -348,6 +349,7 @@ async fn run_bilibili_job_locked(
                         &videos_to_process,
                         &metadata,
                         video_only,
+                        command_started_at,
                         progress,
                     )
                     .await?
@@ -428,6 +430,7 @@ async fn merge_bilibili_streams(
     videos: &[PathBuf],
     metadata: &BilibiliMetadata,
     video_only: bool,
+    command_started_at: SystemTime,
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<Vec<PathBuf>> {
     let mut merged = Vec::new();
@@ -464,11 +467,66 @@ async fn merge_bilibili_streams(
             );
         }
 
+        move_bilibili_danmaku_sidecars(video, &output, command_started_at)?;
         let _ = fs::remove_file(video);
         let _ = fs::remove_file(&audio);
         merged.push(output);
     }
     Ok(merged)
+}
+
+fn move_bilibili_danmaku_sidecars(
+    source_video: &Path,
+    output_video: &Path,
+    since: SystemTime,
+) -> Result<Vec<PathBuf>> {
+    let mut moved = Vec::new();
+    for extension in ["xml", "ass"] {
+        let source = source_video.with_extension(extension);
+        let destination = output_video.with_extension(extension);
+        if source == destination {
+            continue;
+        }
+        if destination.is_file() && modified_since(&destination, since) {
+            if source.is_file() {
+                fs::remove_file(&source).with_context(|| {
+                    format!(
+                        "failed to remove duplicate Bilibili danmaku sidecar {}",
+                        source.display()
+                    )
+                })?;
+            }
+            continue;
+        }
+        if !source.is_file() {
+            if destination.exists() {
+                fs::remove_file(&destination).with_context(|| {
+                    format!(
+                        "failed to remove stale Bilibili danmaku sidecar {}",
+                        destination.display()
+                    )
+                })?;
+            }
+            continue;
+        }
+        if destination.exists() {
+            fs::remove_file(&destination).with_context(|| {
+                format!(
+                    "failed to replace stale Bilibili danmaku sidecar {}",
+                    destination.display()
+                )
+            })?;
+        }
+        fs::rename(&source, &destination).with_context(|| {
+            format!(
+                "failed to move Bilibili danmaku sidecar {} to {}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        moved.push(destination);
+    }
+    Ok(moved)
 }
 
 async fn run_youtube_job(
@@ -722,6 +780,7 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
             config_path.display().to_string(),
         ]);
     }
+    append_bilibili_danmaku_args(config, &mut args);
 
     Ok(CommandSpec {
         program: config.tools.bbdown.clone(),
@@ -730,6 +789,13 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
         activity_dir: Some(config.downloads.video_dir.clone()),
         cleanup_paths: config_path.into_iter().collect(),
     })
+}
+
+fn append_bilibili_danmaku_args(config: &AppConfig, args: &mut Vec<String>) {
+    if !config.bilibili.danmaku.enabled {
+        return;
+    }
+    args.push("--download-danmaku".to_string());
 }
 
 fn bilibili_effective_args(config: &AppConfig) -> Result<Vec<String>> {
@@ -2254,7 +2320,7 @@ fn staged_move_plan(
                 overwrite_video_destination(existing_video, staged_video),
                 &reserved,
             ),
-            _ => unique_path_avoiding(
+            _ => unique_primary_media_path_avoiding(
                 relative_destination(staging_dir, final_dir, staged_video),
                 &reserved,
             ),
@@ -2383,6 +2449,31 @@ fn unique_path_avoiding(candidate: PathBuf, reserved: &BTreeSet<PathBuf>) -> Pat
         };
         let next = parent.join(file_name);
         if !next.exists() && !reserved.contains(&next) {
+            return next;
+        }
+    }
+    unreachable!("unbounded loop returns once it finds a unique path")
+}
+
+fn unique_primary_media_path_avoiding(candidate: PathBuf, reserved: &BTreeSet<PathBuf>) -> PathBuf {
+    if !candidate.exists() && !reserved.contains(&candidate) && !output_sidecar_exists(&candidate) {
+        return candidate;
+    }
+    let parent = candidate.parent().unwrap_or_else(|| Path::new("."));
+    let stem = candidate
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("download");
+    let extension = candidate
+        .extension()
+        .and_then(|extension| extension.to_str());
+    for index in 2.. {
+        let file_name = match extension {
+            Some(extension) => format!("{stem} ({index}).{extension}"),
+            None => format!("{stem} ({index})"),
+        };
+        let next = parent.join(file_name);
+        if !next.exists() && !reserved.contains(&next) && !output_sidecar_exists(&next) {
             return next;
         }
     }
@@ -2565,6 +2656,34 @@ fn unique_output_path(root: &Path, title: &str, extension: &str) -> PathBuf {
         index += 1;
     }
     candidate
+}
+
+fn output_sidecar_exists(output: &Path) -> bool {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let Some(output_stem) = output.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if !file_type.is_file()
+            || path == output
+            || is_video_file(&path)
+            || !is_known_video_sidecar(&path)
+        {
+            return false;
+        }
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(output_stem))
+            .is_some_and(|suffix| suffix.starts_with('.'))
+    })
 }
 
 fn safe_file_stem(title: &str) -> String {
@@ -3218,6 +3337,97 @@ mod tests {
     }
 
     #[test]
+    fn keep_both_avoids_existing_sidecar_stem_for_primary_media() {
+        let final_dir = temp_test_dir("keep-both-existing-sidecar-stem");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(final_dir.join("Example.xml"), "old-xml").expect("old xml should write");
+        let staged = staging_dir.join("Example.mkv");
+        fs::write(&staged, "new-video").expect("staged video should write");
+        fs::write(staged.with_extension("xml"), "new-xml").expect("staged xml should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV123".to_string(),
+            },
+            existing_videos: Vec::new(),
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged files should move");
+
+        let kept = final_dir.join("Example (2).mkv");
+        assert_eq!(moved, vec![kept.clone()]);
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Example.xml")).expect("old xml should remain"),
+            "old-xml"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Example (2).xml"))
+                .expect("new xml should follow kept video basename"),
+            "new-xml"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn keep_both_avoids_existing_compound_sidecar_stem_for_primary_media() {
+        let final_dir = temp_test_dir("keep-both-existing-compound-sidecar-stem");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(final_dir.join("Example.info.json"), "old-json").expect("old json should write");
+        let staged = staging_dir.join("Example.mkv");
+        fs::write(&staged, "new-video").expect("staged video should write");
+        fs::write(staged.with_extension("info.json"), "new-json")
+            .expect("staged info json should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Youtube,
+                id: "PHH1wTDF-1M".to_string(),
+            },
+            existing_videos: Vec::new(),
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged files should move");
+
+        let kept = final_dir.join("Example (2).mkv");
+        assert_eq!(moved, vec![kept.clone()]);
+        assert_eq!(
+            fs::read_to_string(kept).expect("new video should avoid compound sidecar stem"),
+            "new-video"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Example (2).info.json"))
+                .expect("compound sidecar should follow kept video basename"),
+            "new-json"
+        );
+        assert!(!final_dir.join("Example.mkv").exists());
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Example.info.json"))
+                .expect("old compound sidecar should remain"),
+            "old-json"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
     fn keep_both_moves_secondary_sidecars_with_their_video() {
         let final_dir = temp_test_dir("keep-both-secondary-sidecar");
         let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
@@ -3407,6 +3617,7 @@ mod tests {
         let existing = final_dir.join("Old Title [PHH1wTDF-1M].mkv");
         fs::write(&existing, "old-video").expect("existing file should write");
         fs::write(existing.with_extension("nfo"), "old-nfo").expect("old nfo should write");
+        fs::write(existing.with_extension("xml"), "old-xml").expect("old xml should write");
         let unrelated_video = final_dir.join("Old Title [PHH1wTDF-1M].trailer.mp4");
         fs::write(&unrelated_video, "trailer").expect("unrelated video should write");
         let unrelated_part = final_dir.join("Old Title [PHH1wTDF-1M].part2.mkv");
@@ -3416,6 +3627,7 @@ mod tests {
         let staged = staging_dir.join("New Title [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
+        fs::write(staged.with_extension("xml"), "new-xml").expect("new xml should write");
         let duplicate = VideoDuplicate {
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -3445,6 +3657,10 @@ mod tests {
             "new-nfo"
         );
         assert_eq!(
+            fs::read_to_string(existing.with_extension("xml")).expect("xml should be replaced"),
+            "new-xml"
+        );
+        assert_eq!(
             fs::read_to_string(unrelated_video).expect("unrelated video should remain"),
             "trailer"
         );
@@ -3463,6 +3679,140 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".replaced-"))
             .count();
         assert_eq!(replaced_files, 0);
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn moves_bilibili_danmaku_sidecars_after_mux() {
+        let final_dir = temp_test_dir("bilibili-danmaku-sidecars");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        fs::write(source_video.with_extension("xml"), "danmaku-xml")
+            .expect("source xml should write");
+        fs::write(source_video.with_extension("ass"), "danmaku-ass")
+            .expect("source ass should write");
+        let output_video = final_dir.join("Final Title.mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+
+        let moved = move_bilibili_danmaku_sidecars(&source_video, &output_video, UNIX_EPOCH)
+            .expect("danmaku sidecars should move");
+
+        assert_eq!(
+            moved,
+            vec![
+                output_video.with_extension("xml"),
+                output_video.with_extension("ass")
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(output_video.with_extension("xml"))
+                .expect("output xml should exist"),
+            "danmaku-xml"
+        );
+        assert_eq!(
+            fs::read_to_string(output_video.with_extension("ass"))
+                .expect("output ass should exist"),
+            "danmaku-ass"
+        );
+        assert!(!source_video.with_extension("xml").exists());
+        assert!(!source_video.with_extension("ass").exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn moves_bilibili_danmaku_sidecars_over_stale_output_sidecar() {
+        let final_dir = temp_test_dir("bilibili-danmaku-stale-sidecar");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        fs::write(source_video.with_extension("xml"), "new-xml").expect("source xml should write");
+        let output_video = final_dir.join("Final Title.mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+        fs::write(output_video.with_extension("xml"), "old-xml").expect("stale xml should write");
+
+        let moved = move_bilibili_danmaku_sidecars(
+            &source_video,
+            &output_video,
+            SystemTime::now() + Duration::from_secs(1),
+        )
+        .expect("stale danmaku sidecar should be replaced");
+
+        assert_eq!(moved, vec![output_video.with_extension("xml")]);
+        assert_eq!(
+            fs::read_to_string(output_video.with_extension("xml"))
+                .expect("output xml should exist"),
+            "new-xml"
+        );
+        assert!(!source_video.with_extension("xml").exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn keeps_current_root_danmaku_sidecar_after_mux() {
+        let final_dir = temp_test_dir("bilibili-danmaku-current-root-sidecar");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        fs::write(source_video.with_extension("xml"), "raw-xml").expect("source xml should write");
+        let output_video = final_dir.join("Final Title.mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+        fs::write(output_video.with_extension("xml"), "current-xml")
+            .expect("current xml should write");
+
+        let moved =
+            move_bilibili_danmaku_sidecars(&source_video, &output_video, SystemTime::UNIX_EPOCH)
+                .expect("current root sidecar should be kept");
+
+        assert!(moved.is_empty());
+        assert_eq!(
+            fs::read_to_string(output_video.with_extension("xml"))
+                .expect("output xml should exist"),
+            "current-xml"
+        );
+        assert!(
+            !source_video.with_extension("xml").exists(),
+            "duplicate raw sidecar should be removed when the root sidecar is from the same download"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn removes_stale_root_danmaku_sidecar_without_replacement() {
+        let final_dir = temp_test_dir("bilibili-danmaku-stale-root-sidecar");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        let output_video = final_dir.join("Final Title.mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+        fs::write(output_video.with_extension("xml"), "old-xml").expect("old xml should write");
+
+        let moved = move_bilibili_danmaku_sidecars(
+            &source_video,
+            &output_video,
+            SystemTime::now() + Duration::from_secs(1),
+        )
+        .expect("stale root sidecar should be removed");
+
+        assert!(moved.is_empty());
+        assert!(!output_video.with_extension("xml").exists());
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn bilibili_mux_output_ignores_root_danmaku_sidecars() {
+        let final_dir = temp_test_dir("bilibili-output-current-sidecar");
+        fs::create_dir_all(&final_dir).expect("final dir should create");
+        fs::write(final_dir.join("Final Title.xml"), "current-xml")
+            .expect("current xml should write");
+
+        let output = unique_output_path(&final_dir, "Final Title", "mp4");
+
+        assert_eq!(output, final_dir.join("Final Title.mp4"));
         let _ = fs::remove_dir_all(final_dir);
     }
 
@@ -3603,6 +3953,7 @@ mod tests {
                 .windows(2)
                 .any(|args| args == ["--multi-thread", "false"])
         );
+        assert!(spec.args.contains(&"--download-danmaku".to_string()));
         assert!(!spec.args.contains(&"--cookie".to_string()));
         assert_eq!(spec.cwd, test_home().join("Movies").join("Downloads"));
     }
@@ -3654,6 +4005,22 @@ mod tests {
         );
         assert!(spec.cleanup_paths.is_empty());
         let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn skips_bilibili_danmaku_args_when_disabled() {
+        let mut config = test_config();
+        config.bilibili.danmaku.enabled = false;
+
+        let spec = command_spec(
+            &config,
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV123".to_string(),
+            },
+        )
+        .expect("Bilibili command should build");
+
+        assert!(!spec.args.contains(&"--download-danmaku".to_string()));
     }
 
     #[test]
@@ -3716,6 +4083,59 @@ mod tests {
             assert_eq!(mode, 0o600);
         }
         let _ = std::fs::remove_file(path);
+        bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn bilibili_danmaku_arg_overrides_managed_cookie_config() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-cookie-danmaku-priority");
+        let path = video_dir.join("bilibili-auth.json");
+        config.bilibili.auth.state_path = path.clone();
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--download-danmaku false\n",
+        )
+        .expect("default BBDown config should write");
+        save_auth_state(
+            &path,
+            &AuthState {
+                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
+                mid: 123,
+                uname: "Joey".to_string(),
+                stored_at_unix: 1,
+            },
+        )
+        .expect("auth state should save");
+
+        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        let config_index = spec
+            .args
+            .iter()
+            .rposition(|arg| arg == "--config-file")
+            .expect("config file arg should be present");
+        let danmaku_index = spec
+            .args
+            .iter()
+            .rposition(|arg| arg == "--download-danmaku")
+            .expect("danmaku arg should be present");
+        assert!(
+            danmaku_index > config_index + 1,
+            "CLI danmaku arg should be after managed config file path"
+        );
+        let config_path = PathBuf::from(
+            spec.args
+                .get(config_index + 1)
+                .expect("config file path should be present"),
+        );
+        let config_content =
+            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
+        assert!(config_content.contains("--download-danmaku false"));
+
         bilibili_auth::release_bbdown_config_file(&config_path);
         let _ = fs::remove_dir_all(video_dir);
     }

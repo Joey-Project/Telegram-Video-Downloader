@@ -4,7 +4,7 @@
 
 ## 功能
 
-- 普通消息中的 Bilibili 链接调用 `BBDown`，保存到视频下载目录。
+- 普通消息中的 Bilibili 链接调用 `BBDown`，保存到视频下载目录，并默认保留 XML/ASS 弹幕 sidecar。
 - 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
@@ -38,6 +38,8 @@ cp config.example.toml config.toml
 重复视频检测使用 URL 中可直接提取的媒体 ID，例如 YouTube video id、Bilibili `BV...` 或 `av...`，并扫描视频文件名与同 basename sidecar。`b23.tv` 短链在下载前无法离线解析真实视频 ID，所以不会提前弹出重复选择；这类视频仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
 `bilibili.extra_args` 默认包含 `--video-ascending` 和 `--skip-mux`。如果 `bilibili.extra_args`、显式 `--config-file` 或视频下载目录里的 `BBDown.config` 都没有设置 `--multi-thread` / `-mt`，下载命令会自动追加 `--multi-thread false`；下载目录里的 `BBDown.config` 会由 bot 显式传给 BBDown。BBDown 负责下载音视频流，bot 再调用 `tools.ffmpeg` 做受控混流；这样混流也会受到同一套进度、idle timeout 和进程清理保护。需要追求更高码率时可以调整 `--video-ascending`，但建议保留 `--skip-mux`；如果确认目标视频的 CDN 对 BBDown 多线程分片稳定，再显式配置 `--multi-thread true`。
+
+`bilibili.danmaku.enabled = true` 时，bot 会给 BBDown 追加 `--download-danmaku`，把 Bilibili 弹幕保存成同 basename 的 `.xml` 和 `.ass` sidecar，并让它们跟随 staging、覆盖和两者并存流程移动。暂时不做 PGO/PGS 图形字幕预渲染；后续可以以 ASS 为中间格式继续评估。
 
 `bilibili.auth.state_path` 是 bot 管理的 Bilibili Web cookie 状态文件，默认写到 `~/.local/state/telegram-video-downloader/bilibili-auth.json`。`/bbdown login` 会发送 Bilibili 扫码二维码，登录成功后 Bilibili 下载会通过私有临时 `--config-file` 给 BBDown 注入 `--cookie`；如果视频下载目录存在 `BBDown.config`，或 `bilibili.extra_args` 显式指定了 `--config-file`，bot 会先合并原配置再追加 cookie。`/bbdown logout` 只清理本机状态，不远端注销账号。
 

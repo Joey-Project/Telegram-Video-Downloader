@@ -26,6 +26,9 @@ keep_sidecars = true
 [bilibili]
 extra_args = ["--video-ascending", "--skip-mux"]
 
+[bilibili.danmaku]
+enabled = true
+
 [bilibili.auth]
 state_path = "~/.local/state/telegram-video-downloader/bilibili-auth.json"
 login_timeout_seconds = 180

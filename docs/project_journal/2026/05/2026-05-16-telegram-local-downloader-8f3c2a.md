@@ -47,13 +47,14 @@ superseded_by:
 - 新增 `--replay-message` 本地入口，可用真实消息文本重放路由和下载组件，不依赖 Telegram ingress。
 - YouTube 下载会预取 yt-dlp metadata，优先人工字幕、fallback 自动字幕，并启用 metadata、封面、字幕、info JSON、description 和 NFO 输出。
 - Bilibili 下载继续由 BBDown 负责，显式跳过 AI 字幕，默认使用 `--video-ascending --skip-mux`，并在没有显式多线程设置时由下载命令追加 `--multi-thread false`，以避开当前复现链接在后台模式下的高码率流和多线程分片卡住问题，并对新增视频生成 best-effort NFO。
+- Bilibili 视频默认通过 BBDown 保留 XML/ASS 弹幕 sidecar；这些 sidecar 会跟随 staging、覆盖和两者并存流程移动。
 - PDF 支持 `mp.weixin.qq.com` 自动白名单，`/pdf URL` 继续保留。
 - Bilibili `opus` 文章链接现在会规范化为 `https://www.bilibili.com/opus/<id>` 并走 PDF；PDF helper 对这类页面使用静态 HTML 快照渲染，避开页面脚本在 headless Chrome 中主动关闭页面的问题。
 - BBDown 登录态现在由 bot 通过 Bilibili Web QR API 管理：私聊 `/bbdown login/status/logout` 可扫码登录、查看账号、清理本机状态；Bilibili 下载会自动把 bot-managed cookie 注入 BBDown。
 - 视频下载现在默认先进入隐藏 staging 目录，成功后再移动到最终目录；对可直接提取媒体 ID 的 YouTube/Bilibili URL，若本地已有匹配视频或 sidecar，用户可通过 Telegram inline keyboard 选择覆盖、两者并存或取消。
 
 ## Next Steps
-- 调研 Bilibili 弹幕归档：利用 BBDown 下载 XML/ASS 弹幕，并评估提前渲染为播放器可加载的 ASS/PGO/PGS 等 sidecar。
+- 调研 Bilibili 弹幕预渲染：以 ASS 弹幕为中间格式，评估生成播放器可加载的 PGO/PGS 等图形字幕 sidecar。
 - 如果 YouTube 下载遇到 yt-dlp JS runtime warning 变成实际失败，安装 deno 或 node 并在 yt-dlp 配置里启用。
 
 ## Evidence
@@ -106,3 +107,9 @@ superseded_by:
 - 2026-06-05 Independent review follow-up: Bilibili effective-arg boolean detection now respects explicit `false` values from space, equals, or colon forms so bot post-processing stays aligned with BBDown config semantics.
 - 2026-06-05 Independent PR review follow-up: no-auth Bilibili downloads now pass the download-directory `BBDown.config` with `--config-file` when that implicit config is used for effective-arg detection, keeping the bot's single-thread fallback decision aligned with the actual BBDown command.
 - 2026-06-05 BBDown mirror check: local BBDown already supports `--download-danmaku`, `--download-danmaku-formats`, `--danmaku-only`, XML download from `comment.bilibili.com/{cid}.xml`, and ASS writing via `DanmakuUtil.SaveAsAssAsync`; future work can preserve XML/ASS sidecars first, then evaluate pre-rendered graphics subtitle sidecars for target players.
+- 2026-06-05 Bilibili danmaku sidecar follow-up: added `[bilibili.danmaku]` config, default BBDown `--download-danmaku` argument, XML sidecar ownership for overwrite, and command/config coverage for enabled and disabled danmaku modes.
+- Danmaku replay validation passed: `cargo run -- --replay-message .codex-tmp/danmaku-replay/config.toml https://b23.tv/mlTVYet` completed and produced same-basename `.mp4`, `.nfo`, `.xml`, and `.ass` files under `.codex-tmp/danmaku-replay/video`; local BBDown 1.6.3 does not expose `--download-danmaku-formats`, so the bot relies on BBDown's default XML/ASS output for now.
+- Offline review found a possible mux-sidecar mismatch if BBDown places danmaku next to raw stream files; post-mux cleanup now moves raw-stream `.xml/.ass` sidecars to the final MP4 basename when needed.
+- Follow-up review found stale sidecar collisions could keep an old `Title.xml` beside a new `Title.mp4`; Bilibili post-mux cleanup now removes or replaces stale root `.xml/.ass` sidecars while keeping current same-run root sidecars on the final basename.
+- Follow-up review also found staged keep-both could choose a primary media basename already occupied by a stale sidecar; staged primary destination selection now avoids existing same-stem sidecars before assigning sidecar destinations.
+- Final review found two edge cases: bot-managed cookie downloads could let a temporary BBDown config override the danmaku CLI flag, and staged keep-both only checked simple sidecar extensions; danmaku args now come after the managed config path, and staged primary selection detects compound sidecars such as `.info.json`.
