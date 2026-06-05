@@ -3659,7 +3659,6 @@ mod tests {
         let path = video_dir.join("bilibili-auth.json");
         config.bilibili.auth.state_path = path.clone();
         config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec!["--video-ascending".to_string()];
         fs::write(
             video_dir.join("BBDown.config"),
             "--multi-thread\ntrue\n--dfn-priority\n1080P\n",
@@ -3868,7 +3867,6 @@ mod tests {
         let mut config = test_config();
         let video_dir = temp_test_dir("bilibili-effective-config-multi-thread");
         config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec!["--video-ascending".to_string()];
         fs::write(
             video_dir.join("BBDown.config"),
             "--multi-thread\ntrue\n--skip-mux\n",

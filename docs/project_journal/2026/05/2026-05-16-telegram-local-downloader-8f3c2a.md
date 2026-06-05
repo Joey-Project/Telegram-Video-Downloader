@@ -46,7 +46,7 @@ superseded_by:
 - 外部命令现在流式采集 stdout/stderr、监控输出目录文件增长，并支持总超时与 idle timeout；Telegram 任务会转发节流后的进度消息。
 - 新增 `--replay-message` 本地入口，可用真实消息文本重放路由和下载组件，不依赖 Telegram ingress。
 - YouTube 下载会预取 yt-dlp metadata，优先人工字幕、fallback 自动字幕，并启用 metadata、封面、字幕、info JSON、description 和 NFO 输出。
-- Bilibili 下载继续由 BBDown 负责，显式跳过 AI 字幕，默认追加 `--video-ascending --skip-mux --multi-thread false` 以避开当前复现链接在后台模式下的高码率流和多线程分片卡住问题，并对新增视频生成 best-effort NFO。
+- Bilibili 下载继续由 BBDown 负责，显式跳过 AI 字幕，默认使用 `--video-ascending --skip-mux`，并在没有显式多线程设置时由下载命令追加 `--multi-thread false`，以避开当前复现链接在后台模式下的高码率流和多线程分片卡住问题，并对新增视频生成 best-effort NFO。
 - PDF 支持 `mp.weixin.qq.com` 自动白名单，`/pdf URL` 继续保留。
 - Bilibili `opus` 文章链接现在会规范化为 `https://www.bilibili.com/opus/<id>` 并走 PDF；PDF helper 对这类页面使用静态 HTML 快照渲染，避开页面脚本在 headless Chrome 中主动关闭页面的问题。
 - BBDown 登录态现在由 bot 通过 Bilibili Web QR API 管理：私聊 `/bbdown login/status/logout` 可扫码登录、查看账号、清理本机状态；Bilibili 下载会自动把 bot-managed cookie 注入 BBDown。

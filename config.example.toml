@@ -24,7 +24,7 @@ write_nfo = true
 keep_sidecars = true
 
 [bilibili]
-extra_args = ["--video-ascending", "--skip-mux", "--multi-thread", "false"]
+extra_args = ["--video-ascending", "--skip-mux"]
 
 [bilibili.auth]
 state_path = "~/.local/state/telegram-video-downloader/bilibili-auth.json"
