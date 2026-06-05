@@ -498,15 +498,12 @@ fn move_bilibili_danmaku_sidecars(
             }
             continue;
         }
-        let Some(source) = select_bilibili_danmaku_source(output_video, alternate_sources) else {
-            if destination.exists() {
-                fs::remove_file(&destination).with_context(|| {
-                    format!(
-                        "failed to remove stale Bilibili danmaku sidecar {}",
-                        destination.display()
-                    )
-                })?;
-            }
+        let Some(source) = select_bilibili_danmaku_source(
+            output_video,
+            source_video,
+            extension,
+            alternate_sources,
+        ) else {
             continue;
         };
         if source == destination {
@@ -540,7 +537,7 @@ fn current_bilibili_danmaku_sidecars(
 ) -> Result<Vec<PathBuf>> {
     let mut candidates = Vec::new();
     let source = source_video.with_extension(extension);
-    if source.is_file() {
+    if source.is_file() && modified_since(&source, since) {
         candidates.push(source);
     }
     let root = output_video.parent().unwrap_or_else(|| Path::new("."));
@@ -586,10 +583,19 @@ fn collect_current_bilibili_danmaku_sidecars(
 
 fn select_bilibili_danmaku_source(
     output_video: &Path,
+    source_video: &Path,
+    extension: &str,
     candidates: Vec<PathBuf>,
 ) -> Option<PathBuf> {
     if candidates.is_empty() {
         return None;
+    }
+    let direct_source = source_video.with_extension(extension);
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| **candidate == direct_source)
+    {
+        return Some(candidate.clone());
     }
     let output_stem = output_video.file_stem()?.to_str()?;
     if let Some(candidate) = candidates
@@ -888,10 +894,11 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
 }
 
 fn append_bilibili_danmaku_args(config: &AppConfig, args: &mut Vec<String>) {
-    if !config.bilibili.danmaku.enabled {
-        return;
+    if config.bilibili.danmaku.enabled {
+        args.push("--download-danmaku".to_string());
+    } else {
+        args.extend(["--download-danmaku".to_string(), "false".to_string()]);
     }
-    args.push("--download-danmaku".to_string());
 }
 
 fn bilibili_effective_args(config: &AppConfig) -> Result<Vec<String>> {
@@ -3824,17 +3831,16 @@ mod tests {
         fs::create_dir_all(&stream_dir).expect("stream dir should create");
         let source_video = stream_dir.join("Part 1.mp4");
         fs::write(&source_video, "video").expect("source video should write");
-        fs::write(source_video.with_extension("xml"), "new-xml").expect("source xml should write");
         let output_video = final_dir.join("Final Title.mp4");
         fs::write(&output_video, "merged").expect("output video should write");
         fs::write(output_video.with_extension("xml"), "old-xml").expect("stale xml should write");
+        std::thread::sleep(Duration::from_millis(20));
+        let since = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(source_video.with_extension("xml"), "new-xml").expect("source xml should write");
 
-        let moved = move_bilibili_danmaku_sidecars(
-            &source_video,
-            &output_video,
-            SystemTime::now() + Duration::from_secs(1),
-        )
-        .expect("stale danmaku sidecar should be replaced");
+        let moved = move_bilibili_danmaku_sidecars(&source_video, &output_video, since)
+            .expect("stale danmaku sidecar should be replaced");
 
         assert_eq!(moved, vec![output_video.with_extension("xml")]);
         assert_eq!(
@@ -3909,6 +3915,36 @@ mod tests {
     }
 
     #[test]
+    fn prefers_raw_stream_danmaku_sidecar_among_multiple_candidates() {
+        let final_dir = temp_test_dir("bilibili-danmaku-raw-priority");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        fs::write(source_video.with_extension("xml"), "part-1-xml")
+            .expect("source xml should write");
+        fs::write(stream_dir.join("Part 2.xml"), "part-2-xml").expect("part 2 xml should write");
+        let output_video = final_dir.join("Final Title.mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+
+        let moved = move_bilibili_danmaku_sidecars(&source_video, &output_video, UNIX_EPOCH)
+            .expect("raw danmaku sidecar should move");
+
+        assert_eq!(moved, vec![output_video.with_extension("xml")]);
+        assert_eq!(
+            fs::read_to_string(output_video.with_extension("xml"))
+                .expect("output xml should exist"),
+            "part-1-xml"
+        );
+        assert!(!source_video.with_extension("xml").exists());
+        assert!(
+            stream_dir.join("Part 2.xml").exists(),
+            "unmatched sibling sidecar should remain"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
     fn keeps_current_root_danmaku_sidecar_after_mux() {
         let final_dir = temp_test_dir("bilibili-danmaku-current-root-sidecar");
         let stream_dir = final_dir.join("1556453868");
@@ -3939,7 +3975,7 @@ mod tests {
     }
 
     #[test]
-    fn removes_stale_root_danmaku_sidecar_without_replacement() {
+    fn preserves_existing_root_danmaku_sidecar_without_replacement() {
         let final_dir = temp_test_dir("bilibili-danmaku-stale-root-sidecar");
         let stream_dir = final_dir.join("1556453868");
         fs::create_dir_all(&stream_dir).expect("stream dir should create");
@@ -3954,10 +3990,43 @@ mod tests {
             &output_video,
             SystemTime::now() + Duration::from_secs(1),
         )
-        .expect("stale root sidecar should be removed");
+        .expect("existing root sidecar should remain");
+
+        assert!(moved.is_empty());
+        assert_eq!(
+            fs::read_to_string(output_video.with_extension("xml"))
+                .expect("existing xml should remain"),
+            "old-xml"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn ignores_stale_raw_danmaku_sidecar_without_replacement() {
+        let final_dir = temp_test_dir("bilibili-danmaku-stale-raw-sidecar");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 1.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        fs::write(source_video.with_extension("xml"), "old-raw-xml")
+            .expect("old raw xml should write");
+        let output_video = final_dir.join("Final Title.mp4");
+        fs::write(&output_video, "merged").expect("output video should write");
+
+        let moved = move_bilibili_danmaku_sidecars(
+            &source_video,
+            &output_video,
+            SystemTime::now() + Duration::from_secs(1),
+        )
+        .expect("stale raw sidecar should be ignored");
 
         assert!(moved.is_empty());
         assert!(!output_video.with_extension("xml").exists());
+        assert_eq!(
+            fs::read_to_string(source_video.with_extension("xml"))
+                .expect("stale raw xml should remain"),
+            "old-raw-xml"
+        );
         let _ = fs::remove_dir_all(final_dir);
     }
 
@@ -4166,9 +4235,13 @@ mod tests {
     }
 
     #[test]
-    fn skips_bilibili_danmaku_args_when_disabled() {
+    fn disables_bilibili_danmaku_args_when_disabled() {
         let mut config = test_config();
         config.bilibili.danmaku.enabled = false;
+        config
+            .bilibili
+            .extra_args
+            .push("--download-danmaku".to_string());
 
         let spec = command_spec(
             &config,
@@ -4178,7 +4251,12 @@ mod tests {
         )
         .expect("Bilibili command should build");
 
-        assert!(!spec.args.contains(&"--download-danmaku".to_string()));
+        let danmaku_index = spec
+            .args
+            .iter()
+            .rposition(|arg| arg == "--download-danmaku")
+            .expect("managed danmaku flag should be present");
+        assert_eq!(spec.args.get(danmaku_index + 1), Some(&"false".to_string()));
     }
 
     #[test]
