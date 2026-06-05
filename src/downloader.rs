@@ -692,7 +692,8 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
     let (mut auth_extra_args, explicit_config_path) =
         bilibili_extra_args_without_config_file(config);
     let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
-    let base_config_args = read_optional_bbdown_config_args(base_config_path.as_deref())?;
+    let base_config_args =
+        read_bbdown_base_config_args(base_config_path.as_deref(), explicit_config_path.is_some())?;
     let config_path = bilibili_auth::ensure_bbdown_config_file(
         &config.bilibili.auth.state_path,
         base_config_path.as_deref(),
@@ -725,8 +726,9 @@ fn bilibili_effective_args(config: &AppConfig) -> Result<Vec<String>> {
     let (filtered_args, explicit_config_path) = bilibili_extra_args_without_config_file(config);
     let mut args = Vec::new();
     let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
-    args.extend(read_optional_bbdown_config_args(
+    args.extend(read_bbdown_base_config_args(
         base_config_path.as_deref(),
+        explicit_config_path.is_some(),
     )?);
     args.extend(filtered_args);
     append_bilibili_single_thread_default_if_missing(&mut args, &[]);
@@ -749,9 +751,9 @@ fn read_bbdown_config_args(path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-fn read_optional_bbdown_config_args(path: Option<&Path>) -> Result<Vec<String>> {
+fn read_bbdown_base_config_args(path: Option<&Path>, required: bool) -> Result<Vec<String>> {
     match path {
-        Some(path) if path.exists() => read_bbdown_config_args(path),
+        Some(path) if required || path.exists() => read_bbdown_config_args(path),
         _ => Ok(Vec::new()),
     }
 }
@@ -3748,11 +3750,33 @@ mod tests {
     }
 
     #[test]
+    fn fails_bilibili_command_on_missing_explicit_bbdown_config() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-missing-explicit-config-command");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec![
+            "--config-file".to_string(),
+            "missing.config".to_string(),
+            "--skip-cover".to_string(),
+        ];
+
+        let error = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+            .expect_err("missing explicit BBDown config should fail");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to read BBDown config"));
+        assert!(message.contains("missing.config"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
     fn staging_preserves_relative_explicit_bbdown_config_path() {
         let mut config = test_config();
         let video_dir = temp_test_dir("bilibili-staging-explicit-config");
         let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
         fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(video_dir.join("custom.config"), "--skip-cover\n")
+            .expect("explicit BBDown config should write");
         config.downloads.video_dir = video_dir.clone();
         config.bilibili.extra_args = vec![
             "--config-file".to_string(),
@@ -3776,8 +3800,18 @@ mod tests {
     #[test]
     fn staging_absolutizes_relative_download_dir_config_path() {
         let mut config = test_config();
-        let video_dir = PathBuf::from("downloads");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after UNIX_EPOCH")
+            .as_nanos();
+        let video_dir = PathBuf::from(format!(
+            "downloads-bilibili-staging-explicit-config-{}-{nanos}",
+            std::process::id()
+        ));
         let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&video_dir).expect("relative video dir should create");
+        fs::write(video_dir.join("custom.config"), "--skip-cover\n")
+            .expect("explicit BBDown config should write");
         config.downloads.video_dir = video_dir.clone();
         config.bilibili.extra_args = vec![
             "--config-file".to_string(),
@@ -3797,11 +3831,12 @@ mod tests {
             config_path,
             std::env::current_dir()
                 .expect("current dir should be available")
-                .join("downloads")
+                .join(&video_dir)
                 .join("custom.config")
         );
         assert_eq!(spec.cwd, staging_dir);
         assert!(spec.args.contains(&"--skip-cover".to_string()));
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[test]
@@ -3810,6 +3845,8 @@ mod tests {
         let video_dir = temp_test_dir("bilibili-staging-equals-config");
         let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
         fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(video_dir.join("custom.config"), "--skip-cover\n")
+            .expect("explicit BBDown config should write");
         config.downloads.video_dir = video_dir.clone();
         config.bilibili.extra_args = vec![
             "--config-file=custom.config".to_string(),
@@ -3929,6 +3966,25 @@ mod tests {
         assert!(has_bilibili_flag(&args, "--video-only"));
         assert!(has_bilibili_flag(&args, "--video-ascending"));
         assert!(!args.iter().any(|arg| arg == "--config-file=custom.config"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn reads_effective_bilibili_flags_fails_on_missing_explicit_config() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-missing-explicit-config");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.extra_args = vec![
+            "--config-file=missing.config".to_string(),
+            "--video-ascending".to_string(),
+        ];
+
+        let error =
+            bilibili_effective_args(&config).expect_err("missing explicit config should fail");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to read BBDown config"));
+        assert!(message.contains("missing.config"));
         let _ = fs::remove_dir_all(video_dir);
     }
 
