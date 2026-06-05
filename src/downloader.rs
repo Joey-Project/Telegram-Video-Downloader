@@ -1014,9 +1014,12 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
 }
 
 fn append_bilibili_danmaku_args(config: &AppConfig, args: &mut Vec<String>) {
+    let explicit_setting = take_bilibili_danmaku_setting(args);
     if !config.bilibili.danmaku.enabled {
         args.extend(["--download-danmaku".to_string(), "false".to_string()]);
-    } else if !has_bilibili_danmaku_setting(args) {
+    } else if let Some(explicit_setting) = explicit_setting {
+        args.extend(explicit_setting);
+    } else {
         args.push("--download-danmaku".to_string());
     }
 }
@@ -1105,15 +1108,43 @@ fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
     enabled
 }
 
-fn has_bilibili_option(args: &[String], flag: &str) -> bool {
-    let equals_prefix = format!("{flag}=");
-    let colon_prefix = format!("{flag}:");
-    args.iter()
-        .any(|arg| arg == flag || arg.starts_with(&equals_prefix) || arg.starts_with(&colon_prefix))
+fn take_bilibili_danmaku_setting(args: &mut Vec<String>) -> Option<Vec<String>> {
+    let mut retained = Vec::with_capacity(args.len());
+    let mut setting = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if is_bilibili_danmaku_option(arg) {
+            let mut current = vec![arg.clone()];
+            if is_bilibili_danmaku_flag(arg)
+                && let Some(value) = args.get(index + 1)
+                && parse_bool_token(value).is_some()
+            {
+                current.push(value.clone());
+                index += 2;
+            } else {
+                index += 1;
+            }
+            setting = Some(current);
+        } else {
+            retained.push(arg.clone());
+            index += 1;
+        }
+    }
+    *args = retained;
+    setting
 }
 
-fn has_bilibili_danmaku_setting(args: &[String]) -> bool {
-    has_bilibili_option(args, "--download-danmaku") || has_bilibili_option(args, "-dd")
+fn is_bilibili_danmaku_option(arg: &str) -> bool {
+    is_bilibili_danmaku_flag(arg)
+        || arg.starts_with("--download-danmaku=")
+        || arg.starts_with("--download-danmaku:")
+        || arg.starts_with("-dd=")
+        || arg.starts_with("-dd:")
+}
+
+fn is_bilibili_danmaku_flag(arg: &str) -> bool {
+    arg == "--download-danmaku" || arg == "-dd"
 }
 
 fn parse_bool_token(value: &str) -> Option<bool> {
@@ -4707,6 +4738,36 @@ mod tests {
                 assert_eq!(spec.args.get(danmaku_index + 1), Some(&"false".to_string()));
             }
         }
+    }
+
+    #[test]
+    fn preserves_explicit_bilibili_danmaku_after_base_config() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-explicit-danmaku-after-config");
+        config.downloads.video_dir = video_dir.clone();
+        config
+            .bilibili
+            .extra_args
+            .extend(["--download-danmaku".to_string(), "false".to_string()]);
+        fs::write(video_dir.join("BBDown.config"), "--download-danmaku true\n")
+            .expect("default BBDown config should write");
+
+        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        let config_index = spec
+            .args
+            .iter()
+            .rposition(|arg| arg == "--config-file")
+            .expect("config file arg should be present");
+        let danmaku_index = spec
+            .args
+            .iter()
+            .rposition(|arg| arg == "--download-danmaku")
+            .expect("danmaku arg should be present");
+        assert!(danmaku_index > config_index + 1);
+        assert_eq!(spec.args.get(danmaku_index + 1), Some(&"false".to_string()));
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[test]
