@@ -705,6 +705,16 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
         let mut extra_args = config.bilibili.extra_args.clone();
         append_bilibili_single_thread_default_if_missing(&mut extra_args, &base_config_args);
         args.extend(extra_args);
+        if explicit_config_path.is_none()
+            && let Some(base_config_path) = &base_config_path
+        {
+            args.extend([
+                "--config-file".to_string(),
+                absolute_process_path(base_config_path)
+                    .display()
+                    .to_string(),
+            ]);
+        }
     }
     if let Some(config_path) = &config_path {
         args.extend([
@@ -903,12 +913,16 @@ fn resolve_bbdown_config_path(cwd: &Path, path: &Path) -> PathBuf {
 
 fn absolute_bbdown_config_path(cwd: &Path, path: &Path) -> PathBuf {
     let resolved = resolve_bbdown_config_path(cwd, path);
-    if resolved.is_absolute() {
-        resolved
+    absolute_process_path(&resolved)
+}
+
+fn absolute_process_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join(resolved)
+            .join(path)
     }
 }
 
@@ -3614,6 +3628,32 @@ mod tests {
                     .any(|args| args == ["--multi-thread", "false"])
             );
         }
+    }
+
+    #[test]
+    fn passes_default_bbdown_config_without_cookie() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-default-config-no-cookie");
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--multi-thread true\n--dfn-priority\n1080P\n",
+        )
+        .expect("default BBDown config should write");
+
+        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+            .expect("Bilibili command should build");
+
+        let config_path = command_config_path(&spec).expect("config file arg should be present");
+        assert_eq!(config_path, video_dir.join("BBDown.config"));
+        assert!(
+            !spec
+                .args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        assert!(spec.cleanup_paths.is_empty());
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[test]
