@@ -770,6 +770,8 @@ fn has_bilibili_multi_thread_setting(args: &[String]) -> bool {
             || arg == "-mt"
             || arg.starts_with("--multi-thread=")
             || arg.starts_with("-mt=")
+            || arg.starts_with("--multi-thread:")
+            || arg.starts_with("-mt:")
     })
 }
 
@@ -3557,6 +3559,29 @@ mod tests {
     }
 
     #[test]
+    fn builds_bilibili_command_respects_inline_multi_thread_setting() {
+        for inline_arg in ["--multi-thread:true", "-mt:true"] {
+            let mut config = test_config();
+            config.bilibili.extra_args = vec![
+                "--video-ascending".to_string(),
+                "--skip-mux".to_string(),
+                inline_arg.to_string(),
+            ];
+
+            let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
+                .expect("Bilibili command should build");
+
+            assert!(spec.args.contains(&inline_arg.to_string()));
+            assert!(
+                !spec
+                    .args
+                    .windows(2)
+                    .any(|args| args == ["--multi-thread", "false"])
+            );
+        }
+    }
+
+    #[test]
     fn builds_bilibili_command_with_cookie() {
         let mut config = test_config();
         let video_dir = temp_test_dir("bilibili-cookie-command");
@@ -3938,6 +3963,29 @@ mod tests {
         let args = bilibili_effective_args(&config).expect("effective args should read");
 
         assert!(args.windows(2).any(|args| args == ["-mt", "true"]));
+        assert!(
+            !args
+                .windows(2)
+                .any(|args| args == ["--multi-thread", "false"])
+        );
+        assert!(has_bilibili_flag(&args, "--skip-mux"));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn reads_effective_bilibili_flags_respects_inline_config_multi_thread() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-effective-inline-config-multi-thread");
+        config.downloads.video_dir = video_dir.clone();
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--multi-thread:true\n--skip-mux\n",
+        )
+        .expect("default BBDown config should write");
+
+        let args = bilibili_effective_args(&config).expect("effective args should read");
+
+        assert!(args.iter().any(|arg| arg == "--multi-thread:true"));
         assert!(
             !args
                 .windows(2)
