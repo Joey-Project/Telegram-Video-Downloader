@@ -77,7 +77,15 @@ pub struct BilibiliConfig {
     #[serde(default = "default_bilibili_extra_args")]
     pub extra_args: Vec<String>,
     #[serde(default)]
+    pub danmaku: BilibiliDanmakuConfig,
+    #[serde(default)]
     pub auth: BilibiliAuthConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BilibiliDanmakuConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -262,8 +270,15 @@ impl Default for BilibiliConfig {
     fn default() -> Self {
         Self {
             extra_args: default_bilibili_extra_args(),
+            danmaku: BilibiliDanmakuConfig::default(),
             auth: BilibiliAuthConfig::default(),
         }
+    }
+}
+
+impl Default for BilibiliDanmakuConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -481,6 +496,7 @@ mod tests {
             config.bilibili.extra_args,
             vec!["--video-ascending", "--skip-mux"]
         );
+        assert!(config.bilibili.danmaku.enabled);
         assert_eq!(
             config.bilibili.auth.state_path,
             home.join(".local")
@@ -590,6 +606,24 @@ mod tests {
             err.to_string()
                 .contains("bilibili.auth.poll_interval_seconds")
         );
+    }
+
+    #[test]
+    fn loads_disabled_bilibili_danmaku_config() {
+        let config = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.danmaku]
+            enabled = false
+            "#,
+            PathBuf::from("."),
+        )
+        .expect("disabled danmaku config should parse");
+
+        assert!(!config.bilibili.danmaku.enabled);
     }
 
     #[test]
