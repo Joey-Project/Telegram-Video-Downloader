@@ -547,13 +547,54 @@ fn current_bilibili_danmaku_sidecars(
     let mut candidates = Vec::new();
     let source = source_video.with_extension(extension);
     if source.is_file() && modified_since(&source, since) {
-        candidates.push(source);
+        candidates.push(source.clone());
     }
     let root = output_video.parent().unwrap_or_else(|| Path::new("."));
     collect_current_bilibili_danmaku_sidecars(root, extension, since, &mut candidates)?;
+    candidates = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            if candidate == source {
+                return Some(Ok(candidate));
+            }
+            match sidecar_has_current_primary_media(&candidate, since) {
+                Ok(true) => None,
+                Ok(false) => Some(Ok(candidate)),
+                Err(err) => Some(Err(err)),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
     candidates.sort();
     candidates.dedup();
     Ok(candidates)
+}
+
+fn sidecar_has_current_primary_media(sidecar: &Path, since: SystemTime) -> Result<bool> {
+    let Some(parent) = sidecar.parent() else {
+        return Ok(false);
+    };
+    let Some(sidecar_stem) = sidecar.file_stem().and_then(|stem| stem.to_str()) else {
+        return Ok(false);
+    };
+    let entries =
+        fs::read_dir(parent).with_context(|| format!("failed to read {}", parent.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        if file_type.is_file()
+            && (is_video_file(&path) || is_audio_file(&path))
+            && path.file_stem().and_then(|stem| stem.to_str()) == Some(sidecar_stem)
+            && modified_since(&path, since)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn collect_current_bilibili_danmaku_sidecars(
@@ -3985,6 +4026,33 @@ mod tests {
             stream_dir.join("Part 2.xml").exists(),
             "sibling sidecars should remain for later mux outputs"
         );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn does_not_reassign_bound_root_danmaku_sidecar_to_later_mux_output() {
+        let final_dir = temp_test_dir("bilibili-danmaku-bound-root-sidecar");
+        let stream_dir = final_dir.join("1556453868");
+        fs::create_dir_all(&stream_dir).expect("stream dir should create");
+        let source_video = stream_dir.join("Part 2.mp4");
+        fs::write(&source_video, "video").expect("source video should write");
+        let first_output = final_dir.join("Final Title.mp4");
+        fs::write(&first_output, "first-output").expect("first output should write");
+        fs::write(first_output.with_extension("xml"), "first-xml").expect("first xml should write");
+        let second_output = final_dir.join("Final Title (2).mp4");
+        fs::write(&second_output, "second-output").expect("second output should write");
+
+        let moved =
+            move_bilibili_danmaku_sidecars(&source_video, &second_output, SystemTime::UNIX_EPOCH)
+                .expect("bound root sidecar should not be reassigned");
+
+        assert!(moved.is_empty());
+        assert_eq!(
+            fs::read_to_string(first_output.with_extension("xml"))
+                .expect("first xml should remain bound"),
+            "first-xml"
+        );
+        assert!(!second_output.with_extension("xml").exists());
         let _ = fs::remove_dir_all(final_dir);
     }
 
