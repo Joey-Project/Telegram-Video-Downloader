@@ -233,6 +233,13 @@ pub async fn find_video_duplicate_with_probe(
     job: &JobRequest,
 ) -> Result<Option<VideoDuplicate>> {
     let mut identities = video_identity(job).into_iter().collect::<Vec<_>>();
+    if !identities.is_empty()
+        && let Some(duplicate) =
+            scan_video_duplicate_for_identities(config, job, identities.clone()).await?
+    {
+        return Ok(Some(duplicate));
+    }
+
     if let JobRequest::Bilibili { url } = job {
         match probe_bilibili_metadata(config, url).await {
             Ok(metadata) => push_bilibili_metadata_identities(&mut identities, &metadata),
@@ -251,6 +258,14 @@ pub async fn find_video_duplicate_with_probe(
         }
     }
 
+    scan_video_duplicate_for_identities(config, job, identities).await
+}
+
+async fn scan_video_duplicate_for_identities(
+    config: &AppConfig,
+    job: &JobRequest,
+    identities: Vec<VideoIdentity>,
+) -> Result<Option<VideoDuplicate>> {
     let scan_config = config.clone();
     let scan_job = job.clone();
     tokio::task::spawn_blocking(move || {
@@ -271,21 +286,29 @@ fn find_video_duplicate_for_identities(
 
     let primary_media_kind = staged_primary_media_kind(config, job)?;
     let media_files = list_primary_media_files(&config.downloads.video_dir, primary_media_kind)?;
+    let mut matched_identity = None;
+    let mut seen_videos = BTreeSet::new();
+    let mut existing_videos = Vec::new();
     for identity in identities {
-        let existing_videos = media_files
+        let mut matched_this_identity = false;
+        for video in media_files
             .iter()
             .filter(|video| video_matches_identity(video, &identity))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !existing_videos.is_empty() {
-            return Ok(Some(VideoDuplicate {
-                identity,
-                existing_videos,
-            }));
+        {
+            matched_this_identity = true;
+            if seen_videos.insert(video.clone()) {
+                existing_videos.push(video.clone());
+            }
+        }
+        if matched_this_identity && matched_identity.is_none() {
+            matched_identity = Some(identity);
         }
     }
 
-    Ok(None)
+    Ok(matched_identity.map(|identity| VideoDuplicate {
+        identity,
+        existing_videos,
+    }))
 }
 
 async fn run_simple_job(
@@ -1116,11 +1139,23 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
 }
 
 pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
-    let mut spec = bilibili_command_spec(config, url)?;
-    remove_bilibili_info_only_args(&mut spec.args);
-    spec.args.push("--only-show-info".to_string());
-    spec.activity_dir = None;
-    Ok(spec)
+    let config_path =
+        bilibili_auth::ensure_bbdown_config_file(&config.bilibili.auth.state_path, None)?;
+    let mut args = vec![url.to_string(), "--only-show-info".to_string()];
+    if let Some(config_path) = &config_path {
+        args.extend([
+            "--config-file".to_string(),
+            config_path.display().to_string(),
+        ]);
+    }
+
+    Ok(CommandSpec {
+        program: config.tools.bbdown.clone(),
+        args,
+        cwd: config.downloads.video_dir.clone(),
+        activity_dir: None,
+        cleanup_paths: config_path.into_iter().collect(),
+    })
 }
 
 fn append_bilibili_danmaku_args(config: &AppConfig, args: &mut Vec<String>) {
@@ -1216,40 +1251,6 @@ fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
         index += 1;
     }
     enabled
-}
-
-fn remove_bilibili_info_only_args(args: &mut Vec<String>) {
-    let mut retained = Vec::with_capacity(args.len());
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if is_bilibili_info_only_option(arg) {
-            if is_bilibili_info_only_flag(arg)
-                && let Some(value) = args.get(index + 1)
-                && parse_bool_token(value).is_some()
-            {
-                index += 2;
-            } else {
-                index += 1;
-            }
-        } else {
-            retained.push(arg.clone());
-            index += 1;
-        }
-    }
-    *args = retained;
-}
-
-fn is_bilibili_info_only_option(arg: &str) -> bool {
-    is_bilibili_info_only_flag(arg)
-        || arg.starts_with("--only-show-info=")
-        || arg.starts_with("--only-show-info:")
-        || arg.starts_with("-info=")
-        || arg.starts_with("-info:")
-}
-
-fn is_bilibili_info_only_flag(arg: &str) -> bool {
-    arg == "--only-show-info" || arg == "-info"
 }
 
 fn take_bilibili_danmaku_setting(args: &mut Vec<String>) -> Option<Vec<String>> {
@@ -2312,6 +2313,10 @@ fn parse_bilibili_metadata(url: &str, stdout: &str) -> BilibiliMetadata {
             metadata.title = Some(title.trim().to_string());
         } else if let Some((_, aid)) = line.split_once("获取aid结束:") {
             metadata.aid = Some(aid.trim().to_string());
+        } else if let Some((_, video_url)) = line.split_once("视频URL:") {
+            if metadata.id.is_none() {
+                metadata.id = bilibili_id_from_url(video_url.trim());
+            }
         } else if let Some((_, published)) = line.split_once("发布时间:") {
             let published = published.trim();
             metadata.publish_date = published.get(..10).map(str::to_string);
@@ -3475,6 +3480,8 @@ fn join_paths(paths: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use std::env;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use crate::bilibili_auth::{AuthState, save_auth_state};
@@ -3650,6 +3657,92 @@ mod tests {
 
         assert_eq!(duplicate.identity.id, "116539978154171");
         assert_eq!(duplicate.existing_videos, vec![bilibili_path]);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn aggregates_bilibili_duplicates_across_aliases() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-bilibili-aliases");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let bvid_path = video_dir.join("Title [BV12TRrBcEP8].mp4");
+        fs::write(&bvid_path, "video").expect("bvid video should write");
+        let aid_path = video_dir.join("Title from aid.mp4");
+        fs::write(&aid_path, "video").expect("aid video should write");
+        fs::write(
+            aid_path.with_extension("nfo"),
+            "<movie><uniqueid type=\"bilibili-aid\">116539978154171</uniqueid></movie>",
+        )
+        .expect("aid nfo should write");
+
+        let duplicate = find_video_duplicate_for_identities(
+            &config,
+            &JobRequest::Bilibili {
+                url: "https://b23.tv/Jt1mZiL".to_string(),
+            },
+            vec![
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "BV12TRrBcEP8".to_string(),
+                },
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "116539978154171".to_string(),
+                },
+            ],
+        )
+        .expect("duplicate scan should succeed")
+        .expect("bilibili duplicate should be found");
+
+        assert_eq!(duplicate.identity.id, "BV12TRrBcEP8");
+        assert_eq!(duplicate.existing_videos, vec![bvid_path, aid_path]);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn finds_url_duplicate_before_bilibili_probe() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-before-probe");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let existing = video_dir.join("Title [BV12TRrBcEP8].mp4");
+        fs::write(&existing, "video").expect("existing video should write");
+        let probe_marker = video_dir.join("probe-ran");
+        let slow_probe = video_dir.join("slow-bbdown-probe.sh");
+        fs::write(
+            &slow_probe,
+            format!(
+                "#!/bin/sh\necho ran > '{}'\nsleep 3\n",
+                probe_marker.display()
+            ),
+        )
+        .expect("slow probe should write");
+        let mut permissions = fs::metadata(&slow_probe)
+            .expect("slow probe metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&slow_probe, permissions).expect("slow probe should be executable");
+        config.tools.bbdown = slow_probe;
+
+        let duplicate = tokio_timeout(
+            Duration::from_millis(500),
+            find_video_duplicate_with_probe(
+                &config,
+                &JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+                },
+            ),
+        )
+        .await
+        .expect("duplicate scan should not wait for metadata probe")
+        .expect("duplicate scan should succeed")
+        .expect("direct URL duplicate should be found");
+
+        assert_eq!(duplicate.identity.id, "BV12TRrBcEP8");
+        assert_eq!(duplicate.existing_videos, vec![existing]);
+        assert!(!probe_marker.exists());
         let _ = fs::remove_dir_all(video_dir);
     }
 
@@ -4781,12 +4874,18 @@ mod tests {
         let spec = bilibili_metadata_command_spec(&config, "https://b23.tv/Jt1mZiL")
             .expect("Bilibili metadata command should build");
 
-        assert!(spec.args.contains(&"--only-show-info".to_string()));
+        assert_eq!(
+            spec.args,
+            vec![
+                "https://b23.tv/Jt1mZiL".to_string(),
+                "--only-show-info".to_string()
+            ]
+        );
         assert_eq!(spec.activity_dir, None);
     }
 
     #[test]
-    fn bilibili_metadata_command_forces_info_only_over_false_config() {
+    fn bilibili_metadata_command_ignores_download_args() {
         let mut config = test_config();
         config.bilibili.extra_args = vec![
             "--only-show-info=false".to_string(),
@@ -4812,7 +4911,31 @@ mod tests {
                 .count(),
             1
         );
-        assert!(spec.args.contains(&"--skip-mux".to_string()));
+        assert!(!spec.args.contains(&"--skip-mux".to_string()));
+    }
+
+    #[test]
+    fn bilibili_metadata_command_ignores_archive_writing_flags() {
+        let mut config = test_config();
+        config.bilibili.extra_args = vec![
+            "--save-archives-to-file".to_string(),
+            "true".to_string(),
+            "--save-archives-to-file=false".to_string(),
+            "--skip-mux".to_string(),
+        ];
+
+        let spec = bilibili_metadata_command_spec(&config, "https://b23.tv/Jt1mZiL")
+            .expect("Bilibili metadata command should build");
+
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg.starts_with("--save-archives-to-file"))
+        );
+        assert!(!spec.args.contains(&"true".to_string()));
+        assert!(spec.args.contains(&"--only-show-info".to_string()));
+        assert!(!spec.args.contains(&"--skip-mux".to_string()));
     }
 
     #[test]
@@ -5212,6 +5335,53 @@ mod tests {
         let config_content =
             fs::read_to_string(&config_path).expect("BBDown auth config should exist");
         assert!(config_content.contains("--download-danmaku false"));
+
+        bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn bilibili_metadata_probe_cookie_config_does_not_merge_download_config() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-metadata-cookie-config");
+        let path = video_dir.join("bilibili-auth.json");
+        config.bilibili.auth.state_path = path.clone();
+        config.downloads.video_dir = video_dir.clone();
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        fs::write(
+            video_dir.join("BBDown.config"),
+            "--save-archives-to-file\n--dfn-priority\n1080P\n",
+        )
+        .expect("default BBDown config should write");
+        save_auth_state(
+            &path,
+            &AuthState {
+                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
+                mid: 123,
+                uname: "Joey".to_string(),
+                stored_at_unix: 1,
+            },
+        )
+        .expect("auth state should save");
+
+        let spec = bilibili_metadata_command_spec(&config, "https://b23.tv/Jt1mZiL")
+            .expect("Bilibili metadata command should build");
+
+        let config_index = spec
+            .args
+            .iter()
+            .position(|arg| arg == "--config-file")
+            .expect("config file arg should be present");
+        let config_path = PathBuf::from(
+            spec.args
+                .get(config_index + 1)
+                .expect("config file path should be present"),
+        );
+        let config_content =
+            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
+        assert_eq!(config_content, "--cookie\nSESSDATA=secret; bili_jct=csrf\n");
+        assert!(!spec.args.contains(&"--save-archives-to-file".to_string()));
+        assert_eq!(spec.cleanup_paths, vec![config_path.clone()]);
 
         bilibili_auth::release_bbdown_config_file(&config_path);
         let _ = fs::remove_dir_all(video_dir);
@@ -5809,6 +5979,17 @@ mod tests {
         );
         assert_eq!(metadata.id.as_deref(), Some("BV12TRrBcEP8"));
         assert_eq!(metadata.aid.as_deref(), Some("1556453868"));
+    }
+
+    #[test]
+    fn parses_bilibili_metadata_resolved_video_url() {
+        let metadata = parse_bilibili_metadata(
+            "https://b23.tv/Jt1mZiL",
+            "[2026] - 视频URL: https://www.bilibili.com/video/BV12TRrBcEP8/\n[2026] - 获取aid结束: 116539978154171",
+        );
+
+        assert_eq!(metadata.id.as_deref(), Some("BV12TRrBcEP8"));
+        assert_eq!(metadata.aid.as_deref(), Some("116539978154171"));
     }
 
     #[cfg(unix)]
