@@ -2352,6 +2352,15 @@ fn push_bilibili_metadata_identities(
             },
         );
     }
+    if let Some(aid) = metadata.aid.as_deref().filter(|aid| !aid.trim().is_empty()) {
+        push_unique_video_identity(
+            identities,
+            VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: format!("av{}", aid.trim_start_matches("av")),
+            },
+        );
+    }
 }
 
 fn push_unique_video_identity(identities: &mut Vec<VideoIdentity>, identity: VideoIdentity) {
@@ -6034,6 +6043,70 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn adds_bilibili_av_alias_from_resolved_aid() {
+        let metadata = parse_bilibili_metadata(
+            "https://b23.tv/Jt1mZiL",
+            "[2026] - 视频URL: https://www.bilibili.com/video/BV12TRrBcEP8/\n[2026] - 获取aid结束: 1556453868",
+        );
+        let mut identities = Vec::new();
+
+        push_bilibili_metadata_identities(&mut identities, &metadata);
+
+        assert_eq!(
+            identities,
+            vec![
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "BV12TRrBcEP8".to_string(),
+                },
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "1556453868".to_string(),
+                },
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "av1556453868".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_bilibili_duplicate_from_resolved_av_sidecar() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-bilibili-av");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let bilibili_path = video_dir.join("bilibili-title.mp4");
+        fs::write(&bilibili_path, "video").expect("bilibili file should write");
+        fs::write(
+            bilibili_path.with_extension("nfo"),
+            "<movie><uniqueid type=\"bilibili\">av1556453868</uniqueid></movie>",
+        )
+        .expect("nfo should write");
+        let metadata = parse_bilibili_metadata(
+            "https://b23.tv/Jt1mZiL",
+            "[2026] - 视频URL: https://www.bilibili.com/video/BV12TRrBcEP8/\n[2026] - 获取aid结束: 1556453868",
+        );
+        let mut identities = Vec::new();
+        push_bilibili_metadata_identities(&mut identities, &metadata);
+
+        let duplicate = find_video_duplicate_for_identities(
+            &config,
+            &JobRequest::Bilibili {
+                url: "https://b23.tv/Jt1mZiL".to_string(),
+            },
+            identities,
+        )
+        .expect("duplicate scan should succeed")
+        .expect("bilibili av duplicate should be found");
+
+        assert_eq!(duplicate.identity.id, "av1556453868");
+        assert_eq!(duplicate.existing_videos, vec![bilibili_path]);
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[cfg(unix)]
