@@ -370,7 +370,7 @@ fn default_poll_timeout_seconds() -> u64 {
 }
 
 fn default_progress_update_seconds() -> u64 {
-    30
+    5
 }
 
 fn default_command_timeout_seconds() -> u64 {
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(config.tools.ffmpeg, PathBuf::from("ffmpeg"));
         assert_eq!(config.bot.concurrency, 2);
         assert_eq!(config.bot.poll_timeout_seconds, 50);
-        assert_eq!(config.bot.progress_update_seconds, 30);
+        assert_eq!(config.bot.progress_update_seconds, 5);
         assert_eq!(config.bot.command_timeout_seconds, 7200);
         assert_eq!(config.bot.command_idle_timeout_seconds, 300);
         assert_eq!(config.pdf.auto_domains, vec!["mp.weixin.qq.com"]);

@@ -1656,11 +1656,12 @@ async fn run_command(
                 next_activity_poll = Instant::now() + activity_poll_interval;
                 let tracker = file_activity.as_mut().expect("guarded by is_some");
                 match tracker.poll().await {
-                    Ok(Some(message)) => {
-                        last_activity_at = Instant::now();
-                        progress_tracker.emit(message);
+                    Ok(report) => {
+                        if report.changed_since_previous_poll {
+                            last_activity_at = Instant::now();
+                        }
+                        progress_tracker.emit_file_activity(report);
                     }
-                    Ok(None) => {}
                     Err(err) => {
                         info!(
                             command = %spec.program.display(),
@@ -1827,6 +1828,9 @@ struct FileActivityTracker {
     baseline: FileActivitySnapshot,
     last_changed_file_count: usize,
     last_changed_size: u64,
+    started_at: Instant,
+    last_poll_at: Instant,
+    last_change_at: Option<Instant>,
 }
 
 struct FileActivitySnapshot {
@@ -1834,22 +1838,37 @@ struct FileActivitySnapshot {
     direct_dirs: BTreeSet<PathBuf>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FileActivityReport {
+    changed_file_count: usize,
+    changed_size: u64,
+    speed_bytes_per_second: f64,
+    elapsed: Duration,
+    last_change_age: Option<Duration>,
+    changed_since_previous_poll: bool,
+}
+
 impl FileActivityTracker {
     async fn new(root: &Path) -> Result<Self> {
         let root = root.to_path_buf();
         let baseline = collect_file_activity(root.clone(), None).await?;
+        let now = Instant::now();
         Ok(Self {
             root,
             baseline,
             last_changed_file_count: 0,
             last_changed_size: 0,
+            started_at: now,
+            last_poll_at: now,
+            last_change_at: None,
         })
     }
 
-    async fn poll(&mut self) -> Result<Option<String>> {
+    async fn poll(&mut self) -> Result<FileActivityReport> {
         let current =
             collect_file_activity(self.root.clone(), Some(self.baseline.direct_dirs.clone()))
                 .await?;
+        let now = Instant::now();
         let changed = current
             .files
             .iter()
@@ -1861,22 +1880,34 @@ impl FileActivityTracker {
             changed_size += size;
         }
 
-        if changed_file_count == self.last_changed_file_count
-            && changed_size == self.last_changed_size
-        {
-            return Ok(None);
+        let changed_since_previous_poll = changed_file_count != self.last_changed_file_count
+            || changed_size != self.last_changed_size;
+        let delta_bytes = changed_size.saturating_sub(self.last_changed_size);
+        let poll_elapsed = now.saturating_duration_since(self.last_poll_at);
+        let speed_bytes_per_second = if poll_elapsed.is_zero() {
+            0.0
+        } else {
+            delta_bytes as f64 / poll_elapsed.as_secs_f64()
+        };
+
+        if changed_since_previous_poll {
+            self.last_change_at = Some(now);
         }
 
         self.last_changed_file_count = changed_file_count;
         self.last_changed_size = changed_size;
-        if changed_file_count == 0 {
-            return Ok(None);
-        }
+        self.last_poll_at = now;
 
-        Ok(Some(format!(
-            "files: {changed_file_count} changed, {} written",
-            human_bytes(changed_size)
-        )))
+        Ok(FileActivityReport {
+            changed_file_count,
+            changed_size,
+            speed_bytes_per_second,
+            elapsed: now.saturating_duration_since(self.started_at),
+            last_change_age: self
+                .last_change_at
+                .map(|last_change_at| now.saturating_duration_since(last_change_at)),
+            changed_since_previous_poll,
+        })
     }
 }
 
@@ -1990,12 +2021,137 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+fn human_rate(bytes_per_second: f64) -> String {
+    let bytes_per_second = bytes_per_second.max(0.0).round() as u64;
+    format!("{}/s", human_bytes(bytes_per_second))
+}
+
+fn format_duration_compact(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!(
+            "{}h {:02}m {:02}s",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressStage {
+    Resolving,
+    Downloading,
+    Video,
+    Audio,
+    Downloaded,
+    Merging,
+    Finalizing,
+    Running,
+}
+
+impl ProgressStage {
+    fn initial_for(command_name: &str) -> Self {
+        let command_name = command_name.to_ascii_lowercase();
+        if command_name.contains("bbdown") {
+            Self::Resolving
+        } else if command_name.contains("yt-dlp") {
+            Self::Downloading
+        } else if command_name.contains("ffmpeg") {
+            Self::Merging
+        } else {
+            Self::Running
+        }
+    }
+
+    fn update_from_text(self, command_name: &str, text: &str) -> Self {
+        let command_name = command_name.to_ascii_lowercase();
+        let lower_text = text.to_ascii_lowercase();
+
+        if command_name.contains("bbdown") {
+            if text.contains("混流") || text.contains("合并") || lower_text.contains("mux") {
+                Self::Merging
+            } else if text.contains("开始下载") && (text.contains("音频") || text.contains("音轨"))
+            {
+                Self::Audio
+            } else if text.contains("开始下载") && text.contains("视频") {
+                Self::Video
+            } else if (text.contains("下载") && (text.contains("完毕") || text.contains("完成")))
+                || text.contains("任务完成")
+            {
+                Self::Downloaded
+            } else {
+                self
+            }
+        } else if command_name.contains("yt-dlp") {
+            if lower_text.contains("[download]") {
+                Self::Downloading
+            } else if lower_text.contains("ffmpeg") || lower_text.contains("merging") {
+                Self::Merging
+            } else if lower_text.contains("embedding") || lower_text.contains("metadata") {
+                Self::Finalizing
+            } else {
+                self
+            }
+        } else if command_name.contains("ffmpeg") {
+            Self::Merging
+        } else {
+            self
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Resolving => "resolving metadata",
+            Self::Downloading => "downloading media",
+            Self::Video => "downloading video",
+            Self::Audio => "downloading audio",
+            Self::Downloaded => "download complete",
+            Self::Merging => "muxing media",
+            Self::Finalizing => "finalizing",
+            Self::Running => "running",
+        }
+    }
+
+    fn done_label(self) -> &'static str {
+        match self {
+            Self::Resolving | Self::Running => "-",
+            Self::Downloading => "resolve",
+            Self::Video => "resolve",
+            Self::Audio => "resolve, video",
+            Self::Downloaded => "resolve, video, audio",
+            Self::Merging => "download",
+            Self::Finalizing => "download, mux",
+        }
+    }
+
+    fn todo_label(self) -> &'static str {
+        match self {
+            Self::Resolving => "video, audio, mux, move",
+            Self::Downloading => "metadata, embed, move",
+            Self::Video => "audio, mux, move",
+            Self::Audio => "mux, move",
+            Self::Downloaded => "mux, move",
+            Self::Merging => "move",
+            Self::Finalizing => "move",
+            Self::Running => "finish",
+        }
+    }
+}
+
 struct ProgressTracker {
     command_name: String,
     min_interval: Duration,
     next_send_at: Instant,
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
     last_message: Option<String>,
+    last_output: Option<String>,
+    last_file_activity: Option<FileActivityReport>,
+    stage: ProgressStage,
 }
 
 impl ProgressTracker {
@@ -2005,49 +2161,91 @@ impl ProgressTracker {
         progress: Option<mpsc::UnboundedSender<JobProgress>>,
     ) -> Self {
         Self {
+            stage: ProgressStage::initial_for(&command_name),
             command_name,
             min_interval,
             next_send_at: Instant::now(),
             progress,
             last_message: None,
+            last_output: None,
+            last_file_activity: None,
         }
     }
 
     fn observe(&mut self, stream: CommandStream, bytes: &[u8]) {
-        let Some(progress) = &self.progress else {
+        if self.progress.is_none() {
             return;
-        };
+        }
 
         let text = normalize_terminal_text(&String::from_utf8_lossy(bytes));
+        self.stage = self.stage.update_from_text(&self.command_name, &text);
         let Some(message) = summarize_progress_chunk(&self.command_name, stream, &text) else {
             return;
         };
 
-        let message_changed = self.last_message.as_ref() != Some(&message);
+        self.last_output = Some(message);
         let now = Instant::now();
+        self.emit_current(now);
+    }
+
+    fn emit_file_activity(&mut self, report: FileActivityReport) {
+        if self.progress.is_none() {
+            return;
+        }
+
+        self.last_file_activity = Some(report);
+        self.emit_current(Instant::now());
+    }
+
+    fn emit_current(&mut self, now: Instant) {
+        let Some(progress) = &self.progress else {
+            return;
+        };
+
         if now < self.next_send_at {
             return;
         }
-        if !message_changed {
+        let message = self.current_message();
+        if self.last_message.as_ref() == Some(&message) {
             return;
         }
 
         self.send(progress.clone(), message, now);
     }
 
-    fn emit(&mut self, message: String) {
-        let Some(progress) = &self.progress else {
-            return;
-        };
+    fn current_message(&self) -> String {
+        let mut lines = vec![
+            format!("{}: {}", self.command_name, self.stage.label()),
+            format!("Done: {}", self.stage.done_label()),
+            format!("Todo: {}", self.stage.todo_label()),
+        ];
 
-        let now = Instant::now();
-        if now < self.next_send_at {
-            return;
+        if let Some(report) = self.last_file_activity {
+            lines.push(format!(
+                "Files: {} changed, {} written",
+                report.changed_file_count,
+                human_bytes(report.changed_size)
+            ));
+            lines.push(format!(
+                "Speed: {}",
+                human_rate(report.speed_bytes_per_second)
+            ));
+            lines.push(format!(
+                "Elapsed: {}",
+                format_duration_compact(report.elapsed)
+            ));
+            let last_change = report
+                .last_change_age
+                .map(|age| format!("{} ago", format_duration_compact(age)))
+                .unwrap_or_else(|| "none yet".to_string());
+            lines.push(format!("Last file change: {last_change}"));
         }
-        if self.last_message.as_ref() == Some(&message) {
-            return;
+
+        if let Some(output) = &self.last_output {
+            lines.push(format!("Last output: {output}"));
         }
-        self.send(progress.clone(), message, now);
+
+        lines.join("\n")
     }
 
     fn send(
@@ -5818,6 +6016,14 @@ mod tests {
         assert_eq!(human_bytes(42), "42 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
         assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MiB");
+        assert_eq!(human_rate(0.0), "0 B/s");
+        assert_eq!(human_rate(1_572_864.0), "1.5 MiB/s");
+        assert_eq!(format_duration_compact(Duration::from_secs(5)), "5s");
+        assert_eq!(format_duration_compact(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(
+            format_duration_compact(Duration::from_secs(3661)),
+            "1h 01m 01s"
+        );
     }
 
     #[test]
@@ -5843,14 +6049,19 @@ mod tests {
             ProgressTracker::new("yt-dlp".to_string(), Duration::from_secs(30), Some(tx));
 
         tracker.observe(CommandStream::Stdout, b"[download] 1.0%");
-        assert_eq!(rx.try_recv().unwrap().message, "yt-dlp: 1%");
+        let first = rx.try_recv().unwrap().message;
+        assert!(first.contains("yt-dlp: downloading media"));
+        assert!(first.contains("Done: resolve"));
+        assert!(first.contains("Todo: metadata, embed, move"));
+        assert!(first.contains("Last output: yt-dlp: 1%"));
 
         tracker.observe(CommandStream::Stdout, b"[download] 2.0%");
         assert!(rx.try_recv().is_err());
 
         tracker.next_send_at = Instant::now() - Duration::from_secs(1);
         tracker.observe(CommandStream::Stdout, b"[download] 2.0%");
-        assert_eq!(rx.try_recv().unwrap().message, "yt-dlp: 2%");
+        let second = rx.try_recv().unwrap().message;
+        assert!(second.contains("Last output: yt-dlp: 2%"));
     }
 
     #[test]
@@ -5859,14 +6070,52 @@ mod tests {
         let mut tracker =
             ProgressTracker::new("BBDown".to_string(), Duration::from_secs(30), Some(tx));
 
-        tracker.emit("files: 1 changed, 1.0 MiB written".to_string());
-        assert_eq!(
-            rx.try_recv().unwrap().message,
-            "files: 1 changed, 1.0 MiB written"
-        );
+        tracker.emit_file_activity(FileActivityReport {
+            changed_file_count: 1,
+            changed_size: 1024 * 1024,
+            speed_bytes_per_second: 1024.0 * 1024.0,
+            elapsed: Duration::from_secs(60),
+            last_change_age: Some(Duration::ZERO),
+            changed_since_previous_poll: true,
+        });
+        let first = rx.try_recv().unwrap().message;
+        assert!(first.contains("BBDown: resolving metadata"));
+        assert!(first.contains("Done: -"));
+        assert!(first.contains("Todo: video, audio, mux, move"));
+        assert!(first.contains("Files: 1 changed, 1.0 MiB written"));
+        assert!(first.contains("Speed: 1.0 MiB/s"));
+        assert!(first.contains("Elapsed: 1m 00s"));
+        assert!(first.contains("Last file change: 0s ago"));
 
-        tracker.emit("files: 1 changed, 2.0 MiB written".to_string());
+        tracker.emit_file_activity(FileActivityReport {
+            changed_file_count: 1,
+            changed_size: 2 * 1024 * 1024,
+            speed_bytes_per_second: 1024.0 * 1024.0,
+            elapsed: Duration::from_secs(61),
+            last_change_age: Some(Duration::ZERO),
+            changed_since_previous_poll: true,
+        });
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tracks_bbdown_stage_from_output() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tracker =
+            ProgressTracker::new("BBDown".to_string(), Duration::from_secs(30), Some(tx));
+
+        tracker.observe(CommandStream::Stdout, "开始下载P1视频\n".as_bytes());
+        let first = rx.try_recv().unwrap().message;
+        assert!(first.contains("BBDown: downloading video"));
+        assert!(first.contains("Done: resolve"));
+        assert!(first.contains("Todo: audio, mux, move"));
+
+        tracker.next_send_at = Instant::now() - Duration::from_secs(1);
+        tracker.observe(CommandStream::Stdout, "开始下载P1音频\n".as_bytes());
+        let second = rx.try_recv().unwrap().message;
+        assert!(second.contains("BBDown: downloading audio"));
+        assert!(second.contains("Done: resolve, video"));
+        assert!(second.contains("Todo: mux, move"));
     }
 
     #[tokio::test]
@@ -5919,17 +6168,78 @@ mod tests {
         fs::write(existing.join("old.part"), b"changed").expect("existing file should change");
         fs::write(existing_aid.join("old.part"), b"changed")
             .expect("existing aid file should change");
-        assert_eq!(
-            tracker.poll().await.expect("poll should work"),
-            Some("files: 1 changed, 7 B written".to_string())
-        );
+        let report = tracker.poll().await.expect("poll should work");
+        assert_eq!(report.changed_file_count, 1);
+        assert_eq!(report.changed_size, 7);
+        assert!(report.changed_since_previous_poll);
 
         let created = root.join("created");
         fs::create_dir_all(&created).expect("new dir should be created");
         fs::write(created.join("new.part"), b"new bytes").expect("new file should be written");
-        let message = tracker.poll().await.expect("poll should work");
+        let report = tracker.poll().await.expect("poll should work");
 
-        assert_eq!(message, Some("files: 2 changed, 16 B written".to_string()));
+        assert_eq!(report.changed_file_count, 2);
+        assert_eq!(report.changed_size, 16);
+        assert!(report.changed_since_previous_poll);
+
+        let stable_report = tracker.poll().await.expect("poll should work");
+        assert_eq!(stable_report.changed_file_count, 2);
+        assert_eq!(stable_report.changed_size, 16);
+        assert!(!stable_report.changed_since_previous_poll);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_command_refreshes_file_activity_without_output() {
+        let root = temp_test_dir("silent-file-activity");
+        let output = root.join("out.part");
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 10;
+        config.bot.command_idle_timeout_seconds = 10;
+        config.bot.progress_update_seconds = 1;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "printf data > \"$0\"; sleep 3".to_string(),
+                output.display().to_string(),
+            ],
+            cwd: root.clone(),
+            activity_dir: Some(root.clone()),
+            cleanup_paths: Vec::new(),
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let result = tokio_timeout(
+            Duration::from_secs(8),
+            run_command(&config, &spec, Some(tx)),
+        )
+        .await
+        .expect("silent file activity command should not hang")
+        .expect("silent file activity command should succeed");
+
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+        let mut messages = Vec::new();
+        while let Ok(progress) = rx.try_recv() {
+            messages.push(progress.message);
+        }
+        let file_activity_messages = messages
+            .iter()
+            .filter(|message| message.contains("Files: 1 changed, 4 B written"))
+            .count();
+        assert!(
+            file_activity_messages >= 2,
+            "expected repeated fixed-interval file activity updates, got {messages:?}"
+        );
+        assert!(messages.iter().any(|message| message.contains("Speed:")));
+        assert!(messages.iter().any(|message| message.contains("Elapsed:")));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("Last file change:"))
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
