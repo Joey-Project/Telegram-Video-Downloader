@@ -35,6 +35,7 @@ const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
 ];
 const OUTPUT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_ABORT_GRACE: Duration = Duration::from_secs(3);
+const BILIBILI_METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[cfg(unix)]
 type CommandProcessGroup = Option<libc::pid_t>;
@@ -227,25 +228,64 @@ pub async fn run_video_job_staged_keep_both(
     .await
 }
 
-pub fn find_video_duplicate(
+pub async fn find_video_duplicate_with_probe(
     config: &AppConfig,
     job: &JobRequest,
 ) -> Result<Option<VideoDuplicate>> {
-    let Some(identity) = video_identity(job) else {
+    let mut identities = video_identity(job).into_iter().collect::<Vec<_>>();
+    if let JobRequest::Bilibili { url } = job {
+        match probe_bilibili_metadata(config, url).await {
+            Ok(metadata) => push_bilibili_metadata_identities(&mut identities, &metadata),
+            Err(err) if identities.is_empty() => {
+                return Err(err).with_context(|| {
+                    format!("failed to probe Bilibili metadata for duplicate check: {url}")
+                });
+            }
+            Err(err) => {
+                info!(
+                    url = %url,
+                    error = %err,
+                    "Bilibili metadata probe skipped during duplicate check"
+                );
+            }
+        }
+    }
+
+    let scan_config = config.clone();
+    let scan_job = job.clone();
+    tokio::task::spawn_blocking(move || {
+        find_video_duplicate_for_identities(&scan_config, &scan_job, identities)
+    })
+    .await
+    .context("duplicate scan task failed")?
+}
+
+fn find_video_duplicate_for_identities(
+    config: &AppConfig,
+    job: &JobRequest,
+    identities: Vec<VideoIdentity>,
+) -> Result<Option<VideoDuplicate>> {
+    if identities.is_empty() {
         return Ok(None);
-    };
+    }
 
     let primary_media_kind = staged_primary_media_kind(config, job)?;
-    let existing_videos =
-        list_primary_media_files(&config.downloads.video_dir, primary_media_kind)?
-            .into_iter()
+    let media_files = list_primary_media_files(&config.downloads.video_dir, primary_media_kind)?;
+    for identity in identities {
+        let existing_videos = media_files
+            .iter()
             .filter(|video| video_matches_identity(video, &identity))
+            .cloned()
             .collect::<Vec<_>>();
+        if !existing_videos.is_empty() {
+            return Ok(Some(VideoDuplicate {
+                identity,
+                existing_videos,
+            }));
+        }
+    }
 
-    Ok((!existing_videos.is_empty()).then_some(VideoDuplicate {
-        identity,
-        existing_videos,
-    }))
+    Ok(None)
 }
 
 async fn run_simple_job(
@@ -358,6 +398,12 @@ async fn run_bilibili_job_locked(
                     videos_to_process
                 };
                 if config.video.write_nfo {
+                    let mut alternate_unique_ids = Vec::new();
+                    if let (Some(id), Some(aid)) = (metadata.id.as_deref(), metadata.aid.as_deref())
+                        && id != aid
+                    {
+                        alternate_unique_ids.push(("bilibili-aid", aid));
+                    }
                     match write_nfos_for_videos(
                         &final_videos,
                         &MediaNfo {
@@ -369,6 +415,7 @@ async fn run_bilibili_job_locked(
                                 .as_deref()
                                 .or(metadata.aid.as_deref())
                                 .unwrap_or(url),
+                            alternate_unique_ids,
                             source_url: &metadata.source_url,
                             studio: metadata.uploader_url.as_deref(),
                             premiered: metadata.publish_date.as_deref(),
@@ -860,6 +907,7 @@ async fn run_youtube_job_locked(
                     plot: metadata.description.as_deref(),
                     unique_id_type: "youtube",
                     unique_id: metadata.id.as_deref().unwrap_or(url),
+                    alternate_unique_ids: Vec::new(),
                     source_url,
                     studio,
                     premiered: premiered.as_deref(),
@@ -1067,6 +1115,14 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
     })
 }
 
+pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
+    let mut spec = bilibili_command_spec(config, url)?;
+    remove_bilibili_info_only_args(&mut spec.args);
+    spec.args.push("--only-show-info".to_string());
+    spec.activity_dir = None;
+    Ok(spec)
+}
+
 fn append_bilibili_danmaku_args(config: &AppConfig, args: &mut Vec<String>) {
     let explicit_setting = take_bilibili_danmaku_setting(args);
     if !config.bilibili.danmaku.enabled {
@@ -1160,6 +1216,40 @@ fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
         index += 1;
     }
     enabled
+}
+
+fn remove_bilibili_info_only_args(args: &mut Vec<String>) {
+    let mut retained = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if is_bilibili_info_only_option(arg) {
+            if is_bilibili_info_only_flag(arg)
+                && let Some(value) = args.get(index + 1)
+                && parse_bool_token(value).is_some()
+            {
+                index += 2;
+            } else {
+                index += 1;
+            }
+        } else {
+            retained.push(arg.clone());
+            index += 1;
+        }
+    }
+    *args = retained;
+}
+
+fn is_bilibili_info_only_option(arg: &str) -> bool {
+    is_bilibili_info_only_flag(arg)
+        || arg.starts_with("--only-show-info=")
+        || arg.starts_with("--only-show-info:")
+        || arg.starts_with("-info=")
+        || arg.starts_with("-info:")
+}
+
+fn is_bilibili_info_only_flag(arg: &str) -> bool {
+    arg == "--only-show-info" || arg == "-info"
 }
 
 fn take_bilibili_danmaku_setting(args: &mut Vec<String>) -> Option<Vec<String>> {
@@ -1472,6 +1562,29 @@ async fn fetch_youtube_metadata(
 
     let json = last_nonempty_line(&stdout).ok_or_else(|| anyhow!("yt-dlp returned no metadata"))?;
     serde_json::from_str(json).context("failed to parse yt-dlp metadata JSON")
+}
+
+async fn probe_bilibili_metadata(config: &AppConfig, url: &str) -> Result<BilibiliMetadata> {
+    let spec = bilibili_metadata_command_spec(config, url)?;
+    let output = tokio_timeout(
+        BILIBILI_METADATA_PROBE_TIMEOUT,
+        run_command(config, &spec, None),
+    )
+    .await
+    .context("Bilibili metadata probe timed out")??;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        bail!(
+            "{} exited with status {}\n{}",
+            spec.program.display(),
+            output.status,
+            summarize_output(&stdout, &stderr)
+        );
+    }
+
+    Ok(parse_bilibili_metadata(url, &format!("{stdout}\n{stderr}")))
 }
 
 async fn video_output_lock(
@@ -2210,6 +2323,35 @@ fn parse_bilibili_metadata(url: &str, stdout: &str) -> BilibiliMetadata {
     metadata
 }
 
+fn push_bilibili_metadata_identities(
+    identities: &mut Vec<VideoIdentity>,
+    metadata: &BilibiliMetadata,
+) {
+    for id in [metadata.id.as_deref(), metadata.aid.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|id| !id.trim().is_empty())
+    {
+        push_unique_video_identity(
+            identities,
+            VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: id.to_string(),
+            },
+        );
+    }
+}
+
+fn push_unique_video_identity(identities: &mut Vec<VideoIdentity>, identity: VideoIdentity) {
+    if identities
+        .iter()
+        .any(|existing| existing.provider == identity.provider && existing.id == identity.id)
+    {
+        return;
+    }
+    identities.push(identity);
+}
+
 fn bilibili_id_from_url(raw_url: &str) -> Option<String> {
     let url = url::Url::parse(raw_url).ok()?;
     url.path_segments()?
@@ -2371,7 +2513,21 @@ fn nfo_matches_identity(content: &str, identity: &VideoIdentity) -> bool {
 fn uniqueid_tag_matches_provider(tag: &str, provider: VideoProvider) -> bool {
     let tag = tag.to_ascii_lowercase();
     let provider = provider.as_str();
-    tag.contains(&format!("type=\"{provider}\"")) || tag.contains(&format!("type='{provider}'"))
+    tag_contains_provider_uniqueid_type(&tag, provider, '"')
+        || tag_contains_provider_uniqueid_type(&tag, provider, '\'')
+}
+
+fn tag_contains_provider_uniqueid_type(tag: &str, provider: &str, quote: char) -> bool {
+    let Some((_, rest)) = tag.split_once(&format!("type={quote}")) else {
+        return false;
+    };
+    let Some((value, _)) = rest.split_once(quote) else {
+        return false;
+    };
+    value == provider
+        || value
+            .strip_prefix(provider)
+            .is_some_and(|suffix| matches!(suffix, "-aid" | "_aid"))
 }
 
 fn metadata_sidecar_paths(video: &Path) -> Vec<PathBuf> {
@@ -3053,6 +3209,7 @@ struct MediaNfo<'a> {
     plot: Option<&'a str>,
     unique_id_type: &'a str,
     unique_id: &'a str,
+    alternate_unique_ids: Vec<(&'a str, &'a str)>,
     source_url: &'a str,
     studio: Option<&'a str>,
     premiered: Option<&'a str>,
@@ -3085,6 +3242,13 @@ fn render_nfo(title: &str, nfo: &MediaNfo<'_>) -> String {
         xml_escape(nfo.unique_id_type),
         xml_escape(nfo.unique_id)
     ));
+    for (unique_id_type, unique_id) in &nfo.alternate_unique_ids {
+        content.push_str(&format!(
+            "  <uniqueid type=\"{}\">{}</uniqueid>\n",
+            xml_escape(unique_id_type),
+            xml_escape(unique_id)
+        ));
+    }
     content.push_str(&format!(
         "  <trailer>{}</trailer>\n",
         xml_escape(nfo.source_url)
@@ -3356,6 +3520,14 @@ mod tests {
         }
     }
 
+    fn find_video_duplicate_without_probe(
+        config: &AppConfig,
+        job: &JobRequest,
+    ) -> Result<Option<VideoDuplicate>> {
+        let identities = video_identity(job).into_iter().collect();
+        find_video_duplicate_for_identities(config, job, identities)
+    }
+
     #[test]
     fn extracts_video_identity_from_supported_urls() {
         assert_eq!(
@@ -3420,7 +3592,7 @@ mod tests {
         )
         .expect("nfo should write");
 
-        let youtube_duplicate = find_video_duplicate(
+        let youtube_duplicate = find_video_duplicate_without_probe(
             &config,
             &JobRequest::Youtube {
                 url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
@@ -3430,7 +3602,7 @@ mod tests {
         .expect("youtube duplicate should be found");
         assert_eq!(youtube_duplicate.existing_videos, vec![youtube_path]);
 
-        let bilibili_duplicate = find_video_duplicate(
+        let bilibili_duplicate = find_video_duplicate_without_probe(
             &config,
             &JobRequest::Bilibili {
                 url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
@@ -3440,6 +3612,44 @@ mod tests {
         .expect("bilibili duplicate should be found");
         assert_eq!(bilibili_duplicate.existing_videos, vec![bilibili_path]);
 
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn finds_bilibili_duplicate_from_resolved_aid_sidecar() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-bilibili-aid");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let bilibili_path = video_dir.join("bilibili-title.mp4");
+        fs::write(&bilibili_path, "video").expect("bilibili file should write");
+        fs::write(
+            bilibili_path.with_extension("nfo"),
+            "<movie><uniqueid type=\"bilibili-aid\">116539978154171</uniqueid></movie>",
+        )
+        .expect("nfo should write");
+
+        let duplicate = find_video_duplicate_for_identities(
+            &config,
+            &JobRequest::Bilibili {
+                url: "https://b23.tv/Jt1mZiL".to_string(),
+            },
+            vec![
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "BV12TRrBcEP8".to_string(),
+                },
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "116539978154171".to_string(),
+                },
+            ],
+        )
+        .expect("duplicate scan should succeed")
+        .expect("bilibili aid duplicate should be found");
+
+        assert_eq!(duplicate.identity.id, "116539978154171");
+        assert_eq!(duplicate.existing_videos, vec![bilibili_path]);
         let _ = fs::remove_dir_all(video_dir);
     }
 
@@ -3457,7 +3667,7 @@ mod tests {
         )
         .expect("nfo should write");
 
-        let duplicate = find_video_duplicate(
+        let duplicate = find_video_duplicate_without_probe(
             &config,
             &JobRequest::Youtube {
                 url: "https://www.youtube.com/watch?v=ABCDEF12345".to_string(),
@@ -3488,7 +3698,7 @@ mod tests {
         )
         .expect("info json should write");
 
-        let duplicate = find_video_duplicate(
+        let duplicate = find_video_duplicate_without_probe(
             &config,
             &JobRequest::Youtube {
                 url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
@@ -3515,7 +3725,7 @@ mod tests {
         )
         .expect("description should write");
 
-        let duplicate = find_video_duplicate(
+        let duplicate = find_video_duplicate_without_probe(
             &config,
             &JobRequest::Youtube {
                 url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
@@ -3546,7 +3756,7 @@ mod tests {
         )
         .expect("info json should write");
 
-        let duplicate = find_video_duplicate(
+        let duplicate = find_video_duplicate_without_probe(
             &config,
             &JobRequest::Youtube {
                 url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
@@ -3567,7 +3777,7 @@ mod tests {
         fs::write(video_dir.join("Unrelated PHH1wTDF-1M.mkv"), "video")
             .expect("video file should write");
 
-        let duplicate = find_video_duplicate(
+        let duplicate = find_video_duplicate_without_probe(
             &config,
             &JobRequest::Youtube {
                 url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
@@ -3589,7 +3799,7 @@ mod tests {
         let audio_path = video_dir.join("Example [BV12TRrBcEP8].m4a");
         fs::write(&audio_path, "audio").expect("audio file should write");
 
-        let duplicate = find_video_duplicate(
+        let duplicate = find_video_duplicate_without_probe(
             &config,
             &JobRequest::Bilibili {
                 url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
@@ -3612,7 +3822,7 @@ mod tests {
             .expect("staged file should write");
         config.downloads.video_dir = video_dir.clone();
 
-        let duplicate = find_video_duplicate(
+        let duplicate = find_video_duplicate_without_probe(
             &config,
             &JobRequest::Youtube {
                 url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
@@ -4563,6 +4773,46 @@ mod tests {
 
         assert_eq!(output, final_dir.join("Final Title.mp4"));
         let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn bilibili_metadata_command_is_info_only_without_activity_tracking() {
+        let config = test_config();
+        let spec = bilibili_metadata_command_spec(&config, "https://b23.tv/Jt1mZiL")
+            .expect("Bilibili metadata command should build");
+
+        assert!(spec.args.contains(&"--only-show-info".to_string()));
+        assert_eq!(spec.activity_dir, None);
+    }
+
+    #[test]
+    fn bilibili_metadata_command_forces_info_only_over_false_config() {
+        let mut config = test_config();
+        config.bilibili.extra_args = vec![
+            "--only-show-info=false".to_string(),
+            "-info".to_string(),
+            "false".to_string(),
+            "--skip-mux".to_string(),
+        ];
+
+        let spec = bilibili_metadata_command_spec(&config, "https://b23.tv/Jt1mZiL")
+            .expect("Bilibili metadata command should build");
+
+        assert!(!spec.args.contains(&"--only-show-info=false".to_string()));
+        assert!(
+            !spec
+                .args
+                .windows(2)
+                .any(|args| args[0] == "-info" && args[1] == "false")
+        );
+        assert_eq!(
+            spec.args
+                .iter()
+                .filter(|arg| arg.as_str() == "--only-show-info")
+                .count(),
+            1
+        );
+        assert!(spec.args.contains(&"--skip-mux".to_string()));
     }
 
     #[test]
@@ -5698,6 +5948,7 @@ mod tests {
                 plot: Some("x < y"),
                 unique_id_type: "youtube",
                 unique_id: "id",
+                alternate_unique_ids: vec![("youtube-alt", "alt & id")],
                 source_url: "https://example.com/?a=1&b=2",
                 studio: Some("Studio"),
                 premiered: Some("2026-05-17"),
@@ -5705,6 +5956,7 @@ mod tests {
         );
 
         assert!(nfo.contains("<title>A &amp; B</title>"));
+        assert!(nfo.contains("<uniqueid type=\"youtube-alt\">alt &amp; id</uniqueid>"));
         assert!(nfo.contains("<plot>x &lt; y</plot>"));
         assert!(nfo.contains("<year>2026</year>"));
     }
