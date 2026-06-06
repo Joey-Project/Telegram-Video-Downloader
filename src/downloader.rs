@@ -1140,21 +1140,20 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
 
 pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
     let config_path =
-        bilibili_auth::ensure_bbdown_config_file(&config.bilibili.auth.state_path, None)?;
-    let mut args = vec![url.to_string(), "--only-show-info".to_string()];
-    if let Some(config_path) = &config_path {
-        args.extend([
-            "--config-file".to_string(),
-            config_path.display().to_string(),
-        ]);
-    }
+        bilibili_auth::ensure_isolated_bbdown_config_file(&config.bilibili.auth.state_path)?;
+    let args = vec![
+        url.to_string(),
+        "--only-show-info".to_string(),
+        "--config-file".to_string(),
+        config_path.display().to_string(),
+    ];
 
     Ok(CommandSpec {
         program: config.tools.bbdown.clone(),
         args,
         cwd: config.downloads.video_dir.clone(),
         activity_dir: None,
-        cleanup_paths: config_path.into_iter().collect(),
+        cleanup_paths: vec![config_path],
     })
 }
 
@@ -4870,18 +4869,25 @@ mod tests {
 
     #[test]
     fn bilibili_metadata_command_is_info_only_without_activity_tracking() {
-        let config = test_config();
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-metadata-empty-config");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        fs::write(video_dir.join("BBDown.config"), "--save-archives-to-file\n")
+            .expect("default BBDown config should write");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.auth.state_path = video_dir.join("missing-auth.json");
         let spec = bilibili_metadata_command_spec(&config, "https://b23.tv/Jt1mZiL")
             .expect("Bilibili metadata command should build");
 
-        assert_eq!(
-            spec.args,
-            vec![
-                "https://b23.tv/Jt1mZiL".to_string(),
-                "--only-show-info".to_string()
-            ]
-        );
+        assert_eq!(spec.args[0], "https://b23.tv/Jt1mZiL");
+        assert_eq!(spec.args[1], "--only-show-info");
+        assert_eq!(spec.args[2], "--config-file");
+        let config_path = PathBuf::from(&spec.args[3]);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), "");
         assert_eq!(spec.activity_dir, None);
+        assert_eq!(spec.cleanup_paths, vec![config_path.clone()]);
+        bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
     }
 
     #[test]

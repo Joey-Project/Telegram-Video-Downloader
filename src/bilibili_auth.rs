@@ -503,6 +503,28 @@ pub fn ensure_bbdown_config_file(
     Ok(Some(config_path))
 }
 
+pub fn ensure_isolated_bbdown_config_file(path: &Path) -> Result<PathBuf> {
+    let _guard = AUTH_FILE_LOCK
+        .lock()
+        .expect("auth file lock should not poison");
+    let state = load_auth_state_unlocked(path)?;
+
+    cleanup_stale_bbdown_config_files_unlocked(path)?;
+    let config_path = temp_state_path(&bbdown_config_dir(path).join("probe.config"));
+    let content = state
+        .as_ref()
+        .map(|state| state.cookie.trim())
+        .filter(|cookie| !cookie.is_empty())
+        .map(|cookie| format!("--cookie\n{cookie}\n").into_bytes())
+        .unwrap_or_default();
+    write_bbdown_config_content(&config_path, &content)?;
+    active_bbdown_config_files()
+        .lock()
+        .expect("active BBDown config lock should not poison")
+        .insert(config_path.clone());
+    Ok(config_path)
+}
+
 pub fn bbdown_config_path(path: &Path) -> PathBuf {
     let mut value = path.as_os_str().to_os_string();
     value.push(".bbdown.config");
@@ -533,18 +555,6 @@ pub fn release_bbdown_config_file(path: &Path) {
 }
 
 fn write_bbdown_config(path: &Path, cookie: &str, base_config_path: Option<&Path>) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        create_private_dir_if_missing(parent).with_context(|| {
-            format!(
-                "failed to create BBDown auth config directory {}",
-                parent.display()
-            )
-        })?;
-    }
-
     let mut content = match base_config_path {
         Some(base_config_path) => fs::read(base_config_path).with_context(|| {
             format!(
@@ -558,6 +568,22 @@ fn write_bbdown_config(path: &Path, cookie: &str, base_config_path: Option<&Path
         content.push(b'\n');
     }
     content.extend_from_slice(format!("--cookie\n{cookie}\n").as_bytes());
+    write_bbdown_config_content(path, &content)
+}
+
+fn write_bbdown_config_content(path: &Path, content: &[u8]) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_private_dir_if_missing(parent).with_context(|| {
+            format!(
+                "failed to create BBDown auth config directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
     let temp_path = temp_state_path(path);
     {
         let mut options = OpenOptions::new();
@@ -573,7 +599,7 @@ fn write_bbdown_config(path: &Path, cookie: &str, base_config_path: Option<&Path
                 temp_path.display()
             )
         })?;
-        std::io::Write::write_all(&mut file, &content).with_context(|| {
+        std::io::Write::write_all(&mut file, content).with_context(|| {
             format!(
                 "failed to write temp BBDown auth config {}",
                 temp_path.display()
