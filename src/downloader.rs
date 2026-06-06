@@ -2326,8 +2326,9 @@ impl ProgressStage {
                 Self::Audio
             } else if text.contains("开始下载") && text.contains("视频") {
                 Self::Video
-            } else if (text.contains("下载") && (text.contains("完毕") || text.contains("完成")))
-                || text.contains("任务完成")
+            } else if text.contains("任务完成")
+                || text.contains("下载任务完成")
+                || lower_text.contains("download finished")
             {
                 Self::Downloaded
             } else {
@@ -6922,11 +6923,25 @@ mod tests {
         assert!(first.contains("Todo: audio, mux, move"));
 
         tracker.next_send_at = Instant::now() - Duration::from_secs(1);
+        tracker.observe(CommandStream::Stdout, "下载P1视频完毕\n".as_bytes());
+        let video_done = rx.try_recv().unwrap().message;
+        assert!(video_done.contains("BBDown: downloading video"));
+        assert!(video_done.contains("Done: resolve"));
+        assert!(video_done.contains("Todo: audio, mux, move"));
+
+        tracker.next_send_at = Instant::now() - Duration::from_secs(1);
         tracker.observe(CommandStream::Stdout, "开始下载P1音频\n".as_bytes());
         let second = rx.try_recv().unwrap().message;
         assert!(second.contains("BBDown: downloading audio"));
         assert!(second.contains("Done: resolve, video"));
         assert!(second.contains("Todo: mux, move"));
+
+        tracker.next_send_at = Instant::now() - Duration::from_secs(1);
+        tracker.observe(CommandStream::Stdout, "任务完成\n".as_bytes());
+        let third = rx.try_recv().unwrap().message;
+        assert!(third.contains("BBDown: download complete"));
+        assert!(third.contains("Done: resolve, video, audio"));
+        assert!(third.contains("Todo: mux, move"));
     }
 
     #[tokio::test]
