@@ -43,7 +43,7 @@ cp config.example.toml config.toml
 
 `bilibili.auth.state_path` 是 bot 管理的 Bilibili Web cookie 状态文件，默认写到 `~/.local/state/telegram-video-downloader/bilibili-auth.json`。`/bbdown login` 会发送 Bilibili 扫码二维码，登录成功后 Bilibili 下载会通过私有临时 `--config-file` 给 BBDown 注入 `--cookie`；如果视频下载目录存在 `BBDown.config`，或 `bilibili.extra_args` 显式指定了 `--config-file`，bot 会先合并原配置再追加 cookie。`/bbdown logout` 只清理本机状态，不远端注销账号。
 
-`bot.progress_update_seconds` 控制进度回复频率；`bot.command_timeout_seconds` 是单个外部命令的总超时；`bot.command_idle_timeout_seconds` 是没有 stdout/stderr 且输出目录文件也没有增长的 idle 超时。
+`bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。BBDown 下载期间即使命令没有继续输出，bot 也会按这个间隔刷新文件增长快照，显示当前阶段、已完成/待完成阶段、写入速度、持续时间和最近文件变化；`bot.command_timeout_seconds` 是单个外部命令的总超时；`bot.command_idle_timeout_seconds` 是没有 stdout/stderr 且输出目录文件也没有增长的 idle 超时。
 
 ## 运行
 

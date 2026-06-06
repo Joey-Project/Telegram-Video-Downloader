@@ -3,7 +3,7 @@ id: 20260516-8f3c2a
 title: Telegram Local Downloader Bot
 status: completed
 created: 2026-05-16
-updated: 2026-06-05
+updated: 2026-06-06
 branch:
 pr:
 supersedes: []
@@ -44,6 +44,7 @@ superseded_by:
 - 第二轮增强和 downloader 可观测性 follow-up 已实现。
 - Rust 主服务已包含配置加载、Telegram `getUpdates` polling、全文 URL 扫描、消息路由、全局并发限制、外部命令执行和状态回复。
 - 外部命令现在流式采集 stdout/stderr、监控输出目录文件增长，并支持总超时与 idle timeout；Telegram 任务会转发节流后的进度消息。
+- BBDown 下载期间的进度消息现在默认每 5 秒刷新一次，即使命令没有继续输出，也会显示阶段、已完成/待完成阶段、文件写入速度、持续时间和最近文件变化。
 - 新增 `--replay-message` 本地入口，可用真实消息文本重放路由和下载组件，不依赖 Telegram ingress。
 - YouTube 下载会预取 yt-dlp metadata，优先人工字幕、fallback 自动字幕，并启用 metadata、封面、字幕、info JSON、description 和 NFO 输出。
 - Bilibili 下载继续由 BBDown 负责，显式跳过 AI 字幕，默认使用 `--video-ascending --skip-mux`，并在没有显式多线程设置时由下载命令追加 `--multi-thread false`，以避开当前复现链接在后台模式下的高码率流和多线程分片卡住问题，并对新增视频生成 best-effort NFO。
@@ -120,3 +121,4 @@ superseded_by:
 - A later offline frozen review found fallback selection could reassign a current root sidecar already bound to another same-run mux output; sidecar candidates now exclude non-direct sidecars that already have same-stem current primary media.
 - PR9 current-head replay validation passed on 2026-06-05 with the title-prefixed `BV12TRrBcEP8` sample: the first replay produced `.mp4/.nfo/.xml/.ass`, and the second replay produced keep-both `(2).mp4/.nfo/.xml/.ass` under `.codex-tmp/danmaku-e2e-current/video` with no staging or `.json` residue.
 - GitHub Codex review found newer BBDown defaults may emit JSON danmaku sidecars; local BBDown rejected `--download-danmaku-formats`, so the bot keeps XML/ASS compatibility and now removes same-run `.json` danmaku sidecars during post-mux cleanup.
+- 2026-06-06 progress display follow-up: `bot.progress_update_seconds` default changed to 5 seconds; file activity polling now emits fixed-interval snapshots while only real stdout/stderr or file changes refresh idle timeout. Validation passed: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `uv run ruff format --check`, `uv run ruff check`, and `uv run python -m unittest discover -s tests`.
