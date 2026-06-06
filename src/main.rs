@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 
 use crate::config::AppConfig;
 use crate::downloader::{
-    JobProgress, VideoDuplicate, VideoDuplicateAction, find_video_duplicate, run_job,
+    JobProgress, VideoDuplicate, VideoDuplicateAction, find_video_duplicate_with_probe, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both,
 };
 use crate::router::{BilibiliAuthCommand, JobRequest, RouteResult, route_message};
@@ -717,10 +717,7 @@ async fn find_video_duplicate_async(
     config: Arc<AppConfig>,
     job: JobRequest,
 ) -> Result<Option<VideoDuplicate>> {
-    let scan_config = (*config).clone();
-    tokio::task::spawn_blocking(move || find_video_duplicate(&scan_config, &job))
-        .await
-        .context("duplicate scan task failed")?
+    find_video_duplicate_with_probe(&config, &job).await
 }
 
 async fn prompt_duplicate_choice(

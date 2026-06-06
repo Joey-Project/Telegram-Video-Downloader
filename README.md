@@ -35,7 +35,7 @@ cp config.example.toml config.toml
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
-重复视频检测使用 URL 中可直接提取的媒体 ID，例如 YouTube video id、Bilibili `BV...` 或 `av...`，并扫描视频文件名与同 basename sidecar。`b23.tv` 短链在下载前无法离线解析真实视频 ID，所以不会提前弹出重复选择；这类视频仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
+重复视频检测使用媒体 ID 扫描视频文件名与同 basename sidecar。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...`，再通过 `BBDown --only-show-info` 解析 aid，因此 `b23.tv` 短链也可以在下载前弹出重复选择。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
 `bilibili.extra_args` 默认包含 `--video-ascending` 和 `--skip-mux`。如果 `bilibili.extra_args`、显式 `--config-file` 或视频下载目录里的 `BBDown.config` 都没有设置 `--multi-thread` / `-mt`，下载命令会自动追加 `--multi-thread false`；下载目录里的 `BBDown.config` 会由 bot 显式传给 BBDown。BBDown 负责下载音视频流，bot 再调用 `tools.ffmpeg` 做受控混流；这样混流也会受到同一套进度、idle timeout 和进程清理保护。需要追求更高码率时可以调整 `--video-ascending`，但建议保留 `--skip-mux`；如果确认目标视频的 CDN 对 BBDown 多线程分片稳定，再显式配置 `--multi-thread true`。
 
