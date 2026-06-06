@@ -36,6 +36,7 @@ const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
 const OUTPUT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_ABORT_GRACE: Duration = Duration::from_secs(3);
 const BILIBILI_METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
 type CommandProcessGroup = Option<libc::pid_t>;
@@ -234,17 +235,21 @@ pub async fn find_video_duplicate_with_probe(
     job: &JobRequest,
 ) -> Result<Option<VideoDuplicate>> {
     let mut identities = video_identity(job).into_iter().collect::<Vec<_>>();
-    if !identities.is_empty()
-        && let Some(duplicate) =
-            scan_video_duplicate_for_identities(config, job, identities.clone()).await?
-    {
-        return Ok(Some(duplicate));
-    }
+    let direct_duplicate = if identities.is_empty() {
+        None
+    } else {
+        scan_video_duplicate_for_identities(config, job, identities.clone()).await?
+    };
 
     if let JobRequest::Bilibili { url } = job {
-        match probe_bilibili_metadata(config, url).await {
+        let probe_timeout = if direct_duplicate.is_some() {
+            BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT
+        } else {
+            BILIBILI_METADATA_PROBE_TIMEOUT
+        };
+        match probe_bilibili_metadata(config, url, probe_timeout).await {
             Ok(metadata) => push_bilibili_metadata_identities(&mut identities, &metadata),
-            Err(err) if identities.is_empty() => {
+            Err(err) if identities.is_empty() && direct_duplicate.is_none() => {
                 return Err(err).with_context(|| {
                     format!("failed to probe Bilibili metadata for duplicate check: {url}")
                 });
@@ -257,9 +262,14 @@ pub async fn find_video_duplicate_with_probe(
                 );
             }
         }
+    } else if direct_duplicate.is_some() {
+        return Ok(direct_duplicate);
     }
 
-    scan_video_duplicate_for_identities(config, job, identities).await
+    match scan_video_duplicate_for_identities(config, job, identities).await? {
+        Some(duplicate) => Ok(Some(duplicate)),
+        None => Ok(direct_duplicate),
+    }
 }
 
 async fn scan_video_duplicate_for_identities(
@@ -1565,13 +1575,17 @@ async fn fetch_youtube_metadata(
     serde_json::from_str(json).context("failed to parse yt-dlp metadata JSON")
 }
 
-async fn probe_bilibili_metadata(config: &AppConfig, url: &str) -> Result<BilibiliMetadata> {
+async fn probe_bilibili_metadata(
+    config: &AppConfig,
+    url: &str,
+    timeout: Duration,
+) -> Result<BilibiliMetadata> {
     let spec = bilibili_metadata_command_spec(config, url)?;
     let mut probe_config = config.clone();
     probe_config.bot.command_timeout_seconds = probe_config
         .bot
         .command_timeout_seconds
-        .min(BILIBILI_METADATA_PROBE_TIMEOUT.as_secs());
+        .min(timeout.as_secs().max(1));
     let output = run_command(&probe_config, &spec, None).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3718,11 +3732,58 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn finds_url_duplicate_before_bilibili_probe() {
+    async fn aggregates_bilibili_probe_aliases_after_direct_duplicate() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-after-direct-probe");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.auth.state_path = video_dir.join("missing-auth.json");
+        let bvid_path = video_dir.join("Title [BV12TRrBcEP8].mp4");
+        fs::write(&bvid_path, "video").expect("bvid video should write");
+        let aid_path = video_dir.join("Title from aid.mp4");
+        fs::write(&aid_path, "video").expect("aid video should write");
+        fs::write(
+            aid_path.with_extension("nfo"),
+            "<movie><uniqueid type=\"bilibili-aid\">116539978154171</uniqueid></movie>",
+        )
+        .expect("aid nfo should write");
+        let fake_bbdown = video_dir.join("fake-bbdown.sh");
+        fs::write(
+            &fake_bbdown,
+            "#!/bin/sh\necho '[2026] - 视频URL: https://www.bilibili.com/video/BV12TRrBcEP8/'\necho '[2026] - 获取aid结束: 116539978154171'\n",
+        )
+        .expect("fake BBDown should write");
+        let mut permissions = fs::metadata(&fake_bbdown)
+            .expect("fake BBDown metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_bbdown, permissions).expect("fake BBDown should be executable");
+        config.tools.bbdown = fake_bbdown;
+
+        let duplicate = find_video_duplicate_with_probe(
+            &config,
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+            },
+        )
+        .await
+        .expect("duplicate scan should succeed")
+        .expect("bilibili duplicate should be found");
+
+        assert_eq!(duplicate.identity.id, "BV12TRrBcEP8");
+        assert_eq!(duplicate.existing_videos, vec![bvid_path, aid_path]);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn falls_back_to_direct_duplicate_after_short_bilibili_probe_timeout() {
         let mut config = test_config();
         let video_dir = temp_test_dir("duplicate-before-probe");
         fs::create_dir_all(&video_dir).expect("video dir should create");
         config.downloads.video_dir = video_dir.clone();
+        config.bilibili.auth.state_path = video_dir.join("missing-auth.json");
+        config.bot.command_timeout_seconds = 1;
         let existing = video_dir.join("Title [BV12TRrBcEP8].mp4");
         fs::write(&existing, "video").expect("existing video should write");
         let probe_marker = video_dir.join("probe-ran");
@@ -3743,7 +3804,7 @@ mod tests {
         config.tools.bbdown = slow_probe;
 
         let duplicate = tokio_timeout(
-            Duration::from_millis(500),
+            Duration::from_secs(5),
             find_video_duplicate_with_probe(
                 &config,
                 &JobRequest::Bilibili {
@@ -3752,13 +3813,13 @@ mod tests {
             ),
         )
         .await
-        .expect("duplicate scan should not wait for metadata probe")
+        .expect("duplicate scan should return after controlled short probe timeout")
         .expect("duplicate scan should succeed")
         .expect("direct URL duplicate should be found");
 
         assert_eq!(duplicate.identity.id, "BV12TRrBcEP8");
         assert_eq!(duplicate.existing_videos, vec![existing]);
-        assert!(!probe_marker.exists());
+        assert!(probe_marker.exists());
         let _ = fs::remove_dir_all(video_dir);
     }
 
@@ -6130,7 +6191,11 @@ mod tests {
 
         let error = tokio_timeout(
             Duration::from_secs(8),
-            probe_bilibili_metadata(&config, "https://b23.tv/Jt1mZiL"),
+            probe_bilibili_metadata(
+                &config,
+                "https://b23.tv/Jt1mZiL",
+                BILIBILI_METADATA_PROBE_TIMEOUT,
+            ),
         )
         .await
         .expect("probe should return through run_command timeout")
