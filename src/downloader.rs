@@ -1152,12 +1152,12 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
 pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
     let (extra_args, explicit_config_path) = bilibili_extra_args_without_config_file(config);
     let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
-    let base_config_args =
-        read_bbdown_base_config_args(base_config_path.as_deref(), explicit_config_path.is_some())?;
-    let safe_config_args = filter_bilibili_metadata_args(&base_config_args);
-    let config_path = bilibili_auth::ensure_isolated_bbdown_config_file_with_args(
+    let base_config_lines =
+        read_bbdown_base_config_lines(base_config_path.as_deref(), explicit_config_path.is_some())?;
+    let safe_config_lines = filter_bilibili_metadata_config_lines(&base_config_lines);
+    let config_path = bilibili_auth::ensure_isolated_bbdown_config_file_with_lines(
         &config.bilibili.auth.state_path,
-        &safe_config_args,
+        &safe_config_lines,
     )?;
     let mut args = vec![url.to_string(), "--only-show-info".to_string()];
     args.extend(filter_bilibili_metadata_args(&extra_args));
@@ -1204,13 +1204,23 @@ fn bilibili_extra_args_without_config_file(config: &AppConfig) -> (Vec<String>, 
 }
 
 fn read_bbdown_config_args(path: &Path) -> Result<Vec<String>> {
+    Ok(read_bbdown_config_lines(path)?
+        .into_iter()
+        .flat_map(|line| {
+            line.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}
+
+fn read_bbdown_config_lines(path: &Path) -> Result<Vec<String>> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read BBDown config {}", path.display()))?;
     Ok(content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .flat_map(str::split_whitespace)
         .map(str::to_string)
         .collect())
 }
@@ -1218,6 +1228,13 @@ fn read_bbdown_config_args(path: &Path) -> Result<Vec<String>> {
 fn read_bbdown_base_config_args(path: Option<&Path>, required: bool) -> Result<Vec<String>> {
     match path {
         Some(path) if required || path.exists() => read_bbdown_config_args(path),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn read_bbdown_base_config_lines(path: Option<&Path>, required: bool) -> Result<Vec<String>> {
+    match path {
+        Some(path) if required || path.exists() => read_bbdown_config_lines(path),
         _ => Ok(Vec::new()),
     }
 }
@@ -1247,6 +1264,58 @@ fn filter_bilibili_metadata_args(args: &[String]) -> Vec<String> {
         }
     }
     filtered
+}
+
+fn filter_bilibili_metadata_config_lines(lines: &[String]) -> Vec<String> {
+    let mut filtered = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        let line = &lines[index];
+        let (ignored, consumes_next) = bilibili_metadata_config_line_ignored(line);
+        if ignored {
+            index += 1;
+            if consumes_next
+                && lines.get(index).is_some_and(|value| {
+                    !value.starts_with('-') || parse_bool_token(value).is_some()
+                })
+            {
+                index += 1;
+            }
+        } else {
+            filtered.push(line.clone());
+            index += 1;
+        }
+    }
+    filtered
+}
+
+fn bilibili_metadata_config_line_ignored(line: &str) -> (bool, bool) {
+    let trimmed = line.trim();
+    const FLAGS: &[&str] = &[
+        "--audio-only",
+        "--download-danmaku",
+        "--only-show-info",
+        "--save-archives-to-file",
+        "--skip-ai",
+        "--skip-mux",
+        "--video-only",
+        "-dd",
+        "-info",
+    ];
+
+    for flag in FLAGS {
+        if trimmed == *flag {
+            return (true, true);
+        }
+        if trimmed.strip_prefix(flag).is_some_and(|suffix| {
+            suffix.starts_with('=')
+                || suffix.starts_with(':')
+                || suffix.chars().next().is_some_and(char::is_whitespace)
+        }) {
+            return (true, false);
+        }
+    }
+    (false, false)
 }
 
 fn is_bilibili_metadata_ignored_arg(arg: &str) -> bool {
@@ -5473,7 +5542,7 @@ mod tests {
     }
 
     #[test]
-    fn bilibili_metadata_probe_cookie_config_does_not_merge_download_config() {
+    fn bilibili_metadata_probe_filters_default_config_side_effects() {
         let mut config = test_config();
         let video_dir = temp_test_dir("bilibili-metadata-cookie-config");
         let path = video_dir.join("bilibili-auth.json");
@@ -5539,7 +5608,7 @@ mod tests {
         fs::create_dir_all(&video_dir).expect("video dir should create");
         fs::write(
             &explicit_config,
-            "--cookie\nDedeUserID=123\n--save-archives-to-file\ntrue\n--dfn-priority\n1080P\n",
+            "--cookie\nDedeUserID=123; SESSDATA=abc\n--save-archives-to-file true\n--dfn-priority\n1080P\n",
         )
         .expect("explicit BBDown config should write");
 
@@ -5557,10 +5626,9 @@ mod tests {
         let config_path = command_config_path(&spec).expect("config file arg should be present");
         let config_content =
             fs::read_to_string(&config_path).expect("BBDown probe config should exist");
-        assert!(config_content.contains("--cookie\nDedeUserID=123\n"));
+        assert!(config_content.contains("--cookie\nDedeUserID=123; SESSDATA=abc\n"));
         assert!(config_content.contains("--dfn-priority\n1080P\n"));
         assert!(!config_content.contains("--save-archives-to-file"));
-        assert!(!config_content.contains("true"));
 
         bilibili_auth::release_bbdown_config_file(&config_path);
         let _ = fs::remove_dir_all(video_dir);

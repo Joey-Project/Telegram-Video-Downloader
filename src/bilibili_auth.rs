@@ -503,9 +503,9 @@ pub fn ensure_bbdown_config_file(
     Ok(Some(config_path))
 }
 
-pub fn ensure_isolated_bbdown_config_file_with_args(
+pub fn ensure_isolated_bbdown_config_file_with_lines(
     path: &Path,
-    base_args: &[String],
+    base_lines: &[String],
 ) -> Result<PathBuf> {
     let _guard = AUTH_FILE_LOCK
         .lock()
@@ -515,8 +515,8 @@ pub fn ensure_isolated_bbdown_config_file_with_args(
     cleanup_stale_bbdown_config_files_unlocked(path)?;
     let config_path = temp_state_path(&bbdown_config_dir(path).join("probe.config"));
     let mut content = Vec::new();
-    for arg in base_args {
-        content.extend_from_slice(arg.as_bytes());
+    for line in base_lines {
+        content.extend_from_slice(line.as_bytes());
         content.push(b'\n');
     }
     if !content.is_empty() && !content.ends_with(b"\n") {
