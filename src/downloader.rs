@@ -1670,6 +1670,24 @@ fn command_path_arg(path: &Path) -> String {
         .to_string()
 }
 
+fn command_progress_name(spec: &CommandSpec) -> String {
+    let command_name = spec
+        .program
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+        .unwrap_or("command")
+        .to_string();
+    let lower_name = command_name.to_ascii_lowercase();
+    if lower_name.contains("yt-dlp")
+        && spec.args.iter().any(|arg| arg == "--dump-json")
+        && spec.args.iter().any(|arg| arg == "--skip-download")
+    {
+        format!("{command_name} metadata")
+    } else {
+        command_name
+    }
+}
+
 async fn fetch_youtube_metadata(
     config: &AppConfig,
     url: &str,
@@ -1849,15 +1867,8 @@ async fn run_command(
     let progress_interval = Duration::from_secs(config.bot.progress_update_seconds);
     let activity_poll_interval = file_activity_poll_interval(progress_interval, idle_timeout);
     let mut next_activity_poll = started_at + activity_poll_interval;
-    let mut progress_tracker = ProgressTracker::new(
-        spec.program
-            .file_name()
-            .and_then(|file_name| file_name.to_str())
-            .unwrap_or("command")
-            .to_string(),
-        progress_interval,
-        progress,
-    );
+    let mut progress_tracker =
+        ProgressTracker::new(command_progress_name(spec), progress_interval, progress);
 
     let mut output_closed = false;
     let status = loop {
@@ -2290,6 +2301,7 @@ fn format_duration_compact(duration: Duration) -> String {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProgressStage {
+    Metadata,
     Resolving,
     Downloading,
     Video,
@@ -2303,7 +2315,9 @@ enum ProgressStage {
 impl ProgressStage {
     fn initial_for(command_name: &str) -> Self {
         let command_name = command_name.to_ascii_lowercase();
-        if command_name.contains("bbdown") {
+        if command_name.contains("metadata") {
+            Self::Metadata
+        } else if command_name.contains("bbdown") {
             Self::Resolving
         } else if command_name.contains("yt-dlp") {
             Self::Downloading
@@ -2318,7 +2332,9 @@ impl ProgressStage {
         let command_name = command_name.to_ascii_lowercase();
         let lower_text = text.to_ascii_lowercase();
 
-        if command_name.contains("bbdown") {
+        if self == Self::Metadata {
+            Self::Metadata
+        } else if command_name.contains("bbdown") {
             if text.contains("混流") || text.contains("合并") || lower_text.contains("mux") {
                 Self::Merging
             } else if text.contains("开始下载") && (text.contains("音频") || text.contains("音轨"))
@@ -2353,6 +2369,7 @@ impl ProgressStage {
 
     fn label(self) -> &'static str {
         match self {
+            Self::Metadata => "resolving metadata",
             Self::Resolving => "resolving metadata",
             Self::Downloading => "downloading media",
             Self::Video => "downloading video",
@@ -2366,6 +2383,7 @@ impl ProgressStage {
 
     fn done_label(self) -> &'static str {
         match self {
+            Self::Metadata => "-",
             Self::Resolving | Self::Running => "-",
             Self::Downloading => "resolve",
             Self::Video => "resolve",
@@ -2378,6 +2396,7 @@ impl ProgressStage {
 
     fn todo_label(self) -> &'static str {
         match self {
+            Self::Metadata => "download, embed, move",
             Self::Resolving => "video, audio, mux, move",
             Self::Downloading => "metadata, embed, move",
             Self::Video => "audio, mux, move",
@@ -6874,6 +6893,24 @@ mod tests {
         tracker.observe(CommandStream::Stdout, b"[download] 2.0%");
         let second = rx.try_recv().unwrap().message;
         assert!(second.contains("Last output: yt-dlp: 2%"));
+    }
+
+    #[test]
+    fn tracks_youtube_metadata_as_resolving() {
+        let config = test_config();
+        let spec = youtube_metadata_command_spec(&config, "https://youtu.be/abc");
+        let command_name = command_progress_name(&spec);
+        assert_eq!(command_name, "yt-dlp metadata");
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut tracker = ProgressTracker::new(command_name, Duration::from_secs(30), Some(tx));
+
+        tracker.observe(CommandStream::Stdout, b"[download] 1.0%");
+        let first = rx.try_recv().unwrap().message;
+        assert!(first.contains("yt-dlp metadata: resolving metadata"));
+        assert!(first.contains("Done: -"));
+        assert!(first.contains("Todo: download, embed, move"));
+        assert!(!first.contains("downloading media"));
     }
 
     #[test]
