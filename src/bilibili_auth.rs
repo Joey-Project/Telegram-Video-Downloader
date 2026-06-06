@@ -503,7 +503,10 @@ pub fn ensure_bbdown_config_file(
     Ok(Some(config_path))
 }
 
-pub fn ensure_isolated_bbdown_config_file(path: &Path) -> Result<PathBuf> {
+pub fn ensure_isolated_bbdown_config_file_with_args(
+    path: &Path,
+    base_args: &[String],
+) -> Result<PathBuf> {
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
@@ -511,12 +514,21 @@ pub fn ensure_isolated_bbdown_config_file(path: &Path) -> Result<PathBuf> {
 
     cleanup_stale_bbdown_config_files_unlocked(path)?;
     let config_path = temp_state_path(&bbdown_config_dir(path).join("probe.config"));
-    let content = state
+    let mut content = Vec::new();
+    for arg in base_args {
+        content.extend_from_slice(arg.as_bytes());
+        content.push(b'\n');
+    }
+    if !content.is_empty() && !content.ends_with(b"\n") {
+        content.push(b'\n');
+    }
+    if let Some(cookie) = state
         .as_ref()
         .map(|state| state.cookie.trim())
         .filter(|cookie| !cookie.is_empty())
-        .map(|cookie| format!("--cookie\n{cookie}\n").into_bytes())
-        .unwrap_or_default();
+    {
+        content.extend_from_slice(format!("--cookie\n{cookie}\n").as_bytes());
+    }
     write_bbdown_config_content(&config_path, &content)?;
     active_bbdown_config_files()
         .lock()

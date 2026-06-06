@@ -262,7 +262,7 @@ pub async fn find_video_duplicate_with_probe(
                 );
             }
         }
-    } else if direct_duplicate.is_some() {
+    } else {
         return Ok(direct_duplicate);
     }
 
@@ -1150,14 +1150,21 @@ pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpe
 }
 
 pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
-    let config_path =
-        bilibili_auth::ensure_isolated_bbdown_config_file(&config.bilibili.auth.state_path)?;
-    let args = vec![
-        url.to_string(),
-        "--only-show-info".to_string(),
+    let (extra_args, explicit_config_path) = bilibili_extra_args_without_config_file(config);
+    let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
+    let base_config_args =
+        read_bbdown_base_config_args(base_config_path.as_deref(), explicit_config_path.is_some())?;
+    let safe_config_args = filter_bilibili_metadata_args(&base_config_args);
+    let config_path = bilibili_auth::ensure_isolated_bbdown_config_file_with_args(
+        &config.bilibili.auth.state_path,
+        &safe_config_args,
+    )?;
+    let mut args = vec![url.to_string(), "--only-show-info".to_string()];
+    args.extend(filter_bilibili_metadata_args(&extra_args));
+    args.extend([
         "--config-file".to_string(),
         config_path.display().to_string(),
-    ];
+    ]);
 
     Ok(CommandSpec {
         program: config.tools.bbdown.clone(),
@@ -1219,6 +1226,48 @@ fn append_bilibili_single_thread_default_if_missing(args: &mut Vec<String>, base
     if !has_bilibili_multi_thread_setting(base_args) && !has_bilibili_multi_thread_setting(args) {
         args.extend(["--multi-thread".to_string(), "false".to_string()]);
     }
+}
+
+fn filter_bilibili_metadata_args(args: &[String]) -> Vec<String> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if is_bilibili_metadata_ignored_arg(arg) {
+            index += 1;
+            if args
+                .get(index)
+                .is_some_and(|value| !value.starts_with('-') || parse_bool_token(value).is_some())
+            {
+                index += 1;
+            }
+        } else {
+            filtered.push(arg.clone());
+            index += 1;
+        }
+    }
+    filtered
+}
+
+fn is_bilibili_metadata_ignored_arg(arg: &str) -> bool {
+    const FLAGS: &[&str] = &[
+        "--audio-only",
+        "--download-danmaku",
+        "--only-show-info",
+        "--save-archives-to-file",
+        "--skip-ai",
+        "--skip-mux",
+        "--video-only",
+        "-dd",
+        "-info",
+    ];
+
+    FLAGS.iter().any(|flag| {
+        arg == *flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|suffix| suffix.starts_with('=') || suffix.starts_with(':'))
+    })
 }
 
 fn has_bilibili_multi_thread_setting(args: &[String]) -> bool {
@@ -4959,8 +5008,7 @@ mod tests {
 
         assert_eq!(spec.args[0], "https://b23.tv/Jt1mZiL");
         assert_eq!(spec.args[1], "--only-show-info");
-        assert_eq!(spec.args[2], "--config-file");
-        let config_path = PathBuf::from(&spec.args[3]);
+        let config_path = command_config_path(&spec).expect("config file arg should be present");
         assert_eq!(fs::read_to_string(&config_path).unwrap(), "");
         assert_eq!(spec.activity_dir, None);
         assert_eq!(spec.cleanup_paths, vec![config_path.clone()]);
@@ -5463,9 +5511,56 @@ mod tests {
         );
         let config_content =
             fs::read_to_string(&config_path).expect("BBDown auth config should exist");
-        assert_eq!(config_content, "--cookie\nSESSDATA=secret; bili_jct=csrf\n");
+        assert_eq!(
+            config_content,
+            "--dfn-priority\n1080P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
+        );
         assert!(!spec.args.contains(&"--save-archives-to-file".to_string()));
         assert_eq!(spec.cleanup_paths, vec![config_path.clone()]);
+
+        bilibili_auth::release_bbdown_config_file(&config_path);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn bilibili_metadata_probe_preserves_explicit_config_and_safe_extra_args() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("bilibili-metadata-explicit-config");
+        let explicit_config = video_dir.join("custom.config");
+        config.downloads.video_dir = video_dir.clone();
+        config.bilibili.auth.state_path = video_dir.join("missing-auth.json");
+        config.bilibili.extra_args = vec![
+            "--config-file".to_string(),
+            "custom.config".to_string(),
+            "--http-proxy".to_string(),
+            "http://127.0.0.1:8080".to_string(),
+            "--skip-mux".to_string(),
+        ];
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        fs::write(
+            &explicit_config,
+            "--cookie\nDedeUserID=123\n--save-archives-to-file\ntrue\n--dfn-priority\n1080P\n",
+        )
+        .expect("explicit BBDown config should write");
+
+        let spec = bilibili_metadata_command_spec(&config, "https://b23.tv/Jt1mZiL")
+            .expect("Bilibili metadata command should build");
+
+        assert!(spec.args.windows(2).any(|args| {
+            args == [
+                "--http-proxy".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            ]
+        }));
+        assert!(!spec.args.contains(&"--skip-mux".to_string()));
+        assert!(!spec.args.contains(&"custom.config".to_string()));
+        let config_path = command_config_path(&spec).expect("config file arg should be present");
+        let config_content =
+            fs::read_to_string(&config_path).expect("BBDown probe config should exist");
+        assert!(config_content.contains("--cookie\nDedeUserID=123\n"));
+        assert!(config_content.contains("--dfn-priority\n1080P\n"));
+        assert!(!config_content.contains("--save-archives-to-file"));
+        assert!(!config_content.contains("true"));
 
         bilibili_auth::release_bbdown_config_file(&config_path);
         let _ = fs::remove_dir_all(video_dir);
