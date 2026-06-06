@@ -174,6 +174,7 @@ struct BilibiliMetadata {
     uploader_url: Option<String>,
     publish_date: Option<String>,
     id: Option<String>,
+    resolved_id: Option<String>,
     aid: Option<String>,
 }
 
@@ -1566,12 +1567,12 @@ async fn fetch_youtube_metadata(
 
 async fn probe_bilibili_metadata(config: &AppConfig, url: &str) -> Result<BilibiliMetadata> {
     let spec = bilibili_metadata_command_spec(config, url)?;
-    let output = tokio_timeout(
-        BILIBILI_METADATA_PROBE_TIMEOUT,
-        run_command(config, &spec, None),
-    )
-    .await
-    .context("Bilibili metadata probe timed out")??;
+    let mut probe_config = config.clone();
+    probe_config.bot.command_timeout_seconds = probe_config
+        .bot
+        .command_timeout_seconds
+        .min(BILIBILI_METADATA_PROBE_TIMEOUT.as_secs());
+    let output = run_command(&probe_config, &spec, None).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -2313,8 +2314,11 @@ fn parse_bilibili_metadata(url: &str, stdout: &str) -> BilibiliMetadata {
         } else if let Some((_, aid)) = line.split_once("获取aid结束:") {
             metadata.aid = Some(aid.trim().to_string());
         } else if let Some((_, video_url)) = line.split_once("视频URL:") {
-            if metadata.id.is_none() {
-                metadata.id = bilibili_id_from_url(video_url.trim());
+            if let Some(resolved_id) = bilibili_id_from_url(video_url.trim()) {
+                if metadata.id.is_none() {
+                    metadata.id = Some(resolved_id.clone());
+                }
+                metadata.resolved_id = Some(resolved_id);
             }
         } else if let Some((_, published)) = line.split_once("发布时间:") {
             let published = published.trim();
@@ -2331,10 +2335,14 @@ fn push_bilibili_metadata_identities(
     identities: &mut Vec<VideoIdentity>,
     metadata: &BilibiliMetadata,
 ) {
-    for id in [metadata.id.as_deref(), metadata.aid.as_deref()]
-        .into_iter()
-        .flatten()
-        .filter(|id| !id.trim().is_empty())
+    for id in [
+        metadata.id.as_deref(),
+        metadata.resolved_id.as_deref(),
+        metadata.aid.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|id| !id.trim().is_empty())
     {
         push_unique_video_identity(
             identities,
@@ -5995,7 +6003,70 @@ mod tests {
         );
 
         assert_eq!(metadata.id.as_deref(), Some("BV12TRrBcEP8"));
+        assert_eq!(metadata.resolved_id.as_deref(), Some("BV12TRrBcEP8"));
         assert_eq!(metadata.aid.as_deref(), Some("116539978154171"));
+    }
+
+    #[test]
+    fn preserves_bilibili_av_and_resolved_bv_identities() {
+        let metadata = parse_bilibili_metadata(
+            "https://www.bilibili.com/video/av1556453868/",
+            "[2026] - 视频URL: https://www.bilibili.com/video/BV12TRrBcEP8/\n[2026] - 获取aid结束: 1556453868",
+        );
+        let mut identities = Vec::new();
+
+        push_bilibili_metadata_identities(&mut identities, &metadata);
+
+        assert_eq!(
+            identities,
+            vec![
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "av1556453868".to_string(),
+                },
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "BV12TRrBcEP8".to_string(),
+                },
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "1556453868".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_metadata_probe_uses_controlled_command_timeout() {
+        let mut config = test_config();
+        let root = temp_test_dir("bilibili-probe-timeout");
+        fs::create_dir_all(&root).expect("probe root should create");
+        let fake_bbdown = root.join("fake-bbdown.sh");
+        fs::write(&fake_bbdown, "#!/bin/sh\nsleep 30\n").expect("fake BBDown should write");
+        let mut permissions = fs::metadata(&fake_bbdown)
+            .expect("fake BBDown metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_bbdown, permissions).expect("fake BBDown should be executable");
+        config.tools.bbdown = fake_bbdown;
+        config.downloads.video_dir = root.clone();
+        config.bilibili.auth.state_path = root.join("missing-auth.json");
+        config.bot.command_timeout_seconds = 1;
+        config.bot.command_idle_timeout_seconds = 30;
+
+        let error = tokio_timeout(
+            Duration::from_secs(8),
+            probe_bilibili_metadata(&config, "https://b23.tv/Jt1mZiL"),
+        )
+        .await
+        .expect("probe should return through run_command timeout")
+        .expect_err("probe should fail on controlled timeout");
+
+        let message = error.to_string();
+        assert!(message.contains("timed out after 1s"), "{message}");
+        assert!(!message.contains("metadata probe timed out"), "{message}");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[cfg(unix)]
