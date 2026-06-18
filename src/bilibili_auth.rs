@@ -654,6 +654,9 @@ pub fn sync_bbdown_rust_credentials_from_state(
     if cookie.is_empty() {
         return Ok(false);
     }
+    if bbdown_rust_cookie_is_present_unlocked(credential_file, credential_profile)? {
+        return Ok(false);
+    }
     update_bbdown_rust_cookie_unlocked(credential_file, credential_profile, Some(cookie))?;
     Ok(true)
 }
@@ -719,6 +722,29 @@ fn update_bbdown_rust_cookie_unlocked(
         }
     };
     write_bbdown_rust_credential_document(credential_file, &document)
+}
+
+fn bbdown_rust_cookie_is_present_unlocked(
+    credential_file: &Path,
+    credential_profile: Option<&str>,
+) -> Result<bool> {
+    let Some(document) = load_bbdown_rust_credential_document(credential_file)? else {
+        return Ok(false);
+    };
+    let target_profile = credential_profile
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty());
+    let credentials = match document {
+        BbdownRustCredentialDocument::Flat(credentials) => match target_profile {
+            Some(profile) if profile != BBDOWN_RUST_DEFAULT_PROFILE => return Ok(false),
+            _ => credentials,
+        },
+        BbdownRustCredentialDocument::Profiles(profiles) => {
+            let profile = target_profile.unwrap_or(profiles.default_profile.as_str());
+            profiles.profiles.get(profile).cloned().unwrap_or_default()
+        }
+    };
+    Ok(!credentials.cookie.unwrap_or_default().trim().is_empty())
 }
 
 fn load_bbdown_rust_credential_document(
@@ -1325,6 +1351,33 @@ mod tests {
     }
 
     #[test]
+    fn sync_does_not_overwrite_existing_bbdown_rust_flat_cookie() {
+        let path = temp_state_file("bbdown-rust-flat-existing-cookie");
+        let credential_file = path.with_file_name("credentials.json");
+        save_auth_state(&path, &test_state()).expect("state should save");
+        fs::write(
+            &credential_file,
+            r#"{"cookie":"fresh-cookie","access_key":"access"}"#,
+        )
+        .expect("credential file should write");
+
+        assert!(
+            !sync_bbdown_rust_credentials_from_state(&path, &credential_file, None)
+                .expect("credential sync should succeed")
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&credential_file).expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert_eq!(value["cookie"], "fresh-cookie");
+        assert_eq!(value["access_key"], "access");
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
     fn syncs_bbdown_rust_selected_profile_cookie_only() {
         let path = temp_state_file("bbdown-rust-profile-sync");
         let credential_file = path.with_file_name("credentials.json");
@@ -1360,6 +1413,34 @@ mod tests {
         .expect("credential file should parse");
         assert_eq!(value["profiles"]["default"]["cookie"], "old-cookie");
         assert!(value["profiles"]["intl"]["cookie"].is_null());
+        assert_eq!(value["profiles"]["intl"]["access_key"], "intl-access");
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn sync_does_not_overwrite_existing_bbdown_rust_profile_cookie() {
+        let path = temp_state_file("bbdown-rust-profile-existing-cookie");
+        let credential_file = path.with_file_name("credentials.json");
+        save_auth_state(&path, &test_state()).expect("state should save");
+        fs::write(
+            &credential_file,
+            r#"{"version":1,"default_profile":"default","profiles":{"default":{"cookie":"default-cookie"},"intl":{"cookie":"fresh-cookie","access_key":"intl-access"}}}"#,
+        )
+        .expect("credential file should write");
+
+        assert!(
+            !sync_bbdown_rust_credentials_from_state(&path, &credential_file, Some("intl"))
+                .expect("credential sync should succeed")
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&credential_file).expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert_eq!(value["profiles"]["default"]["cookie"], "default-cookie");
+        assert_eq!(value["profiles"]["intl"]["cookie"], "fresh-cookie");
         assert_eq!(value["profiles"]["intl"]["access_key"], "intl-access");
 
         if let Some(parent) = path.parent() {
