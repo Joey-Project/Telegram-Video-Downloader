@@ -1142,6 +1142,9 @@ async fn process_job_after_duplicate_check(
             )
             .await;
         }
+        Err(err) if should_prompt_bilibili_selection_after_probe_error(&job, &err) => {
+            prompt_bilibili_selection(telegram, chat_id, job_id, job).await;
+        }
         Err(err) => {
             send_or_log(
                 &telegram,
@@ -1165,6 +1168,27 @@ async fn process_job_after_duplicate_check(
             .await;
         }
     }
+}
+
+fn should_prompt_bilibili_selection_after_probe_error(
+    job: &JobRequest,
+    error: &anyhow::Error,
+) -> bool {
+    matches!(
+        job,
+        JobRequest::Bilibili {
+            selection: None,
+            ..
+        }
+    ) && is_bilibili_selection_required_error(error)
+}
+
+fn is_bilibili_selection_required_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<bbdown_core::Error>()
+            .is_some_and(|err| matches!(err, bbdown_core::Error::SelectionRequired { .. }))
+    })
 }
 
 async fn find_video_duplicate_async(
@@ -2261,6 +2285,39 @@ mod tests {
 
         assert_eq!(jobs.len(), MAX_PENDING_DUPLICATE_JOBS);
         assert!(jobs.contains_key(&protected_token));
+    }
+
+    #[test]
+    fn detects_deferred_bilibili_selection_required_errors() {
+        let error = anyhow::Error::from(bbdown_core::Error::SelectionRequired {
+            input_kind: "season",
+        })
+        .context("failed to probe Bilibili plan");
+        let job = JobRequest::Bilibili {
+            url: "https://b23.tv/season-short-link".to_string(),
+            selection: None,
+        };
+
+        assert!(is_bilibili_selection_required_error(&error));
+        assert!(should_prompt_bilibili_selection_after_probe_error(
+            &job, &error
+        ));
+        assert!(!should_prompt_bilibili_selection_after_probe_error(
+            &JobRequest::Bilibili {
+                url: "https://b23.tv/season-short-link".to_string(),
+                selection: Some(BilibiliSelection::Latest),
+            },
+            &error
+        ));
+        assert!(!should_prompt_bilibili_selection_after_probe_error(
+            &JobRequest::Youtube {
+                url: "https://youtu.be/PHH1wTDF-1M".to_string(),
+            },
+            &error
+        ));
+        assert!(!is_bilibili_selection_required_error(&anyhow!(
+            "ordinary probe failure"
+        )));
     }
 
     #[tokio::test]
