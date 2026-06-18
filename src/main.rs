@@ -1885,7 +1885,10 @@ fn redact_bbdown_auth_secrets(text: &str) -> String {
                 "<redacted BBDown access-key authorization URL>"
             } else if line.contains("balh-login-credentials:") {
                 "<redacted BBDown access-key callback message>"
-            } else if line.contains("access_token=") || line.contains("refresh_token=") {
+            } else if line.contains("access_token=")
+                || line.contains("access_key=")
+                || line.contains("refresh_token=")
+            {
                 "<redacted BBDown access-key callback URL>"
             } else {
                 line
@@ -1915,10 +1918,11 @@ mod tests {
     #[test]
     fn redacts_bbdown_access_key_auth_secrets() {
         let summary = summarize_bbdown_auth_error(&anyhow!(
-            "open https://www.biliplus.com/login?balh_auth=1&balh_auth_origin=https%3A%2F%2Fwww.bilibili.com\nthen https://www.bilibili.com/callback?access_token=secret&refresh_token=refresh\nbalh-login-credentials: {{\"access_key\":\"secret\"}}"
+            "open https://www.biliplus.com/login?balh_auth=1&balh_auth_origin=https%3A%2F%2Fwww.bilibili.com\nthen https://www.bilibili.com/callback?access_token=secret&refresh_token=refresh\nfragment #access_key=secret\nbalh-login-credentials: {{\"access_key\":\"secret\"}}"
         ));
 
         assert!(!summary.contains("access_token="));
+        assert!(!summary.contains("access_key="));
         assert!(!summary.contains("secret"));
         assert!(summary.contains("<redacted BBDown access-key authorization URL>"));
         assert!(summary.contains("<redacted BBDown access-key callback URL>"));

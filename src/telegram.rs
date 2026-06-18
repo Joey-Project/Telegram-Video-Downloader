@@ -407,7 +407,10 @@ fn redact_sensitive_text(text: &str) -> String {
             redacted.push_str("<redacted BBDown access-key authorization URL>");
         } else if line.contains("balh-login-credentials:") {
             redacted.push_str("<redacted BBDown access-key callback message>");
-        } else if line.contains("access_token=") || line.contains("refresh_token=") {
+        } else if line.contains("access_token=")
+            || line.contains("access_key=")
+            || line.contains("refresh_token=")
+        {
             redacted.push_str("<redacted BBDown access-key callback URL>");
         } else {
             redacted.push_str(line);
@@ -461,6 +464,10 @@ mod tests {
             redact_sensitive_text(
                 "https://www.bilibili.com/callback?access_token=secret&refresh_token=refresh"
             ),
+            "<redacted BBDown access-key callback URL>"
+        );
+        assert_eq!(
+            redact_sensitive_text("https://www.bilibili.com/callback#access_key=secret"),
             "<redacted BBDown access-key callback URL>"
         );
         assert_eq!(
