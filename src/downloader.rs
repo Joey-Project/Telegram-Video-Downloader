@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,7 +8,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use bbdown_core::{
+    DownloadFileKind, DownloadMode, DownloadProgressEvent, DownloadProgressSink, DownloadReport,
+};
+use serde::{Deserialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -15,8 +20,9 @@ use tokio::time::{Instant, sleep_until, timeout as tokio_timeout};
 use tracing::info;
 
 use crate::bilibili_auth;
+use crate::bilibili_core;
 use crate::config::AppConfig;
-use crate::router::JobRequest;
+use crate::router::{BilibiliSelection, JobRequest};
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
@@ -171,12 +177,104 @@ struct YoutubeMetadata {
 #[derive(Debug, Clone, Default)]
 struct BilibiliMetadata {
     title: Option<String>,
-    source_url: String,
     uploader_url: Option<String>,
     publish_date: Option<String>,
     id: Option<String>,
     resolved_id: Option<String>,
     aid: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BilibiliDownloadPlan {
+    title: String,
+    #[serde(default)]
+    entries: Vec<BilibiliDownloadEntry>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BilibiliDownloadEntry {
+    index: u32,
+    aid: u64,
+    bvid: Option<String>,
+    cid: u64,
+    epid: Option<u64>,
+    title: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BilibiliDownloadReport {
+    title: String,
+    output_dir: PathBuf,
+    #[serde(default)]
+    entries: Vec<BilibiliEntryDownloadReport>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BilibiliEntryDownloadReport {
+    index: u32,
+    title: String,
+    #[serde(default)]
+    files: Vec<BilibiliDownloadedFile>,
+    mux: Option<BilibiliMuxReport>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BilibiliDownloadedFile {
+    kind: String,
+    path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct BilibiliMuxReport {
+    output_path: PathBuf,
+}
+
+impl From<&bbdown_core::DownloadPlan> for BilibiliDownloadPlan {
+    fn from(plan: &bbdown_core::DownloadPlan) -> Self {
+        Self {
+            title: plan.title.clone(),
+            entries: plan
+                .entries
+                .iter()
+                .map(|entry| BilibiliDownloadEntry {
+                    index: entry.index,
+                    aid: entry.aid,
+                    bvid: entry.bvid.clone(),
+                    cid: entry.cid,
+                    epid: entry.epid,
+                    title: entry.title.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl From<&DownloadReport> for BilibiliDownloadReport {
+    fn from(report: &DownloadReport) -> Self {
+        Self {
+            title: report.title.clone(),
+            output_dir: report.output_dir.clone(),
+            entries: report
+                .entries
+                .iter()
+                .map(|entry| BilibiliEntryDownloadReport {
+                    index: entry.index,
+                    title: entry.title.clone(),
+                    files: entry
+                        .files
+                        .iter()
+                        .map(|file| BilibiliDownloadedFile {
+                            kind: bilibili_file_kind(&file.kind).to_string(),
+                            path: file.path.clone(),
+                        })
+                        .collect(),
+                    mux: entry.mux.as_ref().map(|mux| BilibiliMuxReport {
+                        output_path: mux.output_path.clone(),
+                    }),
+                })
+                .collect(),
+        }
+    }
 }
 
 pub async fn run_job(
@@ -185,7 +283,9 @@ pub async fn run_job(
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<JobReport> {
     match job {
-        JobRequest::Bilibili { url } => run_bilibili_job(config, url, progress).await,
+        JobRequest::Bilibili { url, selection } => {
+            run_bilibili_job(config, url, *selection, progress).await
+        }
         JobRequest::Youtube { url } => run_youtube_job(config, url, progress).await,
         JobRequest::Pdf { .. } => run_simple_job(config, job, progress).await,
     }
@@ -241,24 +341,24 @@ pub async fn find_video_duplicate_with_probe(
         scan_video_duplicate_for_identities(config, job, identities.clone()).await?
     };
 
-    if let JobRequest::Bilibili { url } = job {
+    if let JobRequest::Bilibili { url, selection } = job {
         let probe_timeout = if direct_duplicate.is_some() {
             BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT
         } else {
             BILIBILI_METADATA_PROBE_TIMEOUT
         };
-        match probe_bilibili_metadata(config, url, probe_timeout).await {
-            Ok(metadata) => push_bilibili_metadata_identities(&mut identities, &metadata),
+        match probe_bilibili_plan(config, url, *selection, probe_timeout).await {
+            Ok(plan) => push_bilibili_plan_identities(&mut identities, &plan),
             Err(err) if identities.is_empty() && direct_duplicate.is_none() => {
                 return Err(err).with_context(|| {
-                    format!("failed to probe Bilibili metadata for duplicate check: {url}")
+                    format!("failed to probe Bilibili plan for duplicate check: {url}")
                 });
             }
             Err(err) => {
                 info!(
                     url = %url,
                     error = %err,
-                    "Bilibili metadata probe skipped during duplicate check"
+                    "Bilibili plan probe skipped during duplicate check"
                 );
             }
         }
@@ -353,127 +453,325 @@ async fn run_simple_job(
 async fn run_bilibili_job(
     config: &AppConfig,
     url: &str,
+    selection: Option<BilibiliSelection>,
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<JobReport> {
     let _guard = video_output_lock("Bilibili download", progress.as_ref()).await;
-    run_bilibili_job_locked(config, url, progress).await
+    run_bilibili_job_locked(config, url, selection, progress).await
 }
 
 async fn run_bilibili_job_locked(
     config: &AppConfig,
     url: &str,
+    selection: Option<BilibiliSelection>,
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<JobReport> {
-    let mut nfo_warnings = Vec::new();
-    let effective_args = bilibili_effective_args(config)?;
-    let needs_mux = bilibili_needs_mux(&effective_args);
-    let video_only = has_bilibili_flag(&effective_args, "--video-only");
-    let before = match list_video_files(&config.downloads.video_dir) {
-        Ok(files) => Some(files),
-        Err(err) if needs_mux => {
-            bail!("Bilibili post-processing failed: failed to scan before download: {err}");
+    sync_bilibili_rust_credentials(config)?;
+    let options = bilibili_core::download_options(config)?;
+    let client = bilibili_core::client(config)?;
+    let core_plan = probe_bilibili_plan_with_mode(
+        &client,
+        url,
+        selection,
+        options.mode,
+        BILIBILI_METADATA_PROBE_TIMEOUT,
+    )
+    .await?;
+    let plan = BilibiliDownloadPlan::from(&core_plan);
+    let progress_reporter = BilibiliCoreProgress::new(progress.clone());
+    let core_report = client
+        .download_plan_with_progress(&core_plan, options, &progress_reporter)
+        .await?;
+    let report = BilibiliDownloadReport::from(&core_report);
+    let primary_videos = bilibili_report_primary_media(&config.downloads.video_dir, &report);
+    let mut details = vec![format!(
+        "BBDown-rust crate: {} entr{}",
+        report.entries.len(),
+        if report.entries.len() == 1 {
+            "y"
+        } else {
+            "ies"
         }
-        Err(err) => {
-            nfo_warnings.push(format!(
-                "Bilibili post-processing skipped: failed to scan before download: {err}"
-            ));
-            None
-        }
-    };
-    let spec = bilibili_command_spec(config, url)?;
-    let command_started_at = SystemTime::now();
-    let output = run_command(config, &spec, progress.clone()).await?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if !output.status.success() {
-        bail!(
-            "{} exited with status {}\n{}",
-            spec.program.display(),
-            output.status,
-            summarize_output(&stdout, &stderr)
-        );
+    )];
+    if !report.title.trim().is_empty() {
+        details.push(format!("Title: {}", report.title));
     }
-
-    let metadata = parse_bilibili_metadata(url, &stdout);
-    let mut details = vec![tail_lines(&stdout, 6)];
-    details.extend(nfo_warnings);
-
-    if let Some(before) = before {
-        match list_video_files(&config.downloads.video_dir) {
-            Ok(after) => {
-                let created_videos: Vec<_> = after.difference(&before).cloned().collect();
-                let videos_to_process = if needs_mux {
-                    bilibili_mux_candidates(
-                        config,
-                        &metadata,
-                        created_videos,
-                        command_started_at,
-                        video_only,
-                    )?
-                } else {
-                    created_videos
-                };
-                if needs_mux && videos_to_process.is_empty() {
-                    bail!("Bilibili post-processing failed: no video/audio stream pairs found");
-                }
-                let final_videos = if needs_mux {
-                    merge_bilibili_streams(
-                        config,
-                        &videos_to_process,
-                        &metadata,
-                        video_only,
-                        command_started_at,
-                        progress,
-                    )
-                    .await?
-                } else {
-                    cleanup_bilibili_download_outputs(&videos_to_process, command_started_at)?;
-                    videos_to_process
-                };
-                if config.video.write_nfo {
-                    let mut alternate_unique_ids = Vec::new();
-                    if let (Some(id), Some(aid)) = (metadata.id.as_deref(), metadata.aid.as_deref())
-                        && id != aid
-                    {
-                        alternate_unique_ids.push(("bilibili-aid", aid));
-                    }
-                    match write_nfos_for_videos(
-                        &final_videos,
-                        &MediaNfo {
-                            title: metadata.title.as_deref(),
-                            plot: None,
-                            unique_id_type: "bilibili",
-                            unique_id: metadata
-                                .id
-                                .as_deref()
-                                .or(metadata.aid.as_deref())
-                                .unwrap_or(url),
-                            alternate_unique_ids,
-                            source_url: &metadata.source_url,
-                            studio: metadata.uploader_url.as_deref(),
-                            premiered: metadata.publish_date.as_deref(),
-                        },
-                    ) {
-                        Ok(created_nfos) if !created_nfos.is_empty() => {
-                            details.push(format!("NFO: {}", join_paths(&created_nfos)));
-                        }
-                        Ok(_) => {}
-                        Err(err) => details.push(format!("NFO skipped: {err}")),
-                    }
-                }
+    if config.video.write_nfo {
+        match write_bilibili_nfos(&config.downloads.video_dir, url, &plan, &report) {
+            Ok(created_nfos) if !created_nfos.is_empty() => {
+                details.push(format!("NFO: {}", join_paths(&created_nfos)));
             }
-            Err(err) if needs_mux => {
-                bail!("Bilibili post-processing failed: failed to scan after download: {err}");
-            }
-            Err(err) => details.push(format!("NFO skipped: failed to scan after download: {err}")),
+            Ok(_) => {}
+            Err(err) => details.push(format!("NFO skipped: {err}")),
         }
     }
 
     Ok(JobReport {
-        saved_location: config.downloads.video_dir.display().to_string(),
+        saved_location: if primary_videos.is_empty() {
+            resolve_command_output_path(&config.downloads.video_dir, &report.output_dir)
+                .display()
+                .to_string()
+        } else if primary_videos.len() == 1 {
+            primary_videos[0].display().to_string()
+        } else {
+            join_paths(&primary_videos)
+        },
         details: nonempty_join(details),
     })
+}
+
+#[derive(Clone)]
+struct BilibiliCoreProgress {
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+}
+
+impl BilibiliCoreProgress {
+    fn new(progress: Option<mpsc::UnboundedSender<JobProgress>>) -> Self {
+        Self { progress }
+    }
+}
+
+impl DownloadProgressSink for BilibiliCoreProgress {
+    fn on_download_progress(&self, event: &DownloadProgressEvent) {
+        let message = match event {
+            DownloadProgressEvent::PlanStarted {
+                title, entry_count, ..
+            } => format!("BBDown-rust: planning {title} ({entry_count} entries)"),
+            DownloadProgressEvent::EntryStarted { index, title, .. } => {
+                format!("BBDown-rust: entry {index} started - {title}")
+            }
+            DownloadProgressEvent::FileStarted {
+                kind,
+                path,
+                attempt,
+                max_attempts,
+                ..
+            } => format!(
+                "BBDown-rust: {} started ({attempt}/{max_attempts}) - {}",
+                bilibili_file_kind(kind),
+                path.display()
+            ),
+            DownloadProgressEvent::FileCompleted {
+                kind,
+                path,
+                total_bytes,
+                ..
+            } => format!(
+                "BBDown-rust: {} completed ({}) - {}",
+                bilibili_file_kind(kind),
+                human_bytes(*total_bytes),
+                path.display()
+            ),
+            DownloadProgressEvent::MuxStarted { output_path, .. } => {
+                format!("BBDown-rust: mux started - {}", output_path.display())
+            }
+            DownloadProgressEvent::MuxCompleted { output_path, .. } => {
+                format!("BBDown-rust: mux completed - {}", output_path.display())
+            }
+            DownloadProgressEvent::EntryCompleted {
+                index,
+                title,
+                file_count,
+                ..
+            } => format!("BBDown-rust: entry {index} completed - {title} ({file_count} files)"),
+            DownloadProgressEvent::PlanCompleted {
+                title, entry_count, ..
+            } => format!("BBDown-rust: completed {title} ({entry_count} entries)"),
+            _ => return,
+        };
+        send_progress(self.progress.as_ref(), message);
+    }
+}
+
+fn bilibili_report_primary_media(cwd: &Path, report: &BilibiliDownloadReport) -> Vec<PathBuf> {
+    let mut media = Vec::new();
+    for entry in &report.entries {
+        if let Some(mux) = &entry.mux {
+            push_unique_path(
+                &mut media,
+                resolve_command_output_path(cwd, &mux.output_path),
+            );
+            continue;
+        }
+
+        let video_files = entry
+            .files
+            .iter()
+            .filter(|file| matches!(file.kind.as_str(), "video" | "flv_segment"))
+            .map(|file| resolve_command_output_path(cwd, &file.path))
+            .collect::<Vec<_>>();
+        if video_files.is_empty() {
+            for file in entry.files.iter().filter(|file| file.kind == "audio") {
+                push_unique_path(&mut media, resolve_command_output_path(cwd, &file.path));
+            }
+        } else {
+            for path in video_files {
+                push_unique_path(&mut media, path);
+            }
+        }
+    }
+    media
+}
+
+fn resolve_command_output_path(cwd: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
+fn bilibili_file_kind(kind: &DownloadFileKind) -> &'static str {
+    match kind {
+        DownloadFileKind::Video => "video",
+        DownloadFileKind::Audio => "audio",
+        DownloadFileKind::FlvSegment => "flv_segment",
+        DownloadFileKind::Cover => "cover",
+        DownloadFileKind::Subtitle => "subtitle",
+        DownloadFileKind::Danmaku => "danmaku",
+        DownloadFileKind::DanmakuAss => "danmaku_ass",
+        _ => "unknown",
+    }
+}
+
+fn write_bilibili_nfos(
+    cwd: &Path,
+    source_url: &str,
+    plan: &BilibiliDownloadPlan,
+    report: &BilibiliDownloadReport,
+) -> Result<Vec<PathBuf>> {
+    let mut nfos = Vec::new();
+    for report_entry in &report.entries {
+        let Some(primary_media) = bilibili_entry_primary_media(cwd, report_entry) else {
+            continue;
+        };
+        if !primary_media.is_file() || !is_video_file(&primary_media) {
+            continue;
+        }
+        let plan_entry = plan
+            .entries
+            .iter()
+            .find(|entry| entry.index == report_entry.index);
+        let Some(ids) = bilibili_nfo_ids(plan_entry) else {
+            continue;
+        };
+        let title = plan_entry
+            .map(|entry| entry.title.as_str())
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| {
+                (!report_entry.title.trim().is_empty()).then_some(report_entry.title.as_str())
+            })
+            .or_else(|| (!plan.title.trim().is_empty()).then_some(plan.title.as_str()));
+        let alternate_unique_ids = ids
+            .alternate_unique_ids
+            .iter()
+            .map(|(unique_id_type, unique_id)| (unique_id_type.as_str(), unique_id.as_str()))
+            .collect::<Vec<_>>();
+        let nfo_path = write_nfo_for_video(
+            &primary_media,
+            &MediaNfo {
+                title,
+                plot: None,
+                unique_id_type: ids.primary_unique_id_type.as_str(),
+                unique_id: ids.primary_unique_id.as_str(),
+                alternate_unique_ids,
+                source_url,
+                studio: Some("Bilibili"),
+                premiered: None,
+            },
+        )?;
+        nfos.push(nfo_path);
+    }
+    Ok(nfos)
+}
+
+fn bilibili_entry_primary_media(
+    cwd: &Path,
+    entry: &BilibiliEntryDownloadReport,
+) -> Option<PathBuf> {
+    if let Some(mux) = &entry.mux {
+        return Some(resolve_command_output_path(cwd, &mux.output_path));
+    }
+    entry
+        .files
+        .iter()
+        .find(|file| matches!(file.kind.as_str(), "video" | "flv_segment"))
+        .or_else(|| entry.files.iter().find(|file| file.kind == "audio"))
+        .map(|file| resolve_command_output_path(cwd, &file.path))
+}
+
+#[derive(Debug)]
+struct BilibiliNfoIds {
+    primary_unique_id_type: String,
+    primary_unique_id: String,
+    alternate_unique_ids: Vec<(String, String)>,
+}
+
+fn bilibili_nfo_ids(entry: Option<&BilibiliDownloadEntry>) -> Option<BilibiliNfoIds> {
+    let entry = entry?;
+    let (primary_unique_id_type, primary_unique_id) =
+        if let Some(bvid) = entry.bvid.as_deref().filter(|bvid| !bvid.trim().is_empty()) {
+            ("bilibili".to_string(), bvid.to_string())
+        } else if let Some(epid) = entry.epid {
+            ("bilibili-epid".to_string(), format!("ep{epid}"))
+        } else {
+            ("bilibili-aid".to_string(), format!("av{}", entry.aid))
+        };
+
+    let mut alternate_unique_ids = Vec::new();
+    push_unique_nfo_id(
+        &mut alternate_unique_ids,
+        "bilibili-aid",
+        format!("av{}", entry.aid),
+        &primary_unique_id_type,
+        &primary_unique_id,
+    );
+    push_unique_nfo_id(
+        &mut alternate_unique_ids,
+        "bilibili-cid",
+        format!("cid{}", entry.cid),
+        &primary_unique_id_type,
+        &primary_unique_id,
+    );
+    if let Some(epid) = entry.epid {
+        push_unique_nfo_id(
+            &mut alternate_unique_ids,
+            "bilibili-epid",
+            format!("ep{epid}"),
+            &primary_unique_id_type,
+            &primary_unique_id,
+        );
+    }
+
+    Some(BilibiliNfoIds {
+        primary_unique_id_type,
+        primary_unique_id,
+        alternate_unique_ids,
+    })
+}
+
+fn push_unique_nfo_id(
+    ids: &mut Vec<(String, String)>,
+    unique_id_type: &str,
+    unique_id: String,
+    primary_unique_id_type: &str,
+    primary_unique_id: &str,
+) {
+    if unique_id_type == primary_unique_id_type && unique_id == primary_unique_id {
+        return;
+    }
+    if ids.iter().any(|(existing_type, existing_id)| {
+        existing_type == unique_id_type && existing_id == &unique_id
+    }) {
+        return;
+    }
+    ids.push((unique_id_type.to_string(), unique_id));
 }
 
 fn bilibili_mux_candidates(
@@ -981,8 +1279,8 @@ async fn run_staged_video_job(
     staging_config.downloads.video_dir = staging_dir.clone();
     preserve_bilibili_config_paths_for_staging(&mut staging_config, &final_dir);
     let result = match job {
-        JobRequest::Bilibili { url } => {
-            run_bilibili_job_locked(&staging_config, url, progress.clone()).await
+        JobRequest::Bilibili { url, selection } => {
+            run_bilibili_job_locked(&staging_config, url, *selection, progress.clone()).await
         }
         JobRequest::Youtube { url } => {
             let metadata = fetch_youtube_metadata(&staging_config, url, progress.clone()).await;
@@ -1079,7 +1377,9 @@ fn remove_staging_detail_lines(details: &str, staging_dir: &Path) -> String {
 
 pub fn command_spec(config: &AppConfig, job: &JobRequest) -> Result<CommandSpec> {
     match job {
-        JobRequest::Bilibili { url } => bilibili_command_spec(config, url),
+        JobRequest::Bilibili { .. } => {
+            bail!("Bilibili downloads use the bbdown-core crate API and do not have a command spec")
+        }
         JobRequest::Youtube { url } => Ok(youtube_download_command_spec(
             config,
             url,
@@ -1103,50 +1403,13 @@ fn fallback_video_identity(job: &JobRequest) -> Option<VideoIdentity> {
     })
 }
 
-pub fn bilibili_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
-    let mut args = vec![url.to_string(), "--skip-ai".to_string()];
-    let (mut auth_extra_args, explicit_config_path) =
-        bilibili_extra_args_without_config_file(config);
-    let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
-    let base_config_args =
-        read_bbdown_base_config_args(base_config_path.as_deref(), explicit_config_path.is_some())?;
-    let config_path = bilibili_auth::ensure_bbdown_config_file(
+fn sync_bilibili_rust_credentials(config: &AppConfig) -> Result<()> {
+    bilibili_auth::sync_bbdown_rust_credentials_from_state(
         &config.bilibili.auth.state_path,
-        base_config_path.as_deref(),
+        &config.bilibili.auth.credential_file,
+        config.bilibili.auth.credential_profile.as_deref(),
     )?;
-    if config_path.is_some() {
-        append_bilibili_single_thread_default_if_missing(&mut auth_extra_args, &base_config_args);
-        args.extend(auth_extra_args);
-    } else {
-        let mut extra_args = config.bilibili.extra_args.clone();
-        append_bilibili_single_thread_default_if_missing(&mut extra_args, &base_config_args);
-        args.extend(extra_args);
-        if explicit_config_path.is_none()
-            && let Some(base_config_path) = &base_config_path
-        {
-            args.extend([
-                "--config-file".to_string(),
-                absolute_process_path(base_config_path)
-                    .display()
-                    .to_string(),
-            ]);
-        }
-    }
-    if let Some(config_path) = &config_path {
-        args.extend([
-            "--config-file".to_string(),
-            config_path.display().to_string(),
-        ]);
-    }
-    append_bilibili_danmaku_args(config, &mut args);
-
-    Ok(CommandSpec {
-        program: config.tools.bbdown.clone(),
-        args,
-        cwd: config.downloads.video_dir.clone(),
-        activity_dir: Some(config.downloads.video_dir.clone()),
-        cleanup_paths: config_path.into_iter().collect(),
-    })
+    Ok(())
 }
 
 pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
@@ -1175,43 +1438,8 @@ pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<C
     })
 }
 
-fn append_bilibili_danmaku_args(config: &AppConfig, args: &mut Vec<String>) {
-    let explicit_setting = take_bilibili_danmaku_setting(args);
-    if !config.bilibili.danmaku.enabled {
-        args.extend(["--download-danmaku".to_string(), "false".to_string()]);
-    } else if let Some(explicit_setting) = explicit_setting {
-        args.extend(explicit_setting);
-    } else {
-        args.push("--download-danmaku".to_string());
-    }
-}
-
-fn bilibili_effective_args(config: &AppConfig) -> Result<Vec<String>> {
-    let (filtered_args, explicit_config_path) = bilibili_extra_args_without_config_file(config);
-    let mut args = Vec::new();
-    let base_config_path = bbdown_base_config_path(config, explicit_config_path.as_deref());
-    args.extend(read_bbdown_base_config_args(
-        base_config_path.as_deref(),
-        explicit_config_path.is_some(),
-    )?);
-    args.extend(filtered_args);
-    append_bilibili_single_thread_default_if_missing(&mut args, &[]);
-    Ok(args)
-}
-
 fn bilibili_extra_args_without_config_file(config: &AppConfig) -> (Vec<String>, Option<PathBuf>) {
     split_bilibili_extra_args(&config.bilibili.extra_args)
-}
-
-fn read_bbdown_config_args(path: &Path) -> Result<Vec<String>> {
-    Ok(read_bbdown_config_lines(path)?
-        .into_iter()
-        .flat_map(|line| {
-            line.split_whitespace()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .collect())
 }
 
 fn read_bbdown_config_lines(path: &Path) -> Result<Vec<String>> {
@@ -1225,23 +1453,10 @@ fn read_bbdown_config_lines(path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-fn read_bbdown_base_config_args(path: Option<&Path>, required: bool) -> Result<Vec<String>> {
-    match path {
-        Some(path) if required || path.exists() => read_bbdown_config_args(path),
-        _ => Ok(Vec::new()),
-    }
-}
-
 fn read_bbdown_base_config_lines(path: Option<&Path>, required: bool) -> Result<Vec<String>> {
     match path {
         Some(path) if required || path.exists() => read_bbdown_config_lines(path),
         _ => Ok(Vec::new()),
-    }
-}
-
-fn append_bilibili_single_thread_default_if_missing(args: &mut Vec<String>, base_args: &[String]) {
-    if !has_bilibili_multi_thread_setting(base_args) && !has_bilibili_multi_thread_setting(args) {
-        args.extend(["--multi-thread".to_string(), "false".to_string()]);
     }
 }
 
@@ -1339,87 +1554,6 @@ fn is_bilibili_metadata_ignored_arg(arg: &str) -> bool {
     })
 }
 
-fn has_bilibili_multi_thread_setting(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        arg == "--multi-thread"
-            || arg == "-mt"
-            || arg.starts_with("--multi-thread=")
-            || arg.starts_with("-mt=")
-            || arg.starts_with("--multi-thread:")
-            || arg.starts_with("-mt:")
-    })
-}
-
-fn has_bilibili_flag(args: &[String], flag: &str) -> bool {
-    let mut enabled = false;
-    let equals_prefix = format!("{flag}=");
-    let colon_prefix = format!("{flag}:");
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if arg == flag {
-            if let Some(value) = args
-                .get(index + 1)
-                .and_then(|value| parse_bool_token(value))
-            {
-                enabled = value;
-                index += 2;
-            } else {
-                enabled = true;
-                index += 1;
-            }
-            continue;
-        }
-        if let Some(value) = arg
-            .strip_prefix(&equals_prefix)
-            .or_else(|| arg.strip_prefix(&colon_prefix))
-        {
-            enabled = parse_bool_token(value).unwrap_or(true);
-        }
-        index += 1;
-    }
-    enabled
-}
-
-fn take_bilibili_danmaku_setting(args: &mut Vec<String>) -> Option<Vec<String>> {
-    let mut retained = Vec::with_capacity(args.len());
-    let mut setting = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        if is_bilibili_danmaku_option(arg) {
-            let mut current = vec![arg.clone()];
-            if is_bilibili_danmaku_flag(arg)
-                && let Some(value) = args.get(index + 1)
-                && parse_bool_token(value).is_some()
-            {
-                current.push(value.clone());
-                index += 2;
-            } else {
-                index += 1;
-            }
-            setting = Some(current);
-        } else {
-            retained.push(arg.clone());
-            index += 1;
-        }
-    }
-    *args = retained;
-    setting
-}
-
-fn is_bilibili_danmaku_option(arg: &str) -> bool {
-    is_bilibili_danmaku_flag(arg)
-        || arg.starts_with("--download-danmaku=")
-        || arg.starts_with("--download-danmaku:")
-        || arg.starts_with("-dd=")
-        || arg.starts_with("-dd:")
-}
-
-fn is_bilibili_danmaku_flag(arg: &str) -> bool {
-    arg == "--download-danmaku" || arg == "-dd"
-}
-
 fn parse_bool_token(value: &str) -> Option<bool> {
     match value.to_ascii_lowercase().as_str() {
         "true" | "1" => Some(true),
@@ -1428,15 +1562,29 @@ fn parse_bool_token(value: &str) -> Option<bool> {
     }
 }
 
-fn bilibili_needs_mux(args: &[String]) -> bool {
-    has_bilibili_flag(args, "--skip-mux") && !has_bilibili_flag(args, "--audio-only")
+fn bilibili_downloads_audio_only(config: &AppConfig) -> Result<bool> {
+    Ok(bilibili_core::download_mode_from_config(config)? == DownloadMode::AudioOnly)
 }
 
-fn bilibili_downloads_audio_only(config: &AppConfig) -> Result<bool> {
-    Ok(has_bilibili_flag(
-        &bilibili_effective_args(config)?,
-        "--audio-only",
-    ))
+fn has_bilibili_only_value(args: &[String], expected: &str) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--only" {
+            if args.get(index + 1).is_some_and(|value| value == expected) {
+                return true;
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--only=")
+            && value == expected
+        {
+            return true;
+        }
+        index += 1;
+    }
+    false
 }
 
 fn split_bilibili_extra_args(extra_args: &[String]) -> (Vec<String>, Option<PathBuf>) {
@@ -1709,6 +1857,63 @@ async fn fetch_youtube_metadata(
 
     let json = last_nonempty_line(&stdout).ok_or_else(|| anyhow!("yt-dlp returned no metadata"))?;
     serde_json::from_str(json).context("failed to parse yt-dlp metadata JSON")
+}
+
+async fn probe_bilibili_plan(
+    config: &AppConfig,
+    url: &str,
+    selection: Option<BilibiliSelection>,
+    timeout: Duration,
+) -> Result<BilibiliDownloadPlan> {
+    sync_bilibili_rust_credentials(config)?;
+    let client = bilibili_core::client(config)?;
+    let plan =
+        probe_bilibili_plan_with_mode(&client, url, selection, DownloadMode::All, timeout).await?;
+    Ok(BilibiliDownloadPlan::from(&plan))
+}
+
+async fn probe_bilibili_plan_with_mode(
+    client: &bbdown_core::BiliClient,
+    url: &str,
+    selection: Option<BilibiliSelection>,
+    mode: DownloadMode,
+    timeout: Duration,
+) -> Result<bbdown_core::DownloadPlan> {
+    tokio_timeout(
+        timeout,
+        client.plan_download_with_mode(url, bilibili_core::selection(selection), mode),
+    )
+    .await
+    .context("Bilibili plan probe timed out")?
+    .context("failed to probe Bilibili plan with bbdown-core")
+}
+
+fn parse_bilibili_plan(stdout: &str) -> Result<BilibiliDownloadPlan> {
+    parse_bilibili_json_output(stdout, "BBDown-rust plan JSON")
+}
+
+fn parse_bilibili_download_report(stdout: &str) -> Result<BilibiliDownloadReport> {
+    parse_bilibili_json_output(stdout, "BBDown-rust download report JSON")
+}
+
+fn parse_bilibili_json_output<T>(stdout: &str, label: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        bail!("{label} was empty");
+    }
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Ok(value);
+    }
+    let Some(start) = trimmed.find('{') else {
+        bail!("{label} did not contain a JSON object");
+    };
+    let Some(end) = trimmed.rfind('}') else {
+        bail!("{label} did not contain a complete JSON object");
+    };
+    serde_json::from_str(&trimmed[start..=end]).with_context(|| format!("failed to parse {label}"))
 }
 
 async fn probe_bilibili_metadata(
@@ -2653,7 +2858,6 @@ fn language_matches(preferred: &str, available: &str) -> bool {
 
 fn parse_bilibili_metadata(url: &str, stdout: &str) -> BilibiliMetadata {
     let mut metadata = BilibiliMetadata {
-        source_url: url.to_string(),
         id: bilibili_id_from_url(url),
         ..BilibiliMetadata::default()
     };
@@ -2713,6 +2917,44 @@ fn push_bilibili_metadata_identities(
     }
 }
 
+fn push_bilibili_plan_identities(identities: &mut Vec<VideoIdentity>, plan: &BilibiliDownloadPlan) {
+    for entry in &plan.entries {
+        if let Some(bvid) = entry.bvid.as_deref().filter(|bvid| !bvid.trim().is_empty()) {
+            push_unique_video_identity(
+                identities,
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: bvid.to_string(),
+                },
+            );
+        }
+        for id in [
+            entry.aid.to_string(),
+            format!("av{}", entry.aid),
+            format!("cid{}", entry.cid),
+        ] {
+            push_unique_video_identity(
+                identities,
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id,
+                },
+            );
+        }
+        if let Some(epid) = entry.epid {
+            for id in [epid.to_string(), format!("ep{epid}")] {
+                push_unique_video_identity(
+                    identities,
+                    VideoIdentity {
+                        provider: VideoProvider::Bilibili,
+                        id,
+                    },
+                );
+            }
+        }
+    }
+}
+
 fn push_unique_video_identity(identities: &mut Vec<VideoIdentity>, identity: VideoIdentity) {
     if identities
         .iter()
@@ -2727,14 +2969,17 @@ fn bilibili_id_from_url(raw_url: &str) -> Option<String> {
     let url = url::Url::parse(raw_url).ok()?;
     url.path_segments()?
         .find(|segment| {
-            segment.starts_with("BV") || segment.starts_with("bv") || segment.starts_with("av")
+            segment.starts_with("BV")
+                || segment.starts_with("bv")
+                || segment.starts_with("av")
+                || segment.starts_with("ep")
         })
         .map(str::to_string)
 }
 
 fn video_identity(job: &JobRequest) -> Option<VideoIdentity> {
     match job {
-        JobRequest::Bilibili { url } => bilibili_id_from_url(url).map(|id| VideoIdentity {
+        JobRequest::Bilibili { url, .. } => bilibili_id_from_url(url).map(|id| VideoIdentity {
             provider: VideoProvider::Bilibili,
             id,
         }),
@@ -2854,7 +3099,11 @@ fn provider_url_matches_identity(url: &str, provider: VideoProvider) -> bool {
         return false;
     };
     match provider {
-        VideoProvider::Bilibili => domain_or_subdomain(&host, "bilibili.com") || host == "b23.tv",
+        VideoProvider::Bilibili => {
+            domain_or_subdomain(&host, "bilibili.com")
+                || domain_or_subdomain(&host, "bilibili.tv")
+                || host == "b23.tv"
+        }
         VideoProvider::Youtube => {
             domain_or_subdomain(&host, "youtube.com")
                 || domain_or_subdomain(&host, "youtube-nocookie.com")
@@ -2896,9 +3145,12 @@ fn tag_contains_provider_uniqueid_type(tag: &str, provider: &str, quote: char) -
         return false;
     };
     value == provider
-        || value
-            .strip_prefix(provider)
-            .is_some_and(|suffix| matches!(suffix, "-aid" | "_aid"))
+        || value.strip_prefix(provider).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "-aid" | "_aid" | "-cid" | "_cid" | "-epid" | "_epid"
+            )
+        })
 }
 
 fn metadata_sidecar_paths(video: &Path) -> Vec<PathBuf> {
@@ -2957,7 +3209,7 @@ fn is_video_file(path: &Path) -> bool {
         .map(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "mkv" | "mp4" | "m4v" | "webm" | "mov" | "avi"
+                "mkv" | "mp4" | "m4v" | "webm" | "mov" | "avi" | "flv" | "m4s"
             )
         })
         .unwrap_or(false)
@@ -3586,13 +3838,6 @@ struct MediaNfo<'a> {
     premiered: Option<&'a str>,
 }
 
-fn write_nfos_for_videos(videos: &[PathBuf], nfo: &MediaNfo<'_>) -> Result<Vec<PathBuf>> {
-    videos
-        .iter()
-        .map(|video| write_nfo_for_video(video, nfo))
-        .collect()
-}
-
 fn write_nfo_for_video(video_path: &Path, nfo: &MediaNfo<'_>) -> Result<PathBuf> {
     let title = nfo
         .title
@@ -3850,7 +4095,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    use crate::bilibili_auth::{AuthState, save_auth_state};
     use crate::config::AppConfig;
 
     use super::*;
@@ -3923,7 +4167,8 @@ mod tests {
         );
         assert_eq!(
             video_identity(&JobRequest::Bilibili {
-                url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string()
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+                selection: None,
             }),
             Some(VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -3932,7 +4177,8 @@ mod tests {
         );
         assert_eq!(
             video_identity(&JobRequest::Bilibili {
-                url: "https://b23.tv/abc".to_string()
+                url: "https://b23.tv/abc".to_string(),
+                selection: None,
             }),
             None
         );
@@ -3979,6 +4225,7 @@ mod tests {
             &config,
             &JobRequest::Bilibili {
                 url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+                selection: None,
             },
         )
         .expect("duplicate scan should succeed")
@@ -4006,6 +4253,7 @@ mod tests {
             &config,
             &JobRequest::Bilibili {
                 url: "https://b23.tv/Jt1mZiL".to_string(),
+                selection: None,
             },
             vec![
                 VideoIdentity {
@@ -4046,6 +4294,7 @@ mod tests {
             &config,
             &JobRequest::Bilibili {
                 url: "https://b23.tv/Jt1mZiL".to_string(),
+                selection: None,
             },
             vec![
                 VideoIdentity {
@@ -4063,99 +4312,6 @@ mod tests {
 
         assert_eq!(duplicate.identity.id, "BV12TRrBcEP8");
         assert_eq!(duplicate.existing_videos, vec![bvid_path, aid_path]);
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn aggregates_bilibili_probe_aliases_after_direct_duplicate() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("duplicate-after-direct-probe");
-        fs::create_dir_all(&video_dir).expect("video dir should create");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.auth.state_path = video_dir.join("missing-auth.json");
-        let bvid_path = video_dir.join("Title [BV12TRrBcEP8].mp4");
-        fs::write(&bvid_path, "video").expect("bvid video should write");
-        let aid_path = video_dir.join("Title from aid.mp4");
-        fs::write(&aid_path, "video").expect("aid video should write");
-        fs::write(
-            aid_path.with_extension("nfo"),
-            "<movie><uniqueid type=\"bilibili-aid\">116539978154171</uniqueid></movie>",
-        )
-        .expect("aid nfo should write");
-        let fake_bbdown = video_dir.join("fake-bbdown.sh");
-        fs::write(
-            &fake_bbdown,
-            "#!/bin/sh\necho '[2026] - 视频URL: https://www.bilibili.com/video/BV12TRrBcEP8/'\necho '[2026] - 获取aid结束: 116539978154171'\n",
-        )
-        .expect("fake BBDown should write");
-        let mut permissions = fs::metadata(&fake_bbdown)
-            .expect("fake BBDown metadata should exist")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&fake_bbdown, permissions).expect("fake BBDown should be executable");
-        config.tools.bbdown = fake_bbdown;
-
-        let duplicate = find_video_duplicate_with_probe(
-            &config,
-            &JobRequest::Bilibili {
-                url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
-            },
-        )
-        .await
-        .expect("duplicate scan should succeed")
-        .expect("bilibili duplicate should be found");
-
-        assert_eq!(duplicate.identity.id, "BV12TRrBcEP8");
-        assert_eq!(duplicate.existing_videos, vec![bvid_path, aid_path]);
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn falls_back_to_direct_duplicate_after_short_bilibili_probe_timeout() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("duplicate-before-probe");
-        fs::create_dir_all(&video_dir).expect("video dir should create");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.auth.state_path = video_dir.join("missing-auth.json");
-        config.bot.command_timeout_seconds = 1;
-        let existing = video_dir.join("Title [BV12TRrBcEP8].mp4");
-        fs::write(&existing, "video").expect("existing video should write");
-        let probe_marker = video_dir.join("probe-ran");
-        let slow_probe = video_dir.join("slow-bbdown-probe.sh");
-        fs::write(
-            &slow_probe,
-            format!(
-                "#!/bin/sh\necho ran > '{}'\nsleep 3\n",
-                probe_marker.display()
-            ),
-        )
-        .expect("slow probe should write");
-        let mut permissions = fs::metadata(&slow_probe)
-            .expect("slow probe metadata should exist")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&slow_probe, permissions).expect("slow probe should be executable");
-        config.tools.bbdown = slow_probe;
-
-        let duplicate = tokio_timeout(
-            Duration::from_secs(5),
-            find_video_duplicate_with_probe(
-                &config,
-                &JobRequest::Bilibili {
-                    url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
-                },
-            ),
-        )
-        .await
-        .expect("duplicate scan should return after controlled short probe timeout")
-        .expect("duplicate scan should succeed")
-        .expect("direct URL duplicate should be found");
-
-        assert_eq!(duplicate.identity.id, "BV12TRrBcEP8");
-        assert_eq!(duplicate.existing_videos, vec![existing]);
-        assert!(probe_marker.exists());
         let _ = fs::remove_dir_all(video_dir);
     }
 
@@ -4309,6 +4465,7 @@ mod tests {
             &config,
             &JobRequest::Bilibili {
                 url: "https://www.bilibili.com/video/BV12TRrBcEP8/".to_string(),
+                selection: None,
             },
         )
         .expect("duplicate scan should succeed")
@@ -4680,6 +4837,57 @@ mod tests {
             fs::read_to_string(final_dir.join("Episode (2).nfo"))
                 .expect("nfo should follow kept audio basename"),
             "new-nfo"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn keep_both_moves_bilibili_segment_primary_files() {
+        let final_dir = temp_test_dir("keep-both-bilibili-segments");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(final_dir.join("Episode.m4s"), "old-segment").expect("old segment should write");
+        let staged_m4s = staging_dir.join("Episode.m4s");
+        fs::write(&staged_m4s, "new-segment").expect("m4s segment should write");
+        fs::write(staged_m4s.with_extension("nfo"), "new-nfo").expect("nfo should write");
+        let staged_flv = staging_dir.join("Episode Part 2.flv");
+        fs::write(&staged_flv, "new-flv").expect("flv segment should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV123".to_string(),
+            },
+            existing_videos: Vec::new(),
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged segment files should move");
+
+        let kept_m4s = final_dir.join("Episode (2).m4s");
+        let kept_flv = final_dir.join("Episode Part 2.flv");
+        assert_eq!(moved.len(), 2);
+        assert!(moved.contains(&kept_m4s));
+        assert!(moved.contains(&kept_flv));
+        assert_eq!(
+            fs::read_to_string(kept_m4s).expect("new m4s segment should move"),
+            "new-segment"
+        );
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Episode (2).nfo"))
+                .expect("nfo should follow kept segment basename"),
+            "new-nfo"
+        );
+        assert_eq!(
+            fs::read_to_string(kept_flv).expect("new flv segment should move"),
+            "new-flv"
         );
         let _ = fs::remove_dir_all(final_dir);
     }
@@ -5475,812 +5683,106 @@ mod tests {
     }
 
     #[test]
-    fn builds_bilibili_command() {
+    fn bilibili_jobs_do_not_build_cli_command_specs() {
         let config = test_config();
-        let spec = command_spec(
+        let error = command_spec(
             &config,
             &JobRequest::Bilibili {
                 url: "https://www.bilibili.com/video/BV123".to_string(),
+                selection: None,
             },
         )
-        .expect("Bilibili command should build");
+        .expect_err("Bilibili command spec should not exist");
 
-        assert_eq!(spec.program, PathBuf::from("BBDown"));
-        assert!(spec.args.contains(&"--skip-ai".to_string()));
-        assert!(spec.args.contains(&"--video-ascending".to_string()));
-        assert!(spec.args.contains(&"--skip-mux".to_string()));
-        assert!(
-            spec.args
-                .windows(2)
-                .any(|args| args == ["--multi-thread", "false"])
-        );
-        assert!(spec.args.contains(&"--download-danmaku".to_string()));
-        assert!(!spec.args.contains(&"--cookie".to_string()));
-        assert_eq!(spec.cwd, test_home().join("Movies").join("Downloads"));
+        assert!(error.to_string().contains("bbdown-core crate API"));
     }
 
     #[test]
-    fn builds_bilibili_command_respects_inline_multi_thread_setting() {
-        for inline_arg in ["--multi-thread:true", "-mt:true"] {
-            let mut config = test_config();
-            config.bilibili.extra_args = vec![
-                "--video-ascending".to_string(),
-                "--skip-mux".to_string(),
-                inline_arg.to_string(),
-            ];
-
-            let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
-                .expect("Bilibili command should build");
-
-            assert!(spec.args.contains(&inline_arg.to_string()));
-            assert!(
-                !spec
-                    .args
-                    .windows(2)
-                    .any(|args| args == ["--multi-thread", "false"])
-            );
-        }
-    }
-
-    #[test]
-    fn passes_default_bbdown_config_without_cookie() {
+    fn builds_bilibili_direct_download_options_from_config() {
         let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-default-config-no-cookie");
+        let video_dir = temp_test_dir("bilibili-direct-options");
         config.downloads.video_dir = video_dir.clone();
-        fs::write(
-            video_dir.join("BBDown.config"),
-            "--multi-thread true\n--dfn-priority\n1080P\n",
-        )
-        .expect("default BBDown config should write");
-
-        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
-            .expect("Bilibili command should build");
-
-        let config_path = command_config_path(&spec).expect("config file arg should be present");
-        assert_eq!(config_path, video_dir.join("BBDown.config"));
-        assert!(
-            !spec
-                .args
-                .windows(2)
-                .any(|args| args == ["--multi-thread", "false"])
-        );
-        assert!(spec.cleanup_paths.is_empty());
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn disables_bilibili_danmaku_args_when_disabled() {
-        let mut config = test_config();
+        config.tools.ffmpeg = PathBuf::from("/opt/bin/ffmpeg");
         config.bilibili.danmaku.enabled = false;
-        config
-            .bilibili
-            .extra_args
-            .push("--download-danmaku".to_string());
+        config.bilibili.download_args = vec!["--only".to_string(), "audio".to_string()];
 
-        let spec = command_spec(
-            &config,
-            &JobRequest::Bilibili {
-                url: "https://www.bilibili.com/video/BV123".to_string(),
-            },
+        let options =
+            bilibili_core::download_options(&config).expect("Bilibili direct options should build");
+
+        assert_eq!(options.output_dir, video_dir);
+        assert_eq!(options.mode, DownloadMode::AudioOnly);
+        assert!(!options.include_danmaku);
+        assert!(!options.sidecars.danmaku);
+        assert!(!options.media_hosts.allow_pcdn);
+        assert_eq!(
+            options.download_idle_timeout,
+            Some(Duration::from_secs(config.bot.command_idle_timeout_seconds))
+        );
+        assert!(
+            matches!(options.mux, bbdown_core::MuxOptions::Ffmpeg { ref binary } if binary == &PathBuf::from("/opt/bin/ffmpeg"))
+        );
+    }
+
+    #[test]
+    fn parses_bilibili_plan_and_pushes_episode_identities() {
+        let plan = parse_bilibili_plan(
+            r#"
+            {"title":"Season","entries":[{"index":1,"aid":123,"bvid":"BV123","cid":456,"epid":789,"title":"Episode 1"}]}
+            "#,
         )
-        .expect("Bilibili command should build");
+        .expect("plan JSON should parse");
+        let mut identities = Vec::new();
+        push_bilibili_plan_identities(&mut identities, &plan);
+        let ids = identities
+            .into_iter()
+            .map(|identity| identity.id)
+            .collect::<Vec<_>>();
 
-        let danmaku_index = spec
-            .args
-            .iter()
-            .rposition(|arg| arg == "--download-danmaku")
-            .expect("managed danmaku flag should be present");
-        assert_eq!(spec.args.get(danmaku_index + 1), Some(&"false".to_string()));
+        assert!(ids.contains(&"BV123".to_string()));
+        assert!(ids.contains(&"123".to_string()));
+        assert!(ids.contains(&"av123".to_string()));
+        assert!(ids.contains(&"cid456".to_string()));
+        assert!(ids.contains(&"789".to_string()));
+        assert!(ids.contains(&"ep789".to_string()));
     }
 
     #[test]
-    fn preserves_explicit_bilibili_danmaku_extra_args() {
-        for explicit_args in [
-            vec!["--download-danmaku", "false"],
-            vec!["--download-danmaku=false"],
-            vec!["--download-danmaku:false"],
-        ] {
-            let mut config = test_config();
-            config
-                .bilibili
-                .extra_args
-                .extend(explicit_args.iter().map(|arg| arg.to_string()));
+    fn parses_bilibili_download_report_and_selects_primary_media() {
+        let report = parse_bilibili_download_report(
+            r#"
+            {"title":"Season","output_dir":".","entries":[{"index":1,"title":"Episode 1","directory":"Episode 1","files":[{"kind":"video","path":"Episode 1/video.m4s"},{"kind":"audio","path":"Episode 1/audio.m4s"}],"mux":{"output_path":"Episode 1/Episode 1.mkv"}}]}
+            "#,
+        )
+        .expect("download report JSON should parse");
+        let primary_media = bilibili_report_primary_media(Path::new("/tmp/videos"), &report);
 
-            let spec = command_spec(
-                &config,
-                &JobRequest::Bilibili {
-                    url: "https://www.bilibili.com/video/BV123".to_string(),
-                },
-            )
-            .expect("Bilibili command should build");
-
-            let danmaku_args = spec
-                .args
-                .iter()
-                .filter(|arg| arg.starts_with("--download-danmaku"))
-                .collect::<Vec<_>>();
-            assert_eq!(danmaku_args.len(), 1);
-            assert_eq!(danmaku_args[0], explicit_args[0]);
-            if explicit_args.len() == 2 {
-                let danmaku_index = spec
-                    .args
-                    .iter()
-                    .position(|arg| arg == "--download-danmaku")
-                    .expect("explicit danmaku flag should be present");
-                assert_eq!(spec.args.get(danmaku_index + 1), Some(&"false".to_string()));
-            }
-        }
+        assert_eq!(
+            primary_media,
+            vec![PathBuf::from("/tmp/videos/Episode 1/Episode 1.mkv")]
+        );
     }
 
     #[test]
-    fn preserves_explicit_bilibili_danmaku_after_base_config() {
+    fn audio_only_downloads_use_audio_primary_media_detection() {
         let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-explicit-danmaku-after-config");
-        config.downloads.video_dir = video_dir.clone();
-        config
-            .bilibili
-            .extra_args
-            .extend(["--download-danmaku".to_string(), "false".to_string()]);
-        fs::write(video_dir.join("BBDown.config"), "--download-danmaku true\n")
-            .expect("default BBDown config should write");
+        config.bilibili.download_args = vec!["--only".to_string(), "audio".to_string()];
+        assert!(bilibili_downloads_audio_only(&config).expect("audio-only check should not fail"));
 
-        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
-            .expect("Bilibili command should build");
+        let mut legacy_config = test_config();
+        legacy_config.bilibili.extra_args = vec!["--audio-only".to_string()];
+        assert!(
+            bilibili_downloads_audio_only(&legacy_config)
+                .expect("legacy audio-only check should not fail")
+        );
 
-        let config_index = spec
-            .args
-            .iter()
-            .rposition(|arg| arg == "--config-file")
-            .expect("config file arg should be present");
-        let danmaku_index = spec
-            .args
-            .iter()
-            .rposition(|arg| arg == "--download-danmaku")
-            .expect("danmaku arg should be present");
-        assert!(danmaku_index > config_index + 1);
-        assert_eq!(spec.args.get(danmaku_index + 1), Some(&"false".to_string()));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn builds_bilibili_command_with_cookie() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-cookie-command");
-        let path = std::env::temp_dir().join(format!(
-            "telegram-video-downloader-bilibili-cookie-{}.json",
-            std::process::id()
+        assert!(has_bilibili_only_value(
+            &["--only=audio".to_string()],
+            "audio"
         ));
-        config.bilibili.auth.state_path = path.clone();
-        config.downloads.video_dir = video_dir.clone();
-        save_auth_state(
-            &path,
-            &AuthState {
-                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
-                mid: 123,
-                uname: "Joey".to_string(),
-                stored_at_unix: 1,
-            },
-        )
-        .expect("auth state should save");
-
-        let spec = command_spec(
-            &config,
-            &JobRequest::Bilibili {
-                url: "https://www.bilibili.com/video/BV123".to_string(),
-            },
-        )
-        .expect("Bilibili command should build");
-
-        assert!(!spec.args.contains(&"--cookie".to_string()));
-        assert!(
-            !spec
-                .args
-                .contains(&"SESSDATA=secret; bili_jct=csrf".to_string())
-        );
-        let config_index = spec
-            .args
-            .iter()
-            .position(|arg| arg == "--config-file")
-            .expect("config file arg should be present");
-        let config_path = PathBuf::from(
-            spec.args
-                .get(config_index + 1)
-                .expect("config file path should be present"),
-        );
-        let config_content =
-            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
-        assert_eq!(config_content, "--cookie\nSESSDATA=secret; bili_jct=csrf\n");
-        assert_eq!(spec.cleanup_paths, vec![config_path.clone()]);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&config_path)
-                .expect("BBDown auth config metadata should exist")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o600);
-        }
-        let _ = std::fs::remove_file(path);
-        bilibili_auth::release_bbdown_config_file(&config_path);
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn bilibili_danmaku_arg_overrides_managed_cookie_config() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-cookie-danmaku-priority");
-        let path = video_dir.join("bilibili-auth.json");
-        config.bilibili.auth.state_path = path.clone();
-        config.downloads.video_dir = video_dir.clone();
-        fs::write(
-            video_dir.join("BBDown.config"),
-            "--download-danmaku false\n",
-        )
-        .expect("default BBDown config should write");
-        save_auth_state(
-            &path,
-            &AuthState {
-                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
-                mid: 123,
-                uname: "Joey".to_string(),
-                stored_at_unix: 1,
-            },
-        )
-        .expect("auth state should save");
-
-        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
-            .expect("Bilibili command should build");
-
-        let config_index = spec
-            .args
-            .iter()
-            .rposition(|arg| arg == "--config-file")
-            .expect("config file arg should be present");
-        let danmaku_index = spec
-            .args
-            .iter()
-            .rposition(|arg| arg == "--download-danmaku")
-            .expect("danmaku arg should be present");
-        assert!(
-            danmaku_index > config_index + 1,
-            "CLI danmaku arg should be after managed config file path"
-        );
-        let config_path = PathBuf::from(
-            spec.args
-                .get(config_index + 1)
-                .expect("config file path should be present"),
-        );
-        let config_content =
-            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
-        assert!(config_content.contains("--download-danmaku false"));
-
-        bilibili_auth::release_bbdown_config_file(&config_path);
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn bilibili_metadata_probe_filters_default_config_side_effects() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-metadata-cookie-config");
-        let path = video_dir.join("bilibili-auth.json");
-        config.bilibili.auth.state_path = path.clone();
-        config.downloads.video_dir = video_dir.clone();
-        fs::create_dir_all(&video_dir).expect("video dir should create");
-        fs::write(
-            video_dir.join("BBDown.config"),
-            "--save-archives-to-file\n--dfn-priority\n1080P\n",
-        )
-        .expect("default BBDown config should write");
-        save_auth_state(
-            &path,
-            &AuthState {
-                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
-                mid: 123,
-                uname: "Joey".to_string(),
-                stored_at_unix: 1,
-            },
-        )
-        .expect("auth state should save");
-
-        let spec = bilibili_metadata_command_spec(&config, "https://b23.tv/Jt1mZiL")
-            .expect("Bilibili metadata command should build");
-
-        let config_index = spec
-            .args
-            .iter()
-            .position(|arg| arg == "--config-file")
-            .expect("config file arg should be present");
-        let config_path = PathBuf::from(
-            spec.args
-                .get(config_index + 1)
-                .expect("config file path should be present"),
-        );
-        let config_content =
-            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
-        assert_eq!(
-            config_content,
-            "--dfn-priority\n1080P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
-        );
-        assert!(!spec.args.contains(&"--save-archives-to-file".to_string()));
-        assert_eq!(spec.cleanup_paths, vec![config_path.clone()]);
-
-        bilibili_auth::release_bbdown_config_file(&config_path);
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn bilibili_metadata_probe_preserves_explicit_config_and_safe_extra_args() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-metadata-explicit-config");
-        let explicit_config = video_dir.join("custom.config");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.auth.state_path = video_dir.join("missing-auth.json");
-        config.bilibili.extra_args = vec![
-            "--config-file".to_string(),
-            "custom.config".to_string(),
-            "--http-proxy".to_string(),
-            "http://127.0.0.1:8080".to_string(),
-            "--skip-mux".to_string(),
-        ];
-        fs::create_dir_all(&video_dir).expect("video dir should create");
-        fs::write(
-            &explicit_config,
-            "--cookie\nDedeUserID=123; SESSDATA=abc\n--save-archives-to-file true\n--dfn-priority\n1080P\n",
-        )
-        .expect("explicit BBDown config should write");
-
-        let spec = bilibili_metadata_command_spec(&config, "https://b23.tv/Jt1mZiL")
-            .expect("Bilibili metadata command should build");
-
-        assert!(spec.args.windows(2).any(|args| {
-            args == [
-                "--http-proxy".to_string(),
-                "http://127.0.0.1:8080".to_string(),
-            ]
-        }));
-        assert!(!spec.args.contains(&"--skip-mux".to_string()));
-        assert!(!spec.args.contains(&"custom.config".to_string()));
-        let config_path = command_config_path(&spec).expect("config file arg should be present");
-        let config_content =
-            fs::read_to_string(&config_path).expect("BBDown probe config should exist");
-        assert!(config_content.contains("--cookie\nDedeUserID=123; SESSDATA=abc\n"));
-        assert!(config_content.contains("--dfn-priority\n1080P\n"));
-        assert!(!config_content.contains("--save-archives-to-file"));
-
-        bilibili_auth::release_bbdown_config_file(&config_path);
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn merges_default_bbdown_config_when_cookie_is_present() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-default-config");
-        let path = video_dir.join("bilibili-auth.json");
-        config.bilibili.auth.state_path = path.clone();
-        config.downloads.video_dir = video_dir.clone();
-        fs::write(video_dir.join("BBDown.config"), "--dfn-priority\n1080P\n")
-            .expect("default BBDown config should write");
-        save_auth_state(
-            &path,
-            &AuthState {
-                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
-                mid: 123,
-                uname: "Joey".to_string(),
-                stored_at_unix: 1,
-            },
-        )
-        .expect("auth state should save");
-
-        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
-            .expect("Bilibili command should build");
-
-        let config_path = command_config_path(&spec).expect("config file arg should be present");
-        let config_content =
-            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
-        assert_eq!(
-            config_content,
-            "--dfn-priority\n1080P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
-        );
-
-        bilibili_auth::release_bbdown_config_file(&config_path);
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn keeps_bbdown_config_multi_thread_setting_when_cookie_is_present() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-default-config-multi-thread");
-        let path = video_dir.join("bilibili-auth.json");
-        config.bilibili.auth.state_path = path.clone();
-        config.downloads.video_dir = video_dir.clone();
-        fs::write(
-            video_dir.join("BBDown.config"),
-            "--multi-thread true\n--dfn-priority\n1080P\n",
-        )
-        .expect("default BBDown config should write");
-        save_auth_state(
-            &path,
-            &AuthState {
-                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
-                mid: 123,
-                uname: "Joey".to_string(),
-                stored_at_unix: 1,
-            },
-        )
-        .expect("auth state should save");
-
-        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
-            .expect("Bilibili command should build");
-
-        assert!(
-            !spec
-                .args
-                .windows(2)
-                .any(|args| args == ["--multi-thread", "false"])
-        );
-        let config_path = command_config_path(&spec).expect("config file arg should be present");
-        let config_content =
-            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
-        assert_eq!(
-            config_content,
-            "--multi-thread true\n--dfn-priority\n1080P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
-        );
-
-        bilibili_auth::release_bbdown_config_file(&config_path);
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn merges_explicit_bbdown_config_and_filters_duplicate_config_arg() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-explicit-config");
-        let path = video_dir.join("bilibili-auth.json");
-        let explicit_config = video_dir.join("custom.config");
-        config.bilibili.auth.state_path = path.clone();
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec![
-            "--config-file".to_string(),
-            "custom.config".to_string(),
-            "--skip-cover".to_string(),
-        ];
-        fs::write(&explicit_config, "--dfn-priority\n720P")
-            .expect("explicit BBDown config should write");
-        save_auth_state(
-            &path,
-            &AuthState {
-                cookie: "SESSDATA=secret; bili_jct=csrf".to_string(),
-                mid: 123,
-                uname: "Joey".to_string(),
-                stored_at_unix: 1,
-            },
-        )
-        .expect("auth state should save");
-
-        let spec = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
-            .expect("Bilibili command should build");
-
-        assert_eq!(
-            spec.args
-                .iter()
-                .filter(|arg| *arg == "--config-file")
-                .count(),
-            1
-        );
-        assert!(spec.args.contains(&"--skip-cover".to_string()));
-        assert!(!spec.args.contains(&"custom.config".to_string()));
-        let config_path = command_config_path(&spec).expect("config file arg should be present");
-        let config_content =
-            fs::read_to_string(&config_path).expect("BBDown auth config should exist");
-        assert_eq!(
-            config_content,
-            "--dfn-priority\n720P\n--cookie\nSESSDATA=secret; bili_jct=csrf\n"
-        );
-
-        bilibili_auth::release_bbdown_config_file(&config_path);
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn fails_bilibili_command_on_missing_explicit_bbdown_config() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-missing-explicit-config-command");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec![
-            "--config-file".to_string(),
-            "missing.config".to_string(),
-            "--skip-cover".to_string(),
-        ];
-
-        let error = bilibili_command_spec(&config, "https://www.bilibili.com/video/BV123")
-            .expect_err("missing explicit BBDown config should fail");
-        let message = format!("{error:#}");
-
-        assert!(message.contains("failed to read BBDown config"));
-        assert!(message.contains("missing.config"));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn staging_preserves_relative_explicit_bbdown_config_path() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-staging-explicit-config");
-        let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
-        fs::create_dir_all(&staging_dir).expect("staging dir should create");
-        fs::write(video_dir.join("custom.config"), "--skip-cover\n")
-            .expect("explicit BBDown config should write");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec![
-            "--config-file".to_string(),
-            "custom.config".to_string(),
-            "--skip-cover".to_string(),
-        ];
-
-        let mut staging_config = config.clone();
-        staging_config.downloads.video_dir = staging_dir.clone();
-        preserve_bilibili_config_paths_for_staging(&mut staging_config, &video_dir);
-        let spec = bilibili_command_spec(&staging_config, "https://www.bilibili.com/video/BV123")
-            .expect("Bilibili command should build");
-
-        let config_path = command_config_path(&spec).expect("config file arg should be preserved");
-        assert_eq!(config_path, video_dir.join("custom.config"));
-        assert_eq!(spec.cwd, staging_dir);
-        assert!(spec.args.contains(&"--skip-cover".to_string()));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn staging_absolutizes_relative_download_dir_config_path() {
-        let mut config = test_config();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time should be after UNIX_EPOCH")
-            .as_nanos();
-        let video_dir = PathBuf::from(format!(
-            "downloads-bilibili-staging-explicit-config-{}-{nanos}",
-            std::process::id()
+        assert!(!has_bilibili_only_value(
+            &["--only".to_string(), "video".to_string()],
+            "audio"
         ));
-        let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
-        fs::create_dir_all(&video_dir).expect("relative video dir should create");
-        fs::write(video_dir.join("custom.config"), "--skip-cover\n")
-            .expect("explicit BBDown config should write");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec![
-            "--config-file".to_string(),
-            "custom.config".to_string(),
-            "--skip-cover".to_string(),
-        ];
-
-        let mut staging_config = config.clone();
-        staging_config.downloads.video_dir = staging_dir.clone();
-        preserve_bilibili_config_paths_for_staging(&mut staging_config, &video_dir);
-        let spec = bilibili_command_spec(&staging_config, "https://www.bilibili.com/video/BV123")
-            .expect("Bilibili command should build");
-
-        let config_path = command_config_path(&spec).expect("config file arg should be preserved");
-        assert!(config_path.is_absolute());
-        assert_eq!(
-            config_path,
-            std::env::current_dir()
-                .expect("current dir should be available")
-                .join(&video_dir)
-                .join("custom.config")
-        );
-        assert_eq!(spec.cwd, staging_dir);
-        assert!(spec.args.contains(&"--skip-cover".to_string()));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn staging_preserves_relative_equals_bbdown_config_path() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-staging-equals-config");
-        let staging_dir = video_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
-        fs::create_dir_all(&staging_dir).expect("staging dir should create");
-        fs::write(video_dir.join("custom.config"), "--skip-cover\n")
-            .expect("explicit BBDown config should write");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec![
-            "--config-file=custom.config".to_string(),
-            "--skip-cover".to_string(),
-        ];
-
-        let mut staging_config = config.clone();
-        staging_config.downloads.video_dir = staging_dir.clone();
-        preserve_bilibili_config_paths_for_staging(&mut staging_config, &video_dir);
-        let spec = bilibili_command_spec(&staging_config, "https://www.bilibili.com/video/BV123")
-            .expect("Bilibili command should build");
-
-        let config_arg = spec
-            .args
-            .iter()
-            .find(|arg| arg.starts_with("--config-file="))
-            .expect("config file arg should be preserved");
-        assert_eq!(
-            config_arg,
-            &format!(
-                "--config-file={}",
-                video_dir.join("custom.config").display()
-            )
-        );
-        assert_eq!(spec.cwd, staging_dir);
-        assert!(spec.args.contains(&"--skip-cover".to_string()));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn reads_effective_bilibili_flags_from_default_config() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-effective-default-config");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec!["--video-ascending".to_string()];
-        fs::write(
-            video_dir.join("BBDown.config"),
-            "--skip-mux\n--video-only\n",
-        )
-        .expect("default BBDown config should write");
-
-        let args = bilibili_effective_args(&config).expect("effective args should read");
-
-        assert!(has_bilibili_flag(&args, "--skip-mux"));
-        assert!(has_bilibili_flag(&args, "--video-only"));
-        assert!(has_bilibili_flag(&args, "--video-ascending"));
-        assert!(
-            args.windows(2)
-                .any(|args| args == ["--multi-thread", "false"])
-        );
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn reads_effective_bilibili_flags_respects_config_multi_thread() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-effective-config-multi-thread");
-        config.downloads.video_dir = video_dir.clone();
-        fs::write(
-            video_dir.join("BBDown.config"),
-            "--multi-thread true\n--skip-mux\n",
-        )
-        .expect("default BBDown config should write");
-
-        let args = bilibili_effective_args(&config).expect("effective args should read");
-
-        assert!(
-            args.windows(2)
-                .any(|args| args == ["--multi-thread", "true"])
-        );
-        assert!(
-            !args
-                .windows(2)
-                .any(|args| args == ["--multi-thread", "false"])
-        );
-        assert!(has_bilibili_flag(&args, "--skip-mux"));
-        assert!(has_bilibili_flag(&args, "--video-ascending"));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn reads_effective_bilibili_flags_respects_short_config_multi_thread() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-effective-short-config-multi-thread");
-        config.downloads.video_dir = video_dir.clone();
-        fs::write(video_dir.join("BBDown.config"), "-mt true\n--skip-mux\n")
-            .expect("default BBDown config should write");
-
-        let args = bilibili_effective_args(&config).expect("effective args should read");
-
-        assert!(args.windows(2).any(|args| args == ["-mt", "true"]));
-        assert!(
-            !args
-                .windows(2)
-                .any(|args| args == ["--multi-thread", "false"])
-        );
-        assert!(has_bilibili_flag(&args, "--skip-mux"));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn reads_effective_bilibili_flags_respects_inline_config_multi_thread() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-effective-inline-config-multi-thread");
-        config.downloads.video_dir = video_dir.clone();
-        fs::write(
-            video_dir.join("BBDown.config"),
-            "--multi-thread:true\n--skip-mux\n",
-        )
-        .expect("default BBDown config should write");
-
-        let args = bilibili_effective_args(&config).expect("effective args should read");
-
-        assert!(args.iter().any(|arg| arg == "--multi-thread:true"));
-        assert!(
-            !args
-                .windows(2)
-                .any(|args| args == ["--multi-thread", "false"])
-        );
-        assert!(has_bilibili_flag(&args, "--skip-mux"));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn reads_effective_bilibili_flags_respects_false_bool_config_values() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-effective-false-bool-config");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec!["--video-ascending".to_string()];
-        fs::write(
-            video_dir.join("BBDown.config"),
-            "--skip-mux false\n--audio-only=false\n--video-only:false\n",
-        )
-        .expect("default BBDown config should write");
-
-        let args = bilibili_effective_args(&config).expect("effective args should read");
-
-        assert!(!bilibili_needs_mux(&args));
-        assert!(!has_bilibili_flag(&args, "--audio-only"));
-        assert!(!has_bilibili_flag(&args, "--video-only"));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn reads_effective_bilibili_flags_from_explicit_config() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-effective-explicit-config");
-        let explicit_config = video_dir.join("custom.config");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec![
-            "--config-file=custom.config".to_string(),
-            "--video-ascending".to_string(),
-        ];
-        fs::write(&explicit_config, "# comment\n--skip-mux\n--video-only\n")
-            .expect("explicit BBDown config should write");
-
-        let args = bilibili_effective_args(&config).expect("effective args should read");
-
-        assert!(has_bilibili_flag(&args, "--skip-mux"));
-        assert!(has_bilibili_flag(&args, "--video-only"));
-        assert!(has_bilibili_flag(&args, "--video-ascending"));
-        assert!(!args.iter().any(|arg| arg == "--config-file=custom.config"));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn reads_effective_bilibili_flags_fails_on_missing_explicit_config() {
-        let mut config = test_config();
-        let video_dir = temp_test_dir("bilibili-effective-missing-explicit-config");
-        config.downloads.video_dir = video_dir.clone();
-        config.bilibili.extra_args = vec![
-            "--config-file=missing.config".to_string(),
-            "--video-ascending".to_string(),
-        ];
-
-        let error =
-            bilibili_effective_args(&config).expect_err("missing explicit config should fail");
-        let message = format!("{error:#}");
-
-        assert!(message.contains("failed to read BBDown config"));
-        assert!(message.contains("missing.config"));
-        let _ = fs::remove_dir_all(video_dir);
-    }
-
-    #[test]
-    fn audio_only_disables_bilibili_mux_postprocessing() {
-        assert!(bilibili_needs_mux(&["--skip-mux".to_string()]));
-        assert!(!bilibili_needs_mux(&[
-            "--skip-mux".to_string(),
-            "--audio-only".to_string(),
-        ]));
-        assert!(!bilibili_needs_mux(&[
-            "--skip-mux".to_string(),
-            "false".to_string(),
-        ]));
-        assert!(!bilibili_needs_mux(&["--skip-mux=false".to_string()]));
-        assert!(bilibili_needs_mux(&["--skip-mux:true".to_string()]));
-        assert!(!bilibili_needs_mux(&[
-            "--skip-mux:true".to_string(),
-            "--skip-mux".to_string(),
-            "false".to_string(),
-        ]));
     }
 
     #[test]
@@ -6540,6 +6042,7 @@ mod tests {
             &config,
             &JobRequest::Bilibili {
                 url: "https://b23.tv/Jt1mZiL".to_string(),
+                selection: None,
             },
             identities,
         )

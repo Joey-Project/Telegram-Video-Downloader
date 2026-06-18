@@ -1,4 +1,5 @@
 mod bilibili_auth;
+mod bilibili_core;
 mod config;
 mod downloader;
 mod router;
@@ -14,7 +15,10 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use reqwest::Client;
+use bbdown_core::{
+    AccessKeyLoginTicket, CredentialHealthReport, CredentialHealthScope, CredentialHealthStatus,
+    CredentialKind, CredentialSource, QrLoginKind, QrLoginState,
+};
 use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio::time::{Instant, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
@@ -24,7 +28,10 @@ use crate::downloader::{
     JobProgress, VideoDuplicate, VideoDuplicateAction, find_video_duplicate_with_probe, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both,
 };
-use crate::router::{BilibiliAuthCommand, JobRequest, RouteResult, route_message};
+use crate::router::{
+    BilibiliAuthCommand, BilibiliAuthLoginMode, BilibiliSelection, JobRequest, RouteResult,
+    route_message,
+};
 use crate::telegram::{
     BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient,
 };
@@ -34,10 +41,18 @@ static BILIBILI_LOGIN_CANCEL_NOTIFY: OnceLock<Notify> = OnceLock::new();
 static BILIBILI_AUTH_STATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static BILIBILI_AUTH_GENERATION: AtomicU64 = AtomicU64::new(0);
 static PENDING_DUPLICATE_JOBS: OnceLock<Mutex<HashMap<u64, PendingDuplicateJob>>> = OnceLock::new();
+static PENDING_BILIBILI_SELECTION_JOBS: OnceLock<Mutex<HashMap<u64, PendingBilibiliSelectionJob>>> =
+    OnceLock::new();
+static PENDING_BILIBILI_ACCESS_KEY_LOGINS: OnceLock<
+    Mutex<HashMap<i64, PendingBilibiliAccessKeyLogin>>,
+> = OnceLock::new();
 static DUPLICATE_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
-const BILIBILI_AUTH_MAX_HTTP_TIMEOUT_SECONDS: u64 = 30;
+static BILIBILI_SELECTION_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 const DUPLICATE_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_PENDING_DUPLICATE_JOBS: usize = 256;
+const BILIBILI_SELECTION_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_PENDING_BILIBILI_SELECTION_JOBS: usize = 256;
+const BILIBILI_ACCESS_KEY_LOGIN_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone)]
 struct PendingDuplicateJob {
@@ -45,6 +60,21 @@ struct PendingDuplicateJob {
     job_id: u64,
     job: JobRequest,
     duplicate: VideoDuplicate,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBilibiliSelectionJob {
+    chat_id: i64,
+    job_id: u64,
+    job: JobRequest,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBilibiliAccessKeyLogin {
+    auth_generation: u64,
+    ticket: AccessKeyLoginTicket,
     created_at: Instant,
 }
 
@@ -146,7 +176,7 @@ async fn main() -> Result<()> {
                                 handle_callback_query(
                                     telegram.clone(),
                                     Arc::clone(&config),
-                                    Arc::clone(&job_dispatch.download_semaphore),
+                                    job_dispatch.clone(),
                                     callback_query,
                                 )
                                 .await;
@@ -179,6 +209,14 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
             for (index, job) in jobs.iter().enumerate() {
                 let job_id = index + 1;
                 println!("Queued replay job #{job_id}: {}", job.label());
+                if job.requires_bilibili_selection() {
+                    println!(
+                        "Failed replay job #{job_id}: {}\nBilibili ss/md links require a Telegram selection prompt.",
+                        job.label()
+                    );
+                    failed_jobs.push(format!("#{job_id} {}", job.label()));
+                    continue;
+                }
                 println!("Started replay job #{job_id}: {}", job.label());
                 let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<JobProgress>();
                 let progress_handle = tokio::spawn(async move {
@@ -248,6 +286,18 @@ async fn handle_message(
 
     if !config.telegram.is_chat_allowed(chat_id) {
         warn!(chat_id, "ignoring message from unauthorized chat");
+        return;
+    }
+
+    if is_private_chat
+        && maybe_complete_pending_bilibili_access_key_login(
+            telegram.clone(),
+            Arc::clone(&config),
+            chat_id,
+            text,
+        )
+        .await
+    {
         return;
     }
 
@@ -327,9 +377,9 @@ fn help_message() -> String {
         "Commands:",
         "/help - Show this help.",
         "/pdf URL - Save a webpage as PDF.",
-        "/bbdown login - Log in to Bilibili for BBDown downloads.",
-        "/bbdown status - Show the saved BBDown login account.",
-        "/bbdown logout - Clear the local BBDown login state.",
+        "/bbdown login [web|tv|access-key] - Log in to Bilibili for BBDown downloads.",
+        "/bbdown status - Check saved BBDown credentials.",
+        "/bbdown logout - Clear the local BBDown credential state.",
     ]
     .join("\n")
 }
@@ -352,7 +402,17 @@ async fn handle_bilibili_auth_command(
     }
 
     match command {
-        BilibiliAuthCommand::Login => {
+        BilibiliAuthCommand::Login(mode) => {
+            if has_pending_bilibili_access_key_login().await {
+                send_or_log(
+                    &telegram,
+                    chat_id,
+                    "BBDown login is already waiting for an access-key callback. Send the callback message, or use /bbdown logout to cancel."
+                        .to_string(),
+                )
+                .await;
+                return;
+            }
             let lock = BILIBILI_LOGIN_LOCK.get_or_init(|| Mutex::new(()));
             let guard = match lock.try_lock() {
                 Ok(guard) => guard,
@@ -369,7 +429,7 @@ async fn handle_bilibili_auth_command(
             let auth_generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
             tokio::spawn(async move {
                 let _guard = guard;
-                run_bbdown_login(telegram, config, chat_id, auth_generation).await;
+                run_bbdown_login(telegram, config, chat_id, auth_generation, mode).await;
             });
         }
         BilibiliAuthCommand::Status => {
@@ -388,110 +448,259 @@ async fn run_bbdown_login(
     config: Arc<AppConfig>,
     chat_id: i64,
     auth_generation: u64,
+    mode: BilibiliAuthLoginMode,
+) {
+    let preparing = match mode {
+        BilibiliAuthLoginMode::Web => "Preparing BBDown Web QR login...",
+        BilibiliAuthLoginMode::Tv => "Preparing BBDown TV QR login...",
+        BilibiliAuthLoginMode::AccessKey => "Preparing BBDown access-key authorization...",
+    };
+    send_or_log(&telegram, chat_id, preparing.to_string()).await;
+
+    let result = match mode {
+        BilibiliAuthLoginMode::Web | BilibiliAuthLoginMode::Tv => {
+            run_bbdown_qr_login(&telegram, &config, chat_id, auth_generation, mode)
+                .await
+                .map(BbdownLoginOutcome::Saved)
+        }
+        BilibiliAuthLoginMode::AccessKey => {
+            start_bbdown_access_key_login(&telegram, &config, chat_id, auth_generation)
+                .await
+                .map(|()| BbdownLoginOutcome::PendingAccessKey)
+        }
+    };
+
+    match result {
+        Ok(BbdownLoginOutcome::Saved(summary)) => {
+            send_or_log(
+                &telegram,
+                chat_id,
+                format!(
+                    "BBDown {} login saved.\n{}",
+                    bbdown_login_mode_label(mode),
+                    format_bbdown_credential_summary(&summary)
+                ),
+            )
+            .await;
+        }
+        Ok(BbdownLoginOutcome::PendingAccessKey) => {}
+        Err(err) => {
+            send_or_log(
+                &telegram,
+                chat_id,
+                format!(
+                    "BBDown {} login failed:\n{}",
+                    bbdown_login_mode_label(mode),
+                    summarize_bbdown_auth_error(&err)
+                ),
+            )
+            .await;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BbdownLoginOutcome {
+    Saved(CredentialSource),
+    PendingAccessKey,
+}
+
+async fn run_bbdown_qr_login(
+    telegram: &TelegramClient,
+    config: &AppConfig,
+    chat_id: i64,
+    auth_generation: u64,
+    mode: BilibiliAuthLoginMode,
+) -> Result<CredentialSource> {
+    let client = bilibili_core::anonymous_client(config)?;
+    let ticket = match mode {
+        BilibiliAuthLoginMode::Web => client.create_web_qr_login().await?,
+        BilibiliAuthLoginMode::Tv => client.create_tv_qr_login().await?,
+        BilibiliAuthLoginMode::AccessKey => bail!("access-key login is not a QR polling command"),
+    };
+    let output = ticket.output();
+    send_bbdown_auth_ticket(
+        telegram,
+        chat_id,
+        mode,
+        &output.url,
+        &output.qr_payload,
+        config.bilibili.auth.login_timeout_seconds,
+    )
+    .await?;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(
+            config.bilibili.auth.login_timeout_seconds,
+        ))
+        .ok_or_else(|| anyhow::anyhow!("BBDown login timeout is too large"))?;
+    let interval = Duration::from_secs(config.bilibili.auth.poll_interval_seconds);
+    let cancel = bbdown_login_cancel_notify().notified();
+    tokio::pin!(cancel);
+    let mut last_waiting_state: Option<&'static str> = None;
+
+    loop {
+        ensure_bbdown_login_active(auth_generation)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| {
+                anyhow::anyhow!("BBDown {} login timed out", bbdown_login_mode_label(mode))
+            })?;
+        tokio::select! {
+            () = &mut cancel => {
+                bail!("BBDown login was canceled by a later /bbdown logout");
+            }
+            state = poll_bbdown_qr_login(&client, &ticket, remaining) => {
+                match state? {
+                    QrLoginState::WaitingForScan => {
+                        last_waiting_state = Some("waiting_for_scan");
+                    }
+                    QrLoginState::WaitingForConfirm => {
+                        if last_waiting_state != Some("waiting_for_confirm") {
+                            send_or_log(
+                                telegram,
+                                chat_id,
+                                "BBDown QR scanned; confirm the login in the Bilibili app.".to_string(),
+                            )
+                            .await;
+                        }
+                        last_waiting_state = Some("waiting_for_confirm");
+                    }
+                    QrLoginState::Expired => bail!("BBDown QR code expired"),
+                    QrLoginState::Succeeded { credentials } => {
+                        ensure_bbdown_login_active(auth_generation)?;
+                        return bilibili_core::credential_runtime(config)?.save_merged(credentials);
+                    }
+                }
+            }
+        }
+        let now = Instant::now();
+        let sleep_duration = deadline
+            .checked_duration_since(now)
+            .map_or(Duration::ZERO, |remaining| remaining.min(interval));
+        if !sleep_duration.is_zero() {
+            sleep(sleep_duration).await;
+        }
+    }
+}
+
+async fn start_bbdown_access_key_login(
+    telegram: &TelegramClient,
+    config: &AppConfig,
+    chat_id: i64,
+    auth_generation: u64,
+) -> Result<()> {
+    let ticket = bilibili_core::create_access_key_ticket()?;
+    let output = ticket.output();
+    send_bbdown_auth_ticket(
+        telegram,
+        chat_id,
+        BilibiliAuthLoginMode::AccessKey,
+        &output.url,
+        &output.qr_payload,
+        config.bilibili.auth.login_timeout_seconds,
+    )
+    .await?;
+    {
+        let mut logins = pending_bilibili_access_key_logins().lock().await;
+        prune_expired_pending_bilibili_access_key_logins(&mut logins, Instant::now());
+        logins.insert(
+            chat_id,
+            PendingBilibiliAccessKeyLogin {
+                auth_generation,
+                ticket,
+                created_at: Instant::now(),
+            },
+        );
+    }
+    send_or_log(
+        telegram,
+        chat_id,
+        "After authorizing, send the callback URL or balh-login-credentials message to this private chat. Use /bbdown logout to cancel."
+            .to_string(),
+    )
+    .await;
+    Ok(())
+}
+
+async fn maybe_complete_pending_bilibili_access_key_login(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    chat_id: i64,
+    text: &str,
+) -> bool {
+    if text.trim_start().starts_with('/') {
+        return false;
+    }
+    let pending = {
+        let mut logins = pending_bilibili_access_key_logins().lock().await;
+        prune_expired_pending_bilibili_access_key_logins(&mut logins, Instant::now());
+        logins.remove(&chat_id)
+    };
+    let Some(pending) = pending else {
+        return false;
+    };
+    let input = text.to_string();
+    tokio::spawn(async move {
+        complete_bbdown_access_key_login(telegram, config, chat_id, pending, input).await;
+    });
+    true
+}
+
+async fn complete_bbdown_access_key_login(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    chat_id: i64,
+    pending: PendingBilibiliAccessKeyLogin,
+    input: String,
 ) {
     send_or_log(
         &telegram,
         chat_id,
-        "Preparing BBDown Bilibili login QR...".to_string(),
+        "Completing BBDown access-key login...".to_string(),
     )
     .await;
-
-    let result = bbdown_login_flow(&telegram, &config, chat_id, auth_generation).await;
+    let result = complete_bbdown_access_key_login_inner(&config, &pending, &input).await;
     let message = match result {
-        Ok(state) => format!("BBDown logged in as {} (mid: {}).", state.uname, state.mid),
+        Ok(summary) => format!(
+            "BBDown access-key login saved.\n{}",
+            format_bbdown_credential_summary(&summary)
+        ),
         Err(err) => format!(
-            "BBDown login failed:\n{}",
+            "BBDown access-key login failed:\n{}",
             summarize_bbdown_auth_error(&err)
         ),
     };
     send_or_log(&telegram, chat_id, message).await;
 }
 
-async fn bbdown_login_flow(
-    telegram: &TelegramClient,
+async fn complete_bbdown_access_key_login_inner(
     config: &AppConfig,
-    chat_id: i64,
-    auth_generation: u64,
-) -> Result<bilibili_auth::AuthState> {
-    let client = bbdown_auth_client(config)?;
-    let login_qr =
-        await_bbdown_login_active(auth_generation, bilibili_auth::generate_login_qr(&client))
-            .await??;
-    ensure_bbdown_login_active(auth_generation)?;
-    let caption = format!(
-        "Scan this Bilibili QR code in the app to authorize BBDown. It expires in {} seconds.",
-        config.bilibili.auth.login_timeout_seconds
-    );
-    let send_photo_result = await_bbdown_login_active(
-        auth_generation,
-        telegram.send_photo(chat_id, caption, login_qr.png.clone()),
-    )
-    .await?;
-    if let Err(err) = send_photo_result {
-        warn!(chat_id, error = %err, "failed to send BBDown login QR image");
-        send_or_log(telegram, chat_id, bbdown_qr_photo_failed_message()).await;
-        bail!("failed to send Bilibili login QR image");
-    }
-    ensure_bbdown_login_active(auth_generation)?;
-
-    let deadline = Instant::now() + Duration::from_secs(config.bilibili.auth.login_timeout_seconds);
-    let poll_interval = Duration::from_secs(config.bilibili.auth.poll_interval_seconds);
-    let mut sent_scanned_notice = false;
-
-    loop {
-        if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != auth_generation {
-            bail!("BBDown login was canceled by a later /bbdown logout");
-        }
-        if Instant::now() >= deadline {
-            bail!("Bilibili login QR timed out");
-        }
-
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let poll = await_bbdown_login_active(
-            auth_generation,
-            tokio_timeout(
-                remaining,
-                bilibili_auth::poll_login(&client, &login_qr.qrcode_key),
-            ),
-        )
-        .await?
-        .context("Bilibili login QR timed out")??;
-
-        match poll {
-            bilibili_auth::LoginPoll::Waiting => {}
-            bilibili_auth::LoginPoll::Scanned => {
-                if !sent_scanned_notice {
-                    sent_scanned_notice = true;
-                    ensure_bbdown_login_active(auth_generation)?;
-                    send_or_log(
-                        telegram,
-                        chat_id,
-                        "QR scanned. Confirm the login in the Bilibili app.".to_string(),
-                    )
-                    .await;
-                }
-            }
-            bilibili_auth::LoginPoll::Expired => bail!("Bilibili login QR expired"),
-            bilibili_auth::LoginPoll::Success { cookie } => {
-                let state = bilibili_auth::verify_cookie(&client, &cookie).await?;
-                let _state_guard = bbdown_auth_state_lock().lock().await;
-                if BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst) != auth_generation {
-                    bail!("BBDown login was canceled by a later /bbdown logout");
-                }
-                bilibili_auth::save_auth_state(&config.bilibili.auth.state_path, &state)?;
-                return Ok(state);
-            }
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            bail!("Bilibili login QR timed out");
-        }
-        await_bbdown_login_active(auth_generation, sleep(poll_interval.min(deadline - now)))
-            .await?;
-    }
+    pending: &PendingBilibiliAccessKeyLogin,
+    input: &str,
+) -> Result<CredentialSource> {
+    ensure_bbdown_login_active(pending.auth_generation)?;
+    let summary = bilibili_core::complete_access_key_login(config, &pending.ticket, input)?;
+    ensure_bbdown_login_active(pending.auth_generation)?;
+    Ok(summary)
 }
 
+async fn poll_bbdown_qr_login(
+    client: &bbdown_core::BiliClient,
+    ticket: &bbdown_core::QrLoginTicket,
+    timeout: Duration,
+) -> Result<QrLoginState> {
+    Ok(tokio_timeout(timeout, async {
+        match ticket.kind {
+            QrLoginKind::Web => client.poll_web_qr_login(&ticket.key).await,
+            QrLoginKind::Tv => client.poll_tv_qr_login(ticket).await,
+        }
+    })
+    .await
+    .context("BBDown QR login timed out")??)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 async fn await_bbdown_login_active<F, T>(auth_generation: u64, future: F) -> Result<T>
 where
     F: std::future::Future<Output = T>,
@@ -516,56 +725,144 @@ fn ensure_bbdown_login_active(auth_generation: u64) -> Result<()> {
     Ok(())
 }
 
-async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
-    let message = match bilibili_auth::load_auth_state(&config.bilibili.auth.state_path) {
-        Ok(None) => "BBDown is not logged in. Use /bbdown login in private chat.".to_string(),
-        Ok(Some(state)) => {
-            let client = match bbdown_auth_client(&config) {
-                Ok(client) => client,
-                Err(err) => {
-                    return send_or_log(
-                        &telegram,
-                        chat_id,
-                        format!(
-                            "Failed to prepare BBDown status check:\n{}",
-                            truncate(&err.to_string())
-                        ),
-                    )
-                    .await;
-                }
-            };
-            match bilibili_auth::verify_cookie(&client, &state.cookie).await {
-                Ok(verified) => {
-                    format!(
-                        "BBDown is logged in as {} (mid: {}).",
-                        verified.uname, verified.mid
-                    )
-                }
-                Err(err) => format!(
-                    "Saved BBDown login is invalid or expired. Use /bbdown login again.\n{}",
-                    truncate(&err.to_string())
-                ),
-            }
+async fn send_bbdown_auth_ticket(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    mode: BilibiliAuthLoginMode,
+    url: &str,
+    qr_payload: &str,
+    timeout_seconds: u64,
+) -> Result<()> {
+    let png = bilibili_auth::render_qr_png(qr_payload)?;
+    let caption = match mode {
+        BilibiliAuthLoginMode::Web => format!(
+            "Scan this BBDown Web login QR in the Bilibili app. It expires in {} seconds.",
+            timeout_seconds
+        ),
+        BilibiliAuthLoginMode::Tv => format!(
+            "Scan this BBDown TV login QR in the Bilibili app. It expires in {} seconds.",
+            timeout_seconds
+        ),
+        BilibiliAuthLoginMode::AccessKey => {
+            "Scan this BBDown access-key authorization QR, or open the authorization link sent next."
+                .to_string()
         }
+    };
+    telegram
+        .send_photo(chat_id, caption, png)
+        .await
+        .context("failed to send BBDown auth QR image")?;
+    if matches!(mode, BilibiliAuthLoginMode::AccessKey) {
+        send_or_log(telegram, chat_id, format!("Authorization link:\n{url}")).await;
+    }
+    Ok(())
+}
+
+fn bbdown_login_mode_label(mode: BilibiliAuthLoginMode) -> &'static str {
+    match mode {
+        BilibiliAuthLoginMode::Web => "web",
+        BilibiliAuthLoginMode::Tv => "tv",
+        BilibiliAuthLoginMode::AccessKey => "access-key",
+    }
+}
+
+fn format_bbdown_credential_summary(summary: &CredentialSource) -> String {
+    format!(
+        "Stored credentials: cookie={}, access_key={}, tv_access_key={}.",
+        yes_no(summary.has_cookie),
+        yes_no(summary.has_access_key),
+        yes_no(summary.has_tv_access_key)
+    )
+}
+
+fn format_bbdown_credential_health_report(report: &CredentialHealthReport) -> String {
+    let mut lines = vec![
+        "BBDown credential health:".to_string(),
+        format_bbdown_credential_summary(&report.credentials),
+    ];
+    if report.probes.is_empty() {
+        lines.push("No health probes were reported.".to_string());
+    } else {
+        for probe in &report.probes {
+            let mut line = format!(
+                "{} ({}): {}",
+                credential_kind_label(probe.kind),
+                credential_health_scope_label(probe.scope),
+                credential_health_status_label(probe.status)
+            );
+            if let Some(code) = probe.api_code {
+                line.push_str(&format!(" code={code}"));
+            }
+            if let Some(message) = probe
+                .message
+                .as_deref()
+                .filter(|message| !message.is_empty())
+            {
+                line.push_str(" - ");
+                line.push_str(message);
+            }
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn credential_kind_label(kind: CredentialKind) -> &'static str {
+    match kind {
+        CredentialKind::Cookie => "cookie",
+        CredentialKind::AccessKey => "access_key",
+        CredentialKind::TvAccessKey => "tv_access_key",
+    }
+}
+
+fn credential_health_scope_label(scope: CredentialHealthScope) -> &'static str {
+    match scope {
+        CredentialHealthScope::WebCookie => "web",
+        CredentialHealthScope::IntlBstar => "intl/bstar",
+        CredentialHealthScope::Tv => "tv",
+    }
+}
+
+fn credential_health_status_label(status: CredentialHealthStatus) -> &'static str {
+    match status {
+        CredentialHealthStatus::Missing => "missing",
+        CredentialHealthStatus::Valid => "valid",
+        CredentialHealthStatus::Rejected => "rejected",
+        CredentialHealthStatus::RequestFailed => "request_failed",
+    }
+}
+
+fn pending_bilibili_access_key_logins()
+-> &'static Mutex<HashMap<i64, PendingBilibiliAccessKeyLogin>> {
+    PENDING_BILIBILI_ACCESS_KEY_LOGINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn has_pending_bilibili_access_key_login() -> bool {
+    let mut logins = pending_bilibili_access_key_logins().lock().await;
+    prune_expired_pending_bilibili_access_key_logins(&mut logins, Instant::now());
+    !logins.is_empty()
+}
+
+fn prune_expired_pending_bilibili_access_key_logins(
+    logins: &mut HashMap<i64, PendingBilibiliAccessKeyLogin>,
+    now: Instant,
+) {
+    logins.retain(|_, login| now.duration_since(login.created_at) <= BILIBILI_ACCESS_KEY_LOGIN_TTL);
+}
+
+async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
+    let message = match bilibili_core::credential_health(&config).await {
+        Ok(report) => format_bbdown_credential_health_report(&report),
         Err(err) => format!(
-            "Failed to read BBDown login state:\n{}",
-            truncate(&err.to_string())
+            "Failed to check BBDown credential health:\n{}",
+            summarize_bbdown_auth_error(&err)
         ),
     };
     send_or_log(&telegram, chat_id, message).await;
-}
-
-fn bbdown_auth_client(config: &AppConfig) -> Result<Client> {
-    let timeout_seconds = config
-        .bilibili
-        .auth
-        .login_timeout_seconds
-        .clamp(1, BILIBILI_AUTH_MAX_HTTP_TIMEOUT_SECONDS);
-    Client::builder()
-        .timeout(Duration::from_secs(timeout_seconds))
-        .connect_timeout(Duration::from_secs(timeout_seconds.min(10)))
-        .build()
-        .context("failed to create Bilibili auth HTTP client")
 }
 
 fn bbdown_auth_state_lock() -> &'static Mutex<()> {
@@ -579,12 +876,21 @@ fn bbdown_login_cancel_notify() -> &'static Notify {
 async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
     BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
     bbdown_login_cancel_notify().notify_waiters();
-    let _state_guard = bbdown_auth_state_lock().lock().await;
-    let message = match bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path) {
-        Ok(true) => "BBDown login state cleared.".to_string(),
-        Ok(false) => "BBDown is not logged in.".to_string(),
-        Err(err) => format!(
-            "Failed to clear BBDown login state:\n{}",
+    pending_bilibili_access_key_logins().lock().await.clear();
+    let legacy_state = {
+        let _state_guard = bbdown_auth_state_lock().lock().await;
+        bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path)
+    };
+    let credential_state =
+        bilibili_core::credential_runtime(&config).and_then(|runtime| runtime.logout());
+    let message = match (legacy_state, credential_state) {
+        (Ok(_), Ok(())) => "BBDown credential state cleared.".to_string(),
+        (Ok(_), Err(err)) => format!(
+            "Failed to clear BBDown credential state:\n{}",
+            summarize_bbdown_auth_error(&err)
+        ),
+        (Err(err), _) => format!(
+            "Failed to clear legacy BBDown login state:\n{}",
             truncate(&err.to_string())
         ),
     };
@@ -592,9 +898,10 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
 }
 
 fn bbdown_auth_usage() -> String {
-    "Usage: /bbdown login | /bbdown status | /bbdown logout".to_string()
+    "Usage: /bbdown login [web|tv|access-key] | /bbdown status | /bbdown logout".to_string()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn bbdown_qr_photo_failed_message() -> String {
     "Could not send the QR image. BBDown login canceled; try /bbdown login again after Telegram photo delivery is working.".to_string()
 }
@@ -607,6 +914,11 @@ fn queue_or_prompt_job(
     job_id: u64,
     job: JobRequest,
 ) {
+    if job.requires_bilibili_selection() {
+        tokio::spawn(prompt_bilibili_selection(telegram, chat_id, job_id, job));
+        return;
+    }
+
     tokio::spawn(process_job_after_duplicate_check(
         telegram,
         config,
@@ -615,6 +927,57 @@ fn queue_or_prompt_job(
         job_id,
         job,
     ));
+}
+
+async fn prompt_bilibili_selection(
+    telegram: TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    job: JobRequest,
+) {
+    let token = next_bilibili_selection_callback_token(job_id);
+    let now = Instant::now();
+    {
+        let mut pending_jobs = pending_bilibili_selection_jobs().lock().await;
+        prune_expired_pending_bilibili_selection_jobs(&mut pending_jobs, now);
+        pending_jobs.insert(
+            token,
+            PendingBilibiliSelectionJob {
+                chat_id,
+                job_id,
+                job,
+                created_at: now,
+            },
+        );
+        cap_pending_bilibili_selection_jobs(&mut pending_jobs, Some(token));
+    }
+
+    match telegram
+        .send_message_with_inline_keyboard(
+            chat_id,
+            bilibili_selection_message(job_id),
+            bilibili_selection_keyboard(token),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(err) => {
+            pending_bilibili_selection_jobs()
+                .lock()
+                .await
+                .remove(&token);
+            warn!(chat_id, job_id, error = %err, "failed to send Bilibili selection prompt");
+            send_or_log(
+                &telegram,
+                chat_id,
+                format!(
+                    "Bilibili selection prompt failed for job #{job_id}; job canceled. Send the link again to retry.\n{}",
+                    truncate(&err.to_string())
+                ),
+            )
+            .await;
+        }
+    }
 }
 
 async fn process_job_after_duplicate_check(
@@ -729,6 +1092,7 @@ async fn prompt_duplicate_choice(
 ) {
     let token = next_duplicate_callback_token(job_id);
     let prompt = duplicate_choice_message(job_id, job.label(), &duplicate);
+    let allow_overwrite = job_allows_duplicate_overwrite(&job);
     let now = Instant::now();
     {
         let mut pending_jobs = pending_duplicate_jobs().lock().await;
@@ -749,7 +1113,7 @@ async fn prompt_duplicate_choice(
         .send_message_with_inline_keyboard(
             chat_id,
             truncate(&prompt),
-            duplicate_choice_keyboard(token),
+            duplicate_choice_keyboard(token, allow_overwrite),
         )
         .await
     {
@@ -791,15 +1155,11 @@ async fn queue_job(
 async fn handle_callback_query(
     telegram: TelegramClient,
     config: Arc<AppConfig>,
-    semaphore: Arc<Semaphore>,
+    job_dispatch: JobDispatch,
     callback_query: CallbackQuery,
 ) {
     let callback_id = callback_query.id.clone();
     let Some(data) = callback_query.data.as_deref() else {
-        answer_callback_or_log(&telegram, callback_id, "Unsupported button.".to_string()).await;
-        return;
-    };
-    let Some(callback) = parse_duplicate_callback_data(data) else {
         answer_callback_or_log(&telegram, callback_id, "Unsupported button.".to_string()).await;
         return;
     };
@@ -818,6 +1178,25 @@ async fn handle_callback_query(
         answer_callback_or_log(&telegram, callback_id, "Unauthorized chat.".to_string()).await;
         return;
     }
+
+    if let Some(callback) = parse_bilibili_selection_callback_data(data) {
+        handle_bilibili_selection_callback(
+            telegram,
+            config,
+            job_dispatch,
+            callback_id,
+            chat_id,
+            message.message_id,
+            callback,
+        )
+        .await;
+        return;
+    }
+
+    let Some(callback) = parse_duplicate_callback_data(data) else {
+        answer_callback_or_log(&telegram, callback_id, "Unsupported button.".to_string()).await;
+        return;
+    };
 
     let pending = take_pending_duplicate_job(callback.token, chat_id).await;
     let Some(pending) = pending else {
@@ -842,6 +1221,24 @@ async fn handle_callback_query(
             .await;
         }
         DuplicateCallbackAction::Run(action) => {
+            if matches!(action, VideoDuplicateAction::Overwrite)
+                && !job_allows_duplicate_overwrite(&pending.job)
+            {
+                answer_callback_or_log(
+                    &telegram,
+                    callback_id,
+                    "Overwrite is not available for this job.".to_string(),
+                )
+                .await;
+                edit_without_keyboard_or_send(
+                    &telegram,
+                    chat_id,
+                    message.message_id,
+                    format!("Canceled job #{}: {}", pending.job_id, pending.job.label()),
+                )
+                .await;
+                return;
+            }
             let action_label = match action {
                 VideoDuplicateAction::Overwrite => "overwrite",
                 VideoDuplicateAction::KeepBoth => "keep both",
@@ -861,7 +1258,7 @@ async fn handle_callback_query(
             queue_job(
                 telegram,
                 config,
-                semaphore,
+                Arc::clone(&job_dispatch.download_semaphore),
                 chat_id,
                 pending.job_id,
                 pending.job,
@@ -875,6 +1272,64 @@ async fn handle_callback_query(
     }
 }
 
+async fn handle_bilibili_selection_callback(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    job_dispatch: JobDispatch,
+    callback_id: String,
+    chat_id: i64,
+    message_id: i64,
+    callback: BilibiliSelectionCallback,
+) {
+    let pending = take_pending_bilibili_selection_job(callback.token, chat_id).await;
+    let Some(pending) = pending else {
+        answer_callback_or_log(
+            &telegram,
+            callback_id,
+            "This choice has expired.".to_string(),
+        )
+        .await;
+        return;
+    };
+
+    match callback.action {
+        BilibiliSelectionCallbackAction::Cancel => {
+            answer_callback_or_log(&telegram, callback_id, "Canceled.".to_string()).await;
+            edit_without_keyboard_or_send(
+                &telegram,
+                chat_id,
+                message_id,
+                format!("Canceled job #{}: {}", pending.job_id, pending.job.label()),
+            )
+            .await;
+        }
+        BilibiliSelectionCallbackAction::Run(selection) => {
+            let job = apply_bilibili_selection(pending.job, selection);
+            answer_callback_or_log(&telegram, callback_id, "Queued.".to_string()).await;
+            edit_without_keyboard_or_send(
+                &telegram,
+                chat_id,
+                message_id,
+                format!(
+                    "Selected {} for job #{}: {}",
+                    selection.label(),
+                    pending.job_id,
+                    job.label()
+                ),
+            )
+            .await;
+            tokio::spawn(process_job_after_duplicate_check(
+                telegram,
+                config,
+                job_dispatch,
+                chat_id,
+                pending.job_id,
+                job,
+            ));
+        }
+    }
+}
+
 fn default_run_mode(job: &JobRequest) -> JobRunMode {
     match job {
         JobRequest::Bilibili { .. } | JobRequest::Youtube { .. } => JobRunMode::StagedKeepBoth,
@@ -882,9 +1337,136 @@ fn default_run_mode(job: &JobRequest) -> JobRunMode {
     }
 }
 
+fn job_allows_duplicate_overwrite(job: &JobRequest) -> bool {
+    !matches!(
+        job,
+        JobRequest::Bilibili {
+            selection: Some(BilibiliSelection::All),
+            ..
+        }
+    )
+}
+
 impl From<DuplicateRun> for JobRunMode {
     fn from(value: DuplicateRun) -> Self {
         Self::Duplicate(value)
+    }
+}
+
+fn pending_bilibili_selection_jobs() -> &'static Mutex<HashMap<u64, PendingBilibiliSelectionJob>> {
+    PENDING_BILIBILI_SELECTION_JOBS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn take_pending_bilibili_selection_job(
+    token: u64,
+    chat_id: i64,
+) -> Option<PendingBilibiliSelectionJob> {
+    let mut jobs = pending_bilibili_selection_jobs().lock().await;
+    prune_expired_pending_bilibili_selection_jobs(&mut jobs, Instant::now());
+    match jobs.get(&token) {
+        Some(job) if job.chat_id == chat_id => jobs.remove(&token),
+        _ => None,
+    }
+}
+
+fn prune_expired_pending_bilibili_selection_jobs(
+    jobs: &mut HashMap<u64, PendingBilibiliSelectionJob>,
+    now: Instant,
+) {
+    jobs.retain(|_, job| now.duration_since(job.created_at) <= BILIBILI_SELECTION_DECISION_TTL);
+}
+
+fn cap_pending_bilibili_selection_jobs(
+    jobs: &mut HashMap<u64, PendingBilibiliSelectionJob>,
+    protected_token: Option<u64>,
+) {
+    while jobs.len() > MAX_PENDING_BILIBILI_SELECTION_JOBS {
+        let Some(oldest_job_id) = jobs
+            .iter()
+            .filter(|(token, _)| Some(**token) != protected_token)
+            .min_by_key(|(_, job)| job.created_at)
+            .map(|(job_id, _)| *job_id)
+        else {
+            break;
+        };
+        jobs.remove(&oldest_job_id);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BilibiliSelectionCallback {
+    token: u64,
+    action: BilibiliSelectionCallbackAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BilibiliSelectionCallbackAction {
+    Run(BilibiliSelection),
+    Cancel,
+}
+
+fn parse_bilibili_selection_callback_data(data: &str) -> Option<BilibiliSelectionCallback> {
+    let mut parts = data.split(':');
+    let prefix = parts.next()?;
+    let token = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let action = parts.next()?;
+    if parts.next().is_some() || prefix != "bsel" {
+        return None;
+    }
+    let action = match action {
+        "latest" => BilibiliSelectionCallbackAction::Run(BilibiliSelection::Latest),
+        "all" => BilibiliSelectionCallbackAction::Run(BilibiliSelection::All),
+        "cancel" => BilibiliSelectionCallbackAction::Cancel,
+        _ => return None,
+    };
+    Some(BilibiliSelectionCallback { token, action })
+}
+
+fn next_bilibili_selection_callback_token(job_id: u64) -> u64 {
+    let counter = BILIBILI_SELECTION_CALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    nanos ^ counter.rotate_left(19) ^ job_id.rotate_left(35) ^ (std::process::id() as u64)
+}
+
+fn bilibili_selection_callback_data(token: u64, action: &str) -> String {
+    format!("bsel:{token:016x}:{action}")
+}
+
+fn bilibili_selection_keyboard(token: u64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![
+            vec![
+                InlineKeyboardButton {
+                    text: "Latest episode".to_string(),
+                    callback_data: bilibili_selection_callback_data(token, "latest"),
+                },
+                InlineKeyboardButton {
+                    text: "All episodes".to_string(),
+                    callback_data: bilibili_selection_callback_data(token, "all"),
+                },
+            ],
+            vec![InlineKeyboardButton {
+                text: "Cancel".to_string(),
+                callback_data: bilibili_selection_callback_data(token, "cancel"),
+            }],
+        ],
+    }
+}
+
+fn bilibili_selection_message(job_id: u64) -> String {
+    format!("Bilibili season/media link queued as job #{job_id}. Choose what to download:")
+}
+
+fn apply_bilibili_selection(job: JobRequest, selection: BilibiliSelection) -> JobRequest {
+    match job {
+        JobRequest::Bilibili { url, .. } => JobRequest::Bilibili {
+            url,
+            selection: Some(selection),
+        },
+        other => other,
     }
 }
 
@@ -967,19 +1549,21 @@ fn duplicate_callback_data(token: u64, action: &str) -> String {
     format!("dup:{token:016x}:{action}")
 }
 
-fn duplicate_choice_keyboard(token: u64) -> InlineKeyboardMarkup {
+fn duplicate_choice_keyboard(token: u64, allow_overwrite: bool) -> InlineKeyboardMarkup {
+    let mut first_row = Vec::new();
+    if allow_overwrite {
+        first_row.push(InlineKeyboardButton {
+            text: "Overwrite".to_string(),
+            callback_data: duplicate_callback_data(token, "overwrite"),
+        });
+    }
+    first_row.push(InlineKeyboardButton {
+        text: "Keep both".to_string(),
+        callback_data: duplicate_callback_data(token, "keep"),
+    });
     InlineKeyboardMarkup {
         inline_keyboard: vec![
-            vec![
-                InlineKeyboardButton {
-                    text: "Overwrite".to_string(),
-                    callback_data: duplicate_callback_data(token, "overwrite"),
-                },
-                InlineKeyboardButton {
-                    text: "Keep both".to_string(),
-                    callback_data: duplicate_callback_data(token, "keep"),
-                },
-            ],
+            first_row,
             vec![InlineKeyboardButton {
                 text: "Cancel".to_string(),
                 callback_data: duplicate_callback_data(token, "cancel"),
@@ -1243,14 +1827,20 @@ fn truncate(text: &str) -> String {
 }
 
 fn summarize_bbdown_auth_error(error: &anyhow::Error) -> String {
-    truncate(&redact_bilibili_login_qr_urls(&error.to_string()))
+    truncate(&redact_bbdown_auth_secrets(&error.to_string()))
 }
 
-fn redact_bilibili_login_qr_urls(text: &str) -> String {
+fn redact_bbdown_auth_secrets(text: &str) -> String {
     text.lines()
         .map(|line| {
             if line.contains("passport.bilibili.com") && line.contains("qrcode_key=") {
                 "<redacted Bilibili login QR URL>"
+            } else if line.contains("biliplus.com/login") && line.contains("balh_auth=") {
+                "<redacted BBDown access-key authorization URL>"
+            } else if line.contains("balh-login-credentials:") {
+                "<redacted BBDown access-key callback message>"
+            } else if line.contains("access_token=") || line.contains("refresh_token=") {
+                "<redacted BBDown access-key callback URL>"
             } else {
                 line
             }
@@ -1277,6 +1867,19 @@ mod tests {
     }
 
     #[test]
+    fn redacts_bbdown_access_key_auth_secrets() {
+        let summary = summarize_bbdown_auth_error(&anyhow!(
+            "open https://www.biliplus.com/login?balh_auth=1&balh_auth_origin=https%3A%2F%2Fwww.bilibili.com\nthen https://www.bilibili.com/callback?access_token=secret&refresh_token=refresh\nbalh-login-credentials: {{\"access_key\":\"secret\"}}"
+        ));
+
+        assert!(!summary.contains("access_token="));
+        assert!(!summary.contains("secret"));
+        assert!(summary.contains("<redacted BBDown access-key authorization URL>"));
+        assert!(summary.contains("<redacted BBDown access-key callback URL>"));
+        assert!(summary.contains("<redacted BBDown access-key callback message>"));
+    }
+
+    #[test]
     fn qr_photo_failure_message_does_not_include_login_url() {
         let message = bbdown_qr_photo_failed_message();
 
@@ -1288,9 +1891,38 @@ mod tests {
     fn help_message_lists_supported_commands() {
         let message = help_message();
 
-        for expected in ["/help", "/pdf URL", "/bbdown login", "/bbdown status"] {
+        for expected in [
+            "/help",
+            "/pdf URL",
+            "/bbdown login [web|tv|access-key]",
+            "/bbdown status",
+        ] {
             assert!(message.contains(expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn formats_bbdown_credential_health_report() {
+        let report: CredentialHealthReport = serde_json::from_value(serde_json::json!({
+            "credentials": {
+                "has_cookie": true,
+                "has_access_key": false,
+                "has_tv_access_key": true
+            },
+            "probes": [{
+                "kind": "tv_access_key",
+                "scope": "tv",
+                "status": "valid",
+                "api_code": 0
+            }]
+        }))
+        .expect("health report sample should deserialize");
+
+        let message = format_bbdown_credential_health_report(&report);
+
+        assert!(message.contains("cookie=yes"));
+        assert!(message.contains("access_key=no"));
+        assert!(message.contains("tv_access_key (tv): valid code=0"));
     }
 
     #[test]
@@ -1367,8 +1999,78 @@ mod tests {
     }
 
     #[test]
+    fn parses_bilibili_selection_callback_data() {
+        assert_eq!(
+            parse_bilibili_selection_callback_data("bsel:000000000000002a:latest"),
+            Some(BilibiliSelectionCallback {
+                token: 42,
+                action: BilibiliSelectionCallbackAction::Run(BilibiliSelection::Latest)
+            })
+        );
+        assert_eq!(
+            parse_bilibili_selection_callback_data("bsel:000000000000002a:all"),
+            Some(BilibiliSelectionCallback {
+                token: 42,
+                action: BilibiliSelectionCallbackAction::Run(BilibiliSelection::All)
+            })
+        );
+        assert_eq!(
+            parse_bilibili_selection_callback_data("bsel:000000000000002a:cancel"),
+            Some(BilibiliSelectionCallback {
+                token: 42,
+                action: BilibiliSelectionCallbackAction::Cancel
+            })
+        );
+        assert_eq!(
+            parse_bilibili_selection_callback_data("bsel:nothex:latest"),
+            None
+        );
+        assert_eq!(
+            parse_bilibili_selection_callback_data("dup:000000000000002a:latest"),
+            None
+        );
+        assert_eq!(
+            parse_bilibili_selection_callback_data("bsel:000000000000002a:unknown"),
+            None
+        );
+    }
+
+    #[test]
+    fn builds_bilibili_selection_keyboard_and_applies_selection() {
+        let keyboard = bilibili_selection_keyboard(42);
+        let data = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .map(|button| button.callback_data.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            data,
+            vec![
+                "bsel:000000000000002a:latest",
+                "bsel:000000000000002a:all",
+                "bsel:000000000000002a:cancel"
+            ]
+        );
+
+        assert_eq!(
+            apply_bilibili_selection(
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+                    selection: None,
+                },
+                BilibiliSelection::All
+            ),
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+                selection: Some(BilibiliSelection::All),
+            }
+        );
+    }
+
+    #[test]
     fn builds_duplicate_choice_keyboard() {
-        let keyboard = duplicate_choice_keyboard(42);
+        let keyboard = duplicate_choice_keyboard(42, true);
         let data = keyboard
             .inline_keyboard
             .iter()
@@ -1385,6 +2087,30 @@ mod tests {
             ]
         );
         assert!(data.iter().all(|value| value.len() <= 64));
+    }
+
+    #[test]
+    fn duplicate_choice_keyboard_can_disable_overwrite() {
+        let keyboard = duplicate_choice_keyboard(42, false);
+        let data = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .map(|button| button.callback_data.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            data,
+            vec!["dup:000000000000002a:keep", "dup:000000000000002a:cancel"]
+        );
+        assert!(!job_allows_duplicate_overwrite(&JobRequest::Bilibili {
+            url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+            selection: Some(BilibiliSelection::All)
+        }));
+        assert!(job_allows_duplicate_overwrite(&JobRequest::Bilibili {
+            url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+            selection: Some(BilibiliSelection::Latest)
+        }));
     }
 
     fn pending_duplicate_job(job_id: u64, created_at: Instant) -> PendingDuplicateJob {
