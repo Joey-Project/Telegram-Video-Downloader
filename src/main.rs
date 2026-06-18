@@ -599,16 +599,6 @@ async fn start_bbdown_access_key_login(
     ensure_bbdown_login_active(auth_generation)?;
     let ticket = bilibili_core::create_access_key_ticket()?;
     let output = ticket.output();
-    send_bbdown_auth_ticket(
-        telegram,
-        chat_id,
-        BilibiliAuthLoginMode::AccessKey,
-        &output.url,
-        &output.qr_payload,
-        config.bilibili.auth.login_timeout_seconds,
-    )
-    .await?;
-    ensure_bbdown_login_active(auth_generation)?;
     {
         let mut logins = pending_bilibili_access_key_logins().lock().await;
         prune_expired_pending_bilibili_access_key_logins(&mut logins, Instant::now());
@@ -622,6 +612,20 @@ async fn start_bbdown_access_key_login(
             },
         );
     }
+    if let Err(err) = send_bbdown_auth_ticket(
+        telegram,
+        chat_id,
+        BilibiliAuthLoginMode::AccessKey,
+        &output.url,
+        &output.qr_payload,
+        config.bilibili.auth.login_timeout_seconds,
+    )
+    .await
+    {
+        clear_pending_bilibili_access_key_login(chat_id, auth_generation).await;
+        return Err(err);
+    }
+    ensure_bbdown_login_active(auth_generation)?;
     send_or_log(
         telegram,
         chat_id,
@@ -764,7 +768,6 @@ async fn send_bbdown_auth_ticket(
     qr_payload: &str,
     timeout_seconds: u64,
 ) -> Result<()> {
-    let png = bilibili_auth::render_qr_png(qr_payload)?;
     let caption = match mode {
         BilibiliAuthLoginMode::Web => format!(
             "Scan this BBDown Web login QR in the Bilibili app. It expires in {} seconds.",
@@ -781,7 +784,39 @@ async fn send_bbdown_auth_ticket(
     };
     if matches!(mode, BilibiliAuthLoginMode::AccessKey) {
         send_or_log(telegram, chat_id, format!("Authorization link:\n{url}")).await;
+        match bilibili_auth::render_qr_png(qr_payload) {
+            Ok(png) => {
+                if let Err(err) = telegram.send_photo(chat_id, caption, png).await {
+                    warn!(
+                        error = %err,
+                        "failed to send BBDown access-key QR image after authorization link"
+                    );
+                    send_or_log(
+                        telegram,
+                        chat_id,
+                        "BBDown access-key QR image could not be sent. Use the authorization link above."
+                            .to_string(),
+                    )
+                    .await;
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to render BBDown access-key QR image after authorization link"
+                );
+                send_or_log(
+                    telegram,
+                    chat_id,
+                    "BBDown access-key QR image could not be rendered. Use the authorization link above."
+                        .to_string(),
+                )
+                .await;
+            }
+        }
+        return Ok(());
     }
+    let png = bilibili_auth::render_qr_png(qr_payload)?;
     telegram
         .send_photo(chat_id, caption, png)
         .await
@@ -870,6 +905,16 @@ fn credential_health_status_label(status: CredentialHealthStatus) -> &'static st
 fn pending_bilibili_access_key_logins()
 -> &'static Mutex<HashMap<i64, PendingBilibiliAccessKeyLogin>> {
     PENDING_BILIBILI_ACCESS_KEY_LOGINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn clear_pending_bilibili_access_key_login(chat_id: i64, auth_generation: u64) {
+    let mut logins = pending_bilibili_access_key_logins().lock().await;
+    if logins
+        .get(&chat_id)
+        .is_some_and(|login| login.auth_generation == auth_generation)
+    {
+        logins.remove(&chat_id);
+    }
 }
 
 async fn has_pending_bilibili_access_key_login() -> bool {

@@ -677,7 +677,9 @@ fn write_bilibili_nfos(
         let Some(primary_media) = bilibili_entry_primary_media(cwd, report_entry) else {
             continue;
         };
-        if !primary_media.is_file() || !is_video_file(&primary_media) {
+        if !primary_media.is_file()
+            || (!is_video_file(&primary_media) && !is_audio_file(&primary_media))
+        {
             continue;
         }
         let plan_entry = plan
@@ -699,7 +701,7 @@ fn write_bilibili_nfos(
             .iter()
             .map(|(unique_id_type, unique_id)| (unique_id_type.as_str(), unique_id.as_str()))
             .collect::<Vec<_>>();
-        let nfo_path = write_nfo_for_video(
+        let nfo_path = write_nfo_for_media(
             &primary_media,
             &MediaNfo {
                 title,
@@ -1258,7 +1260,7 @@ async fn run_youtube_job_locked(
             let source_url = metadata.webpage_url.as_deref().unwrap_or(url);
             let studio = metadata.uploader.as_deref().or(metadata.channel.as_deref());
             let premiered = metadata.upload_date.as_deref().and_then(format_yt_date);
-            match write_nfo_for_video(
+            match write_nfo_for_media(
                 video_path,
                 &MediaNfo {
                     title,
@@ -3996,7 +3998,7 @@ struct MediaNfo<'a> {
     premiered: Option<&'a str>,
 }
 
-fn write_nfo_for_video(video_path: &Path, nfo: &MediaNfo<'_>) -> Result<PathBuf> {
+fn write_nfo_for_media(video_path: &Path, nfo: &MediaNfo<'_>) -> Result<PathBuf> {
     let title = nfo
         .title
         .or_else(|| video_path.file_stem().and_then(|stem| stem.to_str()))
@@ -4630,6 +4632,56 @@ mod tests {
         .expect("audio-only duplicate should be found");
 
         assert_eq!(duplicate.existing_videos, vec![audio_path]);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn writes_bilibili_nfo_for_audio_only_primary_media() {
+        let video_dir = temp_test_dir("bilibili-audio-only-nfo");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        let audio_path = video_dir.join("Episode One.m4a");
+        fs::write(&audio_path, "audio").expect("audio file should write");
+        let plan = BilibiliDownloadPlan {
+            title: "Bangumi".to_string(),
+            entries: vec![BilibiliDownloadEntry {
+                index: 1,
+                aid: 1_556_453_868,
+                bvid: Some("BV12TRrBcEP8".to_string()),
+                cid: 987_654_321,
+                epid: Some(123_456),
+                title: "Episode One".to_string(),
+            }],
+        };
+        let report = BilibiliDownloadReport {
+            title: "Bangumi".to_string(),
+            output_dir: video_dir.clone(),
+            entries: vec![BilibiliEntryDownloadReport {
+                index: 1,
+                title: "Episode One".to_string(),
+                files: vec![BilibiliDownloadedFile {
+                    kind: "audio".to_string(),
+                    path: PathBuf::from("Episode One.m4a"),
+                }],
+                mux: None,
+            }],
+        };
+
+        let nfos = write_bilibili_nfos(
+            &video_dir,
+            "https://www.bilibili.com/bangumi/play/ep123456",
+            &plan,
+            &report,
+        )
+        .expect("audio-only nfo should write");
+        let nfo_path = audio_path.with_extension("nfo");
+        let nfo = fs::read_to_string(&nfo_path).expect("audio nfo should exist");
+
+        assert_eq!(nfos, vec![nfo_path]);
+        assert!(
+            nfo.contains("<uniqueid type=\"bilibili\" default=\"true\">BV12TRrBcEP8</uniqueid>")
+        );
+        assert!(nfo.contains("<uniqueid type=\"bilibili-cid\">cid987654321</uniqueid>"));
+        assert!(nfo.contains("<uniqueid type=\"bilibili-epid\">ep123456</uniqueid>"));
         let _ = fs::remove_dir_all(video_dir);
     }
 
