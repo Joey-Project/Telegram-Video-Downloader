@@ -774,17 +774,17 @@ async fn send_bbdown_auth_ticket(
             timeout_seconds
         ),
         BilibiliAuthLoginMode::AccessKey => {
-            "Scan this BBDown access-key authorization QR, or open the authorization link sent next."
+            "Scan this BBDown access-key authorization QR, or use the authorization link sent above."
                 .to_string()
         }
     };
+    if matches!(mode, BilibiliAuthLoginMode::AccessKey) {
+        send_or_log(telegram, chat_id, format!("Authorization link:\n{url}")).await;
+    }
     telegram
         .send_photo(chat_id, caption, png)
         .await
         .context("failed to send BBDown auth QR image")?;
-    if matches!(mode, BilibiliAuthLoginMode::AccessKey) {
-        send_or_log(telegram, chat_id, format!("Authorization link:\n{url}")).await;
-    }
     Ok(())
 }
 

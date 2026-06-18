@@ -1358,7 +1358,7 @@ async fn run_staged_video_job(
     }
 
     let moved_files = if staged_media.is_empty() && artifact_only {
-        move_staged_artifact_files(&staging_dir, &final_dir, &staged_files)
+        move_staged_artifact_files(&staging_dir, &final_dir, &staged_files, action, duplicate)
     } else {
         move_staged_video_files(
             &staging_dir,
@@ -3448,33 +3448,109 @@ fn move_staged_artifact_files(
     staging_dir: &Path,
     final_dir: &Path,
     staged_files: &[PathBuf],
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
 ) -> Result<Vec<PathBuf>> {
+    let plan = staged_artifact_move_plan(staging_dir, final_dir, staged_files, action, duplicate);
+    let backups = if matches!(action, VideoDuplicateAction::Overwrite) {
+        backup_existing_paths(plan.iter().map(|step| step.destination.clone()))?
+    } else {
+        Vec::new()
+    };
+    let move_result = execute_artifact_move_plan(plan);
+    match move_result {
+        Ok(moved_files) => {
+            if matches!(action, VideoDuplicateAction::Overwrite) {
+                remove_backups(&backups);
+            }
+            Ok(moved_files)
+        }
+        Err(err) => {
+            restore_backups(&backups);
+            Err(err)
+        }
+    }
+}
+
+fn staged_artifact_move_plan(
+    staging_dir: &Path,
+    final_dir: &Path,
+    staged_files: &[PathBuf],
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
+) -> Vec<MoveStep> {
     let mut reserved = BTreeSet::new();
-    let mut moved = Vec::new();
+    let overwrite_video = matches!(action, VideoDuplicateAction::Overwrite)
+        .then(|| duplicate.existing_videos.first())
+        .flatten();
+    let mut steps = Vec::with_capacity(staged_files.len());
     for source in staged_files {
-        let destination = unique_path_avoiding(
-            relative_destination(staging_dir, final_dir, source),
-            &reserved,
-        );
+        let preferred = overwrite_video
+            .and_then(|video| artifact_overwrite_destination(source, video))
+            .unwrap_or_else(|| relative_destination(staging_dir, final_dir, source));
+        let destination = if matches!(action, VideoDuplicateAction::Overwrite)
+            && !reserved.contains(&preferred)
+        {
+            preferred
+        } else {
+            unique_path_avoiding(preferred, &reserved)
+        };
         reserved.insert(destination.clone());
-        if let Some(parent) = destination.parent()
+        steps.push(MoveStep {
+            source: source.clone(),
+            destination,
+        });
+    }
+    steps
+}
+
+fn artifact_overwrite_destination(source: &Path, target_video: &Path) -> Option<PathBuf> {
+    if !is_known_video_sidecar(source) {
+        return None;
+    }
+    let extension = source.extension()?.to_str()?;
+    let source_stem = source.file_stem()?.to_str()?;
+    let target_stem = target_video.file_stem()?.to_str()?;
+    let suffix = source_stem
+        .find('.')
+        .map(|index| &source_stem[index..])
+        .unwrap_or("");
+    Some(
+        target_video
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(format!("{target_stem}{suffix}.{extension}")),
+    )
+}
+
+fn execute_artifact_move_plan(plan: Vec<MoveStep>) -> Result<Vec<PathBuf>> {
+    let mut moved = Vec::new();
+    for step in plan {
+        if step.destination.exists() {
+            rollback_moves(&moved);
+            bail!(
+                "destination already exists while moving staged artifact: {}",
+                step.destination.display()
+            );
+        }
+        if let Some(parent) = step.destination.parent()
             && !parent.as_os_str().is_empty()
             && let Err(err) = fs::create_dir_all(parent)
         {
             rollback_moves(&moved);
             return Err(err).with_context(|| format!("failed to create {}", parent.display()));
         }
-        if let Err(err) = fs::rename(source, &destination) {
+        if let Err(err) = fs::rename(&step.source, &step.destination) {
             rollback_moves(&moved);
             return Err(err).with_context(|| {
                 format!(
                     "failed to move {} to {}",
-                    source.display(),
-                    destination.display()
+                    step.source.display(),
+                    step.destination.display()
                 )
             });
         }
-        moved.push((source.clone(), destination));
+        moved.push((step.source, step.destination));
     }
     Ok(moved
         .into_iter()
@@ -3709,8 +3785,12 @@ fn backup_existing_duplicate_artifacts(existing_videos: &[PathBuf]) -> Result<Ve
         }
     }
 
+    backup_existing_paths(artifacts)
+}
+
+fn backup_existing_paths(paths: impl IntoIterator<Item = PathBuf>) -> Result<Vec<FileBackup>> {
     let mut backups = Vec::new();
-    for original in artifacts {
+    for original in paths.into_iter().collect::<BTreeSet<_>>() {
         if !original.exists() {
             continue;
         }
@@ -4934,9 +5014,22 @@ mod tests {
         fs::write(staging_dir.join("Episode.xml"), "new-xml").expect("xml should write");
         fs::write(staging_dir.join("Episode.cover.jpg"), "cover").expect("cover should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV123".to_string(),
+            },
+            existing_videos: Vec::new(),
+        };
 
-        let moved = move_staged_artifact_files(&staging_dir, &final_dir, &staged_files)
-            .expect("artifact files should move");
+        let moved = move_staged_artifact_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+        )
+        .expect("artifact files should move");
 
         let kept_xml = final_dir.join("Episode (2).xml");
         let cover = final_dir.join("Episode.cover.jpg");
@@ -4952,6 +5045,55 @@ mod tests {
         assert_eq!(
             fs::read_to_string(cover).expect("cover should move"),
             "cover"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn artifact_only_overwrite_replaces_existing_video_sidecars() {
+        let final_dir = temp_test_dir("artifact-only-overwrite");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let existing = final_dir.join("Existing Title.mkv");
+        fs::write(&existing, "video").expect("existing video should write");
+        fs::write(existing.with_extension("xml"), "old-xml").expect("old xml should write");
+        fs::write(final_dir.join("Existing Title.cover.jpg"), "old-cover")
+            .expect("old cover should write");
+        fs::write(staging_dir.join("Downloaded.xml"), "new-xml").expect("xml should write");
+        fs::write(staging_dir.join("Downloaded.cover.jpg"), "new-cover")
+            .expect("cover should write");
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+
+        let moved = move_staged_artifact_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+        )
+        .expect("artifact files should overwrite sidecars");
+
+        let xml = existing.with_extension("xml");
+        let cover = final_dir.join("Existing Title.cover.jpg");
+        assert_eq!(moved, vec![cover.clone(), xml.clone()]);
+        assert_eq!(
+            fs::read_to_string(xml).expect("xml should be replaced"),
+            "new-xml"
+        );
+        assert_eq!(
+            fs::read_to_string(cover).expect("cover should be replaced"),
+            "new-cover"
+        );
+        assert_eq!(
+            fs::read_to_string(existing).expect("video should remain"),
+            "video"
         );
         let _ = fs::remove_dir_all(final_dir);
     }

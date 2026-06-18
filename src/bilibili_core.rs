@@ -4,9 +4,10 @@ use anyhow::{Context, Result, bail, ensure};
 use bbdown_core::{
     AccessKeyLoginConfig, AccessKeyLoginCredentials, AccessKeyLoginTicket, BiliClient,
     ClientConfig, CredentialHealthReport, CredentialProfileSelection, CredentialSource,
-    CredentialStore, Credentials, DanmakuFormat, DownloadMode, DownloadOptions, EndpointConfig,
-    MediaHostOptions, MuxOptions, PlayurlMode, RestrictedArea, RestrictedAreaConfig,
-    RestrictedAreaProxy, RestrictedAreaProxyKind, RetryPolicy, Selection, StreamSelection,
+    CredentialStore, Credentials, DEFAULT_CREDENTIAL_PROFILE, DanmakuFormat, DownloadMode,
+    DownloadOptions, EndpointConfig, MediaHostOptions, MuxOptions, PlayurlMode, RestrictedArea,
+    RestrictedAreaConfig, RestrictedAreaProxy, RestrictedAreaProxyKind, RetryPolicy, Selection,
+    StreamSelection,
 };
 
 use crate::config::AppConfig;
@@ -57,8 +58,8 @@ impl CredentialRuntime {
             }
             None => {
                 self.store
-                    .clear()
-                    .context("failed to clear BBDown credentials")?;
+                    .remove_profile(DEFAULT_CREDENTIAL_PROFILE)
+                    .context("failed to clear BBDown default credential profile")?;
             }
         }
         Ok(())
