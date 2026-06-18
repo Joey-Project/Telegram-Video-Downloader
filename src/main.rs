@@ -519,6 +519,7 @@ async fn run_bbdown_qr_login(
         BilibiliAuthLoginMode::AccessKey => bail!("access-key login is not a QR polling command"),
     };
     let output = ticket.output();
+    ensure_bbdown_login_active(auth_generation)?;
     send_bbdown_auth_ticket(
         telegram,
         chat_id,
@@ -528,6 +529,7 @@ async fn run_bbdown_qr_login(
         config.bilibili.auth.login_timeout_seconds,
     )
     .await?;
+    ensure_bbdown_login_active(auth_generation)?;
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(
             config.bilibili.auth.login_timeout_seconds,
@@ -594,6 +596,7 @@ async fn start_bbdown_access_key_login(
     chat_id: i64,
     auth_generation: u64,
 ) -> Result<()> {
+    ensure_bbdown_login_active(auth_generation)?;
     let ticket = bilibili_core::create_access_key_ticket()?;
     let output = ticket.output();
     send_bbdown_auth_ticket(
@@ -605,6 +608,7 @@ async fn start_bbdown_access_key_login(
         config.bilibili.auth.login_timeout_seconds,
     )
     .await?;
+    ensure_bbdown_login_active(auth_generation)?;
     {
         let mut logins = pending_bilibili_access_key_logins().lock().await;
         prune_expired_pending_bilibili_access_key_logins(&mut logins, Instant::now());
