@@ -483,6 +483,7 @@ async fn run_bilibili_job_locked(
         .download_plan_with_progress(&core_plan, options, &progress_reporter)
         .await?;
     let report = BilibiliDownloadReport::from(&core_report);
+    cleanup_bilibili_mux_input_files(&config.downloads.video_dir, &report)?;
     let primary_videos = bilibili_report_primary_media(&config.downloads.video_dir, &report);
     let mut details = vec![format!(
         "BBDown-rust crate: {} entr{}",
@@ -611,6 +612,31 @@ fn bilibili_report_primary_media(cwd: &Path, report: &BilibiliDownloadReport) ->
         }
     }
     media
+}
+
+fn cleanup_bilibili_mux_input_files(cwd: &Path, report: &BilibiliDownloadReport) -> Result<()> {
+    for entry in &report.entries {
+        if entry.mux.is_none() {
+            continue;
+        }
+        for file in entry
+            .files
+            .iter()
+            .filter(|file| matches!(file.kind.as_str(), "video" | "audio" | "flv_segment"))
+        {
+            let path = resolve_command_output_path(cwd, &file.path);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to remove raw Bilibili input {}", path.display())
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_command_output_path(cwd: &Path, path: &Path) -> PathBuf {
@@ -5849,6 +5875,35 @@ mod tests {
             primary_media,
             vec![PathBuf::from("/tmp/videos/Episode 1/Episode 1.mkv")]
         );
+    }
+
+    #[test]
+    fn cleanup_bilibili_mux_input_files_removes_raw_streams_only() {
+        let root = temp_test_dir("cleanup-bilibili-mux-inputs");
+        let entry_dir = root.join("Episode 1");
+        fs::create_dir_all(&entry_dir).expect("entry dir should create");
+        let video = entry_dir.join("video.m4s");
+        let audio = entry_dir.join("audio.m4s");
+        let mux = entry_dir.join("Episode 1.mkv");
+        let danmaku = entry_dir.join("Episode 1.xml");
+        fs::write(&video, "video").expect("video should write");
+        fs::write(&audio, "audio").expect("audio should write");
+        fs::write(&mux, "mux").expect("mux should write");
+        fs::write(&danmaku, "danmaku").expect("danmaku should write");
+        let report = parse_bilibili_download_report(
+            r#"
+            {"title":"Season","output_dir":".","entries":[{"index":1,"title":"Episode 1","directory":"Episode 1","files":[{"kind":"video","path":"Episode 1/video.m4s"},{"kind":"audio","path":"Episode 1/audio.m4s"},{"kind":"danmaku","path":"Episode 1/Episode 1.xml"}],"mux":{"output_path":"Episode 1/Episode 1.mkv"}}]}
+            "#,
+        )
+        .expect("download report JSON should parse");
+
+        cleanup_bilibili_mux_input_files(&root, &report).expect("raw inputs should clean up");
+
+        assert!(!video.exists());
+        assert!(!audio.exists());
+        assert!(mux.exists());
+        assert!(danmaku.exists());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
