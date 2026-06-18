@@ -568,12 +568,12 @@ async fn run_bbdown_qr_login(
                     }
                     QrLoginState::Expired => bail!("BBDown QR code expired"),
                     QrLoginState::Succeeded { credentials } => {
-                        ensure_bbdown_login_active(auth_generation)?;
-                        sync_legacy_bilibili_auth_state_before_login(config)?;
-                        let summary =
-                            bilibili_core::credential_runtime(config)?.save_merged(credentials)?;
-                        clear_legacy_bilibili_auth_state_after_login(config)?;
-                        return Ok(summary);
+                        return save_bbdown_login_credentials(
+                            config,
+                            auth_generation,
+                            credentials,
+                        )
+                        .await;
                     }
                 }
             }
@@ -636,6 +636,9 @@ async fn maybe_complete_pending_bilibili_access_key_login(
     if text.trim_start().starts_with('/') {
         return false;
     }
+    if !bilibili_core::looks_like_access_key_login_input(text) {
+        return false;
+    }
     let pending = {
         let mut logins = pending_bilibili_access_key_logins().lock().await;
         prune_expired_pending_bilibili_access_key_logins(&mut logins, Instant::now());
@@ -684,25 +687,28 @@ async fn complete_bbdown_access_key_login_inner(
     input: &str,
 ) -> Result<CredentialSource> {
     ensure_bbdown_login_active(pending.auth_generation)?;
-    sync_legacy_bilibili_auth_state_before_login(config)?;
-    let summary = bilibili_core::complete_access_key_login(config, &pending.ticket, input)?;
-    ensure_bbdown_login_active(pending.auth_generation)?;
-    clear_legacy_bilibili_auth_state_after_login(config)?;
-    Ok(summary)
+    let credentials = bilibili_core::access_key_login_credentials(&pending.ticket, input)?;
+    save_bbdown_login_credentials(config, pending.auth_generation, credentials).await
 }
 
-fn sync_legacy_bilibili_auth_state_before_login(config: &AppConfig) -> Result<()> {
+async fn save_bbdown_login_credentials(
+    config: &AppConfig,
+    auth_generation: u64,
+    credentials: bbdown_core::Credentials,
+) -> Result<CredentialSource> {
+    let _state_guard = bbdown_auth_state_lock().lock().await;
+    ensure_bbdown_login_active(auth_generation)?;
     bilibili_auth::sync_bbdown_rust_credentials_from_state(
         &config.bilibili.auth.state_path,
         &config.bilibili.auth.credential_file,
         config.bilibili.auth.credential_profile.as_deref(),
     )?;
-    Ok(())
-}
-
-fn clear_legacy_bilibili_auth_state_after_login(config: &AppConfig) -> Result<()> {
+    ensure_bbdown_login_active(auth_generation)?;
+    let summary = bilibili_core::credential_runtime(config)?.save_merged(credentials)?;
+    ensure_bbdown_login_active(auth_generation)?;
     bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path)?;
-    Ok(())
+    ensure_bbdown_login_active(auth_generation)?;
+    Ok(summary)
 }
 
 async fn poll_bbdown_qr_login(
@@ -897,12 +903,13 @@ async fn run_bbdown_logout(telegram: TelegramClient, config: Arc<AppConfig>, cha
     BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
     bbdown_login_cancel_notify().notify_waiters();
     pending_bilibili_access_key_logins().lock().await.clear();
-    let legacy_state = {
+    let (legacy_state, credential_state) = {
         let _state_guard = bbdown_auth_state_lock().lock().await;
-        bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path)
+        let legacy_state = bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path);
+        let credential_state =
+            bilibili_core::credential_runtime(&config).and_then(|runtime| runtime.logout());
+        (legacy_state, credential_state)
     };
-    let credential_state =
-        bilibili_core::credential_runtime(&config).and_then(|runtime| runtime.logout());
     let message = match (legacy_state, credential_state) {
         (Ok(_), Ok(())) => "BBDown credential state cleared.".to_string(),
         (Ok(_), Err(err)) => format!(

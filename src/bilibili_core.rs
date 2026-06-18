@@ -93,13 +93,19 @@ pub fn create_access_key_ticket() -> Result<AccessKeyLoginTicket> {
     .ticket()?)
 }
 
-pub fn complete_access_key_login(
-    config: &AppConfig,
+pub fn access_key_login_credentials(
     ticket: &AccessKeyLoginTicket,
     input: &str,
-) -> Result<CredentialSource> {
-    let credentials = parse_access_key_login_input(ticket, input)?.credentials();
-    credential_runtime(config)?.save_merged(credentials)
+) -> Result<Credentials> {
+    Ok(parse_access_key_login_input(ticket, input)?.credentials())
+}
+
+pub fn looks_like_access_key_login_input(input: &str) -> bool {
+    let input = input.trim();
+    input.starts_with(BALH_LOGIN_CREDENTIALS_PREFIX)
+        || (input.starts_with('{') && input.contains("\"access_key\""))
+        || input.contains("access_key=")
+        || input.contains("access_token=")
 }
 
 pub fn selection(selection: Option<BilibiliSelection>) -> Option<Selection> {
@@ -533,6 +539,26 @@ mod tests {
             Some(Selection::All)
         );
         assert_eq!(selection(None), None);
+    }
+
+    #[test]
+    fn identifies_access_key_login_input_shapes() {
+        assert!(looks_like_access_key_login_input(
+            r#"balh-login-credentials: {"access_key":"AK"}"#
+        ));
+        assert!(looks_like_access_key_login_input(
+            "https://www.bilibili.com/callback?access_token=AK&refresh_token=RT"
+        ));
+        assert!(looks_like_access_key_login_input(
+            "#access_key=AK&expires_in=60"
+        ));
+        assert!(looks_like_access_key_login_input(
+            r#"{"access_key":"AK","refresh_token":"RT"}"#
+        ));
+        assert!(!looks_like_access_key_login_input(
+            "https://www.bilibili.com/video/BV123"
+        ));
+        assert!(!looks_like_access_key_login_input("普通消息"));
     }
 
     #[test]
