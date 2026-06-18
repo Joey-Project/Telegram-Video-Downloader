@@ -783,36 +783,50 @@ async fn send_bbdown_auth_ticket(
         }
     };
     if matches!(mode, BilibiliAuthLoginMode::AccessKey) {
-        send_or_log(telegram, chat_id, format!("Authorization link:\n{url}")).await;
-        match bilibili_auth::render_qr_png(qr_payload) {
-            Ok(png) => {
-                if let Err(err) = telegram.send_photo(chat_id, caption, png).await {
+        let link_delivered = match telegram
+            .send_message(chat_id, format!("Authorization link:\n{url}"))
+            .await
+        {
+            Ok(_) => true,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to send BBDown access-key authorization link"
+                );
+                false
+            }
+        };
+        let qr_delivered = match bilibili_auth::render_qr_png(qr_payload) {
+            Ok(png) => match telegram.send_photo(chat_id, caption, png).await {
+                Ok(()) => true,
+                Err(err) => {
                     warn!(
                         error = %err,
                         "failed to send BBDown access-key QR image after authorization link"
                     );
-                    send_or_log(
-                        telegram,
-                        chat_id,
-                        "BBDown access-key QR image could not be sent. Use the authorization link above."
-                            .to_string(),
-                    )
-                    .await;
+                    if link_delivered {
+                        let message = "BBDown access-key QR image could not be sent. Use the authorization link above."
+                            .to_string();
+                        send_or_log(telegram, chat_id, message).await;
+                    }
+                    false
                 }
-            }
+            },
             Err(err) => {
                 warn!(
                     error = %err,
                     "failed to render BBDown access-key QR image after authorization link"
                 );
-                send_or_log(
-                    telegram,
-                    chat_id,
-                    "BBDown access-key QR image could not be rendered. Use the authorization link above."
-                        .to_string(),
-                )
-                .await;
+                if link_delivered {
+                    let message = "BBDown access-key QR image could not be rendered. Use the authorization link above."
+                        .to_string();
+                    send_or_log(telegram, chat_id, message).await;
+                }
+                false
             }
+        };
+        if !link_delivered && !qr_delivered {
+            bail!("failed to send BBDown access-key authorization link or QR image");
         }
         return Ok(());
     }
