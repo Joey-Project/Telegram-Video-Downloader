@@ -1915,8 +1915,8 @@ async fn probe_bilibili_plan(
 ) -> Result<BilibiliDownloadPlan> {
     sync_bilibili_rust_credentials(config)?;
     let client = bilibili_core::client(config)?;
-    let plan =
-        probe_bilibili_plan_with_mode(&client, url, selection, DownloadMode::All, timeout).await?;
+    let mode = bilibili_core::download_mode_from_config(config)?;
+    let plan = probe_bilibili_plan_with_mode(&client, url, selection, mode, timeout).await?;
     Ok(BilibiliDownloadPlan::from(&plan))
 }
 
