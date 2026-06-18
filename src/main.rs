@@ -885,8 +885,22 @@ fn prune_expired_pending_bilibili_access_key_logins(
 }
 
 async fn run_bbdown_status(telegram: TelegramClient, config: Arc<AppConfig>, chat_id: i64) {
-    let message = match bilibili_core::credential_health(&config).await {
-        Ok(report) => format_bbdown_credential_health_report(&report),
+    let sync_result = {
+        let _state_guard = bbdown_auth_state_lock().lock().await;
+        bilibili_auth::sync_bbdown_rust_credentials_from_state(
+            &config.bilibili.auth.state_path,
+            &config.bilibili.auth.credential_file,
+            config.bilibili.auth.credential_profile.as_deref(),
+        )
+    };
+    let message = match sync_result {
+        Ok(_) => match bilibili_core::credential_health(&config).await {
+            Ok(report) => format_bbdown_credential_health_report(&report),
+            Err(err) => format!(
+                "Failed to check BBDown credential health:\n{}",
+                summarize_bbdown_auth_error(&err)
+            ),
+        },
         Err(err) => format!(
             "Failed to check BBDown credential health:\n{}",
             summarize_bbdown_auth_error(&err)
