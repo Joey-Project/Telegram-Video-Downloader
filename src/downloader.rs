@@ -2974,11 +2974,7 @@ fn push_bilibili_plan_identities(identities: &mut Vec<VideoIdentity>, plan: &Bil
                 },
             );
         }
-        for id in [
-            entry.aid.to_string(),
-            format!("av{}", entry.aid),
-            format!("cid{}", entry.cid),
-        ] {
+        for id in [format!("av{}", entry.aid), format!("cid{}", entry.cid)] {
             push_unique_video_identity(
                 identities,
                 VideoIdentity {
@@ -2988,15 +2984,13 @@ fn push_bilibili_plan_identities(identities: &mut Vec<VideoIdentity>, plan: &Bil
             );
         }
         if let Some(epid) = entry.epid {
-            for id in [epid.to_string(), format!("ep{epid}")] {
-                push_unique_video_identity(
-                    identities,
-                    VideoIdentity {
-                        provider: VideoProvider::Bilibili,
-                        id,
-                    },
-                );
-            }
+            push_unique_video_identity(
+                identities,
+                VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: format!("ep{epid}"),
+                },
+            );
         }
     }
 }
@@ -5996,11 +5990,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(ids.contains(&"BV123".to_string()));
-        assert!(ids.contains(&"123".to_string()));
         assert!(ids.contains(&"av123".to_string()));
         assert!(ids.contains(&"cid456".to_string()));
-        assert!(ids.contains(&"789".to_string()));
         assert!(ids.contains(&"ep789".to_string()));
+        assert!(!ids.contains(&"123".to_string()));
+        assert!(!ids.contains(&"789".to_string()));
     }
 
     #[test]

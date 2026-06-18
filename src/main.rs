@@ -612,6 +612,7 @@ async fn start_bbdown_access_key_login(
     {
         let mut logins = pending_bilibili_access_key_logins().lock().await;
         prune_expired_pending_bilibili_access_key_logins(&mut logins, Instant::now());
+        ensure_bbdown_login_active(auth_generation)?;
         logins.insert(
             chat_id,
             PendingBilibiliAccessKeyLogin {
