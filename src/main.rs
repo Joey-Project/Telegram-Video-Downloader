@@ -569,6 +569,7 @@ async fn run_bbdown_qr_login(
                     QrLoginState::Expired => bail!("BBDown QR code expired"),
                     QrLoginState::Succeeded { credentials } => {
                         ensure_bbdown_login_active(auth_generation)?;
+                        sync_legacy_bilibili_auth_state_before_login(config)?;
                         let summary =
                             bilibili_core::credential_runtime(config)?.save_merged(credentials)?;
                         clear_legacy_bilibili_auth_state_after_login(config)?;
@@ -683,10 +684,20 @@ async fn complete_bbdown_access_key_login_inner(
     input: &str,
 ) -> Result<CredentialSource> {
     ensure_bbdown_login_active(pending.auth_generation)?;
+    sync_legacy_bilibili_auth_state_before_login(config)?;
     let summary = bilibili_core::complete_access_key_login(config, &pending.ticket, input)?;
     ensure_bbdown_login_active(pending.auth_generation)?;
     clear_legacy_bilibili_auth_state_after_login(config)?;
     Ok(summary)
+}
+
+fn sync_legacy_bilibili_auth_state_before_login(config: &AppConfig) -> Result<()> {
+    bilibili_auth::sync_bbdown_rust_credentials_from_state(
+        &config.bilibili.auth.state_path,
+        &config.bilibili.auth.credential_file,
+        config.bilibili.auth.credential_profile.as_deref(),
+    )?;
+    Ok(())
 }
 
 fn clear_legacy_bilibili_auth_state_after_login(config: &AppConfig) -> Result<()> {

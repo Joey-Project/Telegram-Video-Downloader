@@ -1312,41 +1312,51 @@ async fn run_staged_video_job(
         .into_iter()
         .filter(|path| !is_staging_support_file(&staging_dir, path))
         .collect::<Vec<_>>();
+    if staged_files.is_empty() {
+        bail!(
+            "staged video download finished but no output files were found in {}",
+            staging_dir.display()
+        );
+    }
     let staged_media = staged_files
         .iter()
         .filter(|path| is_primary_media_file(path, primary_media_kind))
         .cloned()
         .collect::<Vec<_>>();
-    if staged_media.is_empty() {
+    let artifact_only = bilibili_downloads_artifacts_only(config, job)?;
+    if staged_media.is_empty() && !artifact_only {
         bail!(
             "staged video download finished but no primary media files were found in {}",
             staging_dir.display()
         );
     }
 
-    let move_report = move_staged_video_files(
-        &staging_dir,
-        &final_dir,
-        &staged_files,
-        action,
-        duplicate,
-        primary_media_kind,
-    )
-    .with_context(|| format!("failed to move staged files from {}", staging_dir.display()));
-    let moved_media = move_report?;
+    let moved_files = if staged_media.is_empty() && artifact_only {
+        move_staged_artifact_files(&staging_dir, &final_dir, &staged_files)
+    } else {
+        move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            action,
+            duplicate,
+            primary_media_kind,
+        )
+    }
+    .with_context(|| format!("failed to move staged files from {}", staging_dir.display()))?;
     send_progress(
         progress.as_ref(),
-        format!("staging: moved {} media file(s)", moved_media.len()),
+        format!("staging: moved {} file(s)", moved_files.len()),
     );
 
-    let saved_location = if moved_media.len() == 1 {
-        moved_media[0].display().to_string()
+    let saved_location = if moved_files.len() == 1 {
+        moved_files[0].display().to_string()
     } else {
-        join_paths(&moved_media)
+        join_paths(&moved_files)
     };
     let details = nonempty_join(vec![
         remove_staging_detail_lines(&report.details, &staging_dir),
-        format!("Moved: {}", join_paths(&moved_media)),
+        format!("Moved: {}", join_paths(&moved_files)),
     ]);
     Ok(JobReport {
         saved_location,
@@ -1564,6 +1574,16 @@ fn parse_bool_token(value: &str) -> Option<bool> {
 
 fn bilibili_downloads_audio_only(config: &AppConfig) -> Result<bool> {
     Ok(bilibili_core::download_mode_from_config(config)? == DownloadMode::AudioOnly)
+}
+
+fn bilibili_downloads_artifacts_only(config: &AppConfig, job: &JobRequest) -> Result<bool> {
+    if !matches!(job, JobRequest::Bilibili { .. }) {
+        return Ok(false);
+    }
+    Ok(matches!(
+        bilibili_core::download_mode_from_config(config)?,
+        DownloadMode::SubtitleOnly | DownloadMode::DanmakuOnly | DownloadMode::CoverOnly
+    ))
 }
 
 fn has_bilibili_only_value(args: &[String], expected: &str) -> bool {
@@ -3398,6 +3418,44 @@ fn move_staged_video_files_inner(
     execute_move_plan(plan, primary_media_kind)
 }
 
+fn move_staged_artifact_files(
+    staging_dir: &Path,
+    final_dir: &Path,
+    staged_files: &[PathBuf],
+) -> Result<Vec<PathBuf>> {
+    let mut reserved = BTreeSet::new();
+    let mut moved = Vec::new();
+    for source in staged_files {
+        let destination = unique_path_avoiding(
+            relative_destination(staging_dir, final_dir, source),
+            &reserved,
+        );
+        reserved.insert(destination.clone());
+        if let Some(parent) = destination.parent()
+            && !parent.as_os_str().is_empty()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            rollback_moves(&moved);
+            return Err(err).with_context(|| format!("failed to create {}", parent.display()));
+        }
+        if let Err(err) = fs::rename(source, &destination) {
+            rollback_moves(&moved);
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to move {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            });
+        }
+        moved.push((source.clone(), destination));
+    }
+    Ok(moved
+        .into_iter()
+        .map(|(_, destination)| destination)
+        .collect())
+}
+
 fn staged_move_plan(
     staging_dir: &Path,
     final_dir: &Path,
@@ -4842,6 +4900,37 @@ mod tests {
     }
 
     #[test]
+    fn artifact_only_staging_moves_outputs_without_primary_media() {
+        let final_dir = temp_test_dir("artifact-only-staging");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        fs::write(final_dir.join("Episode.xml"), "old-xml").expect("old xml should write");
+        fs::write(staging_dir.join("Episode.xml"), "new-xml").expect("xml should write");
+        fs::write(staging_dir.join("Episode.cover.jpg"), "cover").expect("cover should write");
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_artifact_files(&staging_dir, &final_dir, &staged_files)
+            .expect("artifact files should move");
+
+        let kept_xml = final_dir.join("Episode (2).xml");
+        let cover = final_dir.join("Episode.cover.jpg");
+        assert_eq!(moved, vec![cover.clone(), kept_xml.clone()]);
+        assert_eq!(
+            fs::read_to_string(final_dir.join("Episode.xml")).expect("old xml should remain"),
+            "old-xml"
+        );
+        assert_eq!(
+            fs::read_to_string(kept_xml).expect("new xml should move uniquely"),
+            "new-xml"
+        );
+        assert_eq!(
+            fs::read_to_string(cover).expect("cover should move"),
+            "cover"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
     fn keep_both_moves_bilibili_segment_primary_files() {
         let final_dir = temp_test_dir("keep-both-bilibili-segments");
         let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
@@ -5783,6 +5872,44 @@ mod tests {
             &["--only".to_string(), "video".to_string()],
             "audio"
         ));
+    }
+
+    #[test]
+    fn artifact_only_bilibili_modes_skip_primary_media_requirement() {
+        let mut config = test_config();
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV123".to_string(),
+            selection: None,
+        };
+
+        for mode in ["subtitle", "danmaku", "cover"] {
+            config.bilibili.download_args = vec!["--only".to_string(), mode.to_string()];
+            assert!(
+                bilibili_downloads_artifacts_only(&config, &job)
+                    .expect("artifact-only check should succeed"),
+                "{mode} should be artifact-only"
+            );
+        }
+
+        for mode in ["all", "audio", "video"] {
+            config.bilibili.download_args = vec!["--only".to_string(), mode.to_string()];
+            assert!(
+                !bilibili_downloads_artifacts_only(&config, &job)
+                    .expect("artifact-only check should succeed"),
+                "{mode} should require primary media"
+            );
+        }
+
+        config.bilibili.download_args = vec!["--only".to_string(), "danmaku".to_string()];
+        assert!(
+            !bilibili_downloads_artifacts_only(
+                &config,
+                &JobRequest::Youtube {
+                    url: "https://www.youtube.com/watch?v=PHH1wTDF-1M".to_string(),
+                },
+            )
+            .expect("non-Bilibili check should succeed")
+        );
     }
 
     #[test]
