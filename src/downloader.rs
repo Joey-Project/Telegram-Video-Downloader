@@ -493,8 +493,9 @@ async fn run_bilibili_job_locked(
         .download_plan_with_progress(&core_plan, options, &progress_reporter)
         .await?;
     let report = BilibiliDownloadReport::from(&core_report);
-    cleanup_bilibili_mux_input_files(&config.downloads.video_dir, &report)?;
-    let primary_videos = bilibili_report_primary_media(&config.downloads.video_dir, &report);
+    let output_dir = bilibili_core::output_dir(config);
+    cleanup_bilibili_mux_input_files(&output_dir, &report)?;
+    let primary_videos = bilibili_report_primary_media(&output_dir, &report);
     let mut details = vec![format!(
         "BBDown-rust crate: {} entr{}",
         report.entries.len(),
@@ -508,7 +509,7 @@ async fn run_bilibili_job_locked(
         details.push(format!("Title: {}", report.title));
     }
     if config.video.write_nfo {
-        match write_bilibili_nfos(&config.downloads.video_dir, url, &plan, &report) {
+        match write_bilibili_nfos(&output_dir, url, &plan, &report) {
             Ok(created_nfos) if !created_nfos.is_empty() => {
                 details.push(format!("NFO: {}", join_paths(&created_nfos)));
             }
@@ -519,7 +520,7 @@ async fn run_bilibili_job_locked(
 
     Ok(JobReport {
         saved_location: if primary_videos.is_empty() {
-            resolve_command_output_path(&config.downloads.video_dir, &report.output_dir)
+            resolve_command_output_path(&output_dir, &report.output_dir)
                 .display()
                 .to_string()
         } else if primary_videos.len() == 1 {
