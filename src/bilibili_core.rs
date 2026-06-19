@@ -110,6 +110,7 @@ pub fn looks_like_access_key_login_input(input: &str) -> bool {
     let input = input.trim();
     input.starts_with(BALH_LOGIN_CREDENTIALS_PREFIX)
         || (input.starts_with('{') && input.contains("\"access_key\""))
+        || (input.starts_with('{') && input.contains("\"access_token\""))
         || input.contains("access_key=")
         || input.contains("access_token=")
 }
@@ -564,6 +565,9 @@ mod tests {
         ));
         assert!(looks_like_access_key_login_input(
             r#"{"access_key":"AK","refresh_token":"RT"}"#
+        ));
+        assert!(looks_like_access_key_login_input(
+            r#"{"access_token":"AK","refresh_token":"RT"}"#
         ));
         assert!(!looks_like_access_key_login_input(
             "https://www.bilibili.com/video/BV123"

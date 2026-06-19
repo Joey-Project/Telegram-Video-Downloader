@@ -2007,6 +2007,8 @@ mod tests {
 
     use super::*;
 
+    static TEST_AUTH_GENERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn redacts_bilibili_login_qr_urls_from_auth_errors() {
         let summary = summarize_bbdown_auth_error(&anyhow!(
@@ -2083,6 +2085,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_login_save_ignores_malformed_legacy_auth_state() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
         let root = temp_main_test_dir("fresh-login-malformed-legacy");
         fs::create_dir_all(&root).expect("temp dir should create");
         let mut config = AppConfig::for_test();
@@ -2392,6 +2395,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_cancel_check_handles_future_notify_waiters() {
+        let _guard = TEST_AUTH_GENERATION_LOCK.lock().await;
         let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
         BILIBILI_AUTH_GENERATION.fetch_add(1, Ordering::SeqCst);
         let result = await_bbdown_login_active(generation, async { "completed" }).await;
