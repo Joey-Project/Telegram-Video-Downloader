@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -122,8 +123,7 @@ pub fn selection(selection: Option<BilibiliSelection>) -> Option<Selection> {
 
 pub fn download_options(config: &AppConfig) -> Result<DownloadOptions> {
     let mode = download_mode_from_config(config)?;
-    let output_dir = config.resolve_project_path(&config.downloads.video_dir);
-    Ok(DownloadOptions::new(output_dir)
+    Ok(DownloadOptions::new(output_dir(config))
         .with_retry_policy(RetryPolicy::default())
         .with_stream_selection(StreamSelection::default())
         .with_download_idle_timeout(Some(Duration::from_secs(
@@ -134,6 +134,10 @@ pub fn download_options(config: &AppConfig) -> Result<DownloadOptions> {
         .with_danmaku_formats(danmaku_formats(config)?)
         .with_media_hosts(MediaHostOptions::bbdown_cli_default())
         .with_mux(MuxOptions::ffmpeg(config.tools.ffmpeg.clone())))
+}
+
+pub fn output_dir(config: &AppConfig) -> PathBuf {
+    config.resolve_project_path(&config.downloads.video_dir)
 }
 
 pub fn download_mode_from_config(config: &AppConfig) -> Result<DownloadMode> {

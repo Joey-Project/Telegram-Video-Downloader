@@ -397,7 +397,8 @@ fn find_video_duplicate_for_identities(
     }
 
     let primary_media_kind = staged_primary_media_kind(config, job)?;
-    let media_files = list_primary_media_files(&config.downloads.video_dir, primary_media_kind)?;
+    let media_files =
+        list_primary_media_files(&duplicate_scan_video_dir(config, job), primary_media_kind)?;
     let mut matched_identity = None;
     let mut seen_videos = BTreeSet::new();
     let mut existing_videos = Vec::new();
@@ -421,6 +422,14 @@ fn find_video_duplicate_for_identities(
         identity,
         existing_videos,
     }))
+}
+
+fn duplicate_scan_video_dir(config: &AppConfig, job: &JobRequest) -> PathBuf {
+    if matches!(job, JobRequest::Bilibili { .. }) {
+        bilibili_core::output_dir(config)
+    } else {
+        config.downloads.video_dir.clone()
+    }
 }
 
 async fn run_simple_job(
@@ -1320,7 +1329,11 @@ async fn run_staged_video_job(
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<JobReport> {
     let _guard = video_output_lock("Staged video download", progress.as_ref()).await;
-    let final_dir = config.downloads.video_dir.clone();
+    let final_dir = if matches!(job, JobRequest::Bilibili { .. }) {
+        bilibili_core::output_dir(config)
+    } else {
+        config.downloads.video_dir.clone()
+    };
     let primary_media_kind = staged_primary_media_kind(config, job)?;
     let staging_dir = create_video_staging_dir(&final_dir)?;
     let _staging_cleanup = RemoveDirOnDrop::new(staging_dir.clone());
@@ -6109,6 +6122,32 @@ mod tests {
         assert_eq!(
             relative_options.output_dir,
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("relative-videos")
+        );
+    }
+
+    #[test]
+    fn bilibili_duplicate_scan_uses_resolved_output_dir() {
+        let mut config = test_config();
+        config.downloads.video_dir = PathBuf::from("relative-videos");
+
+        assert_eq!(
+            duplicate_scan_video_dir(
+                &config,
+                &JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV123".to_string(),
+                    selection: None,
+                },
+            ),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("relative-videos")
+        );
+        assert_eq!(
+            duplicate_scan_video_dir(
+                &config,
+                &JobRequest::Youtube {
+                    url: "https://youtu.be/PHH1wTDF-1M".to_string(),
+                },
+            ),
+            PathBuf::from("relative-videos")
         );
     }
 
