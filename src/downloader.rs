@@ -27,6 +27,7 @@ use crate::router::{BilibiliSelection, JobRequest};
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
 const BILIBILI_FFMPEG_CONCAT_FILE_NAME: &str = "ffmpeg-concat.txt";
+const BILIBILI_DANMAKU_SIDECAR_NAMES: &[&str] = &["danmaku.xml", "danmaku.ass"];
 const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
     "nfo",
     "json",
@@ -3676,7 +3677,9 @@ fn sidecar_destination_for_best_primary<'a>(
     source: &Path,
     video_destinations: impl Iterator<Item = (&'a PathBuf, &'a Path)>,
 ) -> Option<PathBuf> {
-    video_destinations
+    let video_destinations = video_destinations.collect::<Vec<_>>();
+    if let Some(destination) = video_destinations
+        .iter()
         .filter_map(|(staged_video, video_destination)| {
             let suffix = sidecar_suffix_for_video(source, staged_video)?;
             let stem_len = staged_video.file_stem()?.to_str()?.len();
@@ -3685,6 +3688,30 @@ fn sidecar_destination_for_best_primary<'a>(
         })
         .max_by_key(|(stem_len, _)| *stem_len)
         .map(|(_, destination)| destination)
+    {
+        return Some(destination);
+    }
+
+    bare_bilibili_danmaku_destination_for_single_primary(source, &video_destinations)
+}
+
+fn bare_bilibili_danmaku_destination_for_single_primary<'a>(
+    source: &Path,
+    video_destinations: &[(&'a PathBuf, &'a Path)],
+) -> Option<PathBuf> {
+    if !is_bare_bilibili_danmaku_sidecar(source) {
+        return None;
+    }
+    let extension = source.extension()?.to_str()?;
+    let matching_videos = video_destinations
+        .iter()
+        .filter(|(staged_video, _)| staged_video.parent() == source.parent())
+        .collect::<Vec<_>>();
+    if matching_videos.len() != 1 {
+        return None;
+    }
+    let (_, video_destination) = matching_videos[0];
+    sidecar_destination_for_target_video(video_destination, &format!(".{extension}"))
 }
 
 fn relative_destination(staging_dir: &Path, final_dir: &Path, source: &Path) -> PathBuf {
@@ -3740,6 +3767,16 @@ fn sidecar_suffix_for_video(sidecar: &Path, video: &Path) -> Option<String> {
         .strip_prefix(video_stem)
         .filter(|suffix| suffix.starts_with('.'))
         .map(str::to_string)
+}
+
+fn is_bare_bilibili_danmaku_sidecar(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            BILIBILI_DANMAKU_SIDECAR_NAMES
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+        })
 }
 
 fn unique_path_avoiding(candidate: PathBuf, reserved: &BTreeSet<PathBuf>) -> PathBuf {
@@ -3891,16 +3928,18 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
         entries.push(path);
     }
     let prefix = format!("{stem}.");
+    let video_is_only_primary = primary_stems.len() == 1 && primary_stems.contains(stem);
     for path in entries {
         if path == video {
             continue;
         }
-        if is_known_video_sidecar(&path)
+        if (is_known_video_sidecar(&path)
             && path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(&prefix))
-            && best_primary_stem_for_sidecar(&path, &primary_stems).as_deref() == Some(stem)
+            && best_primary_stem_for_sidecar(&path, &primary_stems).as_deref() == Some(stem))
+            || (video_is_only_primary && is_bare_bilibili_danmaku_sidecar(&path))
         {
             artifacts.push(path);
         }
@@ -5356,6 +5395,59 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().contains(".replaced-"))
             .count();
         assert_eq!(replaced_files, 0);
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_replaces_bare_bilibili_danmaku_sidecar() {
+        let final_dir = temp_test_dir("overwrite-bare-bilibili-danmaku");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let existing = final_dir.join("Old Title [BV123].mkv");
+        fs::write(&existing, "old-video").expect("existing file should write");
+        fs::write(final_dir.join("danmaku.xml"), "old-danmaku")
+            .expect("old bare danmaku should write");
+        let staged = staging_dir.join("New Title [BV123].mkv");
+        fs::write(&staged, "new-video").expect("staged file should write");
+        fs::write(staging_dir.join("danmaku.xml"), "new-danmaku")
+            .expect("new bare danmaku should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged files should overwrite existing files");
+
+        assert_eq!(moved, vec![existing.clone()]);
+        assert_eq!(
+            fs::read_to_string(&existing).expect("video should be replaced"),
+            "new-video"
+        );
+        assert_eq!(
+            fs::read_to_string(existing.with_extension("xml"))
+                .expect("bare danmaku should follow overwritten video basename"),
+            "new-danmaku"
+        );
+        assert!(
+            !final_dir.join("danmaku.xml").exists(),
+            "stale bare danmaku should be removed during overwrite backup cleanup"
+        );
+        assert!(
+            !final_dir.join("danmaku (2).xml").exists(),
+            "new bare danmaku should not be moved as an unrelated relative artifact"
+        );
         let _ = fs::remove_dir_all(final_dir);
     }
 
