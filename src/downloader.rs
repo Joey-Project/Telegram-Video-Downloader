@@ -4630,6 +4630,28 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_bilibili_urls_keep_staging_fallback_identity() {
+        for url in [
+            "https://b23.tv/abc",
+            "https://www.bilibili.com/bangumi/play/ss12345",
+            "https://www.bilibili.com/bangumi/media/md12345",
+            "https://www.bilibili.tv/en/play/123/456",
+        ] {
+            assert_eq!(
+                fallback_video_identity(&JobRequest::Bilibili {
+                    url: url.to_string(),
+                    selection: Some(BilibiliSelection::Latest),
+                }),
+                Some(VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: "unknown".to_string(),
+                }),
+                "{url} should still run through staged keep-both"
+            );
+        }
+    }
+
+    #[test]
     fn finds_duplicate_video_from_filename_and_sidecar_metadata() {
         let mut config = test_config();
         let video_dir = temp_test_dir("duplicate-detection");
