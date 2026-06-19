@@ -26,6 +26,7 @@ use crate::router::{BilibiliSelection, JobRequest};
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
+const BILIBILI_FFMPEG_CONCAT_FILE_NAME: &str = "ffmpeg-concat.txt";
 const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
     "nfo",
     "json",
@@ -634,6 +635,32 @@ fn cleanup_bilibili_mux_input_files(cwd: &Path, report: &BilibiliDownloadReport)
                     });
                 }
             }
+        }
+        cleanup_bilibili_mux_support_files(cwd, entry)?;
+    }
+    Ok(())
+}
+
+fn cleanup_bilibili_mux_support_files(
+    cwd: &Path,
+    entry: &BilibiliEntryDownloadReport,
+) -> Result<()> {
+    let Some(mux) = &entry.mux else {
+        return Ok(());
+    };
+    let mux_output = resolve_command_output_path(cwd, &mux.output_path);
+    let support_dir = mux_output.parent().unwrap_or(cwd);
+    let concat_path = support_dir.join(BILIBILI_FFMPEG_CONCAT_FILE_NAME);
+    match fs::remove_file(&concat_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to remove Bilibili mux support file {}",
+                    concat_path.display()
+                )
+            });
         }
     }
     Ok(())
@@ -3330,6 +3357,10 @@ fn copy_bbdown_config_for_staging(final_dir: &Path, staging_dir: &Path) -> Resul
 
 fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
     path == staging_dir.join("BBDown.config")
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == BILIBILI_FFMPEG_CONCAT_FILE_NAME)
 }
 
 fn collect_regular_files(root: &Path) -> Result<Vec<PathBuf>> {
@@ -6070,6 +6101,15 @@ mod tests {
         assert!(
             matches!(options.mux, bbdown_core::MuxOptions::Ffmpeg { ref binary } if binary == &PathBuf::from("/opt/bin/ffmpeg"))
         );
+
+        let mut relative_config = test_config();
+        relative_config.downloads.video_dir = PathBuf::from("relative-videos");
+        let relative_options = bilibili_core::download_options(&relative_config)
+            .expect("relative Bilibili direct options should build");
+        assert_eq!(
+            relative_options.output_dir,
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("relative-videos")
+        );
     }
 
     #[test]
@@ -6120,10 +6160,12 @@ mod tests {
         let audio = entry_dir.join("audio.m4s");
         let mux = entry_dir.join("Episode 1.mkv");
         let danmaku = entry_dir.join("Episode 1.xml");
+        let concat = entry_dir.join(BILIBILI_FFMPEG_CONCAT_FILE_NAME);
         fs::write(&video, "video").expect("video should write");
         fs::write(&audio, "audio").expect("audio should write");
         fs::write(&mux, "mux").expect("mux should write");
         fs::write(&danmaku, "danmaku").expect("danmaku should write");
+        fs::write(&concat, "concat").expect("concat helper should write");
         let report = parse_bilibili_download_report(
             r#"
             {"title":"Season","output_dir":".","entries":[{"index":1,"title":"Episode 1","directory":"Episode 1","files":[{"kind":"video","path":"Episode 1/video.m4s"},{"kind":"audio","path":"Episode 1/audio.m4s"},{"kind":"danmaku","path":"Episode 1/Episode 1.xml"}],"mux":{"output_path":"Episode 1/Episode 1.mkv"}}]}
@@ -6135,9 +6177,30 @@ mod tests {
 
         assert!(!video.exists());
         assert!(!audio.exists());
+        assert!(!concat.exists());
         assert!(mux.exists());
         assert!(danmaku.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn staging_support_files_include_bilibili_concat_helper() {
+        let staging_dir = PathBuf::from("/tmp/staging");
+
+        assert!(is_staging_support_file(
+            &staging_dir,
+            &staging_dir.join(BILIBILI_FFMPEG_CONCAT_FILE_NAME)
+        ));
+        assert!(is_staging_support_file(
+            &staging_dir,
+            &staging_dir
+                .join("nested")
+                .join(BILIBILI_FFMPEG_CONCAT_FILE_NAME)
+        ));
+        assert!(!is_staging_support_file(
+            &staging_dir,
+            &staging_dir.join("Episode 1.mkv")
+        ));
     }
 
     #[test]
