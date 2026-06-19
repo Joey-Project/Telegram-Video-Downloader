@@ -27,7 +27,6 @@ use crate::router::{BilibiliSelection, JobRequest};
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
 const BILIBILI_FFMPEG_CONCAT_FILE_NAME: &str = "ffmpeg-concat.txt";
-const BILIBILI_DANMAKU_SIDECAR_NAMES: &[&str] = &["danmaku.xml", "danmaku.ass"];
 const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
     "nfo",
     "json",
@@ -3563,6 +3562,9 @@ fn artifact_overwrite_destination(source: &Path, target_video: &Path) -> Option<
     if !is_known_video_sidecar(source) {
         return None;
     }
+    if let Some(suffix) = unbound_bilibili_sidecar_suffix(source) {
+        return sidecar_destination_for_target_video(target_video, &suffix);
+    }
     let extension = source.extension()?.to_str()?;
     let source_stem = source.file_stem()?.to_str()?;
     let target_stem = target_video.file_stem()?.to_str()?;
@@ -3692,17 +3694,14 @@ fn sidecar_destination_for_best_primary<'a>(
         return Some(destination);
     }
 
-    bare_bilibili_danmaku_destination_for_single_primary(source, &video_destinations)
+    unbound_bilibili_sidecar_destination_for_single_primary(source, &video_destinations)
 }
 
-fn bare_bilibili_danmaku_destination_for_single_primary<'a>(
+fn unbound_bilibili_sidecar_destination_for_single_primary<'a>(
     source: &Path,
     video_destinations: &[(&'a PathBuf, &'a Path)],
 ) -> Option<PathBuf> {
-    if !is_bare_bilibili_danmaku_sidecar(source) {
-        return None;
-    }
-    let extension = source.extension()?.to_str()?;
+    let suffix = unbound_bilibili_sidecar_suffix(source)?;
     let matching_videos = video_destinations
         .iter()
         .filter(|(staged_video, _)| staged_video.parent() == source.parent())
@@ -3711,7 +3710,7 @@ fn bare_bilibili_danmaku_destination_for_single_primary<'a>(
         return None;
     }
     let (_, video_destination) = matching_videos[0];
-    sidecar_destination_for_target_video(video_destination, &format!(".{extension}"))
+    sidecar_destination_for_target_video(video_destination, &suffix)
 }
 
 fn relative_destination(staging_dir: &Path, final_dir: &Path, source: &Path) -> PathBuf {
@@ -3769,14 +3768,27 @@ fn sidecar_suffix_for_video(sidecar: &Path, video: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn is_bare_bilibili_danmaku_sidecar(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            BILIBILI_DANMAKU_SIDECAR_NAMES
-                .iter()
-                .any(|known| name.eq_ignore_ascii_case(known))
-        })
+fn unbound_bilibili_sidecar_suffix(path: &Path) -> Option<String> {
+    if !is_known_video_sidecar(path) {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    let extension = path.extension()?.to_str()?;
+    let lower_name = name.to_ascii_lowercase();
+    if lower_name == "danmaku.xml" || lower_name == "danmaku.ass" {
+        return Some(format!(".{extension}"));
+    }
+    if lower_name.starts_with("subtitle-") {
+        return Some(format!(".{name}"));
+    }
+    if lower_name.starts_with("cover-")
+        && ["jpg", "jpeg", "png", "webp"]
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    {
+        return Some(format!(".cover.{extension}"));
+    }
+    None
 }
 
 fn unique_path_avoiding(candidate: PathBuf, reserved: &BTreeSet<PathBuf>) -> PathBuf {
@@ -3939,7 +3951,7 @@ fn existing_video_artifacts(video: &Path) -> Result<Vec<PathBuf>> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with(&prefix))
             && best_primary_stem_for_sidecar(&path, &primary_stems).as_deref() == Some(stem))
-            || (video_is_only_primary && is_bare_bilibili_danmaku_sidecar(&path))
+            || (video_is_only_primary && unbound_bilibili_sidecar_suffix(&path).is_some())
         {
             artifacts.push(path);
         }
@@ -5447,6 +5459,104 @@ mod tests {
         assert!(
             !final_dir.join("danmaku (2).xml").exists(),
             "new bare danmaku should not be moved as an unrelated relative artifact"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_replaces_unbound_bilibili_subtitle_sidecar() {
+        let final_dir = temp_test_dir("overwrite-unbound-bilibili-subtitle");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let existing = final_dir.join("Old Title [BV123].mkv");
+        fs::write(&existing, "old-video").expect("existing file should write");
+        fs::write(final_dir.join("subtitle-zh-01-old.ass"), "old-subtitle")
+            .expect("old unbound subtitle should write");
+        let staged = staging_dir.join("New Title [BV123].mkv");
+        fs::write(&staged, "new-video").expect("staged file should write");
+        fs::write(staging_dir.join("subtitle-zh-01-new.ass"), "new-subtitle")
+            .expect("new unbound subtitle should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged files should overwrite existing files");
+
+        assert_eq!(moved, vec![existing.clone()]);
+        assert_eq!(
+            fs::read_to_string(existing.with_file_name("Old Title [BV123].subtitle-zh-01-new.ass"))
+                .expect("subtitle should follow overwritten video basename"),
+            "new-subtitle"
+        );
+        assert!(
+            !final_dir.join("subtitle-zh-01-old.ass").exists(),
+            "stale unbound subtitle should be removed during overwrite backup cleanup"
+        );
+        assert!(
+            !final_dir.join("subtitle-zh-01-new.ass").exists(),
+            "new unbound subtitle should not be moved as an unrelated relative artifact"
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn overwrite_replaces_unbound_bilibili_cover_sidecar() {
+        let final_dir = temp_test_dir("overwrite-unbound-bilibili-cover");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("job-1");
+        fs::create_dir_all(&staging_dir).expect("staging dir should create");
+        let existing = final_dir.join("Old Title [BV123].mkv");
+        fs::write(&existing, "old-video").expect("existing file should write");
+        fs::write(final_dir.join("cover-image-old.jpg"), "old-cover")
+            .expect("old unbound cover should write");
+        let staged = staging_dir.join("New Title [BV123].mkv");
+        fs::write(&staged, "new-video").expect("staged file should write");
+        fs::write(staging_dir.join("cover-image-new.jpg"), "new-cover")
+            .expect("new unbound cover should write");
+        let duplicate = VideoDuplicate {
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "BV123".to_string(),
+            },
+            existing_videos: vec![existing.clone()],
+        };
+        let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
+
+        let moved = move_staged_video_files(
+            &staging_dir,
+            &final_dir,
+            &staged_files,
+            VideoDuplicateAction::Overwrite,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged files should overwrite existing files");
+
+        assert_eq!(moved, vec![existing.clone()]);
+        assert_eq!(
+            fs::read_to_string(existing.with_file_name("Old Title [BV123].cover.jpg"))
+                .expect("cover should follow overwritten video basename"),
+            "new-cover"
+        );
+        assert!(
+            !final_dir.join("cover-image-old.jpg").exists(),
+            "stale unbound cover should be removed during overwrite backup cleanup"
+        );
+        assert!(
+            !final_dir.join("cover-image-new.jpg").exists(),
+            "new unbound cover should not be moved as an unrelated relative artifact"
         );
         let _ = fs::remove_dir_all(final_dir);
     }
