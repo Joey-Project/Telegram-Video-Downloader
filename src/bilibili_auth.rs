@@ -17,6 +17,7 @@ use qrcode::QrCode;
 use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, SET_COOKIE, USER_AGENT};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 use url::Url;
 
 const USER_AGENT_VALUE: &str = "Mozilla/5.0";
@@ -647,7 +648,17 @@ pub fn sync_bbdown_rust_credentials_from_state(
     let _guard = AUTH_FILE_LOCK
         .lock()
         .expect("auth file lock should not poison");
-    let Some(state) = load_auth_state_unlocked(state_path)? else {
+    let Some(state) = (match load_auth_state_unlocked(state_path) {
+        Ok(state) => state,
+        Err(err) => {
+            warn!(
+                error = %err,
+                path = %state_path.display(),
+                "failed to read legacy Bilibili auth state for BBDown-rust credential migration"
+            );
+            return Ok(false);
+        }
+    }) else {
         return Ok(false);
     };
     let cookie = state.cookie.trim();
@@ -1370,6 +1381,33 @@ mod tests {
         )
         .expect("credential file should parse");
         assert_eq!(value["cookie"], "fresh-cookie");
+        assert_eq!(value["access_key"], "access");
+
+        if let Some(parent) = path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[test]
+    fn sync_ignores_malformed_legacy_auth_state() {
+        let path = temp_state_file("bbdown-rust-malformed-legacy-sync");
+        let credential_file = path.with_file_name("credentials.json");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("state parent should create");
+        }
+        fs::write(&path, "{not-json").expect("malformed state should write");
+        fs::write(&credential_file, r#"{"access_key":"access"}"#)
+            .expect("credential file should write");
+
+        assert!(
+            !sync_bbdown_rust_credentials_from_state(&path, &credential_file, None)
+                .expect("malformed legacy state should not block credential sync")
+        );
+        let value: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&credential_file).expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert!(value.get("cookie").is_none());
         assert_eq!(value["access_key"], "access");
 
         if let Some(parent) = path.parent() {

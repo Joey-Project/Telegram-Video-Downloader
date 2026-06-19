@@ -489,9 +489,17 @@ async fn run_bilibili_job_locked(
     .await?;
     let plan = BilibiliDownloadPlan::from(&core_plan);
     let progress_reporter = BilibiliCoreProgress::new(progress.clone());
-    let core_report = client
-        .download_plan_with_progress(&core_plan, options, &progress_reporter)
-        .await?;
+    let core_report = tokio_timeout(
+        Duration::from_secs(config.bot.command_timeout_seconds),
+        client.download_plan_with_progress(&core_plan, options, &progress_reporter),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Bilibili direct download timed out after {} seconds",
+            config.bot.command_timeout_seconds
+        )
+    })??;
     let report = BilibiliDownloadReport::from(&core_report);
     let output_dir = bilibili_core::output_dir(config);
     cleanup_bilibili_mux_input_files(&output_dir, &report)?;
