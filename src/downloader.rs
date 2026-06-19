@@ -3165,34 +3165,47 @@ fn nfo_matches_identity(content: &str, identity: &VideoIdentity) -> bool {
         let Some((value, _)) = rest.split_once("</uniqueid>") else {
             continue;
         };
-        if value.trim() == identity.id {
+        let value = value.trim();
+        if value == identity.id || legacy_bilibili_aid_nfo_matches(tag, value, identity) {
             return true;
         }
     }
     false
 }
 
+fn legacy_bilibili_aid_nfo_matches(tag: &str, value: &str, identity: &VideoIdentity) -> bool {
+    identity.provider == VideoProvider::Bilibili
+        && uniqueid_tag_has_type(tag, "bilibili-aid")
+        && identity.id.strip_prefix("av") == Some(value)
+}
+
+fn uniqueid_tag_has_type(tag: &str, expected: &str) -> bool {
+    let tag = tag.to_ascii_lowercase();
+    ['"', '\'']
+        .into_iter()
+        .any(|quote| uniqueid_tag_type(&tag, quote) == Some(expected))
+}
+
 fn uniqueid_tag_matches_provider(tag: &str, provider: VideoProvider) -> bool {
     let tag = tag.to_ascii_lowercase();
     let provider = provider.as_str();
-    tag_contains_provider_uniqueid_type(&tag, provider, '"')
-        || tag_contains_provider_uniqueid_type(&tag, provider, '\'')
+    ['"', '\''].into_iter().any(|quote| {
+        uniqueid_tag_type(&tag, quote).is_some_and(|value| {
+            value == provider
+                || value.strip_prefix(provider).is_some_and(|suffix| {
+                    matches!(
+                        suffix,
+                        "-aid" | "_aid" | "-cid" | "_cid" | "-epid" | "_epid"
+                    )
+                })
+        })
+    })
 }
 
-fn tag_contains_provider_uniqueid_type(tag: &str, provider: &str, quote: char) -> bool {
-    let Some((_, rest)) = tag.split_once(&format!("type={quote}")) else {
-        return false;
-    };
-    let Some((value, _)) = rest.split_once(quote) else {
-        return false;
-    };
-    value == provider
-        || value.strip_prefix(provider).is_some_and(|suffix| {
-            matches!(
-                suffix,
-                "-aid" | "_aid" | "-cid" | "_cid" | "-epid" | "_epid"
-            )
-        })
+fn uniqueid_tag_type(tag: &str, quote: char) -> Option<&str> {
+    let (_, rest) = tag.split_once(&format!("type={quote}"))?;
+    let (value, _) = rest.split_once(quote)?;
+    Some(value)
 }
 
 fn metadata_sidecar_paths(video: &Path) -> Vec<PathBuf> {
@@ -4430,6 +4443,39 @@ mod tests {
         .expect("bilibili aid duplicate should be found");
 
         assert_eq!(duplicate.identity.id, "116539978154171");
+        assert_eq!(duplicate.existing_videos, vec![bilibili_path]);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn finds_bilibili_duplicate_from_av_identity_and_legacy_bare_aid_sidecar() {
+        let mut config = test_config();
+        let video_dir = temp_test_dir("duplicate-bilibili-av-legacy-aid");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        config.downloads.video_dir = video_dir.clone();
+        let bilibili_path = video_dir.join("bilibili-title.mp4");
+        fs::write(&bilibili_path, "video").expect("bilibili file should write");
+        fs::write(
+            bilibili_path.with_extension("nfo"),
+            "<movie><uniqueid type=\"bilibili-aid\">116539978154171</uniqueid></movie>",
+        )
+        .expect("nfo should write");
+
+        let duplicate = find_video_duplicate_for_identities(
+            &config,
+            &JobRequest::Bilibili {
+                url: "https://b23.tv/Jt1mZiL".to_string(),
+                selection: None,
+            },
+            vec![VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "av116539978154171".to_string(),
+            }],
+        )
+        .expect("duplicate scan should succeed")
+        .expect("bilibili av identity should match legacy aid sidecar");
+
+        assert_eq!(duplicate.identity.id, "av116539978154171");
         assert_eq!(duplicate.existing_videos, vec![bilibili_path]);
         let _ = fs::remove_dir_all(video_dir);
     }

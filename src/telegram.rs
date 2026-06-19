@@ -405,7 +405,9 @@ fn redact_sensitive_text(text: &str) -> String {
             redacted.push_str("<redacted Bilibili login QR URL>");
         } else if line.contains("biliplus.com/login") && line.contains("balh_auth=") {
             redacted.push_str("<redacted BBDown access-key authorization URL>");
-        } else if line.contains("balh-login-credentials:") {
+        } else if line.contains("balh-login-credentials:")
+            || contains_bbdown_access_key_json_secret(line)
+        {
             redacted.push_str("<redacted BBDown access-key callback message>");
         } else if line.contains("access_token=")
             || line.contains("access_key=")
@@ -417,6 +419,12 @@ fn redact_sensitive_text(text: &str) -> String {
         }
     }
     redacted
+}
+
+fn contains_bbdown_access_key_json_secret(line: &str) -> bool {
+    line.contains("\"access_key\"")
+        || line.contains("\"access_token\"")
+        || line.contains("\"refresh_token\"")
 }
 
 #[cfg(test)]
@@ -472,6 +480,10 @@ mod tests {
         );
         assert_eq!(
             redact_sensitive_text("balh-login-credentials: {\"access_key\":\"secret\"}"),
+            "<redacted BBDown access-key callback message>"
+        );
+        assert_eq!(
+            redact_sensitive_text("{\"access_key\":\"secret\",\"refresh_token\":\"refresh\"}"),
             "<redacted BBDown access-key callback message>"
         );
     }
