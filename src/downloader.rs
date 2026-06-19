@@ -424,12 +424,8 @@ fn find_video_duplicate_for_identities(
     }))
 }
 
-fn duplicate_scan_video_dir(config: &AppConfig, job: &JobRequest) -> PathBuf {
-    if matches!(job, JobRequest::Bilibili { .. }) {
-        bilibili_core::output_dir(config)
-    } else {
-        config.downloads.video_dir.clone()
-    }
+fn duplicate_scan_video_dir(config: &AppConfig, _job: &JobRequest) -> PathBuf {
+    config.downloads.video_dir.clone()
 }
 
 async fn run_simple_job(
@@ -1510,11 +1506,7 @@ async fn run_staged_video_job(
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<JobReport> {
     let _guard = video_output_lock("Staged video download", progress.as_ref()).await;
-    let final_dir = if matches!(job, JobRequest::Bilibili { .. }) {
-        bilibili_core::output_dir(config)
-    } else {
-        config.downloads.video_dir.clone()
-    };
+    let final_dir = config.downloads.video_dir.clone();
     let primary_media_kind = staged_primary_media_kind(config, job)?;
     let staging_dir = create_video_staging_dir(&final_dir)?;
     let _staging_cleanup = RemoveDirOnDrop::new(staging_dir.clone());
@@ -6504,14 +6496,30 @@ mod tests {
             .expect("relative Bilibili direct options should build");
         assert_eq!(
             relative_options.output_dir,
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("relative-videos")
+            PathBuf::from("relative-videos")
         );
     }
 
     #[test]
-    fn bilibili_duplicate_scan_uses_resolved_output_dir() {
-        let mut config = test_config();
-        config.downloads.video_dir = PathBuf::from("relative-videos");
+    fn duplicate_scan_uses_configured_video_dir_for_all_providers() {
+        let root = temp_test_dir("relative-download-dir-config");
+        fs::create_dir_all(&root).expect("temp config dir should create");
+        fs::write(
+            root.join("config.toml"),
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [downloads]
+            video_dir = "relative-videos"
+            "#,
+        )
+        .expect("config should write");
+        let config = AppConfig::load(&root.join("config.toml")).expect("config should load");
+        let expected = fs::canonicalize(&root)
+            .expect("temp config dir should canonicalize")
+            .join("relative-videos");
 
         assert_eq!(
             duplicate_scan_video_dir(
@@ -6521,7 +6529,7 @@ mod tests {
                     selection: None,
                 },
             ),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("relative-videos")
+            expected
         );
         assert_eq!(
             duplicate_scan_video_dir(
@@ -6530,8 +6538,9 @@ mod tests {
                     url: "https://youtu.be/PHH1wTDF-1M".to_string(),
                 },
             ),
-            PathBuf::from("relative-videos")
+            expected
         );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

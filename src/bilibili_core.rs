@@ -138,7 +138,7 @@ pub fn download_options(config: &AppConfig) -> Result<DownloadOptions> {
 }
 
 pub fn output_dir(config: &AppConfig) -> PathBuf {
-    config.resolve_project_path(&config.downloads.video_dir)
+    config.downloads.video_dir.clone()
 }
 
 pub fn download_mode_from_config(config: &AppConfig) -> Result<DownloadMode> {

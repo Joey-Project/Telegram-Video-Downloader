@@ -198,8 +198,10 @@ impl AppConfig {
     }
 
     fn expand_config_paths(&mut self) {
-        self.downloads.video_dir = expand_home_path(&self.downloads.video_dir);
-        self.downloads.pdf_dir = expand_home_path(&self.downloads.pdf_dir);
+        let video_dir = expand_home_path(&self.downloads.video_dir);
+        self.downloads.video_dir = self.resolve_project_path(&video_dir);
+        let pdf_dir = expand_home_path(&self.downloads.pdf_dir);
+        self.downloads.pdf_dir = self.resolve_project_path(&pdf_dir);
         self.tools.bbdown = expand_home_path(&self.tools.bbdown);
         self.tools.yt_dlp = expand_home_path(&self.tools.yt_dlp);
         self.tools.uv = expand_home_path(&self.tools.uv);
@@ -775,6 +777,10 @@ mod tests {
             token = "token"
             allow_all_chats = true
 
+            [downloads]
+            video_dir = "relative-videos"
+            pdf_dir = "relative-pdfs"
+
             [bilibili.auth]
             state_path = "state/bilibili-auth.json"
             "#,
@@ -786,6 +792,14 @@ mod tests {
         let config = AppConfig::load(Path::new("config.toml")).expect("config should load");
 
         assert!(config.bilibili.auth.state_path.is_absolute());
+        assert_eq!(
+            config.downloads.video_dir,
+            expected_root.join("relative-videos")
+        );
+        assert_eq!(
+            config.downloads.pdf_dir,
+            expected_root.join("relative-pdfs")
+        );
         assert_eq!(
             config.bilibili.auth.state_path,
             expected_root.join("state/bilibili-auth.json")
