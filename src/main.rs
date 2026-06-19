@@ -707,17 +707,26 @@ async fn save_bbdown_login_credentials(
 ) -> Result<CredentialSource> {
     let _state_guard = bbdown_auth_state_lock().lock().await;
     ensure_bbdown_login_active(auth_generation)?;
-    bilibili_auth::sync_bbdown_rust_credentials_from_state(
-        &config.bilibili.auth.state_path,
-        &config.bilibili.auth.credential_file,
-        config.bilibili.auth.credential_profile.as_deref(),
-    )?;
+    sync_legacy_bbdown_auth_state_for_fresh_login(config);
     ensure_bbdown_login_active(auth_generation)?;
     let summary = bilibili_core::credential_runtime(config)?.save_merged(credentials)?;
     ensure_bbdown_login_active(auth_generation)?;
     bilibili_auth::delete_auth_state(&config.bilibili.auth.state_path)?;
     ensure_bbdown_login_active(auth_generation)?;
     Ok(summary)
+}
+
+fn sync_legacy_bbdown_auth_state_for_fresh_login(config: &AppConfig) {
+    if let Err(err) = bilibili_auth::sync_bbdown_rust_credentials_from_state(
+        &config.bilibili.auth.state_path,
+        &config.bilibili.auth.credential_file,
+        config.bilibili.auth.credential_profile.as_deref(),
+    ) {
+        warn!(
+            error = %err,
+            "failed to migrate legacy BBDown auth state before saving fresh credentials"
+        );
+    }
 }
 
 async fn poll_bbdown_qr_login(
@@ -1991,6 +2000,9 @@ fn contains_bbdown_access_key_json_secret(line: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use anyhow::anyhow;
 
     use super::*;
@@ -2067,6 +2079,39 @@ mod tests {
         assert!(message.contains("cookie=yes"));
         assert!(message.contains("access_key=no"));
         assert!(message.contains("tv_access_key (tv): valid code=0"));
+    }
+
+    #[tokio::test]
+    async fn fresh_login_save_ignores_malformed_legacy_auth_state() {
+        let root = temp_main_test_dir("fresh-login-malformed-legacy");
+        fs::create_dir_all(&root).expect("temp dir should create");
+        let mut config = AppConfig::for_test();
+        config.bilibili.auth.state_path = root.join("bilibili-auth.json");
+        config.bilibili.auth.credential_file = root.join("bbdown-credentials.json");
+        fs::write(&config.bilibili.auth.state_path, "{not-json")
+            .expect("malformed legacy state should write");
+        let generation = BILIBILI_AUTH_GENERATION.load(Ordering::SeqCst);
+
+        let summary = save_bbdown_login_credentials(
+            &config,
+            generation,
+            bbdown_core::Credentials::default().with_cookie("SESSDATA=fresh"),
+        )
+        .await
+        .expect("fresh credentials should save despite malformed legacy state");
+
+        assert!(summary.has_cookie);
+        let credentials: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&config.bilibili.auth.credential_file)
+                .expect("credential file should read"),
+        )
+        .expect("credential file should parse");
+        assert_eq!(credentials["cookie"], "SESSDATA=fresh");
+        assert!(
+            !config.bilibili.auth.state_path.exists(),
+            "malformed legacy state should still be cleaned after fresh save"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2354,5 +2399,13 @@ mod tests {
 
         let err = result.expect_err("stale generation should cancel immediately");
         assert!(err.to_string().contains("canceled"));
+    }
+
+    fn temp_main_test_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("telegram-video-downloader-{label}-{unique}"))
     }
 }
