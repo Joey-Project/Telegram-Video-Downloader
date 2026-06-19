@@ -477,7 +477,12 @@ async fn run_bilibili_job_locked(
     progress: Option<mpsc::UnboundedSender<JobProgress>>,
 ) -> Result<JobReport> {
     sync_bilibili_rust_credentials(config)?;
-    let options = bilibili_core::download_options(config)?;
+    let mut options = bilibili_core::download_options(config)?;
+    let mux_locally = matches!(options.mode, DownloadMode::All)
+        && matches!(options.mux, bbdown_core::MuxOptions::Ffmpeg { .. });
+    if mux_locally {
+        options = options.with_mux(bbdown_core::MuxOptions::Disabled);
+    }
     let client = bilibili_core::client(config)?;
     let core_plan = probe_bilibili_plan_with_mode(
         &client,
@@ -489,6 +494,7 @@ async fn run_bilibili_job_locked(
     .await?;
     let plan = BilibiliDownloadPlan::from(&core_plan);
     let progress_reporter = BilibiliCoreProgress::new(progress.clone());
+    let command_started_at = SystemTime::now();
     let core_report = tokio_timeout(
         Duration::from_secs(config.bot.command_timeout_seconds),
         client.download_plan_with_progress(&core_plan, options, &progress_reporter),
@@ -500,8 +506,18 @@ async fn run_bilibili_job_locked(
             config.bot.command_timeout_seconds
         )
     })??;
-    let report = BilibiliDownloadReport::from(&core_report);
+    let mut report = BilibiliDownloadReport::from(&core_report);
     let output_dir = bilibili_core::output_dir(config);
+    if mux_locally {
+        mux_bilibili_report_media(
+            config,
+            &output_dir,
+            &mut report,
+            command_started_at,
+            progress.clone(),
+        )
+        .await?;
+    }
     cleanup_bilibili_mux_input_files(&output_dir, &report)?;
     let primary_videos = bilibili_report_primary_media(&output_dir, &report);
     let mut details = vec![format!(
@@ -631,6 +647,162 @@ fn bilibili_report_primary_media(cwd: &Path, report: &BilibiliDownloadReport) ->
         }
     }
     media
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BilibiliMediaInput {
+    kind: String,
+    path: PathBuf,
+}
+
+async fn mux_bilibili_report_media(
+    config: &AppConfig,
+    cwd: &Path,
+    report: &mut BilibiliDownloadReport,
+    since: SystemTime,
+    progress: Option<mpsc::UnboundedSender<JobProgress>>,
+) -> Result<()> {
+    let report_title = report.title.clone();
+    for entry in &mut report.entries {
+        if entry.mux.is_some() {
+            continue;
+        }
+        let media_inputs = bilibili_entry_media_inputs(cwd, entry);
+        if media_inputs.is_empty() {
+            continue;
+        }
+        let entry_dir = media_inputs[0].path.parent().unwrap_or(cwd).to_path_buf();
+        let title = if entry.title.trim().is_empty() {
+            report_title.as_str()
+        } else {
+            entry.title.as_str()
+        };
+        let output_path = unique_bilibili_mux_output_path(&entry_dir, title, "mp4", since);
+        let (spec, concat_path) =
+            bilibili_local_mux_command_spec(config, &media_inputs, &entry_dir, &output_path)?;
+        let output_result = match run_command(config, &spec, progress.clone()).await {
+            Ok(output_result) => output_result,
+            Err(err) => {
+                if let Some(concat_path) = concat_path {
+                    let _ = fs::remove_file(concat_path);
+                }
+                let _ = fs::remove_file(&output_path);
+                return Err(err);
+            }
+        };
+        if let Some(concat_path) = concat_path {
+            let _ = fs::remove_file(concat_path);
+        }
+        if !output_result.status.success() {
+            let _ = fs::remove_file(&output_path);
+            bail!(
+                "{} exited with status {}\n{}",
+                spec.program.display(),
+                output_result.status,
+                summarize_output(
+                    &String::from_utf8_lossy(&output_result.stdout),
+                    &String::from_utf8_lossy(&output_result.stderr)
+                )
+            );
+        }
+        if !output_path.is_file() {
+            bail!(
+                "Bilibili mux finished without creating {}",
+                output_path.display()
+            );
+        }
+        entry.mux = Some(BilibiliMuxReport { output_path });
+    }
+    Ok(())
+}
+
+fn bilibili_entry_media_inputs(
+    cwd: &Path,
+    entry: &BilibiliEntryDownloadReport,
+) -> Vec<BilibiliMediaInput> {
+    entry
+        .files
+        .iter()
+        .filter(|file| matches!(file.kind.as_str(), "video" | "audio" | "flv_segment"))
+        .map(|file| BilibiliMediaInput {
+            kind: file.kind.clone(),
+            path: resolve_command_output_path(cwd, &file.path),
+        })
+        .collect()
+}
+
+fn bilibili_local_mux_command_spec(
+    config: &AppConfig,
+    media_inputs: &[BilibiliMediaInput],
+    entry_dir: &Path,
+    output: &Path,
+) -> Result<(CommandSpec, Option<PathBuf>)> {
+    let mut args = vec![
+        "-hide_banner".to_string(),
+        "-y".to_string(),
+        "-nostdin".to_string(),
+    ];
+    let concat_path = if only_bilibili_flv_segments(media_inputs) {
+        let concat_path = entry_dir.join(BILIBILI_FFMPEG_CONCAT_FILE_NAME);
+        fs::write(&concat_path, ffmpeg_concat_file_list(media_inputs)).with_context(|| {
+            format!(
+                "failed to write Bilibili ffmpeg concat list {}",
+                concat_path.display()
+            )
+        })?;
+        args.extend([
+            "-f".to_string(),
+            "concat".to_string(),
+            "-safe".to_string(),
+            "0".to_string(),
+            "-i".to_string(),
+            command_path_arg(&concat_path),
+        ]);
+        Some(concat_path)
+    } else {
+        for media_input in media_inputs {
+            args.push("-i".to_string());
+            args.push(command_path_arg(&media_input.path));
+        }
+        for index in 0..media_inputs.len() {
+            args.push("-map".to_string());
+            args.push(format!("{index}:0"));
+        }
+        None
+    };
+    args.extend([
+        "-c".to_string(),
+        "copy".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        command_path_arg(output),
+    ]);
+    Ok((
+        CommandSpec {
+            program: config.tools.ffmpeg.clone(),
+            args,
+            cwd: entry_dir.to_path_buf(),
+            activity_dir: Some(entry_dir.to_path_buf()),
+            cleanup_paths: Vec::new(),
+        },
+        concat_path,
+    ))
+}
+
+fn only_bilibili_flv_segments(media_inputs: &[BilibiliMediaInput]) -> bool {
+    !media_inputs.is_empty() && media_inputs.iter().all(|input| input.kind == "flv_segment")
+}
+
+fn ffmpeg_concat_file_list(media_inputs: &[BilibiliMediaInput]) -> String {
+    media_inputs
+        .iter()
+        .map(|input| {
+            format!(
+                "file '{}'\n",
+                command_path_arg(&input.path).replace('\'', "'\\''")
+            )
+        })
+        .collect()
 }
 
 fn cleanup_bilibili_mux_input_files(cwd: &Path, report: &BilibiliDownloadReport) -> Result<()> {
@@ -6547,6 +6719,70 @@ mod tests {
                 "missing {expected}"
             );
         }
+    }
+
+    #[test]
+    fn builds_bilibili_local_dash_mux_command() {
+        let mut config = test_config();
+        config.tools.ffmpeg = PathBuf::from("/opt/bin/ffmpeg");
+        let entry_dir = PathBuf::from("/tmp/bilibili/P001");
+        let inputs = vec![
+            BilibiliMediaInput {
+                kind: "video".to_string(),
+                path: entry_dir.join("video.m4s"),
+            },
+            BilibiliMediaInput {
+                kind: "audio".to_string(),
+                path: entry_dir.join("audio.m4s"),
+            },
+        ];
+        let output = entry_dir.join("Episode.mp4");
+
+        let (spec, concat_path) =
+            bilibili_local_mux_command_spec(&config, &inputs, &entry_dir, &output)
+                .expect("dash mux spec should build");
+
+        assert_eq!(concat_path, None);
+        assert_eq!(spec.program, PathBuf::from("/opt/bin/ffmpeg"));
+        assert_eq!(spec.cwd, entry_dir);
+        assert!(spec.args.contains(&"-nostdin".to_string()));
+        assert!(spec.args.windows(2).any(|args| args == ["-map", "0:0"]));
+        assert!(spec.args.windows(2).any(|args| args == ["-map", "1:0"]));
+        assert!(!spec.args.windows(2).any(|args| args == ["-f", "concat"]));
+    }
+
+    #[test]
+    fn builds_bilibili_local_flv_concat_mux_command() {
+        let config = test_config();
+        let entry_dir = temp_test_dir("bilibili-local-flv-mux");
+        let inputs = vec![
+            BilibiliMediaInput {
+                kind: "flv_segment".to_string(),
+                path: entry_dir.join("segment-001.flv"),
+            },
+            BilibiliMediaInput {
+                kind: "flv_segment".to_string(),
+                path: entry_dir.join("segment-002.flv"),
+            },
+        ];
+        let output = entry_dir.join("Episode.mp4");
+
+        let (spec, concat_path) =
+            bilibili_local_mux_command_spec(&config, &inputs, &entry_dir, &output)
+                .expect("flv mux spec should build");
+
+        let concat_path = concat_path.expect("flv mux should create concat list");
+        let concat = fs::read_to_string(&concat_path).expect("concat list should read");
+        assert!(concat.contains("segment-001.flv"));
+        assert!(concat.contains("segment-002.flv"));
+        assert!(spec.args.windows(2).any(|args| args == ["-f", "concat"]));
+        let concat_arg = command_path_arg(&concat_path);
+        assert!(
+            spec.args
+                .windows(2)
+                .any(|args| args[0] == "-i" && args[1] == concat_arg)
+        );
+        let _ = fs::remove_dir_all(entry_dir);
     }
 
     #[test]
