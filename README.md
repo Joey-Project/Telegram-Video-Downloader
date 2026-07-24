@@ -1,10 +1,11 @@
 # Telegram Local Downloader Bot
 
-这是一个个人本机使用的 Telegram bot。把支持的视频链接发给 bot 后，它会调用本机 CLI 下载；对图文网页，可以使用 `/pdf URL`，也可以配置自动 PDF 域名让 bot 直接保存 PDF。
+这是一个个人本机使用的 Telegram bot。把支持的视频链接发给 bot 后，它会保存到本机下载目录；Bilibili 使用内嵌 `bbdown-core` crate，YouTube/PDF 仍调用本机工具。对图文网页，可以使用 `/pdf URL`，也可以配置自动 PDF 域名让 bot 直接保存 PDF。
 
 ## 功能
 
-- 普通消息中的 Bilibili 链接调用 `BBDown`，保存到视频下载目录，并默认保留 XML/ASS 弹幕 sidecar。
+- 普通消息中的 Bilibili 链接通过 `BBDown-rust` 的 `bbdown-core` crate 解析和下载，保存到视频下载目录，并默认保留 XML/ASS 弹幕 sidecar。
+- Bilibili 番剧和 intl 链接走内嵌 plan/download API；`ss/md` 系列入口会先提示选择最新一集或全集。
 - 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
@@ -35,15 +36,17 @@ cp config.example.toml config.toml
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
-重复视频检测使用媒体 ID 扫描视频文件名与同 basename sidecar。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...`，再通过 `BBDown --only-show-info` 解析 aid，因此 `b23.tv` 短链也可以在下载前弹出重复选择。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
+重复视频检测使用媒体 ID 扫描视频文件名与同 basename sidecar。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
-`bilibili.extra_args` 默认包含 `--video-ascending` 和 `--skip-mux`。如果 `bilibili.extra_args`、显式 `--config-file` 或视频下载目录里的 `BBDown.config` 都没有设置 `--multi-thread` / `-mt`，下载命令会自动追加 `--multi-thread false`；下载目录里的 `BBDown.config` 会由 bot 显式传给 BBDown。BBDown 负责下载音视频流，bot 再调用 `tools.ffmpeg` 做受控混流；这样混流也会受到同一套进度、idle timeout 和进程清理保护。需要追求更高码率时可以调整 `--video-ascending`，但建议保留 `--skip-mux`；如果确认目标视频的 CDN 对 BBDown 多线程分片稳定，再显式配置 `--multi-thread true`。
+Bilibili 下载和登录不需要本机 `bbdown` 可执行文件；项目直接依赖 `BBDown-rust` 的 `bbdown-core` crate。`tools.ffmpeg` 仍会传给 crate 用于 mux，bot 负责 NFO、staging 和重复文件处理。
 
-`bilibili.danmaku.enabled = true` 时，bot 会给 BBDown 追加 `--download-danmaku`，把 Bilibili 弹幕保存成同 basename 的 `.xml` 和 `.ass` sidecar，并让它们跟随 staging、覆盖和两者并存流程移动。暂时不做 PGO/PGS 图形字幕预渲染；后续可以以 ASS 为中间格式继续评估。
+区域受限或 intl 番剧可以配置 `playurl_mode`、`restricted_area`、`restricted_area_proxies`、`restricted_api_proxies`。为兼容旧配置，`bilibili.global_args` 里的已知 BBDown-rust 全局项也会被 direct API 读取：endpoint base、`--playurl-mode`、`--restricted-area`、restricted proxy 和 `--request-timeout-seconds`。`bilibili.plan_args` 不再用于主路径；`bilibili.download_args` 仅保留 `--only audio|video|subtitle|danmaku|cover` 这类下载模式迁移。
 
-`bilibili.auth.state_path` 是 bot 管理的 Bilibili Web cookie 状态文件，默认写到 `~/.local/state/telegram-video-downloader/bilibili-auth.json`。`/bbdown login` 会发送 Bilibili 扫码二维码，登录成功后 Bilibili 下载会通过私有临时 `--config-file` 给 BBDown 注入 `--cookie`；如果视频下载目录存在 `BBDown.config`，或 `bilibili.extra_args` 显式指定了 `--config-file`，bot 会先合并原配置再追加 cookie。`/bbdown logout` 只清理本机状态，不远端注销账号。
+`bilibili.danmaku.enabled = true` 时，bot 会让 `bbdown-core` 写出配置里的弹幕格式，默认是 `.xml` 和 `.ass` sidecar，并让它们跟随 staging、覆盖和两者并存流程移动。后续会接入 `bbdown-core` 的 danmaku update API，用于只更新已有视频的弹幕 sidecar；暂时不做 PGO/PGS 图形字幕预渲染。
 
-`bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。BBDown 下载期间即使命令没有继续输出，bot 也会按这个间隔刷新文件增长快照，显示当前阶段、已完成/待完成阶段、写入速度、持续时间和最近文件变化；`bot.command_timeout_seconds` 是单个外部命令的总超时；`bot.command_idle_timeout_seconds` 是没有 stdout/stderr 且输出目录文件也没有增长的 idle 超时。
+`bilibili.auth.credential_file` 是 `bbdown-core` credential 文件，默认写到 `~/.local/state/telegram-video-downloader/bbdown-credentials.json`；可选的 `credential_profile` 会选择同一文件里的 profile。`/bbdown login` 默认等同 `/bbdown login web`，会直接创建并轮询 Web QR；`/bbdown login tv` 会保存 TV 专用 `tv_access_key`；`/bbdown login access-key` 会发送 BiliPlus/BALH 授权 QR 和链接，授权后把 callback URL 或 `balh-login-credentials:` 消息发回同一个私聊即可保存 generic intl/Bstar `access_key`。`/bbdown status` 通过 crate API 检查 cookie、`access_key` 和 `tv_access_key`；`/bbdown logout` 清理当前 credential/profile，并兼容删除旧版 bot Web cookie state。
+
+`bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。YouTube/PDF 外部命令会按这个间隔刷新文件增长快照；Bilibili 会转发 `bbdown-core` 的关键 plan、download 和 mux 阶段。`bot.command_timeout_seconds` 是单个外部命令的总超时；`bot.command_idle_timeout_seconds` 会作为 Bilibili 下载 idle timeout 传给 `bbdown-core`。
 
 ## 运行
 
@@ -56,11 +59,16 @@ cargo run -- config.toml
 ```text
 https://www.bilibili.com/video/BV...
 Title https://www.bilibili.com/video/BV...
+https://www.bilibili.com/bangumi/play/ss...
+https://www.bilibili.tv/en/play/...
 https://youtu.be/...
 /pdf https://example.com/article
 https://mp.weixin.qq.com/s?...
 https://m.bilibili.com/opus/1206098216310800386?share_source=COPY
 /help
+/bbdown login web
+/bbdown login tv
+/bbdown login access-key
 /bbdown status
 ```
 
@@ -69,6 +77,8 @@ https://m.bilibili.com/opus/1206098216310800386?share_source=COPY
 ```sh
 cargo run -- --replay-message config.toml "Title https://b23.tv/..."
 ```
+
+`ss/md` 番剧系列入口需要 Telegram inline keyboard 选择，`--replay-message` 不会替你默认选择；本地重放请使用具体 `ep` 链接。
 
 ## macOS 自启动
 

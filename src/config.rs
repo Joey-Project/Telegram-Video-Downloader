@@ -74,8 +74,25 @@ pub struct VideoConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BilibiliConfig {
-    #[serde(default = "default_bilibili_extra_args")]
+    #[serde(default)]
     pub extra_args: Vec<String>,
+    #[serde(default)]
+    pub global_args: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub plan_args: Vec<String>,
+    #[serde(default)]
+    pub download_args: Vec<String>,
+    #[serde(default)]
+    pub playurl_mode: Option<String>,
+    #[serde(default)]
+    pub restricted_area: Option<String>,
+    #[serde(default)]
+    pub restricted_area_proxies: Vec<String>,
+    #[serde(default)]
+    pub restricted_api_proxies: Vec<String>,
+    #[serde(default = "default_bilibili_danmaku_formats")]
+    pub danmaku_formats: Vec<String>,
     #[serde(default)]
     pub danmaku: BilibiliDanmakuConfig,
     #[serde(default)]
@@ -92,6 +109,10 @@ pub struct BilibiliDanmakuConfig {
 pub struct BilibiliAuthConfig {
     #[serde(default = "default_bilibili_auth_state_path")]
     pub state_path: PathBuf,
+    #[serde(default = "default_bilibili_credential_file")]
+    pub credential_file: PathBuf,
+    #[serde(default)]
+    pub credential_profile: Option<String>,
     #[serde(default = "default_bilibili_login_timeout_seconds")]
     pub login_timeout_seconds: u64,
     #[serde(default = "default_bilibili_poll_interval_seconds")]
@@ -113,6 +134,24 @@ pub struct BotConfig {
 }
 
 impl AppConfig {
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            telegram: TelegramConfig {
+                token: "test-token".to_string(),
+                allowed_chat_ids: vec![123456789],
+                allow_all_chats: false,
+            },
+            downloads: DownloadsConfig::default(),
+            tools: ToolsConfig::default(),
+            pdf: PdfConfig::default(),
+            video: VideoConfig::default(),
+            bilibili: BilibiliConfig::default(),
+            bot: BotConfig::default(),
+            project_dir: PathBuf::from("."),
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
@@ -159,8 +198,10 @@ impl AppConfig {
     }
 
     fn expand_config_paths(&mut self) {
-        self.downloads.video_dir = expand_home_path(&self.downloads.video_dir);
-        self.downloads.pdf_dir = expand_home_path(&self.downloads.pdf_dir);
+        let video_dir = expand_home_path(&self.downloads.video_dir);
+        self.downloads.video_dir = self.resolve_project_path(&video_dir);
+        let pdf_dir = expand_home_path(&self.downloads.pdf_dir);
+        self.downloads.pdf_dir = self.resolve_project_path(&pdf_dir);
         self.tools.bbdown = expand_home_path(&self.tools.bbdown);
         self.tools.yt_dlp = expand_home_path(&self.tools.yt_dlp);
         self.tools.uv = expand_home_path(&self.tools.uv);
@@ -169,6 +210,8 @@ impl AppConfig {
         self.tools.ffmpeg = expand_home_path(&self.tools.ffmpeg);
         let state_path = expand_home_path(&self.bilibili.auth.state_path);
         self.bilibili.auth.state_path = self.resolve_project_path(&state_path);
+        let credential_file = expand_home_path(&self.bilibili.auth.credential_file);
+        self.bilibili.auth.credential_file = self.resolve_project_path(&credential_file);
     }
 
     fn validate(&self) -> Result<()> {
@@ -203,6 +246,29 @@ impl AppConfig {
             bail!(
                 "bilibili.auth.poll_interval_seconds must be less than bilibili.auth.login_timeout_seconds"
             );
+        }
+        if let Some(profile) = &self.bilibili.auth.credential_profile
+            && profile.trim().is_empty()
+        {
+            bail!("bilibili.auth.credential_profile must not be empty when set");
+        }
+        if let Some(playurl_mode) = &self.bilibili.playurl_mode
+            && !matches!(playurl_mode.as_str(), "web" | "tv" | "app")
+        {
+            bail!("bilibili.playurl_mode must be one of web, tv, or app");
+        }
+        if let Some(area) = &self.bilibili.restricted_area
+            && !matches!(area.as_str(), "cn" | "th" | "hk" | "tw")
+        {
+            bail!("bilibili.restricted_area must be one of cn, th, hk, or tw");
+        }
+        if self.bilibili.danmaku_formats.is_empty() {
+            bail!("bilibili.danmaku_formats must not be empty");
+        }
+        for format in &self.bilibili.danmaku_formats {
+            if !matches!(format.as_str(), "xml" | "ass") {
+                bail!("bilibili.danmaku_formats entries must be xml or ass");
+            }
         }
         Ok(())
     }
@@ -269,7 +335,15 @@ impl Default for BotConfig {
 impl Default for BilibiliConfig {
     fn default() -> Self {
         Self {
-            extra_args: default_bilibili_extra_args(),
+            extra_args: Vec::new(),
+            global_args: Vec::new(),
+            plan_args: Vec::new(),
+            download_args: Vec::new(),
+            playurl_mode: None,
+            restricted_area: None,
+            restricted_area_proxies: Vec::new(),
+            restricted_api_proxies: Vec::new(),
+            danmaku_formats: default_bilibili_danmaku_formats(),
             danmaku: BilibiliDanmakuConfig::default(),
             auth: BilibiliAuthConfig::default(),
         }
@@ -286,6 +360,8 @@ impl Default for BilibiliAuthConfig {
     fn default() -> Self {
         Self {
             state_path: default_bilibili_auth_state_path(),
+            credential_file: default_bilibili_credential_file(),
+            credential_profile: None,
             login_timeout_seconds: default_bilibili_login_timeout_seconds(),
             poll_interval_seconds: default_bilibili_poll_interval_seconds(),
         }
@@ -301,7 +377,7 @@ fn default_pdf_dir() -> PathBuf {
 }
 
 fn default_bbdown() -> PathBuf {
-    PathBuf::from("BBDown")
+    PathBuf::from("bbdown")
 }
 
 fn default_yt_dlp() -> PathBuf {
@@ -396,8 +472,8 @@ fn default_true() -> bool {
     true
 }
 
-fn default_bilibili_extra_args() -> Vec<String> {
-    vec!["--video-ascending".to_string(), "--skip-mux".to_string()]
+fn default_bilibili_danmaku_formats() -> Vec<String> {
+    vec!["xml".to_string(), "ass".to_string()]
 }
 
 fn default_bilibili_auth_state_path() -> PathBuf {
@@ -409,6 +485,18 @@ fn default_bilibili_auth_state_path() -> PathBuf {
             "bilibili-auth.json",
         ],
         "bilibili-auth.json",
+    )
+}
+
+fn default_bilibili_credential_file() -> PathBuf {
+    home_path(
+        &[
+            ".local",
+            "state",
+            "telegram-video-downloader",
+            "bbdown-credentials.json",
+        ],
+        "bbdown-credentials.json",
     )
 }
 
@@ -473,7 +561,7 @@ mod tests {
             config.downloads.pdf_dir,
             home.join("Documents").join("Downloads")
         );
-        assert_eq!(config.tools.bbdown, PathBuf::from("BBDown"));
+        assert_eq!(config.tools.bbdown, PathBuf::from("bbdown"));
         assert_eq!(config.tools.yt_dlp, PathBuf::from("yt-dlp"));
         assert_eq!(
             config.tools.pdf_helper,
@@ -492,10 +580,15 @@ mod tests {
         );
         assert!(config.video.write_nfo);
         assert!(config.video.keep_sidecars);
-        assert_eq!(
-            config.bilibili.extra_args,
-            vec!["--video-ascending", "--skip-mux"]
-        );
+        assert!(config.bilibili.extra_args.is_empty());
+        assert!(config.bilibili.global_args.is_empty());
+        assert!(config.bilibili.plan_args.is_empty());
+        assert!(config.bilibili.download_args.is_empty());
+        assert_eq!(config.bilibili.playurl_mode, None);
+        assert_eq!(config.bilibili.restricted_area, None);
+        assert!(config.bilibili.restricted_area_proxies.is_empty());
+        assert!(config.bilibili.restricted_api_proxies.is_empty());
+        assert_eq!(config.bilibili.danmaku_formats, vec!["xml", "ass"]);
         assert!(config.bilibili.danmaku.enabled);
         assert_eq!(
             config.bilibili.auth.state_path,
@@ -504,6 +597,14 @@ mod tests {
                 .join("telegram-video-downloader")
                 .join("bilibili-auth.json")
         );
+        assert_eq!(
+            config.bilibili.auth.credential_file,
+            home.join(".local")
+                .join("state")
+                .join("telegram-video-downloader")
+                .join("bbdown-credentials.json")
+        );
+        assert_eq!(config.bilibili.auth.credential_profile, None);
         assert_eq!(config.bilibili.auth.login_timeout_seconds, 180);
         assert_eq!(config.bilibili.auth.poll_interval_seconds, 2);
     }
@@ -676,6 +777,10 @@ mod tests {
             token = "token"
             allow_all_chats = true
 
+            [downloads]
+            video_dir = "relative-videos"
+            pdf_dir = "relative-pdfs"
+
             [bilibili.auth]
             state_path = "state/bilibili-auth.json"
             "#,
@@ -687,6 +792,14 @@ mod tests {
         let config = AppConfig::load(Path::new("config.toml")).expect("config should load");
 
         assert!(config.bilibili.auth.state_path.is_absolute());
+        assert_eq!(
+            config.downloads.video_dir,
+            expected_root.join("relative-videos")
+        );
+        assert_eq!(
+            config.downloads.pdf_dir,
+            expected_root.join("relative-pdfs")
+        );
         assert_eq!(
             config.bilibili.auth.state_path,
             expected_root.join("state/bilibili-auth.json")
@@ -713,6 +826,7 @@ mod tests {
 
             [bilibili.auth]
             state_path = "~/Library/Application Support/Bot/bilibili-auth.json"
+            credential_file = "$HOME/Library/Application Support/Bot/bbdown-credentials.json"
             "#,
             PathBuf::from("."),
         )
@@ -730,6 +844,13 @@ mod tests {
                 .join("Application Support")
                 .join("Bot")
                 .join("bilibili-auth.json")
+        );
+        assert_eq!(
+            config.bilibili.auth.credential_file,
+            home.join("Library")
+                .join("Application Support")
+                .join("Bot")
+                .join("bbdown-credentials.json")
         );
     }
 
