@@ -107,7 +107,9 @@ scripts/launch_agent.sh uninstall
 - config：`./config.toml`
 - binary：`./target/release/telegram-video-downloader`
 - logs：`~/Library/Logs/TelegramVideoDownloader/`
-- launchd domain：`user/$(id -u)`
+- launchd domain：`gui/$(id -u)`（当前登录的图形会话）
+
+未设置 `BOT_DOMAIN` 时，`install` 和 `uninstall` 会清理旧版本留下的 `user/$(id -u)` 服务；`status` 和 `restart` 会在新服务尚未安装时回退到该旧服务。显式设置 `BOT_DOMAIN` 会保持该自定义 domain，不触发兼容迁移。
 
 这些都可以通过环境变量覆盖，例如：
 
@@ -121,6 +123,7 @@ BOT_LABEL=com.example.telegram-downloader BOT_CONFIG=/path/to/config.toml script
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+scripts/test_launch_agent.sh
 uv run ruff format --check
 uv run ruff check
 uv run python -m unittest discover -s tests

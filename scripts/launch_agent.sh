@@ -2,6 +2,8 @@
 set -euo pipefail
 
 DEFAULT_LABEL="io.github.telegram-local-downloader.bot"
+SERVICE_STOP_TIMEOUT_SECONDS=10
+SERVICE_STOP_POLL_SECONDS=0.1
 
 usage() {
   cat <<'EOF'
@@ -17,7 +19,7 @@ Environment overrides:
   BOT_CONFIG      Config file path. Defaults to ./config.toml.
   BOT_BINARY      Binary path. Defaults to ./target/release/telegram-video-downloader.
   BOT_LOG_DIR     Log directory. Defaults to ~/Library/Logs/TelegramVideoDownloader.
-  BOT_DOMAIN      launchd domain. Defaults to user/$(id -u).
+  BOT_DOMAIN      launchd domain. Defaults to gui/$(id -u); bypasses legacy migration when set.
   BOT_DOTNET_ROOT Optional .NET runtime root for BBDown global-tool apphosts.
   BOT_SKIP_BUILD  Set to 1 to skip cargo build during install.
 EOF
@@ -42,7 +44,13 @@ label="${BOT_LABEL:-${DEFAULT_LABEL}}"
 config_path="${BOT_CONFIG:-${repo_dir}/config.toml}"
 binary_path="${BOT_BINARY:-${repo_dir}/target/release/telegram-video-downloader}"
 log_dir="${BOT_LOG_DIR:-${HOME}/Library/Logs/TelegramVideoDownloader}"
-domain="${BOT_DOMAIN:-user/$(id -u)}"
+default_domain="gui/$(id -u)"
+legacy_domain="user/$(id -u)"
+domain="${BOT_DOMAIN:-${default_domain}}"
+use_default_domain=0
+if [[ -z "${BOT_DOMAIN:-}" ]]; then
+  use_default_domain=1
+fi
 dotnet_root="${BOT_DOTNET_ROOT:-}"
 skip_build="${BOT_SKIP_BUILD:-0}"
 
@@ -111,8 +119,111 @@ plist_path() {
   printf '%s/Library/LaunchAgents/%s.plist\n' "${HOME}" "${label}"
 }
 
+service_name_for_domain() {
+  local target_domain="$1"
+  printf '%s/%s\n' "${target_domain}" "${label}"
+}
+
 service_name() {
-  printf '%s/%s\n' "${domain}" "${label}"
+  service_name_for_domain "${domain}"
+}
+
+legacy_service_name() {
+  service_name_for_domain "${legacy_domain}"
+}
+
+service_exists() {
+  local target="$1"
+  local output
+
+  if output="$(launchctl print "${target}" 2>&1)"; then
+    return 0
+  fi
+
+  # Return 1 only for launchd's explicit absent-service/domain diagnostics.
+  if [[ "${output}" == *"Could not find service"* || "${output}" == *"Could not find domain"* ]]; then
+    return 1
+  fi
+  printf '%s\n' "${output}" >&2
+  return 2
+}
+
+wait_for_service_absence() {
+  local target="$1"
+  local deadline=$((SECONDS + SERVICE_STOP_TIMEOUT_SECONDS))
+  local status
+
+  while :; do
+    if service_exists "${target}"; then
+      if (( SECONDS >= deadline )); then
+        die "LaunchAgent remained registered after bootout: ${target}"
+      fi
+      sleep "${SERVICE_STOP_POLL_SECONDS}"
+    else
+      status=$?
+      [[ "${status}" -eq 1 ]] && return 0
+      return "${status}"
+    fi
+  done
+}
+
+stop_service_if_present() {
+  local target="$1"
+  local status
+
+  if service_exists "${target}"; then
+    if launchctl bootout "${target}"; then
+      :
+    else
+      status=$?
+      return "${status}"
+    fi
+    wait_for_service_absence "${target}"
+  else
+    status=$?
+    [[ "${status}" -eq 1 ]] && return 0
+    return "${status}"
+  fi
+}
+
+verify_legacy_service_state() {
+  local status
+
+  [[ "${use_default_domain}" == "1" ]] || return 0
+  if service_exists "$(legacy_service_name)"; then
+    return 0
+  else
+    status=$?
+    [[ "${status}" -eq 1 ]] && return 0
+    return "${status}"
+  fi
+}
+
+cleanup_legacy_service() {
+  [[ "${use_default_domain}" == "1" ]] || return 0
+  stop_service_if_present "$(legacy_service_name)"
+}
+
+active_or_default_service_name() {
+  local status
+
+  if service_exists "$(service_name)"; then
+    service_name
+    return
+  else
+    status=$?
+    [[ "${status}" -eq 1 ]] || return "${status}"
+  fi
+  if [[ "${use_default_domain}" == "1" ]]; then
+    if service_exists "$(legacy_service_name)"; then
+      legacy_service_name
+      return
+    else
+      status=$?
+      [[ "${status}" -eq 1 ]] || return "${status}"
+    fi
+  fi
+  service_name
 }
 
 is_dotnet_root() {
@@ -189,6 +300,7 @@ write_plist() {
     escaped_path="$(xml_escape "${path_value}")"
   fi
 
+  # A Background session restriction makes this GUI LaunchAgent fail to bootstrap.
   cat > "${output}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -220,9 +332,6 @@ ${dotnet_env_block}
 
   <key>RunAtLoad</key>
   <true/>
-
-  <key>LimitLoadToSessionType</key>
-  <string>Background</string>
 
   <key>KeepAlive</key>
   <true/>
@@ -265,19 +374,46 @@ install_agent() {
   runtime_root="$(detect_dotnet_root)"
   write_plist "${temp_plist}" "${binary}" "${config}" "${repo_dir}" "${log_dir}" "${runtime_root}"
   plutil -lint "${temp_plist}" >/dev/null
+  verify_legacy_service_state
   install -m 644 "${temp_plist}" "${plist}"
   rm -f "${temp_plist}"
 
-  launchctl bootout "$(service_name)" >/dev/null 2>&1 || true
+  stop_service_if_present "$(service_name)"
   launchctl bootstrap "${domain}" "${plist}"
+  if cleanup_legacy_service; then
+    :
+  else
+    local legacy_status=$?
+    if stop_service_if_present "$(service_name)"; then
+      :
+    else
+      local rollback_status=$?
+      printf 'error: failed to stop new LaunchAgent after legacy migration failure (%s): %s\n' \
+        "${rollback_status}" "$(service_name)" >&2
+    fi
+    return "${legacy_status}"
+  fi
   launchctl print "$(service_name)"
 }
 
 uninstall_agent() {
   local plist
   plist="$(plist_path)"
-  launchctl bootout "$(service_name)" >/dev/null 2>&1 || true
+  stop_service_if_present "$(service_name)"
+  cleanup_legacy_service
   rm -f "${plist}"
+}
+
+restart_agent() {
+  local target
+  target="$(active_or_default_service_name)"
+  launchctl kickstart -k "${target}"
+}
+
+status_agent() {
+  local target
+  target="$(active_or_default_service_name)"
+  launchctl print "${target}"
 }
 
 case "${action}" in
@@ -288,10 +424,10 @@ case "${action}" in
     uninstall_agent
     ;;
   restart)
-    launchctl kickstart -k "$(service_name)"
+    restart_agent
     ;;
   status)
-    launchctl print "$(service_name)"
+    status_agent
     ;;
   logs)
     tail -f "${log_dir}/stdout.log" "${log_dir}/stderr.log"
