@@ -4903,7 +4903,7 @@ struct VideoOutputGuard {
     file_guard: BoundFile,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VideoControlOwner {
     version: u32,
@@ -5253,26 +5253,24 @@ fn validate_video_control_directory(root: &RootedFs, path: &Path) -> Result<Vide
 
     let owner_path = path.join(VIDEO_CONTROL_OWNER_FILE_NAME);
     let expected = video_control_owner(root, identity);
-    let owner = root.open_bound_file(&owner_path)?.with_context(|| {
-        format!(
-            "video control directory is not app-owned; missing {}",
-            owner_path.display()
-        )
-    })?;
-    owner.validate_private_single_link(0o600)?;
-    let actual: VideoControlOwner =
-        serde_json::from_slice(&owner.read_limited(VIDEO_CONTROL_OWNER_LIMIT)?)
-            .context("failed to parse video control ownership record")?;
-    if actual.version != expected.version
-        || actual.root_device != expected.root_device
-        || actual.root_inode != expected.root_inode
-        || actual.control_device != expected.control_device
-        || actual.control_inode != expected.control_inode
-    {
-        bail!("video control ownership record does not match the bound output root");
-    }
-    if root.entry_identity(&owner_path)? != Some(owner.identity()) {
-        bail!("video control ownership record identity changed after validation");
+    let owner_entry = root.bind_entry(&owner_path, false)?;
+    let (owner_identity, actual) = load_video_control_owner(root, &owner_entry, &owner_path)?;
+    if actual != expected {
+        if !video_control_owner_allows_device_rebind(&actual, &expected) {
+            bail!("video control ownership record does not match the bound output root");
+        }
+        rebind_video_control_owner_after_device_change(
+            root,
+            &owner_entry,
+            &owner_path,
+            owner_identity,
+            &actual,
+            &expected,
+        )?;
+        let (_, actual) = load_video_control_owner(root, &owner_entry, &owner_path)?;
+        if actual != expected {
+            bail!("video control ownership record does not match the bound output root");
+        }
     }
     root.validate_private_bound_directory(&entry, identity, 0o700)?;
     Ok(VideoControlDirectory {
@@ -5280,6 +5278,102 @@ fn validate_video_control_directory(root: &RootedFs, path: &Path) -> Result<Vide
         entry,
         identity,
     })
+}
+
+fn load_video_control_owner(
+    root: &RootedFs,
+    entry: &BoundEntry,
+    path: &Path,
+) -> Result<(EntryIdentity, VideoControlOwner)> {
+    let identity = root.bound_entry_identity(entry)?.with_context(|| {
+        format!(
+            "video control directory is not app-owned; missing {}",
+            path.display()
+        )
+    })?;
+    let owner = root.open_bound_file_if_identity(entry, identity)?;
+    owner.validate_private_single_link(0o600)?;
+    let actual = serde_json::from_slice(&owner.read_limited(VIDEO_CONTROL_OWNER_LIMIT)?)
+        .context("failed to parse video control ownership record")?;
+    if root.bound_entry_identity(entry)? != Some(owner.identity()) {
+        bail!("video control ownership record identity changed after validation");
+    }
+    Ok((owner.identity(), actual))
+}
+
+#[cfg(unix)]
+fn video_control_owner_allows_device_rebind(
+    actual: &VideoControlOwner,
+    expected: &VideoControlOwner,
+) -> bool {
+    actual.version == expected.version
+        && actual.root_inode == expected.root_inode
+        && actual.control_inode == expected.control_inode
+        && actual.root_device != expected.root_device
+        && actual.control_device != expected.control_device
+        && actual.root_device == actual.control_device
+        && expected.root_device == expected.control_device
+}
+
+#[cfg(not(unix))]
+fn video_control_owner_allows_device_rebind(
+    _actual: &VideoControlOwner,
+    _expected: &VideoControlOwner,
+) -> bool {
+    false
+}
+
+fn rebind_video_control_owner_after_device_change(
+    root: &RootedFs,
+    entry: &BoundEntry,
+    path: &Path,
+    identity: EntryIdentity,
+    expected_previous_owner: &VideoControlOwner,
+    expected_current_owner: &VideoControlOwner,
+) -> Result<()> {
+    // Protected property: the owner record must bind this private control directory to the
+    // configured output root. APFS can change st_dev across a remount, so we rebind both device
+    // fields only after the held RootedFs has revalidated the root and the private control
+    // directory, and both persisted inode fields still match. Replacement of either object stays
+    // fail-closed; the atomic replacement also requires the exact 0600 owner-record object read.
+    let (current_identity, actual) = load_video_control_owner(root, entry, path)?;
+    if current_identity != identity || actual != *expected_previous_owner {
+        bail!("video control ownership record changed before device rebind");
+    }
+    if !video_control_owner_allows_device_rebind(&actual, expected_current_owner) {
+        bail!("video control ownership record does not match the bound output root");
+    }
+
+    let contents = serde_json::to_vec(expected_current_owner)
+        .context("failed to encode video control ownership record")?;
+    root.replace_bound_file_atomically_if_identity(
+        entry,
+        identity,
+        &video_control_owner_rebind_temp_path(path),
+        &contents,
+        0o600,
+    )
+    .context("failed to rebind video control ownership record after device change")?;
+
+    let (_, actual) = load_video_control_owner(root, entry, path)?;
+    if actual != *expected_current_owner {
+        bail!("video control ownership record changed after device rebind");
+    }
+    Ok(())
+}
+
+fn video_control_owner_rebind_temp_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    value.push(format!(
+        ".device-rebind-{}-{nanos}-{counter}.tmp",
+        std::process::id()
+    ));
+    PathBuf::from(value)
 }
 
 fn video_recovery_state_file(root: &RootedFs) -> Result<(VideoRecoveryMarker, bool)> {
@@ -19498,6 +19592,83 @@ mv video.original video.m4s || exit 46
             fs::read_to_string(stale.join("partial")).unwrap(),
             "interrupted"
         );
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn video_control_owner_rebinds_after_a_device_change() {
+        use std::os::unix::fs::MetadataExt;
+
+        let video_dir = temp_test_dir("video-control-device-rebind");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let control = video_control_directory(&root).expect("control directory should initialize");
+        let owner_path = control.path.join(VIDEO_CONTROL_OWNER_FILE_NAME);
+        let expected = video_control_owner(&root, control.identity);
+        let stale = VideoControlOwner {
+            root_device: expected.root_device ^ 1,
+            control_device: expected.control_device ^ 1,
+            ..expected.clone()
+        };
+        fs::write(
+            &owner_path,
+            serde_json::to_vec(&stale).expect("stale owner should encode"),
+        )
+        .expect("stale owner should persist");
+
+        let recovered =
+            video_control_directory(&root).expect("device-only owner change should rebind");
+        assert_eq!(recovered.identity, control.identity);
+        let owner_entry = root
+            .bind_entry(&owner_path, false)
+            .expect("owner entry should bind");
+        let (_, repaired) = load_video_control_owner(&root, &owner_entry, &owner_path)
+            .expect("repaired owner should load");
+        let root_metadata = fs::metadata(&video_dir).expect("root metadata should read");
+        let control_metadata = fs::metadata(&recovered.path).expect("control metadata should read");
+        assert_eq!(repaired.root_device, root_metadata.dev());
+        assert_eq!(repaired.root_inode, root_metadata.ino());
+        assert_eq!(repaired.control_device, control_metadata.dev());
+        assert_eq!(repaired.control_inode, control_metadata.ino());
+        assert_ne!(repaired, stale);
+
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn video_control_owner_rejects_a_different_inode() {
+        let video_dir = temp_test_dir("video-control-owner-inode-mismatch");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let control = video_control_directory(&root).expect("control directory should initialize");
+        let owner_path = control.path.join(VIDEO_CONTROL_OWNER_FILE_NAME);
+        let expected = video_control_owner(&root, control.identity);
+        let mismatched = VideoControlOwner {
+            root_inode: expected.root_inode ^ 1,
+            ..expected.clone()
+        };
+        fs::write(
+            &owner_path,
+            serde_json::to_vec(&mismatched).expect("mismatched owner should encode"),
+        )
+        .expect("mismatched owner should persist");
+
+        let error = video_control_directory(&root)
+            .expect_err("a control-directory inode mismatch must remain fail-closed");
+        assert!(
+            format!("{error:#}")
+                .contains("video control ownership record does not match the bound output root")
+        );
+        let owner_entry = root
+            .bind_entry(&owner_path, false)
+            .expect("owner entry should bind");
+        assert_eq!(
+            load_video_control_owner(&root, &owner_entry, &owner_path)
+                .expect("mismatched owner should remain readable")
+                .1,
+            mismatched
+        );
+
         let _ = fs::remove_dir_all(video_dir);
     }
 

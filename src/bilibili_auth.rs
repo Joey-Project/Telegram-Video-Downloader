@@ -1549,7 +1549,8 @@ fn acquire_auth_mutation_file_lock(
         let expected_owner = auth_mutation_lock_owner_for_file(&file)?;
         let actual_owner = load_auth_mutation_lock_owner(&owner_path)?
             .context("BBDown auth lock ownership record disappeared while locking")?;
-        if actual_owner != expected_owner {
+        if !auth_mutation_lock_owner_matches_or_allows_device_rebind(&actual_owner, &expected_owner)
+        {
             bail!("BBDown auth lock ownership record does not match the active lock object");
         }
     }
@@ -2150,6 +2151,14 @@ fn load_auth_mutation_lock_owner(path: &Path) -> Result<Option<AuthMutationLockO
     let Some(file) = root.open_bound_file(&bound_path)? else {
         return Ok(None);
     };
+    let owner = parse_auth_mutation_lock_owner(&file, path)?;
+    if root.entry_identity(&bound_path)? != Some(file.identity()) {
+        bail!("BBDown auth lock ownership record identity changed");
+    }
+    Ok(Some(owner))
+}
+
+fn parse_auth_mutation_lock_owner(file: &BoundFile, path: &Path) -> Result<AuthMutationLockOwner> {
     file.validate_private_single_link(0o600)?;
     let owner = serde_json::from_slice::<AuthMutationLockOwner>(
         &file.read_limited(AUTH_MUTATION_LOCK_OWNER_LIMIT)?,
@@ -2166,18 +2175,19 @@ fn load_auth_mutation_lock_owner(path: &Path) -> Result<Option<AuthMutationLockO
             owner.version
         );
     }
-    if root.entry_identity(&bound_path)? != Some(file.identity()) {
-        bail!("BBDown auth lock ownership record identity changed");
-    }
-    Ok(Some(owner))
+    Ok(owner)
 }
 
 fn ensure_auth_mutation_lock_owner(file: &File, owner_path: &Path) -> Result<()> {
     let expected = auth_mutation_lock_owner_for_file(file)?;
     if let Some(actual) = load_auth_mutation_lock_owner(owner_path)? {
-        if actual != expected {
+        if actual == expected {
+            return Ok(());
+        }
+        if !auth_mutation_lock_owner_allows_device_rebind(&actual, &expected) {
             bail!("BBDown auth lock ownership record does not match the active lock object");
         }
+        replace_auth_mutation_lock_owner_for_device_rebind(owner_path, &actual, &expected)?;
         return Ok(());
     }
 
@@ -2190,6 +2200,73 @@ fn ensure_auth_mutation_lock_owner(file: &File, owner_path: &Path) -> Result<()>
         .context("BBDown auth lock ownership record disappeared after creation")?;
     if actual != expected {
         bail!("BBDown auth lock ownership record changed after creation");
+    }
+    Ok(())
+}
+
+fn auth_mutation_lock_owner_matches_or_allows_device_rebind(
+    actual: &AuthMutationLockOwner,
+    expected: &AuthMutationLockOwner,
+) -> bool {
+    actual == expected || auth_mutation_lock_owner_allows_device_rebind(actual, expected)
+}
+
+#[cfg(unix)]
+fn auth_mutation_lock_owner_allows_device_rebind(
+    actual: &AuthMutationLockOwner,
+    expected: &AuthMutationLockOwner,
+) -> bool {
+    actual.version == expected.version
+        && actual.inode == expected.inode
+        && actual.device != expected.device
+}
+
+#[cfg(not(unix))]
+fn auth_mutation_lock_owner_allows_device_rebind(
+    _actual: &AuthMutationLockOwner,
+    _expected: &AuthMutationLockOwner,
+) -> bool {
+    false
+}
+
+fn replace_auth_mutation_lock_owner_for_device_rebind(
+    owner_path: &Path,
+    expected_previous_owner: &AuthMutationLockOwner,
+    expected_current_owner: &AuthMutationLockOwner,
+) -> Result<()> {
+    // Protected property: the persisted record must bind to the current two-link lock object.
+    // macOS can assign a new st_dev after an APFS remount, so a stable inode is re-bound only
+    // after the caller has locked and fully revalidated the primary/anchor pair. An inode change
+    // remains a replacement and is rejected before this path.
+    let (root, bound_path) = rooted_auth_lock_path(owner_path)?;
+    let entry = root.bind_entry(&bound_path, false)?;
+    let identity = root
+        .bound_entry_identity(&entry)?
+        .context("BBDown auth lock ownership record disappeared before device rebind")?;
+    let file = root.open_bound_file_if_identity(&entry, identity)?;
+    let actual = parse_auth_mutation_lock_owner(&file, owner_path)?;
+    if actual != *expected_previous_owner {
+        bail!("BBDown auth lock ownership record changed before device rebind");
+    }
+    if !auth_mutation_lock_owner_allows_device_rebind(&actual, expected_current_owner) {
+        bail!("BBDown auth lock ownership record does not match the active lock object");
+    }
+
+    let contents = serde_json::to_vec(expected_current_owner)
+        .context("failed to encode BBDown auth lock ownership record")?;
+    root.replace_bound_file_atomically_if_identity(
+        &entry,
+        identity,
+        &temp_state_path(&bound_path),
+        &contents,
+        0o600,
+    )
+    .context("failed to rebind BBDown auth lock ownership record after device change")?;
+
+    let actual = load_auth_mutation_lock_owner(owner_path)?
+        .context("BBDown auth lock ownership record disappeared after device rebind")?;
+    if actual != *expected_current_owner {
+        bail!("BBDown auth lock ownership record changed after device rebind");
     }
     Ok(())
 }
@@ -5402,6 +5479,99 @@ mod tests {
         )
         .expect("second auth mutation should commit its epoch");
         assert_eq!(second_epoch.value(), 2);
+
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_lock_rebinds_owner_record_after_a_device_change() {
+        use std::os::unix::fs::MetadataExt;
+
+        let state_path = temp_state_file("auth-lock-device-rebind");
+        let credential_file = state_path.with_file_name("credentials.json");
+        drop(
+            acquire_auth_reply_file_lock(&state_path, &credential_file)
+                .expect("auth lock should initialize"),
+        );
+
+        let lock_path = auth_mutation_lock_path(&credential_file);
+        let owner_path = auth_mutation_lock_owner_path(&credential_file);
+        let expected = load_auth_mutation_lock_owner(&owner_path)
+            .expect("owner record should load")
+            .expect("owner record should exist");
+        let stale = AuthMutationLockOwner {
+            device: expected.device ^ 1,
+            ..expected
+        };
+        fs::write(
+            &owner_path,
+            serde_json::to_vec(&stale).expect("stale owner should encode"),
+        )
+        .expect("stale owner should persist");
+
+        let recovered = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect("device-only owner change should rebind");
+        assert_eq!(
+            recovered
+                .current_epoch()
+                .expect("epoch should read")
+                .value(),
+            0
+        );
+        drop(recovered);
+
+        let metadata = fs::metadata(&lock_path).expect("lock should remain available");
+        let repaired = load_auth_mutation_lock_owner(&owner_path)
+            .expect("repaired owner should load")
+            .expect("repaired owner should exist");
+        assert_eq!(repaired.device, metadata.dev());
+        assert_eq!(repaired.inode, metadata.ino());
+        assert_ne!(repaired, stale);
+
+        if let Some(parent) = state_path.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_lock_rejects_owner_record_with_a_different_inode() {
+        let state_path = temp_state_file("auth-lock-owner-inode-mismatch");
+        let credential_file = state_path.with_file_name("credentials.json");
+        drop(
+            acquire_auth_reply_file_lock(&state_path, &credential_file)
+                .expect("auth lock should initialize"),
+        );
+
+        let owner_path = auth_mutation_lock_owner_path(&credential_file);
+        let expected = load_auth_mutation_lock_owner(&owner_path)
+            .expect("owner record should load")
+            .expect("owner record should exist");
+        let mismatched = AuthMutationLockOwner {
+            inode: expected.inode ^ 1,
+            ..expected
+        };
+        fs::write(
+            &owner_path,
+            serde_json::to_vec(&mismatched).expect("mismatched owner should encode"),
+        )
+        .expect("mismatched owner should persist");
+
+        let error = acquire_auth_reply_file_lock(&state_path, &credential_file)
+            .expect_err("an inode mismatch must remain fail-closed");
+        assert!(
+            format!("{error:#}").contains(
+                "BBDown auth lock ownership record does not match the active lock object"
+            )
+        );
+        assert_eq!(
+            load_auth_mutation_lock_owner(&owner_path)
+                .expect("mismatched owner should remain readable"),
+            Some(mismatched)
+        );
 
         if let Some(parent) = state_path.parent() {
             let _ = fs::remove_dir_all(parent);
