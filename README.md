@@ -15,7 +15,7 @@
 - `/pdf URL` 调用 uv 管理的 Python Playwright helper，使用系统 Chrome 打印 PDF；`pdf.auto_domains` 里的域名会自动走 PDF。
 - 全局并发由配置控制，超出的任务会排队。
 - 外部命令会流式采集 stdout/stderr，并监控输出目录文件大小；长时间无输出且无文件增长会自动失败，避免任务一直停在 `Started`。
-- 任务开始后会发送一条状态消息，后续下载/混流进度会尽量通过 Telegram edit message 在同一条消息中刷新。
+- 任务开始后会发送一条状态消息，后续下载/混流进度会尽量通过 Telegram edit message 在同一条消息中刷新；视频 plan/metadata 解析完成后，同一条消息会持续显示已选媒体的预估大小、分辨率、帧率、视频/音频编码和全集条目数。上游未提供大小时会明确显示 `unknown`，混合已知与未知流时显示 `at least`，不会用码率伪造精确文件大小。
 
 ## 配置
 
@@ -50,7 +50,7 @@ staging 下载成功后会先持久化身份绑定的 `.retained.json`；Bilibil
 
 `bilibili.auth.credential_file` 是 `bbdown-core` credential 文件，默认写到 `~/.local/state/telegram-video-downloader/bbdown-credentials.json`；可选的 `credential_profile` 会选择同一文件里的 profile。`credential_file` 的直接父目录不能是符号链接；需要使用链接目录时，请配置其解析后的真实目录。`/bbdown login` 默认等同 `/bbdown login web`，会直接创建并轮询 Web QR；`/bbdown login tv` 会保存 TV 专用 `tv_access_key`；`/bbdown login access-key` 会发送 BiliPlus/BALH 授权 QR 和链接，授权后把 callback URL 或 `balh-login-credentials:` 消息发回同一个私聊即可保存 generic intl/Bstar `access_key`。`/bbdown status` 通过 crate API 检查 cookie、`access_key` 和 `tv_access_key`；`/bbdown logout` 清理当前 credential/profile，并兼容删除旧版 bot Web cookie state。legacy cookie migration、fresh login 和 logout 使用同一个常驻、`O_NOFOLLOW` 打开的跨进程锁文件。该文件通过两个交替写入、`fsync` 的固定大小槽位保存认证 epoch，并能从旧版有界 append log 自动迁移：登录开始时冻结当前 epoch，写入凭据前必须仍匹配；status、登录成功和 logout 的最终 Telegram 回复会在持有同一跨进程锁时重新核对 epoch。这样并行进程既不能在 logout 后用等待中的登录重新创建凭据，也不能在凭据变化后发送过期的“有效/成功”回复。
 
-`bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。进度通道只保留最新状态，Telegram 按该间隔合并刷新，不会因全集任务的高频事件积压消息。YouTube/PDF 外部命令会刷新文件增长快照；Bilibili 会转发 `bbdown-core` 的关键 plan、download 和 mux 阶段。`bot.command_timeout_seconds` 是单个外部命令的总超时；direct Bilibili 下载不受这个总时限约束，而是把 `bot.command_idle_timeout_seconds` 作为媒体读取 idle timeout 传给 `bbdown-core`。Bilibili API 请求仍受独立的 request timeout 约束，bot 调用的 ffmpeg 等外部命令仍受总超时和 idle timeout 约束。
+`bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。进度通道只保留最新状态，Telegram 按该间隔合并刷新，不会因全集任务的高频事件积压消息。视频计划解析得到的媒体摘要会作为进度上下文保留，后续速度、文件增长、下载和 mux 阶段更新不会覆盖它。YouTube/PDF 外部命令会刷新文件增长快照；Bilibili 会转发 `bbdown-core` 的关键 plan、download 和 mux 阶段。`bot.command_timeout_seconds` 是单个外部命令的总超时；direct Bilibili 下载不受这个总时限约束，而是把 `bot.command_idle_timeout_seconds` 作为媒体读取 idle timeout 传给 `bbdown-core`。Bilibili API 请求仍受独立的 request timeout 约束，bot 调用的 ffmpeg 等外部命令仍受总超时和 idle timeout 约束。
 
 ## 运行
 

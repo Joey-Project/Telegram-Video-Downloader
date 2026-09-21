@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use bbdown_core::{
     DownloadFileKind, DownloadMode, DownloadProgressEvent, DownloadProgressSink, DownloadReport,
-    ResolvedContent,
+    MediaStream, ResolvedContent,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -58,6 +58,7 @@ const VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON: &str =
 const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
 const BILIBILI_WORKER_REQUEST_VERSION: u32 = 3;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
+const BILIBILI_RESOLVED_PROGRESS_WIRE_PREFIX: &str = "TVD_BILIBILI_RESOLVED:";
 const BILIBILI_WORKER_LIFECYCLE_FILE_NAME: &str = ".bilibili-worker-lifecycle.json";
 const BILIBILI_WORKER_LIFECYCLE_TRANSITION_FILE_NAME: &str = ".bilibili-worker-lifecycle.next.json";
 const BILIBILI_WORKER_LIFECYCLE_VERSION: u32 = 2;
@@ -241,6 +242,7 @@ pub struct JobReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobProgress {
     pub message: String,
+    pub resolved_summary: Option<String>,
 }
 
 pub type JobProgressSender = watch::Sender<Option<JobProgress>>;
@@ -441,10 +443,38 @@ struct YoutubeMetadata {
     channel: Option<String>,
     upload_date: Option<String>,
     webpage_url: Option<String>,
+    filesize: Option<u64>,
+    filesize_approx: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<f64>,
+    vcodec: Option<String>,
+    acodec: Option<String>,
+    format_note: Option<String>,
+    resolution: Option<String>,
+    abr: Option<f64>,
+    #[serde(default)]
+    requested_formats: Vec<YoutubeFormat>,
+    #[serde(default)]
+    requested_downloads: Vec<YoutubeFormat>,
     #[serde(default)]
     subtitles: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     automatic_captions: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct YoutubeFormat {
+    filesize: Option<u64>,
+    filesize_approx: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<f64>,
+    vcodec: Option<String>,
+    acodec: Option<String>,
+    format_note: Option<String>,
+    resolution: Option<String>,
+    abr: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -649,6 +679,412 @@ fn bilibili_owner_name(owner: Option<&bbdown_core::Owner>) -> Option<String> {
         .map(|owner| owner.name.trim())
         .filter(|name| !name.is_empty())
         .map(str::to_string)
+}
+
+#[derive(Debug, Default)]
+struct ExpectedMediaSize {
+    known_bytes: u64,
+    unknown_streams: usize,
+    approximate: bool,
+}
+
+impl ExpectedMediaSize {
+    fn add_exact(&mut self, size: Option<u64>) {
+        match size {
+            Some(size) => self.known_bytes = self.known_bytes.saturating_add(size),
+            None => self.unknown_streams += 1,
+        }
+    }
+
+    fn add_estimate(&mut self, exact: Option<u64>, approximate: Option<u64>) {
+        match exact.or(approximate) {
+            Some(size) => {
+                self.known_bytes = self.known_bytes.saturating_add(size);
+                self.approximate |= exact.is_none();
+            }
+            None => self.unknown_streams += 1,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match (self.known_bytes, self.unknown_streams, self.approximate) {
+            (0, 0, _) => "not applicable".to_string(),
+            (0, _, _) => "unknown".to_string(),
+            (known, 0, true) => format!("about {}", human_bytes(known)),
+            (known, 0, false) => human_bytes(known),
+            (known, _, true) => format!("at least about {}", human_bytes(known)),
+            (known, _, false) => format!("at least {}", human_bytes(known)),
+        }
+    }
+}
+
+fn bilibili_resolved_download_summary(
+    plan: &bbdown_core::DownloadPlan,
+    options: &bbdown_core::DownloadOptions,
+) -> String {
+    let mut estimated_size = ExpectedMediaSize::default();
+    let mut video_profiles = Vec::new();
+    let mut audio_profiles = Vec::new();
+    let (expects_video, expects_audio) = match options.mode {
+        DownloadMode::All => (true, true),
+        DownloadMode::VideoOnly => (true, false),
+        DownloadMode::AudioOnly => (false, true),
+        DownloadMode::SubtitleOnly | DownloadMode::DanmakuOnly | DownloadMode::CoverOnly => {
+            (false, false)
+        }
+        _ => (false, false),
+    };
+
+    for entry in &plan.entries {
+        match options.mode {
+            DownloadMode::All => {
+                let video = bilibili_selected_video(entry, &options.stream_selection);
+                let audio = bilibili_selected_audio(entry, &options.stream_selection);
+                if let (Some(video), Some(audio)) = (video, audio) {
+                    estimated_size.add_exact(video.size);
+                    estimated_size.add_exact(audio.size);
+                    video_profiles.push(bilibili_video_profile(entry, video));
+                    audio_profiles.push(bilibili_audio_profile(audio));
+                } else if !entry.streams.flv_segments.is_empty() {
+                    for segment in &entry.streams.flv_segments {
+                        estimated_size.add_exact(segment.size);
+                    }
+                    video_profiles.push("FLV".to_string());
+                }
+            }
+            DownloadMode::VideoOnly => {
+                if let Some(video) = bilibili_selected_video(entry, &options.stream_selection) {
+                    estimated_size.add_exact(video.size);
+                    video_profiles.push(bilibili_video_profile(entry, video));
+                }
+            }
+            DownloadMode::AudioOnly => {
+                if let Some(audio) = bilibili_selected_audio(entry, &options.stream_selection) {
+                    estimated_size.add_exact(audio.size);
+                    audio_profiles.push(bilibili_audio_profile(audio));
+                }
+            }
+            DownloadMode::SubtitleOnly | DownloadMode::DanmakuOnly | DownloadMode::CoverOnly => {}
+            _ => {}
+        }
+    }
+
+    let entry_label = if plan.entries.len() == 1 {
+        "1 entry".to_string()
+    } else {
+        format!("{} entries", plan.entries.len())
+    };
+    let mut lines = vec![format!("Entries: {entry_label}")];
+    if expects_video || expects_audio {
+        lines.push(format!("Estimated media: {}", estimated_size.describe()));
+    }
+    if expects_video {
+        lines.push(format!(
+            "Video: {}",
+            summarize_progress_labels(video_profiles, "unavailable")
+        ));
+    }
+    if expects_audio {
+        lines.push(format!(
+            "Audio: {}",
+            summarize_progress_labels(audio_profiles, "unavailable")
+        ));
+    }
+    if !expects_video && !expects_audio {
+        lines.push("Media: not requested".to_string());
+    }
+    lines.join("\n")
+}
+
+fn bilibili_selected_video<'a>(
+    entry: &'a bbdown_core::DownloadEntry,
+    selection: &bbdown_core::StreamSelection,
+) -> Option<&'a MediaStream> {
+    selection
+        .video_quality
+        .and_then(|quality| {
+            entry
+                .streams
+                .videos
+                .iter()
+                .find(|stream| stream.id == quality)
+        })
+        .or_else(|| entry.streams.videos.first())
+}
+
+fn bilibili_selected_audio<'a>(
+    entry: &'a bbdown_core::DownloadEntry,
+    selection: &bbdown_core::StreamSelection,
+) -> Option<&'a MediaStream> {
+    entry.streams.audios.iter().find(|stream| {
+        selection
+            .audio_quality
+            .is_none_or(|quality| stream.id == quality)
+            && selection.audio_language.as_deref().is_none_or(|language| {
+                [stream.language.as_deref(), stream.language_doc.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(language))
+            })
+    })
+}
+
+fn bilibili_video_profile(entry: &bbdown_core::DownloadEntry, stream: &MediaStream) -> String {
+    let mut parts = Vec::new();
+    if let Some(description) = entry
+        .streams
+        .qualities
+        .iter()
+        .find(|quality| quality.id == stream.id)
+        .and_then(|quality| quality.description.as_deref())
+        .and_then(compact_progress_value)
+    {
+        parts.push(description);
+    }
+    if let (Some(width), Some(height)) = (stream.width, stream.height) {
+        parts.push(format!("{width}x{height}"));
+    } else if let Some(height) = stream.height {
+        parts.push(format!("{height}p"));
+    }
+    if let Some(frame_rate) = bilibili_frame_rate_label(stream.frame_rate.as_deref()) {
+        parts.push(frame_rate);
+    }
+    if let Some(codec) = codec_label(stream.codecs.as_deref()) {
+        parts.push(codec);
+    }
+    if parts.is_empty() {
+        format!("stream {}", stream.id)
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn bilibili_audio_profile(stream: &MediaStream) -> String {
+    let mut parts = Vec::new();
+    if let Some(language) = stream
+        .language_doc
+        .as_deref()
+        .or(stream.language.as_deref())
+        .and_then(compact_progress_value)
+    {
+        parts.push(language);
+    }
+    if let Some(codec) = codec_label(stream.codecs.as_deref()) {
+        parts.push(codec);
+    }
+    if let Some(bandwidth) = stream.bandwidth {
+        parts.push(format_bitrate(bandwidth));
+    }
+    if parts.is_empty() {
+        format!("stream {}", stream.id)
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn youtube_resolved_download_summary(metadata: &YoutubeMetadata) -> String {
+    let fallback = YoutubeFormat {
+        filesize: metadata.filesize,
+        filesize_approx: metadata.filesize_approx,
+        width: metadata.width,
+        height: metadata.height,
+        fps: metadata.fps,
+        vcodec: metadata.vcodec.clone(),
+        acodec: metadata.acodec.clone(),
+        format_note: metadata.format_note.clone(),
+        resolution: metadata.resolution.clone(),
+        abr: metadata.abr,
+    };
+    let formats = if !metadata.requested_formats.is_empty() {
+        metadata.requested_formats.iter().collect::<Vec<_>>()
+    } else if !metadata.requested_downloads.is_empty() {
+        metadata.requested_downloads.iter().collect::<Vec<_>>()
+    } else {
+        vec![&fallback]
+    };
+    let mut estimated_size = ExpectedMediaSize::default();
+    let mut video_profiles = Vec::new();
+    let mut audio_profiles = Vec::new();
+
+    for format in formats {
+        let has_video = youtube_codec_present(format.vcodec.as_deref())
+            || format.width.is_some()
+            || format.height.is_some();
+        let has_audio = youtube_codec_present(format.acodec.as_deref());
+        if has_video || has_audio {
+            estimated_size.add_estimate(format.filesize, format.filesize_approx);
+        }
+        if has_video {
+            video_profiles.push(youtube_video_profile(format));
+        }
+        if has_audio {
+            audio_profiles.push(youtube_audio_profile(format));
+        }
+    }
+
+    let mut lines = vec![format!("Estimated media: {}", estimated_size.describe())];
+    lines.push(format!(
+        "Video: {}",
+        summarize_progress_labels(video_profiles, "unavailable")
+    ));
+    lines.push(format!(
+        "Audio: {}",
+        summarize_progress_labels(audio_profiles, "unavailable")
+    ));
+    lines.join("\n")
+}
+
+fn youtube_video_profile(format: &YoutubeFormat) -> String {
+    let mut parts = Vec::new();
+    if let Some(resolution) = youtube_resolution_label(format) {
+        parts.push(resolution);
+    }
+    if let Some(fps) = format.fps.filter(|fps| *fps > 0.0) {
+        parts.push(format_fps(fps));
+    }
+    if let Some(codec) = codec_label(format.vcodec.as_deref()) {
+        parts.push(codec);
+    }
+    if parts.is_empty() {
+        "available".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn youtube_audio_profile(format: &YoutubeFormat) -> String {
+    let mut parts = Vec::new();
+    if let Some(codec) = codec_label(format.acodec.as_deref()) {
+        parts.push(codec);
+    }
+    if let Some(abr) = format.abr.filter(|abr| *abr > 0.0) {
+        parts.push(format!("{} kbps", format_decimal(abr)));
+    }
+    if parts.is_empty() {
+        "available".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn youtube_resolution_label(format: &YoutubeFormat) -> Option<String> {
+    if let (Some(width), Some(height)) = (format.width, format.height) {
+        return Some(format!("{width}x{height}"));
+    }
+    [format.resolution.as_deref(), format.format_note.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|value| !is_unknown_youtube_value(value))
+        .and_then(compact_progress_value)
+}
+
+fn youtube_codec_present(codec: Option<&str>) -> bool {
+    codec
+        .map(str::trim)
+        .is_some_and(|codec| !codec.is_empty() && !codec.eq_ignore_ascii_case("none"))
+}
+
+fn is_unknown_youtube_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "none" | "unknown" | "audio only"
+    )
+}
+
+fn summarize_progress_labels(labels: Vec<String>, fallback: &str) -> String {
+    let mut unique = Vec::new();
+    for label in labels {
+        if !unique.iter().any(|existing| existing == &label) {
+            unique.push(label);
+        }
+    }
+    match unique.len() {
+        0 => fallback.to_string(),
+        1..=3 => unique.join("; "),
+        count => format!("{} (+{} more)", unique[..3].join("; "), count - 3),
+    }
+}
+
+fn compact_progress_value(value: &str) -> Option<String> {
+    const MAX_CHARS: usize = 64;
+
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return None;
+    }
+    let mut chars = compact.chars();
+    let prefix = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    Some(if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    })
+}
+
+fn codec_label(codec: Option<&str>) -> Option<String> {
+    let raw = codec?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let token = raw
+        .split(['.', ',', ' ', ';'])
+        .next()
+        .unwrap_or(raw)
+        .to_ascii_lowercase();
+    let label = match token.as_str() {
+        "avc1" | "avc3" | "h264" => "H.264".to_string(),
+        "hev1" | "hvc1" | "hevc" | "h265" => "HEVC".to_string(),
+        "av01" | "av1" => "AV1".to_string(),
+        "vp09" | "vp9" => "VP9".to_string(),
+        "mp4a" | "aac" => "AAC".to_string(),
+        "ec-3" | "eac3" => "E-AC-3".to_string(),
+        "ac-3" | "ac3" => "AC-3".to_string(),
+        "flac" => "FLAC".to_string(),
+        _ => compact_progress_value(raw)?,
+    };
+    Some(label)
+}
+
+fn bilibili_frame_rate_label(frame_rate: Option<&str>) -> Option<String> {
+    let frame_rate = compact_progress_value(frame_rate?)?;
+    let value = frame_rate
+        .split_once('/')
+        .and_then(|(numerator, denominator)| {
+            Some(numerator.parse::<f64>().ok()? / denominator.parse::<f64>().ok()?)
+        })
+        .or_else(|| frame_rate.parse::<f64>().ok());
+    value
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(format_fps)
+        .or_else(|| Some(format!("{frame_rate}fps")))
+}
+
+fn format_fps(value: f64) -> String {
+    let rounded = value.round();
+    if (value - rounded).abs() < 0.05 {
+        format!("{rounded:.0}fps")
+    } else {
+        format!("{value:.1}fps")
+    }
+}
+
+fn format_bitrate(bits_per_second: u64) -> String {
+    if bits_per_second >= 1_000_000 {
+        format!(
+            "{} Mbps",
+            format_decimal(bits_per_second as f64 / 1_000_000.0)
+        )
+    } else {
+        format!("{} kbps", format_decimal(bits_per_second as f64 / 1_000.0))
+    }
+}
+
+fn format_decimal(value: f64) -> String {
+    if (value - value.round()).abs() < 0.05 {
+        format!("{:.0}", value.round())
+    } else {
+        format!("{value:.1}")
+    }
 }
 
 impl From<&DownloadReport> for BilibiliDownloadReport {
@@ -1284,10 +1720,19 @@ pub async fn run_bilibili_worker() -> Result<()> {
     validate_bilibili_worker_staging(&root, &request)?;
     let (progress, mut progress_receiver) = job_progress_channel();
     let progress_writer = tokio::spawn(async move {
+        let mut emitted_summary = None;
         while progress_receiver.changed().await.is_ok() {
             let current = progress_receiver.borrow_and_update().clone();
             if let Some(current) = current {
-                println!("{}", current.message);
+                if current.resolved_summary != emitted_summary {
+                    if let Some(summary) = current.resolved_summary.as_deref() {
+                        println!("{}", bilibili_resolved_progress_wire(summary));
+                    }
+                    emitted_summary.clone_from(&current.resolved_summary);
+                }
+                if !current.message.trim().is_empty() {
+                    println!("{}", current.message);
+                }
                 let _ = std::io::stdout().flush();
             }
         }
@@ -1413,6 +1858,11 @@ async fn run_bilibili_job_locked(
     if let Some(expected_identity) = expected_overwrite_identity {
         ensure_bilibili_overwrite_plan_matches(&plan, expected_identity)?;
     }
+    send_resolved_download_summary(
+        progress.as_ref(),
+        "BBDown-rust: resolved media".to_string(),
+        bilibili_resolved_download_summary(&core_plan, &options),
+    );
     let progress_reporter = BilibiliCoreProgress::new(progress.clone());
     let command_started_at = SystemTime::now();
     let core_report = client
@@ -4059,6 +4509,11 @@ async fn run_staged_video_job(
                     .await;
             match metadata {
                 Ok(metadata) => {
+                    send_resolved_download_summary(
+                        progress.as_ref(),
+                        "yt-dlp: resolved media".to_string(),
+                        youtube_resolved_download_summary(&metadata),
+                    );
                     let subtitle_plan =
                         select_subtitles(&metadata, &staging_config.video.subtitle_languages);
                     let result = run_youtube_job_locked(
@@ -5608,10 +6063,42 @@ fn warn_recovered_overwrite(recovery: &str) {
 
 fn send_progress(progress: Option<&JobProgressSender>, message: String) {
     if let Some(progress) = progress {
+        let message = redact_sensitive_text(&message);
+        progress.send_modify(|current| {
+            let resolved_summary = current
+                .as_ref()
+                .and_then(|progress| progress.resolved_summary.clone());
+            *current = Some(JobProgress {
+                message: message.clone(),
+                resolved_summary,
+            });
+        });
+    }
+}
+
+fn send_resolved_download_summary(
+    progress: Option<&JobProgressSender>,
+    message: String,
+    summary: String,
+) {
+    if let Some(progress) = progress {
         progress.send_replace(Some(JobProgress {
             message: redact_sensitive_text(&message),
+            resolved_summary: Some(redact_sensitive_text(&summary)),
         }));
     }
+}
+
+fn bilibili_resolved_progress_wire(summary: &str) -> String {
+    let encoded = serde_json::to_string(summary).unwrap_or_default();
+    format!("{BILIBILI_RESOLVED_PROGRESS_WIRE_PREFIX}{encoded}")
+}
+
+fn parse_bilibili_resolved_progress_wire(text: &str) -> Option<String> {
+    let encoded = text
+        .trim()
+        .strip_prefix(BILIBILI_RESOLVED_PROGRESS_WIRE_PREFIX)?;
+    serde_json::from_str(encoded).ok()
 }
 
 #[derive(Debug)]
@@ -7094,7 +7581,8 @@ struct ProgressTracker {
     min_interval: Duration,
     next_send_at: Instant,
     progress: Option<JobProgressSender>,
-    last_message: Option<String>,
+    last_progress: Option<JobProgress>,
+    resolved_summary: Option<String>,
     last_output: Option<String>,
     last_file_activity: Option<FileActivityReport>,
     stage: ProgressStage,
@@ -7108,13 +7596,20 @@ impl ProgressTracker {
         min_interval: Duration,
         progress: Option<JobProgressSender>,
     ) -> Self {
+        let resolved_summary = progress.as_ref().and_then(|progress| {
+            progress
+                .borrow()
+                .as_ref()
+                .and_then(|current| current.resolved_summary.clone())
+        });
         Self {
             stage: ProgressStage::initial_for(&command_name),
             command_name,
             min_interval,
             next_send_at: Instant::now(),
             progress,
-            last_message: None,
+            last_progress: None,
+            resolved_summary,
             last_output: None,
             last_file_activity: None,
             stdout_sanitizer: CommandProgressSanitizer::default(),
@@ -7152,6 +7647,14 @@ impl ProgressTracker {
 
     fn observe_sanitized(&mut self, stream: CommandStream, text: &str) {
         let text = normalize_terminal_text(text);
+        if self.command_name == "BBDown-rust"
+            && matches!(stream, CommandStream::Stdout)
+            && let Some(summary) = parse_bilibili_resolved_progress_wire(&text)
+        {
+            self.resolved_summary = Some(summary);
+            self.emit_current(Instant::now());
+            return;
+        }
         self.stage = self.stage.update_from_text(&self.command_name, &text);
         let Some(message) = summarize_progress_chunk(&self.command_name, stream, &text) else {
             return;
@@ -7172,19 +7675,22 @@ impl ProgressTracker {
     }
 
     fn emit_current(&mut self, now: Instant) {
-        let Some(progress) = &self.progress else {
+        let Some(progress_sender) = self.progress.clone() else {
             return;
         };
 
         if now < self.next_send_at {
             return;
         }
-        let message = self.current_message();
-        if self.last_message.as_ref() == Some(&message) {
+        let update = JobProgress {
+            message: self.current_message(),
+            resolved_summary: self.resolved_summary.clone(),
+        };
+        if self.last_progress.as_ref() == Some(&update) {
             return;
         }
 
-        self.send(progress.clone(), message, now);
+        self.send(progress_sender, update, now);
     }
 
     fn current_message(&self) -> String {
@@ -7222,12 +7728,15 @@ impl ProgressTracker {
         lines.join("\n")
     }
 
-    fn send(&mut self, progress: JobProgressSender, message: String, now: Instant) {
-        let message = redact_sensitive_output(&message);
-        self.last_message = Some(message.clone());
+    fn send(&mut self, progress: JobProgressSender, mut update: JobProgress, now: Instant) {
+        update.message = redact_sensitive_output(&update.message);
+        update.resolved_summary = update
+            .resolved_summary
+            .map(|summary| redact_sensitive_text(&summary));
+        self.last_progress = Some(update.clone());
         self.next_send_at = now + self.min_interval;
-        info!(command = %self.command_name, message = %message, "command progress");
-        progress.send_replace(Some(JobProgress { message }));
+        info!(command = %self.command_name, message = %update.message, "command progress");
+        progress.send_replace(Some(update));
     }
 }
 
@@ -12570,6 +13079,188 @@ mod tests {
             ]),
             ..YoutubeMetadata::default()
         }
+    }
+
+    fn test_bilibili_plan(entries: Vec<serde_json::Value>) -> bbdown_core::DownloadPlan {
+        serde_json::from_value(serde_json::json!({
+            "title": "Example plan",
+            "entries": entries,
+        }))
+        .expect("test Bilibili plan should deserialize")
+    }
+
+    fn test_bilibili_entry(
+        index: u32,
+        video_size: Option<u64>,
+        audio_size: Option<u64>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "index": index,
+            "aid": 170_000 + index,
+            "bvid": format!("BVtest{index}"),
+            "cid": 10_000 + index,
+            "epid": null,
+            "title": format!("Entry {index}"),
+            "source": "normal_web",
+            "streams": {
+                "videos": [{
+                    "id": 80,
+                    "base_url": "https://example.test/video.m4s",
+                    "backup_urls": [],
+                    "language": null,
+                    "language_doc": null,
+                    "codecs": "avc1.640028",
+                    "bandwidth": 4_000_000,
+                    "width": 1920,
+                    "height": 1080,
+                    "frame_rate": "60",
+                    "mime_type": "video/mp4",
+                    "size": video_size,
+                }],
+                "audios": [{
+                    "id": 30280,
+                    "base_url": "https://example.test/audio.m4s",
+                    "backup_urls": [],
+                    "language": "ja-JP",
+                    "language_doc": "Japanese",
+                    "codecs": "mp4a.40.2",
+                    "bandwidth": 128_000,
+                    "width": null,
+                    "height": null,
+                    "frame_rate": null,
+                    "mime_type": "audio/mp4",
+                    "size": audio_size,
+                }],
+                "flv_segments": [],
+                "accept_quality": [80],
+                "qualities": [{"id": 80, "description": "1080P"}],
+                "duration_seconds": 60,
+            },
+            "subtitles": [],
+            "chapters": [],
+            "danmaku": {
+                "cid": 10_000 + index,
+                "xml_url": "https://comment.example/test.xml",
+            },
+        })
+    }
+
+    #[test]
+    fn summarizes_bilibili_resolved_media_with_selected_streams() {
+        let plan = test_bilibili_plan(vec![test_bilibili_entry(
+            1,
+            Some(3 * 1024 * 1024),
+            Some(1024 * 1024),
+        )]);
+        let options = bbdown_core::DownloadOptions::new("downloads");
+
+        assert_eq!(
+            bilibili_resolved_download_summary(&plan, &options),
+            "Entries: 1 entry\nEstimated media: 4.0 MiB\nVideo: 1080P 1920x1080 60fps H.264\nAudio: Japanese AAC 128 kbps"
+        );
+    }
+
+    #[test]
+    fn summarizes_bilibili_plan_with_unknown_stream_sizes_conservatively() {
+        let plan = test_bilibili_plan(vec![
+            test_bilibili_entry(1, Some(1024 * 1024), Some(1024 * 1024)),
+            test_bilibili_entry(2, None, None),
+        ]);
+        let options = bbdown_core::DownloadOptions::new("downloads");
+        let summary = bilibili_resolved_download_summary(&plan, &options);
+
+        assert!(summary.contains("Entries: 2 entries"));
+        assert!(summary.contains("Estimated media: at least 2.0 MiB"));
+        assert!(summary.contains("Video: 1080P 1920x1080 60fps H.264"));
+        assert!(summary.contains("Audio: Japanese AAC 128 kbps"));
+    }
+
+    #[test]
+    fn summarizes_youtube_selected_formats_and_approximate_size() {
+        let metadata = YoutubeMetadata {
+            requested_formats: vec![
+                YoutubeFormat {
+                    filesize: Some(3 * 1024 * 1024),
+                    width: Some(1920),
+                    height: Some(1080),
+                    fps: Some(60.0),
+                    vcodec: Some("avc1.640028".to_string()),
+                    ..YoutubeFormat::default()
+                },
+                YoutubeFormat {
+                    filesize_approx: Some(1024 * 1024),
+                    acodec: Some("mp4a.40.2".to_string()),
+                    abr: Some(128.0),
+                    ..YoutubeFormat::default()
+                },
+            ],
+            ..YoutubeMetadata::default()
+        };
+
+        assert_eq!(
+            youtube_resolved_download_summary(&metadata),
+            "Estimated media: about 4.0 MiB\nVideo: 1920x1080 60fps H.264\nAudio: AAC 128 kbps"
+        );
+    }
+
+    #[test]
+    fn summarizes_youtube_unknown_size_without_guessing() {
+        let metadata = YoutubeMetadata {
+            width: Some(1280),
+            height: Some(720),
+            fps: Some(30.0),
+            vcodec: Some("av01.0.05M.08".to_string()),
+            ..YoutubeMetadata::default()
+        };
+
+        assert_eq!(
+            youtube_resolved_download_summary(&metadata),
+            "Estimated media: unknown\nVideo: 1280x720 30fps AV1\nAudio: unavailable"
+        );
+    }
+
+    #[test]
+    fn resolved_progress_context_survives_later_progress_updates() {
+        let (progress, mut receiver) = job_progress_channel();
+        send_resolved_download_summary(
+            Some(&progress),
+            "yt-dlp: resolved media".to_string(),
+            "Estimated media: 4.0 MiB".to_string(),
+        );
+        let first = take_latest_progress(&mut receiver);
+        assert_eq!(
+            first.resolved_summary.as_deref(),
+            Some("Estimated media: 4.0 MiB")
+        );
+
+        send_progress(Some(&progress), "yt-dlp: downloading media".to_string());
+        let second = take_latest_progress(&mut receiver);
+        assert_eq!(second.message, "yt-dlp: downloading media");
+        assert_eq!(
+            second.resolved_summary.as_deref(),
+            Some("Estimated media: 4.0 MiB")
+        );
+    }
+
+    #[test]
+    fn bilibili_worker_progress_wire_preserves_resolved_summary() {
+        let (progress, mut receiver) = job_progress_channel();
+        let mut tracker = ProgressTracker::new(
+            "BBDown-rust".to_string(),
+            Duration::from_secs(0),
+            Some(progress),
+        );
+        let wire = format!(
+            "{}\n",
+            bilibili_resolved_progress_wire("Estimated media: 4.0 MiB")
+        );
+        tracker.observe(CommandStream::Stdout, wire.as_bytes());
+
+        let update = take_latest_progress(&mut receiver);
+        assert_eq!(
+            update.resolved_summary.as_deref(),
+            Some("Estimated media: 4.0 MiB")
+        );
     }
 
     fn find_video_duplicate_without_probe(
@@ -19420,7 +20111,8 @@ mv video.original video.m4s || exit 46
                     .expect("waiting progress should have a value")
             },
             JobProgress {
-                message: "Bilibili download: waiting for video output slot".to_string()
+                message: "Bilibili download: waiting for video output slot".to_string(),
+                resolved_summary: None,
             }
         );
 
@@ -19435,7 +20127,8 @@ mv video.original video.m4s || exit 46
                     .expect("acquired progress should have a value")
             },
             JobProgress {
-                message: "Bilibili download: video output slot acquired".to_string()
+                message: "Bilibili download: video output slot acquired".to_string(),
+                resolved_summary: None,
             }
         );
         waiter.await.expect("waiter should finish");
