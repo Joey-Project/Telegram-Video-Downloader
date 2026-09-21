@@ -2515,7 +2515,7 @@ async fn deliver_progress(
             send_or_log(
                 telegram,
                 chat_id,
-                progress_fallback_message(job_id, &progress.message),
+                progress_fallback_message(job_id, &rendered_progress),
             )
             .await;
         }
@@ -2523,7 +2523,7 @@ async fn deliver_progress(
             send_or_log(
                 telegram,
                 chat_id,
-                progress_fallback_message(job_id, &progress.message),
+                progress_fallback_message(job_id, &rendered_progress),
             )
             .await;
         }
@@ -3153,6 +3153,21 @@ mod tests {
         assert_eq!(
             render_job_progress(&progress),
             "Resolved media:\nEntries: 1\nEstimated media: 4.0 MiB\nVideo: 1920x1080 H.264\n\nBBDown-rust: downloading video"
+        );
+    }
+
+    #[test]
+    fn progress_fallback_keeps_resolved_media_summary() {
+        let progress = JobProgress {
+            message: "BBDown-rust: downloading video".to_string(),
+            resolved_summary: Some(
+                "Entries: 1\nExpected media: 4.0 MiB\nVideo: 1920x1080 H.264".to_string(),
+            ),
+        };
+
+        assert_eq!(
+            progress_fallback_message(7, &render_job_progress(&progress)),
+            "Progress job #7: Resolved media:\nEntries: 1\nExpected media: 4.0 MiB\nVideo: 1920x1080 H.264\n\nBBDown-rust: downloading video"
         );
     }
 
