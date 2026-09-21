@@ -750,6 +750,7 @@ fn bilibili_resolved_download_summary(
                         estimated_size.add_exact(segment.size);
                     }
                     video_profiles.push("FLV".to_string());
+                    audio_profiles.push("included in FLV".to_string());
                 }
             }
             DownloadMode::VideoOnly => {
@@ -7652,7 +7653,7 @@ impl ProgressTracker {
             && let Some(summary) = parse_bilibili_resolved_progress_wire(&text)
         {
             self.resolved_summary = Some(summary);
-            self.emit_current(Instant::now());
+            self.emit_current(Instant::now(), true);
             return;
         }
         self.stage = self.stage.update_from_text(&self.command_name, &text);
@@ -7662,7 +7663,7 @@ impl ProgressTracker {
 
         self.last_output = Some(message);
         let now = Instant::now();
-        self.emit_current(now);
+        self.emit_current(now, false);
     }
 
     fn emit_file_activity(&mut self, report: FileActivityReport) {
@@ -7671,15 +7672,15 @@ impl ProgressTracker {
         }
 
         self.last_file_activity = Some(report);
-        self.emit_current(Instant::now());
+        self.emit_current(Instant::now(), false);
     }
 
-    fn emit_current(&mut self, now: Instant) {
+    fn emit_current(&mut self, now: Instant, force: bool) {
         let Some(progress_sender) = self.progress.clone() else {
             return;
         };
 
-        if now < self.next_send_at {
+        if !force && now < self.next_send_at {
             return;
         }
         let update = JobProgress {
@@ -13176,6 +13177,27 @@ mod tests {
     }
 
     #[test]
+    fn summarizes_bilibili_flv_fallback_as_muxed_media() {
+        let mut entry = test_bilibili_entry(1, None, None);
+        entry["streams"]["videos"] = serde_json::json!([]);
+        entry["streams"]["audios"] = serde_json::json!([]);
+        entry["streams"]["flv_segments"] = serde_json::json!([{
+            "order": 1,
+            "url": "https://example.test/video.flv",
+            "backup_urls": [],
+            "size": 4 * 1024 * 1024,
+            "length_ms": 60_000,
+        }]);
+        let plan = test_bilibili_plan(vec![entry]);
+        let options = bbdown_core::DownloadOptions::new("downloads");
+
+        assert_eq!(
+            bilibili_resolved_download_summary(&plan, &options),
+            "Entries: 1 entry\nEstimated media: 4.0 MiB\nVideo: FLV\nAudio: included in FLV"
+        );
+    }
+
+    #[test]
     fn summarizes_youtube_selected_formats_and_approximate_size() {
         let metadata = YoutubeMetadata {
             requested_formats: vec![
@@ -13250,6 +13272,31 @@ mod tests {
             Duration::from_secs(0),
             Some(progress),
         );
+        let wire = format!(
+            "{}\n",
+            bilibili_resolved_progress_wire("Estimated media: 4.0 MiB")
+        );
+        tracker.observe(CommandStream::Stdout, wire.as_bytes());
+
+        let update = take_latest_progress(&mut receiver);
+        assert_eq!(
+            update.resolved_summary.as_deref(),
+            Some("Estimated media: 4.0 MiB")
+        );
+    }
+
+    #[test]
+    fn bilibili_worker_summary_wire_bypasses_progress_throttle() {
+        let (progress, mut receiver) = job_progress_channel();
+        let mut tracker = ProgressTracker::new(
+            "BBDown-rust".to_string(),
+            Duration::from_secs(30),
+            Some(progress),
+        );
+        tracker.observe(CommandStream::Stdout, b"resolving streams\n");
+        let first = take_latest_progress(&mut receiver);
+        assert!(first.resolved_summary.is_none());
+
         let wire = format!(
             "{}\n",
             bilibili_resolved_progress_wire("Estimated media: 4.0 MiB")

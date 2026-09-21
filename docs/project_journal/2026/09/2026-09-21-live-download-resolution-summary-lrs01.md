@@ -27,3 +27,4 @@ superseded_by:
 ## Evidence
 - Unit coverage exercises selected Bilibili DASH streams, multi-entry partial size data, yt-dlp split formats, unknown-size behavior, progress-context persistence, and Bilibili worker propagation.
 - GitHub Codex review on PR #16 identified the fallback-delivery omission; the fallback now reuses the rendered progress text and has a dedicated regression test.
+- A second GitHub Codex round identified Bilibili summary-wire throttling and FLV audio labeling; summary wires now bypass the normal progress interval, and muxed FLV fallback output explicitly reports that audio is included.
