@@ -2504,7 +2504,8 @@ async fn deliver_progress(
     mut delivery: ProgressDelivery,
     progress: JobProgress,
 ) -> ProgressDelivery {
-    let message = job_status_message(job_id, job_label, "Running", Some(&progress.message));
+    let rendered_progress = render_job_progress(&progress);
+    let message = job_status_message(job_id, job_label, "Running", Some(&rendered_progress));
     match delivery {
         ProgressDelivery::Edit(message_id) => {
             if edit_or_log(telegram, chat_id, message_id, message).await {
@@ -2514,7 +2515,7 @@ async fn deliver_progress(
             send_or_log(
                 telegram,
                 chat_id,
-                progress_fallback_message(job_id, &progress.message),
+                progress_fallback_message(job_id, &rendered_progress),
             )
             .await;
         }
@@ -2522,12 +2523,26 @@ async fn deliver_progress(
             send_or_log(
                 telegram,
                 chat_id,
-                progress_fallback_message(job_id, &progress.message),
+                progress_fallback_message(job_id, &rendered_progress),
             )
             .await;
         }
     }
     delivery
+}
+
+fn render_job_progress(progress: &JobProgress) -> String {
+    match progress
+        .resolved_summary
+        .as_deref()
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        Some(summary) if progress.message.trim().is_empty() => {
+            format!("Resolved media:\n{summary}")
+        }
+        Some(summary) => format!("Resolved media:\n{summary}\n\n{}", progress.message),
+        None => progress.message.clone(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3123,6 +3138,36 @@ mod tests {
         assert_eq!(
             job_status_message(7, "Bilibili download", "Running", Some("BBDown: 42%")),
             "Running job #7: Bilibili download\nBBDown: 42%"
+        );
+    }
+
+    #[test]
+    fn rendered_progress_keeps_resolved_media_summary() {
+        let progress = JobProgress {
+            message: "BBDown-rust: downloading video".to_string(),
+            resolved_summary: Some(
+                "Entries: 1\nEstimated media: 4.0 MiB\nVideo: 1920x1080 H.264".to_string(),
+            ),
+        };
+
+        assert_eq!(
+            render_job_progress(&progress),
+            "Resolved media:\nEntries: 1\nEstimated media: 4.0 MiB\nVideo: 1920x1080 H.264\n\nBBDown-rust: downloading video"
+        );
+    }
+
+    #[test]
+    fn progress_fallback_keeps_resolved_media_summary() {
+        let progress = JobProgress {
+            message: "BBDown-rust: downloading video".to_string(),
+            resolved_summary: Some(
+                "Entries: 1\nExpected media: 4.0 MiB\nVideo: 1920x1080 H.264".to_string(),
+            ),
+        };
+
+        assert_eq!(
+            progress_fallback_message(7, &render_job_progress(&progress)),
+            "Progress job #7: Resolved media:\nEntries: 1\nExpected media: 4.0 MiB\nVideo: 1920x1080 H.264\n\nBBDown-rust: downloading video"
         );
     }
 
