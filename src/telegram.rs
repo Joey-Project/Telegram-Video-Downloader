@@ -227,6 +227,17 @@ impl TelegramClient {
             .await
     }
 
+    pub async fn edit_message_text_with_inline_keyboard(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+        reply_markup: InlineKeyboardMarkup,
+    ) -> Result<()> {
+        self.edit_message_text_payload(chat_id, message_id, text, Some(reply_markup))
+            .await
+    }
+
     pub async fn edit_message_text_without_inline_keyboard(
         &self,
         chat_id: i64,

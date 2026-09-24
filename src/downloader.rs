@@ -11,8 +11,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -64,6 +64,7 @@ const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
 const BILIBILI_WORKER_REQUEST_VERSION: u32 = 4;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
 const BILIBILI_RESOLVED_PROGRESS_WIRE_PREFIX: &str = "TVD_BILIBILI_RESOLVED:";
+const BILIBILI_PROGRESS_EVENT_WIRE_PREFIX: &str = "TVD_BILIBILI_PROGRESS_EVENT:";
 const BILIBILI_WORKER_LIFECYCLE_FILE_NAME: &str = ".bilibili-worker-lifecycle.json";
 const BILIBILI_WORKER_LIFECYCLE_TRANSITION_FILE_NAME: &str = ".bilibili-worker-lifecycle.next.json";
 const BILIBILI_WORKER_LIFECYCLE_VERSION: u32 = 2;
@@ -244,14 +245,138 @@ pub struct JobReport {
     pub details: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobProgress {
     pub message: String,
     pub resolved_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<BilibiliCollectionProgressSnapshot>,
 }
 
-pub type JobProgressSender = watch::Sender<Option<JobProgress>>;
-pub type JobProgressReceiver = watch::Receiver<Option<JobProgress>>;
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BilibiliCollectionManifest {
+    pub title: String,
+    pub total_entries: usize,
+    pub skipped_entries: usize,
+    pub planned_entries: usize,
+    pub estimated_media: String,
+    pub entries: Vec<BilibiliCollectionManifestEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BilibiliCollectionManifestEntry {
+    pub index: u32,
+    pub title: String,
+    pub duration_seconds: Option<u32>,
+    pub video: Option<String>,
+    pub audio: Option<String>,
+    pub estimated_media: String,
+    pub status: BilibiliCollectionEntryStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BilibiliCollectionEntryStatus {
+    Queued,
+    AlreadyPresent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BilibiliCollectionEntryProgress {
+    pub index: u32,
+    pub title: String,
+    pub duration_seconds: Option<u32>,
+    pub video: Option<String>,
+    pub audio: Option<String>,
+    pub estimated_media: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BilibiliCollectionProgressSnapshot {
+    pub title: String,
+    pub total_entries: usize,
+    pub skipped_entries: usize,
+    pub planned_entries: usize,
+    pub completed_entries: usize,
+    pub current_entry: Option<BilibiliCollectionEntryProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JobProgressLifecycleEvent {
+    Resolved {
+        manifest: BilibiliCollectionManifest,
+        snapshot: BilibiliCollectionProgressSnapshot,
+    },
+    EntryStarted {
+        entry: BilibiliCollectionEntryProgress,
+        snapshot: BilibiliCollectionProgressSnapshot,
+    },
+    EntryCompleted {
+        entry: BilibiliCollectionEntryProgress,
+        file_count: usize,
+        snapshot: BilibiliCollectionProgressSnapshot,
+    },
+    Completed {
+        snapshot: BilibiliCollectionProgressSnapshot,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct JobProgressSender {
+    latest: watch::Sender<Option<JobProgress>>,
+    lifecycle: mpsc::UnboundedSender<JobProgressLifecycleEvent>,
+}
+
+#[derive(Debug)]
+pub struct JobProgressReceiver {
+    latest: watch::Receiver<Option<JobProgress>>,
+    lifecycle: mpsc::UnboundedReceiver<JobProgressLifecycleEvent>,
+}
+
+impl JobProgressSender {
+    pub fn send_modify<F>(&self, modify: F)
+    where
+        F: FnOnce(&mut Option<JobProgress>),
+    {
+        self.latest.send_modify(modify);
+    }
+
+    pub fn send_replace(&self, progress: Option<JobProgress>) -> Option<JobProgress> {
+        self.latest.send_replace(progress)
+    }
+
+    pub fn borrow(&self) -> watch::Ref<'_, Option<JobProgress>> {
+        self.latest.borrow()
+    }
+
+    pub fn send_lifecycle(&self, event: JobProgressLifecycleEvent) {
+        let _ = self.lifecycle.send(event);
+    }
+}
+
+impl JobProgressReceiver {
+    pub async fn changed(&mut self) -> Result<(), watch::error::RecvError> {
+        self.latest.changed().await
+    }
+
+    pub fn borrow_and_update(&mut self) -> watch::Ref<'_, Option<JobProgress>> {
+        self.latest.borrow_and_update()
+    }
+
+    pub fn has_changed(&self) -> Result<bool, watch::error::RecvError> {
+        self.latest.has_changed()
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        watch::Receiver<Option<JobProgress>>,
+        mpsc::UnboundedReceiver<JobProgressLifecycleEvent>,
+    ) {
+        (self.latest, self.lifecycle)
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -316,7 +441,15 @@ impl std::fmt::Display for BilibiliCoreCompletionMarkerFailure {
 impl std::error::Error for BilibiliCoreCompletionMarkerFailure {}
 
 pub fn job_progress_channel() -> (JobProgressSender, JobProgressReceiver) {
-    watch::channel(None)
+    let (latest, receiver) = watch::channel(None);
+    let (lifecycle, lifecycle_receiver) = mpsc::unbounded_channel();
+    (
+        JobProgressSender { latest, lifecycle },
+        JobProgressReceiver {
+            latest: receiver,
+            lifecycle: lifecycle_receiver,
+        },
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -825,6 +958,162 @@ fn bilibili_resolved_download_summary(
         lines.push("Media: not requested".to_string());
     }
     lines.join("\n")
+}
+
+fn bilibili_collection_manifest(
+    collection: &BilibiliUgcCollectionDownload,
+    plan: &bbdown_core::DownloadPlan,
+    options: &bbdown_core::DownloadOptions,
+) -> BilibiliCollectionManifest {
+    let planned_entries = plan
+        .entries
+        .iter()
+        .map(|entry| (entry.index, entry))
+        .collect::<BTreeMap<_, _>>();
+    let queued_indices = collection
+        .missing_indices
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let items = if collection.resolution.collection.items.is_empty() {
+        &collection.resolution.selected_items
+    } else {
+        &collection.resolution.collection.items
+    };
+    let mut total_size = ExpectedMediaSize::default();
+    let mut entries = Vec::with_capacity(items.len());
+
+    for item in items {
+        let Some(entry) = planned_entries.get(&item.index).copied() else {
+            let status = if queued_indices.contains(&item.index) {
+                BilibiliCollectionEntryStatus::Queued
+            } else {
+                BilibiliCollectionEntryStatus::AlreadyPresent
+            };
+            entries.push(BilibiliCollectionManifestEntry {
+                index: item.index,
+                title: item.title.clone(),
+                duration_seconds: item.duration_seconds,
+                video: None,
+                audio: None,
+                estimated_media: match status {
+                    BilibiliCollectionEntryStatus::Queued => "unknown".to_string(),
+                    BilibiliCollectionEntryStatus::AlreadyPresent => {
+                        "already present; source not resolved".to_string()
+                    }
+                },
+                status,
+            });
+            continue;
+        };
+
+        let (video, audio, entry_size) = bilibili_entry_media_details(entry, options);
+        total_size.known_bytes = total_size
+            .known_bytes
+            .saturating_add(entry_size.known_bytes);
+        total_size.unknown_streams = total_size
+            .unknown_streams
+            .saturating_add(entry_size.unknown_streams);
+        total_size.approximate |= entry_size.approximate;
+        entries.push(BilibiliCollectionManifestEntry {
+            index: item.index,
+            title: entry.title.clone(),
+            duration_seconds: entry.streams.duration_seconds.or(item.duration_seconds),
+            video,
+            audio,
+            estimated_media: entry_size.describe(),
+            status: BilibiliCollectionEntryStatus::Queued,
+        });
+    }
+
+    BilibiliCollectionManifest {
+        title: collection.title.clone(),
+        total_entries: collection.total_entries,
+        skipped_entries: collection.skipped_entries,
+        planned_entries: collection.planned_entries(),
+        estimated_media: total_size.describe(),
+        entries,
+    }
+}
+
+fn bilibili_entry_media_details(
+    entry: &bbdown_core::DownloadEntry,
+    options: &bbdown_core::DownloadOptions,
+) -> (Option<String>, Option<String>, ExpectedMediaSize) {
+    let mut size = ExpectedMediaSize::default();
+    let (video, audio) = match options.mode {
+        DownloadMode::All => {
+            let video = bilibili_selected_video(entry, &options.stream_selection);
+            let audio = bilibili_selected_audio(entry, &options.stream_selection);
+            if let (Some(video), Some(audio)) = (video, audio) {
+                size.add_exact(video.size);
+                size.add_exact(audio.size);
+                (
+                    Some(bilibili_video_profile(entry, video)),
+                    Some(bilibili_audio_profile(audio)),
+                )
+            } else if !entry.streams.flv_segments.is_empty() {
+                for segment in &entry.streams.flv_segments {
+                    size.add_exact(segment.size);
+                }
+                (Some("FLV".to_string()), Some("included in FLV".to_string()))
+            } else {
+                (
+                    video.map(|stream| bilibili_video_profile(entry, stream)),
+                    audio.map(bilibili_audio_profile),
+                )
+            }
+        }
+        DownloadMode::VideoOnly => {
+            let video = bilibili_selected_video(entry, &options.stream_selection);
+            if let Some(video) = video {
+                size.add_exact(video.size);
+            }
+            (
+                video.map(|stream| bilibili_video_profile(entry, stream)),
+                None,
+            )
+        }
+        DownloadMode::AudioOnly => {
+            let audio = bilibili_selected_audio(entry, &options.stream_selection);
+            if let Some(audio) = audio {
+                size.add_exact(audio.size);
+            }
+            (None, audio.map(bilibili_audio_profile))
+        }
+        DownloadMode::SubtitleOnly | DownloadMode::DanmakuOnly | DownloadMode::CoverOnly => {
+            (None, None)
+        }
+        _ => (None, None),
+    };
+    (video, audio, size)
+}
+
+fn bilibili_collection_entry_progress(
+    entry: &BilibiliCollectionManifestEntry,
+) -> BilibiliCollectionEntryProgress {
+    BilibiliCollectionEntryProgress {
+        index: entry.index,
+        title: entry.title.clone(),
+        duration_seconds: entry.duration_seconds,
+        video: entry.video.clone(),
+        audio: entry.audio.clone(),
+        estimated_media: entry.estimated_media.clone(),
+    }
+}
+
+impl BilibiliCollectionManifest {
+    pub fn overview_summary(&self) -> String {
+        format!(
+            "Collection: {}\nSync: {} total; {} already present; {} queued\nEstimated download: {}\nDetails: {} entries available below",
+            self.title,
+            self.total_entries,
+            self.skipped_entries,
+            self.planned_entries,
+            self.estimated_media,
+            self.entries.len()
+        )
+    }
 }
 
 fn bilibili_selected_video<'a>(
@@ -1787,23 +2076,38 @@ pub async fn run_bilibili_worker() -> Result<()> {
     let final_output_root = RootedFs::new(&request.final_video_dir)
         .context("failed to bind Bilibili final output root")?;
     validate_bilibili_worker_final_output_root(&final_output_root, &request)?;
-    let (progress, mut progress_receiver) = job_progress_channel();
+    let (progress, progress_receiver) = job_progress_channel();
     let progress_writer = tokio::spawn(async move {
         let mut emitted_summary = None;
-        while progress_receiver.changed().await.is_ok() {
-            let current = progress_receiver.borrow_and_update().clone();
-            if let Some(current) = current {
-                if current.resolved_summary != emitted_summary {
-                    if let Some(summary) = current.resolved_summary.as_deref() {
-                        println!("{}", bilibili_resolved_progress_wire(summary));
+        let (mut latest, mut lifecycle) = progress_receiver.into_parts();
+        let mut latest_open = true;
+        let mut lifecycle_open = true;
+        while latest_open || lifecycle_open {
+            tokio::select! {
+                event = lifecycle.recv(), if lifecycle_open => match event {
+                    Some(event) => println!("{}", bilibili_progress_event_wire(&event)),
+                    None => lifecycle_open = false,
+                },
+                changed = latest.changed(), if latest_open => {
+                    if changed.is_err() {
+                        latest_open = false;
+                        continue;
                     }
-                    emitted_summary.clone_from(&current.resolved_summary);
+                    let current = latest.borrow_and_update().clone();
+                    if let Some(current) = current {
+                        if current.resolved_summary != emitted_summary {
+                            if let Some(summary) = current.resolved_summary.as_deref() {
+                                println!("{}", bilibili_resolved_progress_wire(summary));
+                            }
+                            emitted_summary.clone_from(&current.resolved_summary);
+                        }
+                        if !current.message.trim().is_empty() {
+                            println!("{}", current.message);
+                        }
+                    }
                 }
-                if !current.message.trim().is_empty() {
-                    println!("{}", current.message);
-                }
-                let _ = std::io::stdout().flush();
             }
+            let _ = std::io::stdout().flush();
         }
     });
     let result = tokio::select! {
@@ -2477,23 +2781,45 @@ async fn run_bilibili_job_locked(
     if let Some(expected_identity) = expected_overwrite_identity {
         ensure_bilibili_overwrite_plan_matches(&plan, expected_identity)?;
     }
+    let collection_manifest = collection_download
+        .as_ref()
+        .map(|collection| bilibili_collection_manifest(collection, &core_plan, &options));
+    let collection_progress = collection_manifest
+        .clone()
+        .map(BilibiliCollectionProgress::from_manifest);
+    if let (Some(manifest), Some(collection_progress)) =
+        (collection_manifest.as_ref(), collection_progress.as_ref())
+    {
+        send_collection_lifecycle(
+            progress.as_ref(),
+            JobProgressLifecycleEvent::Resolved {
+                manifest: manifest.clone(),
+                snapshot: collection_progress.snapshot(),
+            },
+        );
+        send_collection_progress(
+            progress.as_ref(),
+            "BBDown-rust: resolved collection media".to_string(),
+            collection_progress.snapshot(),
+        );
+    }
+    let media_summary = if collection_manifest.is_some() {
+        String::new()
+    } else {
+        bilibili_resolved_download_summary(&core_plan, &options)
+    };
     send_resolved_download_summary(
         progress.as_ref(),
         "BBDown-rust: resolved media".to_string(),
         nonempty_join(vec![
-            collection_download
+            collection_manifest
                 .as_ref()
-                .map(BilibiliUgcCollectionDownload::progress_summary)
+                .map(BilibiliCollectionManifest::overview_summary)
                 .unwrap_or_default(),
-            bilibili_resolved_download_summary(&core_plan, &options),
+            media_summary,
         ]),
     );
-    let progress_reporter = BilibiliCoreProgress::new(
-        progress.clone(),
-        collection_download
-            .as_ref()
-            .map(BilibiliCollectionProgress::from_download),
-    );
+    let progress_reporter = BilibiliCoreProgress::new(progress.clone(), collection_progress);
     let command_started_at = SystemTime::now();
     let core_report = client
         .download_plan_with_progress(&core_plan, options, &progress_reporter)
@@ -2588,63 +2914,138 @@ impl BilibiliCoreProgress {
 
 #[derive(Clone)]
 struct BilibiliCollectionProgress {
-    title: String,
-    total_entries: usize,
-    skipped_entries: usize,
-    planned_entries: usize,
-    completed_entries: Arc<AtomicUsize>,
+    manifest: Arc<BilibiliCollectionManifest>,
+    state: Arc<StdMutex<BilibiliCollectionProgressState>>,
+}
+
+#[derive(Default)]
+struct BilibiliCollectionProgressState {
+    completed_entries: usize,
+    current_entry: Option<BilibiliCollectionEntryProgress>,
 }
 
 impl BilibiliCollectionProgress {
-    fn from_download(download: &BilibiliUgcCollectionDownload) -> Self {
+    fn from_manifest(manifest: BilibiliCollectionManifest) -> Self {
         Self {
-            title: download.title.clone(),
-            total_entries: download.total_entries,
-            skipped_entries: download.skipped_entries,
-            planned_entries: download.planned_entries(),
-            completed_entries: Arc::new(AtomicUsize::new(0)),
+            manifest: Arc::new(manifest),
+            state: Arc::new(StdMutex::new(BilibiliCollectionProgressState::default())),
         }
     }
 
-    fn completed_entries(&self) -> usize {
-        self.completed_entries.load(Ordering::Relaxed)
+    fn snapshot(&self) -> BilibiliCollectionProgressSnapshot {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        BilibiliCollectionProgressSnapshot {
+            title: self.manifest.title.clone(),
+            total_entries: self.manifest.total_entries,
+            skipped_entries: self.manifest.skipped_entries,
+            planned_entries: self.manifest.planned_entries,
+            completed_entries: state.completed_entries,
+            current_entry: state.current_entry.clone(),
+        }
     }
 
-    fn entry_started(&self, index: u32, title: &str) -> String {
-        format!(
-            "BBDown-rust: collection entry {index}/{} started - {} ({}/{} downloaded; {} skipped)",
-            self.total_entries,
-            title,
-            self.completed_entries(),
-            self.planned_entries,
-            self.skipped_entries
-        )
+    fn entry_started(
+        &self,
+        index: u32,
+        fallback_title: &str,
+    ) -> (
+        BilibiliCollectionEntryProgress,
+        BilibiliCollectionProgressSnapshot,
+    ) {
+        let entry = self.entry_for(index, fallback_title);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.current_entry = Some(entry.clone());
+        let snapshot = self.snapshot_from_state(&state);
+        (entry, snapshot)
     }
 
-    fn entry_completed(&self, index: u32, title: &str, file_count: usize) -> String {
-        let completed = self.completed_entries.fetch_add(1, Ordering::Relaxed) + 1;
-        format!(
-            "BBDown-rust: collection entry {index}/{} completed - {title} ({file_count} files; {completed}/{} downloaded; {} skipped)",
-            self.total_entries, self.planned_entries, self.skipped_entries
-        )
+    fn entry_completed(
+        &self,
+        index: u32,
+        fallback_title: &str,
+    ) -> (
+        BilibiliCollectionEntryProgress,
+        BilibiliCollectionProgressSnapshot,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = state
+            .current_entry
+            .take()
+            .filter(|entry| entry.index == index)
+            .unwrap_or_else(|| self.entry_for(index, fallback_title));
+        state.completed_entries = state.completed_entries.saturating_add(1);
+        let snapshot = self.snapshot_from_state(&state);
+        (entry, snapshot)
     }
 
     fn plan_started(&self) -> String {
         format!(
             "BBDown-rust: collection {} started ({} total; {} already present; {} queued)",
-            self.title, self.total_entries, self.skipped_entries, self.planned_entries
+            self.manifest.title,
+            self.manifest.total_entries,
+            self.manifest.skipped_entries,
+            self.manifest.planned_entries
         )
     }
 
     fn plan_completed(&self) -> String {
+        let snapshot = self.snapshot();
         format!(
             "BBDown-rust: collection {} completed ({}/{} downloaded; {} already present; {} total)",
-            self.title,
-            self.completed_entries(),
-            self.planned_entries,
-            self.skipped_entries,
-            self.total_entries
+            self.manifest.title,
+            snapshot.completed_entries,
+            self.manifest.planned_entries,
+            self.manifest.skipped_entries,
+            self.manifest.total_entries
         )
+    }
+
+    fn plan_completed_snapshot(&self) -> BilibiliCollectionProgressSnapshot {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.current_entry = None;
+        self.snapshot_from_state(&state)
+    }
+
+    fn entry_for(&self, index: u32, fallback_title: &str) -> BilibiliCollectionEntryProgress {
+        self.manifest
+            .entries
+            .iter()
+            .find(|entry| entry.index == index)
+            .map(bilibili_collection_entry_progress)
+            .unwrap_or_else(|| BilibiliCollectionEntryProgress {
+                index,
+                title: fallback_title.to_string(),
+                duration_seconds: None,
+                video: None,
+                audio: None,
+                estimated_media: "unknown".to_string(),
+            })
+    }
+
+    fn snapshot_from_state(
+        &self,
+        state: &BilibiliCollectionProgressState,
+    ) -> BilibiliCollectionProgressSnapshot {
+        BilibiliCollectionProgressSnapshot {
+            title: self.manifest.title.clone(),
+            total_entries: self.manifest.total_entries,
+            skipped_entries: self.manifest.skipped_entries,
+            planned_entries: self.manifest.planned_entries,
+            completed_entries: state.completed_entries,
+            current_entry: state.current_entry.clone(),
+        }
     }
 }
 
@@ -2653,15 +3054,38 @@ impl DownloadProgressSink for BilibiliCoreProgress {
         let message = match event {
             DownloadProgressEvent::PlanStarted {
                 title, entry_count, ..
-            } => self.collection.as_ref().map_or_else(
-                || format!("BBDown-rust: planning {title} ({entry_count} entries)"),
-                BilibiliCollectionProgress::plan_started,
-            ),
+            } => {
+                let message = self.collection.as_ref().map_or_else(
+                    || format!("BBDown-rust: planning {title} ({entry_count} entries)"),
+                    BilibiliCollectionProgress::plan_started,
+                );
+                self.send_update(message);
+                return;
+            }
             DownloadProgressEvent::EntryStarted { index, title, .. } => {
-                self.collection.as_ref().map_or_else(
-                    || format!("BBDown-rust: entry {index} started - {title}"),
-                    |collection| collection.entry_started(*index, title),
-                )
+                if let Some(collection) = self.collection.as_ref() {
+                    let (entry, snapshot) = collection.entry_started(*index, title);
+                    send_collection_lifecycle(
+                        self.progress.as_ref(),
+                        JobProgressLifecycleEvent::EntryStarted {
+                            entry,
+                            snapshot: snapshot.clone(),
+                        },
+                    );
+                    self.send_collection_update(
+                        format!(
+                            "BBDown-rust: collection entry {index}/{} started - {} ({}/{} downloaded; {} skipped)",
+                            snapshot.total_entries,
+                            title,
+                            snapshot.completed_entries,
+                            snapshot.planned_entries,
+                            snapshot.skipped_entries
+                        ),
+                        snapshot,
+                    );
+                    return;
+                }
+                format!("BBDown-rust: entry {index} started - {title}")
             }
             DownloadProgressEvent::FileStarted {
                 kind,
@@ -2696,19 +3120,68 @@ impl DownloadProgressSink for BilibiliCoreProgress {
                 title,
                 file_count,
                 ..
-            } => self.collection.as_ref().map_or_else(
-                || format!("BBDown-rust: entry {index} completed - {title} ({file_count} files)"),
-                |collection| collection.entry_completed(*index, title, *file_count),
-            ),
+            } => {
+                if let Some(collection) = self.collection.as_ref() {
+                    let (entry, snapshot) = collection.entry_completed(*index, title);
+                    send_collection_lifecycle(
+                        self.progress.as_ref(),
+                        JobProgressLifecycleEvent::EntryCompleted {
+                            entry,
+                            file_count: *file_count,
+                            snapshot: snapshot.clone(),
+                        },
+                    );
+                    self.send_collection_update(
+                        format!(
+                            "BBDown-rust: collection entry {index}/{} completed - {title} ({file_count} files; {}/{} downloaded; {} skipped)",
+                            snapshot.total_entries,
+                            snapshot.completed_entries,
+                            snapshot.planned_entries,
+                            snapshot.skipped_entries
+                        ),
+                        snapshot,
+                    );
+                    return;
+                }
+                format!("BBDown-rust: entry {index} completed - {title} ({file_count} files)")
+            }
             DownloadProgressEvent::PlanCompleted {
                 title, entry_count, ..
-            } => self.collection.as_ref().map_or_else(
-                || format!("BBDown-rust: completed {title} ({entry_count} entries)"),
-                BilibiliCollectionProgress::plan_completed,
-            ),
+            } => {
+                if let Some(collection) = self.collection.as_ref() {
+                    let snapshot = collection.plan_completed_snapshot();
+                    send_collection_lifecycle(
+                        self.progress.as_ref(),
+                        JobProgressLifecycleEvent::Completed {
+                            snapshot: snapshot.clone(),
+                        },
+                    );
+                    self.send_collection_update(collection.plan_completed(), snapshot);
+                    return;
+                }
+                format!("BBDown-rust: completed {title} ({entry_count} entries)")
+            }
             _ => return,
         };
-        send_progress(self.progress.as_ref(), message);
+        self.send_update(message);
+    }
+}
+
+impl BilibiliCoreProgress {
+    fn send_update(&self, message: String) {
+        if let Some(collection) = self.collection.as_ref() {
+            self.send_collection_update(message, collection.snapshot());
+        } else {
+            send_progress(self.progress.as_ref(), message);
+        }
+    }
+
+    fn send_collection_update(
+        &self,
+        message: String,
+        snapshot: BilibiliCollectionProgressSnapshot,
+    ) {
+        send_collection_progress(self.progress.as_ref(), message, snapshot);
     }
 }
 
@@ -6811,14 +7284,50 @@ fn send_progress(progress: Option<&JobProgressSender>, message: String) {
     if let Some(progress) = progress {
         let message = redact_sensitive_text(&message);
         progress.send_modify(|current| {
+            let (resolved_summary, collection) = current.as_ref().map_or_else(
+                || (None, None),
+                |progress| {
+                    (
+                        progress.resolved_summary.clone(),
+                        progress.collection.clone(),
+                    )
+                },
+            );
+            *current = Some(JobProgress {
+                message: message.clone(),
+                resolved_summary,
+                collection,
+            });
+        });
+    }
+}
+
+fn send_collection_progress(
+    progress: Option<&JobProgressSender>,
+    message: String,
+    collection: BilibiliCollectionProgressSnapshot,
+) {
+    if let Some(progress) = progress {
+        let message = redact_sensitive_text(&message);
+        progress.send_modify(|current| {
             let resolved_summary = current
                 .as_ref()
                 .and_then(|progress| progress.resolved_summary.clone());
             *current = Some(JobProgress {
                 message: message.clone(),
                 resolved_summary,
+                collection: Some(collection.clone()),
             });
         });
+    }
+}
+
+fn send_collection_lifecycle(
+    progress: Option<&JobProgressSender>,
+    event: JobProgressLifecycleEvent,
+) {
+    if let Some(progress) = progress {
+        progress.send_lifecycle(event);
     }
 }
 
@@ -6828,9 +7337,14 @@ fn send_resolved_download_summary(
     summary: String,
 ) {
     if let Some(progress) = progress {
+        let collection = progress
+            .borrow()
+            .as_ref()
+            .and_then(|current| current.collection.clone());
         progress.send_replace(Some(JobProgress {
             message: redact_sensitive_text(&message),
             resolved_summary: Some(redact_sensitive_text(&summary)),
+            collection,
         }));
     }
 }
@@ -6845,6 +7359,29 @@ fn parse_bilibili_resolved_progress_wire(text: &str) -> Option<String> {
         .trim()
         .strip_prefix(BILIBILI_RESOLVED_PROGRESS_WIRE_PREFIX)?;
     serde_json::from_str(encoded).ok()
+}
+
+fn bilibili_progress_event_wire(event: &JobProgressLifecycleEvent) -> String {
+    let encoded = serde_json::to_string(event).unwrap_or_default();
+    format!("{BILIBILI_PROGRESS_EVENT_WIRE_PREFIX}{encoded}")
+}
+
+fn parse_bilibili_progress_event_wire(text: &str) -> Option<JobProgressLifecycleEvent> {
+    let encoded = text
+        .trim()
+        .strip_prefix(BILIBILI_PROGRESS_EVENT_WIRE_PREFIX)?;
+    serde_json::from_str(encoded).ok()
+}
+
+fn bilibili_collection_snapshot_from_event(
+    event: &JobProgressLifecycleEvent,
+) -> BilibiliCollectionProgressSnapshot {
+    match event {
+        JobProgressLifecycleEvent::Resolved { snapshot, .. }
+        | JobProgressLifecycleEvent::EntryStarted { snapshot, .. }
+        | JobProgressLifecycleEvent::EntryCompleted { snapshot, .. }
+        | JobProgressLifecycleEvent::Completed { snapshot } => snapshot.clone(),
+    }
 }
 
 #[derive(Debug)]
@@ -8329,6 +8866,7 @@ struct ProgressTracker {
     progress: Option<JobProgressSender>,
     last_progress: Option<JobProgress>,
     resolved_summary: Option<String>,
+    collection: Option<BilibiliCollectionProgressSnapshot>,
     last_output: Option<String>,
     last_file_activity: Option<FileActivityReport>,
     stage: ProgressStage,
@@ -8342,12 +8880,15 @@ impl ProgressTracker {
         min_interval: Duration,
         progress: Option<JobProgressSender>,
     ) -> Self {
-        let resolved_summary = progress.as_ref().and_then(|progress| {
-            progress
-                .borrow()
-                .as_ref()
-                .and_then(|current| current.resolved_summary.clone())
-        });
+        let (resolved_summary, collection) = progress.as_ref().map_or_else(
+            || (None, None),
+            |progress| {
+                progress.borrow().as_ref().map_or_else(
+                    || (None, None),
+                    |current| (current.resolved_summary.clone(), current.collection.clone()),
+                )
+            },
+        );
         Self {
             stage: ProgressStage::initial_for(&command_name),
             command_name,
@@ -8356,6 +8897,7 @@ impl ProgressTracker {
             progress,
             last_progress: None,
             resolved_summary,
+            collection,
             last_output: None,
             last_file_activity: None,
             stdout_sanitizer: CommandProgressSanitizer::default(),
@@ -8401,6 +8943,17 @@ impl ProgressTracker {
             self.emit_current(Instant::now(), true);
             return;
         }
+        if self.command_name == "BBDown-rust"
+            && matches!(stream, CommandStream::Stdout)
+            && let Some(event) = parse_bilibili_progress_event_wire(&text)
+        {
+            self.collection = Some(bilibili_collection_snapshot_from_event(&event));
+            if let Some(progress) = self.progress.as_ref() {
+                progress.send_lifecycle(event);
+            }
+            self.emit_current(Instant::now(), true);
+            return;
+        }
         self.stage = self.stage.update_from_text(&self.command_name, &text);
         let Some(message) = summarize_progress_chunk(&self.command_name, stream, &text) else {
             return;
@@ -8431,6 +8984,7 @@ impl ProgressTracker {
         let update = JobProgress {
             message: self.current_message(),
             resolved_summary: self.resolved_summary.clone(),
+            collection: self.collection.clone(),
         };
         if self.last_progress.as_ref() == Some(&update) {
             return;
@@ -13948,25 +14502,34 @@ mod tests {
 
     #[test]
     fn bilibili_ugc_collection_progress_reports_overall_counts() {
-        let progress = BilibiliCollectionProgress {
+        let progress = BilibiliCollectionProgress::from_manifest(BilibiliCollectionManifest {
             title: "Collection".to_string(),
             total_entries: 37,
             skipped_entries: 12,
             planned_entries: 25,
-            completed_entries: Arc::new(AtomicUsize::new(0)),
-        };
+            estimated_media: "1.0 GiB".to_string(),
+            entries: vec![BilibiliCollectionManifestEntry {
+                index: 13,
+                title: "Entry 13".to_string(),
+                duration_seconds: Some(60),
+                video: Some("1080P 1920x1080 60fps H.264".to_string()),
+                audio: Some("Japanese AAC 128 kbps".to_string()),
+                estimated_media: "40.0 MiB".to_string(),
+                status: BilibiliCollectionEntryStatus::Queued,
+            }],
+        });
         assert_eq!(
             progress.plan_started(),
             "BBDown-rust: collection Collection started (37 total; 12 already present; 25 queued)"
         );
-        assert_eq!(
-            progress.entry_started(13, "Entry 13"),
-            "BBDown-rust: collection entry 13/37 started - Entry 13 (0/25 downloaded; 12 skipped)"
-        );
-        assert_eq!(
-            progress.entry_completed(13, "Entry 13", 4),
-            "BBDown-rust: collection entry 13/37 completed - Entry 13 (4 files; 1/25 downloaded; 12 skipped)"
-        );
+        let (entry, started) = progress.entry_started(13, "Entry 13");
+        assert_eq!(entry.title, "Entry 13");
+        assert_eq!(started.current_entry, Some(entry.clone()));
+        assert_eq!(started.completed_entries, 0);
+        let (completed_entry, completed) = progress.entry_completed(13, "Entry 13");
+        assert_eq!(completed_entry, entry);
+        assert!(completed.current_entry.is_none());
+        assert_eq!(completed.completed_entries, 1);
         assert_eq!(
             progress.plan_completed(),
             "BBDown-rust: collection Collection completed (1/25 downloaded; 12 already present; 37 total)"
@@ -14233,6 +14796,71 @@ mod tests {
     }
 
     #[test]
+    fn collection_manifest_keeps_per_entry_streams_and_sync_statuses() {
+        let mut queued_item = test_bilibili_collection_item(1, 101, "BVqueued", 1001);
+        queued_item.duration_seconds = Some(60);
+        let mut present_item = test_bilibili_collection_item(2, 102, "BVpresent", 1002);
+        present_item.duration_seconds = Some(120);
+        let collection = BilibiliUgcCollectionDownload {
+            folder: "Collection [collection-1]".to_string(),
+            output_template: "Collection [collection-1]".to_string(),
+            title: "Collection".to_string(),
+            total_entries: 2,
+            skipped_entries: 1,
+            missing_indices: vec![1],
+            resolution: VideoCollectionResolution {
+                collection: VideoCollectionMetadata {
+                    id: Some(1),
+                    kind: VideoCollectionKind::Collection,
+                    title: "Collection".to_string(),
+                    description: String::new(),
+                    cover_url: None,
+                    pub_time: None,
+                    owner: None,
+                    items: vec![queued_item.clone(), present_item.clone()],
+                },
+                selected_items: vec![queued_item],
+            },
+        };
+        let plan = test_bilibili_plan(vec![test_bilibili_entry(
+            1,
+            Some(3 * 1024 * 1024),
+            Some(1024 * 1024),
+        )]);
+        let manifest = bilibili_collection_manifest(
+            &collection,
+            &plan,
+            &bbdown_core::DownloadOptions::new("downloads"),
+        );
+
+        assert_eq!(manifest.estimated_media, "4.0 MiB");
+        assert_eq!(manifest.entries.len(), 2);
+        assert_eq!(
+            manifest.entries[0].status,
+            BilibiliCollectionEntryStatus::Queued
+        );
+        assert_eq!(manifest.entries[0].duration_seconds, Some(60));
+        assert_eq!(
+            manifest.entries[0].video.as_deref(),
+            Some("1080P 1920x1080 60fps H.264")
+        );
+        assert_eq!(manifest.entries[0].estimated_media, "4.0 MiB");
+        assert_eq!(
+            manifest.entries[1].status,
+            BilibiliCollectionEntryStatus::AlreadyPresent
+        );
+        assert_eq!(manifest.entries[1].duration_seconds, Some(120));
+        assert_eq!(
+            manifest.entries[1].estimated_media,
+            "already present; source not resolved"
+        );
+        assert_eq!(
+            manifest.overview_summary(),
+            "Collection: Collection\nSync: 2 total; 1 already present; 1 queued\nEstimated download: 4.0 MiB\nDetails: 2 entries available below"
+        );
+    }
+
+    #[test]
     fn summarizes_bilibili_flv_fallback_as_muxed_media() {
         let mut entry = test_bilibili_entry(1, None, None);
         entry["streams"]["videos"] = serde_json::json!([]);
@@ -14338,6 +14966,45 @@ mod tests {
         assert_eq!(
             update.resolved_summary.as_deref(),
             Some("Estimated media: 4.0 MiB")
+        );
+    }
+
+    #[tokio::test]
+    async fn bilibili_worker_progress_event_preserves_collection_lifecycle() {
+        let (progress, receiver) = job_progress_channel();
+        let (mut latest, mut lifecycle) = receiver.into_parts();
+        let snapshot = BilibiliCollectionProgressSnapshot {
+            title: "Collection".to_string(),
+            total_entries: 2,
+            skipped_entries: 0,
+            planned_entries: 2,
+            completed_entries: 0,
+            current_entry: None,
+        };
+        let event = JobProgressLifecycleEvent::Completed {
+            snapshot: snapshot.clone(),
+        };
+        let mut tracker = ProgressTracker::new(
+            "BBDown-rust".to_string(),
+            Duration::from_secs(30),
+            Some(progress),
+        );
+        tracker.observe(
+            CommandStream::Stdout,
+            format!("{}\n", bilibili_progress_event_wire(&event)).as_bytes(),
+        );
+
+        assert_eq!(lifecycle.recv().await, Some(event));
+        latest
+            .changed()
+            .await
+            .expect("collection snapshot should update");
+        assert_eq!(
+            latest
+                .borrow_and_update()
+                .as_ref()
+                .and_then(|progress| progress.collection.as_ref()),
+            Some(&snapshot)
         );
     }
 
@@ -21242,6 +21909,7 @@ mv video.original video.m4s || exit 46
             JobProgress {
                 message: "Bilibili download: waiting for video output slot".to_string(),
                 resolved_summary: None,
+                collection: None,
             }
         );
 
@@ -21258,6 +21926,7 @@ mv video.original video.m4s || exit 46
             JobProgress {
                 message: "Bilibili download: video output slot acquired".to_string(),
                 resolved_summary: None,
+                collection: None,
             }
         );
         waiter.await.expect("waiter should finish");

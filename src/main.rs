@@ -27,7 +27,9 @@ use tracing::{error, info, warn};
 
 use crate::config::AppConfig;
 use crate::downloader::{
-    JobProgress, JobProgressReceiver, VideoDuplicate, VideoDuplicateAction,
+    BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
+    BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
+    JobProgressLifecycleEvent, JobProgressReceiver, VideoDuplicate, VideoDuplicateAction,
     find_video_duplicate_with_probe, job_progress_channel, recover_pending_overwrite_transactions,
     run_bilibili_worker, run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
     sync_bilibili_rust_credentials,
@@ -51,17 +53,23 @@ static BILIBILI_CREDENTIAL_REVISION: AtomicU64 = AtomicU64::new(0);
 static PENDING_DUPLICATE_JOBS: OnceLock<Mutex<HashMap<u64, PendingDuplicateJob>>> = OnceLock::new();
 static PENDING_BILIBILI_SELECTION_JOBS: OnceLock<Mutex<HashMap<u64, PendingBilibiliSelectionJob>>> =
     OnceLock::new();
+static PENDING_COLLECTION_DETAILS: OnceLock<Mutex<HashMap<u64, PendingCollectionDetails>>> =
+    OnceLock::new();
 static PENDING_BILIBILI_ACCESS_KEY_LOGINS: OnceLock<
     Mutex<HashMap<i64, PendingBilibiliAccessKeyLogin>>,
 > = OnceLock::new();
 static DUPLICATE_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BILIBILI_SELECTION_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
+static COLLECTION_DETAILS_CALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 static BILIBILI_ACCESS_KEY_TICKET_COUNTER: AtomicU64 = AtomicU64::new(1);
 const DUPLICATE_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_PENDING_DUPLICATE_JOBS: usize = 64;
 const PENDING_DUPLICATE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const BILIBILI_SELECTION_DECISION_TTL: Duration = Duration::from_secs(30 * 60);
 const MAX_PENDING_BILIBILI_SELECTION_JOBS: usize = 256;
+const COLLECTION_DETAILS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_PENDING_COLLECTION_DETAILS: usize = 128;
+const COLLECTION_DETAILS_PAGE_SIZE: usize = 5;
 const BILIBILI_ACCESS_KEY_LOGIN_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone)]
@@ -79,6 +87,15 @@ struct PendingBilibiliSelectionJob {
     job_id: u64,
     job: JobRequest,
     prompt: BilibiliSelectionPrompt,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCollectionDetails {
+    chat_id: i64,
+    message_id: i64,
+    job_id: u64,
+    manifest: BilibiliCollectionManifest,
     created_at: Instant,
 }
 
@@ -2033,6 +2050,18 @@ async fn handle_callback_query(
         return;
     }
 
+    if let Some(callback) = parse_collection_details_callback_data(data) {
+        handle_collection_details_callback(
+            telegram,
+            callback_id,
+            chat_id,
+            message.message_id,
+            callback,
+        )
+        .await;
+        return;
+    }
+
     if let Some(callback) = parse_bilibili_selection_callback_data(data) {
         handle_bilibili_selection_callback(
             telegram,
@@ -2256,6 +2285,165 @@ fn cap_pending_bilibili_selection_jobs(
         };
         jobs.remove(&oldest_job_id);
     }
+}
+
+fn pending_collection_details() -> &'static Mutex<HashMap<u64, PendingCollectionDetails>> {
+    PENDING_COLLECTION_DETAILS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn register_collection_details(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    manifest: BilibiliCollectionManifest,
+) {
+    let token = next_collection_details_callback_token(job_id);
+    let page = 0;
+    let text = collection_details_message(job_id, &manifest, page);
+    let keyboard = collection_details_keyboard(token, &manifest, page);
+    let message_id = match telegram
+        .send_message_with_inline_keyboard(chat_id, truncate(&text), keyboard)
+        .await
+    {
+        Ok(message_id) => message_id,
+        Err(err) => {
+            warn!(chat_id, job_id, error = %err, "failed to send collection details message");
+            return;
+        }
+    };
+
+    let mut details = pending_collection_details().lock().await;
+    prune_expired_collection_details(&mut details, Instant::now());
+    details.insert(
+        token,
+        PendingCollectionDetails {
+            chat_id,
+            message_id,
+            job_id,
+            manifest,
+            created_at: Instant::now(),
+        },
+    );
+    cap_pending_collection_details(&mut details, Some(token));
+}
+
+async fn find_collection_details(
+    token: u64,
+    chat_id: i64,
+    message_id: i64,
+) -> Option<PendingCollectionDetails> {
+    let mut details = pending_collection_details().lock().await;
+    prune_expired_collection_details(&mut details, Instant::now());
+    details
+        .get(&token)
+        .filter(|details| details.chat_id == chat_id && details.message_id == message_id)
+        .cloned()
+}
+
+fn prune_expired_collection_details(
+    details: &mut HashMap<u64, PendingCollectionDetails>,
+    now: Instant,
+) {
+    details.retain(|_, details| now.duration_since(details.created_at) <= COLLECTION_DETAILS_TTL);
+}
+
+fn cap_pending_collection_details(
+    details: &mut HashMap<u64, PendingCollectionDetails>,
+    protected_token: Option<u64>,
+) {
+    while details.len() > MAX_PENDING_COLLECTION_DETAILS {
+        let Some(oldest_token) = details
+            .iter()
+            .filter(|(token, _)| Some(**token) != protected_token)
+            .min_by_key(|(_, details)| details.created_at)
+            .map(|(token, _)| *token)
+        else {
+            break;
+        };
+        details.remove(&oldest_token);
+    }
+}
+
+async fn handle_collection_details_callback(
+    telegram: TelegramClient,
+    callback_id: String,
+    chat_id: i64,
+    message_id: i64,
+    callback: CollectionDetailsCallback,
+) {
+    let Some(details) = find_collection_details(callback.token, chat_id, message_id).await else {
+        answer_callback_or_log(
+            &telegram,
+            callback_id,
+            "Collection details have expired.".to_string(),
+        )
+        .await;
+        return;
+    };
+    let page_count = collection_details_page_count(&details.manifest);
+    if callback.page >= page_count {
+        answer_callback_or_log(
+            &telegram,
+            callback_id,
+            "That collection page is unavailable.".to_string(),
+        )
+        .await;
+        return;
+    }
+    let text = collection_details_message(details.job_id, &details.manifest, callback.page);
+    let keyboard = collection_details_keyboard(callback.token, &details.manifest, callback.page);
+    match telegram
+        .edit_message_text_with_inline_keyboard(chat_id, message_id, truncate(&text), keyboard)
+        .await
+    {
+        Ok(()) => {
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                format!("Page {}/{}", callback.page + 1, page_count),
+            )
+            .await;
+        }
+        Err(err) => {
+            warn!(chat_id, message_id, error = %err, "failed to edit collection details page");
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                "Failed to show that collection page.".to_string(),
+            )
+            .await;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CollectionDetailsCallback {
+    token: u64,
+    page: usize,
+}
+
+fn parse_collection_details_callback_data(data: &str) -> Option<CollectionDetailsCallback> {
+    let mut parts = data.split(':');
+    let prefix = parts.next()?;
+    let token = u64::from_str_radix(parts.next()?, 16).ok()?;
+    let page = parts.next()?.parse().ok()?;
+    if prefix != "cdet" || parts.next().is_some() {
+        return None;
+    }
+    Some(CollectionDetailsCallback { token, page })
+}
+
+fn next_collection_details_callback_token(job_id: u64) -> u64 {
+    let counter = COLLECTION_DETAILS_CALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    nanos ^ counter.rotate_left(11) ^ job_id.rotate_left(29) ^ (std::process::id() as u64)
+}
+
+fn collection_details_callback_data(token: u64, page: usize) -> String {
+    format!("cdet:{token:016x}:{page}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2670,33 +2858,324 @@ async fn forward_progress(
     job_id: u64,
     job_label: &'static str,
     status_message_id: Option<i64>,
-    mut progress_rx: JobProgressReceiver,
+    progress_rx: JobProgressReceiver,
     update_interval: Duration,
 ) {
-    let mut delivery = ProgressDelivery::from_message_id(status_message_id);
+    let (mut latest, mut lifecycle) = progress_rx.into_parts();
+    let mut status_delivery = ProgressDelivery::from_message_id(status_message_id);
+    let mut collection_delivery = None;
     let mut ticker = interval(update_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
     let mut pending = None;
+    let mut latest_open = true;
+    let mut lifecycle_open = true;
     loop {
-        tokio::select! {
-            changed = progress_rx.changed() => {
-                if changed.is_err() {
-                    break;
-                }
-                pending = progress_rx.borrow_and_update().clone();
-            }
-            _ = ticker.tick(), if pending.is_some() => {
-                let progress = pending.take().expect("guarded by is_some");
-                delivery = deliver_progress(
+        if !latest_open && !lifecycle_open {
+            if let Some(progress) = pending.take() {
+                let _ = deliver_pending_progress(
                     &telegram,
                     chat_id,
                     job_id,
                     job_label,
-                    delivery,
+                    status_delivery,
+                    &mut collection_delivery,
+                    progress,
+                )
+                .await;
+            }
+            break;
+        }
+        tokio::select! {
+            event = lifecycle.recv(), if lifecycle_open => {
+                match event {
+                    Some(event) => {
+                        status_delivery = deliver_collection_lifecycle(
+                            &telegram,
+                            chat_id,
+                            job_id,
+                            job_label,
+                            status_delivery,
+                            &mut collection_delivery,
+                            event,
+                        ).await;
+                    }
+                    None => lifecycle_open = false,
+                }
+            }
+            changed = latest.changed(), if latest_open => {
+                if changed.is_err() {
+                    latest_open = false;
+                } else {
+                    pending = latest.borrow_and_update().clone();
+                }
+            }
+            _ = ticker.tick(), if pending.is_some() => {
+                let progress = pending.take().expect("guarded by is_some");
+                status_delivery = deliver_pending_progress(
+                    &telegram,
+                    chat_id,
+                    job_id,
+                    job_label,
+                    status_delivery,
+                    &mut collection_delivery,
                     progress,
                 ).await;
             }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProgressDeliveryContext<'a> {
+    telegram: &'a TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    job_label: &'static str,
+}
+
+async fn deliver_pending_progress(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    job_label: &'static str,
+    status_delivery: ProgressDelivery,
+    collection_delivery: &mut Option<CollectionProgressDelivery>,
+    progress: JobProgress,
+) -> ProgressDelivery {
+    let Some(snapshot) = progress.collection.clone() else {
+        return deliver_progress(
+            telegram,
+            chat_id,
+            job_id,
+            job_label,
+            status_delivery,
+            progress,
+        )
+        .await;
+    };
+    let delivery = collection_delivery.get_or_insert_with(CollectionProgressDelivery::default);
+    deliver_collection_progress(
+        ProgressDeliveryContext {
+            telegram,
+            chat_id,
+            job_id,
+            job_label,
+        },
+        status_delivery,
+        delivery,
+        &snapshot,
+        &progress,
+    )
+    .await
+}
+
+async fn deliver_collection_lifecycle(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    job_label: &'static str,
+    mut status_delivery: ProgressDelivery,
+    collection_delivery: &mut Option<CollectionProgressDelivery>,
+    event: JobProgressLifecycleEvent,
+) -> ProgressDelivery {
+    let delivery = collection_delivery.get_or_insert_with(CollectionProgressDelivery::default);
+    let context = ProgressDeliveryContext {
+        telegram,
+        chat_id,
+        job_id,
+        job_label,
+    };
+    match event {
+        JobProgressLifecycleEvent::Resolved { manifest, snapshot } => {
+            if !delivery.details_sent {
+                register_collection_details(telegram, chat_id, job_id, manifest.clone()).await;
+                delivery.details_sent = true;
+            }
+            status_delivery = deliver_collection_overview(
+                context,
+                status_delivery,
+                &snapshot,
+                Some(&manifest.overview_summary()),
+                None,
+            )
+            .await;
+        }
+        JobProgressLifecycleEvent::EntryStarted { entry, snapshot } => {
+            if let Some(previous) = delivery.current_entry.take() {
+                let previous_text = collection_entry_transition_message(
+                    job_id,
+                    job_label,
+                    &snapshot,
+                    "Advanced to the next collection entry before this progress message was finalized.",
+                );
+                deliver_collection_terminal_message(
+                    telegram,
+                    chat_id,
+                    job_id,
+                    previous,
+                    previous_text,
+                )
+                .await;
+            }
+            let entry_text = collection_entry_running_message(
+                job_id,
+                job_label,
+                &snapshot,
+                &entry,
+                "BBDown-rust: collection entry started",
+            );
+            let message_id = send_or_log_message_id(telegram, chat_id, entry_text).await;
+            delivery.current_entry = Some(ProgressDelivery::from_message_id(message_id));
+            status_delivery =
+                deliver_collection_overview(context, status_delivery, &snapshot, None, None).await;
+        }
+        JobProgressLifecycleEvent::EntryCompleted {
+            entry,
+            file_count,
+            snapshot,
+        } => {
+            let entry_text = collection_entry_completed_message(
+                job_id, job_label, &snapshot, &entry, file_count,
+            );
+            if let Some(entry_delivery) = delivery.current_entry.take() {
+                deliver_collection_terminal_message(
+                    telegram,
+                    chat_id,
+                    job_id,
+                    entry_delivery,
+                    entry_text,
+                )
+                .await;
+            } else {
+                send_or_log(telegram, chat_id, entry_text).await;
+            }
+            status_delivery =
+                deliver_collection_overview(context, status_delivery, &snapshot, None, None).await;
+        }
+        JobProgressLifecycleEvent::Completed { snapshot } => {
+            status_delivery = deliver_collection_overview(
+                context,
+                status_delivery,
+                &snapshot,
+                None,
+                Some("BBDown-rust: collection entries downloaded"),
+            )
+            .await;
+        }
+    }
+    status_delivery
+}
+
+async fn deliver_collection_progress(
+    context: ProgressDeliveryContext<'_>,
+    status_delivery: ProgressDelivery,
+    collection_delivery: &mut CollectionProgressDelivery,
+    snapshot: &BilibiliCollectionProgressSnapshot,
+    progress: &JobProgress,
+) -> ProgressDelivery {
+    if let (Some(entry_delivery), Some(entry)) = (
+        collection_delivery.current_entry,
+        snapshot.current_entry.as_ref(),
+    ) {
+        let entry_text = collection_entry_running_message(
+            context.job_id,
+            context.job_label,
+            snapshot,
+            entry,
+            &progress.message,
+        );
+        collection_delivery.current_entry = Some(
+            deliver_collection_running_message(
+                context.telegram,
+                context.chat_id,
+                context.job_id,
+                entry_delivery,
+                entry_text,
+            )
+            .await,
+        );
+        return status_delivery;
+    }
+
+    deliver_collection_overview(
+        context,
+        status_delivery,
+        snapshot,
+        progress.resolved_summary.as_deref(),
+        Some(&progress.message),
+    )
+    .await
+}
+
+async fn deliver_collection_overview(
+    context: ProgressDeliveryContext<'_>,
+    delivery: ProgressDelivery,
+    snapshot: &BilibiliCollectionProgressSnapshot,
+    resolved_summary: Option<&str>,
+    activity: Option<&str>,
+) -> ProgressDelivery {
+    let rendered = render_collection_overview(snapshot, resolved_summary, activity);
+    let message = job_status_message(
+        context.job_id,
+        context.job_label,
+        "Running",
+        Some(&rendered),
+    );
+    deliver_progress_message(
+        context.telegram,
+        context.chat_id,
+        context.job_id,
+        delivery,
+        message,
+        &rendered,
+    )
+    .await
+}
+
+async fn deliver_collection_running_message(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    delivery: ProgressDelivery,
+    message: String,
+) -> ProgressDelivery {
+    deliver_progress_message(
+        telegram,
+        chat_id,
+        job_id,
+        delivery,
+        message.clone(),
+        &message,
+    )
+    .await
+}
+
+async fn deliver_collection_terminal_message(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    delivery: ProgressDelivery,
+    message: String,
+) {
+    match delivery {
+        ProgressDelivery::Edit(message_id) => {
+            if !edit_or_log(telegram, chat_id, message_id, message.clone()).await {
+                send_or_log(
+                    telegram,
+                    chat_id,
+                    format!("Collection update for job #{job_id}: {message}"),
+                )
+                .await;
+            }
+        }
+        ProgressDelivery::Send => {
+            send_or_log(
+                telegram,
+                chat_id,
+                format!("Collection update for job #{job_id}: {message}"),
+            )
+            .await;
         }
     }
 }
@@ -2706,11 +3185,30 @@ async fn deliver_progress(
     chat_id: i64,
     job_id: u64,
     job_label: &'static str,
-    mut delivery: ProgressDelivery,
+    delivery: ProgressDelivery,
     progress: JobProgress,
 ) -> ProgressDelivery {
     let rendered_progress = render_job_progress(&progress);
     let message = job_status_message(job_id, job_label, "Running", Some(&rendered_progress));
+    deliver_progress_message(
+        telegram,
+        chat_id,
+        job_id,
+        delivery,
+        message,
+        &rendered_progress,
+    )
+    .await
+}
+
+async fn deliver_progress_message(
+    telegram: &TelegramClient,
+    chat_id: i64,
+    job_id: u64,
+    mut delivery: ProgressDelivery,
+    message: String,
+    fallback_progress: &str,
+) -> ProgressDelivery {
     match delivery {
         ProgressDelivery::Edit(message_id) => {
             if edit_or_log(telegram, chat_id, message_id, message).await {
@@ -2720,7 +3218,7 @@ async fn deliver_progress(
             send_or_log(
                 telegram,
                 chat_id,
-                progress_fallback_message(job_id, &rendered_progress),
+                progress_fallback_message(job_id, fallback_progress),
             )
             .await;
         }
@@ -2728,12 +3226,235 @@ async fn deliver_progress(
             send_or_log(
                 telegram,
                 chat_id,
-                progress_fallback_message(job_id, &rendered_progress),
+                progress_fallback_message(job_id, fallback_progress),
             )
             .await;
         }
     }
     delivery
+}
+
+fn render_collection_overview(
+    snapshot: &BilibiliCollectionProgressSnapshot,
+    resolved_summary: Option<&str>,
+    activity: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+    if let Some(summary) = resolved_summary.filter(|summary| !summary.trim().is_empty()) {
+        lines.push("Resolved collection:".to_string());
+        lines.push(summary.to_string());
+    } else {
+        lines.push(format!("Collection: {}", snapshot.title));
+        lines.push(format!(
+            "Sync: {} total; {} already present; {} queued",
+            snapshot.total_entries, snapshot.skipped_entries, snapshot.planned_entries
+        ));
+    }
+    lines.push(format!(
+        "Progress: {}/{} downloaded; {} already present; {} queued",
+        snapshot.completed_entries,
+        snapshot.planned_entries,
+        snapshot.skipped_entries,
+        snapshot
+            .planned_entries
+            .saturating_sub(snapshot.completed_entries)
+    ));
+    if let Some(activity) = activity.filter(|activity| !activity.trim().is_empty()) {
+        lines.push(activity.to_string());
+    }
+    lines.join("\n")
+}
+
+fn collection_entry_running_message(
+    job_id: u64,
+    job_label: &str,
+    snapshot: &BilibiliCollectionProgressSnapshot,
+    entry: &BilibiliCollectionEntryProgress,
+    activity: &str,
+) -> String {
+    let mut lines = collection_entry_header(snapshot, entry);
+    lines.push(format!(
+        "Collection progress: {}/{} downloaded; {} already present",
+        snapshot.completed_entries, snapshot.planned_entries, snapshot.skipped_entries
+    ));
+    if !activity.trim().is_empty() {
+        lines.push(activity.to_string());
+    }
+    job_status_message(job_id, job_label, "Running", Some(&lines.join("\n")))
+}
+
+fn collection_entry_completed_message(
+    job_id: u64,
+    job_label: &str,
+    snapshot: &BilibiliCollectionProgressSnapshot,
+    entry: &BilibiliCollectionEntryProgress,
+    file_count: usize,
+) -> String {
+    let mut lines = collection_entry_header(snapshot, entry);
+    lines.push(format!("Files: {file_count} created"));
+    lines.push(format!(
+        "Collection progress: {}/{} downloaded; {} already present",
+        snapshot.completed_entries, snapshot.planned_entries, snapshot.skipped_entries
+    ));
+    lines.push("Download complete; collection finalization follows.".to_string());
+    job_status_message(
+        job_id,
+        job_label,
+        "Downloaded collection entry",
+        Some(&lines.join("\n")),
+    )
+}
+
+fn collection_entry_transition_message(
+    job_id: u64,
+    job_label: &str,
+    snapshot: &BilibiliCollectionProgressSnapshot,
+    activity: &str,
+) -> String {
+    let body = format!(
+        "Collection: {}\nProgress: {}/{} downloaded; {} already present\n{}",
+        snapshot.title,
+        snapshot.completed_entries,
+        snapshot.planned_entries,
+        snapshot.skipped_entries,
+        activity
+    );
+    job_status_message(job_id, job_label, "Collection progress", Some(&body))
+}
+
+fn collection_entry_header(
+    snapshot: &BilibiliCollectionProgressSnapshot,
+    entry: &BilibiliCollectionEntryProgress,
+) -> Vec<String> {
+    let mut lines = vec![
+        format!("Collection: {}", snapshot.title),
+        format!("Entry: {}/{}", entry.index, snapshot.total_entries),
+        format!("Title: {}", entry.title),
+        format!(
+            "Duration: {}",
+            collection_duration_label(entry.duration_seconds)
+        ),
+        format!("Estimated media: {}", entry.estimated_media),
+    ];
+    if let Some(video) = entry.video.as_deref() {
+        lines.push(format!("Video: {video}"));
+    }
+    if let Some(audio) = entry.audio.as_deref() {
+        lines.push(format!("Audio: {audio}"));
+    }
+    lines
+}
+
+fn collection_duration_label(duration_seconds: Option<u32>) -> String {
+    let Some(seconds) = duration_seconds else {
+        return "unknown".to_string();
+    };
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn collection_details_page_count(manifest: &BilibiliCollectionManifest) -> usize {
+    manifest
+        .entries
+        .len()
+        .div_ceil(COLLECTION_DETAILS_PAGE_SIZE)
+        .max(1)
+}
+
+fn collection_details_message(
+    job_id: u64,
+    manifest: &BilibiliCollectionManifest,
+    page: usize,
+) -> String {
+    let page_count = collection_details_page_count(manifest);
+    let page = page.min(page_count.saturating_sub(1));
+    let start = page.saturating_mul(COLLECTION_DETAILS_PAGE_SIZE);
+    let end = (start + COLLECTION_DETAILS_PAGE_SIZE).min(manifest.entries.len());
+    let mut lines = vec![
+        format!("Collection details for job #{job_id}: {}", manifest.title),
+        format!(
+            "Entries {}-{} of {} (page {}/{})",
+            start.saturating_add(1),
+            end,
+            manifest.entries.len(),
+            page + 1,
+            page_count
+        ),
+        format!(
+            "Sync: {} total; {} already present; {} queued",
+            manifest.total_entries, manifest.skipped_entries, manifest.planned_entries
+        ),
+        format!("Estimated download: {}", manifest.estimated_media),
+    ];
+    for entry in &manifest.entries[start..end] {
+        lines.push(collection_manifest_entry_message(entry));
+    }
+    lines.join("\n")
+}
+
+fn collection_manifest_entry_message(entry: &BilibiliCollectionManifestEntry) -> String {
+    let mut lines = vec![format!(
+        "\n{}. {} [{}]",
+        entry.index,
+        entry.title,
+        match entry.status {
+            BilibiliCollectionEntryStatus::Queued => "queued",
+            BilibiliCollectionEntryStatus::AlreadyPresent => "already present",
+        }
+    )];
+    lines.push(format!(
+        "Duration: {}; estimated media: {}",
+        collection_duration_label(entry.duration_seconds),
+        entry.estimated_media
+    ));
+    if let Some(video) = entry.video.as_deref() {
+        lines.push(format!("Video: {video}"));
+    }
+    if let Some(audio) = entry.audio.as_deref() {
+        lines.push(format!("Audio: {audio}"));
+    }
+    lines.join("\n")
+}
+
+fn collection_details_keyboard(
+    token: u64,
+    manifest: &BilibiliCollectionManifest,
+    page: usize,
+) -> InlineKeyboardMarkup {
+    let page_count = collection_details_page_count(manifest);
+    if page_count <= 1 {
+        return InlineKeyboardMarkup {
+            inline_keyboard: Vec::new(),
+        };
+    }
+    let mut buttons = Vec::new();
+    if page > 0 {
+        buttons.push(InlineKeyboardButton {
+            text: "Previous".to_string(),
+            callback_data: collection_details_callback_data(token, page - 1),
+        });
+    }
+    if page + 1 < page_count {
+        buttons.push(InlineKeyboardButton {
+            text: "Next".to_string(),
+            callback_data: collection_details_callback_data(token, page + 1),
+        });
+    }
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![buttons],
+    }
+}
+
+#[derive(Default)]
+struct CollectionProgressDelivery {
+    current_entry: Option<ProgressDelivery>,
+    details_sent: bool,
 }
 
 fn render_job_progress(progress: &JobProgress) -> String {
@@ -3353,6 +4074,7 @@ mod tests {
             resolved_summary: Some(
                 "Entries: 1\nEstimated media: 4.0 MiB\nVideo: 1920x1080 H.264".to_string(),
             ),
+            collection: None,
         };
 
         assert_eq!(
@@ -3368,11 +4090,120 @@ mod tests {
             resolved_summary: Some(
                 "Entries: 1\nExpected media: 4.0 MiB\nVideo: 1920x1080 H.264".to_string(),
             ),
+            collection: None,
         };
 
         assert_eq!(
             progress_fallback_message(7, &render_job_progress(&progress)),
             "Progress job #7: Resolved media:\nEntries: 1\nExpected media: 4.0 MiB\nVideo: 1920x1080 H.264\n\nBBDown-rust: downloading video"
+        );
+    }
+
+    fn test_collection_manifest(entry_count: u32) -> BilibiliCollectionManifest {
+        BilibiliCollectionManifest {
+            title: "Example collection".to_string(),
+            total_entries: entry_count as usize,
+            skipped_entries: 1,
+            planned_entries: entry_count.saturating_sub(1) as usize,
+            estimated_media: "at least 1.2 GiB".to_string(),
+            entries: (1..=entry_count)
+                .map(|index| BilibiliCollectionManifestEntry {
+                    index,
+                    title: format!("Entry {index}"),
+                    duration_seconds: Some(index * 60),
+                    video: (index != entry_count)
+                        .then(|| "1080P 1920x1080 60fps H.264".to_string()),
+                    audio: (index != entry_count).then(|| "Japanese AAC 128 kbps".to_string()),
+                    estimated_media: if index == entry_count {
+                        "already present; source not resolved".to_string()
+                    } else {
+                        "240.0 MiB".to_string()
+                    },
+                    status: if index == entry_count {
+                        BilibiliCollectionEntryStatus::AlreadyPresent
+                    } else {
+                        BilibiliCollectionEntryStatus::Queued
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn collection_details_paginate_per_entry_metadata() {
+        let manifest = test_collection_manifest(6);
+        let first_page = collection_details_message(17, &manifest, 0);
+        let second_page = collection_details_message(17, &manifest, 1);
+
+        assert!(first_page.contains("Entries 1-5 of 6 (page 1/2)"));
+        assert!(first_page.contains("1. Entry 1 [queued]"));
+        assert!(first_page.contains("Video: 1080P 1920x1080 60fps H.264"));
+        assert!(first_page.contains("Estimated download: at least 1.2 GiB"));
+        assert!(second_page.contains("Entries 6-6 of 6 (page 2/2)"));
+        assert!(second_page.contains("6. Entry 6 [already present]"));
+        assert!(!second_page.contains("1. Entry 1 [queued]"));
+
+        let first_keyboard = collection_details_keyboard(42, &manifest, 0);
+        assert_eq!(first_keyboard.inline_keyboard.len(), 1);
+        assert_eq!(
+            first_keyboard.inline_keyboard[0][0].callback_data,
+            "cdet:000000000000002a:1"
+        );
+        let second_keyboard = collection_details_keyboard(42, &manifest, 1);
+        assert_eq!(
+            second_keyboard.inline_keyboard[0][0].callback_data,
+            "cdet:000000000000002a:0"
+        );
+    }
+
+    #[test]
+    fn collection_running_message_keeps_one_entry_profile() {
+        let manifest = test_collection_manifest(2);
+        let entry = BilibiliCollectionEntryProgress {
+            index: 1,
+            title: "Entry 1".to_string(),
+            duration_seconds: Some(60),
+            video: Some("1080P 1920x1080 60fps H.264".to_string()),
+            audio: Some("Japanese AAC 128 kbps".to_string()),
+            estimated_media: "240.0 MiB".to_string(),
+        };
+        let snapshot = BilibiliCollectionProgressSnapshot {
+            title: manifest.title.clone(),
+            total_entries: manifest.total_entries,
+            skipped_entries: manifest.skipped_entries,
+            planned_entries: manifest.planned_entries,
+            completed_entries: 0,
+            current_entry: Some(entry.clone()),
+        };
+
+        let rendered = collection_entry_running_message(
+            17,
+            "Bilibili download",
+            &snapshot,
+            &entry,
+            "BBDown-rust: downloading video",
+        );
+        assert!(rendered.contains("Entry: 1/2"));
+        assert!(rendered.contains("Duration: 1:00"));
+        assert!(rendered.contains("Video: 1080P 1920x1080 60fps H.264"));
+        assert!(rendered.contains("Audio: Japanese AAC 128 kbps"));
+        assert!(!rendered.contains("+5 more"));
+    }
+
+    #[test]
+    fn parses_collection_details_callback_data() {
+        assert_eq!(
+            parse_collection_details_callback_data("cdet:000000000000002a:3"),
+            Some(CollectionDetailsCallback { token: 42, page: 3 })
+        );
+        assert_eq!(
+            parse_collection_details_callback_data("cdet:nothex:3"),
+            None
+        );
+        assert_eq!(parse_collection_details_callback_data("other:2a:3"), None);
+        assert_eq!(
+            parse_collection_details_callback_data("cdet:000000000000002a:3:extra"),
+            None
         );
     }
 
