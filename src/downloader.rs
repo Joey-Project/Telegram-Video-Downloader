@@ -1891,6 +1891,12 @@ struct BilibiliUgcCollectionInput {
     fallback_owner_mid: Option<u64>,
 }
 
+#[derive(Debug)]
+struct BilibiliUgcCollectionOutputDirectory {
+    folder: String,
+    existing_identity: Option<EntryIdentity>,
+}
+
 #[derive(Debug, Clone)]
 struct BilibiliUgcCollectionDownload {
     folder: String,
@@ -1980,7 +1986,7 @@ async fn prepare_bilibili_ugc_collection_download(
     client: &bbdown_core::BiliClient,
     final_output_root: &RootedFs,
     url: &str,
-    primary_media_kind: StagedPrimaryMediaKind,
+    mode: DownloadMode,
 ) -> Result<BilibiliUgcCollectionDownload> {
     let input = bilibili_ugc_collection_input(url)
         .context("Bilibili UGC collection download requires a collection or series URL")?;
@@ -2002,12 +2008,21 @@ async fn prepare_bilibili_ugc_collection_download(
         bail!("Bilibili UGC collection resolution returned a different collection kind");
     }
 
-    let folder = bilibili_ugc_collection_folder(&resolution.collection, input);
-    let index = build_bilibili_ugc_collection_identity_index(
+    let output_directory = select_bilibili_ugc_collection_output_directory(
         final_output_root,
-        &folder,
-        primary_media_kind,
+        &resolution.collection,
+        input,
     )?;
+    let index = if bilibili_ugc_collection_reuses_existing_entries(mode) {
+        build_bilibili_ugc_collection_identity_index(
+            final_output_root,
+            &output_directory.folder,
+            output_directory.existing_identity,
+            StagedPrimaryMediaKind::Video,
+        )?
+    } else {
+        VideoIdentityIndex::default()
+    };
     let items = if resolution.collection.items.is_empty() {
         &resolution.selected_items
     } else {
@@ -2028,7 +2043,7 @@ async fn prepare_bilibili_ugc_collection_download(
     let total_entries = items.len();
     let title = nonempty_collection_title(&resolution.collection.title);
     Ok(BilibiliUgcCollectionDownload {
-        folder,
+        folder: output_directory.folder,
         title,
         total_entries,
         skipped_entries: total_entries.saturating_sub(missing_indices.len()),
@@ -2037,15 +2052,81 @@ async fn prepare_bilibili_ugc_collection_download(
     })
 }
 
+fn bilibili_ugc_collection_reuses_existing_entries(mode: DownloadMode) -> bool {
+    matches!(mode, DownloadMode::All)
+}
+
+fn select_bilibili_ugc_collection_output_directory(
+    output_root: &RootedFs,
+    collection: &VideoCollectionMetadata,
+    input: BilibiliUgcCollectionInput,
+) -> Result<BilibiliUgcCollectionOutputDirectory> {
+    let proposed_folder = bilibili_ugc_collection_folder(collection, input);
+    let stable_suffix = bilibili_ugc_collection_folder_suffix(input);
+    let mut matches = Vec::new();
+
+    // Protected property: a previously selected collection output directory is reused only when
+    // it remains the same direct child object of the locked output root. The immutable collection
+    // suffix selects a human-renamed directory, while the re-bound device/inode identity rejects
+    // replacement before its contents are read. Directory contents are intentionally not assumed
+    // stable here; the later read-only inventory handles those independently as best effort.
+    for (name, identity) in output_root.list_root_directory()? {
+        if !identity.is_dir() {
+            continue;
+        }
+        let Some(folder) = name.to_str().filter(|folder| {
+            folder
+                .strip_suffix(&stable_suffix)
+                .is_some_and(|prefix| prefix.ends_with(' '))
+        }) else {
+            continue;
+        };
+        let path = output_root.logical_root_path().join(&name);
+        let entry = output_root.bind_entry(&path, false)?;
+        if output_root.bound_entry_identity(&entry)? != Some(identity) {
+            bail!(
+                "Bilibili UGC collection output directory changed while selecting its inventory: {}",
+                path.display()
+            );
+        }
+        matches.push((folder.to_string(), identity));
+    }
+    output_root.validate_configured_root()?;
+
+    match matches.as_slice() {
+        [] => Ok(BilibiliUgcCollectionOutputDirectory {
+            folder: proposed_folder,
+            existing_identity: None,
+        }),
+        [(folder, identity)] => Ok(BilibiliUgcCollectionOutputDirectory {
+            folder: folder.clone(),
+            existing_identity: Some(*identity),
+        }),
+        _ => bail!(
+            "multiple Bilibili UGC collection output directories match stable identifier {stable_suffix}"
+        ),
+    }
+}
+
 fn build_bilibili_ugc_collection_identity_index(
     output_root: &RootedFs,
     folder: &str,
+    expected_existing_identity: Option<EntryIdentity>,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<VideoIdentityIndex> {
     output_root.validate_configured_root()?;
     let target = output_root.logical_root_path().join(folder);
-    let Some(expected_target) = output_root.entry_identity(&target)? else {
-        return Ok(VideoIdentityIndex::default());
+    let actual_target = output_root.entry_identity(&target)?;
+    let expected_target = match (expected_existing_identity, actual_target) {
+        (Some(expected), Some(actual)) if expected == actual => actual,
+        (Some(_), _) => {
+            bail!(
+                "Bilibili UGC collection output directory changed before inventory scan: {}",
+                target.display()
+            );
+        }
+        (None, Some(actual)) => actual,
+        (None, None) => return Ok(VideoIdentityIndex::default()),
     };
     if !expected_target.is_dir() {
         bail!(
@@ -2108,7 +2189,7 @@ fn bilibili_ugc_collection_folder(
         .filter(|name| !name.is_empty())
         .map_or(fallback_owner.as_str(), |name| name);
     let owner = sanitize_bilibili_collection_component(owner, "UP-unknown", 64);
-    let suffix = format!("[{}-{}]", input.kind.label(), input.id);
+    let suffix = bilibili_ugc_collection_folder_suffix(input);
     let title_budget = BILIBILI_COLLECTION_FOLDER_MAX_BYTES
         .saturating_sub(owner.len())
         .saturating_sub(" - ".len())
@@ -2117,6 +2198,10 @@ fn bilibili_ugc_collection_folder(
         .max(1);
     let title = sanitize_bilibili_collection_component(&collection.title, "Untitled", title_budget);
     format!("{owner} - {title} {suffix}")
+}
+
+fn bilibili_ugc_collection_folder_suffix(input: BilibiliUgcCollectionInput) -> String {
+    format!("[{}-{}]", input.kind.label(), input.id)
 }
 
 fn sanitize_bilibili_collection_component(raw: &str, fallback: &str, max_bytes: usize) -> String {
@@ -2258,18 +2343,9 @@ async fn run_bilibili_job_locked(
             progress.as_ref(),
             "BBDown-rust: resolving Bilibili UGC collection inventory".to_string(),
         );
-        let primary_media_kind = if matches!(options.mode, DownloadMode::AudioOnly) {
-            StagedPrimaryMediaKind::VideoOrAudio
-        } else {
-            StagedPrimaryMediaKind::Video
-        };
-        let collection = prepare_bilibili_ugc_collection_download(
-            &client,
-            final_output_root,
-            url,
-            primary_media_kind,
-        )
-        .await?;
+        let collection =
+            prepare_bilibili_ugc_collection_download(&client, final_output_root, url, options.mode)
+                .await?;
         if collection.missing_indices.is_empty() {
             return Ok(BilibiliJobOutcome::AlreadyComplete(
                 collection.already_complete_report(final_output_root),
@@ -13540,7 +13616,7 @@ mod tests {
     }
 
     #[test]
-    fn bilibili_ugc_collection_folder_is_stable_safe_and_bounded() {
+    fn bilibili_ugc_collection_folder_is_safe_and_bounded() {
         let collection = VideoCollectionMetadata {
             id: Some(167822),
             kind: VideoCollectionKind::Collection,
@@ -13589,6 +13665,76 @@ mod tests {
     }
 
     #[test]
+    fn bilibili_ugc_collection_reuses_existing_entries_only_for_all_mode() {
+        assert!(bilibili_ugc_collection_reuses_existing_entries(
+            DownloadMode::All
+        ));
+        for mode in [
+            DownloadMode::VideoOnly,
+            DownloadMode::AudioOnly,
+            DownloadMode::SubtitleOnly,
+            DownloadMode::DanmakuOnly,
+            DownloadMode::CoverOnly,
+        ] {
+            assert!(
+                !bilibili_ugc_collection_reuses_existing_entries(mode),
+                "{mode:?} should not skip collection entries based on existing video media"
+            );
+        }
+    }
+
+    #[test]
+    fn bilibili_ugc_collection_reuses_directory_when_display_metadata_changes() {
+        let video_dir = temp_test_dir("bilibili-ugc-collection-folder-reuse");
+        let existing_folder = "Former Owner - Former Collection [collection-167822]";
+        fs::create_dir_all(video_dir.join(existing_folder))
+            .expect("existing collection directory should create");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let collection = VideoCollectionMetadata {
+            id: Some(167822),
+            kind: VideoCollectionKind::Collection,
+            title: "Renamed Collection".to_string(),
+            description: String::new(),
+            cover_url: None,
+            pub_time: None,
+            owner: Some(bbdown_core::Owner {
+                mid: 210798,
+                name: "Renamed Owner".to_string(),
+            }),
+            items: Vec::new(),
+        };
+        let input = BilibiliUgcCollectionInput {
+            id: 167822,
+            kind: BilibiliUgcCollectionKind::Collection,
+            fallback_owner_mid: Some(210798),
+        };
+
+        let selected = select_bilibili_ugc_collection_output_directory(&root, &collection, input)
+            .expect("existing collection directory should be selected");
+        assert_eq!(selected.folder, existing_folder);
+        assert_eq!(
+            selected.existing_identity,
+            root.entry_identity(&video_dir.join(existing_folder))
+                .expect("existing directory identity should read")
+        );
+        assert_ne!(
+            selected.folder,
+            bilibili_ugc_collection_folder(&collection, input),
+            "renamed display metadata must not select a second collection directory"
+        );
+
+        fs::create_dir_all(video_dir.join("Other Owner - Other Collection [collection-167822]"))
+            .expect("ambiguous collection directory should create");
+        let error = select_bilibili_ugc_collection_output_directory(&root, &collection, input)
+            .expect_err("ambiguous stable collection identifiers must be rejected");
+        assert!(
+            format!("{error:#}").contains("multiple Bilibili UGC collection output directories")
+        );
+        drop(root);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
     fn parses_direct_bilibili_ugc_collection_inputs() {
         assert_eq!(
             bilibili_ugc_collection_input(
@@ -13634,6 +13780,7 @@ mod tests {
         let index = build_bilibili_ugc_collection_identity_index(
             &root,
             folder,
+            None,
             StagedPrimaryMediaKind::Video,
         )
         .expect("collection inventory should scan");
@@ -13653,6 +13800,7 @@ mod tests {
         let index = build_bilibili_ugc_collection_identity_index(
             &root,
             folder,
+            None,
             StagedPrimaryMediaKind::Video,
         )
         .expect("collection inventory should rescan");

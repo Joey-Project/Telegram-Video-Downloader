@@ -21,14 +21,14 @@ superseded_by:
 - The dependency upgrade is present locally and passed `cargo test`, `cargo fmt --check`, and `cargo clippy --all-targets -- -D warnings` before this workstream began.
 - A positive membership probe was verified against `BV1kk4y1T7cd`: collection `167822`, title `东方钢琴单曲集`, owner `Satori旅人`, 37 items. `BV12TRrBcEP8` is a negative single-video control.
 - Normal BV membership now presents `Current video`, `Entire collection`, and `Cancel`. Direct UGC collection and series URLs present `Entire collection` and `Cancel`.
-- Confirmed collection jobs resolve all entries, recursively inventory NFO/info sidecar identities in the target collection directory, and download only missing items through the existing staging and atomic-publication flow.
-- Collection output is named `<UP主> - <合集名> [collection-<id>]` or `[series-<id>]`; unsafe or oversized components are normalized, and an unavailable owner name falls back to `UP-<mid>`.
+- Confirmed collection jobs resolve all entries, recursively inventory NFO/info sidecar identities in the target collection directory, and download only missing items through the existing staging and atomic-publication flow when the Bilibili mode is `All`. Non-complete media modes download every selected collection item so existing videos cannot suppress requested audio or auxiliary artifacts.
+- Collection output is named `<UP主> - <合集名> [collection-<id>]` or `[series-<id>]`; unsafe or oversized components are normalized, and an unavailable owner name falls back to `UP-<mid>`. On later syncs, an existing directory is located by its immutable kind/id suffix, so title or owner-name edits do not create a duplicate collection directory.
 - The live progress message reports collection total, current item, already-present items, and completed downloads. Single-video, YouTube, and PDF behavior remains unchanged.
 
 ## Plan
 - Add explicit collection job data and generalized confirmation callbacks for PGC episodes, BV membership, and direct UGC URLs.
 - Resolve collection entries through `bbdown-core`, inventory existing sidecars inside the target collection directory, and request only missing entry indices.
-- Publish into `<UP主> - <合集名> [collection-<id>]` or `[series-<id>]`, with a stable `UP-<mid>` fallback when an owner name is unavailable.
+- Publish into `<UP主> - <合集名> [collection-<id>]` or `[series-<id>]`, with a stable `UP-<mid>` fallback when an owner name is unavailable, and reuse an existing matching kind/id directory across display-metadata changes.
 - Report collection total, current item, completed items, and skipped existing items through the existing live Telegram progress message.
 - Preserve single-video behavior when membership is absent or cannot be resolved, and leave YouTube/PDF routing untouched.
 
