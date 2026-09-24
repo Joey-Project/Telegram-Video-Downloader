@@ -3667,11 +3667,170 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use anyhow::anyhow;
+    use anyhow::{Context, Result, anyhow};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{mpsc, oneshot};
 
     use super::*;
 
     static TEST_AUTH_GENERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Debug)]
+    struct FakeTelegramRequest {
+        method: String,
+        body: serde_json::Value,
+    }
+
+    async fn spawn_fake_telegram_api() -> (
+        TelegramClient,
+        mpsc::UnboundedReceiver<FakeTelegramRequest>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram API should bind localhost");
+        let address = listener
+            .local_addr()
+            .expect("fake Telegram API should expose its address");
+        let (requests_tx, requests_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut next_message_id = 1_000_i64;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => return Ok(()),
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.context("fake Telegram API accept failed")?;
+                        let request = read_fake_telegram_request(&mut stream).await?;
+                        let response = fake_telegram_response(&request, &mut next_message_id);
+                        let _ = requests_tx.send(request);
+                        stream
+                            .write_all(response.as_bytes())
+                            .await
+                            .context("fake Telegram API response write failed")?;
+                    }
+                }
+            }
+        });
+
+        (
+            TelegramClient::with_test_api_base_url(
+                "test-token".to_string(),
+                format!("http://{address}"),
+            ),
+            requests_rx,
+            shutdown_tx,
+            server,
+        )
+    }
+
+    async fn read_fake_telegram_request(stream: &mut TcpStream) -> Result<FakeTelegramRequest> {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 4_096];
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .context("fake Telegram API request read failed")?;
+            if read == 0 {
+                return Err(anyhow!("fake Telegram API request ended before headers"));
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+            if bytes.len() > 64 * 1024 {
+                return Err(anyhow!("fake Telegram API request headers were too large"));
+            }
+        };
+
+        let headers = std::str::from_utf8(&bytes[..header_end])
+            .context("fake Telegram API request headers were not UTF-8")?;
+        let request_line = headers
+            .lines()
+            .next()
+            .context("fake Telegram API request line was missing")?;
+        let method = request_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|path| path.rsplit('/').next())
+            .filter(|method| !method.is_empty())
+            .context("fake Telegram API request path was missing")?
+            .to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then_some(value.trim())
+            })
+            .context("fake Telegram API request content length was missing")?
+            .parse::<usize>()
+            .context("fake Telegram API request content length was invalid")?;
+        let body_end = header_end.saturating_add(content_length);
+        while bytes.len() < body_end {
+            let mut chunk = [0_u8; 4_096];
+            let read = stream
+                .read(&mut chunk)
+                .await
+                .context("fake Telegram API request body read failed")?;
+            if read == 0 {
+                return Err(anyhow!("fake Telegram API request ended before body"));
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        let body = serde_json::from_slice(&bytes[header_end..body_end])
+            .context("fake Telegram API request body was not JSON")?;
+
+        Ok(FakeTelegramRequest { method, body })
+    }
+
+    fn fake_telegram_response(request: &FakeTelegramRequest, next_message_id: &mut i64) -> String {
+        let result = if request.method == "sendMessage" {
+            let message_id = *next_message_id;
+            *next_message_id += 1;
+            serde_json::json!({
+                "message_id": message_id,
+                "chat": {
+                    "id": request.body["chat_id"].as_i64().unwrap_or_default(),
+                    "type": "private"
+                }
+            })
+        } else {
+            serde_json::json!(true)
+        };
+        let payload = serde_json::json!({ "ok": true, "result": result }).to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+    }
+
+    fn take_fake_telegram_requests(
+        requests: &mut mpsc::UnboundedReceiver<FakeTelegramRequest>,
+    ) -> Vec<FakeTelegramRequest> {
+        let mut recorded = Vec::new();
+        while let Ok(request) = requests.try_recv() {
+            recorded.push(request);
+        }
+        recorded
+    }
+
+    async fn stop_fake_telegram_api(
+        shutdown: oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<Result<()>>,
+    ) {
+        shutdown
+            .send(())
+            .expect("fake Telegram API shutdown should be accepted");
+        tokio_timeout(Duration::from_secs(5), server)
+            .await
+            .expect("fake Telegram API should stop within timeout")
+            .expect("fake Telegram API task should not panic")
+            .expect("fake Telegram API should not fail");
+    }
 
     fn test_auth_epoch(value: u64) -> bilibili_auth::AuthEpoch {
         bilibili_auth::AuthEpoch::for_test(value)
@@ -4194,6 +4353,40 @@ mod tests {
         }
     }
 
+    fn test_collection_entry_progress(
+        manifest: &BilibiliCollectionManifest,
+        index: u32,
+    ) -> BilibiliCollectionEntryProgress {
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.index == index)
+            .expect("test collection entry should exist");
+        BilibiliCollectionEntryProgress {
+            index: entry.index,
+            title: entry.title.clone(),
+            duration_seconds: entry.duration_seconds,
+            video: entry.video.clone(),
+            audio: entry.audio.clone(),
+            estimated_media: entry.estimated_media.clone(),
+        }
+    }
+
+    fn test_collection_snapshot(
+        manifest: &BilibiliCollectionManifest,
+        completed_entries: usize,
+        current_entry: Option<BilibiliCollectionEntryProgress>,
+    ) -> BilibiliCollectionProgressSnapshot {
+        BilibiliCollectionProgressSnapshot {
+            title: manifest.title.clone(),
+            total_entries: manifest.total_entries,
+            skipped_entries: manifest.skipped_entries,
+            planned_entries: manifest.planned_entries,
+            completed_entries,
+            current_entry,
+        }
+    }
+
     #[test]
     fn collection_details_paginate_per_entry_metadata() {
         let manifest = test_collection_manifest(6);
@@ -4315,6 +4508,174 @@ mod tests {
             lifecycle.recv().await,
             Some(JobProgressLifecycleEvent::Failed { snapshot })
         );
+    }
+
+    #[tokio::test]
+    async fn collection_progress_local_telegram_e2e_preserves_entry_lifecycle_and_pagination() {
+        let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+        let manifest = test_collection_manifest(6);
+        let entry_one = test_collection_entry_progress(&manifest, 1);
+        let entry_two = test_collection_entry_progress(&manifest, 2);
+        let (progress, progress_rx) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress(
+            telegram.clone(),
+            123_456_789,
+            17,
+            "Bilibili download",
+            Some(700),
+            progress_rx,
+            Duration::from_secs(60),
+        ));
+
+        progress.send_lifecycle(JobProgressLifecycleEvent::Resolved {
+            manifest: manifest.clone(),
+            snapshot: test_collection_snapshot(&manifest, 0, None),
+        });
+        progress.send_lifecycle(JobProgressLifecycleEvent::EntryStarted {
+            entry: entry_one.clone(),
+            snapshot: test_collection_snapshot(&manifest, 0, Some(entry_one.clone())),
+        });
+        progress.send_lifecycle(JobProgressLifecycleEvent::EntryCompleted {
+            entry: entry_one,
+            file_count: 2,
+            snapshot: test_collection_snapshot(&manifest, 1, None),
+        });
+        progress.send_lifecycle(JobProgressLifecycleEvent::EntryStarted {
+            entry: entry_two.clone(),
+            snapshot: test_collection_snapshot(&manifest, 1, Some(entry_two.clone())),
+        });
+        progress.send_lifecycle(JobProgressLifecycleEvent::Failed {
+            snapshot: test_collection_snapshot(&manifest, 1, Some(entry_two)),
+        });
+        drop(progress);
+
+        tokio_timeout(Duration::from_secs(5), progress_task)
+            .await
+            .expect("collection progress forwarding should finish within timeout")
+            .expect("collection progress forwarding task should not panic");
+
+        let lifecycle_requests = take_fake_telegram_requests(&mut requests);
+        let lifecycle_methods = lifecycle_requests
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle_methods,
+            vec![
+                "sendMessage",
+                "editMessageText",
+                "sendMessage",
+                "editMessageText",
+                "editMessageText",
+                "editMessageText",
+                "sendMessage",
+                "editMessageText",
+                "editMessageText",
+                "editMessageText",
+            ]
+        );
+
+        let details_request = &lifecycle_requests[0];
+        let details_text = details_request.body["text"]
+            .as_str()
+            .expect("collection details should include text");
+        assert!(details_text.contains("Entries 1-5 of 6 (page 1/2)"));
+        assert!(details_text.contains("1. Entry 1 [queued]"));
+        let next_callback_data =
+            details_request.body["reply_markup"]["inline_keyboard"][0][0]["callback_data"]
+                .as_str()
+                .expect("collection details should include a next callback")
+                .to_string();
+        let next_callback = parse_collection_details_callback_data(&next_callback_data)
+            .expect("collection next callback should parse");
+        assert_eq!(next_callback.page, 1);
+
+        assert!(
+            lifecycle_requests[1].body["text"]
+                .as_str()
+                .expect("resolved overview should include text")
+                .contains("Resolved collection:")
+        );
+        assert!(
+            lifecycle_requests[4].body["text"]
+                .as_str()
+                .expect("completed entry should include text")
+                .starts_with("Downloaded collection entry job #17: Bilibili download")
+        );
+        assert_eq!(
+            lifecycle_requests[4].body["message_id"].as_i64(),
+            Some(1_001)
+        );
+        assert!(
+            lifecycle_requests[8].body["text"]
+                .as_str()
+                .expect("failed entry should include text")
+                .starts_with("Failed collection entry job #17: Bilibili download")
+        );
+        assert_eq!(
+            lifecycle_requests[8].body["message_id"].as_i64(),
+            Some(1_002)
+        );
+        let failed_overview = lifecycle_requests[9].body["text"]
+            .as_str()
+            .expect("failed overview should include text");
+        assert!(
+            failed_overview
+                .contains("Collection download failed; see final job status for details."),
+            "failed overview did not preserve the lifecycle activity: {failed_overview}"
+        );
+
+        handle_callback_query(
+            telegram,
+            Arc::new(AppConfig::for_test()),
+            JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            crate::telegram::CallbackQuery {
+                id: "next-page".to_string(),
+                data: Some(next_callback_data),
+                message: Some(crate::telegram::Message {
+                    message_id: 1_000,
+                    chat: crate::telegram::Chat {
+                        id: 123_456_789,
+                        kind: Some("private".to_string()),
+                    },
+                    text: None,
+                }),
+            },
+        )
+        .await;
+
+        let callback_requests = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            callback_requests
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["editMessageText", "answerCallbackQuery"]
+        );
+        assert_eq!(
+            callback_requests[0].body["message_id"].as_i64(),
+            Some(1_000)
+        );
+        assert!(
+            callback_requests[0].body["text"]
+                .as_str()
+                .expect("second collection page should include text")
+                .contains("Entries 6-6 of 6 (page 2/2)")
+        );
+        assert_eq!(
+            callback_requests[0].body["reply_markup"]["inline_keyboard"][0][0]["text"].as_str(),
+            Some("Previous")
+        );
+        assert_eq!(callback_requests[1].body["text"].as_str(), Some("Page 2/2"));
+
+        pending_collection_details()
+            .lock()
+            .await
+            .remove(&next_callback.token);
+        stop_fake_telegram_api(shutdown, server).await;
     }
 
     #[test]
