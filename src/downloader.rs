@@ -10,14 +10,15 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bbdown_core::{
     DownloadFileKind, DownloadMode, DownloadProgressEvent, DownloadProgressSink, DownloadReport,
-    MediaStream, ResolvedContent,
+    IndexSelection, IndexSelector, Input, MediaStream, ResolvedContent, Selection,
+    VideoCollectionKind, VideoCollectionMetadata, VideoCollectionResolution,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -31,7 +32,7 @@ use crate::bilibili_auth;
 use crate::bilibili_core;
 use crate::config::AppConfig;
 use crate::redaction::redact_sensitive_text;
-use crate::router::{BilibiliSelection, JobRequest};
+use crate::router::{BilibiliSelection, JobRequest, is_bilibili_ugc_collection_url};
 use crate::safe_fs::{
     BoundDirectory, BoundEntry, BoundFile, EntryIdentity, RootedFs, identity_for_open_file,
 };
@@ -56,7 +57,7 @@ const VIDEO_STAGING_RETENTION_LIMIT: usize = 4096;
 const VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON: &str =
     "download completed; automatic publication has not finished";
 const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
-const BILIBILI_WORKER_REQUEST_VERSION: u32 = 3;
+const BILIBILI_WORKER_REQUEST_VERSION: u32 = 4;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
 const BILIBILI_RESOLVED_PROGRESS_WIRE_PREFIX: &str = "TVD_BILIBILI_RESOLVED:";
 const BILIBILI_WORKER_LIFECYCLE_FILE_NAME: &str = ".bilibili-worker-lifecycle.json";
@@ -253,6 +254,7 @@ pub type JobProgressReceiver = watch::Receiver<Option<JobProgress>>;
 struct BilibiliWorkerRequest {
     version: u32,
     config: AppConfig,
+    final_video_dir: PathBuf,
     url: String,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<VideoIdentity>,
@@ -269,7 +271,31 @@ struct BilibiliWorkerRequest {
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 enum BilibiliWorkerResponse {
     Completed { report: JobReport },
+    AlreadyComplete { report: JobReport },
     CoreCompletedMarkerFailed,
+}
+
+struct BilibiliWorkerRoots<'a> {
+    final_output_root: &'a RootedFs,
+    staging: &'a BoundStagingDir,
+    output_lock: &'a BoundFile,
+}
+
+struct BilibiliWorkerJobContext<'a> {
+    request: &'a BilibiliWorkerRequest,
+    final_output_root: &'a RootedFs,
+}
+
+#[derive(Debug)]
+enum BilibiliWorkerOutcome {
+    Completed(JobReport),
+    AlreadyComplete(JobReport),
+}
+
+#[derive(Debug)]
+enum BilibiliJobOutcome {
+    Downloaded(JobReport),
+    AlreadyComplete(JobReport),
 }
 
 #[derive(Debug)]
@@ -1258,6 +1284,7 @@ fn find_video_duplicate_for_identities(
 struct VideoIdentityIndex {
     videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
     overwrite_videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
+    metadata_videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
     root: Option<RootedFs>,
     file_identities: BTreeMap<PathBuf, EntryIdentity>,
 }
@@ -1278,12 +1305,21 @@ impl VideoIdentityIndex {
         insert_identity_path(&mut self.overwrite_videos_by_identity, identity, video);
     }
 
+    fn insert_metadata_evidence(&mut self, identity: VideoIdentity, video: &Path) {
+        self.insert_overwrite_evidence(identity.clone(), video);
+        insert_identity_path(&mut self.metadata_videos_by_identity, identity, video);
+    }
+
     fn videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
         identity_paths(&self.videos_by_identity, identity)
     }
 
     fn overwrite_videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
         identity_paths(&self.overwrite_videos_by_identity, identity)
+    }
+
+    fn metadata_videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
+        identity_paths(&self.metadata_videos_by_identity, identity)
     }
 
     fn overwrite_confirmation(&self, video: &Path) -> Option<VideoOverwriteConfirmation> {
@@ -1447,33 +1483,33 @@ async fn run_simple_job(
 
 async fn run_staged_bilibili_worker(
     config: &AppConfig,
-    staging: &BoundStagingDir,
-    output_lock: &BoundFile,
+    roots: BilibiliWorkerRoots<'_>,
     url: &str,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<&VideoIdentity>,
     progress: Option<JobProgressSender>,
-) -> Result<JobReport> {
+) -> Result<BilibiliWorkerOutcome> {
     let request = build_bilibili_worker_request(
         config,
+        roots.final_output_root.root_path(),
         url,
         selection,
         expected_overwrite_identity,
-        staging,
-        output_lock,
+        roots.staging,
+        roots.output_lock,
     );
     let contents =
         serde_json::to_vec(&request).context("failed to encode Bilibili worker request")?;
     if contents.len() > BILIBILI_WORKER_REQUEST_LIMIT {
         bail!("Bilibili worker request exceeds its size limit");
     }
-    let request_file = create_unlinked_bilibili_worker_request(staging, &contents)?;
+    let request_file = create_unlinked_bilibili_worker_request(roots.staging, &contents)?;
     let executable = std::env::current_exe().context("failed to resolve downloader executable")?;
     let spec = CommandSpec {
         program: executable,
         args: vec!["--bilibili-worker".to_string()],
-        cwd: staging.path().to_path_buf(),
-        activity_dir: Some(staging.path().to_path_buf()),
+        cwd: roots.staging.path().to_path_buf(),
+        activity_dir: Some(roots.staging.path().to_path_buf()),
         cleanup_paths: Vec::new(),
         inherited_fd_base: Some(BILIBILI_WORKER_REQUEST_FD),
     };
@@ -1481,7 +1517,7 @@ async fn run_staged_bilibili_worker(
     let (additional_inherited_fds, _parent_liveness) = {
         let (worker_liveness, parent_liveness) =
             command_liveness_pair().context("failed to create Bilibili worker liveness channel")?;
-        let inherited = prepare_bilibili_worker_inherited_fds(&worker_liveness, output_lock)?;
+        let inherited = prepare_bilibili_worker_inherited_fds(&worker_liveness, roots.output_lock)?;
         (inherited, parent_liveness)
     };
     #[cfg(not(unix))]
@@ -1489,14 +1525,14 @@ async fn run_staged_bilibili_worker(
     let output = run_command_with_bound_cwd_and_inherited_files_with_policy(
         config,
         &spec,
-        &staging.directory,
+        &roots.staging.directory,
         std::slice::from_ref(&request_file),
         additional_inherited_fds,
         progress,
         CommandExecutionPolicy::BILIBILI_WORKER,
     )
     .await?;
-    staging.validate_for_path_access()?;
+    roots.staging.validate_for_path_access()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -1510,9 +1546,14 @@ async fn run_staged_bilibili_worker(
     parse_bilibili_worker_response(response)
 }
 
-fn parse_bilibili_worker_response(response: &str) -> Result<JobReport> {
+fn parse_bilibili_worker_response(response: &str) -> Result<BilibiliWorkerOutcome> {
     match serde_json::from_str(response).context("failed to parse Bilibili worker response")? {
-        BilibiliWorkerResponse::Completed { report } => Ok(report),
+        BilibiliWorkerResponse::Completed { report } => {
+            Ok(BilibiliWorkerOutcome::Completed(report))
+        }
+        BilibiliWorkerResponse::AlreadyComplete { report } => {
+            Ok(BilibiliWorkerOutcome::AlreadyComplete(report))
+        }
         BilibiliWorkerResponse::CoreCompletedMarkerFailed => {
             Err(anyhow!(BilibiliCoreCompletionMarkerFailure))
         }
@@ -1576,6 +1617,7 @@ where
 
 fn build_bilibili_worker_request(
     config: &AppConfig,
+    final_video_dir: &Path,
     url: &str,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<&VideoIdentity>,
@@ -1591,6 +1633,7 @@ fn build_bilibili_worker_request(
     BilibiliWorkerRequest {
         version: BILIBILI_WORKER_REQUEST_VERSION,
         config: worker_config,
+        final_video_dir: final_video_dir.to_path_buf(),
         url: url.to_string(),
         selection,
         expected_overwrite_identity: expected_overwrite_identity.cloned(),
@@ -1633,6 +1676,24 @@ fn validate_bilibili_worker_staging(
     }
     if root.entry_identity(&owner_path)? != Some(owner.identity()) {
         bail!("Bilibili worker staging ownership record changed during validation");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_bilibili_worker_final_output_root(
+    root: &RootedFs,
+    request: &BilibiliWorkerRequest,
+) -> Result<()> {
+    // Protected property: incremental collection inventory remains inside the same final output
+    // directory object locked by the parent. Device and inode prove object identity; the bound
+    // root revalidation keeps the configured access path stable while the worker reads it.
+    root.validate_configured_root()?;
+    if root.root_identity().device() != request.output_root_device
+        || root.root_identity().inode() != request.output_root_inode
+        || !root.root_identity().is_dir()
+    {
+        bail!("Bilibili worker final output root does not match its request");
     }
     Ok(())
 }
@@ -1719,6 +1780,9 @@ pub async fn run_bilibili_worker() -> Result<()> {
         inherited_worker_output_lock(request.output_lock_device, request.output_lock_inode)?;
     let root = RootedFs::new(Path::new("."))?;
     validate_bilibili_worker_staging(&root, &request)?;
+    let final_output_root = RootedFs::new(&request.final_video_dir)
+        .context("failed to bind Bilibili final output root")?;
+    validate_bilibili_worker_final_output_root(&final_output_root, &request)?;
     let (progress, mut progress_receiver) = job_progress_channel();
     let progress_writer = tokio::spawn(async move {
         let mut emitted_summary = None;
@@ -1745,7 +1809,10 @@ pub async fn run_bilibili_worker() -> Result<()> {
             &request.url,
             request.selection,
             request.expected_overwrite_identity.as_ref(),
-            Some(&request),
+            BilibiliWorkerJobContext {
+                request: &request,
+                final_output_root: &final_output_root,
+            },
             Some(progress),
         ) => result,
         liveness_result = wait_for_liveness_peer_close(liveness) => {
@@ -1757,7 +1824,10 @@ pub async fn run_bilibili_worker() -> Result<()> {
         }
     };
     let response = match result {
-        Ok(report) => BilibiliWorkerResponse::Completed { report },
+        Ok(BilibiliJobOutcome::Downloaded(report)) => BilibiliWorkerResponse::Completed { report },
+        Ok(BilibiliJobOutcome::AlreadyComplete(report)) => {
+            BilibiliWorkerResponse::AlreadyComplete { report }
+        }
         Err(err)
             if err
                 .downcast_ref::<BilibiliCoreCompletionMarkerFailure>()
@@ -1789,15 +1859,519 @@ pub async fn run_bilibili_worker() -> Result<()> {
     bail!("Bilibili worker requires a Unix platform")
 }
 
+// BBDown-rust renders output templates as an 80-byte filename component.
+const BILIBILI_COLLECTION_FOLDER_MAX_BYTES: usize = 80;
+const BILIBILI_COLLECTION_OWNER_MAX_BYTES: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BilibiliUgcCollectionKind {
+    Collection,
+    Series,
+}
+
+impl BilibiliUgcCollectionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Collection => "collection",
+            Self::Series => "series",
+        }
+    }
+
+    fn matches(self, kind: &VideoCollectionKind) -> bool {
+        matches!(
+            (self, kind),
+            (Self::Collection, VideoCollectionKind::Collection)
+                | (Self::Series, VideoCollectionKind::Series)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BilibiliUgcCollectionInput {
+    id: u64,
+    kind: BilibiliUgcCollectionKind,
+    fallback_owner_mid: Option<u64>,
+}
+
+#[derive(Debug)]
+struct BilibiliUgcCollectionOutputDirectory {
+    folder: String,
+    existing_identity: Option<EntryIdentity>,
+}
+
+#[derive(Debug, Clone)]
+struct BilibiliUgcCollectionDownload {
+    folder: String,
+    output_template: String,
+    title: String,
+    total_entries: usize,
+    skipped_entries: usize,
+    missing_indices: Vec<u32>,
+    resolution: VideoCollectionResolution,
+}
+
+impl BilibiliUgcCollectionDownload {
+    fn planned_entries(&self) -> usize {
+        self.missing_indices.len()
+    }
+
+    fn missing_selection(&self) -> Result<Selection> {
+        let selectors = self
+            .missing_indices
+            .iter()
+            .copied()
+            .map(IndexSelector::index)
+            .collect::<Vec<_>>();
+        Ok(Selection::Indices(IndexSelection::new(selectors).context(
+            "failed to select missing Bilibili UGC collection entries",
+        )?))
+    }
+
+    fn progress_summary(&self) -> String {
+        format!(
+            "Collection: {}\nSync: {} total; {} already present; {} queued",
+            self.title,
+            self.total_entries,
+            self.skipped_entries,
+            self.planned_entries()
+        )
+    }
+
+    fn details_summary(&self, downloaded_entries: usize) -> String {
+        format!(
+            "Collection sync: {} total; {} already present; {} downloaded",
+            self.total_entries, self.skipped_entries, downloaded_entries
+        )
+    }
+
+    fn already_complete_report(&self, output_root: &RootedFs) -> JobReport {
+        JobReport {
+            saved_location: output_root
+                .logical_root_path()
+                .join(&self.folder)
+                .display()
+                .to_string(),
+            details: format!(
+                "Bilibili UGC collection already complete: {} ({} total, {} already present)",
+                self.title, self.total_entries, self.skipped_entries
+            ),
+        }
+    }
+}
+
+fn bilibili_ugc_collection_input(url: &str) -> Option<BilibiliUgcCollectionInput> {
+    match Input::parse(url).ok()? {
+        Input::CollectionList(id) => Some(BilibiliUgcCollectionInput {
+            id,
+            kind: BilibiliUgcCollectionKind::Collection,
+            fallback_owner_mid: None,
+        }),
+        Input::SeriesList(id) => Some(BilibiliUgcCollectionInput {
+            id,
+            kind: BilibiliUgcCollectionKind::Series,
+            fallback_owner_mid: None,
+        }),
+        Input::SpaceCollectionList { list_id, owner_mid } => Some(BilibiliUgcCollectionInput {
+            id: list_id,
+            kind: BilibiliUgcCollectionKind::Collection,
+            fallback_owner_mid: Some(owner_mid),
+        }),
+        Input::SpaceSeriesList { list_id, owner_mid } => Some(BilibiliUgcCollectionInput {
+            id: list_id,
+            kind: BilibiliUgcCollectionKind::Series,
+            fallback_owner_mid: Some(owner_mid),
+        }),
+        _ => None,
+    }
+}
+
+async fn prepare_bilibili_ugc_collection_download(
+    client: &bbdown_core::BiliClient,
+    final_output_root: &RootedFs,
+    url: &str,
+    mode: DownloadMode,
+) -> Result<BilibiliUgcCollectionDownload> {
+    let input = bilibili_ugc_collection_input(url)
+        .context("Bilibili UGC collection download requires a collection or series URL")?;
+    let resolved = tokio_timeout(
+        BILIBILI_METADATA_PROBE_TIMEOUT,
+        client.resolve_input(url, Some(Selection::All)),
+    )
+    .await
+    .context("Bilibili UGC collection resolution timed out")?
+    .context("failed to resolve Bilibili UGC collection")?;
+    let ResolvedContent::Collection(resolution) = resolved else {
+        bail!("Bilibili UGC collection URL did not resolve to a collection");
+    };
+
+    if resolution.collection.id.is_some_and(|id| id != input.id) {
+        bail!("Bilibili UGC collection resolution returned a different collection id");
+    }
+    if !input.kind.matches(&resolution.collection.kind) {
+        bail!("Bilibili UGC collection resolution returned a different collection kind");
+    }
+
+    let output_directory = select_bilibili_ugc_collection_output_directory(
+        final_output_root,
+        &resolution.collection,
+        input,
+    )?;
+    let output_template = bilibili_ugc_collection_output_template(&output_directory.folder)?;
+    let index = if bilibili_ugc_collection_reuses_existing_entries(mode) {
+        build_bilibili_ugc_collection_identity_index(
+            final_output_root,
+            &output_directory.folder,
+            output_directory.existing_identity,
+            StagedPrimaryMediaKind::Video,
+        )?
+    } else {
+        VideoIdentityIndex::default()
+    };
+    let items = if resolution.collection.items.is_empty() {
+        &resolution.selected_items
+    } else {
+        &resolution.collection.items
+    };
+    let bvid_counts = collection_item_bvid_counts(items);
+    let aid_counts = collection_item_aid_counts(items);
+    let mut seen_indices = BTreeSet::new();
+    let mut missing_indices = Vec::new();
+    for item in items {
+        if item.index == 0 || !seen_indices.insert(item.index) {
+            bail!("Bilibili UGC collection contains an invalid entry index");
+        }
+        if !bilibili_ugc_collection_item_is_present(&index, item, &bvid_counts, &aid_counts) {
+            missing_indices.push(item.index);
+        }
+    }
+    let total_entries = items.len();
+    let title = nonempty_collection_title(&resolution.collection.title);
+    Ok(BilibiliUgcCollectionDownload {
+        folder: output_directory.folder,
+        output_template,
+        title,
+        total_entries,
+        skipped_entries: total_entries.saturating_sub(missing_indices.len()),
+        missing_indices,
+        resolution,
+    })
+}
+
+fn bilibili_ugc_collection_reuses_existing_entries(mode: DownloadMode) -> bool {
+    matches!(mode, DownloadMode::All)
+}
+
+fn select_bilibili_ugc_collection_output_directory(
+    output_root: &RootedFs,
+    collection: &VideoCollectionMetadata,
+    input: BilibiliUgcCollectionInput,
+) -> Result<BilibiliUgcCollectionOutputDirectory> {
+    let proposed_folder = bilibili_ugc_collection_folder(collection, input);
+    let stable_suffix = bilibili_ugc_collection_folder_suffix(input);
+    let mut matches = Vec::new();
+
+    // Protected property: a previously selected collection output directory is reused only when
+    // it remains the same direct child object of the locked output root. The immutable collection
+    // suffix selects a human-renamed directory, while the re-bound device/inode identity rejects
+    // replacement before its contents are read. Directory contents are intentionally not assumed
+    // stable here; the later read-only inventory handles those independently as best effort.
+    for (name, identity) in output_root.list_root_directory()? {
+        if !identity.is_dir() {
+            continue;
+        }
+        let Some(folder) = name.to_str().filter(|folder| {
+            folder
+                .strip_suffix(&stable_suffix)
+                .is_some_and(|prefix| prefix.ends_with(' '))
+        }) else {
+            continue;
+        };
+        let path = output_root.logical_root_path().join(&name);
+        let entry = output_root.bind_entry(&path, false)?;
+        if output_root.bound_entry_identity(&entry)? != Some(identity) {
+            bail!(
+                "Bilibili UGC collection output directory changed while selecting its inventory: {}",
+                path.display()
+            );
+        }
+        matches.push((folder.to_string(), identity));
+    }
+    output_root.validate_configured_root()?;
+
+    match matches.as_slice() {
+        [] => Ok(BilibiliUgcCollectionOutputDirectory {
+            folder: proposed_folder,
+            existing_identity: None,
+        }),
+        [(folder, identity)] => Ok(BilibiliUgcCollectionOutputDirectory {
+            folder: folder.clone(),
+            existing_identity: Some(*identity),
+        }),
+        _ => bail!(
+            "multiple Bilibili UGC collection output directories match stable identifier {stable_suffix}"
+        ),
+    }
+}
+
+fn build_bilibili_ugc_collection_identity_index(
+    output_root: &RootedFs,
+    folder: &str,
+    expected_existing_identity: Option<EntryIdentity>,
+    primary_media_kind: StagedPrimaryMediaKind,
+) -> Result<VideoIdentityIndex> {
+    output_root.validate_configured_root()?;
+    let target = output_root.logical_root_path().join(folder);
+    let actual_target = output_root.entry_identity(&target)?;
+    let expected_target = match (expected_existing_identity, actual_target) {
+        (Some(expected), Some(actual)) if expected == actual => actual,
+        (Some(_), _) => {
+            bail!(
+                "Bilibili UGC collection output directory changed before inventory scan: {}",
+                target.display()
+            );
+        }
+        (None, Some(actual)) => actual,
+        (None, None) => return Ok(VideoIdentityIndex::default()),
+    };
+    if !expected_target.is_dir() {
+        bail!(
+            "Bilibili UGC collection output path is not a directory: {}",
+            target.display()
+        );
+    }
+
+    // Protected property: the incremental inventory must describe the selected collection
+    // directory object beneath the already locked final output root. The parent-root validation
+    // and no-follow entry identity checks prove its access path and object identity before and
+    // after the read-only scan. Content stability is intentionally not assumed: a concurrent
+    // sidecar change can only make this best-effort sync download an item again, never delete or
+    // overwrite an existing item.
+    let entry = output_root.bind_entry(&target, false)?;
+    let bound_target = output_root.open_bound_directory(&entry, expected_target)?;
+    let target_root = RootedFs::new(&target).with_context(|| {
+        format!(
+            "failed to bind Bilibili UGC collection directory {}",
+            target.display()
+        )
+    })?;
+    if target_root.root_identity() != expected_target {
+        bail!("Bilibili UGC collection directory changed while binding its inventory");
+    }
+    let index = build_video_identity_index_in_dir(
+        target_root.root_path(),
+        primary_media_kind,
+        IdentityIndexReadPolicy::BestEffort,
+    )?;
+    if index
+        .root
+        .as_ref()
+        .is_none_or(|index_root| index_root.root_identity() != expected_target)
+        || output_root.entry_identity(&target)? != Some(expected_target)
+    {
+        bail!("Bilibili UGC collection directory changed during inventory scan");
+    }
+    bound_target.validate_identity()?;
+    output_root.validate_configured_root()?;
+    Ok(index)
+}
+
+fn bilibili_ugc_collection_folder(
+    collection: &VideoCollectionMetadata,
+    input: BilibiliUgcCollectionInput,
+) -> String {
+    let fallback_owner = collection
+        .owner
+        .as_ref()
+        .map(|owner| owner.mid)
+        .filter(|mid| *mid != 0)
+        .or(input.fallback_owner_mid)
+        .map(|mid| format!("UP-{mid}"))
+        .unwrap_or_else(|| "UP-unknown".to_string());
+    let owner = collection
+        .owner
+        .as_ref()
+        .map(|owner| owner.name.trim())
+        .filter(|name| !name.is_empty())
+        .map_or(fallback_owner.as_str(), |name| name);
+    let suffix = bilibili_ugc_collection_folder_suffix(input);
+    let variable_budget = BILIBILI_COLLECTION_FOLDER_MAX_BYTES
+        .saturating_sub(" - ".len())
+        .saturating_sub(" ".len())
+        .saturating_sub(suffix.len());
+    let owner_budget = variable_budget
+        .saturating_sub(1)
+        .clamp(1, BILIBILI_COLLECTION_OWNER_MAX_BYTES);
+    let owner = sanitize_bilibili_collection_component(owner, "UP-unknown", owner_budget);
+    let title_budget = variable_budget.saturating_sub(owner.len()).max(1);
+    let title = sanitize_bilibili_collection_component(&collection.title, "Untitled", title_budget);
+    format!("{owner} - {title} {suffix}")
+}
+
+fn bilibili_ugc_collection_folder_suffix(input: BilibiliUgcCollectionInput) -> String {
+    format!("[{}-{}]", input.kind.label(), input.id)
+}
+
+fn bilibili_ugc_collection_output_template(folder: &str) -> Result<String> {
+    if folder.len() > BILIBILI_COLLECTION_FOLDER_MAX_BYTES
+        || folder.trim().trim_matches('.') != folder
+        || folder.chars().any(|character| {
+            matches!(
+                character,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+            ) || character.is_control()
+        })
+    {
+        bail!(
+            "Bilibili UGC collection output directory cannot be passed literally to BBDown: {folder}"
+        );
+    }
+
+    let template = folder.replace('{', "{{").replace('}', "}}");
+    if render_bilibili_output_template_literal(&template)? != folder {
+        bail!(
+            "Bilibili UGC collection output template does not preserve its selected directory: {folder}"
+        );
+    }
+    Ok(template)
+}
+
+fn render_bilibili_output_template_literal(template: &str) -> Result<String> {
+    let mut output = String::with_capacity(template.len());
+    let mut characters = template.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '{' if characters.next_if_eq(&'{').is_some() => output.push('{'),
+            '}' if characters.next_if_eq(&'}').is_some() => output.push('}'),
+            '{' | '}' => bail!("Bilibili output template contains an unescaped brace: {template}"),
+            character => output.push(character),
+        }
+    }
+    Ok(output)
+}
+
+fn sanitize_bilibili_collection_component(raw: &str, fallback: &str, max_bytes: usize) -> String {
+    let value = raw
+        .chars()
+        .map(|character| match character {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '{' | '}' => '-',
+            character if character.is_control() => '-',
+            character => character,
+        })
+        .collect::<String>();
+    let value = value.trim().trim_matches('.');
+    let value = if value.is_empty() { fallback } else { value };
+    truncate_bilibili_collection_component(value, max_bytes)
+}
+
+fn truncate_bilibili_collection_component(value: &str, max_bytes: usize) -> String {
+    let limit = max_bytes.max(1);
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let mut end = 0;
+    for (index, character) in value.char_indices() {
+        let next = index + character.len_utf8();
+        if next > limit {
+            break;
+        }
+        end = next;
+    }
+    let truncated = value[..end].trim().trim_matches(['-', '.', '_']);
+    if truncated.is_empty() {
+        "u".to_string()
+    } else {
+        truncated.to_string()
+    }
+}
+
+fn nonempty_collection_title(title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        "Untitled collection".to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+fn collection_item_bvid_counts(
+    items: &[bbdown_core::VideoCollectionItem],
+) -> BTreeMap<String, usize> {
+    let mut counts = BTreeMap::new();
+    for item in items {
+        if let Some(bvid) = item
+            .bvid
+            .as_deref()
+            .map(str::trim)
+            .filter(|bvid| !bvid.is_empty())
+        {
+            *counts.entry(bvid.to_string()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+fn collection_item_aid_counts(items: &[bbdown_core::VideoCollectionItem]) -> BTreeMap<u64, usize> {
+    let mut counts = BTreeMap::new();
+    for item in items.iter().filter(|item| item.aid != 0) {
+        *counts.entry(item.aid).or_default() += 1;
+    }
+    counts
+}
+
+fn bilibili_ugc_collection_item_is_present(
+    index: &VideoIdentityIndex,
+    item: &bbdown_core::VideoCollectionItem,
+    bvid_counts: &BTreeMap<String, usize>,
+    aid_counts: &BTreeMap<u64, usize>,
+) -> bool {
+    if item.cid != 0
+        && !index
+            .metadata_videos(&bilibili_collection_cid_identity(item.cid))
+            .is_empty()
+    {
+        return true;
+    }
+    if let Some(bvid) = item
+        .bvid
+        .as_deref()
+        .map(str::trim)
+        .filter(|bvid| !bvid.is_empty())
+        && bvid_counts.get(bvid) == Some(&1)
+        && !index
+            .metadata_videos(&VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: bvid.to_string(),
+            })
+            .is_empty()
+    {
+        return true;
+    }
+    item.aid != 0
+        && aid_counts.get(&item.aid) == Some(&1)
+        && !index
+            .metadata_videos(&VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: format!("av{}", item.aid),
+            })
+            .is_empty()
+}
+
+fn bilibili_collection_cid_identity(cid: u64) -> VideoIdentity {
+    VideoIdentity {
+        provider: VideoProvider::Bilibili,
+        id: format!("cid{cid}"),
+    }
+}
+
 async fn run_bilibili_job_locked(
     config: &AppConfig,
     root: &RootedFs,
     url: &str,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<&VideoIdentity>,
-    worker_request: Option<&BilibiliWorkerRequest>,
+    worker_context: BilibiliWorkerJobContext<'_>,
     progress: Option<JobProgressSender>,
-) -> Result<JobReport> {
+) -> Result<BilibiliJobOutcome> {
     sync_bilibili_rust_credentials(config).await?;
     let mut options = bilibili_core::download_options(config)?;
     let mux_locally = matches!(options.mode, DownloadMode::All)
@@ -1806,7 +2380,47 @@ async fn run_bilibili_job_locked(
         options = options.with_mux(bbdown_core::MuxOptions::Disabled);
     }
     let client = bilibili_core::client(config)?;
-    let (core_plan, resolved_metadata) = if config.video.write_nfo {
+    let collection_download = if matches!(selection, Some(BilibiliSelection::All))
+        && is_bilibili_ugc_collection_url(url)
+    {
+        let final_output_root = worker_context.final_output_root;
+        send_progress(
+            progress.as_ref(),
+            "BBDown-rust: resolving Bilibili UGC collection inventory".to_string(),
+        );
+        let collection =
+            prepare_bilibili_ugc_collection_download(&client, final_output_root, url, options.mode)
+                .await?;
+        if collection.missing_indices.is_empty() {
+            return Ok(BilibiliJobOutcome::AlreadyComplete(
+                collection.already_complete_report(final_output_root),
+            ));
+        }
+        options = options.with_output_template(collection.output_template.clone());
+        send_progress(progress.as_ref(), collection.progress_summary());
+        Some(collection)
+    } else {
+        None
+    };
+    let core_selection = collection_download
+        .as_ref()
+        .map(BilibiliUgcCollectionDownload::missing_selection)
+        .transpose()?
+        .or_else(|| bilibili_core::selection(selection));
+    let (core_plan, resolved_metadata) = if let Some(collection) = collection_download.as_ref() {
+        let core_plan = tokio_timeout(
+            BILIBILI_METADATA_PROBE_TIMEOUT,
+            client.plan_download_with_mode(url, core_selection.clone(), options.mode),
+        )
+        .await
+        .context("Bilibili UGC collection download plan timed out")?
+        .context("failed to plan missing Bilibili UGC collection entries")?;
+        let metadata = config
+            .video
+            .write_nfo
+            .then(|| ResolvedContent::Collection(collection.resolution.clone()));
+        (core_plan, Ok(metadata))
+    } else if config.video.write_nfo {
         let plan_probe = probe_bilibili_plan_with_mode(
             &client,
             url,
@@ -1862,15 +2476,26 @@ async fn run_bilibili_job_locked(
     send_resolved_download_summary(
         progress.as_ref(),
         "BBDown-rust: resolved media".to_string(),
-        bilibili_resolved_download_summary(&core_plan, &options),
+        nonempty_join(vec![
+            collection_download
+                .as_ref()
+                .map(BilibiliUgcCollectionDownload::progress_summary)
+                .unwrap_or_default(),
+            bilibili_resolved_download_summary(&core_plan, &options),
+        ]),
     );
-    let progress_reporter = BilibiliCoreProgress::new(progress.clone());
+    let progress_reporter = BilibiliCoreProgress::new(
+        progress.clone(),
+        collection_download
+            .as_ref()
+            .map(BilibiliCollectionProgress::from_download),
+    );
     let command_started_at = SystemTime::now();
     let core_report = client
         .download_plan_with_progress(&core_plan, options, &progress_reporter)
         .await?;
     let mut report = BilibiliDownloadReport::from(&core_report);
-    mark_bilibili_core_download_completed(root, worker_request)?;
+    mark_bilibili_core_download_completed(root, Some(worker_context.request))?;
     let output_dir = bilibili_core::output_dir(config);
     if mux_locally {
         mux_bilibili_report_media(
@@ -1885,9 +2510,7 @@ async fn run_bilibili_job_locked(
     }
     cleanup_bilibili_mux_input_files(root, &mut report)?;
     let primary_videos = bilibili_report_primary_media(&output_dir, &report);
-    let reported_output_dir = worker_request
-        .map(|request| request.logical_output_dir.as_path())
-        .unwrap_or(output_dir.as_path());
+    let reported_output_dir = worker_context.request.logical_output_dir.as_path();
     let mut details = vec![format!(
         "BBDown-rust crate: {} entr{}",
         report.entries.len(),
@@ -1897,6 +2520,9 @@ async fn run_bilibili_job_locked(
             "ies"
         }
     )];
+    if let Some(collection) = collection_download.as_ref() {
+        details.push(collection.details_summary(report.entries.len()));
+    }
     if !report.title.trim().is_empty() {
         details.push(format!("Title: {}", report.title));
     }
@@ -1926,7 +2552,7 @@ async fn run_bilibili_job_locked(
         reported_output_dir,
     );
 
-    Ok(JobReport {
+    Ok(BilibiliJobOutcome::Downloaded(JobReport {
         saved_location: if reported_primary_videos.is_empty() {
             fallback_output.display().to_string()
         } else if reported_primary_videos.len() == 1 {
@@ -1935,17 +2561,86 @@ async fn run_bilibili_job_locked(
             join_paths(&reported_primary_videos)
         },
         details: nonempty_join(details),
-    })
+    }))
 }
 
 #[derive(Clone)]
 struct BilibiliCoreProgress {
     progress: Option<JobProgressSender>,
+    collection: Option<BilibiliCollectionProgress>,
 }
 
 impl BilibiliCoreProgress {
-    fn new(progress: Option<JobProgressSender>) -> Self {
-        Self { progress }
+    fn new(
+        progress: Option<JobProgressSender>,
+        collection: Option<BilibiliCollectionProgress>,
+    ) -> Self {
+        Self {
+            progress,
+            collection,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BilibiliCollectionProgress {
+    title: String,
+    total_entries: usize,
+    skipped_entries: usize,
+    planned_entries: usize,
+    completed_entries: Arc<AtomicUsize>,
+}
+
+impl BilibiliCollectionProgress {
+    fn from_download(download: &BilibiliUgcCollectionDownload) -> Self {
+        Self {
+            title: download.title.clone(),
+            total_entries: download.total_entries,
+            skipped_entries: download.skipped_entries,
+            planned_entries: download.planned_entries(),
+            completed_entries: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn completed_entries(&self) -> usize {
+        self.completed_entries.load(Ordering::Relaxed)
+    }
+
+    fn entry_started(&self, index: u32, title: &str) -> String {
+        format!(
+            "BBDown-rust: collection entry {index}/{} started - {} ({}/{} downloaded; {} skipped)",
+            self.total_entries,
+            title,
+            self.completed_entries(),
+            self.planned_entries,
+            self.skipped_entries
+        )
+    }
+
+    fn entry_completed(&self, index: u32, title: &str, file_count: usize) -> String {
+        let completed = self.completed_entries.fetch_add(1, Ordering::Relaxed) + 1;
+        format!(
+            "BBDown-rust: collection entry {index}/{} completed - {title} ({file_count} files; {completed}/{} downloaded; {} skipped)",
+            self.total_entries, self.planned_entries, self.skipped_entries
+        )
+    }
+
+    fn plan_started(&self) -> String {
+        format!(
+            "BBDown-rust: collection {} started ({} total; {} already present; {} queued)",
+            self.title, self.total_entries, self.skipped_entries, self.planned_entries
+        )
+    }
+
+    fn plan_completed(&self) -> String {
+        format!(
+            "BBDown-rust: collection {} completed ({}/{} downloaded; {} already present; {} total)",
+            self.title,
+            self.completed_entries(),
+            self.planned_entries,
+            self.skipped_entries,
+            self.total_entries
+        )
     }
 }
 
@@ -1954,9 +2649,15 @@ impl DownloadProgressSink for BilibiliCoreProgress {
         let message = match event {
             DownloadProgressEvent::PlanStarted {
                 title, entry_count, ..
-            } => format!("BBDown-rust: planning {title} ({entry_count} entries)"),
+            } => self.collection.as_ref().map_or_else(
+                || format!("BBDown-rust: planning {title} ({entry_count} entries)"),
+                BilibiliCollectionProgress::plan_started,
+            ),
             DownloadProgressEvent::EntryStarted { index, title, .. } => {
-                format!("BBDown-rust: entry {index} started - {title}")
+                self.collection.as_ref().map_or_else(
+                    || format!("BBDown-rust: entry {index} started - {title}"),
+                    |collection| collection.entry_started(*index, title),
+                )
             }
             DownloadProgressEvent::FileStarted {
                 kind,
@@ -1991,10 +2692,16 @@ impl DownloadProgressSink for BilibiliCoreProgress {
                 title,
                 file_count,
                 ..
-            } => format!("BBDown-rust: entry {index} completed - {title} ({file_count} files)"),
+            } => self.collection.as_ref().map_or_else(
+                || format!("BBDown-rust: entry {index} completed - {title} ({file_count} files)"),
+                |collection| collection.entry_completed(*index, title, *file_count),
+            ),
             DownloadProgressEvent::PlanCompleted {
                 title, entry_count, ..
-            } => format!("BBDown-rust: completed {title} ({entry_count} entries)"),
+            } => self.collection.as_ref().map_or_else(
+                || format!("BBDown-rust: completed {title} ({entry_count} entries)"),
+                BilibiliCollectionProgress::plan_completed,
+            ),
             _ => return,
         };
         send_progress(self.progress.as_ref(), message);
@@ -4493,16 +5200,32 @@ async fn run_staged_video_job(
                 .context("failed to persist Bilibili worker lifecycle before launch")?;
             let expected_identity =
                 matches!(action, VideoDuplicateAction::Overwrite).then_some(&duplicate.identity);
-            run_staged_bilibili_worker(
+            match run_staged_bilibili_worker(
                 &staging_config,
-                &staging,
-                guard.output_lock(),
+                BilibiliWorkerRoots {
+                    final_output_root: &root,
+                    staging: &staging,
+                    output_lock: guard.output_lock(),
+                },
                 url,
                 *selection,
                 expected_identity,
                 progress.clone(),
             )
             .await
+            {
+                Ok(BilibiliWorkerOutcome::Completed(report)) => Ok(report),
+                Ok(BilibiliWorkerOutcome::AlreadyComplete(report)) => {
+                    if let Err(err) = staging.discard_incomplete() {
+                        return Err(err.context(
+                            "Bilibili collection was already complete but its empty staging directory could not be discarded",
+                        ));
+                    }
+                    guard.mark_operation_clean();
+                    return Ok(report);
+                }
+                Err(err) => Err(err),
+            }
         }
         JobRequest::Youtube { url } => {
             let metadata =
@@ -8184,7 +8907,7 @@ fn index_metadata_sidecar(
         }
     };
     for identity in identities {
-        index.insert_overwrite_evidence(identity, video);
+        index.insert_metadata_evidence(identity, video);
     }
 
     Ok(())
@@ -12917,6 +13640,275 @@ mod tests {
         .expect("Bilibili identity NFO should write");
     }
 
+    fn test_bilibili_collection_item(
+        index: u32,
+        aid: u64,
+        bvid: &str,
+        cid: u64,
+    ) -> bbdown_core::VideoCollectionItem {
+        bbdown_core::VideoCollectionItem {
+            index,
+            aid,
+            bvid: Some(bvid.to_string()),
+            cid,
+            title: format!("Entry {index}"),
+            cover_url: None,
+            description: String::new(),
+            pub_time: None,
+            owner: None,
+            duration_seconds: None,
+        }
+    }
+
+    #[test]
+    fn bilibili_ugc_collection_folder_is_safe_and_bounded() {
+        let collection = VideoCollectionMetadata {
+            id: Some(167822),
+            kind: VideoCollectionKind::Collection,
+            title: format!("{{unsafe}}/{}", "Long title ".repeat(80)),
+            description: String::new(),
+            cover_url: None,
+            pub_time: None,
+            owner: Some(bbdown_core::Owner {
+                mid: 210798,
+                name: "Owner/Name".to_string(),
+            }),
+            items: Vec::new(),
+        };
+        let folder = bilibili_ugc_collection_folder(
+            &collection,
+            BilibiliUgcCollectionInput {
+                id: 167822,
+                kind: BilibiliUgcCollectionKind::Collection,
+                fallback_owner_mid: Some(999),
+            },
+        );
+
+        assert!(folder.ends_with("[collection-167822]"));
+        assert!(folder.starts_with("Owner-Name - "));
+        assert!(!folder.contains(['{', '}', '/', '\\']));
+        assert!(folder.len() <= BILIBILI_COLLECTION_FOLDER_MAX_BYTES);
+        assert_eq!(
+            bilibili_ugc_collection_output_template(&folder)
+                .expect("generated collection folder should round-trip through BBDown"),
+            folder
+        );
+
+        let nameless_owner = VideoCollectionMetadata {
+            owner: Some(bbdown_core::Owner {
+                mid: 210798,
+                name: " ".to_string(),
+            }),
+            ..collection
+        };
+        assert!(
+            bilibili_ugc_collection_folder(
+                &nameless_owner,
+                BilibiliUgcCollectionInput {
+                    id: 167822,
+                    kind: BilibiliUgcCollectionKind::Collection,
+                    fallback_owner_mid: None,
+                },
+            )
+            .starts_with("UP-210798 - ")
+        );
+    }
+
+    #[test]
+    fn bilibili_ugc_collection_reuses_existing_entries_only_for_all_mode() {
+        assert!(bilibili_ugc_collection_reuses_existing_entries(
+            DownloadMode::All
+        ));
+        for mode in [
+            DownloadMode::VideoOnly,
+            DownloadMode::AudioOnly,
+            DownloadMode::SubtitleOnly,
+            DownloadMode::DanmakuOnly,
+            DownloadMode::CoverOnly,
+        ] {
+            assert!(
+                !bilibili_ugc_collection_reuses_existing_entries(mode),
+                "{mode:?} should not skip collection entries based on existing video media"
+            );
+        }
+    }
+
+    #[test]
+    fn bilibili_ugc_collection_reuses_directory_when_display_metadata_changes() {
+        let video_dir = temp_test_dir("bilibili-ugc-collection-folder-reuse");
+        let existing_folder = "Former {title} Owner - Former Collection [collection-167822]";
+        fs::create_dir_all(video_dir.join(existing_folder))
+            .expect("existing collection directory should create");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let collection = VideoCollectionMetadata {
+            id: Some(167822),
+            kind: VideoCollectionKind::Collection,
+            title: "Renamed Collection".to_string(),
+            description: String::new(),
+            cover_url: None,
+            pub_time: None,
+            owner: Some(bbdown_core::Owner {
+                mid: 210798,
+                name: "Renamed Owner".to_string(),
+            }),
+            items: Vec::new(),
+        };
+        let input = BilibiliUgcCollectionInput {
+            id: 167822,
+            kind: BilibiliUgcCollectionKind::Collection,
+            fallback_owner_mid: Some(210798),
+        };
+
+        let selected = select_bilibili_ugc_collection_output_directory(&root, &collection, input)
+            .expect("existing collection directory should be selected");
+        assert_eq!(selected.folder, existing_folder);
+        assert_eq!(
+            selected.existing_identity,
+            root.entry_identity(&video_dir.join(existing_folder))
+                .expect("existing directory identity should read")
+        );
+        assert_ne!(
+            selected.folder,
+            bilibili_ugc_collection_folder(&collection, input),
+            "renamed display metadata must not select a second collection directory"
+        );
+        assert_eq!(
+            bilibili_ugc_collection_output_template(&selected.folder)
+                .expect("renamed collection directory should escape as a BBDown literal"),
+            "Former {{title}} Owner - Former Collection [collection-167822]"
+        );
+
+        fs::create_dir_all(video_dir.join("Other Owner - Other Collection [collection-167822]"))
+            .expect("ambiguous collection directory should create");
+        let error = select_bilibili_ugc_collection_output_directory(&root, &collection, input)
+            .expect_err("ambiguous stable collection identifiers must be rejected");
+        assert!(
+            format!("{error:#}").contains("multiple Bilibili UGC collection output directories")
+        );
+        drop(root);
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn bilibili_ugc_collection_output_template_rejects_nonliteral_directory_names() {
+        let error =
+            bilibili_ugc_collection_output_template("Owner: Name - Collection [collection-167822]")
+                .expect_err("BBDown filename normalization must not redirect a reused directory");
+        assert!(format!("{error:#}").contains("cannot be passed literally to BBDown"));
+
+        let error = bilibili_ugc_collection_output_template(
+            &"x".repeat(BILIBILI_COLLECTION_FOLDER_MAX_BYTES + 1),
+        )
+        .expect_err("BBDown filename truncation must not redirect a reused directory");
+        assert!(format!("{error:#}").contains("cannot be passed literally to BBDown"));
+    }
+
+    #[test]
+    fn parses_direct_bilibili_ugc_collection_inputs() {
+        assert_eq!(
+            bilibili_ugc_collection_input(
+                "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+            ),
+            Some(BilibiliUgcCollectionInput {
+                id: 167822,
+                kind: BilibiliUgcCollectionKind::Collection,
+                fallback_owner_mid: Some(210798),
+            })
+        );
+        assert_eq!(
+            bilibili_ugc_collection_input(
+                "https://www.bilibili.com/list/210798?sid=167822&type=series"
+            ),
+            Some(BilibiliUgcCollectionInput {
+                id: 167822,
+                kind: BilibiliUgcCollectionKind::Series,
+                fallback_owner_mid: Some(210798),
+            })
+        );
+        assert_eq!(
+            bilibili_ugc_collection_input("https://www.bilibili.com/video/BV12TRrBcEP8"),
+            None
+        );
+    }
+
+    #[test]
+    fn bilibili_ugc_collection_inventory_requires_metadata_sidecars() {
+        let video_dir = temp_test_dir("bilibili-ugc-collection-inventory");
+        let folder = "Owner - Collection [collection-167822]";
+        let collection_dir = video_dir.join(folder);
+        let video = collection_dir.join("nested").join("Entry [cid100].mkv");
+        fs::create_dir_all(video.parent().expect("video should have a parent"))
+            .expect("collection directory should create");
+        fs::write(&video, "video").expect("collection video should write");
+        let root = RootedFs::new(&video_dir).expect("output root should bind");
+        let item = test_bilibili_collection_item(1, 10, "BV1xx411c7mD", 100);
+        let items = vec![item.clone()];
+        let bvid_counts = collection_item_bvid_counts(&items);
+        let aid_counts = collection_item_aid_counts(&items);
+
+        let index = build_bilibili_ugc_collection_identity_index(
+            &root,
+            folder,
+            None,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("collection inventory should scan");
+        assert!(
+            !index
+                .videos(&bilibili_collection_cid_identity(100))
+                .is_empty()
+        );
+        assert!(!bilibili_ugc_collection_item_is_present(
+            &index,
+            &item,
+            &bvid_counts,
+            &aid_counts,
+        ));
+
+        write_bilibili_identity_nfo(&video, "cid100");
+        let index = build_bilibili_ugc_collection_identity_index(
+            &root,
+            folder,
+            None,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("collection inventory should rescan");
+        assert!(bilibili_ugc_collection_item_is_present(
+            &index,
+            &item,
+            &bvid_counts,
+            &aid_counts,
+        ));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn bilibili_ugc_collection_progress_reports_overall_counts() {
+        let progress = BilibiliCollectionProgress {
+            title: "Collection".to_string(),
+            total_entries: 37,
+            skipped_entries: 12,
+            planned_entries: 25,
+            completed_entries: Arc::new(AtomicUsize::new(0)),
+        };
+        assert_eq!(
+            progress.plan_started(),
+            "BBDown-rust: collection Collection started (37 total; 12 already present; 25 queued)"
+        );
+        assert_eq!(
+            progress.entry_started(13, "Entry 13"),
+            "BBDown-rust: collection entry 13/37 started - Entry 13 (0/25 downloaded; 12 skipped)"
+        );
+        assert_eq!(
+            progress.entry_completed(13, "Entry 13", 4),
+            "BBDown-rust: collection entry 13/37 completed - Entry 13 (4 files; 1/25 downloaded; 12 skipped)"
+        );
+        assert_eq!(
+            progress.plan_completed(),
+            "BBDown-rust: collection Collection completed (1/25 downloaded; 12 already present; 37 total)"
+        );
+    }
+
     fn overwrite_backup_dirs(root: &Path) -> Vec<PathBuf> {
         fs::read_dir(root)
             .expect("test directory should read")
@@ -14507,6 +15499,7 @@ mod tests {
         fs::write(&staged_video, "completed-video").expect("completed video should write");
         let request = build_bilibili_worker_request(
             &config,
+            &final_dir,
             "https://www.bilibili.com/video/BV123",
             None,
             None,
@@ -18368,6 +19361,7 @@ mod tests {
 
         let request = build_bilibili_worker_request(
             &config,
+            &video_dir,
             "https://www.bilibili.com/video/BV123",
             Some(BilibiliSelection::Latest),
             Some(&expected_identity),
@@ -18383,6 +19377,7 @@ mod tests {
         assert!(request.config.telegram.allowed_chat_ids.is_empty());
         assert!(request.config.telegram.allow_all_chats);
         assert_eq!(request.config.downloads.video_dir, Path::new("."));
+        assert_eq!(request.final_video_dir, video_dir);
         assert_eq!(request.expected_overwrite_identity, Some(expected_identity));
         assert_eq!(request.logical_output_dir, logical_output_dir);
         assert_eq!(request.output_root_device, root.root_identity().device());
@@ -18498,6 +19493,7 @@ mod tests {
         };
         let request = build_bilibili_worker_request(
             &config,
+            &video_dir,
             "https://www.bilibili.com/video/BV123",
             Some(BilibiliSelection::Latest),
             Some(&expected_identity),
@@ -18543,6 +19539,7 @@ mod tests {
             .expect("worker lifecycle should persist before marker failure");
         let request = build_bilibili_worker_request(
             &config,
+            &video_dir,
             "https://www.bilibili.com/video/BV123",
             None,
             None,
@@ -18609,6 +19606,7 @@ mod tests {
             .expect("worker launch lifecycle should persist");
         let request = build_bilibili_worker_request(
             &config,
+            &video_dir,
             "https://www.bilibili.com/video/BV123",
             None,
             None,
@@ -18684,9 +19682,28 @@ mod tests {
             },
         };
         let encoded = serde_json::to_string(&completed).expect("response should encode");
-        let report = parse_bilibili_worker_response(&encoded)
+        let outcome = parse_bilibili_worker_response(&encoded)
             .expect("completed worker response should parse");
-        assert_eq!(report.saved_location, "Episode.mp4");
+        assert!(matches!(
+            outcome,
+            BilibiliWorkerOutcome::Completed(JobReport { saved_location, .. })
+                if saved_location == "Episode.mp4"
+        ));
+
+        let already_complete = BilibiliWorkerResponse::AlreadyComplete {
+            report: JobReport {
+                saved_location: "Collection".to_string(),
+                details: "already complete".to_string(),
+            },
+        };
+        let encoded = serde_json::to_string(&already_complete)
+            .expect("already-complete response should encode");
+        assert!(matches!(
+            parse_bilibili_worker_response(&encoded)
+                .expect("already-complete response should parse"),
+            BilibiliWorkerOutcome::AlreadyComplete(JobReport { saved_location, .. })
+                if saved_location == "Collection"
+        ));
 
         let encoded = serde_json::to_string(&BilibiliWorkerResponse::CoreCompletedMarkerFailed)
             .expect("marker failure response should encode");
@@ -18743,6 +19760,7 @@ mod tests {
             .expect("worker launch lifecycle should persist before core completion");
         let request = build_bilibili_worker_request(
             &config,
+            &video_dir,
             "https://www.bilibili.com/video/BV123",
             None,
             None,
