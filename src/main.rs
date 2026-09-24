@@ -30,6 +30,7 @@ use crate::downloader::{
     JobProgress, JobProgressReceiver, VideoDuplicate, VideoDuplicateAction,
     find_video_duplicate_with_probe, job_progress_channel, recover_pending_overwrite_transactions,
     run_bilibili_worker, run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
+    sync_bilibili_rust_credentials,
 };
 use crate::redaction::redact_sensitive_text;
 use crate::router::{
@@ -1671,6 +1672,7 @@ async fn bilibili_ugc_selection_prompt(
         return Ok(None);
     }
 
+    sync_bilibili_rust_credentials(config).await?;
     bilibili_ugc_membership_prompt(
         bilibili_core::resolve_video_collection_membership(config, url).await,
     )
@@ -3620,6 +3622,89 @@ mod tests {
             bilibili_membership_probe_failure_message(),
             "Could not verify whether this Bilibili video belongs to a collection. No download was started; please retry the link."
         );
+    }
+
+    #[tokio::test]
+    async fn membership_probe_migrates_legacy_cookie_before_request() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let directory = std::env::temp_dir().join(format!(
+            "telegram-video-downloader-membership-legacy-cookie-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        let state_path = directory.join("legacy-state.json");
+        let credential_file = directory.join("credentials.json");
+        bilibili_auth::save_auth_state(
+            &state_path,
+            &bilibili_auth::AuthState {
+                cookie: "SESSDATA=membership-test".to_string(),
+                mid: 210_798,
+                uname: "Satori".to_string(),
+                stored_at_unix: 1_717_171_717,
+            },
+        )?;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("test client should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("test request should be readable");
+                assert_ne!(read, 0, "test request must include HTTP headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let body = r#"{"code":0,"data":{"aid":170001,"bvid":"BV1cookie","title":"Cookie test","owner":{"mid":210798,"name":"Satori"},"pages":[{"page":1,"cid":9988,"part":"P1"}],"ugc_season":{"id":167822,"title":"Piano collection","cover":"https://example.invalid/season.jpg","mid":210798,"intro":"Test collection","ep_count":37,"season_type":1}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("test response should be writable");
+            String::from_utf8(request).expect("test request should be UTF-8")
+        });
+
+        let mut config = AppConfig::for_test();
+        config.bilibili.auth.state_path = state_path;
+        config.bilibili.auth.credential_file = credential_file.clone();
+        config.bilibili.global_args = vec![format!("--api-base=http://{address}")];
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV1cookie".to_string(),
+            selection: None,
+        };
+
+        let prompt = bilibili_ugc_selection_prompt(&config, &job)
+            .await?
+            .expect("legacy cookie should resolve collection membership");
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("test client should finish")
+            .expect("test server should not panic");
+
+        assert!(matches!(
+            prompt,
+            BilibiliSelectionPrompt::UgcMembership(reference) if reference.id == 167_822
+        ));
+        assert!(credential_file.exists());
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("cookie: sessdata=membership-test")
+        );
+        let _ = fs::remove_dir_all(directory);
+        Ok(())
     }
 
     #[test]

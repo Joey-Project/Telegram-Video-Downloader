@@ -5493,7 +5493,7 @@ fn fallback_video_identity(job: &JobRequest) -> Option<VideoIdentity> {
     })
 }
 
-async fn sync_bilibili_rust_credentials(config: &AppConfig) -> Result<()> {
+pub(crate) async fn sync_bilibili_rust_credentials(config: &AppConfig) -> Result<()> {
     let state_path = config.bilibili.auth.state_path.clone();
     let credential_file = config.bilibili.auth.credential_file.clone();
     let credential_profile = config.bilibili.auth.credential_profile.clone();
