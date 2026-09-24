@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex, MutexGuard, watch};
+use tokio::sync::{Mutex, MutexGuard, Semaphore, watch};
 use tokio::time::{Instant, sleep, sleep_until, timeout as tokio_timeout};
 use tracing::info;
 
@@ -38,6 +39,9 @@ use crate::safe_fs::{
 };
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+// Credential migration can block on the cross-process auth lock. Keep callers waiting
+// asynchronously so inbound Bilibili links cannot consume Tokio blocking workers.
+static BILIBILI_CREDENTIAL_SYNC_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
 #[cfg(unix)]
 static BILIBILI_WORKER_PROCESS: AtomicBool = AtomicBool::new(false);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -5493,20 +5497,38 @@ fn fallback_video_identity(job: &JobRequest) -> Option<VideoIdentity> {
     })
 }
 
-async fn sync_bilibili_rust_credentials(config: &AppConfig) -> Result<()> {
+pub(crate) async fn sync_bilibili_rust_credentials(config: &AppConfig) -> Result<()> {
     let state_path = config.bilibili.auth.state_path.clone();
     let credential_file = config.bilibili.auth.credential_file.clone();
     let credential_profile = config.bilibili.auth.credential_profile.clone();
-    tokio::task::spawn_blocking(move || {
-        bilibili_auth::sync_bbdown_rust_credentials_from_state(
-            &state_path,
-            &credential_file,
-            credential_profile.as_deref(),
-        )
+    run_with_bilibili_credential_sync_limit(bilibili_credential_sync_semaphore(), async move {
+        tokio::task::spawn_blocking(move || {
+            bilibili_auth::sync_bbdown_rust_credentials_from_state(
+                &state_path,
+                &credential_file,
+                credential_profile.as_deref(),
+            )
+        })
+        .await
+        .context("BBDown credential migration task failed")??;
+        Ok(())
     })
     .await
-    .context("BBDown credential migration task failed")??;
-    Ok(())
+}
+
+fn bilibili_credential_sync_semaphore() -> &'static Semaphore {
+    BILIBILI_CREDENTIAL_SYNC_SEMAPHORE.get_or_init(|| Semaphore::new(1))
+}
+
+async fn run_with_bilibili_credential_sync_limit<T>(
+    semaphore: &Semaphore,
+    operation: impl Future<Output = T>,
+) -> T {
+    let _permit = semaphore
+        .acquire()
+        .await
+        .expect("Bilibili credential sync semaphore should remain open");
+    operation.await
 }
 
 pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
@@ -13624,6 +13646,48 @@ mod tests {
         config.bilibili.auth.state_path =
             temp_test_dir("telegram-video-downloader-test-auth-missing").join("auth.json");
         config
+    }
+
+    #[tokio::test]
+    async fn bilibili_credential_sync_limit_queues_waiters_before_starting_work() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let first_permit = semaphore
+            .acquire()
+            .await
+            .expect("test semaphore should remain open");
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let waiting_semaphore = Arc::clone(&semaphore);
+        let waiting_task = tokio::spawn(async move {
+            run_with_bilibili_credential_sync_limit(&waiting_semaphore, async move {
+                started_tx
+                    .send(())
+                    .await
+                    .expect("test receiver should remain open");
+                release_rx.await.expect("test sender should remain open");
+            })
+            .await;
+        });
+
+        assert!(
+            tokio_timeout(Duration::from_millis(50), started_rx.recv())
+                .await
+                .is_err(),
+            "waiting credential sync must not start before a permit is available"
+        );
+
+        drop(first_permit);
+        tokio_timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("waiting credential sync should start after the permit is released")
+            .expect("waiting credential sync should signal its start");
+        release_tx
+            .send(())
+            .expect("waiting credential sync should still await release");
+        tokio_timeout(Duration::from_secs(1), waiting_task)
+            .await
+            .expect("waiting credential sync task should finish")
+            .expect("waiting credential sync task should not panic");
     }
 
     fn test_home() -> PathBuf {

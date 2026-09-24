@@ -170,7 +170,7 @@ pub async fn resolve_video_collection_membership(
     let Some(bvid) = bilibili_bvid_from_url(raw_url) else {
         return Ok(None);
     };
-    let client = anonymous_client(config)?;
+    let client = client(config)?;
     client
         .resolve_video_collection_membership(&bvid)
         .await
@@ -991,6 +991,86 @@ mod tests {
             Some("SESSDATA=selected")
         );
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn collection_membership_uses_saved_cookie() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let directory = std::env::temp_dir().join(format!(
+            "telegram-video-downloader-membership-cookie-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory)?;
+        let credential_file = directory.join("credentials.json");
+        let store = CredentialStore::new(credential_file.clone());
+        let mut profiles = bbdown_core::CredentialProfiles::default();
+        profiles.set_profile(
+            "default",
+            Credentials::default().with_cookie("SESSDATA=membership-test"),
+        )?;
+        profiles.set_default_profile("default")?;
+        store.save_profiles(&profiles)?;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("test client should connect");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut buffer)
+                    .await
+                    .expect("test request should be readable");
+                assert_ne!(read, 0, "test request must include HTTP headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let body = r#"{"code":0,"data":{"aid":170001,"bvid":"BV1cookie","title":"Cookie test","owner":{"mid":210798,"name":"Satori"},"pages":[{"page":1,"cid":9988,"part":"P1"}],"ugc_season":{"id":167822,"title":"Piano collection","cover":"https://example.invalid/season.jpg","mid":210798,"intro":"Test collection","ep_count":37,"season_type":1}}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("test response should be writable");
+            String::from_utf8(request).expect("test request should be UTF-8")
+        });
+
+        let mut config = crate::config::AppConfig::for_test();
+        config.bilibili.auth.credential_file = credential_file;
+        config.bilibili.global_args = vec![format!("--api-base=http://{address}")];
+
+        let membership = resolve_video_collection_membership(
+            &config,
+            "https://www.bilibili.com/video/BV1cookie",
+        )
+        .await?
+        .expect("test response should describe a collection");
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("test client should finish")
+            .expect("test server should not panic");
+
+        assert_eq!(membership.id, 167_822);
+        assert!(request.contains("GET /x/web-interface/view?bvid=BV1cookie HTTP/1.1"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("cookie: sessdata=membership-test")
+        );
+        let _ = std::fs::remove_dir_all(directory);
+        Ok(())
     }
 
     #[cfg(unix)]
