@@ -1631,9 +1631,26 @@ async fn queue_or_prompt_normalized_job(
         return;
     }
 
-    if let Some(prompt) = bilibili_ugc_selection_prompt(config.as_ref(), &job).await {
-        prompt_bilibili_selection(telegram, chat_id, job_id, job, prompt).await;
-        return;
+    match bilibili_ugc_selection_prompt(config.as_ref(), &job).await {
+        Ok(Some(prompt)) => {
+            prompt_bilibili_selection(telegram, chat_id, job_id, job, prompt).await;
+            return;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            warn!(
+                job = %job.label(),
+                error = %redact_sensitive_text(&format!("{err:#}")),
+                "Bilibili UGC collection membership probe failed; refusing to start an ambiguous download"
+            );
+            send_or_log(
+                &telegram,
+                chat_id,
+                bilibili_membership_probe_failure_message().to_string(),
+            )
+            .await;
+            return;
+        }
     }
 
     process_job_after_duplicate_check(telegram, config, job_dispatch, chat_id, job_id, job).await;
@@ -1642,30 +1659,31 @@ async fn queue_or_prompt_normalized_job(
 async fn bilibili_ugc_selection_prompt(
     config: &AppConfig,
     job: &JobRequest,
-) -> Option<BilibiliSelectionPrompt> {
+) -> Result<Option<BilibiliSelectionPrompt>> {
     let JobRequest::Bilibili { url, selection } = job else {
-        return None;
+        return Ok(None);
     };
 
     if selection.is_none() && is_bilibili_ugc_collection_url(url) {
-        return Some(BilibiliSelectionPrompt::UgcCollection);
+        return Ok(Some(BilibiliSelectionPrompt::UgcCollection));
     }
     if !matches!(selection, None | Some(BilibiliSelection::Page(_))) {
-        return None;
+        return Ok(None);
     }
 
-    match bilibili_core::resolve_video_collection_membership(config, url).await {
-        Ok(Some(reference)) => Some(BilibiliSelectionPrompt::UgcMembership(reference)),
-        Ok(None) => None,
-        Err(err) => {
-            warn!(
-                url = %url,
-                error = %redact_sensitive_text(&format!("{err:#}")),
-                "Bilibili UGC collection membership probe failed; preserving single-video behavior"
-            );
-            None
-        }
-    }
+    bilibili_ugc_membership_prompt(
+        bilibili_core::resolve_video_collection_membership(config, url).await,
+    )
+}
+
+fn bilibili_ugc_membership_prompt(
+    membership: Result<Option<UgcCollectionReference>>,
+) -> Result<Option<BilibiliSelectionPrompt>> {
+    membership.map(|reference| reference.map(BilibiliSelectionPrompt::UgcMembership))
+}
+
+fn bilibili_membership_probe_failure_message() -> &'static str {
+    "Could not verify whether this Bilibili video belongs to a collection. No download was started; please retry the link."
 }
 
 async fn normalize_bilibili_short_link_job(config: &AppConfig, job: JobRequest) -> JobRequest {
@@ -3587,6 +3605,20 @@ mod tests {
         assert_eq!(
             direct_data,
             vec!["bsel:000000000000002a:all", "bsel:000000000000002a:cancel"]
+        );
+    }
+
+    #[test]
+    fn membership_probe_error_does_not_fall_back_to_a_single_video() {
+        let error = bilibili_ugc_membership_prompt(Err(anyhow!(
+            "HTTP status client error (412 Precondition Failed)"
+        )))
+        .expect_err("a failed membership probe must block automatic download");
+
+        assert!(format!("{error:#}").contains("412 Precondition Failed"));
+        assert_eq!(
+            bilibili_membership_probe_failure_message(),
+            "Could not verify whether this Bilibili video belongs to a collection. No download was started; please retry the link."
         );
     }
 
