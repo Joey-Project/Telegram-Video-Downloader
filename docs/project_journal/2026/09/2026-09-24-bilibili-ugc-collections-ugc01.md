@@ -23,6 +23,7 @@ superseded_by:
 - Normal BV membership now presents `Current video`, `Entire collection`, and `Cancel`. Direct UGC collection and series URLs present `Entire collection` and `Cancel`.
 - Confirmed collection jobs resolve all entries, recursively inventory NFO/info sidecar identities in the target collection directory, and download only missing items through the existing staging and atomic-publication flow when the Bilibili mode is `All`. Non-complete media modes download every selected collection item so existing videos cannot suppress requested audio or auxiliary artifacts.
 - Collection output is named `<UP主> - <合集名> [collection-<id>]` or `[series-<id>]`; unsafe or oversized components are normalized, and an unavailable owner name falls back to `UP-<mid>`. On later syncs, an existing directory is located by its immutable kind/id suffix, so title or owner-name edits do not create a duplicate collection directory.
+- Collection directory names use BBDown's 80-byte rendered-component limit. A reused human-renamed directory is escaped as a literal BBDown output template before download planning; a name that BBDown would normalize, truncate, or otherwise map to another component is rejected before inventory, preventing a scan of one directory followed by publication into another.
 - The live progress message reports collection total, current item, already-present items, and completed downloads. Single-video, YouTube, and PDF behavior remains unchanged.
 
 ## Plan

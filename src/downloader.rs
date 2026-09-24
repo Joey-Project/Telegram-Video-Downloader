@@ -1859,7 +1859,9 @@ pub async fn run_bilibili_worker() -> Result<()> {
     bail!("Bilibili worker requires a Unix platform")
 }
 
-const BILIBILI_COLLECTION_FOLDER_MAX_BYTES: usize = 180;
+// BBDown-rust renders output templates as an 80-byte filename component.
+const BILIBILI_COLLECTION_FOLDER_MAX_BYTES: usize = 80;
+const BILIBILI_COLLECTION_OWNER_MAX_BYTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BilibiliUgcCollectionKind {
@@ -1900,6 +1902,7 @@ struct BilibiliUgcCollectionOutputDirectory {
 #[derive(Debug, Clone)]
 struct BilibiliUgcCollectionDownload {
     folder: String,
+    output_template: String,
     title: String,
     total_entries: usize,
     skipped_entries: usize,
@@ -2013,6 +2016,7 @@ async fn prepare_bilibili_ugc_collection_download(
         &resolution.collection,
         input,
     )?;
+    let output_template = bilibili_ugc_collection_output_template(&output_directory.folder)?;
     let index = if bilibili_ugc_collection_reuses_existing_entries(mode) {
         build_bilibili_ugc_collection_identity_index(
             final_output_root,
@@ -2044,6 +2048,7 @@ async fn prepare_bilibili_ugc_collection_download(
     let title = nonempty_collection_title(&resolution.collection.title);
     Ok(BilibiliUgcCollectionDownload {
         folder: output_directory.folder,
+        output_template,
         title,
         total_entries,
         skipped_entries: total_entries.saturating_sub(missing_indices.len()),
@@ -2188,20 +2193,60 @@ fn bilibili_ugc_collection_folder(
         .map(|owner| owner.name.trim())
         .filter(|name| !name.is_empty())
         .map_or(fallback_owner.as_str(), |name| name);
-    let owner = sanitize_bilibili_collection_component(owner, "UP-unknown", 64);
     let suffix = bilibili_ugc_collection_folder_suffix(input);
-    let title_budget = BILIBILI_COLLECTION_FOLDER_MAX_BYTES
-        .saturating_sub(owner.len())
+    let variable_budget = BILIBILI_COLLECTION_FOLDER_MAX_BYTES
         .saturating_sub(" - ".len())
-        .saturating_sub(suffix.len())
+        .saturating_sub(" ".len())
+        .saturating_sub(suffix.len());
+    let owner_budget = variable_budget
         .saturating_sub(1)
-        .max(1);
+        .clamp(1, BILIBILI_COLLECTION_OWNER_MAX_BYTES);
+    let owner = sanitize_bilibili_collection_component(owner, "UP-unknown", owner_budget);
+    let title_budget = variable_budget.saturating_sub(owner.len()).max(1);
     let title = sanitize_bilibili_collection_component(&collection.title, "Untitled", title_budget);
     format!("{owner} - {title} {suffix}")
 }
 
 fn bilibili_ugc_collection_folder_suffix(input: BilibiliUgcCollectionInput) -> String {
     format!("[{}-{}]", input.kind.label(), input.id)
+}
+
+fn bilibili_ugc_collection_output_template(folder: &str) -> Result<String> {
+    if folder.len() > BILIBILI_COLLECTION_FOLDER_MAX_BYTES
+        || folder.trim().trim_matches('.') != folder
+        || folder.chars().any(|character| {
+            matches!(
+                character,
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+            ) || character.is_control()
+        })
+    {
+        bail!(
+            "Bilibili UGC collection output directory cannot be passed literally to BBDown: {folder}"
+        );
+    }
+
+    let template = folder.replace('{', "{{").replace('}', "}}");
+    if render_bilibili_output_template_literal(&template)? != folder {
+        bail!(
+            "Bilibili UGC collection output template does not preserve its selected directory: {folder}"
+        );
+    }
+    Ok(template)
+}
+
+fn render_bilibili_output_template_literal(template: &str) -> Result<String> {
+    let mut output = String::with_capacity(template.len());
+    let mut characters = template.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '{' if characters.next_if_eq(&'{').is_some() => output.push('{'),
+            '}' if characters.next_if_eq(&'}').is_some() => output.push('}'),
+            '{' | '}' => bail!("Bilibili output template contains an unescaped brace: {template}"),
+            character => output.push(character),
+        }
+    }
+    Ok(output)
 }
 
 fn sanitize_bilibili_collection_component(raw: &str, fallback: &str, max_bytes: usize) -> String {
@@ -2351,7 +2396,7 @@ async fn run_bilibili_job_locked(
                 collection.already_complete_report(final_output_root),
             ));
         }
-        options = options.with_output_template(collection.folder.clone());
+        options = options.with_output_template(collection.output_template.clone());
         send_progress(progress.as_ref(), collection.progress_summary());
         Some(collection)
     } else {
@@ -13643,6 +13688,11 @@ mod tests {
         assert!(folder.starts_with("Owner-Name - "));
         assert!(!folder.contains(['{', '}', '/', '\\']));
         assert!(folder.len() <= BILIBILI_COLLECTION_FOLDER_MAX_BYTES);
+        assert_eq!(
+            bilibili_ugc_collection_output_template(&folder)
+                .expect("generated collection folder should round-trip through BBDown"),
+            folder
+        );
 
         let nameless_owner = VideoCollectionMetadata {
             owner: Some(bbdown_core::Owner {
@@ -13686,7 +13736,7 @@ mod tests {
     #[test]
     fn bilibili_ugc_collection_reuses_directory_when_display_metadata_changes() {
         let video_dir = temp_test_dir("bilibili-ugc-collection-folder-reuse");
-        let existing_folder = "Former Owner - Former Collection [collection-167822]";
+        let existing_folder = "Former {title} Owner - Former Collection [collection-167822]";
         fs::create_dir_all(video_dir.join(existing_folder))
             .expect("existing collection directory should create");
         let root = RootedFs::new(&video_dir).expect("output root should bind");
@@ -13722,6 +13772,11 @@ mod tests {
             bilibili_ugc_collection_folder(&collection, input),
             "renamed display metadata must not select a second collection directory"
         );
+        assert_eq!(
+            bilibili_ugc_collection_output_template(&selected.folder)
+                .expect("renamed collection directory should escape as a BBDown literal"),
+            "Former {{title}} Owner - Former Collection [collection-167822]"
+        );
 
         fs::create_dir_all(video_dir.join("Other Owner - Other Collection [collection-167822]"))
             .expect("ambiguous collection directory should create");
@@ -13732,6 +13787,20 @@ mod tests {
         );
         drop(root);
         let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn bilibili_ugc_collection_output_template_rejects_nonliteral_directory_names() {
+        let error =
+            bilibili_ugc_collection_output_template("Owner: Name - Collection [collection-167822]")
+                .expect_err("BBDown filename normalization must not redirect a reused directory");
+        assert!(format!("{error:#}").contains("cannot be passed literally to BBDown"));
+
+        let error = bilibili_ugc_collection_output_template(
+            &"x".repeat(BILIBILI_COLLECTION_FOLDER_MAX_BYTES + 1),
+        )
+        .expect_err("BBDown filename truncation must not redirect a reused directory");
+        assert!(format!("{error:#}").contains("cannot be passed literally to BBDown"));
     }
 
     #[test]
