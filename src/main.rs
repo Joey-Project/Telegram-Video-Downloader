@@ -29,10 +29,10 @@ use crate::config::AppConfig;
 use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
     BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
-    JobProgressLifecycleEvent, JobProgressReceiver, VideoDuplicate, VideoDuplicateAction,
-    find_video_duplicate_with_probe, job_progress_channel, recover_pending_overwrite_transactions,
-    run_bilibili_worker, run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
-    sync_bilibili_rust_credentials,
+    JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, VideoDuplicate,
+    VideoDuplicateAction, find_video_duplicate_with_probe, job_progress_channel,
+    recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
+    run_job_with_duplicate_action, run_video_job_staged_keep_both, sync_bilibili_rust_credentials,
 };
 use crate::redaction::redact_sensitive_text;
 use crate::router::{
@@ -2798,6 +2798,7 @@ async fn run_queued_job(
         progress_rx,
         Duration::from_secs(config.bot.progress_update_seconds),
     ));
+    let completion_progress = progress_tx.clone();
     let result = match run_mode {
         JobRunMode::Duplicate(duplicate_run) => {
             run_job_with_duplicate_action(
@@ -2814,6 +2815,10 @@ async fn run_queued_job(
         }
         JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
     };
+    if result.is_err() {
+        send_collection_failure_lifecycle(&completion_progress);
+    }
+    drop(completion_progress);
     let _ = progress_task.await;
     drop(permit);
 
@@ -2842,6 +2847,12 @@ async fn run_queued_job(
         edit_or_send(&telegram, chat_id, message_id, message).await;
     } else {
         send_or_log(&telegram, chat_id, message).await;
+    }
+}
+
+fn send_collection_failure_lifecycle(progress: &JobProgressSender) {
+    if let Some(snapshot) = progress.collection_snapshot() {
+        progress.send_lifecycle(JobProgressLifecycleEvent::Failed { snapshot });
     }
 }
 
@@ -3060,6 +3071,37 @@ async fn deliver_collection_lifecycle(
                 &snapshot,
                 None,
                 Some("BBDown-rust: collection entries downloaded"),
+            )
+            .await;
+        }
+        JobProgressLifecycleEvent::Failed { snapshot } => {
+            if let Some(entry_delivery) = delivery.current_entry.take() {
+                let entry_text = snapshot.current_entry.as_ref().map_or_else(
+                    || {
+                        collection_entry_transition_message(
+                            job_id,
+                            job_label,
+                            &snapshot,
+                            "The job failed before this collection entry was finalized. See the final job status for details.",
+                        )
+                    },
+                    |entry| collection_entry_failed_message(job_id, job_label, &snapshot, entry),
+                );
+                deliver_collection_terminal_message(
+                    telegram,
+                    chat_id,
+                    job_id,
+                    entry_delivery,
+                    entry_text,
+                )
+                .await;
+            }
+            status_delivery = deliver_collection_overview(
+                context,
+                status_delivery,
+                &snapshot,
+                None,
+                Some("Collection download failed; see final job status for details."),
             )
             .await;
         }
@@ -3301,6 +3343,29 @@ fn collection_entry_completed_message(
         job_id,
         job_label,
         "Downloaded collection entry",
+        Some(&lines.join("\n")),
+    )
+}
+
+fn collection_entry_failed_message(
+    job_id: u64,
+    job_label: &str,
+    snapshot: &BilibiliCollectionProgressSnapshot,
+    entry: &BilibiliCollectionEntryProgress,
+) -> String {
+    let mut lines = collection_entry_header(snapshot, entry);
+    lines.push(format!(
+        "Collection progress: {}/{} downloaded; {} already present",
+        snapshot.completed_entries, snapshot.planned_entries, snapshot.skipped_entries
+    ));
+    lines.push(
+        "Download failed before this entry completed. See the final job status for details."
+            .to_string(),
+    );
+    job_status_message(
+        job_id,
+        job_label,
+        "Failed collection entry",
         Some(&lines.join("\n")),
     )
 }
@@ -4188,6 +4253,68 @@ mod tests {
         assert!(rendered.contains("Video: 1080P 1920x1080 60fps H.264"));
         assert!(rendered.contains("Audio: Japanese AAC 128 kbps"));
         assert!(!rendered.contains("+5 more"));
+    }
+
+    #[test]
+    fn collection_failed_message_finalizes_the_active_entry() {
+        let manifest = test_collection_manifest(2);
+        let entry = BilibiliCollectionEntryProgress {
+            index: 1,
+            title: "Entry 1".to_string(),
+            duration_seconds: Some(60),
+            video: Some("1080P 1920x1080 60fps H.264".to_string()),
+            audio: Some("Japanese AAC 128 kbps".to_string()),
+            estimated_media: "240.0 MiB".to_string(),
+        };
+        let snapshot = BilibiliCollectionProgressSnapshot {
+            title: manifest.title.clone(),
+            total_entries: manifest.total_entries,
+            skipped_entries: manifest.skipped_entries,
+            planned_entries: manifest.planned_entries,
+            completed_entries: 0,
+            current_entry: Some(entry.clone()),
+        };
+
+        let rendered = collection_entry_failed_message(17, "Bilibili download", &snapshot, &entry);
+
+        assert!(rendered.starts_with("Failed collection entry job #17: Bilibili download"));
+        assert!(rendered.contains("Entry: 1/2"));
+        assert!(rendered.contains("Download failed before this entry completed"));
+    }
+
+    #[tokio::test]
+    async fn collection_failure_lifecycle_uses_the_latest_snapshot() {
+        let manifest = test_collection_manifest(2);
+        let entry = BilibiliCollectionEntryProgress {
+            index: 1,
+            title: "Entry 1".to_string(),
+            duration_seconds: Some(60),
+            video: None,
+            audio: None,
+            estimated_media: "unknown".to_string(),
+        };
+        let snapshot = BilibiliCollectionProgressSnapshot {
+            title: manifest.title,
+            total_entries: manifest.total_entries,
+            skipped_entries: manifest.skipped_entries,
+            planned_entries: manifest.planned_entries,
+            completed_entries: 0,
+            current_entry: Some(entry),
+        };
+        let (progress, receiver) = job_progress_channel();
+        progress.send_replace(Some(JobProgress {
+            message: "BBDown-rust: downloading video".to_string(),
+            resolved_summary: None,
+            collection: Some(snapshot.clone()),
+        }));
+
+        send_collection_failure_lifecycle(&progress);
+        let (_, mut lifecycle) = receiver.into_parts();
+
+        assert_eq!(
+            lifecycle.recv().await,
+            Some(JobProgressLifecycleEvent::Failed { snapshot })
+        );
     }
 
     #[test]

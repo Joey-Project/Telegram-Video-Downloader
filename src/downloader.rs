@@ -320,6 +320,9 @@ pub enum JobProgressLifecycleEvent {
     Completed {
         snapshot: BilibiliCollectionProgressSnapshot,
     },
+    Failed {
+        snapshot: BilibiliCollectionProgressSnapshot,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -348,6 +351,13 @@ impl JobProgressSender {
 
     pub fn borrow(&self) -> watch::Ref<'_, Option<JobProgress>> {
         self.latest.borrow()
+    }
+
+    pub fn collection_snapshot(&self) -> Option<BilibiliCollectionProgressSnapshot> {
+        self.latest
+            .borrow()
+            .as_ref()
+            .and_then(|progress| progress.collection.clone())
     }
 
     pub fn send_lifecycle(&self, event: JobProgressLifecycleEvent) {
@@ -7380,7 +7390,8 @@ fn bilibili_collection_snapshot_from_event(
         JobProgressLifecycleEvent::Resolved { snapshot, .. }
         | JobProgressLifecycleEvent::EntryStarted { snapshot, .. }
         | JobProgressLifecycleEvent::EntryCompleted { snapshot, .. }
-        | JobProgressLifecycleEvent::Completed { snapshot } => snapshot.clone(),
+        | JobProgressLifecycleEvent::Completed { snapshot }
+        | JobProgressLifecycleEvent::Failed { snapshot } => snapshot.clone(),
     }
 }
 

@@ -21,6 +21,7 @@ superseded_by:
 - BBDown-rust worker 到父进程的进度通道新增可靠生命周期事件，避免 watch 状态被连续的 `EntryCompleted` / `EntryStarted` 覆盖。
 - Telegram 清单页支持 Previous / Next 内联按钮；状态仅保存在内存中，进程重启后分页按钮会自然过期。
 - 条目完成表示媒体流下载完成；合集层面的本地 mux、sidecar 整理和发布仍由最终作业状态确认。
+- 复核补丁确保作业在某条条目完成前失败时，前台会将该条 live message 固定为失败，再由总览和最终作业消息分别说明集合状态与错误摘要。
 - Rust 与 Python 本地验证均已通过；持久队列/恢复没有混入本次 UX 改动。
 
 ## Next Steps
