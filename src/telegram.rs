@@ -10,6 +10,7 @@ use crate::redaction::redact_sensitive_text;
 
 #[derive(Debug, Clone)]
 pub struct TelegramClient {
+    api_base_url: String,
     client: Client,
     token: String,
 }
@@ -106,7 +107,17 @@ struct AnswerCallbackQueryRequest {
 
 impl TelegramClient {
     pub fn new(token: String) -> Self {
+        Self::with_api_base_url(token, "https://api.telegram.org".to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_api_base_url(token: String, api_base_url: String) -> Self {
+        Self::with_api_base_url(token, api_base_url)
+    }
+
+    fn with_api_base_url(token: String, api_base_url: String) -> Self {
         Self {
+            api_base_url: api_base_url.trim_end_matches('/').to_string(),
             client: Client::new(),
             token,
         }
@@ -224,6 +235,17 @@ impl TelegramClient {
         text: String,
     ) -> Result<()> {
         self.edit_message_text_payload(chat_id, message_id, text, None)
+            .await
+    }
+
+    pub async fn edit_message_text_with_inline_keyboard(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: String,
+        reply_markup: InlineKeyboardMarkup,
+    ) -> Result<()> {
+        self.edit_message_text_payload(chat_id, message_id, text, Some(reply_markup))
             .await
     }
 
@@ -377,7 +399,7 @@ impl TelegramClient {
     }
 
     fn api_url(&self, method: &str) -> String {
-        format!("https://api.telegram.org/bot{}/{method}", self.token)
+        format!("{}/bot{}/{method}", self.api_base_url, self.token)
     }
 }
 
