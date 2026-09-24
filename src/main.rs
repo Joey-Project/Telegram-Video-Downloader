@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bbdown_core::{
     AccessKeyLoginTicket, CredentialHealthReport, CredentialHealthScope, CredentialHealthStatus,
-    CredentialKind, CredentialSource, QrLoginKind, QrLoginState,
+    CredentialKind, CredentialSource, QrLoginKind, QrLoginState, UgcCollectionReference,
 };
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
@@ -35,7 +35,7 @@ use crate::redaction::redact_sensitive_text;
 use crate::router::{
     BilibiliAuthCommand, BilibiliAuthLoginMode, BilibiliSelection, JobRequest, RouteResult,
     bilibili_selection_from_url, bilibili_url_ep_id_selects_episode, is_b23_short_link_url,
-    route_message,
+    is_bilibili_ugc_collection_url, route_message,
 };
 use crate::telegram::{
     BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient,
@@ -77,7 +77,15 @@ struct PendingBilibiliSelectionJob {
     chat_id: i64,
     job_id: u64,
     job: JobRequest,
+    prompt: BilibiliSelectionPrompt,
     created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+enum BilibiliSelectionPrompt {
+    SeasonMedia,
+    UgcMembership(UgcCollectionReference),
+    UgcCollection,
 }
 
 #[derive(Debug, Clone)]
@@ -1612,11 +1620,52 @@ async fn queue_or_prompt_normalized_job(
     job: JobRequest,
 ) {
     if job.requires_bilibili_selection() {
-        prompt_bilibili_selection(telegram, chat_id, job_id, job).await;
+        prompt_bilibili_selection(
+            telegram,
+            chat_id,
+            job_id,
+            job,
+            BilibiliSelectionPrompt::SeasonMedia,
+        )
+        .await;
+        return;
+    }
+
+    if let Some(prompt) = bilibili_ugc_selection_prompt(config.as_ref(), &job).await {
+        prompt_bilibili_selection(telegram, chat_id, job_id, job, prompt).await;
         return;
     }
 
     process_job_after_duplicate_check(telegram, config, job_dispatch, chat_id, job_id, job).await;
+}
+
+async fn bilibili_ugc_selection_prompt(
+    config: &AppConfig,
+    job: &JobRequest,
+) -> Option<BilibiliSelectionPrompt> {
+    let JobRequest::Bilibili { url, selection } = job else {
+        return None;
+    };
+
+    if selection.is_none() && is_bilibili_ugc_collection_url(url) {
+        return Some(BilibiliSelectionPrompt::UgcCollection);
+    }
+    if !matches!(selection, None | Some(BilibiliSelection::Page(_))) {
+        return None;
+    }
+
+    match bilibili_core::resolve_video_collection_membership(config, url).await {
+        Ok(Some(reference)) => Some(BilibiliSelectionPrompt::UgcMembership(reference)),
+        Ok(None) => None,
+        Err(err) => {
+            warn!(
+                url = %url,
+                error = %redact_sensitive_text(&format!("{err:#}")),
+                "Bilibili UGC collection membership probe failed; preserving single-video behavior"
+            );
+            None
+        }
+    }
 }
 
 async fn normalize_bilibili_short_link_job(config: &AppConfig, job: JobRequest) -> JobRequest {
@@ -1662,6 +1711,7 @@ async fn prompt_bilibili_selection(
     chat_id: i64,
     job_id: u64,
     job: JobRequest,
+    prompt: BilibiliSelectionPrompt,
 ) {
     let token = next_bilibili_selection_callback_token(job_id);
     let now = Instant::now();
@@ -1674,6 +1724,7 @@ async fn prompt_bilibili_selection(
                 chat_id,
                 job_id,
                 job,
+                prompt: prompt.clone(),
                 created_at: now,
             },
         );
@@ -1683,8 +1734,8 @@ async fn prompt_bilibili_selection(
     match telegram
         .send_message_with_inline_keyboard(
             chat_id,
-            bilibili_selection_message(job_id),
-            bilibili_selection_keyboard(token),
+            bilibili_selection_message(job_id, &prompt),
+            bilibili_selection_keyboard(token, &prompt),
         )
         .await
     {
@@ -1725,6 +1776,20 @@ async fn process_job_after_duplicate_check(
             job_id,
             job,
             JobRunMode::Direct,
+        )
+        .await;
+        return;
+    }
+
+    if is_confirmed_bilibili_ugc_collection_job(&job) {
+        queue_job(
+            telegram,
+            config,
+            Arc::clone(&job_dispatch.download_semaphore),
+            chat_id,
+            job_id,
+            job,
+            JobRunMode::StagedKeepBoth,
         )
         .await;
         return;
@@ -1780,7 +1845,14 @@ async fn process_job_after_duplicate_check(
             .await;
         }
         Err(err) if should_prompt_bilibili_selection_after_probe_error(&job, &err) => {
-            prompt_bilibili_selection(telegram, chat_id, job_id, job).await;
+            prompt_bilibili_selection(
+                telegram,
+                chat_id,
+                job_id,
+                job,
+                BilibiliSelectionPrompt::SeasonMedia,
+            )
+            .await;
         }
         Err(err) => {
             send_or_log(
@@ -1805,6 +1877,16 @@ async fn process_job_after_duplicate_check(
             .await;
         }
     }
+}
+
+fn is_confirmed_bilibili_ugc_collection_job(job: &JobRequest) -> bool {
+    matches!(
+        job,
+        JobRequest::Bilibili {
+            url,
+            selection: Some(BilibiliSelection::All),
+        } if is_bilibili_ugc_collection_url(url)
+    )
 }
 
 fn should_prompt_bilibili_selection_after_probe_error(
@@ -2055,16 +2137,33 @@ async fn handle_bilibili_selection_callback(
             )
             .await;
         }
-        BilibiliSelectionCallbackAction::Run(selection) => {
-            let job = apply_bilibili_selection(pending.job, selection);
+        action => {
+            let pending_label = pending.job.label();
+            let Some((job, selection_label)) =
+                apply_bilibili_selection(pending.job, &pending.prompt, action)
+            else {
+                answer_callback_or_log(
+                    &telegram,
+                    callback_id,
+                    "This choice is not available for this link.".to_string(),
+                )
+                .await;
+                edit_without_keyboard_or_send(
+                    &telegram,
+                    chat_id,
+                    message_id,
+                    format!("Canceled job #{}: {pending_label}", pending.job_id),
+                )
+                .await;
+                return;
+            };
             answer_callback_or_log(&telegram, callback_id, "Queued.".to_string()).await;
             edit_without_keyboard_or_send(
                 &telegram,
                 chat_id,
                 message_id,
                 format!(
-                    "Selected {} for job #{}: {}",
-                    selection.label(),
+                    "Selected {selection_label} for job #{}: {}",
                     pending.job_id,
                     job.label()
                 ),
@@ -2147,7 +2246,9 @@ struct BilibiliSelectionCallback {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BilibiliSelectionCallbackAction {
-    Run(BilibiliSelection),
+    Current,
+    Latest,
+    All,
     Cancel,
 }
 
@@ -2160,8 +2261,9 @@ fn parse_bilibili_selection_callback_data(data: &str) -> Option<BilibiliSelectio
         return None;
     }
     let action = match action {
-        "latest" => BilibiliSelectionCallbackAction::Run(BilibiliSelection::Latest),
-        "all" => BilibiliSelectionCallbackAction::Run(BilibiliSelection::All),
+        "current" => BilibiliSelectionCallbackAction::Current,
+        "latest" => BilibiliSelectionCallbackAction::Latest,
+        "all" => BilibiliSelectionCallbackAction::All,
         "cancel" => BilibiliSelectionCallbackAction::Cancel,
         _ => return None,
     };
@@ -2181,32 +2283,115 @@ fn bilibili_selection_callback_data(token: u64, action: &str) -> String {
     format!("bsel:{token:016x}:{action}")
 }
 
-fn bilibili_selection_keyboard(token: u64) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup {
-        inline_keyboard: vec![
-            vec![
-                InlineKeyboardButton {
-                    text: "Latest episode".to_string(),
-                    callback_data: bilibili_selection_callback_data(token, "latest"),
-                },
-                InlineKeyboardButton {
-                    text: "All episodes".to_string(),
-                    callback_data: bilibili_selection_callback_data(token, "all"),
-                },
-            ],
-            vec![InlineKeyboardButton {
-                text: "Cancel".to_string(),
-                callback_data: bilibili_selection_callback_data(token, "cancel"),
-            }],
-        ],
+fn bilibili_selection_keyboard(
+    token: u64,
+    prompt: &BilibiliSelectionPrompt,
+) -> InlineKeyboardMarkup {
+    let mut inline_keyboard = match prompt {
+        BilibiliSelectionPrompt::SeasonMedia => vec![vec![
+            InlineKeyboardButton {
+                text: "Latest episode".to_string(),
+                callback_data: bilibili_selection_callback_data(token, "latest"),
+            },
+            InlineKeyboardButton {
+                text: "All episodes".to_string(),
+                callback_data: bilibili_selection_callback_data(token, "all"),
+            },
+        ]],
+        BilibiliSelectionPrompt::UgcMembership(_) => vec![vec![
+            InlineKeyboardButton {
+                text: "Current video".to_string(),
+                callback_data: bilibili_selection_callback_data(token, "current"),
+            },
+            InlineKeyboardButton {
+                text: "Entire collection".to_string(),
+                callback_data: bilibili_selection_callback_data(token, "all"),
+            },
+        ]],
+        BilibiliSelectionPrompt::UgcCollection => vec![vec![InlineKeyboardButton {
+            text: "Entire collection".to_string(),
+            callback_data: bilibili_selection_callback_data(token, "all"),
+        }]],
+    };
+    inline_keyboard.push(vec![InlineKeyboardButton {
+        text: "Cancel".to_string(),
+        callback_data: bilibili_selection_callback_data(token, "cancel"),
+    }]);
+    InlineKeyboardMarkup { inline_keyboard }
+}
+
+fn bilibili_selection_message(job_id: u64, prompt: &BilibiliSelectionPrompt) -> String {
+    match prompt {
+        BilibiliSelectionPrompt::SeasonMedia => {
+            format!("Bilibili season/media link queued as job #{job_id}. Choose what to download:")
+        }
+        BilibiliSelectionPrompt::UgcMembership(reference) => format!(
+            "Bilibili UGC collection detected for job #{job_id}: {} ({} items). Choose what to download:",
+            truncate(&reference.title),
+            reference.item_count
+        ),
+        BilibiliSelectionPrompt::UgcCollection => {
+            format!(
+                "Bilibili collection link queued as job #{job_id}. Download the entire collection?"
+            )
+        }
     }
 }
 
-fn bilibili_selection_message(job_id: u64) -> String {
-    format!("Bilibili season/media link queued as job #{job_id}. Choose what to download:")
+fn apply_bilibili_selection(
+    job: JobRequest,
+    prompt: &BilibiliSelectionPrompt,
+    action: BilibiliSelectionCallbackAction,
+) -> Option<(JobRequest, &'static str)> {
+    match (prompt, action) {
+        (BilibiliSelectionPrompt::SeasonMedia, BilibiliSelectionCallbackAction::Latest) => Some((
+            set_bilibili_selection(job, BilibiliSelection::Latest),
+            "latest episode",
+        )),
+        (BilibiliSelectionPrompt::SeasonMedia, BilibiliSelectionCallbackAction::All) => Some((
+            set_bilibili_selection(job, BilibiliSelection::All),
+            "all episodes",
+        )),
+        (BilibiliSelectionPrompt::UgcMembership(_), BilibiliSelectionCallbackAction::Current) => {
+            Some((confirm_current_bilibili_video(job), "current video"))
+        }
+        (
+            BilibiliSelectionPrompt::UgcMembership(reference),
+            BilibiliSelectionCallbackAction::All,
+        ) => Some((
+            JobRequest::Bilibili {
+                url: bilibili_core::ugc_collection_url(reference),
+                selection: Some(BilibiliSelection::All),
+            },
+            "entire collection",
+        )),
+        (BilibiliSelectionPrompt::UgcCollection, BilibiliSelectionCallbackAction::All) => Some((
+            set_bilibili_selection(job, BilibiliSelection::All),
+            "entire collection",
+        )),
+        (_, BilibiliSelectionCallbackAction::Cancel) => None,
+        _ => None,
+    }
 }
 
-fn apply_bilibili_selection(job: JobRequest, selection: BilibiliSelection) -> JobRequest {
+fn confirm_current_bilibili_video(job: JobRequest) -> JobRequest {
+    match job {
+        JobRequest::Bilibili {
+            url,
+            selection: Some(BilibiliSelection::Page(page)),
+        } => JobRequest::Bilibili {
+            url,
+            selection: Some(BilibiliSelection::CurrentPage(page)),
+        },
+        JobRequest::Bilibili { url, .. } => JobRequest::Bilibili {
+            url,
+            selection: Some(BilibiliSelection::Current),
+        },
+        other => other,
+    }
+}
+
+fn set_bilibili_selection(job: JobRequest, selection: BilibiliSelection) -> JobRequest {
     match job {
         JobRequest::Bilibili { url, .. } => JobRequest::Bilibili {
             url,
@@ -3252,14 +3437,21 @@ mod tests {
             parse_bilibili_selection_callback_data("bsel:000000000000002a:latest"),
             Some(BilibiliSelectionCallback {
                 token: 42,
-                action: BilibiliSelectionCallbackAction::Run(BilibiliSelection::Latest)
+                action: BilibiliSelectionCallbackAction::Latest
             })
         );
         assert_eq!(
             parse_bilibili_selection_callback_data("bsel:000000000000002a:all"),
             Some(BilibiliSelectionCallback {
                 token: 42,
-                action: BilibiliSelectionCallbackAction::Run(BilibiliSelection::All)
+                action: BilibiliSelectionCallbackAction::All
+            })
+        );
+        assert_eq!(
+            parse_bilibili_selection_callback_data("bsel:000000000000002a:current"),
+            Some(BilibiliSelectionCallback {
+                token: 42,
+                action: BilibiliSelectionCallbackAction::Current
             })
         );
         assert_eq!(
@@ -3285,7 +3477,8 @@ mod tests {
 
     #[test]
     fn builds_bilibili_selection_keyboard_and_applies_selection() {
-        let keyboard = bilibili_selection_keyboard(42);
+        let season_prompt = BilibiliSelectionPrompt::SeasonMedia;
+        let keyboard = bilibili_selection_keyboard(42, &season_prompt);
         let data = keyboard
             .inline_keyboard
             .iter()
@@ -3307,12 +3500,93 @@ mod tests {
                     url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
                     selection: None,
                 },
-                BilibiliSelection::All
-            ),
-            JobRequest::Bilibili {
-                url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
-                selection: Some(BilibiliSelection::All),
-            }
+                &season_prompt,
+                BilibiliSelectionCallbackAction::All,
+            )
+            .expect("season all selection should be available"),
+            (
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+                    selection: Some(BilibiliSelection::All),
+                },
+                "all episodes"
+            )
+        );
+
+        let reference = UgcCollectionReference {
+            id: 167822,
+            kind: bbdown_core::UgcCollectionKind::Collection,
+            owner_mid: 210798,
+            title: "Piano collection".to_string(),
+            description: String::new(),
+            cover_url: None,
+            item_count: 37,
+        };
+        let membership_prompt = BilibiliSelectionPrompt::UgcMembership(reference.clone());
+        let membership_keyboard = bilibili_selection_keyboard(42, &membership_prompt);
+        let membership_data = membership_keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .map(|button| button.callback_data.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            membership_data,
+            vec![
+                "bsel:000000000000002a:current",
+                "bsel:000000000000002a:all",
+                "bsel:000000000000002a:cancel"
+            ]
+        );
+        assert_eq!(
+            apply_bilibili_selection(
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV12TRrBcEP8?p=2".to_string(),
+                    selection: Some(BilibiliSelection::Page(2)),
+                },
+                &membership_prompt,
+                BilibiliSelectionCallbackAction::Current,
+            )
+            .expect("current collection video selection should be available"),
+            (
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV12TRrBcEP8?p=2".to_string(),
+                    selection: Some(BilibiliSelection::CurrentPage(2)),
+                },
+                "current video"
+            )
+        );
+        assert_eq!(
+            apply_bilibili_selection(
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV12TRrBcEP8".to_string(),
+                    selection: None,
+                },
+                &membership_prompt,
+                BilibiliSelectionCallbackAction::All,
+            )
+            .expect("entire collection selection should be available"),
+            (
+                JobRequest::Bilibili {
+                    url: "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+                        .to_string(),
+                    selection: Some(BilibiliSelection::All),
+                },
+                "entire collection"
+            )
+        );
+
+        let direct_prompt = BilibiliSelectionPrompt::UgcCollection;
+        let direct_keyboard = bilibili_selection_keyboard(42, &direct_prompt);
+        let direct_data = direct_keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .map(|button| button.callback_data.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            direct_data,
+            vec!["bsel:000000000000002a:all", "bsel:000000000000002a:cancel"]
         );
     }
 

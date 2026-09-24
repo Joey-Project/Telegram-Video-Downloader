@@ -9,10 +9,11 @@ use bbdown_core::{
     CredentialStore, Credentials, DanmakuFormat, DownloadMode, DownloadOptions, EndpointConfig,
     MediaHostOptions, MuxOptions, PlayurlMode, RestrictedArea, RestrictedAreaConfig,
     RestrictedAreaProxy, RestrictedAreaProxyKind, RetryPolicy, Selection, StreamSelection,
+    UgcCollectionKind, UgcCollectionReference,
 };
 
 use crate::config::AppConfig;
-use crate::router::BilibiliSelection;
+use crate::router::{BilibiliSelection, bilibili_bvid_from_url};
 use reqwest::redirect::Policy;
 use url::Url;
 
@@ -162,6 +163,31 @@ pub async fn resolve_b23_short_link(config: &AppConfig, raw_url: &str) -> Result
     bail!("Bilibili short link exceeded redirect limit")
 }
 
+pub async fn resolve_video_collection_membership(
+    config: &AppConfig,
+    raw_url: &str,
+) -> Result<Option<UgcCollectionReference>> {
+    let Some(bvid) = bilibili_bvid_from_url(raw_url) else {
+        return Ok(None);
+    };
+    let client = anonymous_client(config)?;
+    client
+        .resolve_video_collection_membership(&bvid)
+        .await
+        .context("failed to resolve Bilibili UGC collection membership")
+}
+
+pub fn ugc_collection_url(reference: &UgcCollectionReference) -> String {
+    let detail = match reference.kind {
+        UgcCollectionKind::Collection => "collectiondetail",
+        UgcCollectionKind::Series => "seriesdetail",
+    };
+    format!(
+        "https://space.bilibili.com/{}/channel/{detail}?sid={}",
+        reference.owner_mid, reference.id
+    )
+}
+
 fn terminal_b23_short_link_target(
     current: &Url,
     status: reqwest::StatusCode,
@@ -231,9 +257,11 @@ pub fn looks_like_access_key_login_input(input: &str) -> bool {
 
 pub fn selection(selection: Option<BilibiliSelection>) -> Option<Selection> {
     selection.map(|selection| match selection {
+        BilibiliSelection::Current => Selection::Current,
         BilibiliSelection::Latest => Selection::Latest,
         BilibiliSelection::All => Selection::All,
         BilibiliSelection::Page(page) => Selection::Page(page),
+        BilibiliSelection::CurrentPage(page) => Selection::Page(page),
     })
 }
 
@@ -1044,6 +1072,10 @@ mod tests {
     #[test]
     fn maps_router_selection_to_core_selection() {
         assert_eq!(
+            selection(Some(BilibiliSelection::Current)),
+            Some(Selection::Current)
+        );
+        assert_eq!(
             selection(Some(BilibiliSelection::Latest)),
             Some(Selection::Latest)
         );
@@ -1055,7 +1087,36 @@ mod tests {
             selection(Some(BilibiliSelection::Page(2))),
             Some(Selection::Page(2))
         );
+        assert_eq!(
+            selection(Some(BilibiliSelection::CurrentPage(2))),
+            Some(Selection::Page(2))
+        );
         assert_eq!(selection(None), None);
+    }
+
+    #[test]
+    fn builds_canonical_ugc_collection_urls() {
+        let collection = UgcCollectionReference {
+            id: 167822,
+            kind: UgcCollectionKind::Collection,
+            owner_mid: 210798,
+            title: String::new(),
+            description: String::new(),
+            cover_url: None,
+            item_count: 0,
+        };
+        assert_eq!(
+            ugc_collection_url(&collection),
+            "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+        );
+        let series = UgcCollectionReference {
+            kind: UgcCollectionKind::Series,
+            ..collection
+        };
+        assert_eq!(
+            ugc_collection_url(&series),
+            "https://space.bilibili.com/210798/channel/seriesdetail?sid=167822"
+        );
     }
 
     #[test]

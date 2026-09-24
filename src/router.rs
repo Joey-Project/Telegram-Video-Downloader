@@ -18,9 +18,11 @@ pub enum JobRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum BilibiliSelection {
+    Current,
     Latest,
     All,
     Page(u32),
+    CurrentPage(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,16 +65,6 @@ impl JobRequest {
                 selection.is_none() && bilibili_url_requires_selection(url)
             }
             Self::Youtube { .. } | Self::Pdf { .. } => false,
-        }
-    }
-}
-
-impl BilibiliSelection {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Latest => "latest episode",
-            Self::All => "all episodes",
-            Self::Page(_) => "selected video page",
         }
     }
 }
@@ -193,7 +185,10 @@ fn classify_video_url(raw_url: &str) -> Option<JobRequest> {
     let url = Url::parse(raw_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
 
-    if is_b23_short_link_url(raw_url) || is_bilibili_video_url(&host, &url) {
+    if is_b23_short_link_url(raw_url)
+        || is_bilibili_video_url(&host, &url)
+        || is_bilibili_ugc_collection_url(raw_url)
+    {
         Some(JobRequest::Bilibili {
             url: raw_url.to_string(),
             selection: bilibili_selection_from_url(raw_url),
@@ -204,6 +199,33 @@ fn classify_video_url(raw_url: &str) -> Option<JobRequest> {
         })
     } else {
         None
+    }
+}
+
+pub(crate) fn is_bilibili_ugc_collection_url(raw_url: &str) -> bool {
+    let Ok(url) = Url::parse(raw_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    if !domain_or_subdomain(&host, "bilibili.com") {
+        return false;
+    }
+
+    matches!(
+        Input::parse(raw_url),
+        Ok(Input::CollectionList(_)
+            | Input::SeriesList(_)
+            | Input::SpaceCollectionList { .. }
+            | Input::SpaceSeriesList { .. })
+    )
+}
+
+pub(crate) fn bilibili_bvid_from_url(raw_url: &str) -> Option<String> {
+    match Input::parse(raw_url).ok()? {
+        Input::Bvid(bvid) => Some(bvid),
+        _ => None,
     }
 }
 
@@ -514,6 +536,44 @@ mod tests {
                 url: "https://www.bilibili.com/bangumi/play/ep123456".to_string(),
                 selection: None
             }])
+        );
+    }
+
+    #[test]
+    fn routes_direct_bilibili_ugc_collection_links() {
+        for input in [
+            "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822",
+            "https://space.bilibili.com/210798/lists/167822?type=series",
+            "https://www.bilibili.com/list/210798?sid=167822",
+            "https://www.bilibili.com/list/210798?sid=167822&type=series",
+            "https://www.bilibili.com/medialist/play?business=space_collection&business_id=167822",
+        ] {
+            assert!(matches!(
+                route_message(input, &auto_pdf_domains()),
+                RouteResult::Jobs(jobs)
+                    if matches!(jobs.as_slice(), [JobRequest::Bilibili { url, selection: None }] if url == input)
+            ));
+            assert!(is_bilibili_ugc_collection_url(input));
+        }
+        assert!(!is_bilibili_ugc_collection_url(
+            "https://www.bilibili.com/video/BV12TRrBcEP8"
+        ));
+        assert!(!is_bilibili_ugc_collection_url(
+            "https://www.example.com/list/210798?sid=167822"
+        ));
+    }
+
+    #[test]
+    fn extracts_bvid_only_from_bilibili_video_inputs() {
+        assert_eq!(
+            bilibili_bvid_from_url("https://www.bilibili.com/video/BV12TRrBcEP8/?p=2"),
+            Some("BV12TRrBcEP8".to_string())
+        );
+        assert_eq!(
+            bilibili_bvid_from_url(
+                "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+            ),
+            None
         );
     }
 
