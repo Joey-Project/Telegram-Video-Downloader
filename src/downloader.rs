@@ -32,6 +32,7 @@ use tracing::info;
 use crate::bilibili_auth;
 use crate::bilibili_core;
 use crate::config::AppConfig;
+use crate::queue::{PlanSize, PlanValidationSnapshot, sanitize_job_for_storage};
 use crate::redaction::redact_sensitive_text;
 use crate::router::{BilibiliSelection, JobRequest, is_bilibili_ugc_collection_url};
 use crate::safe_fs::{
@@ -243,6 +244,8 @@ impl CommandExecutionPolicy {
 pub struct JobReport {
     pub saved_location: String,
     pub details: String,
+    #[serde(default)]
+    pub primary_media_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +307,9 @@ pub struct BilibiliCollectionProgressSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobProgressLifecycleEvent {
+    StagingAttempt {
+        path: PathBuf,
+    },
     Resolved {
         manifest: BilibiliCollectionManifest,
         snapshot: BilibiliCollectionProgressSnapshot,
@@ -610,6 +616,7 @@ impl SubtitlePlan {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct YoutubeMetadata {
     id: Option<String>,
+    format_id: Option<String>,
     title: Option<String>,
     description: Option<String>,
     uploader: Option<String>,
@@ -638,6 +645,7 @@ struct YoutubeMetadata {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct YoutubeFormat {
+    format_id: Option<String>,
     filesize: Option<u64>,
     filesize_approx: Option<u64>,
     width: Option<u32>,
@@ -1214,6 +1222,7 @@ fn bilibili_audio_profile(stream: &MediaStream) -> String {
 
 fn youtube_resolved_download_summary(metadata: &YoutubeMetadata) -> String {
     let fallback = YoutubeFormat {
+        format_id: metadata.format_id.clone(),
         filesize: metadata.filesize,
         filesize_approx: metadata.filesize_approx,
         width: metadata.width,
@@ -1459,6 +1468,168 @@ pub async fn run_job(
         }
         JobRequest::Pdf { .. } => run_simple_job(config, job, progress).await,
     }
+}
+
+pub async fn inspect_job_plan(
+    config: &AppConfig,
+    job: &JobRequest,
+) -> Result<PlanValidationSnapshot> {
+    match job {
+        JobRequest::Pdf { url } => {
+            let (safe_job, _) = sanitize_job_for_storage(job.clone());
+            let JobRequest::Pdf { url: safe_url } = safe_job else {
+                unreachable!("PDF job sanitization preserves the job type")
+            };
+            Ok(PlanValidationSnapshot {
+                stable_media_ids: vec![format!("pdf:{safe_url}")],
+                title: Some(
+                    url::Url::parse(url)
+                        .ok()
+                        .and_then(|url| url.host_str().map(str::to_string))
+                        .unwrap_or_else(|| "PDF".to_string()),
+                ),
+                ..PlanValidationSnapshot::default()
+            })
+        }
+        JobRequest::Youtube { url } => {
+            let spec = youtube_metadata_command_spec(config, url);
+            let output = run_command(config, &spec, None).await?;
+            if !output.status.success() {
+                bail!("yt-dlp metadata probe exited with status {}", output.status);
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let json = last_nonempty_line(&stdout)
+                .ok_or_else(|| anyhow!("yt-dlp returned no metadata"))?;
+            let metadata: YoutubeMetadata =
+                serde_json::from_str(json).context("failed to parse yt-dlp metadata JSON")?;
+            let fallback = YoutubeFormat {
+                format_id: metadata.format_id.clone(),
+                filesize: metadata.filesize,
+                filesize_approx: metadata.filesize_approx,
+                width: metadata.width,
+                height: metadata.height,
+                fps: metadata.fps,
+                vcodec: metadata.vcodec.clone(),
+                acodec: metadata.acodec.clone(),
+                format_note: metadata.format_note.clone(),
+                resolution: metadata.resolution.clone(),
+                abr: metadata.abr,
+            };
+            let formats = if !metadata.requested_formats.is_empty() {
+                metadata.requested_formats.iter().collect::<Vec<_>>()
+            } else if !metadata.requested_downloads.is_empty() {
+                metadata.requested_downloads.iter().collect::<Vec<_>>()
+            } else {
+                vec![&fallback]
+            };
+            let mut snapshot = PlanValidationSnapshot {
+                stable_media_ids: metadata.id.clone().into_iter().collect(),
+                title: metadata.title.clone(),
+                ..PlanValidationSnapshot::default()
+            };
+            for format in formats {
+                let id = format
+                    .format_id
+                    .clone()
+                    .context("yt-dlp did not report a selected format ID")?;
+                snapshot.selected_format_ids.push(id.clone());
+                if let Some(bytes) = format.filesize {
+                    snapshot.exact_sizes.push(PlanSize {
+                        subject: id.clone(),
+                        bytes,
+                        provenance: "yt-dlp filesize".to_string(),
+                    });
+                } else if let Some(bytes) = format.filesize_approx {
+                    snapshot.approximate_sizes.push(PlanSize {
+                        subject: id.clone(),
+                        bytes,
+                        provenance: "yt-dlp filesize_approx".to_string(),
+                    });
+                }
+                snapshot.resolution_codecs.push(format!(
+                    "{id}:{}:{}:{}",
+                    youtube_resolution_label(format).unwrap_or_else(|| "unknown".to_string()),
+                    format.vcodec.as_deref().unwrap_or("unknown"),
+                    format.acodec.as_deref().unwrap_or("unknown")
+                ));
+            }
+            Ok(snapshot)
+        }
+        JobRequest::Bilibili { url, selection } => {
+            sync_bilibili_rust_credentials(config).await?;
+            let options = bilibili_core::download_options(config)?;
+            let client = bilibili_core::client(config)?;
+            let plan = probe_bilibili_plan_with_mode(
+                &client,
+                url,
+                *selection,
+                options.mode,
+                BILIBILI_METADATA_PROBE_TIMEOUT,
+            )
+            .await?;
+            let mut snapshot = PlanValidationSnapshot {
+                title: Some(plan.title.clone()),
+                ..PlanValidationSnapshot::default()
+            };
+            for entry in &plan.entries {
+                let stable_id = bilibili_plan_stable_media_id(
+                    entry.bvid.as_deref(),
+                    entry.aid,
+                    entry.cid,
+                    entry.epid,
+                );
+                snapshot.stable_media_ids.push(stable_id.clone());
+                if let Some(stream) = bilibili_selected_video(entry, &options.stream_selection) {
+                    let format_id = format!("{stable_id}:video:{}", stream.id);
+                    snapshot.selected_format_ids.push(format_id.clone());
+                    if let Some(bytes) = stream.size {
+                        snapshot.exact_sizes.push(PlanSize {
+                            subject: format_id.clone(),
+                            bytes,
+                            provenance: "Bilibili plan stream size".to_string(),
+                        });
+                    }
+                    snapshot.resolution_codecs.push(format!(
+                        "{format_id}:{}x{}:{}",
+                        stream.width.unwrap_or_default(),
+                        stream.height.unwrap_or_default(),
+                        stream.codecs.as_deref().unwrap_or("unknown")
+                    ));
+                }
+                if let Some(stream) = bilibili_selected_audio(entry, &options.stream_selection) {
+                    let format_id = format!("{stable_id}:audio:{}", stream.id);
+                    snapshot.selected_format_ids.push(format_id.clone());
+                    if let Some(bytes) = stream.size {
+                        snapshot.exact_sizes.push(PlanSize {
+                            subject: format_id.clone(),
+                            bytes,
+                            provenance: "Bilibili plan stream size".to_string(),
+                        });
+                    }
+                    snapshot.resolution_codecs.push(format!(
+                        "{format_id}:{}",
+                        stream.codecs.as_deref().unwrap_or("unknown")
+                    ));
+                }
+            }
+            Ok(snapshot)
+        }
+    }
+}
+
+fn bilibili_plan_stable_media_id(
+    bvid: Option<&str>,
+    aid: u64,
+    cid: u64,
+    epid: Option<u64>,
+) -> String {
+    let media_id = bvid
+        .map(|bvid| format!("bvid:{bvid}"))
+        .unwrap_or_else(|| format!("aid:{aid}"));
+    let epid = epid
+        .map(|epid| epid.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    format!("{media_id}:cid:{cid}:epid:{epid}")
 }
 
 pub async fn run_job_with_duplicate_action(
@@ -1778,9 +1949,11 @@ async fn run_simple_job(
     let saved_location = last_nonempty_line(&stdout)
         .ok_or_else(|| anyhow!("pdf helper finished without printing output path"))?
         .to_string();
+    let primary_media_path = PathBuf::from(saved_location.clone());
     Ok(JobReport {
         saved_location,
         details: tail_lines(&stderr, 6),
+        primary_media_paths: vec![primary_media_path],
     })
 }
 
@@ -2221,6 +2394,7 @@ struct BilibiliUgcCollectionOutputDirectory {
 struct BilibiliUgcCollectionDownload {
     folder: String,
     output_template: String,
+    existing_media_paths: Vec<PathBuf>,
     title: String,
     total_entries: usize,
     skipped_entries: usize,
@@ -2273,6 +2447,7 @@ impl BilibiliUgcCollectionDownload {
                 "Bilibili UGC collection already complete: {} ({} total, {} already present)",
                 self.title, self.total_entries, self.skipped_entries
             ),
+            primary_media_paths: self.existing_media_paths.clone(),
         }
     }
 }
@@ -2345,6 +2520,14 @@ async fn prepare_bilibili_ugc_collection_download(
     } else {
         VideoIdentityIndex::default()
     };
+    let existing_media_paths = index
+        .videos_by_identity
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let items = if resolution.collection.items.is_empty() {
         &resolution.selected_items
     } else {
@@ -2367,6 +2550,7 @@ async fn prepare_bilibili_ugc_collection_download(
     Ok(BilibiliUgcCollectionDownload {
         folder: output_directory.folder,
         output_template,
+        existing_media_paths,
         title,
         total_entries,
         skipped_entries: total_entries.saturating_sub(missing_indices.len()),
@@ -2882,10 +3066,19 @@ async fn run_bilibili_job_locked(
             Err(err) => details.push(format!("NFO skipped: {err}")),
         }
     }
-    let reported_primary_videos = primary_videos
+    let mut reported_primary_videos = primary_videos
         .iter()
         .map(|path| rebase_download_path(path, &output_dir, reported_output_dir))
-        .collect::<Vec<_>>();
+        .collect::<BTreeSet<_>>();
+    if let Some(collection) = collection_download.as_ref() {
+        reported_primary_videos.extend(
+            collection
+                .existing_media_paths
+                .iter()
+                .map(|path| rebase_download_path(path, &output_dir, reported_output_dir)),
+        );
+    }
+    let reported_primary_videos = reported_primary_videos.into_iter().collect::<Vec<_>>();
     let fallback_output = rebase_download_path(
         &resolve_command_output_path(&output_dir, &report.output_dir),
         &output_dir,
@@ -2901,6 +3094,7 @@ async fn run_bilibili_job_locked(
             join_paths(&reported_primary_videos)
         },
         details: nonempty_join(details),
+        primary_media_paths: reported_primary_videos,
     }))
 }
 
@@ -5640,10 +5834,12 @@ async fn run_youtube_job_locked(
         .filter(|line| Path::new(line).is_absolute())
         .map(str::to_string)
         .unwrap_or_else(|| config.downloads.video_dir.display().to_string());
+    let primary_media_path = PathBuf::from(saved_location.clone());
 
     Ok(JobReport {
         saved_location,
         details: nonempty_join(vec![subtitle_plan.describe(), tail_lines(&stderr, 6)]),
+        primary_media_paths: vec![primary_media_path],
     })
 }
 
@@ -5667,6 +5863,11 @@ async fn run_staged_video_job(
     let staging = create_video_staging_dir(&root)?;
     let staging_dir = staging.path().to_path_buf();
     staging.validate_for_path_access()?;
+    staging
+        .retain_for_manual_recovery(
+            "persistent task retry; this attempt is retained if it fails or is canceled",
+        )
+        .context("failed to mark staged download for recovery before execution")?;
     send_progress(
         progress.as_ref(),
         format!("staging: downloading into {}", staging_dir.display()),
@@ -5876,6 +6077,23 @@ async fn run_staged_video_job(
     let report = JobReport {
         saved_location,
         details,
+        primary_media_paths: moved_files
+            .iter()
+            .filter(|path| is_primary_media_file(path, primary_media_kind))
+            .cloned()
+            .chain(
+                report
+                    .primary_media_paths
+                    .iter()
+                    .filter(|path| {
+                        path.starts_with(&final_dir)
+                            && is_primary_media_file(path, primary_media_kind)
+                    })
+                    .cloned(),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
     };
     staging
         .finish()
@@ -7293,6 +7511,11 @@ fn warn_recovered_overwrite(recovery: &str) {
 fn send_progress(progress: Option<&JobProgressSender>, message: String) {
     if let Some(progress) = progress {
         let message = redact_sensitive_text(&message);
+        if let Some(path) = message.strip_prefix("staging: downloading into ") {
+            progress.send_lifecycle(JobProgressLifecycleEvent::StagingAttempt {
+                path: PathBuf::from(path),
+            });
+        }
         progress.send_modify(|current| {
             let (resolved_summary, collection) = current.as_ref().map_or_else(
                 || (None, None),
@@ -7385,13 +7608,14 @@ fn parse_bilibili_progress_event_wire(text: &str) -> Option<JobProgressLifecycle
 
 fn bilibili_collection_snapshot_from_event(
     event: &JobProgressLifecycleEvent,
-) -> BilibiliCollectionProgressSnapshot {
+) -> Option<BilibiliCollectionProgressSnapshot> {
     match event {
+        JobProgressLifecycleEvent::StagingAttempt { .. } => None,
         JobProgressLifecycleEvent::Resolved { snapshot, .. }
         | JobProgressLifecycleEvent::EntryStarted { snapshot, .. }
         | JobProgressLifecycleEvent::EntryCompleted { snapshot, .. }
         | JobProgressLifecycleEvent::Completed { snapshot }
-        | JobProgressLifecycleEvent::Failed { snapshot } => snapshot.clone(),
+        | JobProgressLifecycleEvent::Failed { snapshot } => Some(snapshot.clone()),
     }
 }
 
@@ -8958,7 +9182,9 @@ impl ProgressTracker {
             && matches!(stream, CommandStream::Stdout)
             && let Some(event) = parse_bilibili_progress_event_wire(&text)
         {
-            self.collection = Some(bilibili_collection_snapshot_from_event(&event));
+            if let Some(snapshot) = bilibili_collection_snapshot_from_event(&event) {
+                self.collection = Some(snapshot);
+            }
             if let Some(progress) = self.progress.as_ref() {
                 progress.send_lifecycle(event);
             }
@@ -9890,8 +10116,8 @@ fn is_primary_media_file(path: &Path, kind: StagedPrimaryMediaKind) -> bool {
 }
 
 fn create_video_staging_dir(root: &RootedFs) -> Result<BoundStagingDir> {
-    let parent = root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
-    let _ = root.create_dir(&parent, 0o755)?;
+    let (parent_entry, _parent_identity) = ensure_private_video_staging_root(root)?;
+    let parent = parent_entry.path().to_path_buf();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -10052,6 +10278,27 @@ fn validate_video_staging_directory(
     }
     root.validate_private_bound_directory(&entry, expected_identity, 0o700)?;
     Ok(entry)
+}
+
+fn ensure_private_video_staging_root(root: &RootedFs) -> Result<(BoundEntry, EntryIdentity)> {
+    let parent = root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
+    let created_identity = root.create_dir(&parent, 0o700)?;
+    let identity = match created_identity {
+        Some(identity) => identity,
+        None => root
+            .entry_identity(&parent)?
+            .ok_or_else(|| anyhow!("video staging root disappeared during creation"))?,
+    };
+    let entry = root.bind_entry(&parent, false)?;
+    if root.bound_entry_identity(&entry)? != Some(identity) || !identity.is_dir() {
+        bail!("video staging root identity changed: {}", parent.display());
+    }
+    let directory = root.open_bound_directory(&entry, identity)?;
+    directory
+        .set_private_mode(0o700)
+        .context("failed to make the hidden video staging root private")?;
+    root.validate_private_bound_directory(&entry, identity, 0o700)?;
+    Ok((entry, identity))
 }
 
 fn retained_video_staging_reason(
@@ -10407,17 +10654,8 @@ fn recover_pending_video_staging_directories_locked_with_hook<F>(
 where
     F: FnMut(StagedPublicationDirection, &StagedPublicationStep) -> Result<()>,
 {
-    let parent_path = root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
-    let Some(parent_identity) = root.entry_identity(&parent_path)? else {
-        return Ok(VideoStagingRecoveryReport::default());
-    };
-    if !parent_identity.is_dir() {
-        bail!(
-            "video staging root is not a directory: {}",
-            parent_path.display()
-        );
-    }
-    let parent_entry = root.bind_entry(&parent_path, false)?;
+    let (parent_entry, parent_identity) = ensure_private_video_staging_root(root)?;
+    let parent_path = parent_entry.path().to_path_buf();
     let mut report = VideoStagingRecoveryReport::default();
     for (name, identity) in root.list_bound_directory(&parent_entry, parent_identity)? {
         let Some(name) = name.to_str() else {
@@ -14213,6 +14451,22 @@ mod tests {
         config
     }
 
+    #[test]
+    fn bilibili_plan_identity_includes_cid_and_episode_id_with_bvid() {
+        let original = bilibili_plan_stable_media_id(Some("BV123"), 123, 456, Some(789));
+
+        assert_ne!(
+            bilibili_plan_stable_media_id(Some("BV123"), 123, 457, Some(789)),
+            original,
+            "a changed content ID should invalidate the plan identity"
+        );
+        assert_ne!(
+            bilibili_plan_stable_media_id(Some("BV123"), 123, 456, Some(790)),
+            original,
+            "a changed episode ID should invalidate the plan identity"
+        );
+    }
+
     #[tokio::test]
     async fn bilibili_credential_sync_limit_queues_waiters_before_starting_work() {
         let semaphore = Arc::new(Semaphore::new(1));
@@ -14815,6 +15069,7 @@ mod tests {
         let collection = BilibiliUgcCollectionDownload {
             folder: "Collection [collection-1]".to_string(),
             output_template: "Collection [collection-1]".to_string(),
+            existing_media_paths: Vec::new(),
             title: "Collection".to_string(),
             total_entries: 2,
             skipped_entries: 1,
@@ -20421,6 +20676,7 @@ mod tests {
             report: JobReport {
                 saved_location: "Episode.mp4".to_string(),
                 details: "complete".to_string(),
+                primary_media_paths: Vec::new(),
             },
         };
         let encoded = serde_json::to_string(&completed).expect("response should encode");
@@ -20436,6 +20692,7 @@ mod tests {
             report: JobReport {
                 saved_location: "Collection".to_string(),
                 details: "already complete".to_string(),
+                primary_media_paths: Vec::new(),
             },
         };
         let encoded = serde_json::to_string(&already_complete)

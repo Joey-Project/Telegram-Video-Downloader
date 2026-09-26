@@ -2,7 +2,8 @@ use bbdown_core::Input;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
 pub enum JobRequest {
     Bilibili {
         url: String,
