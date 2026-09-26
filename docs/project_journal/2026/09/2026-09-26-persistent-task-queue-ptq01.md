@@ -17,7 +17,7 @@ superseded_by:
 - 增加 `/queue` 页面，提供恢复、重试失败任务、取消和历史记录操作。Telegram update ID 用于避免重复处理；轮询偏移量仅在 update 处理完后推进。
 - 重启时将未完成任务标记为中断。恢复任务会重新探测元数据或合集计划、重新检查已存在的 Bilibili 合集文件；媒体身份、所选格式、精确大小、分辨率或编码发生变化时要求用户确认。
 - 任务完成前对已发布的主媒体文件计算 SHA-256。Bilibili 合集同步会同时校验已存在和新下载的媒体。
-- 队列记录保存在各下载根目录下仅当前用户可访问的隐藏 JSON 目录中。完成记录会移动到已发布文件旁边。NFO 继续用于媒体库元数据，不承担会频繁变化的队列状态。
+- 队列记录保存在各下载根目录下仅当前用户可访问的隐藏 JSON 目录中。已完成任务记录会移动到已发布文件旁边；取消或没有媒体 sidecar 的终态记录会归档到私有历史子目录。索引最多保留最近 10,000 条历史引用，并受索引字节上限约束；淘汰索引引用不会删除磁盘上的记录文件。NFO 继续用于媒体库元数据，不承担会频繁变化的队列状态。
 - 隐藏的 `.telegram-video-downloader-staging` 根目录及每次尝试目录仅当前用户可访问。失败、取消和未决尝试永久保留以便手动恢复；后续成功任务不会清理它们。
 
 ## 当前状态
@@ -28,7 +28,7 @@ superseded_by:
 - 队列索引 v2 使用相对下载根目录的记录路径，迁移旧版绝对路径，并支持通过同一根目录的符号链接别名重启。
 - 运行中取消先记录为请求；若下载结果已就绪，则优先验证已发布文件，再决定完成状态。
 - `/queue` 限制每个 URL 预览，并把完整消息限制在 3,500 个 UTF-16 单元以内。
-- Telegram 回复发送失败只记录日志，不再阻止后续 update 处理和轮询 offset 前进；恢复任务通过队列目录内的操作系统文件锁进行原子 claim。
+- Telegram 回复发送失败只记录日志，不再阻止后续 update 处理和轮询 offset 前进；任务创建、恢复 claim 和启动恢复通过队列目录内的操作系统文件锁序列化，避免多个进程重复建立同一任务或重复 claim。
 - 大合集的主媒体哈希会在任务记录中压缩为确定性 SHA-256 清单，避免单条记录超过 2 MiB 上限；Bilibili 计划身份同时纳入 CID 和 EPID。
 - 失败、取消和未决视频尝试永久保留在下载根目录下的隐藏私有 staging 目录中。
 
@@ -38,5 +38,5 @@ superseded_by:
 ## 检查记录
 - 已检查 `src/queue.rs`、`src/main.rs`、`src/downloader.rs`、`src/safe_fs.rs`、`src/telegram.rs` 和 `src/router.rs` 的相关实现。
 - `cargo fmt --all --check`、`cargo build --quiet`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all-targets --quiet` 和 `git diff --check` 均通过。
-- 全量测试结果：463 passed、11 ignored；覆盖持久队列重启恢复、旧索引与根目录别名迁移、跨进程恢复 claim、超大哈希清单、Bilibili CID/EPID 计划身份、完成与取消竞态、队列消息长度限制，以及 mock Telegram 交互 E2E、失败回复后继续处理 update、合集进度生命周期和分页 mock Telegram E2E。
-- GitHub Actions 的 macOS Rust CI workflow 在 PR 和 `master` 更新时运行格式检查、严格 Clippy 与全部 Rust 测试；后者包含 mock Telegram E2E。
+- 全量测试结果：467 passed、11 ignored；覆盖持久队列重启恢复、旧索引与根目录别名迁移、跨进程任务创建与恢复 claim、中断的终态归档恢复、历史索引限额和文件保留、超大哈希清单、Bilibili CID/EPID 计划身份、完成与取消竞态、队列消息长度限制，以及 mock Telegram 交互 E2E、失败回复后继续处理 update、合集进度生命周期和分页 mock Telegram E2E。
+- GitHub Actions 的 macOS Rust CI workflow 在 PR 和 `master` 更新时运行格式检查、严格 Clippy 与 `cargo test --all-targets --quiet`；新增测试由该全量测试命令自动覆盖，包含 mock Telegram E2E。

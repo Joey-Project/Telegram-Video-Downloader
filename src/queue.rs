@@ -19,14 +19,16 @@ use crate::router::JobRequest;
 use crate::safe_fs::{BoundFile, EntryIdentity, RootedFs};
 
 const QUEUE_DIRECTORY: &str = ".telegram-video-downloader-queue";
+const TERMINAL_HISTORY_DIRECTORY: &str = "history";
 const INDEX_FILE: &str = "index.json";
-const CLAIM_LOCK_FILE: &str = "claims.lock";
+const QUEUE_OPERATION_LOCK_FILE: &str = "claims.lock";
 const LEGACY_INDEX_VERSION: u32 = 1;
 const INDEX_VERSION: u32 = 2;
 const TASK_RECORD_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_RECORDS: usize = 20_000;
+const MAX_HISTORY_INDEX_ENTRIES: usize = 10_000;
 const MAX_PERSISTED_MEDIA_HASHES: usize = 128;
 const MAX_PERSISTED_MEDIA_HASH_BYTES: usize = 256 * 1024;
 const QUEUE_PAGE_SIZE: usize = 10;
@@ -191,10 +193,10 @@ struct DownloadStore {
     root: RootedFs,
     queue_dir: PathBuf,
     queue_identity: EntryIdentity,
-    claim_lock_path: PathBuf,
+    operation_lock_path: PathBuf,
 }
 
-struct QueueClaimLock {
+struct QueueOperationLock {
     _file: BoundFile,
 }
 
@@ -278,12 +280,24 @@ impl QueueManager {
             #[cfg(test)]
             interrupt_after_sidecar_move: AtomicBool::new(false),
         };
+        let _video_operation_lock = manager.video.lock_queue_operations()?;
+        let _pdf_operation_lock = if manager.video.shares_root(&manager.pdf) {
+            None
+        } else {
+            Some(manager.pdf.lock_queue_operations()?)
+        };
         manager.recover_interrupted_tasks()?;
         Ok(manager)
     }
 
     pub fn create(&self, mut task: TaskRecord) -> Result<bool> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let _video_operation_lock = self.video.lock_queue_operations()?;
+        let _pdf_operation_lock = if self.video.shares_root(&self.pdf) {
+            None
+        } else {
+            Some(self.pdf.lock_queue_operations()?)
+        };
         if self.find_record_unlocked(&task.id)?.is_some() {
             return Ok(false);
         }
@@ -342,15 +356,15 @@ impl QueueManager {
 
     pub fn claim_resume(&self, id: &str, retry_failed: bool) -> Result<Option<TaskRecord>> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
-        let video_claim_lock = self.video.lock_claims()?;
+        let video_operation_lock = self.video.lock_queue_operations()?;
         if let Some((record, entry)) = self.video.get_task(id)? {
             return Self::claim_resume_in_store(&self.video, retry_failed, record, entry);
         }
-        drop(video_claim_lock);
+        drop(video_operation_lock);
         if self.video.shares_root(&self.pdf) {
             return Ok(None);
         }
-        let _pdf_claim_lock = self.pdf.lock_claims()?;
+        let _pdf_operation_lock = self.pdf.lock_queue_operations()?;
         let Some((record, entry)) = self.pdf.get_task(id)? else {
             return Ok(None);
         };
@@ -862,12 +876,13 @@ impl DownloadStore {
         let store = Self {
             root_path: root_path.clone(),
             root_aliases: vec![root_path],
-            claim_lock_path: queue_dir.join(CLAIM_LOCK_FILE),
+            operation_lock_path: queue_dir.join(QUEUE_OPERATION_LOCK_FILE),
             root,
             queue_dir,
             queue_identity,
         };
-        store.ensure_claim_lock_file()?;
+        store.ensure_operation_lock_file()?;
+        let _operation_lock = store.lock_queue_operations()?;
         if store
             .read_private_file(&store.index_path(), MAX_INDEX_BYTES)?
             .is_none()
@@ -888,16 +903,16 @@ impl DownloadStore {
         self.root.root_identity() == other.root.root_identity()
     }
 
-    fn ensure_claim_lock_file(&self) -> Result<()> {
-        if let Some(file) = self.root.open_bound_file(&self.claim_lock_path)? {
+    fn ensure_operation_lock_file(&self) -> Result<()> {
+        if let Some(file) = self.root.open_bound_file(&self.operation_lock_path)? {
             file.validate_private_single_link(0o600)?;
             return Ok(());
         }
         if let Err(create_error) =
             self.root
-                .create_new_bound_file(&self.claim_lock_path, &[], 0o600)
+                .create_new_bound_file(&self.operation_lock_path, &[], 0o600)
         {
-            let Some(file) = self.root.open_bound_file(&self.claim_lock_path)? else {
+            let Some(file) = self.root.open_bound_file(&self.operation_lock_path)? else {
                 return Err(create_error);
             };
             file.validate_private_single_link(0o600)?;
@@ -905,13 +920,13 @@ impl DownloadStore {
         Ok(())
     }
 
-    fn lock_claims(&self) -> Result<QueueClaimLock> {
+    fn lock_queue_operations(&self) -> Result<QueueOperationLock> {
         self.ensure_private_directory()?;
-        let entry = self.root.bind_entry(&self.claim_lock_path, false)?;
+        let entry = self.root.bind_entry(&self.operation_lock_path, false)?;
         let file = self
             .root
-            .open_bound_file(&self.claim_lock_path)?
-            .ok_or_else(|| anyhow!("task queue claim lock file is missing"))?;
+            .open_bound_file(&self.operation_lock_path)?
+            .ok_or_else(|| anyhow!("task queue operation lock file is missing"))?;
         let identity = file.identity();
         file.validate_private_single_link(0o600)?;
         file.lock_exclusive()?;
@@ -919,7 +934,7 @@ impl DownloadStore {
             bail!("task queue claim lock file was replaced while locking");
         }
         file.validate_private_single_link(0o600)?;
-        Ok(QueueClaimLock { _file: file })
+        Ok(QueueOperationLock { _file: file })
     }
 
     fn normalize_media_path(&self, path: &Path) -> Result<PathBuf> {
@@ -954,6 +969,30 @@ impl DownloadStore {
     fn task_path(&self, id: &str) -> Result<PathBuf> {
         validate_task_id(id)?;
         Ok(self.queue_dir.join(format!("task-{id}.json")))
+    }
+
+    fn terminal_history_path(&self, id: &str) -> Result<PathBuf> {
+        validate_task_id(id)?;
+        Ok(self
+            .queue_dir
+            .join(TERMINAL_HISTORY_DIRECTORY)
+            .join(format!("task-{id}.json")))
+    }
+
+    fn ensure_private_history_directory(&self) -> Result<()> {
+        self.ensure_private_directory()?;
+        let path = self.queue_dir.join(TERMINAL_HISTORY_DIRECTORY);
+        let identity = match self.root.create_dir(&path, 0o700)? {
+            Some(identity) => identity,
+            None => self
+                .root
+                .entry_identity(&path)?
+                .ok_or_else(|| anyhow!("task history directory disappeared"))?,
+        };
+        let entry = self.root.bind_entry(&path, false)?;
+        self.root
+            .validate_private_bound_directory(&entry, identity, 0o700)
+            .context("task history directory must be owner-private")
     }
 
     fn read_private_file(&self, path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
@@ -1038,7 +1077,29 @@ impl DownloadStore {
     fn write_index(&self, index: &StoreIndex) -> Result<()> {
         let mut stored_index = index.clone();
         stored_index.version = INDEX_VERSION;
-        for entry in stored_index.tasks.values_mut() {
+        self.prune_history_index(&mut stored_index);
+        let mut bytes = self.encode_index(&stored_index)?;
+        while bytes.len() > MAX_INDEX_BYTES {
+            let average_entry_bytes = bytes.len() / stored_index.tasks.len().max(1);
+            let excess_bytes = bytes.len() - MAX_INDEX_BYTES;
+            let remove_count = (excess_bytes / average_entry_bytes.max(1) + 1).max(1);
+            let mut removed = 0;
+            while removed < remove_count
+                && self.remove_oldest_history_index_entry(&mut stored_index)
+            {
+                removed += 1;
+            }
+            if removed == 0 {
+                bail!("task queue index exceeds its size limit");
+            }
+            bytes = self.encode_index(&stored_index)?;
+        }
+        self.write_private_file(&self.index_path(), &bytes)
+    }
+
+    fn encode_index(&self, index: &StoreIndex) -> Result<Vec<u8>> {
+        let mut encoded_index = index.clone();
+        for entry in encoded_index.tasks.values_mut() {
             entry.record_path = self.make_relative_index_path(&entry.record_path)?;
             entry.move_target = entry
                 .move_target
@@ -1046,12 +1107,37 @@ impl DownloadStore {
                 .map(|path| self.make_relative_index_path(path))
                 .transpose()?;
         }
-        let bytes =
-            serde_json::to_vec(&stored_index).context("failed to encode task queue index")?;
-        if bytes.len() > MAX_INDEX_BYTES {
-            bail!("task queue index exceeds its size limit");
+        serde_json::to_vec(&encoded_index).context("failed to encode task queue index")
+    }
+
+    fn prune_history_index(&self, index: &mut StoreIndex) {
+        let mut history = index
+            .tasks
+            .iter()
+            .filter(|(_, entry)| self.is_history_index_entry(entry))
+            .map(|(id, entry)| (entry.updated_at, id.clone()))
+            .collect::<Vec<_>>();
+        history.sort();
+        let excess = history.len().saturating_sub(MAX_HISTORY_INDEX_ENTRIES);
+        for (_, id) in history.into_iter().take(excess) {
+            index.tasks.remove(&id);
         }
-        self.write_private_file(&self.index_path(), &bytes)
+    }
+
+    fn remove_oldest_history_index_entry(&self, index: &mut StoreIndex) -> bool {
+        let oldest = index
+            .tasks
+            .iter()
+            .filter(|(_, entry)| self.is_history_index_entry(entry))
+            .min_by(|(left_id, left), (right_id, right)| {
+                (left.updated_at, *left_id).cmp(&(right.updated_at, *right_id))
+            })
+            .map(|(id, _)| id.clone());
+        oldest.is_some_and(|id| index.tasks.remove(&id).is_some())
+    }
+
+    fn is_history_index_entry(&self, entry: &TaskIndexEntry) -> bool {
+        entry.move_target.is_none() && entry.record_path.parent() != Some(self.queue_dir.as_path())
     }
 
     fn resolve_relative_index_path(&self, path: &Path) -> Result<PathBuf> {
@@ -1196,6 +1282,18 @@ impl DownloadStore {
         self.write_record(&entry.record_path, &record)?;
         entry.revision = record.revision;
         entry.updated_at = record.updated_at;
+        if matches!(record.status, TaskStatus::Cancelled | TaskStatus::Completed)
+            && entry.record_path.parent() == Some(self.queue_dir.as_path())
+        {
+            let destination = self.terminal_history_path(&record.id)?;
+            self.ensure_private_history_directory()?;
+            entry.move_target = Some(destination.clone());
+            index.tasks.insert(record.id.clone(), entry.clone());
+            self.write_index(&index)?;
+            self.move_record_to_sidecar(&record.id, &entry.record_path, &destination)?;
+            entry.record_path = destination;
+            entry.move_target = None;
+        }
         index.tasks.insert(record.id.clone(), entry);
         self.write_index(&index)?;
         Ok(record)
@@ -1288,25 +1386,43 @@ impl DownloadStore {
     fn reconcile_move_targets(&self, index: &mut StoreIndex) -> Result<()> {
         let mut changed = false;
         for (id, entry) in &mut index.tasks {
-            if self.root.entry_exists(&entry.record_path)? {
+            let Some(target) = entry.move_target.clone() else {
                 continue;
-            }
-            if let Some(target) = &entry.move_target
-                && self.root.entry_exists(target)?
-            {
-                let Some(record) = self.read_record(target)? else {
+            };
+            let source_exists = self.root.entry_exists(&entry.record_path)?;
+            let target_exists = self.root.entry_exists(&target)?;
+            if source_exists {
+                let Some(source_record) = self.read_record(&entry.record_path)? else {
                     continue;
                 };
-                if record.id != *id {
+                if source_record.id != *id {
                     bail!(
                         "sidecar recovery found a mismatched task ID at {}",
-                        target.display()
+                        entry.record_path.display()
                     );
                 }
-                entry.record_path = target.clone();
-                entry.move_target = None;
-                changed = true;
             }
+            if source_exists && !target_exists {
+                self.move_record_to_sidecar(id, &entry.record_path, &target)?;
+            }
+            if !source_exists && !target_exists {
+                continue;
+            }
+            let Some(record) = self.read_record(&target)? else {
+                continue;
+            };
+            if record.id != *id {
+                bail!(
+                    "sidecar recovery found a mismatched task ID at {}",
+                    target.display()
+                );
+            }
+            if source_exists && target_exists {
+                self.move_record_to_sidecar(id, &entry.record_path, &target)?;
+            }
+            entry.record_path = target;
+            entry.move_target = None;
+            changed = true;
         }
         if changed {
             self.write_index(index)?;
@@ -1693,6 +1809,38 @@ mod tests {
         TaskRecord::new(id.to_string(), 1, 2, 123_456_789, Some(3), 0, job)
     }
 
+    fn spawn_queue_operation_child(
+        root: &Path,
+        operation: &str,
+        slot: &str,
+    ) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("test binary should resolve"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("queue::tests::cross_process_queue_operation_child")
+            .arg("--nocapture")
+            .env("TVD_QUEUE_OPERATION_CHILD_ROOT", root)
+            .env("TVD_QUEUE_OPERATION_CHILD_MODE", operation)
+            .env("TVD_QUEUE_OPERATION_CHILD_SLOT", slot)
+            .spawn()
+            .expect("queue operation child process should start")
+    }
+
+    fn wait_for_child_marker(child: &mut std::process::Child, path: &Path, label: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !path.exists() {
+            if let Some(status) = child.try_wait().expect("child status should read") {
+                panic!("{label} exited before writing its ready marker: {status}");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{label} did not reach its queue operation");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn aliased_video_and_pdf_roots_share_records_and_normalize_canonical_outputs() {
         let temp_root = temp_queue_root("aliased-queue-roots");
@@ -1887,9 +2035,7 @@ mod tests {
 
     #[test]
     fn concurrent_resume_claims_across_processes_start_only_once() {
-        use std::process::Command;
         use std::sync::mpsc::{TryRecvError, sync_channel};
-        use std::time::Instant;
 
         let temp_root = temp_queue_root("concurrent-resume-claims");
         let video_root = temp_root.join("videos");
@@ -1919,33 +2065,18 @@ mod tests {
 
         let first = Arc::new(QueueManager::open(&config).expect("first manager should open"));
         let second = Arc::new(QueueManager::open(&config).expect("second manager should open"));
-        let held_claim_lock = first
+        let mut child = spawn_queue_operation_child(&temp_root, "claim", "child");
+        wait_for_child_marker(
+            &mut child,
+            &temp_root.join("claim-child-ready"),
+            "claim child",
+        );
+        let held_operation_lock = first
             .video
-            .lock_claims()
-            .expect("parent process should lock task claims");
-        let child_ready_path = temp_root.join("resume-child-ready");
-        let child_result_path = temp_root.join("resume-child-result");
-        let mut child = Command::new(std::env::current_exe().expect("test binary should resolve"))
-            .arg("--ignored")
-            .arg("--exact")
-            .arg("queue::tests::cross_process_resume_claim_child")
-            .arg("--nocapture")
-            .env("TVD_QUEUE_CLAIM_CHILD_ROOT", &temp_root)
-            .spawn()
-            .expect("claim child process should start");
-
-        let ready_deadline = Instant::now() + Duration::from_secs(5);
-        while !child_ready_path.exists() {
-            if let Some(status) = child.try_wait().expect("claim child status should read") {
-                panic!("claim child exited before attempting its claim: {status}");
-            }
-            if Instant::now() >= ready_deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("claim child did not reach its cross-process claim");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+            .lock_queue_operations()
+            .expect("parent process should lock queue operations");
+        fs::write(temp_root.join("claim-start"), b"start")
+            .expect("claim start marker should write");
 
         let (claim_tx, claim_rx) = sync_channel(1);
         let second_manager = Arc::clone(&second);
@@ -1963,14 +2094,14 @@ mod tests {
                 .try_wait()
                 .expect("claim child status should read")
                 .is_none(),
-            "a separate process must wait for the task claim lock"
+            "a separate process must wait for the queue operation lock"
         );
         assert!(
             matches!(claim_rx.try_recv(), Err(TryRecvError::Empty)),
-            "a second manager must wait for the task claim lock"
+            "a second manager must wait for the queue operation lock"
         );
 
-        drop(held_claim_lock);
+        drop(held_operation_lock);
         let output = child
             .wait_with_output()
             .expect("claim child output should collect");
@@ -1980,7 +2111,7 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let child_claimed = fs::read(&child_result_path)
+        let child_claimed = fs::read(temp_root.join("claim-child-result"))
             .expect("claim child should persist its result")
             == b"claimed";
         let manager_claimed = claim_rx
@@ -2009,31 +2140,384 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "spawned by concurrent_resume_claims_across_processes_start_only_once"]
-    fn cross_process_resume_claim_child() {
-        let root = PathBuf::from(
-            std::env::var_os("TVD_QUEUE_CLAIM_CHILD_ROOT")
-                .expect("claim child root must be provided by the parent test"),
+    fn concurrent_task_creates_across_processes_start_only_once() {
+        let temp_root = temp_queue_root("concurrent-task-creates");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let mut first = spawn_queue_operation_child(&temp_root, "create", "first");
+        let mut second = spawn_queue_operation_child(&temp_root, "create", "second");
+        wait_for_child_marker(
+            &mut first,
+            &temp_root.join("create-first-ready"),
+            "first create child",
         );
+        wait_for_child_marker(
+            &mut second,
+            &temp_root.join("create-second-ready"),
+            "second create child",
+        );
+
+        let held_operation_lock = queue
+            .video
+            .lock_queue_operations()
+            .expect("parent process should lock queue operations");
+        fs::write(temp_root.join("create-start"), b"start")
+            .expect("create start marker should write");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            first
+                .try_wait()
+                .expect("first create child status should read")
+                .is_none()
+                && second
+                    .try_wait()
+                    .expect("second create child status should read")
+                    .is_none(),
+            "both task creators must wait for the queue operation lock"
+        );
+        assert!(
+            !temp_root.join("create-first-result").exists()
+                && !temp_root.join("create-second-result").exists(),
+            "task create results must not be written while another process owns the lock"
+        );
+
+        drop(held_operation_lock);
+        for (slot, child) in [("first", first), ("second", second)] {
+            let output = child
+                .wait_with_output()
+                .expect("create child output should collect");
+            assert!(
+                output.status.success(),
+                "{slot} create child failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let created = ["first", "second"]
+            .iter()
+            .filter(|slot| {
+                fs::read(temp_root.join(format!("create-{slot}-result")))
+                    .expect("create child result should exist")
+                    == b"created"
+            })
+            .count();
+        assert_eq!(created, 1, "only one process may create a task ID");
+        assert!(
+            queue
+                .get("task-concurrent-create-1")
+                .expect("created task should load")
+                .is_some(),
+            "the single winning create should persist a task record"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    #[ignore = "spawned by cross-process queue operation tests"]
+    fn cross_process_queue_operation_child() {
+        use std::time::Instant;
+
+        let root = PathBuf::from(
+            std::env::var_os("TVD_QUEUE_OPERATION_CHILD_ROOT")
+                .expect("queue operation child root must be provided by the parent test"),
+        );
+        let operation = std::env::var("TVD_QUEUE_OPERATION_CHILD_MODE")
+            .expect("queue operation child mode must be provided");
+        let slot = std::env::var("TVD_QUEUE_OPERATION_CHILD_SLOT")
+            .expect("queue operation child slot must be provided");
         let mut config = AppConfig::for_test();
         config.downloads.video_dir = root.join("videos");
         config.downloads.pdf_dir = root.join("pdfs");
         let queue = QueueManager::open(&config).expect("child queue should open");
-        fs::write(root.join("resume-child-ready"), b"ready")
-            .expect("claim child ready marker should write");
-        let claimed = queue
-            .claim_resume("task-concurrent-resume-1", false)
-            .expect("child claim should complete")
-            .is_some();
+        fs::write(root.join(format!("{operation}-{slot}-ready")), b"ready")
+            .expect("queue operation child ready marker should write");
+        let start_path = root.join(format!("{operation}-start"));
+        let start_deadline = Instant::now() + Duration::from_secs(5);
+        while !start_path.exists() {
+            assert!(
+                Instant::now() < start_deadline,
+                "parent should release the {operation} child barrier"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let result = match operation.as_str() {
+            "claim" => queue
+                .claim_resume("task-concurrent-resume-1", false)
+                .expect("child claim should complete")
+                .is_some(),
+            "create" => queue
+                .create(test_task(
+                    "task-concurrent-create-1",
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("child create should complete"),
+            _ => panic!("unsupported queue operation child mode {operation}"),
+        };
         fs::write(
-            root.join("resume-child-result"),
-            if claimed {
+            root.join(format!("{operation}-{slot}-result")),
+            if operation == "create" {
+                if result {
+                    &b"created"[..]
+                } else {
+                    &b"existing"[..]
+                }
+            } else if result {
                 &b"claimed"[..]
             } else {
                 &b"not-claimed"[..]
             },
         )
-        .expect("claim child result should write");
+        .expect("queue operation child result should write");
+    }
+
+    #[test]
+    fn completed_history_index_keeps_recent_entries_without_deleting_sidecars() {
+        let temp_root = temp_queue_root("bounded-completed-history-index");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        let published_root = video_root.join("published");
+        fs::create_dir_all(&published_root).expect("published directory should create");
+        let oldest_sidecar =
+            published_root.join(".telegram-video-downloader-task-completed-00000.json");
+        fs::write(&oldest_sidecar, b"retained historical task record")
+            .expect("oldest sidecar should write");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let mut index = StoreIndex {
+            version: INDEX_VERSION,
+            ..StoreIndex::default()
+        };
+        for number in 0..(MAX_HISTORY_INDEX_ENTRIES + 3) {
+            let id = format!("completed-{number:05}");
+            let record_path = if number == 0 {
+                oldest_sidecar.clone()
+            } else {
+                published_root.join(format!(".telegram-video-downloader-task-{id}.json"))
+            };
+            index.tasks.insert(
+                id,
+                TaskIndexEntry {
+                    chat_id: 123_456_789,
+                    record_path,
+                    move_target: None,
+                    revision: 1,
+                    updated_at: number as u64,
+                },
+            );
+        }
+        let active_id = "task-old-but-active";
+        index.tasks.insert(
+            active_id.to_string(),
+            TaskIndexEntry {
+                chat_id: 123_456_789,
+                record_path: queue
+                    .video
+                    .task_path(active_id)
+                    .expect("active task path should resolve"),
+                move_target: None,
+                revision: 1,
+                updated_at: 0,
+            },
+        );
+
+        queue
+            .video
+            .write_index(&index)
+            .expect("history index should remain bounded");
+        let stored = queue
+            .video
+            .read_index()
+            .expect("bounded task queue index should read");
+        assert_eq!(stored.tasks.len(), MAX_HISTORY_INDEX_ENTRIES + 1);
+        assert!(!stored.tasks.contains_key("completed-00000"));
+        assert!(!stored.tasks.contains_key("completed-00001"));
+        assert!(!stored.tasks.contains_key("completed-00002"));
+        assert!(stored.tasks.contains_key("completed-00003"));
+        assert!(
+            stored
+                .tasks
+                .contains_key(&format!("completed-{:05}", MAX_HISTORY_INDEX_ENTRIES + 2))
+        );
+        assert!(stored.tasks.contains_key(active_id));
+        assert!(
+            oldest_sidecar.is_file(),
+            "pruning must retain the sidecar file"
+        );
+        assert!(
+            fs::metadata(video_root.join(QUEUE_DIRECTORY).join(INDEX_FILE))
+                .expect("bounded index metadata should read")
+                .len()
+                <= MAX_INDEX_BYTES as u64
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn cancelled_task_moves_to_private_history_and_survives_restart() {
+        let temp_root = temp_queue_root("cancelled-task-private-history");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-cancelled-private-history";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+
+        let cancelled = queue
+            .cancel(id, 123_456_789)
+            .expect("task cancellation should persist")
+            .expect("received task should be cancellable");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        let source_path = queue
+            .video
+            .task_path(id)
+            .expect("active task path should resolve");
+        let history_path = queue
+            .video
+            .terminal_history_path(id)
+            .expect("history task path should resolve");
+        assert!(
+            !source_path.exists(),
+            "terminal record should leave active queue"
+        );
+        assert!(
+            history_path.is_file(),
+            "terminal record should be retained in history"
+        );
+        assert_eq!(
+            queue
+                .video
+                .read_index()
+                .expect("queue index should read")
+                .tasks[id]
+                .record_path,
+            history_path
+        );
+
+        drop(queue);
+        let reopened = QueueManager::open(&config).expect("task queue should reopen");
+        let recovered = reopened
+            .get(id)
+            .expect("cancelled task should load")
+            .expect("cancelled task should remain indexed");
+        assert_eq!(recovered.status, TaskStatus::Cancelled);
+        assert!(
+            history_path.is_file(),
+            "restart recovery must retain history file"
+        );
+
+        drop(reopened);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn interrupted_terminal_history_move_recovers_on_restart() {
+        let temp_root = temp_queue_root("interrupted-terminal-history-move");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root;
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-interrupted-terminal-history-move";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        let (mut record, mut entry) = queue
+            .video
+            .get_task(id)
+            .expect("task should load")
+            .expect("task should exist");
+        record.status = TaskStatus::Cancelled;
+        record.cancel_requested = false;
+        record.revision = record.revision.saturating_add(1);
+        let destination = queue
+            .video
+            .terminal_history_path(id)
+            .expect("history task path should resolve");
+        queue
+            .video
+            .ensure_private_history_directory()
+            .expect("private history directory should exist");
+        queue
+            .video
+            .write_record(&entry.record_path, &record)
+            .expect("terminal task record should persist before migration");
+        entry.move_target = Some(destination.clone());
+        entry.revision = record.revision;
+        entry.updated_at = record.updated_at;
+        queue
+            .video
+            .save_index_task(id, entry.clone())
+            .expect("move intent should persist before migration");
+
+        drop(queue);
+        let reopened = QueueManager::open(&config).expect("interrupted move should recover");
+        let recovered = reopened
+            .get(id)
+            .expect("cancelled task should load")
+            .expect("cancelled task should remain indexed");
+        assert_eq!(recovered.status, TaskStatus::Cancelled);
+        assert!(
+            !entry.record_path.exists(),
+            "recovery should clear active record"
+        );
+        assert!(
+            destination.is_file(),
+            "recovery should finish history migration"
+        );
+        assert_eq!(
+            reopened
+                .video
+                .read_index()
+                .expect("queue index should read")
+                .tasks[id]
+                .move_target,
+            None
+        );
+
+        drop(reopened);
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     #[test]
