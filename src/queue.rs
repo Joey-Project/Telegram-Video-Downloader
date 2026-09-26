@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -166,8 +168,10 @@ struct ChatActivity {
     notified_revision: u64,
 }
 
+#[derive(Clone)]
 struct DownloadStore {
     root_path: PathBuf,
+    root_aliases: Vec<PathBuf>,
     root: RootedFs,
     queue_dir: PathBuf,
     queue_identity: EntryIdentity,
@@ -178,6 +182,8 @@ pub struct QueueManager {
     pdf: DownloadStore,
     operation_lock: Mutex<()>,
     cancellations: Mutex<HashMap<String, Arc<Notify>>>,
+    #[cfg(test)]
+    interrupt_after_sidecar_move: AtomicBool,
 }
 
 impl TaskRecord {
@@ -229,11 +235,25 @@ impl TaskRecord {
 
 impl QueueManager {
     pub fn open(config: &AppConfig) -> Result<Self> {
+        let mut video = DownloadStore::new(&config.downloads.video_dir)?;
+        let pdf_root = RootedFs::new(&config.downloads.pdf_dir)?;
+        pdf_root.validate_configured_root()?;
+        let pdf = if video.root.root_identity() == pdf_root.root_identity() {
+            let pdf_alias = pdf_root.logical_root_path().to_path_buf();
+            if !video.root_aliases.contains(&pdf_alias) {
+                video.root_aliases.push(pdf_alias);
+            }
+            video.clone()
+        } else {
+            DownloadStore::from_root(pdf_root)?
+        };
         let manager = Self {
-            video: DownloadStore::new(&config.downloads.video_dir)?,
-            pdf: DownloadStore::new(&config.downloads.pdf_dir)?,
+            video,
+            pdf,
             operation_lock: Mutex::new(()),
             cancellations: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            interrupt_after_sidecar_move: AtomicBool::new(false),
         };
         manager.recover_interrupted_tasks()?;
         Ok(manager)
@@ -257,7 +277,7 @@ impl QueueManager {
     pub fn list(&self, chat_id: i64, history: bool, page: usize) -> Result<Vec<TaskRecord>> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         let mut records = self.video.list_records()?;
-        if self.video.root_path != self.pdf.root_path {
+        if !self.video.shares_root(&self.pdf) {
             records.extend(self.pdf.list_records()?);
         }
         records.retain(|record| {
@@ -280,7 +300,7 @@ impl QueueManager {
     pub fn page_count(&self, chat_id: i64, history: bool) -> Result<usize> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         let mut records = self.video.list_records()?;
-        if self.video.root_path != self.pdf.root_path {
+        if !self.video.shares_root(&self.pdf) {
             records.extend(self.pdf.list_records()?);
         }
         let count = records
@@ -496,12 +516,11 @@ impl QueueManager {
         if record.status != TaskStatus::Verifying {
             bail!("task {id} changed state before output verification completed");
         }
-        for path in media_paths {
-            if !path.starts_with(&store.root_path) {
-                bail!("published media path is outside its configured download root");
-            }
-        }
-        record.status = TaskStatus::Verifying;
+        let media_paths = media_paths
+            .iter()
+            .map(|path| store.normalize_media_path(path))
+            .collect::<Result<Vec<_>>>()?;
+        record.status = TaskStatus::Completed;
         record.error = None;
         record.saved_location = Some(saved_location);
         record.primary_media_hashes = hashes;
@@ -513,13 +532,8 @@ impl QueueManager {
             record.media_entries_failed = 0;
         }
         let record_path = entry.record_path.clone();
-        store.write_record(&record_path, &record)?;
-        entry.revision = record.revision;
-        entry.updated_at = record.updated_at;
-
-        let destination = sidecar_destination(&store.root_path, &record, media_paths)?;
+        let destination = sidecar_destination(&store.root_path, &record, &media_paths)?;
         let Some(destination) = destination else {
-            record.status = TaskStatus::Completed;
             return store.save_mutated_record(record, entry, true);
         };
         record.updated_at = unix_time();
@@ -530,9 +544,12 @@ impl QueueManager {
         store.write_record(&record_path, &record)?;
         store.save_index_task(id, entry.clone())?;
         store.move_record_to_sidecar(id, &record_path, &destination)?;
+        #[cfg(test)]
+        if self.interrupt_after_sidecar_move.load(Ordering::Relaxed) {
+            bail!("simulated interruption after task sidecar migration");
+        }
         entry.record_path = destination;
         entry.move_target = None;
-        record.status = TaskStatus::Completed;
         store.save_mutated_record(record, entry, true)
     }
 
@@ -583,7 +600,7 @@ impl QueueManager {
         let video = self.video.restart_summary_data()?;
         let pdf = self.pdf.restart_summary_data()?;
         let mut summaries = BTreeMap::<i64, RestartSummary>::new();
-        let data = if self.video.root_path == self.pdf.root_path {
+        let data = if self.video.shares_root(&self.pdf) {
             vec![video]
         } else {
             vec![video, pdf]
@@ -637,7 +654,7 @@ impl QueueManager {
     pub fn mark_restart_summary_sent(&self, chat_id: i64) -> Result<()> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         self.video.mark_notified(chat_id)?;
-        if self.video.root_path != self.pdf.root_path {
+        if !self.video.shares_root(&self.pdf) {
             self.pdf.mark_notified(chat_id)?;
         }
         Ok(())
@@ -683,7 +700,7 @@ impl QueueManager {
     }
 
     fn recover_interrupted_tasks(&self) -> Result<()> {
-        let stores = if self.video.root_path == self.pdf.root_path {
+        let stores = if self.video.shares_root(&self.pdf) {
             vec![&self.video]
         } else {
             vec![&self.video, &self.pdf]
@@ -741,7 +758,10 @@ pub fn hash_primary_media(
 
 impl DownloadStore {
     fn new(root_path: &Path) -> Result<Self> {
-        let root = RootedFs::new(root_path)?;
+        Self::from_root(RootedFs::new(root_path)?)
+    }
+
+    fn from_root(root: RootedFs) -> Result<Self> {
         root.validate_configured_root()?;
         let queue_dir = root.logical_root_path().join(QUEUE_DIRECTORY);
         let identity = root.create_dir(&queue_dir, 0o700)?;
@@ -754,8 +774,10 @@ impl DownloadStore {
         let queue_entry = root.bind_entry(&queue_dir, false)?;
         root.validate_private_bound_directory(&queue_entry, queue_identity, 0o700)
             .context("task queue directory must be owner-private")?;
+        let root_path = root.logical_root_path().to_path_buf();
         let store = Self {
-            root_path: root.logical_root_path().to_path_buf(),
+            root_path: root_path.clone(),
+            root_aliases: vec![root_path],
             root,
             queue_dir,
             queue_identity,
@@ -774,6 +796,29 @@ impl DownloadStore {
         }
         store.reconcile_index()?;
         Ok(store)
+    }
+
+    fn shares_root(&self, other: &Self) -> bool {
+        self.root.root_identity() == other.root.root_identity()
+    }
+
+    fn normalize_media_path(&self, path: &Path) -> Result<PathBuf> {
+        let relative = self
+            .root_aliases
+            .iter()
+            .find_map(|root| path.strip_prefix(root).ok())
+            .or_else(|| path.strip_prefix(self.root.root_path()).ok())
+            .ok_or_else(|| {
+                anyhow!("published media path is outside its configured download root")
+            })?;
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            bail!("published media path is not a file within its configured download root");
+        }
+        Ok(self.root_path.join(relative))
     }
 
     fn ensure_private_directory(&self) -> Result<()> {
@@ -1382,4 +1427,199 @@ fn unix_time() -> u64 {
 
 fn poisoned_lock<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
     anyhow!("persistent task queue lock was poisoned")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    fn temp_queue_root(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("telegram-video-downloader-{label}-{unique}"))
+    }
+
+    fn test_task(id: &str, job: JobRequest) -> TaskRecord {
+        TaskRecord::new(id.to_string(), 1, 2, 123_456_789, Some(3), 0, job)
+    }
+
+    #[test]
+    fn aliased_video_and_pdf_roots_share_records_and_normalize_canonical_outputs() {
+        let temp_root = temp_queue_root("aliased-queue-roots");
+        let physical_root = temp_root.join("physical");
+        let video_alias = temp_root.join("video");
+        let pdf_alias = temp_root.join("pdf");
+        fs::create_dir_all(&physical_root).expect("physical download root should create");
+        symlink(&physical_root, &video_alias).expect("video root alias should create");
+        symlink(&physical_root, &pdf_alias).expect("PDF root alias should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_alias;
+        config.downloads.pdf_dir = pdf_alias;
+        let queue = QueueManager::open(&config).expect("aliased queue roots should open");
+
+        let tasks = [
+            (
+                "task-pdf-alias-1",
+                "pdf-output.pdf",
+                JobRequest::Pdf {
+                    url: "https://example.invalid/document.pdf".to_string(),
+                },
+            ),
+            (
+                "task-bilibili-alias-1",
+                "collection-output.mp4",
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV1234567890".to_string(),
+                    selection: None,
+                },
+            ),
+        ];
+        for (id, filename, job) in tasks {
+            assert!(
+                queue
+                    .create(test_task(id, job))
+                    .expect("task should persist")
+            );
+            queue
+                .set_status(id, TaskStatus::Running, None)
+                .expect("task should start");
+            queue
+                .begin_verification(id)
+                .expect("verification should begin")
+                .expect("task should still exist");
+
+            let media_path = physical_root.join(filename);
+            fs::write(&media_path, b"verified media")
+                .expect("published media fixture should write");
+            let canonical_media_path =
+                fs::canonicalize(&media_path).expect("published media path should canonicalize");
+            queue
+                .complete(
+                    id,
+                    canonical_media_path.display().to_string(),
+                    std::slice::from_ref(&canonical_media_path),
+                    BTreeMap::new(),
+                )
+                .expect("PDF and collection outputs should complete from canonical paths");
+        }
+
+        assert!(
+            queue
+                .list(123_456_789, false, 0)
+                .expect("active queue should load")
+                .is_empty()
+        );
+        let history = queue
+            .list(123_456_789, true, 0)
+            .expect("history should load from the shared store");
+        assert_eq!(
+            history.len(),
+            2,
+            "shared queue records must not be duplicated"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|record| record.status == TaskStatus::Completed)
+        );
+        assert_eq!(
+            queue
+                .page_count(123_456_789, true)
+                .expect("page count should load"),
+            1
+        );
+
+        drop(queue);
+        let reopened = QueueManager::open(&config).expect("aliased queue should reopen");
+        assert_eq!(
+            reopened
+                .list(123_456_789, true, 0)
+                .expect("reopened history should load")
+                .len(),
+            2
+        );
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn completed_task_survives_restart_after_sidecar_move() {
+        let temp_root = temp_queue_root("completed-sidecar-recovery");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-sidecar-recovery-1";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Running, None)
+            .expect("task should start");
+        queue
+            .begin_verification(id)
+            .expect("verification should begin")
+            .expect("task should still exist");
+
+        let media_dir = video_root.join("completed");
+        fs::create_dir_all(&media_dir).expect("media directory should create");
+        let media_path = media_dir.join("output.mp4");
+        fs::write(&media_path, b"verified media").expect("media fixture should write");
+        queue
+            .interrupt_after_sidecar_move
+            .store(true, Ordering::Relaxed);
+        let error = queue
+            .complete(
+                id,
+                media_path.display().to_string(),
+                std::slice::from_ref(&media_path),
+                BTreeMap::new(),
+            )
+            .expect_err("the simulated process stop should interrupt completion");
+        assert!(
+            error
+                .to_string()
+                .contains("simulated interruption after task sidecar migration")
+        );
+        drop(queue);
+
+        let reopened = QueueManager::open(&config).expect("queue should recover after restart");
+        let recovered = reopened
+            .get(id)
+            .expect("recovered task should load")
+            .expect("recovered task should exist");
+        assert_eq!(recovered.status, TaskStatus::Completed);
+        assert_eq!(
+            reopened
+                .list(123_456_789, true, 0)
+                .expect("history should load")
+                .len(),
+            1
+        );
+        assert!(
+            reopened
+                .list(123_456_789, false, 0)
+                .expect("active queue should load")
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(temp_root);
+    }
 }
