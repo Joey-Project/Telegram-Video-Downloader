@@ -20,7 +20,9 @@ use crate::safe_fs::{EntryIdentity, RootedFs};
 
 const QUEUE_DIRECTORY: &str = ".telegram-video-downloader-queue";
 const INDEX_FILE: &str = "index.json";
-const STORE_VERSION: u32 = 1;
+const LEGACY_INDEX_VERSION: u32 = 1;
+const INDEX_VERSION: u32 = 2;
+const TASK_RECORD_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_RECORDS: usize = 20_000;
@@ -116,6 +118,8 @@ pub struct TaskRecord {
     pub url_was_sanitized: bool,
     pub job: JobRequest,
     pub status: TaskStatus,
+    #[serde(default)]
+    pub cancel_requested: bool,
     pub plan: Option<PlanValidationSnapshot>,
     pub proposed_plan: Option<PlanValidationSnapshot>,
     pub saved_location: Option<String>,
@@ -143,7 +147,7 @@ pub struct RestartSummary {
     pub failed_entries: usize,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StoreIndex {
     version: u32,
     #[serde(default)]
@@ -203,7 +207,7 @@ impl TaskRecord {
         };
         let now = unix_time();
         Self {
-            schema_version: STORE_VERSION,
+            schema_version: TASK_RECORD_VERSION,
             id,
             update_id,
             message_id,
@@ -215,6 +219,7 @@ impl TaskRecord {
             url_was_sanitized: false,
             job,
             status: TaskStatus::Received,
+            cancel_requested: false,
             plan: None,
             proposed_plan: None,
             saved_location: None,
@@ -339,6 +344,7 @@ impl QueueManager {
             return Ok(None);
         }
         record.status = TaskStatus::Preparing;
+        record.cancel_requested = false;
         record.error = None;
         record.user_actions = record.user_actions.saturating_add(1);
         store.save_mutated_record(record, entry, true).map(Some)
@@ -354,6 +360,7 @@ impl QueueManager {
             record.url_was_sanitized |= url_was_sanitized;
             record.job = job;
             record.status = status;
+            record.cancel_requested = false;
             record.error = None;
             Ok(())
         })
@@ -373,6 +380,12 @@ impl QueueManager {
                 bail!("task {id} is already complete");
             }
             record.status = status;
+            if !matches!(
+                status,
+                TaskStatus::Running | TaskStatus::AwaitingConfirmation
+            ) {
+                record.cancel_requested = false;
+            }
             record.error = error;
             Ok(())
         })
@@ -387,6 +400,7 @@ impl QueueManager {
             return Ok(false);
         }
         record.status = TaskStatus::Running;
+        record.cancel_requested = false;
         record.error = None;
         store.save_mutated_record(record, entry, true)?;
         Ok(true)
@@ -401,6 +415,7 @@ impl QueueManager {
             return Ok(None);
         }
         record.status = TaskStatus::Verifying;
+        record.cancel_requested = false;
         store.save_mutated_record(record, entry, true).map(Some)
     }
 
@@ -448,6 +463,7 @@ impl QueueManager {
         };
         record.plan = Some(plan);
         record.status = TaskStatus::Preparing;
+        record.cancel_requested = false;
         record.user_actions = record.user_actions.saturating_add(1);
         store.save_mutated_record(record, entry, true).map(Some)
     }
@@ -533,6 +549,7 @@ impl QueueManager {
         }
         let record_path = entry.record_path.clone();
         let destination = sidecar_destination(&store.root_path, &record, &media_paths)?;
+        record.cancel_requested = false;
         let Some(destination) = destination else {
             return store.save_mutated_record(record, entry, true);
         };
@@ -559,6 +576,7 @@ impl QueueManager {
                 bail!("task {id} is already terminal");
             }
             record.status = TaskStatus::Failed;
+            record.cancel_requested = false;
             record.error = Some(message);
             if record.media_entries_total <= 1 && record.media_entries_completed == 0 {
                 record.media_entries_failed = 1;
@@ -578,13 +596,41 @@ impl QueueManager {
         {
             return Ok(None);
         }
+        if record.status == TaskStatus::Running {
+            record.cancel_requested = true;
+            record.user_actions = record.user_actions.saturating_add(1);
+            let result = store.save_mutated_record(record, entry, false)?;
+            drop(_guard);
+            self.notify_cancel(id)?;
+            return Ok(Some(result));
+        }
         record.status = TaskStatus::Cancelled;
+        record.cancel_requested = false;
         record.error = None;
         record.user_actions = record.user_actions.saturating_add(1);
         let result = store.save_mutated_record(record, entry, true)?;
         drop(_guard);
         self.notify_cancel(id)?;
         Ok(Some(result))
+    }
+
+    pub fn finish_cancellation(&self, id: &str) -> Result<Option<TaskRecord>> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
+            return Ok(None);
+        };
+        if !record.cancel_requested
+            || !matches!(
+                record.status,
+                TaskStatus::Running | TaskStatus::AwaitingConfirmation
+            )
+        {
+            return Ok(None);
+        }
+        record.status = TaskStatus::Cancelled;
+        record.cancel_requested = false;
+        record.error = None;
+        store.save_mutated_record(record, entry, true).map(Some)
     }
 
     pub fn cancel_for_chat(&self, id: &str, chat_id: i64) -> Result<Option<TaskRecord>> {
@@ -713,6 +759,7 @@ impl QueueManager {
                     };
                     record = current;
                     record.status = TaskStatus::Interrupted;
+                    record.cancel_requested = false;
                     record.error = Some("Task was interrupted by process restart.".to_string());
                     store.save_mutated_record(record, entry, true)?;
                 }
@@ -789,7 +836,7 @@ impl DownloadStore {
             store.write_private_file(
                 &store.index_path(),
                 &serde_json::to_vec(&StoreIndex {
-                    version: STORE_VERSION,
+                    version: INDEX_VERSION,
                     ..StoreIndex::default()
                 })?,
             )?;
@@ -886,20 +933,101 @@ impl DownloadStore {
         let bytes = self
             .read_private_file(&self.index_path(), MAX_INDEX_BYTES)?
             .ok_or_else(|| anyhow!("task queue index is missing"))?;
-        let index: StoreIndex =
+        let mut index: StoreIndex =
             serde_json::from_slice(&bytes).context("invalid task queue index")?;
-        if index.version != STORE_VERSION {
-            bail!("unsupported task queue index version {}", index.version);
+        match index.version {
+            INDEX_VERSION => {
+                for entry in index.tasks.values_mut() {
+                    entry.record_path = self.resolve_relative_index_path(&entry.record_path)?;
+                    entry.move_target = entry
+                        .move_target
+                        .as_deref()
+                        .map(|path| self.resolve_relative_index_path(path))
+                        .transpose()?;
+                }
+            }
+            LEGACY_INDEX_VERSION => {
+                for entry in index.tasks.values_mut() {
+                    entry.record_path = self.resolve_legacy_index_path(&entry.record_path)?;
+                    entry.move_target = entry
+                        .move_target
+                        .as_deref()
+                        .map(|path| self.resolve_legacy_index_path(path))
+                        .transpose()?;
+                }
+                index.version = INDEX_VERSION;
+            }
+            version => bail!("unsupported task queue index version {version}"),
         }
         Ok(index)
     }
 
     fn write_index(&self, index: &StoreIndex) -> Result<()> {
-        let bytes = serde_json::to_vec(index).context("failed to encode task queue index")?;
+        let mut stored_index = index.clone();
+        stored_index.version = INDEX_VERSION;
+        for entry in stored_index.tasks.values_mut() {
+            entry.record_path = self.make_relative_index_path(&entry.record_path)?;
+            entry.move_target = entry
+                .move_target
+                .as_deref()
+                .map(|path| self.make_relative_index_path(path))
+                .transpose()?;
+        }
+        let bytes =
+            serde_json::to_vec(&stored_index).context("failed to encode task queue index")?;
         if bytes.len() > MAX_INDEX_BYTES {
             bail!("task queue index exceeds its size limit");
         }
         self.write_private_file(&self.index_path(), &bytes)
+    }
+
+    fn resolve_relative_index_path(&self, path: &Path) -> Result<PathBuf> {
+        validate_root_relative_index_path(path)?;
+        Ok(self.root_path.join(path))
+    }
+
+    fn resolve_legacy_index_path(&self, path: &Path) -> Result<PathBuf> {
+        if !path.is_absolute() {
+            bail!("legacy task queue index path is not absolute");
+        }
+        let relative = if let Ok(relative) = path.strip_prefix(&self.root_path) {
+            relative.to_path_buf()
+        } else {
+            let parent = path
+                .parent()
+                .ok_or_else(|| anyhow!("legacy task queue index path has no parent"))?;
+            // Only migrate aliases whose parent resolves inside the root bound by RootedFs.
+            self.root.validate_configured_root()?;
+            let canonical_parent = std::fs::canonicalize(parent).with_context(|| {
+                format!("failed to resolve legacy queue path {}", path.display())
+            })?;
+            self.root.validate_configured_root()?;
+            let relative_parent = canonical_parent
+                .strip_prefix(self.root.root_path())
+                .with_context(|| {
+                    format!(
+                        "legacy queue path is outside the configured download root: {}",
+                        path.display()
+                    )
+                })?;
+            relative_parent.join(
+                path.file_name()
+                    .ok_or_else(|| anyhow!("legacy task queue index path has no filename"))?,
+            )
+        };
+        validate_root_relative_index_path(&relative)?;
+        Ok(self.root_path.join(relative))
+    }
+
+    fn make_relative_index_path(&self, path: &Path) -> Result<PathBuf> {
+        let relative = path.strip_prefix(&self.root_path).with_context(|| {
+            format!(
+                "task queue index path is outside the configured download root: {}",
+                path.display()
+            )
+        })?;
+        validate_root_relative_index_path(relative)?;
+        Ok(relative.to_path_buf())
     }
 
     fn read_record(&self, path: &Path) -> Result<Option<TaskRecord>> {
@@ -908,7 +1036,7 @@ impl DownloadStore {
         };
         let record: TaskRecord = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid task queue record {}", path.display()))?;
-        if record.schema_version != STORE_VERSION {
+        if record.schema_version != TASK_RECORD_VERSION {
             bail!("unsupported task record version for task {}", record.id);
         }
         Ok(Some(record))
@@ -1346,6 +1474,18 @@ fn validate_task_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_root_relative_index_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        bail!("task queue index path must be root-relative");
+    }
+    Ok(())
+}
+
 pub fn sanitize_job_for_storage(job: JobRequest) -> (JobRequest, bool) {
     match job {
         JobRequest::Bilibili { url, selection } => {
@@ -1433,7 +1573,7 @@ fn poisoned_lock<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
 mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -1545,6 +1685,169 @@ mod tests {
                 .len(),
             2
         );
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn legacy_absolute_record_path_migrates_across_root_alias_restart() {
+        let temp_root = temp_queue_root("legacy-index-alias-migration");
+        let video_root = temp_root.join("videos");
+        let video_alias = temp_root.join("video-alias");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        symlink(&video_root, &video_alias).expect("video root alias should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-legacy-index-alias-1";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Running, None)
+            .expect("task should start");
+        queue
+            .begin_verification(id)
+            .expect("verification should begin")
+            .expect("task should still exist");
+
+        let media_dir = video_root.join("completed");
+        fs::create_dir_all(&media_dir).expect("media directory should create");
+        let media_path = media_dir.join("output.mp4");
+        fs::write(&media_path, b"verified media").expect("media fixture should write");
+        queue
+            .complete(
+                id,
+                media_path.display().to_string(),
+                std::slice::from_ref(&media_path),
+                BTreeMap::new(),
+            )
+            .expect("task should complete");
+
+        let index_path = video_root.join(QUEUE_DIRECTORY).join(INDEX_FILE);
+        let mut legacy_index: serde_json::Value = serde_json::from_slice(
+            &fs::read(&index_path).expect("task queue index should be readable"),
+        )
+        .expect("task queue index should be valid JSON");
+        legacy_index["version"] = serde_json::json!(LEGACY_INDEX_VERSION);
+        legacy_index["tasks"][id]["record_path"] = serde_json::json!(
+            media_dir
+                .join(format!(".telegram-video-downloader-task-{id}.json"))
+                .display()
+                .to_string()
+        );
+        fs::write(
+            &index_path,
+            serde_json::to_vec(&legacy_index).expect("legacy index should encode"),
+        )
+        .expect("legacy queue index should write");
+        drop(queue);
+
+        config.downloads.video_dir = video_alias.clone();
+        let reopened = QueueManager::open(&config)
+            .expect("legacy index should migrate through the configured root alias");
+        let recovered = reopened
+            .get(id)
+            .expect("migrated task should load")
+            .expect("migrated task should exist");
+        assert_eq!(recovered.status, TaskStatus::Completed);
+
+        let migrated_index: serde_json::Value = serde_json::from_slice(
+            &fs::read(video_alias.join(QUEUE_DIRECTORY).join(INDEX_FILE))
+                .expect("migrated queue index should be readable"),
+        )
+        .expect("migrated queue index should be valid JSON");
+        assert_eq!(migrated_index["version"], INDEX_VERSION);
+        let stored_path = migrated_index["tasks"][id]["record_path"]
+            .as_str()
+            .expect("record path should be serialized as a string");
+        assert!(!Path::new(stored_path).is_absolute());
+        assert_eq!(
+            stored_path,
+            "completed/.telegram-video-downloader-task-task-legacy-index-alias-1.json"
+        );
+
+        drop(reopened);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn running_cancel_request_does_not_block_published_output_completion() {
+        let temp_root = temp_queue_root("running-cancel-verification");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-running-cancel-1";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Queued, None)
+            .expect("task should queue");
+        assert!(queue.begin_run(id).expect("task should begin running"));
+        let media_dir = video_root.join("completed");
+        fs::create_dir_all(&media_dir).expect("media directory should create");
+        let media_path = media_dir.join("output.mp4");
+        fs::write(&media_path, b"verified media").expect("media fixture should write");
+        let cancel = queue
+            .register_cancellation(id)
+            .expect("cancellation should register");
+
+        let requested = queue
+            .cancel_for_chat(id, 123_456_789)
+            .expect("cancellation request should persist")
+            .expect("running task should accept cancellation request");
+        assert_eq!(requested.status, TaskStatus::Running);
+        tokio::time::timeout(Duration::from_secs(1), cancel.notified())
+            .await
+            .expect("running task should receive cancellation");
+
+        let verifying = queue
+            .begin_verification(id)
+            .expect("published result should enter verification")
+            .expect("running task should still exist");
+        assert_eq!(verifying.status, TaskStatus::Verifying);
+        let completed = queue
+            .complete(
+                id,
+                media_path.display().to_string(),
+                std::slice::from_ref(&media_path),
+                BTreeMap::new(),
+            )
+            .expect("published output should complete despite the late cancellation request");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert!(
+            queue
+                .finish_cancellation(id)
+                .expect("completed task should not be canceled")
+                .is_none()
+        );
+
+        let _ = queue.unregister_cancellation(id);
+        drop(queue);
         let _ = fs::remove_dir_all(temp_root);
     }
 

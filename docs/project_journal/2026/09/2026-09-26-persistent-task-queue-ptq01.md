@@ -5,7 +5,7 @@ status: completed
 created: 2026-09-26
 updated: 2026-09-26
 branch: wip/persistent-task-queue
-pr:
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/20
 supersedes: []
 superseded_by:
 ---
@@ -25,6 +25,9 @@ superseded_by:
 - SHA-256 校验会拒绝缺失、被替换、非普通文件、空文件或大小变化的输出。Unix 上检测到元数据时间戳变化时会再次计算内容哈希；只有内容哈希不同或文件身份/大小变化时才拒绝文件。
 - 持久记录通过 `/queue` 支持恢复、失败重试、取消和历史分页；恢复前会重新验证任务计划和已发布媒体。
 - 完成状态在 sidecar 迁移前持久化；视频与 PDF 根目录指向同一目录对象时共用队列，并把规范化媒体路径映射回配置路径。
+- 队列索引 v2 使用相对下载根目录的记录路径，迁移旧版绝对路径，并支持通过同一根目录的符号链接别名重启。
+- 运行中取消先记录为请求；若下载结果已就绪，则优先验证已发布文件，再决定完成状态。
+- `/queue` 限制每个 URL 预览，并把完整消息限制在 3,500 个 UTF-16 单元以内。
 - 失败、取消和未决视频尝试永久保留在下载根目录下的隐藏私有 staging 目录中。
 
 ## 后续事项
@@ -33,5 +36,5 @@ superseded_by:
 ## 检查记录
 - 已检查 `src/queue.rs`、`src/main.rs`、`src/downloader.rs`、`src/safe_fs.rs`、`src/telegram.rs` 和 `src/router.rs` 的相关实现。
 - `cargo fmt --all --check`、`cargo build --quiet`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all-targets --quiet` 和 `git diff --check` 均通过。
-- 全量测试结果：455 passed、10 ignored；覆盖持久队列重启恢复、根目录别名和 sidecar 迁移，以及 mock Telegram 交互 E2E、合集进度生命周期和分页 mock Telegram E2E。
+- 全量测试结果：459 passed、10 ignored；覆盖持久队列重启恢复、旧索引与根目录别名迁移、完成与取消竞态、队列消息长度限制，以及 mock Telegram 交互 E2E、合集进度生命周期和分页 mock Telegram E2E。
 - GitHub Actions 的 macOS Rust CI workflow 在 PR 和 `master` 更新时运行格式检查、严格 Clippy 与全部 Rust 测试；后者包含 mock Telegram E2E。

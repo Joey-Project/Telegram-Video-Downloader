@@ -9,6 +9,7 @@ mod safe_fs;
 mod telegram;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::sync::{
@@ -745,14 +746,21 @@ async fn handle_queue_callback(
             queue_or_prompt_job(context, chat_id, job_id, claimed.id, claimed.job);
         }
         QueueCallbackAction::Cancel(id) => match queue.cancel_for_chat(&id, chat_id) {
-            Ok(Some(_)) => {
-                answer_callback_or_log(&telegram, callback_id, "Task canceled.".to_string()).await;
-                let _ = telegram
-                    .edit_message_text(
-                        chat_id,
-                        message_id,
-                        "Task canceled. Use /queue to refresh the list.".to_string(),
+            Ok(Some(task)) => {
+                let (answer, message) = if task.status == TaskStatus::Running {
+                    (
+                        "Cancellation requested.",
+                        "Cancellation requested. Use /queue to refresh the list.",
                     )
+                } else {
+                    (
+                        "Task canceled.",
+                        "Task canceled. Use /queue to refresh the list.",
+                    )
+                };
+                answer_callback_or_log(&telegram, callback_id, answer.to_string()).await;
+                let _ = telegram
+                    .edit_message_text(chat_id, message_id, message.to_string())
                     .await;
             }
             Ok(None) => {
@@ -887,7 +895,7 @@ fn render_queue_page(
             record.media_entries_completed,
             record.media_entries_total,
             record.media_entries_failed,
-            truncate(&record.original_url),
+            truncate_utf16_units(&record.original_url, QUEUE_URL_PREVIEW_UNITS),
         ));
         if command.history {
             continue;
@@ -954,10 +962,39 @@ fn render_queue_page(
             },
         ]);
     }
-    let keyboard = (!rows.is_empty()).then_some(InlineKeyboardMarkup {
+    let rendered = lines.join("\n");
+    let over_limit = rendered.encode_utf16().count() > QUEUE_PAGE_MAX_TEXT_UNITS;
+    let text = truncate_utf16_units(&rendered, QUEUE_PAGE_MAX_TEXT_UNITS);
+    let keyboard = (!over_limit && !rows.is_empty()).then_some(InlineKeyboardMarkup {
         inline_keyboard: rows,
     });
-    Ok((lines.join("\n"), keyboard))
+    Ok((text, keyboard))
+}
+
+const QUEUE_PAGE_MAX_TEXT_UNITS: usize = 3_500;
+const QUEUE_URL_PREVIEW_UNITS: usize = 128;
+
+fn truncate_utf16_units(text: &str, max_units: usize) -> String {
+    if text.encode_utf16().count() <= max_units {
+        return text.to_string();
+    }
+    if max_units == 0 {
+        return String::new();
+    }
+
+    let mut truncated = String::new();
+    let content_limit = max_units - 1;
+    let mut used_units = 0;
+    for character in text.chars() {
+        let character_units = character.len_utf16();
+        if used_units + character_units > content_limit {
+            break;
+        }
+        truncated.push(character);
+        used_units += character_units;
+    }
+    truncated.push('…');
+    truncated
 }
 
 fn task_status_label(status: TaskStatus) -> &'static str {
@@ -3388,6 +3425,9 @@ async fn run_queued_job(
         result = inspect_job_plan(&config, &job) => Some(result),
     };
     let Some(current_plan) = current_plan else {
+        if let Err(err) = queue.finish_cancellation(&task_id) {
+            warn!(task_id, error = %err, "failed to persist task cancellation");
+        }
         drop(permit);
         let _ = queue.unregister_cancellation(&task_id);
         if let Some(message_id) = status_message_id {
@@ -3426,6 +3466,35 @@ async fn run_queued_job(
             return;
         }
     };
+    let cancellation_finished =
+        queue
+            .finish_cancellation(&task_id)
+            .and_then(|finished| match finished {
+                Some(_) => Ok(true),
+                None => Ok(queue
+                    .get(&task_id)?
+                    .is_none_or(|task| task.status == TaskStatus::Cancelled)),
+            });
+    let cancellation_finished = match cancellation_finished {
+        Ok(finished) => finished,
+        Err(err) => {
+            warn!(task_id, error = %err, "failed to resolve task cancellation state");
+            drop(permit);
+            let _ = queue.unregister_cancellation(&task_id);
+            return;
+        }
+    };
+    if cancellation_finished {
+        drop(permit);
+        let _ = queue.unregister_cancellation(&task_id);
+        let message = format!("Canceled job #{job_id}: {}", job.label());
+        if let Some(message_id) = status_message_id {
+            edit_or_send(&telegram, chat_id, message_id, message).await;
+        } else {
+            send_or_log(&telegram, chat_id, message).await;
+        }
+        return;
+    }
     if !differences.is_empty() {
         let keyboard = task_action_keyboard(&[
             (
@@ -3480,28 +3549,30 @@ async fn run_queued_job(
         progress_rx,
     ));
     let completion_progress = progress_tx.clone();
-    let result = tokio::select! {
-        biased;
-        _ = cancel.notified() => None,
-        result = async {
-            match run_mode {
-                JobRunMode::Duplicate(duplicate_run) => {
-                    run_job_with_duplicate_action(
-                        &config,
-                        &job,
-                        duplicate_run.action,
-                        &duplicate_run.duplicate,
-                        Some(progress_tx),
-                    )
-                    .await
-                }
-                JobRunMode::StagedKeepBoth => {
-                    run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
-                }
-                JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
+    let result = select_worker_result_or_cancel(&cancel, async {
+        match run_mode {
+            JobRunMode::Duplicate(duplicate_run) => {
+                run_job_with_duplicate_action(
+                    &config,
+                    &job,
+                    duplicate_run.action,
+                    &duplicate_run.duplicate,
+                    Some(progress_tx),
+                )
+                .await
             }
-        } => Some(result),
-    };
+            JobRunMode::StagedKeepBoth => {
+                run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
+            }
+            JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
+        }
+    })
+    .await;
+    if (result.is_none() || result.as_ref().is_some_and(Result::is_err))
+        && let Err(err) = queue.finish_cancellation(&task_id)
+    {
+        warn!(task_id, error = %err, "failed to persist task cancellation");
+    }
     if result.as_ref().is_some_and(Result::is_err) || result.is_none() {
         send_collection_failure_lifecycle(&completion_progress);
     }
@@ -3613,6 +3684,18 @@ async fn run_queued_job(
         edit_or_send(&telegram, chat_id, message_id, message).await;
     } else {
         send_or_log(&telegram, chat_id, message).await;
+    }
+}
+
+async fn select_worker_result_or_cancel<F>(cancel: &Notify, worker: F) -> Option<F::Output>
+where
+    F: Future,
+{
+    tokio::select! {
+        biased;
+        // A ready worker result means publication finished, so verification takes priority.
+        result = worker => Some(result),
+        _ = cancel.notified() => None,
     }
 }
 
@@ -5545,6 +5628,69 @@ mod tests {
 
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn completed_worker_result_wins_over_a_ready_cancellation() {
+        let cancellation = Notify::new();
+        cancellation.notify_one();
+
+        let result = select_worker_result_or_cancel(&cancellation, async { "published" }).await;
+
+        assert_eq!(result, Some("published"));
+    }
+
+    #[test]
+    fn queue_page_stays_within_telegram_text_limit_for_long_urls() {
+        let queue_root = temp_main_test_dir("queue-page-size-limit");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let chat_id = 123_456_789;
+
+        for ordinal in 0..10 {
+            let id = format!("task-queue-size-{ordinal}");
+            assert!(
+                queue
+                    .create(TaskRecord::new(
+                        id,
+                        ordinal,
+                        ordinal,
+                        chat_id,
+                        None,
+                        ordinal as usize,
+                        JobRequest::Youtube {
+                            url: format!("https://example.invalid/{}", "😀".repeat(2_000)),
+                        },
+                    ))
+                    .expect("task should persist")
+            );
+        }
+
+        let (text, keyboard) = render_queue_page(
+            &queue,
+            chat_id,
+            QueueCommand {
+                history: false,
+                page: 0,
+            },
+        )
+        .expect("queue page should render");
+        assert!(text.encode_utf16().count() <= QUEUE_PAGE_MAX_TEXT_UNITS);
+        assert!(text.contains('…'));
+        assert_eq!(
+            keyboard
+                .expect("queue page should retain its actions")
+                .inline_keyboard
+                .len(),
+            10
+        );
+
+        drop(queue);
         let _ = fs::remove_dir_all(queue_root);
     }
 
