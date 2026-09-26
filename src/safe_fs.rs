@@ -2785,7 +2785,11 @@ fn decode_remove_quarantine_original_name(encoded: &str) -> Result<OsString> {
     }
     let encoded = encoded.as_bytes();
     let mut bytes = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.chunks_exact(2) {
+    let (pairs, remainder) = encoded.as_chunks::<2>();
+    if !remainder.is_empty() {
+        bail!("interrupted-removal original name has invalid hex framing");
+    }
+    for pair in pairs {
         let high = decode_lower_hex_digit(pair[0])?;
         let low = decode_lower_hex_digit(pair[1])?;
         bytes.push((high << 4) | low);
