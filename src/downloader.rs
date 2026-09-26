@@ -1572,11 +1572,12 @@ pub async fn inspect_job_plan(
                 ..PlanValidationSnapshot::default()
             };
             for entry in &plan.entries {
-                let stable_id = entry
-                    .bvid
-                    .as_ref()
-                    .map(|bvid| format!("bvid:{bvid}"))
-                    .unwrap_or_else(|| format!("aid:{}:cid:{}", entry.aid, entry.cid));
+                let stable_id = bilibili_plan_stable_media_id(
+                    entry.bvid.as_deref(),
+                    entry.aid,
+                    entry.cid,
+                    entry.epid,
+                );
                 snapshot.stable_media_ids.push(stable_id.clone());
                 if let Some(stream) = bilibili_selected_video(entry, &options.stream_selection) {
                     let format_id = format!("{stable_id}:video:{}", stream.id);
@@ -1614,6 +1615,21 @@ pub async fn inspect_job_plan(
             Ok(snapshot)
         }
     }
+}
+
+fn bilibili_plan_stable_media_id(
+    bvid: Option<&str>,
+    aid: u64,
+    cid: u64,
+    epid: Option<u64>,
+) -> String {
+    let media_id = bvid
+        .map(|bvid| format!("bvid:{bvid}"))
+        .unwrap_or_else(|| format!("aid:{aid}"));
+    let epid = epid
+        .map(|epid| epid.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    format!("{media_id}:cid:{cid}:epid:{epid}")
 }
 
 pub async fn run_job_with_duplicate_action(
@@ -14433,6 +14449,22 @@ mod tests {
         config.bilibili.auth.state_path =
             temp_test_dir("telegram-video-downloader-test-auth-missing").join("auth.json");
         config
+    }
+
+    #[test]
+    fn bilibili_plan_identity_includes_cid_and_episode_id_with_bvid() {
+        let original = bilibili_plan_stable_media_id(Some("BV123"), 123, 456, Some(789));
+
+        assert_ne!(
+            bilibili_plan_stable_media_id(Some("BV123"), 123, 457, Some(789)),
+            original,
+            "a changed content ID should invalidate the plan identity"
+        );
+        assert_ne!(
+            bilibili_plan_stable_media_id(Some("BV123"), 123, 456, Some(790)),
+            original,
+            "a changed episode ID should invalidate the plan identity"
+        );
     }
 
     #[tokio::test]

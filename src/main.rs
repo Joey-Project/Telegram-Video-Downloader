@@ -669,10 +669,10 @@ async fn handle_queue_command(
             .await
         {
             warn!(chat_id, error = %err, "failed to send task queue page");
-            telegram.send_message(chat_id, text).await?;
+            send_or_log(telegram, chat_id, text).await;
         }
     } else {
-        telegram.send_message(chat_id, text).await?;
+        send_or_log(telegram, chat_id, text).await;
     }
     Ok(())
 }
@@ -4717,6 +4717,18 @@ mod tests {
         next_message_id: &mut i64,
         updates: Vec<serde_json::Value>,
     ) -> String {
+        if request.method == "sendMessage" && request.body["chat_id"].as_i64() == Some(-404_404) {
+            let payload = serde_json::json!({
+                "ok": false,
+                "error_code": 403,
+                "description": "bot is no longer allowed to send messages in this chat"
+            })
+            .to_string();
+            return format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+        }
         let result = match request.method.as_str() {
             "sendMessage" => {
                 let message_id = *next_message_id;
@@ -5691,6 +5703,80 @@ mod tests {
         );
 
         drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn failed_queue_reply_does_not_block_later_telegram_updates() {
+        let queue_root = temp_main_test_dir("queue-reply-failure-offset");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        config.telegram.allow_all_chats = true;
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+        let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        update_sender
+            .send(vec![
+                serde_json::json!({
+                    "update_id": 901,
+                    "message": {
+                        "message_id": 1001,
+                        "chat": {"id": -404404, "type": "private"},
+                        "from": {"id": 701},
+                        "text": "/queue"
+                    }
+                }),
+                serde_json::json!({
+                    "update_id": 902,
+                    "message": {
+                        "message_id": 1002,
+                        "chat": {"id": 123456789, "type": "private"},
+                        "from": {"id": 701},
+                        "text": "/help"
+                    }
+                }),
+            ])
+            .expect("fake Telegram should accept updates");
+        let updates = telegram
+            .get_updates(None, 0)
+            .await
+            .expect("fake Telegram should return scripted updates");
+        let config = Arc::new(config);
+        let job_dispatch = JobDispatch {
+            download_semaphore: Arc::new(Semaphore::new(1)),
+            duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+        };
+        let next_job_id = Arc::new(AtomicU64::new(1));
+        let mut offset = None;
+        process_telegram_updates(
+            &telegram,
+            &config,
+            &job_dispatch,
+            &next_job_id,
+            &queue,
+            updates,
+            &mut offset,
+        )
+        .await
+        .expect("a Telegram delivery failure should not block update processing");
+
+        assert_eq!(offset, Some(903));
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getUpdates", "sendMessage", "sendMessage"]
+        );
+        assert_eq!(recorded[1].body["chat_id"].as_i64(), Some(-404_404));
+        assert_eq!(recorded[2].body["chat_id"].as_i64(), Some(123_456_789));
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
     }
 

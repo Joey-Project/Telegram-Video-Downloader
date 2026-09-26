@@ -28,6 +28,8 @@ superseded_by:
 - 队列索引 v2 使用相对下载根目录的记录路径，迁移旧版绝对路径，并支持通过同一根目录的符号链接别名重启。
 - 运行中取消先记录为请求；若下载结果已就绪，则优先验证已发布文件，再决定完成状态。
 - `/queue` 限制每个 URL 预览，并把完整消息限制在 3,500 个 UTF-16 单元以内。
+- Telegram 回复发送失败只记录日志，不再阻止后续 update 处理和轮询 offset 前进；恢复任务通过队列目录内的操作系统文件锁进行原子 claim。
+- 大合集的主媒体哈希会在任务记录中压缩为确定性 SHA-256 清单，避免单条记录超过 2 MiB 上限；Bilibili 计划身份同时纳入 CID 和 EPID。
 - 失败、取消和未决视频尝试永久保留在下载根目录下的隐藏私有 staging 目录中。
 
 ## 后续事项
@@ -36,5 +38,5 @@ superseded_by:
 ## 检查记录
 - 已检查 `src/queue.rs`、`src/main.rs`、`src/downloader.rs`、`src/safe_fs.rs`、`src/telegram.rs` 和 `src/router.rs` 的相关实现。
 - `cargo fmt --all --check`、`cargo build --quiet`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all-targets --quiet` 和 `git diff --check` 均通过。
-- 全量测试结果：459 passed、10 ignored；覆盖持久队列重启恢复、旧索引与根目录别名迁移、完成与取消竞态、队列消息长度限制，以及 mock Telegram 交互 E2E、合集进度生命周期和分页 mock Telegram E2E。
+- 全量测试结果：463 passed、11 ignored；覆盖持久队列重启恢复、旧索引与根目录别名迁移、跨进程恢复 claim、超大哈希清单、Bilibili CID/EPID 计划身份、完成与取消竞态、队列消息长度限制，以及 mock Telegram 交互 E2E、失败回复后继续处理 update、合集进度生命周期和分页 mock Telegram E2E。
 - GitHub Actions 的 macOS Rust CI workflow 在 PR 和 `master` 更新时运行格式检查、严格 Clippy 与全部 Rust 测试；后者包含 mock Telegram E2E。

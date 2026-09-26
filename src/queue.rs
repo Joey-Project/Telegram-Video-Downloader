@@ -16,16 +16,19 @@ use tokio::sync::Notify;
 
 use crate::config::AppConfig;
 use crate::router::JobRequest;
-use crate::safe_fs::{EntryIdentity, RootedFs};
+use crate::safe_fs::{BoundFile, EntryIdentity, RootedFs};
 
 const QUEUE_DIRECTORY: &str = ".telegram-video-downloader-queue";
 const INDEX_FILE: &str = "index.json";
+const CLAIM_LOCK_FILE: &str = "claims.lock";
 const LEGACY_INDEX_VERSION: u32 = 1;
 const INDEX_VERSION: u32 = 2;
 const TASK_RECORD_VERSION: u32 = 1;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ACTIVE_RECORDS: usize = 20_000;
+const MAX_PERSISTED_MEDIA_HASHES: usize = 128;
+const MAX_PERSISTED_MEDIA_HASH_BYTES: usize = 256 * 1024;
 const QUEUE_PAGE_SIZE: usize = 10;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -72,6 +75,12 @@ pub struct PlanSize {
     pub subject: String,
     pub bytes: u64,
     pub provenance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimaryMediaHashManifest {
+    pub file_count: usize,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -123,7 +132,10 @@ pub struct TaskRecord {
     pub plan: Option<PlanValidationSnapshot>,
     pub proposed_plan: Option<PlanValidationSnapshot>,
     pub saved_location: Option<String>,
+    #[serde(default)]
     pub primary_media_hashes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub primary_media_hash_manifest: Option<PrimaryMediaHashManifest>,
     pub staging_attempts: Vec<PathBuf>,
     pub media_entries_total: usize,
     pub media_entries_completed: usize,
@@ -179,6 +191,11 @@ struct DownloadStore {
     root: RootedFs,
     queue_dir: PathBuf,
     queue_identity: EntryIdentity,
+    claim_lock_path: PathBuf,
+}
+
+struct QueueClaimLock {
+    _file: BoundFile,
 }
 
 pub struct QueueManager {
@@ -224,6 +241,7 @@ impl TaskRecord {
             proposed_plan: None,
             saved_location: None,
             primary_media_hashes: BTreeMap::new(),
+            primary_media_hash_manifest: None,
             staging_attempts: Vec::new(),
             media_entries_total: 1,
             media_entries_completed: 0,
@@ -324,16 +342,33 @@ impl QueueManager {
 
     pub fn claim_resume(&self, id: &str, retry_failed: bool) -> Result<Option<TaskRecord>> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
-        let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
+        let video_claim_lock = self.video.lock_claims()?;
+        if let Some((record, entry)) = self.video.get_task(id)? {
+            return Self::claim_resume_in_store(&self.video, retry_failed, record, entry);
+        }
+        drop(video_claim_lock);
+        if self.video.shares_root(&self.pdf) {
+            return Ok(None);
+        }
+        let _pdf_claim_lock = self.pdf.lock_claims()?;
+        let Some((record, entry)) = self.pdf.get_task(id)? else {
             return Ok(None);
         };
+        Self::claim_resume_in_store(&self.pdf, retry_failed, record, entry)
+    }
+
+    fn claim_resume_in_store(
+        store: &DownloadStore,
+        retry_failed: bool,
+        mut record: TaskRecord,
+        entry: TaskIndexEntry,
+    ) -> Result<Option<TaskRecord>> {
         let allowed = if retry_failed {
             record.status == TaskStatus::Failed
         } else {
             matches!(
                 record.status,
                 TaskStatus::Received
-                    | TaskStatus::Preparing
                     | TaskStatus::AwaitingSelection
                     | TaskStatus::AwaitingConfirmation
                     | TaskStatus::AwaitingDuplicateChoice
@@ -539,7 +574,9 @@ impl QueueManager {
         record.status = TaskStatus::Completed;
         record.error = None;
         record.saved_location = Some(saved_location);
-        record.primary_media_hashes = hashes;
+        let (persisted_hashes, hash_manifest) = persist_media_hashes(hashes)?;
+        record.primary_media_hashes = persisted_hashes;
+        record.primary_media_hash_manifest = hash_manifest;
         if record.media_entries_total <= 1 {
             record.media_entries_total = 1;
             record.media_entries_completed = 1;
@@ -825,10 +862,12 @@ impl DownloadStore {
         let store = Self {
             root_path: root_path.clone(),
             root_aliases: vec![root_path],
+            claim_lock_path: queue_dir.join(CLAIM_LOCK_FILE),
             root,
             queue_dir,
             queue_identity,
         };
+        store.ensure_claim_lock_file()?;
         if store
             .read_private_file(&store.index_path(), MAX_INDEX_BYTES)?
             .is_none()
@@ -847,6 +886,40 @@ impl DownloadStore {
 
     fn shares_root(&self, other: &Self) -> bool {
         self.root.root_identity() == other.root.root_identity()
+    }
+
+    fn ensure_claim_lock_file(&self) -> Result<()> {
+        if let Some(file) = self.root.open_bound_file(&self.claim_lock_path)? {
+            file.validate_private_single_link(0o600)?;
+            return Ok(());
+        }
+        if let Err(create_error) =
+            self.root
+                .create_new_bound_file(&self.claim_lock_path, &[], 0o600)
+        {
+            let Some(file) = self.root.open_bound_file(&self.claim_lock_path)? else {
+                return Err(create_error);
+            };
+            file.validate_private_single_link(0o600)?;
+        }
+        Ok(())
+    }
+
+    fn lock_claims(&self) -> Result<QueueClaimLock> {
+        self.ensure_private_directory()?;
+        let entry = self.root.bind_entry(&self.claim_lock_path, false)?;
+        let file = self
+            .root
+            .open_bound_file(&self.claim_lock_path)?
+            .ok_or_else(|| anyhow!("task queue claim lock file is missing"))?;
+        let identity = file.identity();
+        file.validate_private_single_link(0o600)?;
+        file.lock_exclusive()?;
+        if self.root.bound_entry_identity(&entry)? != Some(identity) {
+            bail!("task queue claim lock file was replaced while locking");
+        }
+        file.validate_private_single_link(0o600)?;
+        Ok(QueueClaimLock { _file: file })
     }
 
     fn normalize_media_path(&self, path: &Path) -> Result<PathBuf> {
@@ -1462,6 +1535,37 @@ fn temporary_sibling(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp-{}-{serial}", std::process::id()))
 }
 
+fn persist_media_hashes(
+    hashes: BTreeMap<String, String>,
+) -> Result<(BTreeMap<String, String>, Option<PrimaryMediaHashManifest>)> {
+    if hashes.len() <= MAX_PERSISTED_MEDIA_HASHES
+        && serde_json::to_vec(&hashes)?.len() <= MAX_PERSISTED_MEDIA_HASH_BYTES
+    {
+        return Ok((hashes, None));
+    }
+
+    let file_count = hashes.len();
+    let mut hasher = Sha256::new();
+    hasher.update(b"telegram-video-downloader-primary-media-manifest-v1\0");
+    for (path, digest) in &hashes {
+        let path_bytes = path.as_bytes();
+        let digest_bytes = digest.as_bytes();
+        hasher.update((path_bytes.len() as u64).to_be_bytes());
+        hasher.update(path_bytes);
+        hasher.update((digest_bytes.len() as u64).to_be_bytes());
+        hasher.update(digest_bytes);
+    }
+    let sha256 = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((
+        BTreeMap::new(),
+        Some(PrimaryMediaHashManifest { file_count, sha256 }),
+    ))
+}
+
 fn validate_task_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 64
@@ -1775,6 +1879,247 @@ mod tests {
         assert_eq!(
             stored_path,
             "completed/.telegram-video-downloader-task-task-legacy-index-alias-1.json"
+        );
+
+        drop(reopened);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn concurrent_resume_claims_across_processes_start_only_once() {
+        use std::process::Command;
+        use std::sync::mpsc::{TryRecvError, sync_channel};
+        use std::time::Instant;
+
+        let temp_root = temp_queue_root("concurrent-resume-claims");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root;
+        config.downloads.pdf_dir = pdf_root;
+        let initial = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-concurrent-resume-1";
+        assert!(
+            initial
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        initial
+            .set_status(id, TaskStatus::Interrupted, None)
+            .expect("task should be interrupted");
+        drop(initial);
+
+        let first = Arc::new(QueueManager::open(&config).expect("first manager should open"));
+        let second = Arc::new(QueueManager::open(&config).expect("second manager should open"));
+        let held_claim_lock = first
+            .video
+            .lock_claims()
+            .expect("parent process should lock task claims");
+        let child_ready_path = temp_root.join("resume-child-ready");
+        let child_result_path = temp_root.join("resume-child-result");
+        let mut child = Command::new(std::env::current_exe().expect("test binary should resolve"))
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("queue::tests::cross_process_resume_claim_child")
+            .arg("--nocapture")
+            .env("TVD_QUEUE_CLAIM_CHILD_ROOT", &temp_root)
+            .spawn()
+            .expect("claim child process should start");
+
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        while !child_ready_path.exists() {
+            if let Some(status) = child.try_wait().expect("claim child status should read") {
+                panic!("claim child exited before attempting its claim: {status}");
+            }
+            if Instant::now() >= ready_deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("claim child did not reach its cross-process claim");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (claim_tx, claim_rx) = sync_channel(1);
+        let second_manager = Arc::clone(&second);
+        let second_claim = std::thread::spawn(move || {
+            let result = second_manager
+                .claim_resume(id, false)
+                .expect("second manager claim should complete");
+            claim_tx
+                .send(result.is_some())
+                .expect("claim result receiver should remain available");
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            child
+                .try_wait()
+                .expect("claim child status should read")
+                .is_none(),
+            "a separate process must wait for the task claim lock"
+        );
+        assert!(
+            matches!(claim_rx.try_recv(), Err(TryRecvError::Empty)),
+            "a second manager must wait for the task claim lock"
+        );
+
+        drop(held_claim_lock);
+        let output = child
+            .wait_with_output()
+            .expect("claim child output should collect");
+        assert!(
+            output.status.success(),
+            "claim child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let child_claimed = fs::read(&child_result_path)
+            .expect("claim child should persist its result")
+            == b"claimed";
+        let manager_claimed = claim_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second manager claim should finish");
+        second_claim
+            .join()
+            .expect("second manager claim thread should finish");
+        assert_eq!(
+            usize::from(child_claimed) + usize::from(manager_claimed),
+            1,
+            "only one process may claim the interrupted task"
+        );
+        assert_eq!(
+            first
+                .get(id)
+                .expect("claimed task should load")
+                .expect("claimed task should remain")
+                .status,
+            TaskStatus::Preparing
+        );
+
+        drop(first);
+        drop(second);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    #[ignore = "spawned by concurrent_resume_claims_across_processes_start_only_once"]
+    fn cross_process_resume_claim_child() {
+        let root = PathBuf::from(
+            std::env::var_os("TVD_QUEUE_CLAIM_CHILD_ROOT")
+                .expect("claim child root must be provided by the parent test"),
+        );
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        let queue = QueueManager::open(&config).expect("child queue should open");
+        fs::write(root.join("resume-child-ready"), b"ready")
+            .expect("claim child ready marker should write");
+        let claimed = queue
+            .claim_resume("task-concurrent-resume-1", false)
+            .expect("child claim should complete")
+            .is_some();
+        fs::write(
+            root.join("resume-child-result"),
+            if claimed {
+                &b"claimed"[..]
+            } else {
+                &b"not-claimed"[..]
+            },
+        )
+        .expect("claim child result should write");
+    }
+
+    #[test]
+    fn large_primary_media_hashes_are_compacted_before_task_persistence() {
+        let temp_root = temp_queue_root("large-primary-media-hashes");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-large-primary-media-hashes-1";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Running, None)
+            .expect("task should start");
+        queue
+            .begin_verification(id)
+            .expect("verification should begin")
+            .expect("task should still exist");
+
+        let media_path = video_root.join("output.mp4");
+        fs::write(&media_path, b"verified media").expect("media fixture should write");
+        let digest = "a".repeat(64);
+        let hashes = (0..8_000)
+            .map(|index| {
+                (
+                    format!("collection/item-{index:05}/{}", "x".repeat(192)),
+                    digest.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            serde_json::to_vec(&hashes)
+                .expect("large hash map should serialize")
+                .len()
+                > MAX_RECORD_BYTES,
+            "fixture should reproduce a hash map larger than the task record limit"
+        );
+
+        let completed = queue
+            .complete(
+                id,
+                media_path.display().to_string(),
+                std::slice::from_ref(&media_path),
+                hashes,
+            )
+            .expect("large hash map should not block output completion");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert!(completed.primary_media_hashes.is_empty());
+        let manifest = completed
+            .primary_media_hash_manifest
+            .as_ref()
+            .expect("large hash map should be represented by a compact manifest");
+        assert_eq!(manifest.file_count, 8_000);
+        assert_eq!(manifest.sha256.len(), 64);
+        drop(queue);
+
+        let reopened = QueueManager::open(&config).expect("task queue should reopen");
+        let recovered = reopened
+            .get(id)
+            .expect("completed task should load")
+            .expect("completed task should remain available");
+        assert_eq!(recovered.status, TaskStatus::Completed);
+        assert_eq!(recovered.primary_media_hashes.len(), 0);
+        assert_eq!(
+            recovered.primary_media_hash_manifest,
+            completed.primary_media_hash_manifest
+        );
+        assert!(
+            serde_json::to_vec(&recovered)
+                .expect("compacted task record should serialize")
+                .len()
+                <= MAX_RECORD_BYTES
         );
 
         drop(reopened);
