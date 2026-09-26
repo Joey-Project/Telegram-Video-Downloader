@@ -33,3 +33,4 @@ superseded_by:
 - 已检查 `src/queue.rs`、`src/main.rs`、`src/downloader.rs`、`src/safe_fs.rs`、`src/telegram.rs` 和 `src/router.rs` 的相关实现。
 - `cargo fmt --all --check`、`cargo build --quiet`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all-targets --quiet` 和 `git diff --check` 均通过。
 - 全量测试结果：453 passed、10 ignored；覆盖持久队列重启恢复和 mock Telegram 交互 E2E，以及合集进度生命周期和分页 mock Telegram E2E。
+- GitHub Actions 的 Rust CI workflow 在 PR 和 `master` 更新时运行格式检查、严格 Clippy 与全部 Rust 测试；后者包含 mock Telegram E2E。
