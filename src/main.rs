@@ -906,13 +906,12 @@ fn render_queue_page(
                 "Retry failed".to_string(),
                 queue_callback_data("retry", &record.id),
             )),
-            TaskStatus::Received
-            | TaskStatus::Preparing
-            | TaskStatus::AwaitingSelection
-            | TaskStatus::Interrupted => buttons.push((
-                "Resume".to_string(),
-                queue_callback_data("resume", &record.id),
-            )),
+            TaskStatus::Received | TaskStatus::AwaitingSelection | TaskStatus::Interrupted => {
+                buttons.push((
+                    "Resume".to_string(),
+                    queue_callback_data("resume", &record.id),
+                ))
+            }
             TaskStatus::AwaitingConfirmation => buttons.push((
                 "Confirm updated plan".to_string(),
                 queue_callback_data("confirm", &record.id),
@@ -921,6 +920,7 @@ fn render_queue_page(
                 "Resume".to_string(),
                 queue_callback_data("resume", &record.id),
             )),
+            TaskStatus::Preparing => {}
             TaskStatus::Queued | TaskStatus::Running | TaskStatus::Verifying => {}
             TaskStatus::Cancelled | TaskStatus::Completed => {}
         }
@@ -6049,6 +6049,60 @@ mod tests {
                 .inline_keyboard
                 .len(),
             10
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[test]
+    fn preparing_queue_tasks_only_offer_cancel_action() {
+        let queue_root = temp_main_test_dir("preparing-queue-actions");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let chat_id = 123_456_789;
+        let task_id = "preparing-task";
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    1,
+                    1,
+                    chat_id,
+                    None,
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://example.invalid/video".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("task should enter preparation");
+
+        let (_, keyboard) = render_queue_page(
+            &queue,
+            chat_id,
+            QueueCommand {
+                history: false,
+                page: 0,
+            },
+        )
+        .expect("queue page should render");
+        let buttons = &keyboard
+            .expect("preparing task should retain its cancel action")
+            .inline_keyboard;
+        assert_eq!(buttons.len(), 1);
+        assert_eq!(buttons[0].len(), 1);
+        assert_eq!(buttons[0][0].text, "Cancel");
+        assert_eq!(
+            buttons[0][0].callback_data,
+            queue_callback_data("cancel", task_id)
         );
 
         drop(queue);

@@ -29,7 +29,7 @@ superseded_by:
 - 运行中取消先记录为请求；若下载结果已就绪，则优先验证已发布文件，再决定完成状态。
 - `/queue` 限制每个 URL 预览，并把完整消息限制在 3,500 个 UTF-16 单元以内。
 - Telegram 回复发送失败只记录日志，不再阻止后续 update 处理和轮询 offset 前进；每个队列管理器在整个生命周期内独占其下载根目录的队列 owner 锁，启动恢复仅由成功取得锁的进程执行；任务索引操作仍通过操作锁序列化。
-- 选择和重复任务回调按记录当前状态做条件转换；任务恢复后到达的旧回调会过期，不会把运行中任务重新排队或启动第二个 worker。重启时会把已持久化的取消请求恢复为已取消，而不是中断。
+- 选择和重复任务回调按记录当前状态做条件转换；任务恢复后到达的旧回调会过期，不会把运行中任务重新排队或启动第二个 worker。`Preparing` 状态只显示取消操作，不展示无法成功的恢复按钮。重启时会把已持久化的取消请求恢复为已取消，而不是中断。
 - 大合集的主媒体哈希会在任务记录中压缩为确定性 SHA-256 清单，避免单条记录超过 2 MiB 上限；Bilibili 计划身份同时纳入 CID 和 EPID。
 - 失败、取消和未决视频尝试永久保留在下载根目录下的隐藏私有 staging 目录中。
 
@@ -39,5 +39,5 @@ superseded_by:
 ## 检查记录
 - 已检查 `src/queue.rs`、`src/main.rs`、`src/downloader.rs`、`src/safe_fs.rs`、`src/telegram.rs` 和 `src/router.rs` 的相关实现。
 - `cargo fmt --all --check`、`cargo build --quiet`、`cargo clippy --all-targets -- -D warnings`、`cargo test --all-targets --quiet` 和 `git diff --check` 均通过。
-- 全量测试结果：470 passed、11 ignored；覆盖持久队列重启恢复、旧索引与根目录别名迁移、跨进程队列 owner 独占、中断的终态归档恢复、恢复后旧选择回调失效、重启时完成已请求取消、历史索引限额和文件保留、超大哈希清单、Bilibili CID/EPID 计划身份、完成与取消竞态、队列消息长度限制，以及 mock Telegram 交互 E2E、失败回复后继续处理 update、合集进度生命周期和分页 mock Telegram E2E。
+- 全量测试结果：471 passed、11 ignored；覆盖持久队列重启恢复、旧索引与根目录别名迁移、跨进程队列 owner 独占、中断的终态归档恢复、恢复后旧选择回调失效、`Preparing` 状态操作按钮、重启时完成已请求取消、历史索引限额和文件保留、超大哈希清单、Bilibili CID/EPID 计划身份、完成与取消竞态、队列消息长度限制，以及 mock Telegram 交互 E2E、失败回复后继续处理 update、合集进度生命周期和分页 mock Telegram E2E。
 - GitHub Actions 的 macOS Rust CI workflow 在 PR 和 `master` 更新时运行格式检查、严格 Clippy 与 `cargo test --all-targets --quiet`；新增测试由该全量测试命令自动覆盖，包含 mock Telegram E2E。
