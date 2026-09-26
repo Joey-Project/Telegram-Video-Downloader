@@ -2,6 +2,7 @@ mod bilibili_auth;
 mod bilibili_core;
 mod config;
 mod downloader;
+mod queue;
 mod redaction;
 mod router;
 mod safe_fs;
@@ -30,9 +31,13 @@ use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
     BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
     JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, VideoDuplicate,
-    VideoDuplicateAction, find_video_duplicate_with_probe, job_progress_channel,
+    VideoDuplicateAction, find_video_duplicate_with_probe, inspect_job_plan, job_progress_channel,
     recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both, sync_bilibili_rust_credentials,
+};
+use crate::queue::{
+    QueueManager, RestartSummary, TaskRecord, TaskStatus, hash_primary_media,
+    sanitize_job_for_storage,
 };
 use crate::redaction::redact_sensitive_text;
 use crate::router::{
@@ -41,7 +46,7 @@ use crate::router::{
     is_bilibili_ugc_collection_url, route_message,
 };
 use crate::telegram::{
-    BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient,
+    BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, Update,
 };
 
 static BILIBILI_LOGIN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -76,6 +81,7 @@ const BILIBILI_ACCESS_KEY_LOGIN_TTL: Duration = Duration::from_secs(30 * 60);
 struct PendingDuplicateJob {
     chat_id: i64,
     job_id: u64,
+    task_id: String,
     job: JobRequest,
     duplicate: VideoDuplicate,
     created_at: Instant,
@@ -85,6 +91,7 @@ struct PendingDuplicateJob {
 struct PendingBilibiliSelectionJob {
     chat_id: i64,
     job_id: u64,
+    task_id: String,
     job: JobRequest,
     prompt: BilibiliSelectionPrompt,
     created_at: Instant,
@@ -142,6 +149,24 @@ struct JobDispatch {
     duplicate_scan_semaphore: Arc<Semaphore>,
 }
 
+#[derive(Clone)]
+struct BotContext {
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    job_dispatch: JobDispatch,
+    next_job_id: Arc<AtomicU64>,
+    queue: Arc<QueueManager>,
+}
+
+struct JobProgressContext {
+    chat_id: i64,
+    job_id: u64,
+    task_id: String,
+    job_label: &'static str,
+    status_message_id: Option<i64>,
+    update_interval: Duration,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -191,12 +216,14 @@ async fn main() -> Result<()> {
     for recovery in recover_pending_overwrite_transactions(&config.downloads.video_dir)? {
         warn!(message = %recovery, "recovered interrupted overwrite transaction");
     }
+    let queue = Arc::new(QueueManager::open(&config)?);
     tokio::spawn(expire_pending_duplicate_jobs());
 
     let telegram = TelegramClient::new(config.telegram.token.clone());
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
         warn!(error = %err, "failed to register Telegram bot commands");
     }
+    notify_restart_summaries(&telegram, &queue).await?;
     let job_dispatch = JobDispatch {
         download_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
         duplicate_scan_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
@@ -221,29 +248,18 @@ async fn main() -> Result<()> {
             updates = telegram.get_updates(offset, config.bot.poll_timeout_seconds) => {
                 match updates {
                     Ok(updates) => {
-                        for update in updates {
-                            offset = Some(update.update_id + 1);
-                            if let Some(message) = update.message {
-                                handle_message(
-                                    telegram.clone(),
-                                    Arc::clone(&config),
-                                    job_dispatch.clone(),
-                                    Arc::clone(&next_job_id),
-                                    message.chat.id,
-                                    message.chat.is_private(),
-                                    message.text.as_deref(),
-                                )
-                                .await;
-                            }
-                            if let Some(callback_query) = update.callback_query {
-                                handle_callback_query(
-                                    telegram.clone(),
-                                    Arc::clone(&config),
-                                    job_dispatch.clone(),
-                                    callback_query,
-                                )
-                                .await;
-                            }
+                        if let Err(err) = process_telegram_updates(
+                            &telegram,
+                            &config,
+                            &job_dispatch,
+                            &next_job_id,
+                            &queue,
+                            updates,
+                            &mut offset,
+                        )
+                        .await
+                        {
+                            warn!(error = %err, "failed to persist or handle telegram update");
                         }
                     }
                     Err(err) => {
@@ -255,6 +271,62 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn process_telegram_updates(
+    telegram: &TelegramClient,
+    config: &Arc<AppConfig>,
+    job_dispatch: &JobDispatch,
+    next_job_id: &Arc<AtomicU64>,
+    queue: &Arc<QueueManager>,
+    updates: Vec<Update>,
+    offset: &mut Option<i64>,
+) -> Result<()> {
+    let context = BotContext {
+        telegram: telegram.clone(),
+        config: Arc::clone(config),
+        job_dispatch: job_dispatch.clone(),
+        next_job_id: Arc::clone(next_job_id),
+        queue: Arc::clone(queue),
+    };
+    for update in updates {
+        let update_id = update.update_id;
+        if let Some(message) = update.message {
+            handle_message(
+                context.clone(),
+                update_id,
+                message.message_id,
+                message.from.map(|user| user.id),
+                message.chat.id,
+                message.chat.is_private(),
+                message.text.as_deref(),
+            )
+            .await
+            .with_context(|| format!("telegram message update {update_id} failed"))?;
+        }
+        if let Some(callback_query) = update.callback_query {
+            handle_callback_query(context.clone(), callback_query).await;
+        }
+        *offset = Some(update_id + 1);
+    }
+    Ok(())
+}
+
+async fn notify_restart_summaries(telegram: &TelegramClient, queue: &QueueManager) -> Result<()> {
+    for summary in queue.startup_summaries()? {
+        match telegram
+            .send_message(summary.chat_id, render_restart_summary(&summary))
+            .await
+        {
+            Ok(_) => queue.mark_restart_summary_sent(summary.chat_id)?,
+            Err(err) => warn!(
+                chat_id = summary.chat_id,
+                error = %err,
+                "failed to send persistent queue restart summary"
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -378,21 +450,25 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
 }
 
 async fn handle_message(
-    telegram: TelegramClient,
-    config: Arc<AppConfig>,
-    job_dispatch: JobDispatch,
-    next_job_id: Arc<AtomicU64>,
+    context: BotContext,
+    update_id: i64,
+    message_id: i64,
+    submitter_user_id: Option<i64>,
     chat_id: i64,
     is_private_chat: bool,
     text: Option<&str>,
-) {
+) -> Result<()> {
+    let telegram = context.telegram.clone();
+    let config = Arc::clone(&context.config);
+    let next_job_id = Arc::clone(&context.next_job_id);
+    let queue = Arc::clone(&context.queue);
     let Some(text) = text else {
-        return;
+        return Ok(());
     };
 
     if !config.telegram.is_chat_allowed(chat_id) {
         warn!(chat_id, "ignoring message from unauthorized chat");
-        return;
+        return Ok(());
     }
 
     if is_private_chat
@@ -404,21 +480,34 @@ async fn handle_message(
         )
         .await
     {
-        return;
+        return Ok(());
+    }
+
+    if let Some(command) = parse_queue_command(text) {
+        handle_queue_command(&telegram, &queue, chat_id, command).await?;
+        return Ok(());
     }
 
     match route_message(text, &config.pdf.auto_domains) {
         RouteResult::Jobs(jobs) => {
-            for job in jobs {
+            for (ordinal, job) in jobs.into_iter().enumerate() {
                 let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
-                queue_or_prompt_job(
-                    telegram.clone(),
-                    Arc::clone(&config),
-                    job_dispatch.clone(),
+                let task_id = format!("u{update_id}-{ordinal}");
+                let (stored_job, sanitized) = sanitize_job_for_storage(job.clone());
+                let mut task = TaskRecord::new(
+                    task_id.clone(),
+                    update_id,
+                    message_id,
                     chat_id,
-                    job_id,
-                    job,
+                    submitter_user_id,
+                    ordinal,
+                    stored_job,
                 );
+                task.url_was_sanitized = sanitized;
+                if !queue.create(task)? {
+                    continue;
+                }
+                queue_or_prompt_job(context.clone(), chat_id, job_id, task_id, job);
             }
         }
         RouteResult::BilibiliAuth(command) => {
@@ -454,6 +543,7 @@ async fn handle_message(
         }
         RouteResult::Empty => {}
     }
+    Ok(())
 }
 
 fn default_bot_commands() -> Vec<BotCommand> {
@@ -465,6 +555,10 @@ fn default_bot_commands() -> Vec<BotCommand> {
         BotCommand {
             command: "pdf".to_string(),
             description: "Save a webpage as PDF.".to_string(),
+        },
+        BotCommand {
+            command: "queue".to_string(),
+            description: "View, resume, retry, or cancel saved tasks.".to_string(),
         },
         BotCommand {
             command: "bbdown".to_string(),
@@ -483,11 +577,416 @@ fn help_message() -> String {
         "Commands:",
         "/help - Show this help.",
         "/pdf URL - Save a webpage as PDF.",
+        "/queue - View active tasks; use /queue history [page] for history.",
         "/bbdown login [web|tv|access-key] - Log in to Bilibili for BBDown downloads.",
         "/bbdown status - Check saved BBDown credentials.",
         "/bbdown logout - Clear the local BBDown credential state.",
     ]
     .join("\n")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueueCommand {
+    history: bool,
+    page: usize,
+}
+
+#[derive(Debug, Clone)]
+enum QueueCallbackAction {
+    Resume(String),
+    Retry(String),
+    Cancel(String),
+    Confirm(String),
+    ActivePage(usize),
+    HistoryPage(usize),
+}
+
+fn parse_queue_command(text: &str) -> Option<QueueCommand> {
+    let mut parts = text.split_whitespace();
+    let command = parts.next()?.to_ascii_lowercase();
+    if command != "/queue" && !command.starts_with("/queue@") {
+        return None;
+    }
+    let mode = parts.next();
+    let history = mode == Some("history");
+    let page = if history {
+        parts.next().and_then(|value| value.parse::<usize>().ok())
+    } else {
+        mode.and_then(|value| value.parse::<usize>().ok())
+    }
+    .unwrap_or(1)
+    .saturating_sub(1);
+    Some(QueueCommand { history, page })
+}
+
+fn parse_queue_callback_data(data: &str) -> Option<QueueCallbackAction> {
+    let mut parts = data.splitn(3, ':');
+    if parts.next()? != "q" {
+        return None;
+    }
+    let action = parts.next()?;
+    let value = parts.next()?;
+    match action {
+        "resume" => Some(QueueCallbackAction::Resume(value.to_string())),
+        "retry" => Some(QueueCallbackAction::Retry(value.to_string())),
+        "cancel" => Some(QueueCallbackAction::Cancel(value.to_string())),
+        "confirm" => Some(QueueCallbackAction::Confirm(value.to_string())),
+        "active" => value.parse().ok().map(QueueCallbackAction::ActivePage),
+        "history" => value.parse().ok().map(QueueCallbackAction::HistoryPage),
+        _ => None,
+    }
+}
+
+fn queue_callback_data(action: &str, id: &str) -> String {
+    format!("q:{action}:{id}")
+}
+
+fn task_action_keyboard(buttons: &[(String, String)]) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![
+            buttons
+                .iter()
+                .map(|(text, callback_data)| InlineKeyboardButton {
+                    text: text.clone(),
+                    callback_data: callback_data.clone(),
+                })
+                .collect(),
+        ],
+    }
+}
+
+async fn handle_queue_command(
+    telegram: &TelegramClient,
+    queue: &QueueManager,
+    chat_id: i64,
+    command: QueueCommand,
+) -> Result<()> {
+    let (text, keyboard) = render_queue_page(queue, chat_id, command)?;
+    if let Some(keyboard) = keyboard {
+        if let Err(err) = telegram
+            .send_message_with_inline_keyboard(chat_id, text.clone(), keyboard)
+            .await
+        {
+            warn!(chat_id, error = %err, "failed to send task queue page");
+            telegram.send_message(chat_id, text).await?;
+        }
+    } else {
+        telegram.send_message(chat_id, text).await?;
+    }
+    Ok(())
+}
+
+async fn handle_queue_callback(
+    context: BotContext,
+    callback_id: String,
+    chat_id: i64,
+    message_id: i64,
+    action: QueueCallbackAction,
+) {
+    let telegram = context.telegram.clone();
+    let queue = Arc::clone(&context.queue);
+    let next_job_id = Arc::clone(&context.next_job_id);
+    match action {
+        action @ QueueCallbackAction::Resume(_) | action @ QueueCallbackAction::Retry(_) => {
+            let (id, retry) = match action {
+                QueueCallbackAction::Resume(id) => (id, false),
+                QueueCallbackAction::Retry(id) => (id, true),
+                _ => unreachable!("matched resume or retry action"),
+            };
+            if queue.validate_chat(&id, chat_id).ok().flatten().is_none() {
+                answer_callback_or_log(
+                    &telegram,
+                    callback_id,
+                    "Task not found in this chat.".to_string(),
+                )
+                .await;
+                return;
+            }
+            let claimed = match queue.claim_resume(&id, retry) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Task state changed; refresh /queue.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                Err(err) => {
+                    warn!(task_id = %id, error = %err, "failed to claim task for restart");
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Could not update this task.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                "Rechecking the download plan and published files.".to_string(),
+            )
+            .await;
+            if claimed.url_was_sanitized {
+                send_or_log(
+                    &telegram,
+                    chat_id,
+                    format!(
+                        "Task {} had sensitive URL parameters removed from its saved record. If the link no longer works, send the link again.",
+                        claimed.id
+                    ),
+                )
+                .await;
+            }
+            let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
+            queue_or_prompt_job(context, chat_id, job_id, claimed.id, claimed.job);
+        }
+        QueueCallbackAction::Cancel(id) => match queue.cancel_for_chat(&id, chat_id) {
+            Ok(Some(_)) => {
+                answer_callback_or_log(&telegram, callback_id, "Task canceled.".to_string()).await;
+                let _ = telegram
+                    .edit_message_text(
+                        chat_id,
+                        message_id,
+                        "Task canceled. Use /queue to refresh the list.".to_string(),
+                    )
+                    .await;
+            }
+            Ok(None) => {
+                answer_callback_or_log(
+                    &telegram,
+                    callback_id,
+                    "Task is no longer cancellable.".to_string(),
+                )
+                .await;
+            }
+            Err(err) => {
+                warn!(task_id = %id, error = %err, "failed to cancel persistent task");
+                answer_callback_or_log(
+                    &telegram,
+                    callback_id,
+                    "Could not cancel this task.".to_string(),
+                )
+                .await;
+            }
+        },
+        QueueCallbackAction::Confirm(id) => {
+            if queue.validate_chat(&id, chat_id).ok().flatten().is_none() {
+                answer_callback_or_log(
+                    &telegram,
+                    callback_id,
+                    "Task not found in this chat.".to_string(),
+                )
+                .await;
+                return;
+            }
+            let record = match queue.accept_proposed_plan(&id) {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "There is no pending plan change to confirm.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                Err(err) => {
+                    warn!(task_id = %id, error = %err, "failed to accept changed plan");
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Could not save the plan confirmation.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                "Plan accepted; checking it again before download.".to_string(),
+            )
+            .await;
+            let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
+            queue_or_prompt_job(context, chat_id, job_id, record.id, record.job);
+        }
+        action @ QueueCallbackAction::ActivePage(_)
+        | action @ QueueCallbackAction::HistoryPage(_) => {
+            let (page, history) = match action {
+                QueueCallbackAction::ActivePage(page) => (page, false),
+                QueueCallbackAction::HistoryPage(page) => (page, true),
+                _ => unreachable!("matched queue page action"),
+            };
+            match render_queue_page(&queue, chat_id, QueueCommand { history, page }) {
+                Ok((text, keyboard)) => {
+                    let result = match keyboard {
+                        Some(keyboard) => {
+                            telegram
+                                .edit_message_text_with_inline_keyboard(
+                                    chat_id, message_id, text, keyboard,
+                                )
+                                .await
+                        }
+                        None => telegram.edit_message_text(chat_id, message_id, text).await,
+                    };
+                    if let Err(err) = result {
+                        warn!(chat_id, error = %err, "failed to change task queue page");
+                    }
+                    answer_callback_or_log(&telegram, callback_id, "Page updated.".to_string())
+                        .await;
+                }
+                Err(err) => {
+                    warn!(chat_id, error = %err, "failed to load task queue page");
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Could not load this queue page.".to_string(),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+fn render_queue_page(
+    queue: &QueueManager,
+    chat_id: i64,
+    command: QueueCommand,
+) -> Result<(String, Option<InlineKeyboardMarkup>)> {
+    let records = queue.list(chat_id, command.history, command.page)?;
+    let pages = queue.page_count(chat_id, command.history)?;
+    let title = if command.history {
+        "Task history"
+    } else {
+        "Active and actionable tasks"
+    };
+    if records.is_empty() {
+        return Ok((
+            if command.history {
+                "Task history is empty.".to_string()
+            } else {
+                "No active or actionable tasks. Use /queue history to see completed tasks."
+                    .to_string()
+            },
+            None,
+        ));
+    }
+    let mut lines = vec![format!("{title} (page {}/{pages}):", command.page + 1)];
+    let mut rows = Vec::new();
+    for record in records {
+        lines.push(format!(
+            "\n{} · {} · {} · media {}/{} done, {} failed\n{}",
+            record.id,
+            task_status_label(record.status),
+            record.job.label(),
+            record.media_entries_completed,
+            record.media_entries_total,
+            record.media_entries_failed,
+            truncate(&record.original_url),
+        ));
+        if command.history {
+            continue;
+        }
+        let mut buttons = Vec::new();
+        match record.status {
+            TaskStatus::Failed => buttons.push((
+                "Retry failed".to_string(),
+                queue_callback_data("retry", &record.id),
+            )),
+            TaskStatus::Received
+            | TaskStatus::Preparing
+            | TaskStatus::AwaitingSelection
+            | TaskStatus::Interrupted => buttons.push((
+                "Resume".to_string(),
+                queue_callback_data("resume", &record.id),
+            )),
+            TaskStatus::AwaitingConfirmation => buttons.push((
+                "Confirm updated plan".to_string(),
+                queue_callback_data("confirm", &record.id),
+            )),
+            TaskStatus::AwaitingDuplicateChoice => buttons.push((
+                "Resume".to_string(),
+                queue_callback_data("resume", &record.id),
+            )),
+            TaskStatus::Queued | TaskStatus::Running | TaskStatus::Verifying => {}
+            TaskStatus::Cancelled | TaskStatus::Completed => {}
+        }
+        if record.status.is_unfinished() && record.status != TaskStatus::Verifying {
+            buttons.push((
+                "Cancel".to_string(),
+                queue_callback_data("cancel", &record.id),
+            ));
+        }
+        if !buttons.is_empty() {
+            rows.push(
+                buttons
+                    .into_iter()
+                    .map(|(text, callback_data)| InlineKeyboardButton {
+                        text,
+                        callback_data,
+                    })
+                    .collect(),
+            );
+        }
+    }
+    if pages > 1 {
+        let previous = command.page.saturating_sub(1);
+        let next = (command.page + 1).min(pages - 1);
+        rows.push(vec![
+            InlineKeyboardButton {
+                text: "Previous".to_string(),
+                callback_data: format!(
+                    "q:{}:{previous}",
+                    if command.history { "history" } else { "active" }
+                ),
+            },
+            InlineKeyboardButton {
+                text: "Next".to_string(),
+                callback_data: format!(
+                    "q:{}:{next}",
+                    if command.history { "history" } else { "active" }
+                ),
+            },
+        ]);
+    }
+    let keyboard = (!rows.is_empty()).then_some(InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    });
+    Ok((lines.join("\n"), keyboard))
+}
+
+fn task_status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Received => "received",
+        TaskStatus::Preparing => "preparing",
+        TaskStatus::AwaitingSelection => "awaiting selection",
+        TaskStatus::AwaitingConfirmation => "awaiting confirmation",
+        TaskStatus::AwaitingDuplicateChoice => "awaiting duplicate choice",
+        TaskStatus::Queued => "queued",
+        TaskStatus::Running => "running",
+        TaskStatus::Verifying => "verifying published files",
+        TaskStatus::Interrupted => "interrupted",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+        TaskStatus::Completed => "completed",
+    }
+}
+
+fn render_restart_summary(summary: &RestartSummary) -> String {
+    format!(
+        "Some tasks were interrupted by restart.\nJobs: {} interrupted, {} recently completed, {} recently failed.\nMedia entries: {} completed, {} remaining, {} failed.\nUse /queue to review and resume tasks.",
+        summary.interrupted_jobs,
+        summary.recently_completed_jobs,
+        summary.recently_failed_jobs,
+        summary.completed_entries,
+        summary.remaining_entries,
+        summary.failed_entries,
+    )
 }
 
 async fn handle_bilibili_auth_command(
@@ -1595,25 +2094,31 @@ fn bbdown_qr_photo_failed_message() -> String {
 }
 
 fn queue_or_prompt_job(
-    telegram: TelegramClient,
-    config: Arc<AppConfig>,
-    job_dispatch: JobDispatch,
+    context: BotContext,
     chat_id: i64,
     job_id: u64,
+    task_id: String,
     job: JobRequest,
 ) {
     tokio::spawn(async move {
+        if let Err(err) = context
+            .queue
+            .set_status(&task_id, TaskStatus::Preparing, None)
+        {
+            warn!(task_id, error = %err, "failed to update persistent task before preflight");
+            return;
+        }
         let needs_short_link_normalization = matches!(
             &job,
             JobRequest::Bilibili { url, .. } if is_b23_short_link_url(url)
         );
         let job = if needs_short_link_normalization {
-            match Arc::clone(&job_dispatch.duplicate_scan_semaphore)
+            match Arc::clone(&context.job_dispatch.duplicate_scan_semaphore)
                 .acquire_owned()
                 .await
             {
                 Ok(permit) => {
-                    let job = normalize_bilibili_short_link_job(config.as_ref(), job).await;
+                    let job = normalize_bilibili_short_link_job(context.config.as_ref(), job).await;
                     drop(permit);
                     job
                 }
@@ -1625,23 +2130,31 @@ fn queue_or_prompt_job(
         } else {
             job
         };
-        queue_or_prompt_normalized_job(telegram, config, job_dispatch, chat_id, job_id, job).await;
+        queue_or_prompt_normalized_job(context, chat_id, job_id, task_id, job).await;
     });
 }
 
 async fn queue_or_prompt_normalized_job(
-    telegram: TelegramClient,
-    config: Arc<AppConfig>,
-    job_dispatch: JobDispatch,
+    context: BotContext,
     chat_id: i64,
     job_id: u64,
+    task_id: String,
     job: JobRequest,
 ) {
+    if let Err(err) = context
+        .queue
+        .update_job(&task_id, job.clone(), TaskStatus::Preparing)
+    {
+        warn!(task_id, error = %err, "failed to persist normalized task plan");
+        return;
+    }
     if job.requires_bilibili_selection() {
         prompt_bilibili_selection(
-            telegram,
+            context.telegram.clone(),
+            Arc::clone(&context.queue),
             chat_id,
             job_id,
+            task_id,
             job,
             BilibiliSelectionPrompt::SeasonMedia,
         )
@@ -1649,9 +2162,18 @@ async fn queue_or_prompt_normalized_job(
         return;
     }
 
-    match bilibili_ugc_selection_prompt(config.as_ref(), &job).await {
+    match bilibili_ugc_selection_prompt(context.config.as_ref(), &job).await {
         Ok(Some(prompt)) => {
-            prompt_bilibili_selection(telegram, chat_id, job_id, job, prompt).await;
+            prompt_bilibili_selection(
+                context.telegram.clone(),
+                Arc::clone(&context.queue),
+                chat_id,
+                job_id,
+                task_id,
+                job,
+                prompt,
+            )
+            .await;
             return;
         }
         Ok(None) => {}
@@ -1662,16 +2184,20 @@ async fn queue_or_prompt_normalized_job(
                 "Bilibili UGC collection membership probe failed; refusing to start an ambiguous download"
             );
             send_or_log(
-                &telegram,
+                &context.telegram,
                 chat_id,
                 bilibili_membership_probe_failure_message().to_string(),
             )
             .await;
+            let _ = context.queue.fail(
+                &task_id,
+                truncate(&redact_sensitive_text(&format!("{err:#}"))),
+            );
             return;
         }
     }
 
-    process_job_after_duplicate_check(telegram, config, job_dispatch, chat_id, job_id, job).await;
+    process_job_after_duplicate_check(context, chat_id, job_id, task_id, job).await;
 }
 
 async fn bilibili_ugc_selection_prompt(
@@ -1745,8 +2271,10 @@ fn apply_bilibili_short_link_resolution(
 
 async fn prompt_bilibili_selection(
     telegram: TelegramClient,
+    queue: Arc<QueueManager>,
     chat_id: i64,
     job_id: u64,
+    task_id: String,
     job: JobRequest,
     prompt: BilibiliSelectionPrompt,
 ) {
@@ -1760,12 +2288,22 @@ async fn prompt_bilibili_selection(
             PendingBilibiliSelectionJob {
                 chat_id,
                 job_id,
-                job,
+                task_id: task_id.clone(),
+                job: job.clone(),
                 prompt: prompt.clone(),
                 created_at: now,
             },
         );
         cap_pending_bilibili_selection_jobs(&mut pending_jobs, Some(token));
+    }
+
+    if let Err(err) = queue.update_job(&task_id, job.clone(), TaskStatus::AwaitingSelection) {
+        pending_bilibili_selection_jobs()
+            .lock()
+            .await
+            .remove(&token);
+        warn!(task_id, error = %err, "failed to persist Bilibili selection prompt");
+        return;
     }
 
     match telegram
@@ -1776,13 +2314,18 @@ async fn prompt_bilibili_selection(
         )
         .await
     {
-        Ok(_) => {}
+        Ok(message_id) => {
+            if let Err(err) = queue.set_status_message_id(&task_id, message_id) {
+                warn!(task_id, error = %err, "failed to persist Bilibili prompt message association");
+            }
+        }
         Err(err) => {
             pending_bilibili_selection_jobs()
                 .lock()
                 .await
                 .remove(&token);
             warn!(chat_id, job_id, error = %err, "failed to send Bilibili selection prompt");
+            let _ = queue.set_status(&task_id, TaskStatus::Cancelled, None);
             send_or_log(
                 &telegram,
                 chat_id,
@@ -1797,34 +2340,26 @@ async fn prompt_bilibili_selection(
 }
 
 async fn process_job_after_duplicate_check(
-    telegram: TelegramClient,
-    config: Arc<AppConfig>,
-    job_dispatch: JobDispatch,
+    context: BotContext,
     chat_id: i64,
     job_id: u64,
+    task_id: String,
     job: JobRequest,
 ) {
+    let telegram = context.telegram.clone();
+    let config = Arc::clone(&context.config);
+    let queue = Arc::clone(&context.queue);
     if matches!(job, JobRequest::Pdf { .. }) {
-        queue_job(
-            telegram,
-            config,
-            Arc::clone(&job_dispatch.download_semaphore),
-            chat_id,
-            job_id,
-            job,
-            JobRunMode::Direct,
-        )
-        .await;
+        queue_job(context, chat_id, job_id, task_id, job, JobRunMode::Direct).await;
         return;
     }
 
     if is_confirmed_bilibili_ugc_collection_job(&job) {
         queue_job(
-            telegram,
-            config,
-            Arc::clone(&job_dispatch.download_semaphore),
+            context,
             chat_id,
             job_id,
+            task_id,
             job,
             JobRunMode::StagedKeepBoth,
         )
@@ -1832,7 +2367,7 @@ async fn process_job_after_duplicate_check(
         return;
     }
 
-    let duplicate_scan_permit = match Arc::clone(&job_dispatch.duplicate_scan_semaphore)
+    let duplicate_scan_permit = match Arc::clone(&context.job_dispatch.duplicate_scan_semaphore)
         .acquire_owned()
         .await
     {
@@ -1848,16 +2383,7 @@ async fn process_job_after_duplicate_check(
             )
             .await;
             let run_mode = default_run_mode(&job);
-            queue_job(
-                telegram,
-                config,
-                Arc::clone(&job_dispatch.download_semaphore),
-                chat_id,
-                job_id,
-                job,
-                run_mode,
-            )
-            .await;
+            queue_job(context, chat_id, job_id, task_id.clone(), job, run_mode).await;
             return;
         }
     };
@@ -1866,26 +2392,20 @@ async fn process_job_after_duplicate_check(
 
     match duplicate_scan_result {
         Ok(Some(duplicate)) => {
-            prompt_duplicate_choice(&telegram, chat_id, job_id, job, duplicate).await;
+            prompt_duplicate_choice(&telegram, &queue, chat_id, job_id, task_id, job, duplicate)
+                .await;
         }
         Ok(None) => {
             let run_mode = default_run_mode(&job);
-            queue_job(
-                telegram,
-                config,
-                Arc::clone(&job_dispatch.download_semaphore),
-                chat_id,
-                job_id,
-                job,
-                run_mode,
-            )
-            .await;
+            queue_job(context, chat_id, job_id, task_id, job, run_mode).await;
         }
         Err(err) if should_prompt_bilibili_selection_after_probe_error(&job, &err) => {
             prompt_bilibili_selection(
                 telegram,
+                queue,
                 chat_id,
                 job_id,
+                task_id,
                 job,
                 BilibiliSelectionPrompt::SeasonMedia,
             )
@@ -1902,16 +2422,7 @@ async fn process_job_after_duplicate_check(
             )
             .await;
             let run_mode = default_run_mode(&job);
-            queue_job(
-                telegram,
-                config,
-                Arc::clone(&job_dispatch.download_semaphore),
-                chat_id,
-                job_id,
-                job,
-                run_mode,
-            )
-            .await;
+            queue_job(context, chat_id, job_id, task_id, job, run_mode).await;
         }
     }
 }
@@ -1956,14 +2467,20 @@ async fn find_video_duplicate_async(
 
 async fn prompt_duplicate_choice(
     telegram: &TelegramClient,
+    queue: &QueueManager,
     chat_id: i64,
     job_id: u64,
+    task_id: String,
     job: JobRequest,
     duplicate: VideoDuplicate,
 ) {
     let token = next_duplicate_callback_token(job_id);
     let prompt = duplicate_choice_message(job_id, job.label(), &duplicate);
     let allow_overwrite = job_allows_duplicate_overwrite(&job, &duplicate);
+    if let Err(err) = queue.update_job(&task_id, job.clone(), TaskStatus::AwaitingDuplicateChoice) {
+        warn!(task_id, error = %err, "failed to persist duplicate choice prompt");
+        return;
+    }
     let now = Instant::now();
     {
         let mut pending_jobs = pending_duplicate_jobs().lock().await;
@@ -1973,6 +2490,7 @@ async fn prompt_duplicate_choice(
             PendingDuplicateJob {
                 chat_id,
                 job_id,
+                task_id: task_id.clone(),
                 job,
                 duplicate,
                 created_at: now,
@@ -1988,10 +2506,15 @@ async fn prompt_duplicate_choice(
         )
         .await
     {
-        Ok(_) => {}
+        Ok(message_id) => {
+            if let Err(err) = queue.set_status_message_id(&task_id, message_id) {
+                warn!(task_id, error = %err, "failed to persist duplicate prompt message association");
+            }
+        }
         Err(err) => {
             pending_duplicate_jobs().lock().await.remove(&token);
             warn!(chat_id, job_id, error = %err, "failed to send duplicate choice prompt");
+            let _ = queue.set_status(&task_id, TaskStatus::Cancelled, None);
             send_or_log(
                 telegram,
                 chat_id,
@@ -2003,32 +2526,46 @@ async fn prompt_duplicate_choice(
 }
 
 async fn queue_job(
-    telegram: TelegramClient,
-    config: Arc<AppConfig>,
-    semaphore: Arc<Semaphore>,
+    context: BotContext,
     chat_id: i64,
     job_id: u64,
+    task_id: String,
     job: JobRequest,
     run_mode: JobRunMode,
 ) {
-    send_or_log(
+    let telegram = context.telegram.clone();
+    if let Err(err) = context.queue.set_status(&task_id, TaskStatus::Queued, None) {
+        warn!(task_id, error = %err, "failed to persist queued task state");
+        return;
+    }
+    let cancel = match context.queue.register_cancellation(&task_id) {
+        Ok(cancel) => cancel,
+        Err(err) => {
+            warn!(task_id, error = %err, "failed to register task cancellation");
+            return;
+        }
+    };
+    let queued_message_id = send_or_log_message_id(
         &telegram,
         chat_id,
         format!("Queued job #{job_id}: {}", job.label()),
     )
     .await;
+    if let Some(message_id) = queued_message_id
+        && let Err(err) = context.queue.set_status_message_id(&task_id, message_id)
+    {
+        warn!(task_id, error = %err, "failed to persist queued message association");
+    }
 
     tokio::spawn(run_queued_job(
-        telegram, config, semaphore, chat_id, job_id, job, run_mode,
+        context, cancel, chat_id, job_id, task_id, job, run_mode,
     ));
 }
 
-async fn handle_callback_query(
-    telegram: TelegramClient,
-    config: Arc<AppConfig>,
-    job_dispatch: JobDispatch,
-    callback_query: CallbackQuery,
-) {
+async fn handle_callback_query(context: BotContext, callback_query: CallbackQuery) {
+    let telegram = context.telegram.clone();
+    let config = Arc::clone(&context.config);
+    let queue = Arc::clone(&context.queue);
     let callback_id = callback_query.id.clone();
     let Some(data) = callback_query.data.as_deref() else {
         answer_callback_or_log(&telegram, callback_id, "Unsupported button.".to_string()).await;
@@ -2050,6 +2587,18 @@ async fn handle_callback_query(
         return;
     }
 
+    if let Some(action) = parse_queue_callback_data(data) {
+        handle_queue_callback(
+            context.clone(),
+            callback_id,
+            chat_id,
+            message.message_id,
+            action,
+        )
+        .await;
+        return;
+    }
+
     if let Some(callback) = parse_collection_details_callback_data(data) {
         handle_collection_details_callback(
             telegram,
@@ -2064,9 +2613,7 @@ async fn handle_callback_query(
 
     if let Some(callback) = parse_bilibili_selection_callback_data(data) {
         handle_bilibili_selection_callback(
-            telegram,
-            config,
-            job_dispatch,
+            context.clone(),
             callback_id,
             chat_id,
             message.message_id,
@@ -2094,6 +2641,7 @@ async fn handle_callback_query(
 
     match callback.action {
         DuplicateCallbackAction::Cancel => {
+            let _ = queue.cancel_for_chat(&pending.task_id, chat_id);
             answer_callback_or_log(&telegram, callback_id, "Canceled.".to_string()).await;
             edit_without_keyboard_or_send(
                 &telegram,
@@ -2107,6 +2655,7 @@ async fn handle_callback_query(
             if matches!(action, VideoDuplicateAction::Overwrite)
                 && !job_allows_duplicate_overwrite(&pending.job, &pending.duplicate)
             {
+                let _ = queue.cancel_for_chat(&pending.task_id, chat_id);
                 answer_callback_or_log(
                     &telegram,
                     callback_id,
@@ -2139,11 +2688,10 @@ async fn handle_callback_query(
             )
             .await;
             queue_job(
-                telegram,
-                config,
-                Arc::clone(&job_dispatch.download_semaphore),
+                context,
                 chat_id,
                 pending.job_id,
+                pending.task_id,
                 pending.job,
                 JobRunMode::Duplicate(DuplicateRun {
                     action,
@@ -2156,14 +2704,14 @@ async fn handle_callback_query(
 }
 
 async fn handle_bilibili_selection_callback(
-    telegram: TelegramClient,
-    config: Arc<AppConfig>,
-    job_dispatch: JobDispatch,
+    context: BotContext,
     callback_id: String,
     chat_id: i64,
     message_id: i64,
     callback: BilibiliSelectionCallback,
 ) {
+    let telegram = context.telegram.clone();
+    let queue = Arc::clone(&context.queue);
     let pending = take_pending_bilibili_selection_job(callback.token, chat_id).await;
     let Some(pending) = pending else {
         answer_callback_or_log(
@@ -2177,6 +2725,7 @@ async fn handle_bilibili_selection_callback(
 
     match callback.action {
         BilibiliSelectionCallbackAction::Cancel => {
+            let _ = queue.cancel_for_chat(&pending.task_id, chat_id);
             answer_callback_or_log(&telegram, callback_id, "Canceled.".to_string()).await;
             edit_without_keyboard_or_send(
                 &telegram,
@@ -2191,6 +2740,7 @@ async fn handle_bilibili_selection_callback(
             let Some((job, selection_label)) =
                 apply_bilibili_selection(pending.job, &pending.prompt, action)
             else {
+                let _ = queue.cancel_for_chat(&pending.task_id, chat_id);
                 answer_callback_or_log(
                     &telegram,
                     callback_id,
@@ -2206,6 +2756,17 @@ async fn handle_bilibili_selection_callback(
                 .await;
                 return;
             };
+            if let Err(err) = queue.update_job(&pending.task_id, job.clone(), TaskStatus::Preparing)
+            {
+                answer_callback_or_log(
+                    &telegram,
+                    callback_id,
+                    "Could not save this selection; try again from /queue.".to_string(),
+                )
+                .await;
+                warn!(task_id = %pending.task_id, error = %err, "failed to persist Bilibili selection");
+                return;
+            }
             answer_callback_or_log(&telegram, callback_id, "Queued.".to_string()).await;
             edit_without_keyboard_or_send(
                 &telegram,
@@ -2219,11 +2780,10 @@ async fn handle_bilibili_selection_callback(
             )
             .await;
             tokio::spawn(process_job_after_duplicate_check(
-                telegram,
-                config,
-                job_dispatch,
+                context,
                 chat_id,
                 pending.job_id,
+                pending.task_id,
                 job,
             ));
         }
@@ -2765,21 +3325,50 @@ async fn answer_callback_or_log(
 }
 
 async fn run_queued_job(
-    telegram: TelegramClient,
-    config: Arc<AppConfig>,
-    semaphore: Arc<Semaphore>,
+    context: BotContext,
+    cancel: Arc<Notify>,
     chat_id: i64,
     job_id: u64,
+    task_id: String,
     job: JobRequest,
     run_mode: JobRunMode,
 ) {
-    let permit = match semaphore.acquire_owned().await {
-        Ok(permit) => permit,
-        Err(err) => {
-            error!(job_id, error = %err, "job semaphore closed");
+    let telegram = context.telegram.clone();
+    let config = Arc::clone(&context.config);
+    let queue = Arc::clone(&context.queue);
+    let semaphore = Arc::clone(&context.job_dispatch.download_semaphore);
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.notified() => {
+            let _ = queue.unregister_cancellation(&task_id);
+            send_or_log(&telegram, chat_id, format!("Canceled job #{job_id}: {}", job.label())).await;
             return;
         }
+        result = semaphore.acquire_owned() => match result {
+            Ok(permit) => permit,
+            Err(err) => {
+                error!(job_id, error = %err, "job semaphore closed");
+                let _ = queue.fail(&task_id, truncate(&err.to_string()));
+                let _ = queue.unregister_cancellation(&task_id);
+                return;
+            }
+        }
     };
+
+    match queue.begin_run(&task_id) {
+        Ok(true) => {}
+        Ok(false) => {
+            drop(permit);
+            let _ = queue.unregister_cancellation(&task_id);
+            return;
+        }
+        Err(err) => {
+            error!(task_id, error = %err, "failed to persist running task state");
+            drop(permit);
+            let _ = queue.unregister_cancellation(&task_id);
+            return;
+        }
+    }
 
     let status_message_id = send_or_log_message_id(
         &telegram,
@@ -2787,35 +3376,133 @@ async fn run_queued_job(
         job_status_message(job_id, job.label(), "Started", None),
     )
     .await;
+    if let Some(message_id) = status_message_id
+        && let Err(err) = queue.set_status_message_id(&task_id, message_id)
+    {
+        warn!(task_id, error = %err, "failed to persist running message association");
+    }
+
+    let current_plan = tokio::select! {
+        biased;
+        _ = cancel.notified() => None,
+        result = inspect_job_plan(&config, &job) => Some(result),
+    };
+    let Some(current_plan) = current_plan else {
+        drop(permit);
+        let _ = queue.unregister_cancellation(&task_id);
+        if let Some(message_id) = status_message_id {
+            edit_or_send(
+                &telegram,
+                chat_id,
+                message_id,
+                format!("Canceled job #{job_id}: {}", job.label()),
+            )
+            .await;
+        }
+        return;
+    };
+    let current_plan = match current_plan {
+        Ok(plan) => plan,
+        Err(err) => {
+            let message = redact_sensitive_text(&format!("{err:#}"));
+            let _ = queue.fail(&task_id, truncate(&message));
+            drop(permit);
+            let _ = queue.unregister_cancellation(&task_id);
+            send_or_log(
+                &telegram,
+                chat_id,
+                failed_job_message(job_id, job.label(), &message),
+            )
+            .await;
+            return;
+        }
+    };
+    let (updated_task, differences) = match queue.set_plan(&task_id, current_plan) {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = queue.unregister_cancellation(&task_id);
+            drop(permit);
+            warn!(task_id, error = %err, "task plan validation could not be persisted");
+            return;
+        }
+    };
+    if !differences.is_empty() {
+        let keyboard = task_action_keyboard(&[
+            (
+                "Use updated plan".to_string(),
+                queue_callback_data("confirm", &task_id),
+            ),
+            (
+                "Cancel".to_string(),
+                queue_callback_data("cancel", &task_id),
+            ),
+        ]);
+        let text = format!(
+            "Task {} paused because its download plan changed ({}). Review and confirm the updated plan before downloading.",
+            task_id,
+            differences.join(", ")
+        );
+        if let Some(message_id) = status_message_id {
+            if let Err(err) = telegram
+                .edit_message_text_with_inline_keyboard(chat_id, message_id, text, keyboard)
+                .await
+            {
+                warn!(task_id, error = %err, "failed to send plan change confirmation");
+                send_or_log(
+                    &telegram,
+                    chat_id,
+                    plan_confirmation_text(&updated_task, &differences),
+                )
+                .await;
+            }
+        } else {
+            let _ = telegram
+                .send_message_with_inline_keyboard(chat_id, text, keyboard)
+                .await;
+        }
+        drop(permit);
+        let _ = queue.unregister_cancellation(&task_id);
+        return;
+    }
 
     let (progress_tx, progress_rx) = job_progress_channel();
     let progress_task = tokio::spawn(forward_progress(
         telegram.clone(),
-        chat_id,
-        job_id,
-        job.label(),
-        status_message_id,
+        Arc::clone(&queue),
+        JobProgressContext {
+            chat_id,
+            job_id,
+            task_id: task_id.clone(),
+            job_label: job.label(),
+            status_message_id,
+            update_interval: Duration::from_secs(config.bot.progress_update_seconds),
+        },
         progress_rx,
-        Duration::from_secs(config.bot.progress_update_seconds),
     ));
     let completion_progress = progress_tx.clone();
-    let result = match run_mode {
-        JobRunMode::Duplicate(duplicate_run) => {
-            run_job_with_duplicate_action(
-                &config,
-                &job,
-                duplicate_run.action,
-                &duplicate_run.duplicate,
-                Some(progress_tx),
-            )
-            .await
-        }
-        JobRunMode::StagedKeepBoth => {
-            run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
-        }
-        JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
+    let result = tokio::select! {
+        biased;
+        _ = cancel.notified() => None,
+        result = async {
+            match run_mode {
+                JobRunMode::Duplicate(duplicate_run) => {
+                    run_job_with_duplicate_action(
+                        &config,
+                        &job,
+                        duplicate_run.action,
+                        &duplicate_run.duplicate,
+                        Some(progress_tx),
+                    )
+                    .await
+                }
+                JobRunMode::StagedKeepBoth => {
+                    run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
+                }
+                JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
+            }
+        } => Some(result),
     };
-    if result.is_err() {
+    if result.as_ref().is_some_and(Result::is_err) || result.is_none() {
         send_collection_failure_lifecycle(&completion_progress);
     }
     drop(completion_progress);
@@ -2823,31 +3510,118 @@ async fn run_queued_job(
     drop(permit);
 
     let message = match result {
-        Ok(report) => {
-            let details = if report.details.is_empty() {
-                String::new()
-            } else {
-                format!("\n{}", report.details)
-            };
-            format!(
-                "Finished job #{job_id}: {}\nSaved: {}{}",
-                job.label(),
-                report.saved_location,
-                details
-            )
+        Some(Ok(report)) => {
+            let finalize = async {
+                queue.begin_verification(&task_id)?.ok_or_else(|| {
+                    anyhow::anyhow!("task changed state before file verification")
+                })?;
+                if let Some(message_id) = status_message_id
+                    && let Err(err) = telegram
+                        .edit_message_text(
+                            chat_id,
+                            message_id,
+                            job_status_message(
+                                job_id,
+                                job.label(),
+                                "Verifying published files",
+                                None,
+                            ),
+                        )
+                        .await
+                {
+                    warn!(task_id, error = %err, "failed to update task verification status");
+                }
+                let media_root = if matches!(job, JobRequest::Pdf { .. }) {
+                    config.downloads.pdf_dir.clone()
+                } else {
+                    config.downloads.video_dir.clone()
+                };
+                let media_paths = report.primary_media_paths.clone();
+                let hashes = tokio::task::spawn_blocking(move || {
+                    hash_primary_media(&media_root, &media_paths)
+                })
+                .await
+                .context("published media hash task failed to join")??;
+                queue.complete(
+                    &task_id,
+                    report.saved_location.clone(),
+                    &report.primary_media_paths,
+                    hashes,
+                )?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            match finalize {
+                Ok(()) => {
+                    let details = if report.details.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{}", report.details)
+                    };
+                    format!(
+                        "Finished job #{job_id}: {}\nSaved: {}{}",
+                        job.label(),
+                        report.saved_location,
+                        details
+                    )
+                }
+                Err(err) => {
+                    let error_chain = redact_sensitive_text(&format!(
+                        "failed to verify or persist published outputs: {err:#}"
+                    ));
+                    match queue.get(&task_id).ok().flatten().map(|task| task.status) {
+                        Some(TaskStatus::Cancelled) => {
+                            format!("Canceled job #{job_id}: {}", job.label())
+                        }
+                        Some(TaskStatus::Completed) => format!(
+                            "Finished job #{job_id}: {}\nSaved: {}\nTask history could not be relocated beside the media file: {}",
+                            job.label(),
+                            report.saved_location,
+                            truncate(&error_chain),
+                        ),
+                        _ => {
+                            let _ = queue.fail(&task_id, truncate(&error_chain));
+                            failed_job_message(job_id, job.label(), &error_chain)
+                        }
+                    }
+                }
+            }
         }
-        Err(err) => {
+        Some(Err(err)) => {
             let error_chain = redact_sensitive_text(&format!("{err:#}"));
             error!(job_id, error = %error_chain, "job failed");
-            failed_job_message(job_id, job.label(), &error_chain)
+            if queue
+                .get(&task_id)
+                .ok()
+                .flatten()
+                .is_some_and(|record| record.status != TaskStatus::Cancelled)
+            {
+                let _ = queue.fail(&task_id, truncate(&error_chain));
+                failed_job_message(job_id, job.label(), &error_chain)
+            } else {
+                format!("Canceled job #{job_id}: {}", job.label())
+            }
+        }
+        None => {
+            format!("Canceled job #{job_id}: {}", job.label())
         }
     };
+
+    let _ = queue.unregister_cancellation(&task_id);
 
     if let Some(message_id) = status_message_id {
         edit_or_send(&telegram, chat_id, message_id, message).await;
     } else {
         send_or_log(&telegram, chat_id, message).await;
     }
+}
+
+fn plan_confirmation_text(task: &TaskRecord, differences: &[&str]) -> String {
+    format!(
+        "Task {} paused because its download plan changed ({}). Review and confirm the updated plan before downloading.",
+        task.id,
+        differences.join(", ")
+    )
 }
 
 fn send_collection_failure_lifecycle(progress: &JobProgressSender) {
@@ -2865,13 +3639,18 @@ fn failed_job_message(job_id: u64, job_label: &str, error_chain: &str) -> String
 
 async fn forward_progress(
     telegram: TelegramClient,
-    chat_id: i64,
-    job_id: u64,
-    job_label: &'static str,
-    status_message_id: Option<i64>,
+    queue: Arc<QueueManager>,
+    context: JobProgressContext,
     progress_rx: JobProgressReceiver,
-    update_interval: Duration,
 ) {
+    let JobProgressContext {
+        chat_id,
+        job_id,
+        task_id,
+        job_label,
+        status_message_id,
+        update_interval,
+    } = context;
     let (mut latest, mut lifecycle) = progress_rx.into_parts();
     let mut status_delivery = ProgressDelivery::from_message_id(status_message_id);
     let mut collection_delivery = None;
@@ -2901,15 +3680,24 @@ async fn forward_progress(
             event = lifecycle.recv(), if lifecycle_open => {
                 match event {
                     Some(event) => {
-                        status_delivery = deliver_collection_lifecycle(
-                            &telegram,
-                            chat_id,
-                            job_id,
-                            job_label,
-                            status_delivery,
-                            &mut collection_delivery,
-                            event,
-                        ).await;
+                        if let JobProgressLifecycleEvent::StagingAttempt { path } = &event {
+                            if let Err(err) = queue.record_staging_path(&task_id, path.clone()) {
+                                warn!(task_id, error = %err, "failed to persist staging attempt path");
+                            }
+                        } else {
+                            if let Err(err) = persist_collection_progress(&queue, &task_id, &event) {
+                                warn!(task_id, error = %err, "failed to persist collection progress");
+                            }
+                            status_delivery = deliver_collection_lifecycle(
+                                &telegram,
+                                chat_id,
+                                job_id,
+                                job_label,
+                                status_delivery,
+                                &mut collection_delivery,
+                                event,
+                            ).await;
+                        }
                     }
                     None => lifecycle_open = false,
                 }
@@ -2935,6 +3723,35 @@ async fn forward_progress(
             }
         }
     }
+}
+
+fn persist_collection_progress(
+    queue: &QueueManager,
+    task_id: &str,
+    event: &JobProgressLifecycleEvent,
+) -> Result<()> {
+    let (total, completed, failed) = match event {
+        JobProgressLifecycleEvent::StagingAttempt { .. } => return Ok(()),
+        JobProgressLifecycleEvent::Resolved { manifest, .. } => {
+            (manifest.total_entries, manifest.skipped_entries, 0)
+        }
+        JobProgressLifecycleEvent::EntryStarted { snapshot, .. }
+        | JobProgressLifecycleEvent::EntryCompleted { snapshot, .. }
+        | JobProgressLifecycleEvent::Completed { snapshot }
+        | JobProgressLifecycleEvent::Failed { snapshot } => {
+            let completed = snapshot.skipped_entries + snapshot.completed_entries;
+            let failed = if matches!(event, JobProgressLifecycleEvent::Failed { .. })
+                && snapshot.current_entry.is_some()
+            {
+                1
+            } else {
+                0
+            };
+            (snapshot.total_entries, completed, failed)
+        }
+    };
+    queue.set_collection_progress(task_id, total, completed, failed)?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -2998,6 +3815,7 @@ async fn deliver_collection_lifecycle(
         job_label,
     };
     match event {
+        JobProgressLifecycleEvent::StagingAttempt { .. } => {}
         JobProgressLifecycleEvent::Resolved { manifest, snapshot } => {
             if !delivery.details_sent {
                 register_collection_details(telegram, chat_id, job_id, manifest.clone()).await;
@@ -3679,12 +4497,14 @@ mod tests {
     #[derive(Debug)]
     struct FakeTelegramRequest {
         method: String,
+        query: String,
         body: serde_json::Value,
     }
 
     async fn spawn_fake_telegram_api() -> (
         TelegramClient,
         mpsc::UnboundedReceiver<FakeTelegramRequest>,
+        mpsc::UnboundedSender<Vec<serde_json::Value>>,
         oneshot::Sender<()>,
         tokio::task::JoinHandle<Result<()>>,
     ) {
@@ -3695,6 +4515,7 @@ mod tests {
             .local_addr()
             .expect("fake Telegram API should expose its address");
         let (requests_tx, requests_rx) = mpsc::unbounded_channel();
+        let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
             let mut next_message_id = 1_000_i64;
@@ -3704,7 +4525,12 @@ mod tests {
                     accepted = listener.accept() => {
                         let (mut stream, _) = accepted.context("fake Telegram API accept failed")?;
                         let request = read_fake_telegram_request(&mut stream).await?;
-                        let response = fake_telegram_response(&request, &mut next_message_id);
+                        let updates = if request.method == "getUpdates" {
+                            updates_rx.try_recv().unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        let response = fake_telegram_response(&request, &mut next_message_id, updates);
                         let _ = requests_tx.send(request);
                         stream
                             .write_all(response.as_bytes())
@@ -3721,6 +4547,7 @@ mod tests {
                 format!("http://{address}"),
             ),
             requests_rx,
+            updates_tx,
             shutdown_tx,
             server,
         )
@@ -3747,15 +4574,22 @@ mod tests {
         };
 
         let headers = std::str::from_utf8(&bytes[..header_end])
-            .context("fake Telegram API request headers were not UTF-8")?;
+            .context("fake Telegram API request headers were not UTF-8")?
+            .to_string();
         let request_line = headers
             .lines()
             .next()
             .context("fake Telegram API request line was missing")?;
-        let method = request_line
+        let request_target = request_line
             .split_whitespace()
             .nth(1)
-            .and_then(|path| path.rsplit('/').next())
+            .context("fake Telegram API request path was missing")?;
+        let (path, query) = request_target
+            .split_once('?')
+            .unwrap_or((request_target, ""));
+        let method = path
+            .rsplit('/')
+            .next()
             .filter(|method| !method.is_empty())
             .context("fake Telegram API request path was missing")?
             .to_string();
@@ -3766,7 +4600,7 @@ mod tests {
                 name.eq_ignore_ascii_case("content-length")
                     .then_some(value.trim())
             })
-            .context("fake Telegram API request content length was missing")?
+            .unwrap_or("0")
             .parse::<usize>()
             .context("fake Telegram API request content length was invalid")?;
         let body_end = header_end.saturating_add(content_length);
@@ -3781,25 +4615,39 @@ mod tests {
             }
             bytes.extend_from_slice(&chunk[..read]);
         }
-        let body = serde_json::from_slice(&bytes[header_end..body_end])
-            .context("fake Telegram API request body was not JSON")?;
+        let body = if content_length == 0 {
+            serde_json::json!({})
+        } else {
+            serde_json::from_slice(&bytes[header_end..body_end])
+                .context("fake Telegram API request body was not JSON")?
+        };
 
-        Ok(FakeTelegramRequest { method, body })
+        Ok(FakeTelegramRequest {
+            method,
+            query: query.to_string(),
+            body,
+        })
     }
 
-    fn fake_telegram_response(request: &FakeTelegramRequest, next_message_id: &mut i64) -> String {
-        let result = if request.method == "sendMessage" {
-            let message_id = *next_message_id;
-            *next_message_id += 1;
-            serde_json::json!({
-                "message_id": message_id,
-                "chat": {
-                    "id": request.body["chat_id"].as_i64().unwrap_or_default(),
-                    "type": "private"
-                }
-            })
-        } else {
-            serde_json::json!(true)
+    fn fake_telegram_response(
+        request: &FakeTelegramRequest,
+        next_message_id: &mut i64,
+        updates: Vec<serde_json::Value>,
+    ) -> String {
+        let result = match request.method.as_str() {
+            "sendMessage" => {
+                let message_id = *next_message_id;
+                *next_message_id += 1;
+                serde_json::json!({
+                    "message_id": message_id,
+                    "chat": {
+                        "id": request.body["chat_id"].as_i64().unwrap_or_default(),
+                        "type": "private"
+                    }
+                })
+            }
+            "getUpdates" => serde_json::json!(updates),
+            _ => serde_json::json!(true),
         };
         let payload = serde_json::json!({ "ok": true, "result": result }).to_string();
         format!(
@@ -4275,7 +5123,7 @@ mod tests {
                 .iter()
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["help", "pdf", "bbdown"]
+            vec!["help", "pdf", "queue", "bbdown"]
         );
     }
 
@@ -4511,20 +5359,244 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_queue_restart_and_telegram_interactions_e2e() {
+        let queue_root = temp_main_test_dir("persistent-queue-telegram-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+
+        let task_id = "task-telegram-e2e-1";
+        let chat_id = 123_456_789;
+        let initial_queue = QueueManager::open(&config).expect("task queue should open");
+        let task = TaskRecord::new(
+            task_id.to_string(),
+            501,
+            601,
+            chat_id,
+            Some(701),
+            0,
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            },
+        );
+        assert!(
+            initial_queue
+                .create(task)
+                .expect("interrupted task should persist")
+        );
+        initial_queue
+            .set_status(task_id, TaskStatus::Running, None)
+            .expect("task should enter running state");
+        initial_queue
+            .set_status_message_id(task_id, 777)
+            .expect("task status message should persist");
+        drop(initial_queue);
+
+        let queue = Arc::new(QueueManager::open(&config).expect("queue should recover on restart"));
+        let recovered = queue
+            .get(task_id)
+            .expect("recovered task should load")
+            .expect("recovered task should exist");
+        assert_eq!(recovered.status, TaskStatus::Interrupted);
+        assert_eq!(recovered.status_message_id, Some(777));
+        let summaries = queue
+            .startup_summaries()
+            .expect("restart summary should load");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].interrupted_jobs, 1);
+
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        let cancel_data = queue_callback_data("cancel", task_id);
+        update_sender
+            .send(vec![
+                serde_json::json!({
+                    "update_id": 801,
+                    "message": {
+                        "message_id": 901,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": 701},
+                        "text": "/queue"
+                    }
+                }),
+                serde_json::json!({
+                    "update_id": 802,
+                    "callback_query": {
+                        "id": "cancel-task-1",
+                        "data": cancel_data.clone(),
+                        "message": {
+                            "message_id": 1001,
+                            "chat": {"id": chat_id, "type": "private"}
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "update_id": 803,
+                    "message": {
+                        "message_id": 902,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": 701},
+                        "text": "/queue history"
+                    }
+                }),
+            ])
+            .expect("fake Telegram should accept scripted updates");
+
+        notify_restart_summaries(&telegram, &queue)
+            .await
+            .expect("restart notice should be delivered");
+        let updates = telegram
+            .get_updates(None, 0)
+            .await
+            .expect("mock Telegram should return scripted updates");
+        assert_eq!(updates.len(), 3);
+        let mut offset = None;
+        let config = Arc::new(config);
+        let job_dispatch = JobDispatch {
+            download_semaphore: Arc::new(Semaphore::new(1)),
+            duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+        };
+        let next_job_id = Arc::new(AtomicU64::new(1));
+        process_telegram_updates(
+            &telegram,
+            &config,
+            &job_dispatch,
+            &next_job_id,
+            &queue,
+            updates,
+            &mut offset,
+        )
+        .await
+        .expect("mock Telegram updates should process successfully");
+        assert_eq!(offset, Some(804));
+        assert!(
+            telegram
+                .get_updates(offset, 0)
+                .await
+                .expect("mock Telegram should accept the advanced offset")
+                .is_empty()
+        );
+
+        let cancelled = queue
+            .get(task_id)
+            .expect("cancelled task should load")
+            .expect("cancelled task should remain in history");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert_eq!(cancelled.status_message_id, Some(777));
+        assert_eq!(cancelled.update_id, 501);
+        assert_eq!(cancelled.message_id, 601);
+        assert_eq!(cancelled.submitter_user_id, Some(701));
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let methods = recorded
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            methods,
+            vec![
+                "sendMessage",
+                "getUpdates",
+                "sendMessage",
+                "answerCallbackQuery",
+                "editMessageText",
+                "sendMessage",
+                "getUpdates",
+            ]
+        );
+        assert!(
+            recorded[0].body["text"]
+                .as_str()
+                .expect("restart notification should include text")
+                .contains("1 interrupted")
+        );
+
+        let active_page = &recorded[2].body;
+        let active_text = active_page["text"]
+            .as_str()
+            .expect("active queue page should include text");
+        assert!(active_text.contains(task_id));
+        assert!(active_text.contains("interrupted"));
+        let active_buttons = active_page["reply_markup"]["inline_keyboard"][0]
+            .as_array()
+            .expect("interrupted task should have action buttons");
+        let resume_data = format!("q:resume:{task_id}");
+        assert_eq!(active_buttons[0]["text"].as_str(), Some("Resume"));
+        assert_eq!(
+            active_buttons[0]["callback_data"].as_str(),
+            Some(resume_data.as_str())
+        );
+        assert_eq!(active_buttons[1]["text"].as_str(), Some("Cancel"));
+        assert_eq!(
+            active_buttons[1]["callback_data"].as_str(),
+            Some(cancel_data.as_str())
+        );
+
+        assert_eq!(recorded[4].body["message_id"].as_i64(), Some(1001));
+        assert!(
+            recorded[5].body["text"]
+                .as_str()
+                .expect("history page should include text")
+                .contains("cancelled")
+        );
+        assert!(recorded[6].query.contains("offset=804"));
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
     async fn collection_progress_local_telegram_e2e_preserves_entry_lifecycle_and_pagination() {
-        let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let queue_root = temp_main_test_dir("queue-callback");
+        let mut callback_config = AppConfig::for_test();
+        callback_config.downloads.video_dir = queue_root.join("videos");
+        callback_config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&callback_config.downloads.video_dir)
+            .expect("video queue root should create");
+        fs::create_dir_all(&callback_config.downloads.pdf_dir)
+            .expect("pdf queue root should create");
+        let queue = Arc::new(QueueManager::open(&callback_config).expect("task queue should open"));
+        let task_id = "task-collection-e2e-17";
+        let task = TaskRecord::new(
+            task_id.to_string(),
+            17,
+            699,
+            123_456_789,
+            Some(42),
+            0,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV1234567890".to_string(),
+                selection: None,
+            },
+        );
+        assert!(queue.create(task).expect("collection task should persist"));
+        queue
+            .set_status(task_id, TaskStatus::Running, None)
+            .expect("collection task should enter running state");
+        queue
+            .set_status_message_id(task_id, 700)
+            .expect("collection task status message should persist");
+
         let manifest = test_collection_manifest(6);
         let entry_one = test_collection_entry_progress(&manifest, 1);
         let entry_two = test_collection_entry_progress(&manifest, 2);
         let (progress, progress_rx) = job_progress_channel();
         let progress_task = tokio::spawn(forward_progress(
             telegram.clone(),
-            123_456_789,
-            17,
-            "Bilibili download",
-            Some(700),
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id: 123_456_789,
+                job_id: 17,
+                task_id: task_id.to_string(),
+                job_label: "Bilibili download",
+                status_message_id: Some(700),
+                update_interval: Duration::from_secs(60),
+            },
             progress_rx,
-            Duration::from_secs(60),
         ));
 
         progress.send_lifecycle(JobProgressLifecycleEvent::Resolved {
@@ -4626,11 +5698,15 @@ mod tests {
         );
 
         handle_callback_query(
-            telegram,
-            Arc::new(AppConfig::for_test()),
-            JobDispatch {
-                download_semaphore: Arc::new(Semaphore::new(1)),
-                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            BotContext {
+                telegram,
+                config: Arc::new(callback_config),
+                job_dispatch: JobDispatch {
+                    download_semaphore: Arc::new(Semaphore::new(1)),
+                    duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+                },
+                next_job_id: Arc::new(AtomicU64::new(1)),
+                queue: Arc::clone(&queue),
             },
             crate::telegram::CallbackQuery {
                 id: "next-page".to_string(),
@@ -4642,6 +5718,7 @@ mod tests {
                         kind: Some("private".to_string()),
                     },
                     text: None,
+                    from: None,
                 }),
             },
         )
@@ -4675,7 +5752,9 @@ mod tests {
             .lock()
             .await
             .remove(&next_callback.token);
+        drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
     }
 
     #[test]
@@ -5206,6 +6285,7 @@ mod tests {
         PendingDuplicateJob {
             chat_id: 1,
             job_id,
+            task_id: format!("task-{job_id}"),
             job: JobRequest::Youtube {
                 url: format!("https://youtu.be/{job_id}"),
             },

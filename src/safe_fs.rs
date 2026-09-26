@@ -332,6 +332,16 @@ impl BoundFile {
         Ok(contents)
     }
 
+    pub(crate) fn duplicate_std_file(&self) -> Result<File> {
+        self.validate_identity()?;
+        let duplicate = rustix::io::dup(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to duplicate bound file descriptor")?;
+        let file = File::from(duplicate);
+        self.validate_identity()?;
+        Ok(file)
+    }
+
     #[cfg(unix)]
     pub(crate) fn duplicate_fd_cloexec_at_least(&self, minimum: RawFd) -> Result<OwnedFd> {
         self.validate_identity()?;
@@ -380,6 +390,34 @@ impl BoundDirectory {
         self.validate_identity()?;
         sync_directory(self.fd.as_ref())?;
         self.validate_identity()
+    }
+
+    pub(crate) fn set_private_mode(&self, mode: u16) -> Result<()> {
+        // Protected property: the staging root's access policy must be owner-private. The open
+        // descriptor and device/inode identity select the same directory object; checking its
+        // owner before fchmod prevents changing an unrelated replacement path.
+        self.validate_identity()?;
+        let before = rustix::fs::fstat(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to inspect bound directory permissions")?;
+        if identity_from_stat(&before) != self.identity
+            || before.st_uid != unsafe { libc::geteuid() }
+        {
+            bail!("cannot change permissions on an unowned or replaced directory");
+        }
+        rustix::fs::fchmod(self.fd.as_ref(), Mode::from_raw_mode(mode))
+            .map_err(errno_to_io)
+            .context("failed to restrict bound directory permissions")?;
+        let after = rustix::fs::fstat(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to revalidate bound directory permissions")?;
+        if identity_from_stat(&after) != self.identity
+            || after.st_uid != unsafe { libc::geteuid() }
+            || after.st_mode & 0o777 != mode
+        {
+            bail!("bound directory identity or private permissions changed");
+        }
+        Ok(())
     }
 
     #[cfg(unix)]

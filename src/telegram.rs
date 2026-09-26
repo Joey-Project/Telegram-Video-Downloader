@@ -33,6 +33,12 @@ pub struct Message {
     pub message_id: i64,
     pub chat: Chat,
     pub text: Option<String>,
+    pub from: Option<User>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct User {
+    pub id: i64,
 }
 
 #[derive(Debug, Deserialize)]

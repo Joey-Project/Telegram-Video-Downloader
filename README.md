@@ -9,6 +9,7 @@
 - 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
+- `/queue` 查看可操作的持久任务；可以恢复中断任务、重试失败任务或取消任务，`/queue history` 查看已完成和已取消记录。重启后需要重新选择的任务会重新显示选择项；下载计划或媒体规格变化时，bot 会暂停并要求确认。
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
 - 视频下载会先写入隐藏 staging 目录，成功后再移动到最终目录；如果可从 URL 识别到本地已有相同 YouTube 或 Bilibili 视频，bot 会先提供两者并存或取消，只有能唯一定位现有文件时才同时提供覆盖按钮。
@@ -16,6 +17,7 @@
 - 全局并发由配置控制，超出的任务会排队。
 - 外部命令会流式采集 stdout/stderr，并监控输出目录文件大小；长时间无输出且无文件增长会自动失败，避免任务一直停在 `Started`。
 - 任务开始后会发送一条状态消息，后续下载/混流进度会尽量通过 Telegram edit message 在同一条消息中刷新；视频 plan/metadata 解析完成后，同一条消息会持续显示已选媒体的预估大小、分辨率、帧率、视频/音频编码和全集条目数。上游未提供大小时会明确显示 `unknown`，混合已知与未知流时显示 `at least`，不会用码率伪造精确文件大小。
+- 持久任务记录保存在视频和 PDF 下载根目录下的隐藏私有队列目录；完成后，任务记录会移动到已发布文件旁边，并保存主媒体文件的 SHA-256。视频下载失败或取消时，隐藏的私有 staging 尝试目录会永久保留，后续成功任务也不会清理它。
 
 ## 配置
 
@@ -70,6 +72,8 @@ https://youtu.be/...
 https://mp.weixin.qq.com/s?...
 https://m.bilibili.com/opus/1206098216310800386?share_source=COPY
 /help
+/queue
+/queue history
 /bbdown login web
 /bbdown login tv
 /bbdown login access-key
