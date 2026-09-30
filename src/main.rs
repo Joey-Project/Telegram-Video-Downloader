@@ -2,13 +2,14 @@ mod bilibili_auth;
 mod bilibili_core;
 mod config;
 mod downloader;
+mod file_provider;
 mod queue;
 mod redaction;
 mod router;
 mod safe_fs;
 mod telegram;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -23,7 +24,7 @@ use bbdown_core::{
     AccessKeyLoginTicket, CredentialHealthReport, CredentialHealthScope, CredentialHealthStatus,
     CredentialKind, CredentialSource, QrLoginKind, QrLoginState, UgcCollectionReference,
 };
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
 
@@ -36,6 +37,7 @@ use crate::downloader::{
     recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both, sync_bilibili_rust_credentials,
 };
+use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 use crate::queue::{
     QueueManager, RestartSummary, TaskRecord, TaskStatus, hash_primary_media,
     sanitize_job_for_storage,
@@ -77,6 +79,7 @@ const COLLECTION_DETAILS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_PENDING_COLLECTION_DETAILS: usize = 128;
 const COLLECTION_DETAILS_PAGE_SIZE: usize = 5;
 const BILIBILI_ACCESS_KEY_LOGIN_TTL: Duration = Duration::from_secs(30 * 60);
+const QUEUE_START_FILE_PROVIDER_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 struct PendingDuplicateJob {
@@ -157,6 +160,7 @@ struct BotContext {
     job_dispatch: JobDispatch,
     next_job_id: Arc<AtomicU64>,
     queue: Arc<QueueManager>,
+    queue_start_retry_delay: Duration,
 }
 
 struct JobProgressContext {
@@ -206,25 +210,86 @@ async fn main() -> Result<()> {
         .first()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
+    // Keep synchronous File Provider coordination off the runtime that observes OS shutdown.
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let worker_result = spawn_bot_runtime_worker(run_bot(config_path, shutdown_receiver))?;
+    supervise_bot_runtime(worker_result, shutdown_sender, shutdown_signal()).await
+}
+
+async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>) -> Result<()> {
     let config = Arc::new(AppConfig::load(&config_path)?);
-    config.ensure_runtime_dirs()?;
+    let telegram = TelegramClient::new(config.telegram.token.clone());
+    let shutdown = wait_for_supervisor_shutdown(shutdown_receiver);
+    tokio::pin!(shutdown);
+    let setup_config = Arc::clone(&config);
+    let Some(()) = retry_file_provider_startup_operation(
+        move || setup_config.ensure_runtime_dirs(),
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        &mut shutdown,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     for recovery in bilibili_auth::recover_interrupted_auth_cleanup(
         &config.bilibili.auth.state_path,
         &config.bilibili.auth.credential_file,
     )? {
         warn!(message = %recovery, "recovered interrupted BBDown auth cleanup");
     }
-    for recovery in recover_pending_overwrite_transactions(&config.downloads.video_dir)? {
+    let recovery_video_dir = config.downloads.video_dir.clone();
+    let recovery_error_video_dir = recovery_video_dir.clone();
+    let Some(recoveries) = retry_file_provider_startup_operation(
+        move || {
+            recover_pending_overwrite_transactions(&recovery_video_dir).map_err(|error| {
+                classify_deadlock_error(
+                    &recovery_error_video_dir,
+                    "recover video output transactions",
+                    error,
+                )
+            })
+        },
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        &mut shutdown,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    for recovery in recoveries {
         warn!(message = %recovery, "recovered interrupted overwrite transaction");
     }
-    let queue = Arc::new(QueueManager::open(&config)?);
+    let startup_config = Arc::clone(&config);
+    let Some((queue, restart_summaries)) = retry_file_provider_startup_operation(
+        move || {
+            let queue = QueueManager::open(&startup_config)?;
+            let restart_summaries = queue.startup_summaries()?;
+            Ok((queue, restart_summaries))
+        },
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        &mut shutdown,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let queue = Arc::new(queue);
     tokio::spawn(expire_pending_duplicate_jobs());
 
-    let telegram = TelegramClient::new(config.telegram.token.clone());
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
         warn!(error = %err, "failed to register Telegram bot commands");
     }
-    notify_restart_summaries(&telegram, &queue).await?;
+    if !notify_restart_summaries(
+        &telegram,
+        &queue,
+        &restart_summaries,
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        &mut shutdown,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let job_dispatch = JobDispatch {
         download_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
         duplicate_scan_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
@@ -237,8 +302,6 @@ async fn main() -> Result<()> {
         "telegram local downloader started"
     );
 
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
     loop {
         tokio::select! {
             signal = &mut shutdown => {
@@ -261,11 +324,18 @@ async fn main() -> Result<()> {
                         .await
                         {
                             warn!(error = %err, "failed to persist or handle telegram update");
+                            if !retry_delay_or_shutdown(&mut shutdown, Duration::from_secs(5)).await? {
+                                info!("shutdown requested during Telegram update retry delay");
+                                break;
+                            }
                         }
                     }
                     Err(err) => {
                         warn!(error = %err, "failed to fetch telegram updates");
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        if !retry_delay_or_shutdown(&mut shutdown, Duration::from_secs(5)).await? {
+                            info!("shutdown requested during Telegram polling retry delay");
+                            break;
+                        }
                     }
                 }
             }
@@ -273,6 +343,120 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn spawn_bot_runtime_worker<F>(future: F) -> Result<oneshot::Receiver<Result<()>>>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    let (result_sender, result_receiver) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("telegram-bot-runtime".to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build Telegram bot runtime")
+                .and_then(|runtime| runtime.block_on(future));
+            let _ = result_sender.send(result);
+        })
+        .context("failed to start Telegram bot runtime worker")?;
+    Ok(result_receiver)
+}
+
+async fn supervise_bot_runtime(
+    worker_result: oneshot::Receiver<Result<()>>,
+    shutdown_sender: watch::Sender<bool>,
+    shutdown: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::pin!(shutdown);
+    tokio::select! {
+        signal = &mut shutdown => {
+            signal?;
+            // A synchronous coordinator call may remain blocked. The queue is durable, so let
+            // the process exit without joining the bot runtime and allow LaunchAgent recovery.
+            let _ = shutdown_sender.send_replace(true);
+            info!("shutdown requested");
+            Ok(())
+        }
+        result = worker_result => {
+            result.context("Telegram bot runtime worker exited without a result")?
+        }
+    }
+}
+
+async fn wait_for_supervisor_shutdown(mut shutdown_receiver: watch::Receiver<bool>) -> Result<()> {
+    loop {
+        if *shutdown_receiver.borrow_and_update() {
+            return Ok(());
+        }
+        shutdown_receiver
+            .changed()
+            .await
+            .context("Telegram bot shutdown supervisor exited unexpectedly")?;
+    }
+}
+
+async fn retry_file_provider_startup_operation<T, F>(
+    operation: F,
+    retry_delay: Duration,
+    shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
+) -> Result<Option<T>>
+where
+    T: Send + 'static,
+    F: Fn() -> Result<T> + Send + Sync + 'static,
+{
+    let operation = Arc::new(operation);
+    loop {
+        let operation = Arc::clone(&operation);
+        let (result_sender, result_receiver) = oneshot::channel();
+        // Startup operations touch coordinated queue files and configured output directories.
+        // A detached OS thread lets the async runtime observe shutdown even if a provider call
+        // stalls indefinitely.
+        std::thread::Builder::new()
+            .name("file-provider-startup".to_string())
+            .spawn(move || {
+                let _ = result_sender.send(operation());
+            })
+            .context("failed to start File Provider startup worker")?;
+        let opened = tokio::select! {
+            signal = &mut *shutdown => {
+                signal?;
+                info!("shutdown requested while waiting for File Provider startup access");
+                return Ok(None);
+            }
+            result = result_receiver => {
+                result.context("File Provider startup worker exited without a result")?
+            }
+        };
+        match opened {
+            Ok(value) => return Ok(Some(value)),
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "File Provider blocked startup; retrying without removing queue or staging data"
+                );
+                if !retry_delay_or_shutdown(&mut *shutdown, retry_delay).await? {
+                    info!("shutdown requested while retrying File Provider startup");
+                    return Ok(None);
+                }
+            }
+            Err(error) => return Err(error).context("File Provider startup operation failed"),
+        }
+    }
+}
+
+async fn retry_delay_or_shutdown(
+    shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
+    delay: Duration,
+) -> Result<bool> {
+    tokio::select! {
+        signal = shutdown => {
+            signal?;
+            Ok(false)
+        }
+        _ = tokio::time::sleep(delay) => Ok(true),
+    }
 }
 
 async fn process_telegram_updates(
@@ -290,37 +474,88 @@ async fn process_telegram_updates(
         job_dispatch: job_dispatch.clone(),
         next_job_id: Arc::clone(next_job_id),
         queue: Arc::clone(queue),
+        queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
     };
+    process_telegram_updates_with_context(&context, updates, offset).await
+}
+
+async fn process_telegram_updates_with_context(
+    context: &BotContext,
+    updates: Vec<Update>,
+    offset: &mut Option<i64>,
+) -> Result<()> {
     for update in updates {
         let update_id = update.update_id;
         if let Some(message) = update.message {
-            handle_message(
-                context.clone(),
+            let chat_id = message.chat.id;
+            if let Err(err) = handle_message(
+                (*context).clone(),
                 update_id,
                 message.message_id,
                 message.from.map(|user| user.id),
-                message.chat.id,
+                chat_id,
                 message.chat.is_private(),
                 message.text.as_deref(),
             )
             .await
-            .with_context(|| format!("telegram message update {update_id} failed"))?;
+            .with_context(|| format!("telegram message update {update_id} failed"))
+            {
+                if is_file_provider_access_error(&err) {
+                    warn!(
+                        update_id,
+                        chat_id,
+                        error = %format!("{err:#}"),
+                        "File Provider blocked queue access; acknowledging for user retry"
+                    );
+                    let response = "macOS could not coordinate access to the task queue files. Wait until the hidden queue folder shows as downloaded in Finder, then retry your message. Check /queue first to avoid starting a duplicate; existing queue and staging data are retained.".to_string();
+                    send_or_log(&context.telegram, chat_id, response).await;
+                } else {
+                    warn!(
+                        update_id,
+                        chat_id,
+                        error = %format!("{err:#}"),
+                        "failed to handle telegram message update; leaving it unacknowledged for retry"
+                    );
+                    return Err(err);
+                }
+            }
         }
         if let Some(callback_query) = update.callback_query {
-            handle_callback_query(context.clone(), callback_query).await;
+            handle_callback_query((*context).clone(), callback_query).await;
         }
         *offset = Some(update_id + 1);
     }
     Ok(())
 }
 
-async fn notify_restart_summaries(telegram: &TelegramClient, queue: &QueueManager) -> Result<()> {
-    for summary in queue.startup_summaries()? {
+fn task_id_for_update(update_id: i64, ordinal: usize) -> String {
+    format!("u{update_id}-{ordinal}")
+}
+
+async fn notify_restart_summaries(
+    telegram: &TelegramClient,
+    queue: &QueueManager,
+    summaries: &[RestartSummary],
+    retry_delay: Duration,
+    shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
+) -> Result<bool> {
+    for summary in summaries {
         match telegram
-            .send_message(summary.chat_id, render_restart_summary(&summary))
+            .send_message(summary.chat_id, render_restart_summary(summary))
             .await
         {
-            Ok(_) => queue.mark_restart_summary_sent(summary.chat_id)?,
+            Ok(_) => {
+                if !retry_restart_summary_acknowledgement(
+                    queue,
+                    summary.chat_id,
+                    retry_delay,
+                    shutdown,
+                )
+                .await?
+                {
+                    return Ok(false);
+                }
+            }
             Err(err) => warn!(
                 chat_id = summary.chat_id,
                 error = %err,
@@ -328,7 +563,37 @@ async fn notify_restart_summaries(telegram: &TelegramClient, queue: &QueueManage
             ),
         }
     }
-    Ok(())
+    Ok(true)
+}
+
+async fn retry_restart_summary_acknowledgement(
+    queue: &QueueManager,
+    chat_id: i64,
+    retry_delay: Duration,
+    shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
+) -> Result<bool> {
+    loop {
+        match queue.mark_restart_summary_sent(chat_id) {
+            Ok(()) => return Ok(true),
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    chat_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked restart summary acknowledgement; retrying without resending"
+                );
+                if !retry_delay_or_shutdown(shutdown, retry_delay).await? {
+                    info!(
+                        chat_id,
+                        "shutdown requested while retrying restart summary acknowledgement"
+                    );
+                    return Ok(false);
+                }
+            }
+            Err(error) => {
+                return Err(error).context("failed to persist restart summary acknowledgement");
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -493,7 +758,7 @@ async fn handle_message(
         RouteResult::Jobs(jobs) => {
             for (ordinal, job) in jobs.into_iter().enumerate() {
                 let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
-                let task_id = format!("u{update_id}-{ordinal}");
+                let task_id = task_id_for_update(update_id, ordinal);
                 let (stored_job, sanitized) = sanitize_job_for_storage(job.clone());
                 let mut task = TaskRecord::new(
                     task_id.clone(),
@@ -677,6 +942,40 @@ async fn handle_queue_command(
     Ok(())
 }
 
+async fn report_queue_file_provider_callback_error(
+    telegram: &TelegramClient,
+    callback_id: &str,
+    chat_id: i64,
+    task_id: Option<&str>,
+    operation: &'static str,
+    error: &anyhow::Error,
+) -> bool {
+    if !is_file_provider_access_error(error) {
+        return false;
+    }
+
+    warn!(
+        chat_id,
+        task_id = task_id.unwrap_or("queue"),
+        operation,
+        error = %format!("{error:#}"),
+        "File Provider blocked a task queue button"
+    );
+    answer_callback_or_log(
+        telegram,
+        callback_id.to_string(),
+        "Queue files unavailable. Check Finder, then tap again.".to_string(),
+    )
+    .await;
+    send_or_log(
+        telegram,
+        chat_id,
+        "macOS could not coordinate access to the task queue files. Wait until the hidden queue folder is available in Finder, then tap the button again. Existing queue and staging data are retained.".to_string(),
+    )
+    .await;
+    true
+}
+
 async fn handle_queue_callback(
     context: BotContext,
     callback_id: String,
@@ -694,14 +993,38 @@ async fn handle_queue_callback(
                 QueueCallbackAction::Retry(id) => (id, true),
                 _ => unreachable!("matched resume or retry action"),
             };
-            if queue.validate_chat(&id, chat_id).ok().flatten().is_none() {
-                answer_callback_or_log(
-                    &telegram,
-                    callback_id,
-                    "Task not found in this chat.".to_string(),
-                )
-                .await;
-                return;
+            match queue.validate_chat(&id, chat_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Task not found in this chat.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                Err(err) => {
+                    if !report_queue_file_provider_callback_error(
+                        &telegram,
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "validate task before resume or retry",
+                        &err,
+                    )
+                    .await
+                    {
+                        warn!(task_id = %id, error = %err, "failed to validate task for restart");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not check this task.".to_string(),
+                        )
+                        .await;
+                    }
+                    return;
+                }
             }
             let claimed = match queue.claim_resume(&id, retry) {
                 Ok(Some(record)) => record,
@@ -715,13 +1038,24 @@ async fn handle_queue_callback(
                     return;
                 }
                 Err(err) => {
-                    warn!(task_id = %id, error = %err, "failed to claim task for restart");
-                    answer_callback_or_log(
+                    if !report_queue_file_provider_callback_error(
                         &telegram,
-                        callback_id,
-                        "Could not update this task.".to_string(),
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "claim task for restart",
+                        &err,
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(task_id = %id, error = %err, "failed to claim task for restart");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not update this task.".to_string(),
+                        )
+                        .await;
+                    }
                     return;
                 }
             };
@@ -772,24 +1106,59 @@ async fn handle_queue_callback(
                 .await;
             }
             Err(err) => {
-                warn!(task_id = %id, error = %err, "failed to cancel persistent task");
-                answer_callback_or_log(
+                if !report_queue_file_provider_callback_error(
                     &telegram,
-                    callback_id,
-                    "Could not cancel this task.".to_string(),
+                    &callback_id,
+                    chat_id,
+                    Some(&id),
+                    "cancel task",
+                    &err,
                 )
-                .await;
+                .await
+                {
+                    warn!(task_id = %id, error = %err, "failed to cancel persistent task");
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Could not cancel this task.".to_string(),
+                    )
+                    .await;
+                }
             }
         },
         QueueCallbackAction::Confirm(id) => {
-            if queue.validate_chat(&id, chat_id).ok().flatten().is_none() {
-                answer_callback_or_log(
-                    &telegram,
-                    callback_id,
-                    "Task not found in this chat.".to_string(),
-                )
-                .await;
-                return;
+            match queue.validate_chat(&id, chat_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Task not found in this chat.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                Err(err) => {
+                    if !report_queue_file_provider_callback_error(
+                        &telegram,
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "validate task before confirming plan",
+                        &err,
+                    )
+                    .await
+                    {
+                        warn!(task_id = %id, error = %err, "failed to validate task for plan confirmation");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not check this task.".to_string(),
+                        )
+                        .await;
+                    }
+                    return;
+                }
             }
             let record = match queue.accept_proposed_plan(&id) {
                 Ok(Some(record)) => record,
@@ -803,13 +1172,24 @@ async fn handle_queue_callback(
                     return;
                 }
                 Err(err) => {
-                    warn!(task_id = %id, error = %err, "failed to accept changed plan");
-                    answer_callback_or_log(
+                    if !report_queue_file_provider_callback_error(
                         &telegram,
-                        callback_id,
-                        "Could not save the plan confirmation.".to_string(),
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "confirm changed plan",
+                        &err,
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(task_id = %id, error = %err, "failed to accept changed plan");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not save the plan confirmation.".to_string(),
+                        )
+                        .await;
+                    }
                     return;
                 }
             };
@@ -848,13 +1228,24 @@ async fn handle_queue_callback(
                         .await;
                 }
                 Err(err) => {
-                    warn!(chat_id, error = %err, "failed to load task queue page");
-                    answer_callback_or_log(
+                    if !report_queue_file_provider_callback_error(
                         &telegram,
-                        callback_id,
-                        "Could not load this queue page.".to_string(),
+                        &callback_id,
+                        chat_id,
+                        None,
+                        "load task queue page",
+                        &err,
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(chat_id, error = %err, "failed to load task queue page");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not load this queue page.".to_string(),
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -2138,11 +2529,7 @@ fn queue_or_prompt_job(
     job: JobRequest,
 ) {
     tokio::spawn(async move {
-        if let Err(err) = context
-            .queue
-            .set_status(&task_id, TaskStatus::Preparing, None)
-        {
-            warn!(task_id, error = %err, "failed to update persistent task before preflight");
+        if !prepare_persisted_task_for_job(&context, chat_id, &task_id).await {
             return;
         }
         let needs_short_link_normalization = matches!(
@@ -2171,6 +2558,66 @@ fn queue_or_prompt_job(
     });
 }
 
+async fn prepare_persisted_task_for_job(context: &BotContext, chat_id: i64, task_id: &str) -> bool {
+    let mut reported_file_provider_error = false;
+    loop {
+        match context.queue.set_status_if_current(
+            task_id,
+            &[TaskStatus::Received, TaskStatus::Preparing],
+            TaskStatus::Preparing,
+        ) {
+            Ok(Some(_)) => return true,
+            Ok(None) => return false,
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    task_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked background task setup; retaining task and retrying"
+                );
+                if !reported_file_provider_error {
+                    send_or_log(
+                        &context.telegram,
+                        chat_id,
+                        format!(
+                            "Task {task_id} is saved in the queue, but macOS temporarily cannot access its queue file. It will retry automatically. Check /queue before resending; the task and staging data are retained."
+                        ),
+                    )
+                    .await;
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(context.queue_start_retry_delay).await;
+            }
+            Err(error) => {
+                warn!(
+                    task_id,
+                    error = %format!("{error:#}"),
+                    "failed to prepare persistent task before preflight"
+                );
+                if let Err(mark_error) = context.queue.set_status_if_current(
+                    task_id,
+                    &[TaskStatus::Received, TaskStatus::Preparing],
+                    TaskStatus::Failed,
+                ) {
+                    warn!(
+                        task_id,
+                        error = %format!("{mark_error:#}"),
+                        "failed to persist background task setup failure"
+                    );
+                }
+                send_or_log(
+                    &context.telegram,
+                    chat_id,
+                    format!(
+                        "Task {task_id} was saved, but setup stopped because its queue state could not be updated. Use /queue to resume or retry it; resend the link only if the task is not listed."
+                    ),
+                )
+                .await;
+                return false;
+            }
+        }
+    }
+}
+
 async fn queue_or_prompt_normalized_job(
     context: BotContext,
     chat_id: i64,
@@ -2178,29 +2625,54 @@ async fn queue_or_prompt_normalized_job(
     task_id: String,
     job: JobRequest,
 ) {
-    match context.queue.update_job_if_current(
-        &task_id,
-        &[TaskStatus::Received, TaskStatus::Preparing],
-        job.clone(),
-        TaskStatus::Preparing,
-    ) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            warn!(
-                task_id,
-                "task is no longer ready for normalized job processing"
-            );
-            return;
-        }
-        Err(err) => {
-            warn!(task_id, error = %err, "failed to persist normalized task plan");
-            return;
+    let mut reported_file_provider_error = false;
+    loop {
+        match context.queue.update_job_if_current(
+            &task_id,
+            &[TaskStatus::Received, TaskStatus::Preparing],
+            job.clone(),
+            TaskStatus::Preparing,
+        ) {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                warn!(
+                    task_id,
+                    "task is no longer ready for normalized job processing"
+                );
+                return;
+            }
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    task_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked normalized task persistence; retaining task and retrying"
+                );
+                if !reported_file_provider_error {
+                    send_or_log(
+                        &context.telegram,
+                        chat_id,
+                        format!(
+                            "Task {task_id} is saved in the queue, but macOS temporarily cannot access its queue file. It will retry automatically. Check /queue before resending; the task and staging data are retained."
+                        ),
+                    )
+                    .await;
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(context.queue_start_retry_delay).await;
+            }
+            Err(error) => {
+                warn!(
+                    task_id,
+                    error = %error,
+                    "failed to persist normalized task plan"
+                );
+                return;
+            }
         }
     }
     if job.requires_bilibili_selection() {
         prompt_bilibili_selection(
-            context.telegram.clone(),
-            Arc::clone(&context.queue),
+            &context,
             chat_id,
             job_id,
             task_id,
@@ -2213,16 +2685,7 @@ async fn queue_or_prompt_normalized_job(
 
     match bilibili_ugc_selection_prompt(context.config.as_ref(), &job).await {
         Ok(Some(prompt)) => {
-            prompt_bilibili_selection(
-                context.telegram.clone(),
-                Arc::clone(&context.queue),
-                chat_id,
-                job_id,
-                task_id,
-                job,
-                prompt,
-            )
-            .await;
+            prompt_bilibili_selection(&context, chat_id, job_id, task_id, job, prompt).await;
             return;
         }
         Ok(None) => {}
@@ -2319,14 +2782,16 @@ fn apply_bilibili_short_link_resolution(
 }
 
 async fn prompt_bilibili_selection(
-    telegram: TelegramClient,
-    queue: Arc<QueueManager>,
+    context: &BotContext,
     chat_id: i64,
     job_id: u64,
     task_id: String,
     job: JobRequest,
     prompt: BilibiliSelectionPrompt,
 ) {
+    let telegram = &context.telegram;
+    let queue = &context.queue;
+    let retry_delay = context.queue_start_retry_delay;
     let token = next_bilibili_selection_callback_token(job_id);
     let now = Instant::now();
     {
@@ -2346,27 +2811,49 @@ async fn prompt_bilibili_selection(
         cap_pending_bilibili_selection_jobs(&mut pending_jobs, Some(token));
     }
 
-    match queue.update_job_if_current(
-        &task_id,
-        &[TaskStatus::Preparing],
-        job.clone(),
-        TaskStatus::AwaitingSelection,
-    ) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            pending_bilibili_selection_jobs()
-                .lock()
-                .await
-                .remove(&token);
-            return;
-        }
-        Err(err) => {
-            pending_bilibili_selection_jobs()
-                .lock()
-                .await
-                .remove(&token);
-            warn!(task_id, error = %err, "failed to persist Bilibili selection prompt");
-            return;
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.update_job_if_current(
+            &task_id,
+            &[TaskStatus::Preparing, TaskStatus::AwaitingSelection],
+            job.clone(),
+            TaskStatus::AwaitingSelection,
+        ) {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                pending_bilibili_selection_jobs()
+                    .lock()
+                    .await
+                    .remove(&token);
+                return;
+            }
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    task_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked Bilibili selection persistence; retaining task and retrying"
+                );
+                if !reported_file_provider_error {
+                    send_or_log(
+                        telegram,
+                        chat_id,
+                        format!(
+                            "Task {task_id} is saved in the queue, but macOS temporarily cannot access its queue file. It will retry automatically. Check /queue before resending; the task and staging data are retained."
+                        ),
+                    )
+                    .await;
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => {
+                pending_bilibili_selection_jobs()
+                    .lock()
+                    .await
+                    .remove(&token);
+                warn!(task_id, error = %error, "failed to persist Bilibili selection prompt");
+                return;
+            }
         }
     }
 
@@ -2391,7 +2878,7 @@ async fn prompt_bilibili_selection(
             warn!(chat_id, job_id, error = %err, "failed to send Bilibili selection prompt");
             let _ = queue.cancel_if_current(&task_id, chat_id, &[TaskStatus::AwaitingSelection]);
             send_or_log(
-                &telegram,
+                telegram,
                 chat_id,
                 format!(
                     "Bilibili selection prompt failed for job #{job_id}; job canceled. Send the link again to retry.\n{}",
@@ -2493,8 +2980,7 @@ async fn process_job_after_duplicate_check(
         }
         Err(err) if should_prompt_bilibili_selection_after_probe_error(&job, &err) => {
             prompt_bilibili_selection(
-                telegram,
-                queue,
+                &context,
                 chat_id,
                 job_id,
                 task_id,
@@ -2645,21 +3131,58 @@ async fn queue_job(
     run_mode: JobRunMode,
     expected_status: TaskStatus,
 ) {
-    match context
-        .queue
-        .set_status_if_current(&task_id, &[expected_status], TaskStatus::Queued)
-    {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            warn!(task_id, "task state changed before queue transition");
-            return;
-        }
-        Err(err) => {
-            warn!(task_id, error = %err, "failed to persist queued task state");
-            return;
-        }
+    if !persist_queued_task_state(&context, chat_id, &task_id, expected_status).await {
+        return;
     }
     queue_queued_task(context, chat_id, job_id, task_id, job, run_mode).await;
+}
+
+async fn persist_queued_task_state(
+    context: &BotContext,
+    chat_id: i64,
+    task_id: &str,
+    expected_status: TaskStatus,
+) -> bool {
+    let mut reported_file_provider_error = false;
+    loop {
+        match context
+            .queue
+            .set_status_if_current(task_id, &[expected_status], TaskStatus::Queued)
+        {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                warn!(task_id, "task state changed before queue transition");
+                return false;
+            }
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    task_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked queued task persistence; retaining task and retrying"
+                );
+                if !reported_file_provider_error {
+                    send_or_log(
+                        &context.telegram,
+                        chat_id,
+                        format!(
+                            "Task {task_id} is saved in the queue, but macOS temporarily cannot access its queue file. It will retry automatically. Check /queue before resending; the task and staging data are retained."
+                        ),
+                    )
+                    .await;
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(context.queue_start_retry_delay).await;
+            }
+            Err(error) => {
+                warn!(
+                    task_id,
+                    error = %error,
+                    "failed to persist queued task state"
+                );
+                return false;
+            }
+        }
+    }
 }
 
 async fn queue_queued_task(
@@ -3598,6 +4121,54 @@ async fn answer_callback_or_log(
     }
 }
 
+async fn complete_published_task_with_retry(
+    telegram: &TelegramClient,
+    queue: &QueueManager,
+    completion: PublishedTaskCompletion<'_>,
+    retry_delay: Duration,
+) -> Result<TaskRecord> {
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.complete(
+            completion.task_id,
+            completion.saved_location.to_string(),
+            completion.media_paths,
+            completion.hashes.clone(),
+        ) {
+            Ok(record) => return Ok(record),
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    task_id = completion.task_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked completion persistence; retaining published outputs and retrying"
+                );
+                if !reported_file_provider_error {
+                    send_or_log(
+                        telegram,
+                        completion.chat_id,
+                        format!(
+                            "Task {} has published its files, but macOS temporarily cannot save the completion record. It will retry automatically; the output and staging data are being kept. Check /queue before resending.",
+                            completion.task_id
+                        ),
+                    )
+                    .await;
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct PublishedTaskCompletion<'a> {
+    chat_id: i64,
+    task_id: &'a str,
+    saved_location: &'a str,
+    media_paths: &'a [PathBuf],
+    hashes: BTreeMap<String, String>,
+}
+
 async fn run_queued_job(
     context: BotContext,
     cancel: Arc<Notify>,
@@ -3850,12 +4421,19 @@ async fn run_queued_job(
                 })
                 .await
                 .context("published media hash task failed to join")??;
-                queue.complete(
-                    &task_id,
-                    report.saved_location.clone(),
-                    &report.primary_media_paths,
-                    hashes,
-                )?;
+                complete_published_task_with_retry(
+                    &telegram,
+                    &queue,
+                    PublishedTaskCompletion {
+                        chat_id,
+                        task_id: &task_id,
+                        saved_location: &report.saved_location,
+                        media_paths: &report.primary_media_paths,
+                        hashes,
+                    },
+                    context.queue_start_retry_delay,
+                )
+                .await?;
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -4805,6 +5383,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::file_provider::{MockQueueFileProvider, QueueFileProvider};
     use anyhow::{Context, Result, anyhow};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -5701,7 +6280,11 @@ mod tests {
 
         let task_id = "task-telegram-e2e-1";
         let chat_id = 123_456_789;
-        let initial_queue = QueueManager::open(&config).expect("task queue should open");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let initial_queue =
+            QueueManager::open_with_file_provider(&config, Arc::clone(&file_provider_trait))
+                .expect("task queue should open");
         let task = TaskRecord::new(
             task_id.to_string(),
             501,
@@ -5726,7 +6309,10 @@ mod tests {
             .expect("task status message should persist");
         drop(initial_queue);
 
-        let queue = Arc::new(QueueManager::open(&config).expect("queue should recover on restart"));
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, Arc::clone(&file_provider_trait))
+                .expect("queue should recover on restart"),
+        );
         let recovered = queue
             .get(task_id)
             .expect("recovered task should load")
@@ -5776,9 +6362,26 @@ mod tests {
             ])
             .expect("fake Telegram should accept scripted updates");
 
-        notify_restart_summaries(&telegram, &queue)
+        file_provider.fail_next_file_provider_write("simulated summary acknowledgement failure");
+        let retry_shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(retry_shutdown);
+        assert!(
+            notify_restart_summaries(
+                &telegram,
+                &queue,
+                &summaries,
+                Duration::from_millis(1),
+                &mut retry_shutdown,
+            )
             .await
-            .expect("restart notice should be delivered");
+            .expect("restart notice acknowledgement should retry")
+        );
+        assert!(
+            queue
+                .startup_summaries()
+                .expect("acknowledged restart summary should reload")
+                .is_empty()
+        );
         let updates = telegram
             .get_updates(None, 0)
             .await
@@ -5951,6 +6554,7 @@ mod tests {
                 },
                 next_job_id: Arc::new(AtomicU64::new(1)),
                 queue: Arc::clone(&queue),
+                queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
             },
             crate::telegram::CallbackQuery {
                 id: "stale-bilibili-selection".to_string(),
@@ -6164,7 +6768,7 @@ mod tests {
             &mut offset,
         )
         .await
-        .expect("a Telegram delivery failure should not block update processing");
+        .expect("a failed response delivery is logged while updates continue");
 
         assert_eq!(offset, Some(903));
         let recorded = take_fake_telegram_requests(&mut requests);
@@ -6178,6 +6782,1283 @@ mod tests {
         assert_eq!(recorded[1].body["chat_id"].as_i64(), Some(-404_404));
         assert_eq!(recorded[2].body["chat_id"].as_i64(), Some(123_456_789));
 
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn startup_retries_file_provider_queue_open_failures() {
+        let queue_root = temp_main_test_dir("queue-startup-file-provider-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        file_provider.fail_next_read("simulated startup File Provider deadlock");
+        let file_provider: Arc<dyn QueueFileProvider> = file_provider;
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_attempts = Arc::clone(&attempts);
+        let config = Arc::new(config);
+        let open_file_provider = Arc::clone(&file_provider);
+        let shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(shutdown);
+        let queue = retry_file_provider_startup_operation(
+            move || {
+                open_attempts.fetch_add(1, Ordering::Relaxed);
+                QueueManager::open_with_file_provider(&config, Arc::clone(&open_file_provider))
+            },
+            Duration::from_millis(1),
+            &mut shutdown,
+        )
+        .await
+        .expect("startup should reopen the queue after a transient provider failure")
+        .expect("startup should complete before shutdown");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn startup_retries_classified_output_recovery_deadlock() {
+        let output_root = temp_main_test_dir("output-recovery-file-provider-retry");
+        let recovery_path = output_root.clone();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recovery_attempts = Arc::clone(&attempts);
+        let shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(shutdown);
+
+        let result = retry_file_provider_startup_operation(
+            move || {
+                let attempt = recovery_attempts.fetch_add(1, Ordering::Relaxed);
+                if attempt == 0 {
+                    let error =
+                        anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EDEADLK))
+                            .context("simulated output recovery access failure");
+                    Err(classify_deadlock_error(
+                        &recovery_path,
+                        "recover video output transactions",
+                        error,
+                    ))
+                } else {
+                    Ok(Vec::<String>::new())
+                }
+            },
+            Duration::from_millis(1),
+            &mut shutdown,
+        )
+        .await
+        .expect("classified output recovery deadlocks should retry")
+        .expect("startup should finish before shutdown");
+
+        assert!(result.is_empty());
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        let _ = fs::remove_dir_all(output_root);
+    }
+
+    #[tokio::test]
+    async fn startup_retries_file_provider_queue_directory_creation_failures() {
+        let queue_root = temp_main_test_dir("queue-directory-file-provider-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        file_provider
+            .fail_next_file_provider_write("simulated queue directory coordination failure");
+        let open_file_provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let config = Arc::new(config);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_attempts = Arc::clone(&attempts);
+        let open_file_provider = Arc::clone(&open_file_provider);
+        let shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(shutdown);
+        let queue = retry_file_provider_startup_operation(
+            move || {
+                open_attempts.fetch_add(1, Ordering::Relaxed);
+                QueueManager::open_with_file_provider(&config, Arc::clone(&open_file_provider))
+            },
+            Duration::from_millis(1),
+            &mut shutdown,
+        )
+        .await
+        .expect("startup should retry coordinated queue directory creation")
+        .expect("startup should complete before shutdown");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            file_provider.write_paths().first(),
+            Some(&queue_root.join("videos/.telegram-video-downloader-queue")),
+            "the first startup mutation should coordinate queue directory creation"
+        );
+        drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn startup_retries_file_provider_failure_during_restart_summaries() {
+        let queue_root = temp_main_test_dir("queue-startup-summary-file-provider-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let open_file_provider = Arc::clone(&file_provider);
+        let file_provider: Arc<dyn QueueFileProvider> = file_provider;
+        let open_queue_file_provider = Arc::clone(&file_provider);
+        let config = Arc::new(config);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_attempts = Arc::clone(&attempts);
+        let shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(shutdown);
+        let (queue, summaries) = retry_file_provider_startup_operation(
+            move || {
+                let attempt = open_attempts.fetch_add(1, Ordering::Relaxed);
+                let queue = QueueManager::open_with_file_provider(
+                    &config,
+                    Arc::clone(&open_queue_file_provider),
+                )?;
+                if attempt == 0 {
+                    open_file_provider
+                        .fail_next_read("simulated restart summary File Provider failure");
+                }
+                let summaries = queue.startup_summaries()?;
+                Ok((queue, summaries))
+            },
+            Duration::from_millis(1),
+            &mut shutdown,
+        )
+        .await
+        .expect("startup should retry summary reads after a transient provider failure")
+        .expect("startup should complete before shutdown");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(summaries.is_empty());
+        drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_retry_permanent_queue_open_failures() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_attempts = Arc::clone(&attempts);
+        let shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(shutdown);
+        let error = retry_file_provider_startup_operation(
+            move || {
+                open_attempts.fetch_add(1, Ordering::Relaxed);
+                Err::<(), _>(anyhow!("simulated permanent queue configuration failure"))
+            },
+            Duration::from_millis(1),
+            &mut shutdown,
+        )
+        .await
+        .expect_err("permanent queue open errors should return immediately");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(format!("{error:#}").contains("simulated permanent queue configuration failure"));
+    }
+
+    #[tokio::test]
+    async fn startup_queue_open_wait_is_interrupted_by_shutdown() {
+        let (started_sender, mut started_receiver) = oneshot::channel();
+        let started_sender = Arc::new(std::sync::Mutex::new(Some(started_sender)));
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
+        let (finished_sender, finished_receiver) = oneshot::channel();
+        let finished_sender = Arc::new(std::sync::Mutex::new(Some(finished_sender)));
+        let open_started_sender = Arc::clone(&started_sender);
+        let open_release_receiver = Arc::clone(&release_receiver);
+        let open_finished_sender = Arc::clone(&finished_sender);
+        let open_queue = move || {
+            if let Some(sender) = open_started_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            open_release_receiver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .expect("test should release the simulated blocking open");
+            if let Some(sender) = open_finished_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            Err::<(), _>(anyhow!("simulated open should be abandoned after shutdown"))
+        };
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let shutdown = async move {
+            let _ = shutdown_receiver.await;
+            Ok(())
+        };
+        tokio::pin!(shutdown);
+        let startup = retry_file_provider_startup_operation(
+            open_queue,
+            Duration::from_secs(30),
+            &mut shutdown,
+        );
+        tokio::pin!(startup);
+        tokio::select! {
+            result = &mut startup => panic!("startup returned before the blocking open: {result:?}"),
+            started = &mut started_receiver => {
+                started.expect("the blocking open worker should start");
+            }
+        }
+
+        shutdown_sender
+            .send(())
+            .expect("shutdown should reach the startup retry loop");
+        let outcome = tokio_timeout(Duration::from_secs(1), &mut startup)
+            .await
+            .expect("shutdown should not wait for the blocking open worker")
+            .expect("shutdown should complete without an error");
+        assert!(outcome.is_none());
+
+        release_sender
+            .send(())
+            .expect("the detached open worker should be released for test cleanup");
+        tokio_timeout(Duration::from_secs(1), finished_receiver)
+            .await
+            .expect("the detached open worker should finish after release")
+            .expect("the worker should report completion");
+    }
+
+    #[tokio::test]
+    async fn shutdown_supervisor_returns_while_bot_runtime_is_blocked() {
+        let (started_sender, started_receiver) = oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = oneshot::channel();
+        let worker_result = spawn_bot_runtime_worker(async move {
+            started_sender
+                .send(())
+                .expect("test should observe the blocked bot runtime");
+            release_receiver
+                .recv()
+                .expect("test should release the blocked bot runtime");
+            finished_sender
+                .send(())
+                .expect("test should observe bot runtime cleanup");
+            Ok(())
+        })
+        .expect("bot runtime worker should start");
+        tokio_timeout(Duration::from_secs(1), started_receiver)
+            .await
+            .expect("bot runtime should enter its blocking operation")
+            .expect("bot runtime should report that it started");
+
+        let (signal_sender, signal_receiver) = oneshot::channel();
+        let (shutdown_sender, mut shutdown_receiver) = watch::channel(false);
+        let shutdown = async move {
+            signal_receiver
+                .await
+                .context("simulated shutdown signal sender dropped")?;
+            Ok(())
+        };
+        let supervisor = supervise_bot_runtime(worker_result, shutdown_sender, shutdown);
+        tokio::pin!(supervisor);
+
+        signal_sender
+            .send(())
+            .expect("simulated shutdown signal should be delivered");
+        tokio_timeout(Duration::from_secs(1), &mut supervisor)
+            .await
+            .expect("shutdown supervisor must not wait for blocked File Provider work")
+            .expect("shutdown supervision should succeed");
+        assert!(*shutdown_receiver.borrow_and_update());
+
+        release_sender
+            .send(())
+            .expect("test should release the detached runtime worker");
+        tokio_timeout(Duration::from_secs(1), finished_receiver)
+            .await
+            .expect("blocked worker should finish after release")
+            .expect("worker should report test cleanup");
+    }
+
+    #[tokio::test]
+    async fn telegram_retry_backoff_is_interrupted_by_shutdown() {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let shutdown = async move {
+            let _ = shutdown_rx.await;
+            Ok(())
+        };
+        tokio::pin!(shutdown);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = shutdown_tx.send(());
+        });
+
+        let should_retry = tokio_timeout(
+            Duration::from_secs(1),
+            retry_delay_or_shutdown(&mut shutdown, Duration::from_secs(30)),
+        )
+        .await
+        .expect("shutdown should interrupt the retry backoff")
+        .expect("shutdown signal should be handled successfully");
+
+        assert!(!should_retry, "a shutdown signal must skip the retry");
+    }
+
+    #[tokio::test]
+    async fn transient_queue_write_failure_retries_telegram_update_e2e() {
+        let queue_root = temp_main_test_dir("queue-write-retry-offset");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        config.telegram.allow_all_chats = true;
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        file_provider.fail_next_write("simulated transient queue write failure");
+
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        let scripted_updates = vec![
+            serde_json::json!({
+                "update_id": 931,
+                "message": {
+                    "message_id": 1031,
+                    "chat": {"id": 123456789, "type": "private"},
+                    "from": {"id": 701},
+                    "text": "/queue"
+                }
+            }),
+            serde_json::json!({
+                "update_id": 932,
+                "message": {
+                    "message_id": 1032,
+                    "chat": {"id": 123456789, "type": "private"},
+                    "from": {"id": 701},
+                    "text": "/help"
+                }
+            }),
+        ];
+        update_sender
+            .send(scripted_updates.clone())
+            .expect("fake Telegram should accept updates");
+        let config = Arc::new(config);
+        let job_dispatch = JobDispatch {
+            download_semaphore: Arc::new(Semaphore::new(1)),
+            duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+        };
+        let next_job_id = Arc::new(AtomicU64::new(1));
+        let mut offset = None;
+        let updates = telegram
+            .get_updates(offset, 0)
+            .await
+            .expect("fake Telegram should return the first delivery");
+        let error = process_telegram_updates(
+            &telegram,
+            &config,
+            &job_dispatch,
+            &next_job_id,
+            &queue,
+            updates,
+            &mut offset,
+        )
+        .await
+        .expect_err("transient queue write failure should leave the update unacknowledged");
+        assert!(format!("{error:#}").contains("simulated transient queue write failure"));
+        assert_eq!(offset, None);
+
+        update_sender
+            .send(scripted_updates)
+            .expect("fake Telegram should redeliver the unacknowledged updates");
+        let retried_updates = telegram
+            .get_updates(offset, 0)
+            .await
+            .expect("fake Telegram should return the retry");
+        process_telegram_updates(
+            &telegram,
+            &config,
+            &job_dispatch,
+            &next_job_id,
+            &queue,
+            retried_updates,
+            &mut offset,
+        )
+        .await
+        .expect("the redelivered updates should process after the transient failure clears");
+        assert_eq!(offset, Some(933));
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getUpdates", "getUpdates", "sendMessage", "sendMessage"]
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn spawned_task_file_provider_failure_notifies_and_keeps_update_e2e() {
+        let queue_root = temp_main_test_dir("spawned-task-file-provider-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        config.telegram.allow_all_chats = true;
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        file_provider.fail_write_after(4, "simulated spawned setup File Provider failure");
+
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        update_sender
+            .send(vec![serde_json::json!({
+                "update_id": 941,
+                "message": {
+                    "message_id": 1041,
+                    "chat": {"id": 123456789, "type": "private"},
+                    "from": {"id": 701},
+                    "text": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+                }
+            })])
+            .expect("fake Telegram should accept the video update");
+        let updates = telegram
+            .get_updates(None, 0)
+            .await
+            .expect("fake Telegram should return the video update");
+        let config = Arc::new(config);
+        let job_dispatch = JobDispatch {
+            download_semaphore: Arc::new(Semaphore::new(1)),
+            duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+        };
+        let next_job_id = Arc::new(AtomicU64::new(1));
+        let mut offset = None;
+        let context = BotContext {
+            telegram: telegram.clone(),
+            config,
+            job_dispatch,
+            next_job_id,
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::from_secs(30),
+        };
+        process_telegram_updates_with_context(&context, updates, &mut offset)
+            .await
+            .expect("accepted updates should advance after persisting the task");
+        assert_eq!(offset, Some(942));
+
+        let notification = tokio_timeout(Duration::from_secs(3), async {
+            loop {
+                let request = requests
+                    .recv()
+                    .await
+                    .expect("fake Telegram request stream should remain open");
+                if request.method == "sendMessage"
+                    && request.body["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Task u941-0 is saved in the queue"))
+                {
+                    break request;
+                }
+            }
+        })
+        .await
+        .expect("background setup failure should produce an actionable Telegram message");
+        assert!(
+            notification.body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("retry automatically"))
+        );
+        let task = queue
+            .get("u941-0")
+            .expect("saved task should remain readable")
+            .expect("saved task should not be lost after background setup failure");
+        assert_eq!(task.status, TaskStatus::Received);
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn spawned_task_setup_retries_a_transient_file_provider_error() {
+        let queue_root = temp_main_test_dir("spawned-task-setup-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "task-setup-retry";
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    951,
+                    1051,
+                    123_456_789,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        file_provider.fail_next_file_provider_write("simulated transient setup write failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        assert!(
+            prepare_persisted_task_for_job(&context, 123_456_789, task_id).await,
+            "setup should retry after a transient File Provider error"
+        );
+        assert_eq!(
+            queue
+                .get(task_id)
+                .expect("retried task should load")
+                .expect("retried task should exist")
+                .status,
+            TaskStatus::Preparing
+        );
+        let notification = tokio_timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .expect("File Provider failure should be reported")
+            .expect("fake Telegram request stream should remain open");
+        assert_eq!(notification.method, "sendMessage");
+        assert!(
+            notification.body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("retry automatically"))
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn normalized_job_file_provider_write_retries_with_telegram_notice_e2e() {
+        let queue_root = temp_main_test_dir("normalized-job-file-provider-retry-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "normalized-file-provider-retry";
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    952,
+                    1052,
+                    123_456_789,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("task should enter preparing state");
+        file_provider.fail_next_file_provider_write("simulated normalized-job write failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+            selection: None,
+        };
+        assert!(job.requires_bilibili_selection());
+        queue_or_prompt_normalized_job(context, 123_456_789, 952, task_id.to_string(), job).await;
+
+        let task = queue
+            .get(task_id)
+            .expect("retried task should load")
+            .expect("retried task should remain in queue");
+        assert_eq!(task.status, TaskStatus::AwaitingSelection);
+        assert!(matches!(
+            task.job,
+            JobRequest::Bilibili {
+                selection: None,
+                ..
+            }
+        ));
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let sent_messages = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(sent_messages.len(), 2);
+        assert!(
+            sent_messages[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("retry automatically"))
+        );
+        assert!(
+            sent_messages[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Check /queue before resending"))
+        );
+        assert!(
+            sent_messages[1].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Bilibili"))
+        );
+        assert!(sent_messages[1].body["reply_markup"].is_object());
+
+        pending_bilibili_selection_jobs()
+            .lock()
+            .await
+            .retain(|_, pending| pending.task_id != task_id);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn bilibili_selection_state_write_retries_and_sends_prompt_e2e() {
+        let queue_root = temp_main_test_dir("bilibili-selection-state-provider-retry-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "bilibili-selection-state-retry";
+        let chat_id = 123_456_789;
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+            selection: None,
+        };
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    953,
+                    1053,
+                    chat_id,
+                    Some(701),
+                    0,
+                    job.clone(),
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("task should enter preparing state");
+        // get_task writes the current index, then the task record succeeds; fail the
+        // index write that publishes AwaitingSelection to exercise the partial-save path.
+        file_provider.fail_write_after(2, "simulated selection index File Provider failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        prompt_bilibili_selection(
+            &context,
+            chat_id,
+            953,
+            task_id.to_string(),
+            job,
+            BilibiliSelectionPrompt::SeasonMedia,
+        )
+        .await;
+
+        let task = queue
+            .get(task_id)
+            .expect("selection task should load")
+            .expect("selection task should remain in the queue");
+        assert_eq!(task.status, TaskStatus::AwaitingSelection);
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let sent_messages = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent_messages.len(),
+            2,
+            "one notice and one selection prompt should be sent"
+        );
+        assert!(
+            sent_messages[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("retry automatically"))
+        );
+        assert!(
+            sent_messages[1].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Bilibili"))
+        );
+        assert!(sent_messages[1].body["reply_markup"].is_object());
+
+        pending_bilibili_selection_jobs()
+            .lock()
+            .await
+            .retain(|_, pending| pending.task_id != task_id);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn published_completion_file_provider_write_retries_e2e() {
+        for (case, successful_writes) in [("record", 1), ("index", 2)] {
+            let queue_root = temp_main_test_dir(&format!("completion-provider-retry-{case}"));
+            let mut config = AppConfig::for_test();
+            config.downloads.video_dir = queue_root.join("videos");
+            config.downloads.pdf_dir = queue_root.join("pdfs");
+            fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+            fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+            let file_provider = Arc::new(MockQueueFileProvider::default());
+            let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+            let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open");
+            let task_id = format!("published-completion-provider-retry-{case}");
+            let chat_id = 123_456_789;
+            assert!(
+                queue
+                    .create(TaskRecord::new(
+                        task_id.clone(),
+                        954,
+                        1054,
+                        chat_id,
+                        Some(701),
+                        0,
+                        JobRequest::Youtube {
+                            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                        },
+                    ))
+                    .expect("task should persist")
+            );
+            queue
+                .set_status(&task_id, TaskStatus::Running, None)
+                .expect("task should start");
+            queue
+                .begin_verification(&task_id)
+                .expect("verification should begin")
+                .expect("task should remain present");
+            let output = config.downloads.video_dir.join("published-output.mp4");
+            fs::write(&output, b"published media must remain intact")
+                .expect("published output should be created");
+            file_provider.fail_write_after(
+                successful_writes,
+                format!("simulated completion {case} File Provider failure"),
+            );
+
+            let (telegram, mut requests, _updates, shutdown, server) =
+                spawn_fake_telegram_api().await;
+            let saved_location = output.display().to_string();
+            let completed = complete_published_task_with_retry(
+                &telegram,
+                &queue,
+                PublishedTaskCompletion {
+                    chat_id,
+                    task_id: &task_id,
+                    saved_location: &saved_location,
+                    media_paths: std::slice::from_ref(&output),
+                    hashes: BTreeMap::new(),
+                },
+                Duration::ZERO,
+            )
+            .await
+            .expect("completion persistence should retry after a transient failure");
+            assert_eq!(completed.status, TaskStatus::Completed);
+            assert_eq!(
+                fs::read(&output).expect("published output should still be readable"),
+                b"published media must remain intact"
+            );
+            assert!(
+                queue
+                    .list(chat_id, false, 0)
+                    .expect("active queue should load")
+                    .is_empty()
+            );
+            assert!(
+                queue
+                    .list(chat_id, true, 0)
+                    .expect("task history should load")
+                    .iter()
+                    .any(|record| record.id == task_id && record.status == TaskStatus::Completed)
+            );
+
+            let recorded = take_fake_telegram_requests(&mut requests);
+            let notices = recorded
+                .iter()
+                .filter(|request| request.method == "sendMessage")
+                .collect::<Vec<_>>();
+            assert_eq!(notices.len(), 1, "a retry sequence should notify only once");
+            assert!(
+                notices[0].body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("published its files"))
+            );
+            assert!(
+                notices[0].body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Check /queue before resending"))
+            );
+
+            drop(queue);
+            stop_fake_telegram_api(shutdown, server).await;
+            let _ = fs::remove_dir_all(queue_root);
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_transition_retries_file_provider_write_with_telegram_notice_e2e() {
+        let queue_root = temp_main_test_dir("queued-transition-file-provider-retry-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "queued-transition-file-provider";
+        let chat_id = 123_456_789;
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    955,
+                    1055,
+                    chat_id,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("task should enter preparing state");
+        file_provider.fail_next_file_provider_write("simulated queued transition write failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+
+        assert!(
+            persist_queued_task_state(&context, chat_id, task_id, TaskStatus::Preparing).await,
+            "queued state should persist after a transient File Provider error"
+        );
+        assert_eq!(
+            queue
+                .get(task_id)
+                .expect("retried task should load")
+                .expect("retried task should remain in queue")
+                .status,
+            TaskStatus::Queued
+        );
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let notices = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("retry automatically"))
+        );
+        assert!(
+            notices[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Check /queue before resending"))
+        );
+
+        drop(context);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[test]
+    fn replayed_multi_link_updates_keep_stable_task_ids() {
+        let queue_root = temp_main_test_dir("queue-update-idempotency");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let jobs = [
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=first000001".to_string(),
+            },
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=second00002".to_string(),
+            },
+        ];
+        for (ordinal, job) in jobs.iter().cloned().enumerate() {
+            assert!(
+                queue
+                    .create(TaskRecord::new(
+                        task_id_for_update(941, ordinal),
+                        941,
+                        1041,
+                        123_456_789,
+                        Some(701),
+                        ordinal,
+                        job,
+                    ))
+                    .expect("first delivery should persist each task")
+            );
+        }
+        for (ordinal, job) in jobs.into_iter().enumerate() {
+            assert!(
+                !queue
+                    .create(TaskRecord::new(
+                        task_id_for_update(941, ordinal),
+                        941,
+                        1041,
+                        123_456_789,
+                        Some(701),
+                        ordinal,
+                        job,
+                    ))
+                    .expect("redelivery should be idempotent")
+            );
+        }
+        let tasks = queue
+            .list(123_456_789, false, 0)
+            .expect("active tasks should load");
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().any(|task| task.id == "u941-0"));
+        assert!(tasks.iter().any(|task| task.id == "u941-1"));
+
+        drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn file_provider_queue_read_failure_is_actionable_and_retryable_e2e() {
+        let queue_root = temp_main_test_dir("file-provider-queue-read-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        config.telegram.allow_all_chats = true;
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open with mock File Provider access"),
+        );
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    "file-provider-queue-task".to_string(),
+                    1,
+                    2,
+                    123_456_789,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://example.invalid/video".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        file_provider.fail_next_read("Resource deadlock avoided (os error 11)");
+
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        let chat_id = 123_456_789;
+        update_sender
+            .send(vec![
+                serde_json::json!({
+                    "update_id": 921,
+                    "message": {
+                        "message_id": 1021,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": 701},
+                        "text": "/queue"
+                    }
+                }),
+                serde_json::json!({
+                    "update_id": 922,
+                    "message": {
+                        "message_id": 1022,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": 701},
+                        "text": "/help"
+                    }
+                }),
+                serde_json::json!({
+                    "update_id": 923,
+                    "message": {
+                        "message_id": 1023,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": 701},
+                        "text": "/queue"
+                    }
+                }),
+            ])
+            .expect("fake Telegram should accept updates");
+        let updates = telegram
+            .get_updates(None, 0)
+            .await
+            .expect("fake Telegram should return scripted updates");
+        let config = Arc::new(config);
+        let job_dispatch = JobDispatch {
+            download_semaphore: Arc::new(Semaphore::new(1)),
+            duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+        };
+        let next_job_id = Arc::new(AtomicU64::new(1));
+        let mut offset = None;
+        process_telegram_updates(
+            &telegram,
+            &config,
+            &job_dispatch,
+            &next_job_id,
+            &queue,
+            updates,
+            &mut offset,
+        )
+        .await
+        .expect("a File Provider read failure should not block later updates");
+
+        assert_eq!(offset, Some(924));
+        assert!(
+            file_provider
+                .read_paths()
+                .iter()
+                .any(|path| path.ends_with("index.json"))
+        );
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getUpdates", "sendMessage", "sendMessage", "sendMessage"]
+        );
+        assert!(
+            recorded[1].body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("shows as downloaded in Finder")
+        );
+        assert!(
+            recorded[1].body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("existing queue and staging data are retained")
+        );
+        assert!(
+            recorded[2].body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("/queue - View active tasks")
+        );
+        assert!(
+            recorded[3].body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Active and actionable tasks")
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn queue_resume_callback_file_provider_read_failure_is_actionable_e2e() {
+        let queue_root = temp_main_test_dir("queue-resume-callback-file-provider-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        config.telegram.allow_all_chats = true;
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "resume-callback-file-provider";
+        let chat_id = 123_456_789;
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    953,
+                    1053,
+                    chat_id,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Interrupted, None)
+            .expect("task should be resumable");
+
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        update_sender
+            .send(vec![serde_json::json!({
+                "update_id": 954,
+                "callback_query": {
+                    "id": "resume-file-provider-1",
+                    "data": queue_callback_data("resume", task_id),
+                    "message": {
+                        "message_id": 1054,
+                        "chat": {"id": chat_id, "type": "private"}
+                    }
+                }
+            })])
+            .expect("fake Telegram should accept callback update");
+        let updates = telegram
+            .get_updates(None, 0)
+            .await
+            .expect("fake Telegram should return callback update");
+        file_provider.fail_next_read("simulated callback File Provider read failure");
+
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        let mut offset = None;
+        process_telegram_updates_with_context(&context, updates, &mut offset)
+            .await
+            .expect("File Provider callback errors should be acknowledged with recovery guidance");
+
+        assert_eq!(offset, Some(955));
+        assert_eq!(
+            queue
+                .get(task_id)
+                .expect("task should load after callback failure")
+                .expect("task should be retained")
+                .status,
+            TaskStatus::Interrupted
+        );
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getUpdates", "answerCallbackQuery", "sendMessage"]
+        );
+        assert!(
+            recorded[1].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Check Finder, then tap again"))
+        );
+        assert!(recorded[2].body["text"].as_str().is_some_and(|text| {
+            text.contains("Wait until the hidden queue folder is available in Finder")
+        }));
+        assert!(
+            recorded[2].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Existing queue and staging data are retained"))
+        );
+
+        drop(context);
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
@@ -6342,6 +8223,7 @@ mod tests {
                 },
                 next_job_id: Arc::new(AtomicU64::new(1)),
                 queue: Arc::clone(&queue),
+                queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
             },
             crate::telegram::CallbackQuery {
                 id: "next-page".to_string(),

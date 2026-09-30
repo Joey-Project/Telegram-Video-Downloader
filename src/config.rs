@@ -9,6 +9,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::bilibili_auth::{
     auth_mutation_control_paths, ensure_auth_state_path_has_no_symlink_components,
 };
+use crate::file_provider::classify_deadlock_error;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -172,18 +173,34 @@ impl AppConfig {
     }
 
     pub fn ensure_runtime_dirs(&self) -> Result<()> {
-        fs::create_dir_all(&self.downloads.video_dir).with_context(|| {
-            format!(
-                "failed to create video download directory {}",
-                self.downloads.video_dir.display()
-            )
-        })?;
-        fs::create_dir_all(&self.downloads.pdf_dir).with_context(|| {
-            format!(
-                "failed to create pdf download directory {}",
-                self.downloads.pdf_dir.display()
-            )
-        })?;
+        fs::create_dir_all(&self.downloads.video_dir)
+            .with_context(|| {
+                format!(
+                    "failed to create video download directory {}",
+                    self.downloads.video_dir.display()
+                )
+            })
+            .map_err(|error| {
+                classify_deadlock_error(
+                    &self.downloads.video_dir,
+                    "create video download directory",
+                    error,
+                )
+            })?;
+        fs::create_dir_all(&self.downloads.pdf_dir)
+            .with_context(|| {
+                format!(
+                    "failed to create pdf download directory {}",
+                    self.downloads.pdf_dir.display()
+                )
+            })
+            .map_err(|error| {
+                classify_deadlock_error(
+                    &self.downloads.pdf_dir,
+                    "create PDF download directory",
+                    error,
+                )
+            })?;
         Ok(())
     }
 

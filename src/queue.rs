@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::config::AppConfig;
+use crate::file_provider::{
+    QueueFileProvider, classify_deadlock_error, is_deadlock_error, is_file_provider_access_error,
+    platform_queue_file_provider,
+};
 use crate::router::JobRequest;
 use crate::safe_fs::{BoundFile, EntryIdentity, RootedFs};
 
@@ -34,6 +38,13 @@ const MAX_PERSISTED_MEDIA_HASHES: usize = 128;
 const MAX_PERSISTED_MEDIA_HASH_BYTES: usize = 256 * 1024;
 const QUEUE_PAGE_SIZE: usize = 10;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarMoveStatus {
+    Moved,
+    AlreadyAtTarget,
+    Missing,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +206,7 @@ struct DownloadStore {
     queue_dir: PathBuf,
     queue_identity: EntryIdentity,
     operation_lock_path: PathBuf,
+    file_provider: Arc<dyn QueueFileProvider>,
 }
 
 struct QueueOperationLock {
@@ -267,9 +279,18 @@ impl TaskRecord {
 
 impl QueueManager {
     pub fn open(config: &AppConfig) -> Result<Self> {
-        let mut video = DownloadStore::new(&config.downloads.video_dir)?;
-        let pdf_root = RootedFs::new(&config.downloads.pdf_dir)?;
-        pdf_root.validate_configured_root()?;
+        Self::open_with_file_provider(config, platform_queue_file_provider())
+    }
+
+    pub(crate) fn open_with_file_provider(
+        config: &AppConfig,
+        file_provider: Arc<dyn QueueFileProvider>,
+    ) -> Result<Self> {
+        let video_root =
+            coordinate_directory_root(file_provider.as_ref(), &config.downloads.video_dir)?;
+        let pdf_root =
+            coordinate_directory_root(file_provider.as_ref(), &config.downloads.pdf_dir)?;
+        let mut video = DownloadStore::from_root(video_root, Arc::clone(&file_provider))?;
         let pdf = if video.root.root_identity() == pdf_root.root_identity() {
             let pdf_alias = pdf_root.logical_root_path().to_path_buf();
             if !video.root_aliases.contains(&pdf_alias) {
@@ -277,7 +298,7 @@ impl QueueManager {
             }
             video.clone()
         } else {
-            DownloadStore::from_root(pdf_root)?
+            DownloadStore::from_root(pdf_root, file_provider)?
         };
         // Protected property: a live queue manager exclusively owns each backing download root,
         // so no second process can mutate its task index or recover its running tasks. The
@@ -447,6 +468,7 @@ impl QueueManager {
         })
     }
 
+    #[cfg(test)]
     pub fn set_status(
         &self,
         id: &str,
@@ -635,17 +657,27 @@ impl QueueManager {
         let Some((store, mut record, mut entry)) = self.find_record_entry_unlocked(id)? else {
             bail!("persistent task {id} was missing at completion");
         };
-        if record.status != TaskStatus::Verifying {
-            bail!("task {id} changed state before output verification completed");
-        }
         let media_paths = media_paths
             .iter()
             .map(|path| store.normalize_media_path(path))
             .collect::<Result<Vec<_>>>()?;
+        let (persisted_hashes, hash_manifest) = persist_media_hashes(hashes)?;
+        if record.status == TaskStatus::Completed {
+            if record.saved_location.as_deref() != Some(saved_location.as_str())
+                || record.primary_media_hashes != persisted_hashes
+                || record.primary_media_hash_manifest != hash_manifest
+            {
+                bail!("task {id} was already completed with different published outputs");
+            }
+            let destination = sidecar_destination(&store.root_path, &record, &media_paths)?;
+            return self.finish_completed_record_sidecar(store, record, entry, destination);
+        }
+        if record.status != TaskStatus::Verifying {
+            bail!("task {id} changed state before output verification completed");
+        }
         record.status = TaskStatus::Completed;
         record.error = None;
         record.saved_location = Some(saved_location);
-        let (persisted_hashes, hash_manifest) = persist_media_hashes(hashes)?;
         record.primary_media_hashes = persisted_hashes;
         record.primary_media_hash_manifest = hash_manifest;
         if record.media_entries_total <= 1 {
@@ -659,7 +691,7 @@ impl QueueManager {
         let destination = sidecar_destination(&store.root_path, &record, &media_paths)?;
         record.cancel_requested = false;
         let Some(destination) = destination else {
-            return store.save_mutated_record(record, entry, true);
+            return self.finish_completed_record_sidecar(store, record, entry, None);
         };
         record.updated_at = unix_time();
         record.revision = record.revision.saturating_add(1);
@@ -668,7 +700,57 @@ impl QueueManager {
         entry.updated_at = record.updated_at;
         store.write_record(&record_path, &record)?;
         store.save_index_task(id, entry.clone())?;
-        store.move_record_to_sidecar(id, &record_path, &destination)?;
+        self.finish_completed_record_sidecar(store, record, entry, Some(destination))
+    }
+
+    fn finish_completed_record_sidecar(
+        &self,
+        store: &DownloadStore,
+        record: TaskRecord,
+        mut entry: TaskIndexEntry,
+        destination: Option<PathBuf>,
+    ) -> Result<TaskRecord> {
+        let Some(destination) = destination else {
+            if entry.record_path.parent() == Some(store.queue_dir.as_path()) {
+                return store.save_mutated_record(record, entry, true);
+            }
+            return Ok(record);
+        };
+        if let Some(pending_target) = &entry.move_target {
+            if pending_target != &destination {
+                bail!(
+                    "task {} has a different pending sidecar destination",
+                    record.id
+                );
+            }
+        } else if entry.record_path != destination {
+            entry.move_target = Some(destination.clone());
+            entry.revision = record.revision;
+            entry.updated_at = record.updated_at;
+            store.save_index_task(&record.id, entry.clone())?;
+        }
+        if entry.record_path == destination {
+            if entry.move_target.is_some() {
+                entry.move_target = None;
+                return store.save_mutated_record(record, entry, true);
+            }
+            return Ok(record);
+        }
+        match store.move_record_to_sidecar(&record.id, &entry.record_path, &destination) {
+            Ok(SidecarMoveStatus::Moved | SidecarMoveStatus::AlreadyAtTarget) => {}
+            Ok(SidecarMoveStatus::Missing) => {
+                bail!("task record disappeared before sidecar migration")
+            }
+            Err(error) if is_file_provider_access_error(&error) => {
+                tracing::warn!(
+                    task_id = %record.id,
+                    error = %error,
+                    "published task is complete; retaining its pending sidecar migration for recovery"
+                );
+                return Ok(record);
+            }
+            Err(error) => return Err(error),
+        }
         #[cfg(test)]
         if self.interrupt_after_sidecar_move.load(Ordering::Relaxed) {
             bail!("simulated interruption after task sidecar migration");
@@ -963,21 +1045,133 @@ pub fn hash_primary_media(
     Ok(hashes)
 }
 
-impl DownloadStore {
-    fn new(root_path: &Path) -> Result<Self> {
-        Self::from_root(RootedFs::new(root_path)?)
-    }
+fn coordinate_directory_root(
+    file_provider: &dyn QueueFileProvider,
+    path: &Path,
+) -> Result<RootedFs> {
+    let mut bound_root = None;
+    let mut list_entries = |coordinated_path: &Path| -> Result<()> {
+        // Protected property: retain the identity of the configured download-root directory
+        // opened while File Provider coordination holds access. Check that the coordinator's
+        // accessor names that same root, enumerate it through its descriptor, and reuse this
+        // bound root after the accessor returns instead of resolving the pathname again.
+        let root = RootedFs::new(path)?;
+        let rooted_accessor = coordinated_path_under_root(&root, coordinated_path)?;
+        if rooted_accessor != root.logical_root_path() {
+            bail!("coordinated download directory is outside its configured root");
+        }
+        let _ = root.list_root_directory()?;
+        bound_root = Some(root);
+        Ok(())
+    };
+    file_provider
+        .coordinate_read(path, &mut list_entries)
+        .map_err(|error| classify_deadlock_error(path, "read", error))?;
+    bound_root.ok_or_else(|| anyhow!("File Provider did not supply a coordinated download root"))
+}
 
-    fn from_root(root: RootedFs) -> Result<Self> {
-        root.validate_configured_root()?;
-        let queue_dir = root.logical_root_path().join(QUEUE_DIRECTORY);
-        let identity = root.create_dir(&queue_dir, 0o700)?;
-        let queue_identity = match identity {
-            Some(identity) => identity,
-            None => root
-                .entry_identity(&queue_dir)?
-                .ok_or_else(|| anyhow!("task queue directory disappeared"))?,
+fn coordinate_private_directory_creation(
+    file_provider: &dyn QueueFileProvider,
+    root: &RootedFs,
+    path: &Path,
+    mode: u16,
+) -> Result<()> {
+    let mut created = false;
+    let mut create_directory = |coordinated_path: &Path| -> Result<()> {
+        let rooted_accessor = coordinated_path_under_root(root, coordinated_path)?;
+        if rooted_accessor == root.logical_root_path() {
+            bail!("coordinated queue directory resolved to the download root");
+        }
+        let _ = root.create_dir(&rooted_accessor, mode)?;
+        let entry = root.bind_entry(&rooted_accessor, false)?;
+        let identity = root
+            .bound_entry_identity(&entry)?
+            .ok_or_else(|| anyhow!("coordinated task queue directory disappeared"))?;
+        root.validate_private_bound_directory(&entry, identity, mode)
+            .context("task queue directory must be owner-private")?;
+        created = true;
+        Ok(())
+    };
+    file_provider
+        .coordinate_write(path, &mut create_directory)
+        .map_err(|error| classify_deadlock_error(path, "write", error))?;
+    if !created {
+        bail!("File Provider did not supply a coordinated directory accessor");
+    }
+    Ok(())
+}
+
+fn coordinate_bound_directory_listing(
+    file_provider: &dyn QueueFileProvider,
+    root: &RootedFs,
+    path: &Path,
+) -> Result<(PathBuf, EntryIdentity)> {
+    let mut result = None;
+    let mut list_entries = |coordinated_path: &Path| -> Result<()> {
+        let rooted_accessor = coordinated_path_under_root(root, coordinated_path)?;
+        if rooted_accessor == root.logical_root_path() {
+            bail!("coordinated queue directory resolved to the download root");
+        }
+        let entry = root.bind_entry(&rooted_accessor, false)?;
+        let identity = root
+            .bound_entry_identity(&entry)?
+            .ok_or_else(|| anyhow!("coordinated task queue directory disappeared"))?;
+        root.validate_private_bound_directory(&entry, identity, 0o700)
+            .context("task queue directory must be owner-private")?;
+        let _ = root.list_bound_directory(&entry, identity)?;
+        root.validate_private_bound_directory(&entry, identity, 0o700)
+            .context("task queue directory changed during coordinated listing")?;
+        result = Some((rooted_accessor, identity));
+        Ok(())
+    };
+    file_provider
+        .coordinate_read(path, &mut list_entries)
+        .map_err(|error| classify_deadlock_error(path, "read", error))?;
+    result.ok_or_else(|| anyhow!("File Provider did not supply a coordinated directory"))
+}
+
+fn coordinated_path_under_root(root: &RootedFs, coordinated_path: &Path) -> Result<PathBuf> {
+    // The configured root is the access-policy boundary. File Provider may return either its
+    // configured spelling or the canonical URL for that rooted item; reject escapes and
+    // non-normal components before translating back to the logical path used by RootedFs.
+    let relative = coordinated_path
+        .strip_prefix(root.logical_root_path())
+        .or_else(|_| coordinated_path.strip_prefix(root.root_path()))
+        .with_context(|| {
+            format!(
+                "coordinated File Provider URL is outside the configured download root: {}",
+                coordinated_path.display()
+            )
+        })?;
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            bail!(
+                "coordinated File Provider URL contains an invalid path component: {}",
+                coordinated_path.display()
+            );
         };
+        normalized.push(name);
+    }
+    Ok(root.logical_root_path().join(normalized))
+}
+
+impl DownloadStore {
+    fn from_root(root: RootedFs, file_provider: Arc<dyn QueueFileProvider>) -> Result<Self> {
+        let requested_queue_dir = root.logical_root_path().join(QUEUE_DIRECTORY);
+        coordinate_private_directory_creation(
+            file_provider.as_ref(),
+            &root,
+            &requested_queue_dir,
+            0o700,
+        )?;
+        // File Provider may replace a directory placeholder while enumerating it.
+        // Bind the current directory identity only after its children are available.
+        let (queue_dir, queue_identity) = coordinate_bound_directory_listing(
+            file_provider.as_ref(),
+            &root,
+            &requested_queue_dir,
+        )?;
         let queue_entry = root.bind_entry(&queue_dir, false)?;
         root.validate_private_bound_directory(&queue_entry, queue_identity, 0o700)
             .context("task queue directory must be owner-private")?;
@@ -989,6 +1183,7 @@ impl DownloadStore {
             root,
             queue_dir,
             queue_identity,
+            file_provider,
         };
         store.ensure_operation_lock_file()?;
         Ok(store)
@@ -999,44 +1194,123 @@ impl DownloadStore {
     }
 
     fn ensure_operation_lock_file(&self) -> Result<()> {
-        if let Some(file) = self.root.open_bound_file(&self.operation_lock_path)? {
-            file.validate_private_single_link(0o600)?;
+        self.ensure_coordinated_lock_file(&self.operation_lock_path)
+    }
+
+    fn ensure_coordinated_lock_file(&self, path: &Path) -> Result<()> {
+        if self.open_coordinated_lock_file(path)?.is_some() {
             return Ok(());
         }
-        if let Err(create_error) =
-            self.root
-                .create_new_bound_file(&self.operation_lock_path, &[], 0o600)
-        {
-            let Some(file) = self.root.open_bound_file(&self.operation_lock_path)? else {
-                return Err(create_error);
+
+        let mut created = false;
+        let mut create = |accessor_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(accessor_path)?;
+            if coordinated_path != path {
+                bail!("coordinated task queue lock path changed during creation");
+            }
+            self.ensure_private_directory()?;
+            let file = match self
+                .root
+                .create_new_bound_file(&coordinated_path, &[], 0o600)
+            {
+                Ok(_) => self
+                    .root
+                    .open_bound_file(&coordinated_path)?
+                    .ok_or_else(|| anyhow!("created task queue lock file disappeared"))?,
+                Err(create_error) => {
+                    let Some(file) = self.root.open_bound_file(&coordinated_path)? else {
+                        return Err(create_error);
+                    };
+                    file
+                }
             };
+            let identity = file.identity();
             file.validate_private_single_link(0o600)?;
+            let entry = self.root.bind_entry(&coordinated_path, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(identity) {
+                bail!("task queue lock file changed during coordinated creation");
+            }
+            file.validate_private_single_link(0o600)?;
+            self.ensure_private_directory()?;
+            created = true;
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_write(path, &mut create)
+            .map_err(|error| classify_deadlock_error(path, "write", error))?;
+        if !created {
+            bail!("File Provider did not supply a coordinated lock-file accessor");
         }
         Ok(())
     }
 
-    fn ensure_owner_lock_file(&self) -> Result<PathBuf> {
-        let path = self.queue_dir.join(QUEUE_OWNER_LOCK_FILE);
-        if let Some(file) = self.root.open_bound_file(&path)? {
-            file.validate_private_single_link(0o600)?;
-            return Ok(path);
-        }
-        if let Err(create_error) = self.root.create_new_bound_file(&path, &[], 0o600) {
-            let Some(file) = self.root.open_bound_file(&path)? else {
-                return Err(create_error);
+    fn open_coordinated_lock_file(&self, path: &Path) -> Result<Option<BoundFile>> {
+        let mut opened = None;
+        let mut open = |accessor_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(accessor_path)?;
+            if coordinated_path != path {
+                bail!("coordinated task queue lock path changed during access");
+            }
+            self.ensure_private_directory()?;
+            let Some(file) = self.root.open_bound_file(&coordinated_path)? else {
+                opened = Some(None);
+                return Ok(());
             };
+            let identity = file.identity();
             file.validate_private_single_link(0o600)?;
+            let entry = self.root.bind_entry(&coordinated_path, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(identity) {
+                bail!("task queue lock file changed during coordinated access");
+            }
+            file.validate_private_single_link(0o600)?;
+            self.ensure_private_directory()?;
+            opened = Some(Some(file));
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(path, &mut open)
+            .map_err(|error| classify_deadlock_error(path, "read", error))?;
+        opened
+            .ok_or_else(|| anyhow!("File Provider did not supply a coordinated lock-file accessor"))
+    }
+
+    fn validate_coordinated_lock_file(&self, path: &Path, expected: EntryIdentity) -> Result<()> {
+        let mut validated = false;
+        let mut validate = |accessor_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(accessor_path)?;
+            if coordinated_path != path {
+                bail!("coordinated task queue lock path changed while locking");
+            }
+            self.ensure_private_directory()?;
+            let entry = self.root.bind_entry(&coordinated_path, false)?;
+            let file = self
+                .root
+                .open_bound_file(&coordinated_path)?
+                .ok_or_else(|| anyhow!("task queue lock file disappeared while locking"))?;
+            if file.identity() != expected
+                || self.root.bound_entry_identity(&entry)? != Some(expected)
+            {
+                bail!("task queue lock file was replaced while locking");
+            }
+            file.validate_private_single_link(0o600)?;
+            self.ensure_private_directory()?;
+            validated = true;
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(path, &mut validate)
+            .map_err(|error| classify_deadlock_error(path, "read", error))?;
+        if !validated {
+            bail!("File Provider did not supply a coordinated lock-file validation");
         }
-        Ok(path)
+        Ok(())
     }
 
     fn lock_queue_owner(&self) -> Result<QueueOwnerLock> {
-        self.ensure_private_directory()?;
-        let path = self.ensure_owner_lock_file()?;
-        let entry = self.root.bind_entry(&path, false)?;
+        let path = self.queue_dir.join(QUEUE_OWNER_LOCK_FILE);
+        self.ensure_coordinated_lock_file(&path)?;
         let file = self
-            .root
-            .open_bound_file(&path)?
+            .open_coordinated_lock_file(&path)?
             .ok_or_else(|| anyhow!("task queue owner lock file is missing"))?;
         let identity = file.identity();
         file.validate_private_single_link(0o600)?;
@@ -1046,27 +1320,21 @@ impl DownloadStore {
                 self.root_path.display()
             );
         }
-        if self.root.bound_entry_identity(&entry)? != Some(identity) {
-            bail!("task queue owner lock file was replaced while locking");
-        }
         file.validate_private_single_link(0o600)?;
+        self.validate_coordinated_lock_file(&path, identity)?;
         Ok(QueueOwnerLock { _file: file })
     }
 
     fn lock_queue_operations(&self) -> Result<QueueOperationLock> {
-        self.ensure_private_directory()?;
-        let entry = self.root.bind_entry(&self.operation_lock_path, false)?;
+        self.ensure_coordinated_lock_file(&self.operation_lock_path)?;
         let file = self
-            .root
-            .open_bound_file(&self.operation_lock_path)?
+            .open_coordinated_lock_file(&self.operation_lock_path)?
             .ok_or_else(|| anyhow!("task queue operation lock file is missing"))?;
         let identity = file.identity();
         file.validate_private_single_link(0o600)?;
         file.lock_exclusive()?;
-        if self.root.bound_entry_identity(&entry)? != Some(identity) {
-            bail!("task queue claim lock file was replaced while locking");
-        }
         file.validate_private_single_link(0o600)?;
+        self.validate_coordinated_lock_file(&self.operation_lock_path, identity)?;
         Ok(QueueOperationLock { _file: file })
     }
 
@@ -1090,9 +1358,20 @@ impl DownloadStore {
     }
 
     fn ensure_private_directory(&self) -> Result<()> {
+        // This metadata check must run inside a File Provider accessor callback. A cloud-only
+        // queue directory may reject opening or inspecting its parent before coordination.
         let entry = self.root.bind_entry(&self.queue_dir, false)?;
         self.root
             .validate_private_bound_directory(&entry, self.queue_identity, 0o700)
+    }
+
+    fn coordinated_queue_file_path(&self, accessor_path: &Path) -> Result<PathBuf> {
+        let rooted_path = coordinated_path_under_root(&self.root, accessor_path)?;
+        let relative = rooted_path.strip_prefix(self.root.logical_root_path())?;
+        if relative.as_os_str().is_empty() {
+            bail!("coordinated URL does not name a task queue file");
+        }
+        Ok(rooted_path)
     }
 
     fn index_path(&self) -> PathBuf {
@@ -1129,49 +1408,86 @@ impl DownloadStore {
     }
 
     fn read_private_file(&self, path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
-        self.ensure_private_directory()?;
-        let Some(file) = self.root.open_bound_file(path)? else {
-            return Ok(None);
-        };
-        file.validate_private_single_link(0o600)
-            .with_context(|| format!("private task file is unsafe: {}", path.display()))?;
-        if file.byte_len()? > limit as u64 {
-            bail!(
-                "task queue file exceeds its {limit}-byte limit: {}",
-                path.display()
-            );
+        // A cloud placeholder may be replaced as it materializes. Only use the
+        // pre-coordination lookup to preserve the missing-file case; bind and
+        // validate the actual object inside the coordinated accessor below.
+        match self.root.entry_identity(path) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(None),
+            // A provider can reject metadata lookup until coordinated access
+            // asks it to make the path available. Do not treat that as missing.
+            Err(error) if is_deadlock_error(&error) => {}
+            Err(error) => return Err(error),
         }
-        Ok(Some(file.read_limited(limit)?))
+
+        let mut contents = None;
+        let mut read = |accessor_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(accessor_path)?;
+            self.ensure_private_directory()?;
+            let file = self
+                .root
+                .open_bound_file(&coordinated_path)?
+                .ok_or_else(|| anyhow!("task queue file disappeared during coordinated access"))?;
+            file.validate_private_single_link(0o600).with_context(|| {
+                format!(
+                    "private task file is unsafe: {}",
+                    coordinated_path.display()
+                )
+            })?;
+            if file.byte_len()? > limit as u64 {
+                bail!(
+                    "task queue file exceeds its {limit}-byte limit: {}",
+                    coordinated_path.display()
+                );
+            }
+            contents = Some(file.read_limited(limit).with_context(|| {
+                format!(
+                    "failed to read task queue file {}",
+                    coordinated_path.display()
+                )
+            })?);
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(path, &mut read)
+            .map_err(|error| classify_deadlock_error(path, "read", error))?;
+        Ok(contents)
     }
 
     fn write_private_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
-        self.ensure_private_directory()?;
         if contents.len() > MAX_RECORD_BYTES.max(MAX_INDEX_BYTES) {
             bail!("task queue record exceeds the configured size limit");
         }
-        let temporary = temporary_sibling(path);
-        if let Some(file) = self.root.open_bound_file(path)? {
-            file.validate_private_single_link(0o600)?;
-            let entry = self.root.bind_entry(path, false)?;
-            self.root.replace_bound_file_atomically_if_identity(
-                &entry,
-                file.identity(),
-                &temporary,
-                contents,
-                0o600,
-            )?;
-        } else {
-            let (source, identity) = self
-                .root
-                .create_new_bound_file(&temporary, contents, 0o600)?;
-            let destination = self.root.bind_entry(path, false)?;
-            self.root.rename_via_bound_parents_noreplace_if_identity(
-                &source,
-                &destination,
-                identity,
-            )?;
-        }
-        Ok(())
+        let mut write = |accessor_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(accessor_path)?;
+            self.ensure_private_directory()?;
+            let temporary = temporary_sibling(&coordinated_path);
+            if let Some(file) = self.root.open_bound_file(&coordinated_path)? {
+                file.validate_private_single_link(0o600)?;
+                let entry = self.root.bind_entry(&coordinated_path, false)?;
+                self.root.replace_bound_file_atomically_if_identity(
+                    &entry,
+                    file.identity(),
+                    &temporary,
+                    contents,
+                    0o600,
+                )?;
+            } else {
+                let (source, identity) = self
+                    .root
+                    .create_new_bound_file(&temporary, contents, 0o600)?;
+                let destination = self.root.bind_entry(&coordinated_path, false)?;
+                self.root.rename_via_bound_parents_noreplace_if_identity(
+                    &source,
+                    &destination,
+                    identity,
+                )?;
+            }
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_write(path, &mut write)
+            .map_err(|error| classify_deadlock_error(path, "write", error))
     }
 
     fn read_index(&self) -> Result<StoreIndex> {
@@ -1419,11 +1735,15 @@ impl DownloadStore {
             && entry.record_path.parent() == Some(self.queue_dir.as_path())
         {
             let destination = self.terminal_history_path(&record.id)?;
-            self.ensure_private_history_directory()?;
             entry.move_target = Some(destination.clone());
             index.tasks.insert(record.id.clone(), entry.clone());
             self.write_index(&index)?;
-            self.move_record_to_sidecar(&record.id, &entry.record_path, &destination)?;
+            match self.move_record_to_sidecar(&record.id, &entry.record_path, &destination)? {
+                SidecarMoveStatus::Moved | SidecarMoveStatus::AlreadyAtTarget => {}
+                SidecarMoveStatus::Missing => {
+                    bail!("task record disappeared before sidecar migration")
+                }
+            }
             entry.record_path = destination;
             entry.move_target = None;
         }
@@ -1482,11 +1802,7 @@ impl DownloadStore {
     }
 
     fn scan_active_records(&self, index: &mut StoreIndex) -> Result<()> {
-        self.ensure_private_directory()?;
-        let queue_entry = self.root.bind_entry(&self.queue_dir, false)?;
-        let entries = self
-            .root
-            .list_bound_directory(&queue_entry, self.queue_identity)?;
+        let entries = self.list_coordinated_queue_directory()?;
         if entries.len() > MAX_ACTIVE_RECORDS {
             bail!("task queue contains more than {MAX_ACTIVE_RECORDS} entries");
         }
@@ -1532,42 +1848,48 @@ impl DownloadStore {
         Ok(())
     }
 
+    fn list_coordinated_queue_directory(&self) -> Result<Vec<(std::ffi::OsString, EntryIdentity)>> {
+        let mut entries = None;
+        let mut list_entries = |coordinated_path: &Path| -> Result<()> {
+            let rooted_accessor = coordinated_path_under_root(&self.root, coordinated_path)?;
+            if rooted_accessor != self.queue_dir {
+                bail!("coordinated task queue directory changed during listing");
+            }
+            let queue_entry = self.root.bind_entry(&rooted_accessor, false)?;
+            let identity = self
+                .root
+                .bound_entry_identity(&queue_entry)?
+                .ok_or_else(|| anyhow!("coordinated task queue directory disappeared"))?;
+            if identity != self.queue_identity {
+                bail!("task queue directory identity changed during coordinated access");
+            }
+            self.root
+                .validate_private_bound_directory(&queue_entry, self.queue_identity, 0o700)
+                .context("task queue directory must remain owner-private")?;
+            entries = Some(
+                self.root
+                    .list_bound_directory(&queue_entry, self.queue_identity)?,
+            );
+            self.root
+                .validate_private_bound_directory(&queue_entry, self.queue_identity, 0o700)
+                .context("task queue directory changed during coordinated listing")?;
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(&self.queue_dir, &mut list_entries)
+            .map_err(|error| classify_deadlock_error(&self.queue_dir, "read", error))?;
+        entries.ok_or_else(|| anyhow!("File Provider did not supply a coordinated queue listing"))
+    }
+
     fn reconcile_move_targets(&self, index: &mut StoreIndex) -> Result<()> {
         let mut changed = false;
         for (id, entry) in &mut index.tasks {
             let Some(target) = entry.move_target.clone() else {
                 continue;
             };
-            let source_exists = self.root.entry_exists(&entry.record_path)?;
-            let target_exists = self.root.entry_exists(&target)?;
-            if source_exists {
-                let Some(source_record) = self.read_record(&entry.record_path)? else {
-                    continue;
-                };
-                if source_record.id != *id {
-                    bail!(
-                        "sidecar recovery found a mismatched task ID at {}",
-                        entry.record_path.display()
-                    );
-                }
-            }
-            if source_exists && !target_exists {
-                self.move_record_to_sidecar(id, &entry.record_path, &target)?;
-            }
-            if !source_exists && !target_exists {
+            let move_status = self.move_record_to_sidecar(id, &entry.record_path, &target)?;
+            if move_status == SidecarMoveStatus::Missing {
                 continue;
-            }
-            let Some(record) = self.read_record(&target)? else {
-                continue;
-            };
-            if record.id != *id {
-                bail!(
-                    "sidecar recovery found a mismatched task ID at {}",
-                    target.display()
-                );
-            }
-            if source_exists && target_exists {
-                self.move_record_to_sidecar(id, &entry.record_path, &target)?;
             }
             entry.record_path = target;
             entry.move_target = None;
@@ -1584,33 +1906,158 @@ impl DownloadStore {
         id: &str,
         source_path: &Path,
         target_path: &Path,
-    ) -> Result<()> {
-        self.ensure_private_directory()?;
-        let Some(file) = self.root.open_bound_file(source_path)? else {
-            if let Some(record) = self.read_record(target_path)?
-                && record.id == id
-            {
-                return Ok(());
-            }
-            bail!("task record disappeared before sidecar migration");
-        };
-        file.validate_private_single_link(0o600)?;
-        if self.root.entry_exists(target_path)? {
-            let Some(existing) = self.read_record(target_path)? else {
-                bail!("task sidecar target exists but is unreadable");
-            };
-            if existing.id != id {
-                bail!("refusing to overwrite an unrelated task sidecar");
-            }
-            let source = self.root.bind_entry(source_path, false)?;
-            self.root
-                .remove_bound_file_if_identity(&source, file.identity())?;
-            return Ok(());
+    ) -> Result<SidecarMoveStatus> {
+        let history_directory = self.queue_dir.join(TERMINAL_HISTORY_DIRECTORY);
+        if target_path.parent() == Some(history_directory.as_path()) {
+            self.ensure_private_history_directory_coordinated()?;
         }
-        let source = self.root.bind_entry(source_path, false)?;
-        let target = self.root.bind_entry(target_path, false)?;
-        self.root
-            .rename_via_bound_parents_noreplace_if_identity(&source, &target, file.identity())
+        let mut outcome = None;
+        let mut move_entries = |coordinated_source: &Path,
+                                coordinated_target: &Path|
+         -> Result<()> {
+            let source_path_from_provider = self.coordinated_queue_file_path(coordinated_source)?;
+            let target_path_from_provider = self.coordinated_queue_file_path(coordinated_target)?;
+            if source_path_from_provider != source_path || target_path_from_provider != target_path
+            {
+                bail!("File Provider changed a task sidecar migration path");
+            }
+            self.ensure_private_directory()?;
+
+            // Both source and destination are inspected only while the paired move is
+            // coordinated. Descriptor identity and owner-private checks protect the files
+            // selected for migration; path metadata outside this callback is not trusted.
+            let source_file = self.root.open_bound_file(source_path)?;
+            let target_file = self.root.open_bound_file(target_path)?;
+            let target_entry = target_file
+                .as_ref()
+                .map(|_| self.root.bind_entry(target_path, false))
+                .transpose()?;
+            if let Some(file) = &source_file {
+                let source_record = self.read_coordinated_record(source_path, file)?;
+                if source_record.id != id {
+                    bail!(
+                        "sidecar recovery found a mismatched task ID at {}",
+                        source_path.display()
+                    );
+                }
+            }
+            if let Some(file) = &target_file {
+                let target_record = self.read_coordinated_record(target_path, file)?;
+                if target_record.id != id {
+                    bail!(
+                        "sidecar recovery found a mismatched task ID at {}",
+                        target_path.display()
+                    );
+                }
+                self.validate_coordinated_record_entry(
+                    target_path,
+                    file,
+                    target_entry
+                        .as_ref()
+                        .expect("an opened target file should have a bound directory entry"),
+                )?;
+            }
+
+            match (&source_file, &target_file) {
+                (Some(source_file), None) => {
+                    source_file.validate_private_single_link(0o600)?;
+                    let source = self.root.bind_entry(source_path, false)?;
+                    let target = self.root.bind_entry(target_path, false)?;
+                    self.root.rename_via_bound_parents_noreplace_if_identity(
+                        &source,
+                        &target,
+                        source_file.identity(),
+                    )?;
+                    outcome = Some(SidecarMoveStatus::Moved);
+                }
+                (Some(source_file), Some(target_file)) => {
+                    source_file.validate_private_single_link(0o600)?;
+                    let source = self.root.bind_entry(source_path, false)?;
+                    let target_entry = target_entry
+                        .as_ref()
+                        .expect("matched target file should have a bound directory entry");
+                    self.validate_coordinated_record_entry(target_path, target_file, target_entry)?;
+                    self.root
+                        .remove_bound_file_if_identity(&source, source_file.identity())?;
+                    self.validate_coordinated_record_entry(target_path, target_file, target_entry)?;
+                    outcome = Some(SidecarMoveStatus::AlreadyAtTarget);
+                }
+                (None, Some(target_file)) => {
+                    self.validate_coordinated_record_entry(
+                        target_path,
+                        target_file,
+                        target_entry
+                            .as_ref()
+                            .expect("matched target file should have a bound directory entry"),
+                    )?;
+                    outcome = Some(SidecarMoveStatus::AlreadyAtTarget);
+                }
+                (None, None) => outcome = Some(SidecarMoveStatus::Missing),
+            }
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_move(source_path, target_path, &mut move_entries)
+            .map_err(|error| classify_deadlock_error(source_path, "move", error))?;
+        outcome.ok_or_else(|| anyhow!("File Provider did not supply a coordinated move"))
+    }
+
+    fn ensure_private_history_directory_coordinated(&self) -> Result<()> {
+        let path = self.queue_dir.join(TERMINAL_HISTORY_DIRECTORY);
+        let mut ensure = |coordinated_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(coordinated_path)?;
+            if coordinated_path != path {
+                bail!("File Provider changed the task history directory path");
+            }
+            self.ensure_private_history_directory()
+        };
+        self.file_provider
+            .coordinate_write(&path, &mut ensure)
+            .map_err(|error| classify_deadlock_error(&path, "write", error))
+    }
+
+    fn read_coordinated_record(&self, path: &Path, file: &BoundFile) -> Result<TaskRecord> {
+        file.validate_private_single_link(0o600)
+            .with_context(|| format!("private task record is unsafe: {}", path.display()))?;
+        if file.byte_len()? > MAX_RECORD_BYTES as u64 {
+            bail!(
+                "task queue file exceeds its {MAX_RECORD_BYTES}-byte limit: {}",
+                path.display()
+            );
+        }
+        let bytes = file
+            .read_limited(MAX_RECORD_BYTES)
+            .with_context(|| format!("failed to read task queue file {}", path.display()))?;
+        let record: TaskRecord = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid task queue record {}", path.display()))?;
+        if record.schema_version != TASK_RECORD_VERSION {
+            bail!("unsupported task record version for task {}", record.id);
+        }
+        Ok(record)
+    }
+
+    fn validate_coordinated_record_entry(
+        &self,
+        path: &Path,
+        file: &BoundFile,
+        entry: &crate::safe_fs::BoundEntry,
+    ) -> Result<()> {
+        // Descriptor identity selects the record object, while owner/mode/link checks preserve
+        // its private access policy. The path check ensures recovery will not discard the active
+        // copy after the destination name has been replaced; timestamps are not mutation signals.
+        file.validate_private_single_link(0o600)?;
+        match self.root.bound_entry_identity(entry)? {
+            Some(identity) if identity == file.identity() => {}
+            Some(_) => bail!(
+                "coordinated task record path was replaced during migration: {}",
+                path.display()
+            ),
+            None => bail!(
+                "coordinated task record disappeared during migration: {}",
+                path.display()
+            ),
+        }
+        Ok(())
     }
 }
 
@@ -1944,6 +2391,8 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use crate::file_provider::MockQueueFileProvider;
+
     use super::*;
 
     fn temp_queue_root(label: &str) -> PathBuf {
@@ -2081,6 +2530,162 @@ mod tests {
                 .len(),
             2
         );
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn queue_lock_files_and_queue_scans_use_coordinated_reads() {
+        let temp_root = temp_queue_root("coordinated-queue-scans");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root.clone();
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
+            .expect("queue should open with the mock File Provider");
+        let startup_writes = file_provider.write_paths();
+        let startup_reads = file_provider.read_paths();
+        for queue_root in [&video_root, &pdf_root] {
+            let queue_dir = queue_root.join(QUEUE_DIRECTORY);
+            assert!(
+                startup_writes.contains(&queue_dir),
+                "queue directory creation should use coordinated writes: {startup_writes:?}"
+            );
+            assert!(
+                startup_reads.contains(&queue_dir.join(QUEUE_OPERATION_LOCK_FILE)),
+                "operation lock access should use coordinated reads: {startup_reads:?}"
+            );
+            assert!(
+                startup_reads.contains(&queue_dir.join(QUEUE_OWNER_LOCK_FILE)),
+                "owner lock access should use coordinated reads: {startup_reads:?}"
+            );
+        }
+        let reads_before_listing = file_provider.read_paths().len();
+
+        queue
+            .list(123_456_789, false, 0)
+            .expect("queue listing should scan both stores");
+
+        let reads = file_provider.read_paths();
+        let listing_reads = &reads[reads_before_listing..];
+        assert!(
+            listing_reads.contains(&video_root.join(QUEUE_DIRECTORY)),
+            "video queue directory scans should use coordinated reads: {listing_reads:?}"
+        );
+        assert!(
+            listing_reads.contains(&pdf_root.join(QUEUE_DIRECTORY)),
+            "PDF queue directory scans should use coordinated reads: {listing_reads:?}"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn coordinated_accessor_urls_are_rebased_and_stay_within_the_download_root() {
+        let temp_root = temp_queue_root("file-provider-accessor-url");
+        let physical_video_root = temp_root.join("physical-videos");
+        let video_alias = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&physical_video_root).expect("physical video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        symlink(&physical_video_root, &video_alias).expect("video root alias should create");
+
+        let rooted = RootedFs::new(&video_alias).expect("video root should bind");
+        let canonical_video_root = rooted.root_path().to_path_buf();
+        let accessor_record = canonical_video_root
+            .join(QUEUE_DIRECTORY)
+            .join("task-accessor.json");
+        assert_eq!(
+            coordinated_path_under_root(&rooted, &accessor_record)
+                .expect("canonical accessor path should map under its logical root"),
+            video_alias.join(QUEUE_DIRECTORY).join("task-accessor.json")
+        );
+        assert!(coordinated_path_under_root(&rooted, &temp_root.join("outside.json")).is_err());
+        assert!(
+            coordinated_path_under_root(&rooted, &rooted.root_path().join("../outside.json"))
+                .is_err()
+        );
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_alias.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        file_provider.rewrite_paths_under(&video_alias, &canonical_video_root);
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
+            .expect("queue should accept canonical accessor URLs within the configured root");
+        let task = test_task(
+            "task-canonical-accessor-url",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            },
+        );
+        assert!(
+            queue
+                .create(task)
+                .expect("task should write through accessor URL")
+        );
+        assert!(
+            queue
+                .get("task-canonical-accessor-url")
+                .expect("task should read through accessor URL")
+                .is_some()
+        );
+        assert!(
+            file_provider
+                .accessor_paths()
+                .iter()
+                .any(|path| path.starts_with(&canonical_video_root)),
+            "mock provider should pass its alternate canonical URL to accessors"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn download_root_is_bound_before_file_provider_accessor_returns() {
+        let temp_root = temp_queue_root("file-provider-bound-download-root");
+        let physical_video_root = temp_root.join("physical-videos");
+        let replacement_video_root = temp_root.join("replacement-videos");
+        let video_alias = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&physical_video_root).expect("physical video root should create");
+        fs::create_dir_all(&replacement_video_root).expect("replacement video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        symlink(&physical_video_root, &video_alias).expect("video root alias should create");
+        let expected_identity = RootedFs::new(&physical_video_root)
+            .expect("physical video root should bind")
+            .root_identity();
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        file_provider.replace_symlink_after_next_read(&video_alias, &replacement_video_root);
+        let root = coordinate_directory_root(file_provider.as_ref(), &video_alias)
+            .expect("coordinated root should be bound before access returns");
+
+        // root_identity comes from the held directory descriptor, so comparing it with a
+        // descriptor opened on the original target checks object identity. Canonicalizing the
+        // alias separately only confirms the mock retargeted the path after the callback.
+        assert_eq!(
+            root.root_identity(),
+            expected_identity,
+            "the returned root must retain the object opened inside the coordinator callback"
+        );
+        assert!(
+            fs::canonicalize(&video_alias)
+                .expect("mock provider should replace the configured alias")
+                == fs::canonicalize(&replacement_video_root)
+                    .expect("replacement root should resolve"),
+            "the test must replace the alias after the coordinator callback returns"
+        );
+
+        drop(root);
         let _ = fs::remove_dir_all(temp_root);
     }
 
@@ -2646,7 +3251,10 @@ mod tests {
             .expect("move intent should persist before migration");
 
         drop(queue);
-        let reopened = QueueManager::open(&config).expect("interrupted move should recover");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let reopened = QueueManager::open_with_file_provider(&config, file_provider_trait)
+            .expect("interrupted move should recover");
         let recovered = reopened
             .get(id)
             .expect("cancelled task should load")
@@ -2668,6 +3276,11 @@ mod tests {
                 .tasks[id]
                 .move_target,
             None
+        );
+        assert_eq!(
+            file_provider.move_paths(),
+            vec![(entry.record_path.clone(), destination.clone())],
+            "restart recovery should coordinate the source and destination together"
         );
 
         drop(reopened);
@@ -2906,6 +3519,102 @@ mod tests {
                 .expect("active queue should load")
                 .is_empty()
         );
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn published_completion_survives_temporary_sidecar_move_failure() {
+        let temp_root = temp_queue_root("completed-sidecar-provider-retry");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
+            .expect("queue should open with the mock File Provider");
+        let id = "task-completed-sidecar-provider-retry";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Running, None)
+            .expect("task should start");
+        queue
+            .begin_verification(id)
+            .expect("verification should begin")
+            .expect("task should still exist");
+        let media_path = video_root.join("completed-output.mp4");
+        fs::write(&media_path, b"verified media").expect("published media fixture should write");
+        file_provider.fail_next_move("simulated temporary File Provider move failure");
+
+        let completed = queue
+            .complete(
+                id,
+                media_path.display().to_string(),
+                std::slice::from_ref(&media_path),
+                BTreeMap::new(),
+            )
+            .expect("published output should succeed while archival migration remains pending");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        let active_path = queue
+            .video
+            .task_path(id)
+            .expect("active task path should resolve");
+        let destination = queue
+            .video
+            .root_path
+            .join(".telegram-video-downloader-task-task-completed-sidecar-provider-retry.json");
+        assert!(
+            active_path.is_file(),
+            "the active record should remain recoverable"
+        );
+        assert!(
+            !destination.exists(),
+            "the sidecar should remain pending until File Provider access recovers"
+        );
+        assert_eq!(
+            queue
+                .video
+                .read_index()
+                .expect("queue index should read")
+                .tasks[id]
+                .move_target,
+            Some(destination.clone()),
+            "the durable move intent should survive the provider failure"
+        );
+
+        let recovered = queue
+            .get(id)
+            .expect("queue access should retry the pending sidecar migration")
+            .expect("completed task should remain indexed");
+        assert_eq!(recovered.status, TaskStatus::Completed);
+        assert!(
+            !active_path.exists(),
+            "recovery should remove the active record"
+        );
+        assert!(destination.is_file(), "recovery should install the sidecar");
+        assert_eq!(
+            file_provider.move_paths(),
+            vec![
+                (active_path.clone(), destination.clone()),
+                (active_path, destination),
+            ],
+            "completion and recovery should both coordinate both migration paths"
+        );
+
+        drop(queue);
         let _ = fs::remove_dir_all(temp_root);
     }
 }
