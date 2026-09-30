@@ -304,6 +304,8 @@ pub(crate) struct MockQueueFileProvider {
     next_write_failure: std::sync::Mutex<Option<String>>,
     next_move_failure: std::sync::Mutex<Option<String>>,
     write_failure_after: std::sync::Mutex<Option<(usize, String)>>,
+    #[cfg(unix)]
+    read_path_replacement: std::sync::Mutex<Option<(PathBuf, PathBuf)>>,
 }
 
 #[cfg(test)]
@@ -341,6 +343,15 @@ impl MockQueueFileProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push((from.to_path_buf(), to.to_path_buf()));
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn replace_symlink_after_next_read(&self, path: &Path, target: &Path) {
+        *self
+            .read_path_replacement
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((path.to_path_buf(), target.to_path_buf()));
     }
 
     pub(crate) fn accessor_paths(&self) -> Vec<PathBuf> {
@@ -415,7 +426,26 @@ impl QueueFileProvider for MockQueueFileProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(accessor_path.clone());
-        accessor(&accessor_path)
+        let result = accessor(&accessor_path);
+        #[cfg(unix)]
+        {
+            let replacement = {
+                let mut replacement = self
+                    .read_path_replacement
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                replacement
+                    .as_ref()
+                    .is_some_and(|(expected, _)| expected == path)
+                    .then(|| replacement.take())
+                    .flatten()
+            };
+            if let Some((path, target)) = replacement {
+                std::fs::remove_file(&path)?;
+                std::os::unix::fs::symlink(target, path)?;
+            }
+        }
+        result
     }
 
     fn coordinate_write(

@@ -286,12 +286,11 @@ impl QueueManager {
         config: &AppConfig,
         file_provider: Arc<dyn QueueFileProvider>,
     ) -> Result<Self> {
-        coordinate_directory_listing(file_provider.as_ref(), &config.downloads.video_dir)?;
-        coordinate_directory_listing(file_provider.as_ref(), &config.downloads.pdf_dir)?;
-        let mut video =
-            DownloadStore::new(&config.downloads.video_dir, Arc::clone(&file_provider))?;
-        let pdf_root = RootedFs::new(&config.downloads.pdf_dir)?;
-        pdf_root.validate_configured_root()?;
+        let video_root =
+            coordinate_directory_root(file_provider.as_ref(), &config.downloads.video_dir)?;
+        let pdf_root =
+            coordinate_directory_root(file_provider.as_ref(), &config.downloads.pdf_dir)?;
+        let mut video = DownloadStore::from_root(video_root, Arc::clone(&file_provider))?;
         let pdf = if video.root.root_identity() == pdf_root.root_identity() {
             let pdf_alias = pdf_root.logical_root_path().to_path_buf();
             if !video.root_aliases.contains(&pdf_alias) {
@@ -658,17 +657,27 @@ impl QueueManager {
         let Some((store, mut record, mut entry)) = self.find_record_entry_unlocked(id)? else {
             bail!("persistent task {id} was missing at completion");
         };
-        if record.status != TaskStatus::Verifying {
-            bail!("task {id} changed state before output verification completed");
-        }
         let media_paths = media_paths
             .iter()
             .map(|path| store.normalize_media_path(path))
             .collect::<Result<Vec<_>>>()?;
+        let (persisted_hashes, hash_manifest) = persist_media_hashes(hashes)?;
+        if record.status == TaskStatus::Completed {
+            if record.saved_location.as_deref() != Some(saved_location.as_str())
+                || record.primary_media_hashes != persisted_hashes
+                || record.primary_media_hash_manifest != hash_manifest
+            {
+                bail!("task {id} was already completed with different published outputs");
+            }
+            let destination = sidecar_destination(&store.root_path, &record, &media_paths)?;
+            return self.finish_completed_record_sidecar(store, record, entry, destination);
+        }
+        if record.status != TaskStatus::Verifying {
+            bail!("task {id} changed state before output verification completed");
+        }
         record.status = TaskStatus::Completed;
         record.error = None;
         record.saved_location = Some(saved_location);
-        let (persisted_hashes, hash_manifest) = persist_media_hashes(hashes)?;
         record.primary_media_hashes = persisted_hashes;
         record.primary_media_hash_manifest = hash_manifest;
         if record.media_entries_total <= 1 {
@@ -682,7 +691,7 @@ impl QueueManager {
         let destination = sidecar_destination(&store.root_path, &record, &media_paths)?;
         record.cancel_requested = false;
         let Some(destination) = destination else {
-            return store.save_mutated_record(record, entry, true);
+            return self.finish_completed_record_sidecar(store, record, entry, None);
         };
         record.updated_at = unix_time();
         record.revision = record.revision.saturating_add(1);
@@ -691,14 +700,50 @@ impl QueueManager {
         entry.updated_at = record.updated_at;
         store.write_record(&record_path, &record)?;
         store.save_index_task(id, entry.clone())?;
-        match store.move_record_to_sidecar(id, &record_path, &destination) {
+        self.finish_completed_record_sidecar(store, record, entry, Some(destination))
+    }
+
+    fn finish_completed_record_sidecar(
+        &self,
+        store: &DownloadStore,
+        record: TaskRecord,
+        mut entry: TaskIndexEntry,
+        destination: Option<PathBuf>,
+    ) -> Result<TaskRecord> {
+        let Some(destination) = destination else {
+            if entry.record_path.parent() == Some(store.queue_dir.as_path()) {
+                return store.save_mutated_record(record, entry, true);
+            }
+            return Ok(record);
+        };
+        if let Some(pending_target) = &entry.move_target {
+            if pending_target != &destination {
+                bail!(
+                    "task {} has a different pending sidecar destination",
+                    record.id
+                );
+            }
+        } else if entry.record_path != destination {
+            entry.move_target = Some(destination.clone());
+            entry.revision = record.revision;
+            entry.updated_at = record.updated_at;
+            store.save_index_task(&record.id, entry.clone())?;
+        }
+        if entry.record_path == destination {
+            if entry.move_target.is_some() {
+                entry.move_target = None;
+                return store.save_mutated_record(record, entry, true);
+            }
+            return Ok(record);
+        }
+        match store.move_record_to_sidecar(&record.id, &entry.record_path, &destination) {
             Ok(SidecarMoveStatus::Moved | SidecarMoveStatus::AlreadyAtTarget) => {}
             Ok(SidecarMoveStatus::Missing) => {
                 bail!("task record disappeared before sidecar migration")
             }
             Err(error) if is_file_provider_access_error(&error) => {
                 tracing::warn!(
-                    task_id = id,
+                    task_id = %record.id,
                     error = %error,
                     "published task is complete; retaining its pending sidecar migration for recovery"
                 );
@@ -1000,23 +1045,29 @@ pub fn hash_primary_media(
     Ok(hashes)
 }
 
-fn coordinate_directory_listing(file_provider: &dyn QueueFileProvider, path: &Path) -> Result<()> {
+fn coordinate_directory_root(
+    file_provider: &dyn QueueFileProvider,
+    path: &Path,
+) -> Result<RootedFs> {
+    let mut bound_root = None;
     let mut list_entries = |coordinated_path: &Path| -> Result<()> {
-        // Bind the configured root only after coordination, since File Provider can replace a
-        // directory placeholder while making it available. Accept its logical or canonical URL,
-        // then enumerate through the descriptor-bound root rather than reopening an unchecked
-        // accessor path.
+        // Protected property: retain the identity of the configured download-root directory
+        // opened while File Provider coordination holds access. Check that the coordinator's
+        // accessor names that same root, enumerate it through its descriptor, and reuse this
+        // bound root after the accessor returns instead of resolving the pathname again.
         let root = RootedFs::new(path)?;
         let rooted_accessor = coordinated_path_under_root(&root, coordinated_path)?;
         if rooted_accessor != root.logical_root_path() {
             bail!("coordinated download directory is outside its configured root");
         }
         let _ = root.list_root_directory()?;
+        bound_root = Some(root);
         Ok(())
     };
     file_provider
         .coordinate_read(path, &mut list_entries)
-        .map_err(|error| classify_deadlock_error(path, "read", error))
+        .map_err(|error| classify_deadlock_error(path, "read", error))?;
+    bound_root.ok_or_else(|| anyhow!("File Provider did not supply a coordinated download root"))
 }
 
 fn coordinate_private_directory_creation(
@@ -1106,12 +1157,7 @@ fn coordinated_path_under_root(root: &RootedFs, coordinated_path: &Path) -> Resu
 }
 
 impl DownloadStore {
-    fn new(root_path: &Path, file_provider: Arc<dyn QueueFileProvider>) -> Result<Self> {
-        Self::from_root(RootedFs::new(root_path)?, file_provider)
-    }
-
     fn from_root(root: RootedFs, file_provider: Arc<dyn QueueFileProvider>) -> Result<Self> {
-        root.validate_configured_root()?;
         let requested_queue_dir = root.logical_root_path().join(QUEUE_DIRECTORY);
         coordinate_private_directory_creation(
             file_provider.as_ref(),
@@ -2600,6 +2646,46 @@ mod tests {
         );
 
         drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn download_root_is_bound_before_file_provider_accessor_returns() {
+        let temp_root = temp_queue_root("file-provider-bound-download-root");
+        let physical_video_root = temp_root.join("physical-videos");
+        let replacement_video_root = temp_root.join("replacement-videos");
+        let video_alias = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&physical_video_root).expect("physical video root should create");
+        fs::create_dir_all(&replacement_video_root).expect("replacement video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        symlink(&physical_video_root, &video_alias).expect("video root alias should create");
+        let expected_identity = RootedFs::new(&physical_video_root)
+            .expect("physical video root should bind")
+            .root_identity();
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        file_provider.replace_symlink_after_next_read(&video_alias, &replacement_video_root);
+        let root = coordinate_directory_root(file_provider.as_ref(), &video_alias)
+            .expect("coordinated root should be bound before access returns");
+
+        // root_identity comes from the held directory descriptor, so comparing it with a
+        // descriptor opened on the original target checks object identity. Canonicalizing the
+        // alias separately only confirms the mock retargeted the path after the callback.
+        assert_eq!(
+            root.root_identity(),
+            expected_identity,
+            "the returned root must retain the object opened inside the coordinator callback"
+        );
+        assert!(
+            fs::canonicalize(&video_alias)
+                .expect("mock provider should replace the configured alias")
+                == fs::canonicalize(&replacement_video_root)
+                    .expect("replacement root should resolve"),
+            "the test must replace the alias after the coordinator callback returns"
+        );
+
+        drop(root);
         let _ = fs::remove_dir_all(temp_root);
     }
 

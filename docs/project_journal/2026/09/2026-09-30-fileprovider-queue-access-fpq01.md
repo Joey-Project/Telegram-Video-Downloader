@@ -14,6 +14,7 @@ superseded_by:
 
 ## 摘要
 - macOS 队列元数据通过 `NSFileCoordinator` 读写，使 File Provider 能在访问回调内按需物化云端内容。
+- 视频与 PDF 下载根目录在协调读取回调内绑定，并将该描述符绑定根复用于队列初始化，避免回调结束后重新解析可能已被 File Provider 替换的路径。
 - 接受协调器提供的根目录内 accessor URL，并在 `RootedFs` 下重新绑定；拒绝下载根目录外的路径，同时保留私有权限和描述符身份校验。
 - 队列写入统一使用 replacement 协调，且只在回调中探测目标文件，避免云端占位文件未物化时的未协调访问。
 - `claims.lock` 和 `owner.lock` 的检查、创建、打开与路径身份复核都在协调访问中完成；文件锁等待在回调外进行，避免占用协调期间阻塞。
@@ -23,6 +24,8 @@ superseded_by:
 - 已持久化任务进入后台准备阶段后遇到 File Provider 错误时，向用户发送一次可操作提示并每 5 秒自动重试；其他准备错误会尽力标为失败并提示通过 `/queue` 恢复或重试。
 - Bilibili 短链规范化后的任务计划写入遇到 File Provider 错误时，同样保留任务、只发送一次提示并自动重试；队列按钮遇到已分类的 File Provider 错误时显示 callback 提示，并指导用户等 Finder 中隐藏队列目录可用后重试。
 - 任务持久化为 `Queued` 时遇到 File Provider 错误会保留当前任务、只发送一次提示并自动重试，成功后再启动下载工作。
+- Bilibili 选择提示从 `Preparing` 持久化为 `AwaitingSelection` 时遇到 File Provider 错误会保留 pending callback、只发送一次提示并重试，完成写入后再发送选择按钮。
+- 媒体文件发布后，完成记录和 sidecar 迁移准备阶段的 File Provider 写入失败会自动重试；重复调用可从记录已写而索引未写的状态继续，保留已发布文件并避免重复下载。
 - 任务记录迁入历史目录或媒体旁 sidecar 时，通过单次双路径 `NSFileCoordinator` 移动协调同时访问源和目标；启动恢复中的源/目标读取、探测、去重删除与重命名都在同一协调访问内完成。
 - 发布文件后的 sidecar 移动若只因 File Provider 协调失败，保留已完成任务和持久化的迁移意图并报告下载成功；之后的队列访问或启动会继续完成迁移。
 - 每次扫描活动队列目录都通过协调读取完成；队列目录身份与 owner-private 权限只在协调回调内验证，覆盖 `/queue`、恢复和任务查找路径。
@@ -38,8 +41,9 @@ superseded_by:
 - mock Telegram E2E 还覆盖规范化任务写入暂时失败后自动重试并继续进入 Bilibili 选择流程，以及 Resume callback 读取失败后的 Finder 指引和任务保留。
 - mock Telegram E2E 还覆盖 `Preparing` 转为 `Queued` 的暂时写入失败、单次通知和重试成功；启动测试覆盖输出恢复的 `EDEADLK` 分类后重试。
 - mock provider 测试覆盖队列目录创建经过协调写、目录创建失败后启动重试、启动和重启摘要读写中的 File Provider 暂时失败后重试、普通配置错误不重试、队列锁文件及 `/queue` 目录的协调访问、双路径历史迁移及恢复、完成文件发布后迁移失败的成功语义，以及启动、Telegram 退避和 bot runtime 阻塞期间的 shutdown 中断。
+- 新增根目录绑定测试，模拟协调回调返回后下载根目录 symlink 被替换；新增 mock Telegram E2E 覆盖 Bilibili 选择状态写入、完成记录写入和完成索引写入的 File Provider 瞬时失败重试。
 - Rust CI 的 `cargo test --all-targets --quiet` 已覆盖新增 E2E，无需增加另一条 workflow。
 
 ## 检查记录
 - `cargo fmt --all --manifest-path Cargo.toml -- --check`、`cargo check --all-targets --quiet --locked --offline`、`cargo clippy --all-targets --quiet --locked --offline -- -D warnings`、`cargo build --quiet --locked --offline` 和 `git diff --check` 通过。
-- `cargo test --all-targets --quiet --locked --offline` 通过：490 passed、11 ignored；包含 mock Telegram、队列目录和锁文件协调、File Provider 启动与输出恢复重试、启动摘要和后台任务准备、规范化任务及 `Queued` 状态转换重试、回调恢复指引、双路径 sidecar 迁移恢复、瞬时队列写入和 shutdown 中断回归测试。因测试使用 macOS 文件协调和 localhost，完整套件在沙盒外运行。
+- `cargo test --all-targets --quiet --locked --offline` 通过：493 passed、11 ignored；包含 mock Telegram、协调回调内根目录绑定、队列目录和锁文件协调、File Provider 启动与输出恢复重试、后台任务准备和规范化任务重试、Bilibili 选择状态和完成记录/索引写入重试、双路径 sidecar 迁移恢复及 shutdown 中断回归测试。因测试使用 macOS 文件协调和 localhost，完整套件在沙盒外运行。

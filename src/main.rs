@@ -9,7 +9,7 @@ mod router;
 mod safe_fs;
 mod telegram;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -2672,8 +2672,7 @@ async fn queue_or_prompt_normalized_job(
     }
     if job.requires_bilibili_selection() {
         prompt_bilibili_selection(
-            context.telegram.clone(),
-            Arc::clone(&context.queue),
+            &context,
             chat_id,
             job_id,
             task_id,
@@ -2686,16 +2685,7 @@ async fn queue_or_prompt_normalized_job(
 
     match bilibili_ugc_selection_prompt(context.config.as_ref(), &job).await {
         Ok(Some(prompt)) => {
-            prompt_bilibili_selection(
-                context.telegram.clone(),
-                Arc::clone(&context.queue),
-                chat_id,
-                job_id,
-                task_id,
-                job,
-                prompt,
-            )
-            .await;
+            prompt_bilibili_selection(&context, chat_id, job_id, task_id, job, prompt).await;
             return;
         }
         Ok(None) => {}
@@ -2792,14 +2782,16 @@ fn apply_bilibili_short_link_resolution(
 }
 
 async fn prompt_bilibili_selection(
-    telegram: TelegramClient,
-    queue: Arc<QueueManager>,
+    context: &BotContext,
     chat_id: i64,
     job_id: u64,
     task_id: String,
     job: JobRequest,
     prompt: BilibiliSelectionPrompt,
 ) {
+    let telegram = &context.telegram;
+    let queue = &context.queue;
+    let retry_delay = context.queue_start_retry_delay;
     let token = next_bilibili_selection_callback_token(job_id);
     let now = Instant::now();
     {
@@ -2819,27 +2811,49 @@ async fn prompt_bilibili_selection(
         cap_pending_bilibili_selection_jobs(&mut pending_jobs, Some(token));
     }
 
-    match queue.update_job_if_current(
-        &task_id,
-        &[TaskStatus::Preparing],
-        job.clone(),
-        TaskStatus::AwaitingSelection,
-    ) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            pending_bilibili_selection_jobs()
-                .lock()
-                .await
-                .remove(&token);
-            return;
-        }
-        Err(err) => {
-            pending_bilibili_selection_jobs()
-                .lock()
-                .await
-                .remove(&token);
-            warn!(task_id, error = %err, "failed to persist Bilibili selection prompt");
-            return;
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.update_job_if_current(
+            &task_id,
+            &[TaskStatus::Preparing, TaskStatus::AwaitingSelection],
+            job.clone(),
+            TaskStatus::AwaitingSelection,
+        ) {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                pending_bilibili_selection_jobs()
+                    .lock()
+                    .await
+                    .remove(&token);
+                return;
+            }
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    task_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked Bilibili selection persistence; retaining task and retrying"
+                );
+                if !reported_file_provider_error {
+                    send_or_log(
+                        telegram,
+                        chat_id,
+                        format!(
+                            "Task {task_id} is saved in the queue, but macOS temporarily cannot access its queue file. It will retry automatically. Check /queue before resending; the task and staging data are retained."
+                        ),
+                    )
+                    .await;
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => {
+                pending_bilibili_selection_jobs()
+                    .lock()
+                    .await
+                    .remove(&token);
+                warn!(task_id, error = %error, "failed to persist Bilibili selection prompt");
+                return;
+            }
         }
     }
 
@@ -2864,7 +2878,7 @@ async fn prompt_bilibili_selection(
             warn!(chat_id, job_id, error = %err, "failed to send Bilibili selection prompt");
             let _ = queue.cancel_if_current(&task_id, chat_id, &[TaskStatus::AwaitingSelection]);
             send_or_log(
-                &telegram,
+                telegram,
                 chat_id,
                 format!(
                     "Bilibili selection prompt failed for job #{job_id}; job canceled. Send the link again to retry.\n{}",
@@ -2966,8 +2980,7 @@ async fn process_job_after_duplicate_check(
         }
         Err(err) if should_prompt_bilibili_selection_after_probe_error(&job, &err) => {
             prompt_bilibili_selection(
-                telegram,
-                queue,
+                &context,
                 chat_id,
                 job_id,
                 task_id,
@@ -4108,6 +4121,54 @@ async fn answer_callback_or_log(
     }
 }
 
+async fn complete_published_task_with_retry(
+    telegram: &TelegramClient,
+    queue: &QueueManager,
+    completion: PublishedTaskCompletion<'_>,
+    retry_delay: Duration,
+) -> Result<TaskRecord> {
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.complete(
+            completion.task_id,
+            completion.saved_location.to_string(),
+            completion.media_paths,
+            completion.hashes.clone(),
+        ) {
+            Ok(record) => return Ok(record),
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    task_id = completion.task_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked completion persistence; retaining published outputs and retrying"
+                );
+                if !reported_file_provider_error {
+                    send_or_log(
+                        telegram,
+                        completion.chat_id,
+                        format!(
+                            "Task {} has published its files, but macOS temporarily cannot save the completion record. It will retry automatically; the output and staging data are being kept. Check /queue before resending.",
+                            completion.task_id
+                        ),
+                    )
+                    .await;
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+struct PublishedTaskCompletion<'a> {
+    chat_id: i64,
+    task_id: &'a str,
+    saved_location: &'a str,
+    media_paths: &'a [PathBuf],
+    hashes: BTreeMap<String, String>,
+}
+
 async fn run_queued_job(
     context: BotContext,
     cancel: Arc<Notify>,
@@ -4360,12 +4421,19 @@ async fn run_queued_job(
                 })
                 .await
                 .context("published media hash task failed to join")??;
-                queue.complete(
-                    &task_id,
-                    report.saved_location.clone(),
-                    &report.primary_media_paths,
-                    hashes,
-                )?;
+                complete_published_task_with_retry(
+                    &telegram,
+                    &queue,
+                    PublishedTaskCompletion {
+                        chat_id,
+                        task_id: &task_id,
+                        saved_location: &report.saved_location,
+                        media_paths: &report.primary_media_paths,
+                        hashes,
+                    },
+                    context.queue_start_retry_delay,
+                )
+                .await?;
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -7401,6 +7469,210 @@ mod tests {
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn bilibili_selection_state_write_retries_and_sends_prompt_e2e() {
+        let queue_root = temp_main_test_dir("bilibili-selection-state-provider-retry-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "bilibili-selection-state-retry";
+        let chat_id = 123_456_789;
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+            selection: None,
+        };
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    953,
+                    1053,
+                    chat_id,
+                    Some(701),
+                    0,
+                    job.clone(),
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("task should enter preparing state");
+        // get_task writes the current index, then the task record succeeds; fail the
+        // index write that publishes AwaitingSelection to exercise the partial-save path.
+        file_provider.fail_write_after(2, "simulated selection index File Provider failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        prompt_bilibili_selection(
+            &context,
+            chat_id,
+            953,
+            task_id.to_string(),
+            job,
+            BilibiliSelectionPrompt::SeasonMedia,
+        )
+        .await;
+
+        let task = queue
+            .get(task_id)
+            .expect("selection task should load")
+            .expect("selection task should remain in the queue");
+        assert_eq!(task.status, TaskStatus::AwaitingSelection);
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let sent_messages = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sent_messages.len(),
+            2,
+            "one notice and one selection prompt should be sent"
+        );
+        assert!(
+            sent_messages[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("retry automatically"))
+        );
+        assert!(
+            sent_messages[1].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Bilibili"))
+        );
+        assert!(sent_messages[1].body["reply_markup"].is_object());
+
+        pending_bilibili_selection_jobs()
+            .lock()
+            .await
+            .retain(|_, pending| pending.task_id != task_id);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn published_completion_file_provider_write_retries_e2e() {
+        for (case, successful_writes) in [("record", 1), ("index", 2)] {
+            let queue_root = temp_main_test_dir(&format!("completion-provider-retry-{case}"));
+            let mut config = AppConfig::for_test();
+            config.downloads.video_dir = queue_root.join("videos");
+            config.downloads.pdf_dir = queue_root.join("pdfs");
+            fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+            fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+            let file_provider = Arc::new(MockQueueFileProvider::default());
+            let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+            let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open");
+            let task_id = format!("published-completion-provider-retry-{case}");
+            let chat_id = 123_456_789;
+            assert!(
+                queue
+                    .create(TaskRecord::new(
+                        task_id.clone(),
+                        954,
+                        1054,
+                        chat_id,
+                        Some(701),
+                        0,
+                        JobRequest::Youtube {
+                            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                        },
+                    ))
+                    .expect("task should persist")
+            );
+            queue
+                .set_status(&task_id, TaskStatus::Running, None)
+                .expect("task should start");
+            queue
+                .begin_verification(&task_id)
+                .expect("verification should begin")
+                .expect("task should remain present");
+            let output = config.downloads.video_dir.join("published-output.mp4");
+            fs::write(&output, b"published media must remain intact")
+                .expect("published output should be created");
+            file_provider.fail_write_after(
+                successful_writes,
+                format!("simulated completion {case} File Provider failure"),
+            );
+
+            let (telegram, mut requests, _updates, shutdown, server) =
+                spawn_fake_telegram_api().await;
+            let saved_location = output.display().to_string();
+            let completed = complete_published_task_with_retry(
+                &telegram,
+                &queue,
+                PublishedTaskCompletion {
+                    chat_id,
+                    task_id: &task_id,
+                    saved_location: &saved_location,
+                    media_paths: std::slice::from_ref(&output),
+                    hashes: BTreeMap::new(),
+                },
+                Duration::ZERO,
+            )
+            .await
+            .expect("completion persistence should retry after a transient failure");
+            assert_eq!(completed.status, TaskStatus::Completed);
+            assert_eq!(
+                fs::read(&output).expect("published output should still be readable"),
+                b"published media must remain intact"
+            );
+            assert!(
+                queue
+                    .list(chat_id, false, 0)
+                    .expect("active queue should load")
+                    .is_empty()
+            );
+            assert!(
+                queue
+                    .list(chat_id, true, 0)
+                    .expect("task history should load")
+                    .iter()
+                    .any(|record| record.id == task_id && record.status == TaskStatus::Completed)
+            );
+
+            let recorded = take_fake_telegram_requests(&mut requests);
+            let notices = recorded
+                .iter()
+                .filter(|request| request.method == "sendMessage")
+                .collect::<Vec<_>>();
+            assert_eq!(notices.len(), 1, "a retry sequence should notify only once");
+            assert!(
+                notices[0].body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("published its files"))
+            );
+            assert!(
+                notices[0].body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Check /queue before resending"))
+            );
+
+            drop(queue);
+            stop_fake_telegram_api(shutdown, server).await;
+            let _ = fs::remove_dir_all(queue_root);
+        }
     }
 
     #[tokio::test]
