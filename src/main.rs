@@ -251,7 +251,17 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
         warn!(error = %err, "failed to register Telegram bot commands");
     }
-    notify_restart_summaries(&telegram, &queue, &restart_summaries).await?;
+    if !notify_restart_summaries(
+        &telegram,
+        &queue,
+        &restart_summaries,
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        &mut shutdown,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     let job_dispatch = JobDispatch {
         download_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
         duplicate_scan_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
@@ -497,13 +507,26 @@ async fn notify_restart_summaries(
     telegram: &TelegramClient,
     queue: &QueueManager,
     summaries: &[RestartSummary],
-) -> Result<()> {
+    retry_delay: Duration,
+    shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
+) -> Result<bool> {
     for summary in summaries {
         match telegram
             .send_message(summary.chat_id, render_restart_summary(summary))
             .await
         {
-            Ok(_) => queue.mark_restart_summary_sent(summary.chat_id)?,
+            Ok(_) => {
+                if !retry_restart_summary_acknowledgement(
+                    queue,
+                    summary.chat_id,
+                    retry_delay,
+                    shutdown,
+                )
+                .await?
+                {
+                    return Ok(false);
+                }
+            }
             Err(err) => warn!(
                 chat_id = summary.chat_id,
                 error = %err,
@@ -511,7 +534,37 @@ async fn notify_restart_summaries(
             ),
         }
     }
-    Ok(())
+    Ok(true)
+}
+
+async fn retry_restart_summary_acknowledgement(
+    queue: &QueueManager,
+    chat_id: i64,
+    retry_delay: Duration,
+    shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
+) -> Result<bool> {
+    loop {
+        match queue.mark_restart_summary_sent(chat_id) {
+            Ok(()) => return Ok(true),
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    chat_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked restart summary acknowledgement; retrying without resending"
+                );
+                if !retry_delay_or_shutdown(shutdown, retry_delay).await? {
+                    info!(
+                        chat_id,
+                        "shutdown requested while retrying restart summary acknowledgement"
+                    );
+                    return Ok(false);
+                }
+            }
+            Err(error) => {
+                return Err(error).context("failed to persist restart summary acknowledgement");
+            }
+        }
+    }
 }
 
 async fn shutdown_signal() -> Result<()> {
@@ -5941,7 +5994,11 @@ mod tests {
 
         let task_id = "task-telegram-e2e-1";
         let chat_id = 123_456_789;
-        let initial_queue = QueueManager::open(&config).expect("task queue should open");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let initial_queue =
+            QueueManager::open_with_file_provider(&config, Arc::clone(&file_provider_trait))
+                .expect("task queue should open");
         let task = TaskRecord::new(
             task_id.to_string(),
             501,
@@ -5966,7 +6023,10 @@ mod tests {
             .expect("task status message should persist");
         drop(initial_queue);
 
-        let queue = Arc::new(QueueManager::open(&config).expect("queue should recover on restart"));
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, Arc::clone(&file_provider_trait))
+                .expect("queue should recover on restart"),
+        );
         let recovered = queue
             .get(task_id)
             .expect("recovered task should load")
@@ -6016,9 +6076,26 @@ mod tests {
             ])
             .expect("fake Telegram should accept scripted updates");
 
-        notify_restart_summaries(&telegram, &queue, &summaries)
+        file_provider.fail_next_file_provider_write("simulated summary acknowledgement failure");
+        let retry_shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(retry_shutdown);
+        assert!(
+            notify_restart_summaries(
+                &telegram,
+                &queue,
+                &summaries,
+                Duration::from_millis(1),
+                &mut retry_shutdown,
+            )
             .await
-            .expect("restart notice should be delivered");
+            .expect("restart notice acknowledgement should retry")
+        );
+        assert!(
+            queue
+                .startup_summaries()
+                .expect("acknowledged restart summary should reload")
+                .is_empty()
+        );
         let updates = telegram
             .get_updates(None, 0)
             .await

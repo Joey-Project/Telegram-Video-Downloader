@@ -1312,6 +1312,8 @@ impl DownloadStore {
     }
 
     fn ensure_private_directory(&self) -> Result<()> {
+        // This metadata check must run inside a File Provider accessor callback. A cloud-only
+        // queue directory may reject opening or inspecting its parent before coordination.
         let entry = self.root.bind_entry(&self.queue_dir, false)?;
         self.root
             .validate_private_bound_directory(&entry, self.queue_identity, 0o700)
@@ -1360,7 +1362,6 @@ impl DownloadStore {
     }
 
     fn read_private_file(&self, path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
-        self.ensure_private_directory()?;
         // A cloud placeholder may be replaced as it materializes. Only use the
         // pre-coordination lookup to preserve the missing-file case; bind and
         // validate the actual object inside the coordinated accessor below.
@@ -1408,7 +1409,6 @@ impl DownloadStore {
     }
 
     fn write_private_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
-        self.ensure_private_directory()?;
         if contents.len() > MAX_RECORD_BYTES.max(MAX_INDEX_BYTES) {
             bail!("task queue record exceeds the configured size limit");
         }
@@ -1756,7 +1756,6 @@ impl DownloadStore {
     }
 
     fn scan_active_records(&self, index: &mut StoreIndex) -> Result<()> {
-        self.ensure_private_directory()?;
         let entries = self.list_coordinated_queue_directory()?;
         if entries.len() > MAX_ACTIVE_RECORDS {
             bail!("task queue contains more than {MAX_ACTIVE_RECORDS} entries");
