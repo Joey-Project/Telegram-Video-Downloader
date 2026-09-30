@@ -219,10 +219,22 @@ async fn main() -> Result<()> {
     for recovery in recover_pending_overwrite_transactions(&config.downloads.video_dir)? {
         warn!(message = %recovery, "recovered interrupted overwrite transaction");
     }
-    let queue = Arc::new(QueueManager::open(&config)?);
+    let telegram = TelegramClient::new(config.telegram.token.clone());
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    let queue = tokio::select! {
+        signal = &mut shutdown => {
+            signal?;
+            info!("shutdown requested while waiting for task queue access");
+            return Ok(());
+        }
+        queue = retry_file_provider_queue_open(
+            || QueueManager::open(&config),
+            Duration::from_secs(5),
+        ) => Arc::new(queue?),
+    };
     tokio::spawn(expire_pending_duplicate_jobs());
 
-    let telegram = TelegramClient::new(config.telegram.token.clone());
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
         warn!(error = %err, "failed to register Telegram bot commands");
     }
@@ -239,8 +251,6 @@ async fn main() -> Result<()> {
         "telegram local downloader started"
     );
 
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
     loop {
         tokio::select! {
             signal = &mut shutdown => {
@@ -276,6 +286,25 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn retry_file_provider_queue_open(
+    mut open_queue: impl FnMut() -> Result<QueueManager>,
+    retry_delay: Duration,
+) -> Result<QueueManager> {
+    loop {
+        match open_queue() {
+            Ok(queue) => return Ok(queue),
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "File Provider blocked task queue startup; retrying without removing queue data"
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error).context("failed to open task queue"),
+        }
+    }
 }
 
 async fn process_telegram_updates(
@@ -6210,6 +6239,52 @@ mod tests {
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn startup_retries_file_provider_queue_open_failures() {
+        let queue_root = temp_main_test_dir("queue-startup-file-provider-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        file_provider.fail_next_read("simulated startup File Provider deadlock");
+        let file_provider: Arc<dyn QueueFileProvider> = file_provider;
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let queue = retry_file_provider_queue_open(
+            || {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                QueueManager::open_with_file_provider(&config, Arc::clone(&file_provider))
+            },
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("startup should reopen the queue after a transient provider failure");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_retry_permanent_queue_open_failures() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let error = retry_file_provider_queue_open(
+            || {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(anyhow!("simulated permanent queue configuration failure"))
+            },
+            Duration::from_millis(1),
+        )
+        .await
+        .err()
+        .expect("permanent queue open errors should return immediately");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        assert!(format!("{error:#}").contains("simulated permanent queue configuration failure"));
     }
 
     #[tokio::test]
