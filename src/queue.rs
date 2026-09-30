@@ -15,6 +15,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::config::AppConfig;
+use crate::file_provider::{
+    FileProviderAccessError, QueueFileProvider, classify_deadlock_error, is_deadlock_error,
+    platform_queue_file_provider,
+};
 use crate::router::JobRequest;
 use crate::safe_fs::{BoundFile, EntryIdentity, RootedFs};
 
@@ -195,6 +199,7 @@ struct DownloadStore {
     queue_dir: PathBuf,
     queue_identity: EntryIdentity,
     operation_lock_path: PathBuf,
+    file_provider: Arc<dyn QueueFileProvider>,
 }
 
 struct QueueOperationLock {
@@ -267,7 +272,17 @@ impl TaskRecord {
 
 impl QueueManager {
     pub fn open(config: &AppConfig) -> Result<Self> {
-        let mut video = DownloadStore::new(&config.downloads.video_dir)?;
+        Self::open_with_file_provider(config, platform_queue_file_provider())
+    }
+
+    pub(crate) fn open_with_file_provider(
+        config: &AppConfig,
+        file_provider: Arc<dyn QueueFileProvider>,
+    ) -> Result<Self> {
+        coordinate_directory_listing(file_provider.as_ref(), &config.downloads.video_dir)?;
+        coordinate_directory_listing(file_provider.as_ref(), &config.downloads.pdf_dir)?;
+        let mut video =
+            DownloadStore::new(&config.downloads.video_dir, Arc::clone(&file_provider))?;
         let pdf_root = RootedFs::new(&config.downloads.pdf_dir)?;
         pdf_root.validate_configured_root()?;
         let pdf = if video.root.root_identity() == pdf_root.root_identity() {
@@ -277,7 +292,7 @@ impl QueueManager {
             }
             video.clone()
         } else {
-            DownloadStore::from_root(pdf_root)?
+            DownloadStore::from_root(pdf_root, file_provider)?
         };
         // Protected property: a live queue manager exclusively owns each backing download root,
         // so no second process can mutate its task index or recover its running tasks. The
@@ -963,21 +978,45 @@ pub fn hash_primary_media(
     Ok(hashes)
 }
 
+fn coordinate_directory_listing(file_provider: &dyn QueueFileProvider, path: &Path) -> Result<()> {
+    let mut list_entries = |coordinated_path: &Path| -> Result<()> {
+        if coordinated_path != path {
+            return Err(FileProviderAccessError::new(
+                path,
+                "read",
+                "the download directory moved while access was being coordinated",
+            )
+            .into());
+        }
+        // Enumerating within the accessor lets File Provider reveal cloud-only
+        // children before startup decides whether the queue directory is absent.
+        for entry in std::fs::read_dir(coordinated_path)
+            .with_context(|| format!("failed to enumerate download directory {}", path.display()))?
+        {
+            let _ = entry?.file_name();
+        }
+        Ok(())
+    };
+    file_provider
+        .coordinate_read(path, &mut list_entries)
+        .map_err(|error| classify_deadlock_error(path, "read", error))
+}
+
 impl DownloadStore {
-    fn new(root_path: &Path) -> Result<Self> {
-        Self::from_root(RootedFs::new(root_path)?)
+    fn new(root_path: &Path, file_provider: Arc<dyn QueueFileProvider>) -> Result<Self> {
+        Self::from_root(RootedFs::new(root_path)?, file_provider)
     }
 
-    fn from_root(root: RootedFs) -> Result<Self> {
+    fn from_root(root: RootedFs, file_provider: Arc<dyn QueueFileProvider>) -> Result<Self> {
         root.validate_configured_root()?;
         let queue_dir = root.logical_root_path().join(QUEUE_DIRECTORY);
-        let identity = root.create_dir(&queue_dir, 0o700)?;
-        let queue_identity = match identity {
-            Some(identity) => identity,
-            None => root
-                .entry_identity(&queue_dir)?
-                .ok_or_else(|| anyhow!("task queue directory disappeared"))?,
-        };
+        let _ = root.create_dir(&queue_dir, 0o700)?;
+        // File Provider may replace a directory placeholder while enumerating it.
+        // Bind the current directory identity only after its children are available.
+        coordinate_directory_listing(file_provider.as_ref(), &queue_dir)?;
+        let queue_identity = root
+            .entry_identity(&queue_dir)?
+            .ok_or_else(|| anyhow!("task queue directory disappeared"))?;
         let queue_entry = root.bind_entry(&queue_dir, false)?;
         root.validate_private_bound_directory(&queue_entry, queue_identity, 0o700)
             .context("task queue directory must be owner-private")?;
@@ -989,6 +1028,7 @@ impl DownloadStore {
             root,
             queue_dir,
             queue_identity,
+            file_provider,
         };
         store.ensure_operation_lock_file()?;
         Ok(store)
@@ -1130,18 +1170,57 @@ impl DownloadStore {
 
     fn read_private_file(&self, path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
         self.ensure_private_directory()?;
-        let Some(file) = self.root.open_bound_file(path)? else {
-            return Ok(None);
-        };
-        file.validate_private_single_link(0o600)
-            .with_context(|| format!("private task file is unsafe: {}", path.display()))?;
-        if file.byte_len()? > limit as u64 {
-            bail!(
-                "task queue file exceeds its {limit}-byte limit: {}",
-                path.display()
-            );
+        // A cloud placeholder may be replaced as it materializes. Only use the
+        // pre-coordination lookup to preserve the missing-file case; bind and
+        // validate the actual object inside the coordinated accessor below.
+        match self.root.entry_identity(path) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(None),
+            // A provider can reject metadata lookup until coordinated access
+            // asks it to make the path available. Do not treat that as missing.
+            Err(error) if is_deadlock_error(&error) => {}
+            Err(error) => return Err(error),
         }
-        Ok(Some(file.read_limited(limit)?))
+
+        let mut contents = None;
+        let mut read = |coordinated_path: &Path| -> Result<()> {
+            if coordinated_path != path {
+                return Err(FileProviderAccessError::new(
+                    path,
+                    "read",
+                    "the queue file moved while access was being coordinated",
+                )
+                .into());
+            }
+            self.ensure_private_directory()?;
+            let file = self
+                .root
+                .open_bound_file(coordinated_path)?
+                .ok_or_else(|| anyhow!("task queue file disappeared during coordinated access"))?;
+            file.validate_private_single_link(0o600).with_context(|| {
+                format!(
+                    "private task file is unsafe: {}",
+                    coordinated_path.display()
+                )
+            })?;
+            if file.byte_len()? > limit as u64 {
+                bail!(
+                    "task queue file exceeds its {limit}-byte limit: {}",
+                    coordinated_path.display()
+                );
+            }
+            contents = Some(file.read_limited(limit).with_context(|| {
+                format!(
+                    "failed to read task queue file {}",
+                    coordinated_path.display()
+                )
+            })?);
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(path, &mut read)
+            .map_err(|error| classify_deadlock_error(path, "read", error))?;
+        Ok(contents)
     }
 
     fn write_private_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
@@ -1149,29 +1228,44 @@ impl DownloadStore {
         if contents.len() > MAX_RECORD_BYTES.max(MAX_INDEX_BYTES) {
             bail!("task queue record exceeds the configured size limit");
         }
-        let temporary = temporary_sibling(path);
-        if let Some(file) = self.root.open_bound_file(path)? {
-            file.validate_private_single_link(0o600)?;
-            let entry = self.root.bind_entry(path, false)?;
-            self.root.replace_bound_file_atomically_if_identity(
-                &entry,
-                file.identity(),
-                &temporary,
-                contents,
-                0o600,
-            )?;
-        } else {
-            let (source, identity) = self
-                .root
-                .create_new_bound_file(&temporary, contents, 0o600)?;
-            let destination = self.root.bind_entry(path, false)?;
-            self.root.rename_via_bound_parents_noreplace_if_identity(
-                &source,
-                &destination,
-                identity,
-            )?;
-        }
-        Ok(())
+        let replacing = self.root.entry_identity(path)?.is_some();
+        let mut write = |coordinated_path: &Path| -> Result<()> {
+            if coordinated_path != path {
+                return Err(FileProviderAccessError::new(
+                    path,
+                    "write",
+                    "the queue file moved while access was being coordinated",
+                )
+                .into());
+            }
+            self.ensure_private_directory()?;
+            let temporary = temporary_sibling(coordinated_path);
+            if let Some(file) = self.root.open_bound_file(coordinated_path)? {
+                file.validate_private_single_link(0o600)?;
+                let entry = self.root.bind_entry(coordinated_path, false)?;
+                self.root.replace_bound_file_atomically_if_identity(
+                    &entry,
+                    file.identity(),
+                    &temporary,
+                    contents,
+                    0o600,
+                )?;
+            } else {
+                let (source, identity) = self
+                    .root
+                    .create_new_bound_file(&temporary, contents, 0o600)?;
+                let destination = self.root.bind_entry(coordinated_path, false)?;
+                self.root.rename_via_bound_parents_noreplace_if_identity(
+                    &source,
+                    &destination,
+                    identity,
+                )?;
+            }
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_write(path, replacing, &mut write)
+            .map_err(|error| classify_deadlock_error(path, "write", error))
     }
 
     fn read_index(&self) -> Result<StoreIndex> {

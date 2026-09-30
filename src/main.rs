@@ -2,6 +2,7 @@ mod bilibili_auth;
 mod bilibili_core;
 mod config;
 mod downloader;
+mod file_provider;
 mod queue;
 mod redaction;
 mod router;
@@ -36,6 +37,7 @@ use crate::downloader::{
     recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both, sync_bilibili_rust_credentials,
 };
+use crate::file_provider::is_file_provider_access_error;
 use crate::queue::{
     QueueManager, RestartSummary, TaskRecord, TaskStatus, hash_primary_media,
     sanitize_job_for_storage,
@@ -294,17 +296,32 @@ async fn process_telegram_updates(
     for update in updates {
         let update_id = update.update_id;
         if let Some(message) = update.message {
-            handle_message(
+            let chat_id = message.chat.id;
+            if let Err(err) = handle_message(
                 context.clone(),
                 update_id,
                 message.message_id,
                 message.from.map(|user| user.id),
-                message.chat.id,
+                chat_id,
                 message.chat.is_private(),
                 message.text.as_deref(),
             )
             .await
-            .with_context(|| format!("telegram message update {update_id} failed"))?;
+            .with_context(|| format!("telegram message update {update_id} failed"))
+            {
+                warn!(
+                    update_id,
+                    chat_id,
+                    error = %format!("{err:#}"),
+                    "failed to handle telegram message update; acknowledging and continuing"
+                );
+                let response = if is_file_provider_access_error(&err) {
+                    "macOS could not coordinate access to the task queue files. Wait until the hidden queue folder shows as downloaded in Finder, then retry your message. Check /queue first to avoid starting a duplicate; existing queue and staging data are retained.".to_string()
+                } else {
+                    "I couldn't process that message. Check /queue for any task that may have started. If it isn't listed, send the message again.".to_string()
+                };
+                send_or_log(telegram, chat_id, response).await;
+            }
         }
         if let Some(callback_query) = update.callback_query {
             handle_callback_query(context.clone(), callback_query).await;
@@ -4805,6 +4822,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::file_provider::{MockQueueFileProvider, QueueFileProvider};
     use anyhow::{Context, Result, anyhow};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -6177,6 +6195,141 @@ mod tests {
         );
         assert_eq!(recorded[1].body["chat_id"].as_i64(), Some(-404_404));
         assert_eq!(recorded[2].body["chat_id"].as_i64(), Some(123_456_789));
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn file_provider_queue_read_failure_is_actionable_and_retryable_e2e() {
+        let queue_root = temp_main_test_dir("file-provider-queue-read-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        config.telegram.allow_all_chats = true;
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open with mock File Provider access"),
+        );
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    "file-provider-queue-task".to_string(),
+                    1,
+                    2,
+                    123_456_789,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://example.invalid/video".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        file_provider.fail_next_read("Resource deadlock avoided (os error 11)");
+
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        let chat_id = 123_456_789;
+        update_sender
+            .send(vec![
+                serde_json::json!({
+                    "update_id": 921,
+                    "message": {
+                        "message_id": 1021,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": 701},
+                        "text": "/queue"
+                    }
+                }),
+                serde_json::json!({
+                    "update_id": 922,
+                    "message": {
+                        "message_id": 1022,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": 701},
+                        "text": "/help"
+                    }
+                }),
+                serde_json::json!({
+                    "update_id": 923,
+                    "message": {
+                        "message_id": 1023,
+                        "chat": {"id": chat_id, "type": "private"},
+                        "from": {"id": 701},
+                        "text": "/queue"
+                    }
+                }),
+            ])
+            .expect("fake Telegram should accept updates");
+        let updates = telegram
+            .get_updates(None, 0)
+            .await
+            .expect("fake Telegram should return scripted updates");
+        let config = Arc::new(config);
+        let job_dispatch = JobDispatch {
+            download_semaphore: Arc::new(Semaphore::new(1)),
+            duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+        };
+        let next_job_id = Arc::new(AtomicU64::new(1));
+        let mut offset = None;
+        process_telegram_updates(
+            &telegram,
+            &config,
+            &job_dispatch,
+            &next_job_id,
+            &queue,
+            updates,
+            &mut offset,
+        )
+        .await
+        .expect("a File Provider read failure should not block later updates");
+
+        assert_eq!(offset, Some(924));
+        assert!(
+            file_provider
+                .read_paths()
+                .iter()
+                .any(|path| path.ends_with("index.json"))
+        );
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getUpdates", "sendMessage", "sendMessage", "sendMessage"]
+        );
+        assert!(
+            recorded[1].body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("shows as downloaded in Finder")
+        );
+        assert!(
+            recorded[1].body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("existing queue and staging data are retained")
+        );
+        assert!(
+            recorded[2].body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("/queue - View active tasks")
+        );
+        assert!(
+            recorded[3].body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Active and actionable tasks")
+        );
 
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;

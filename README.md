@@ -10,6 +10,7 @@
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
 - `/queue` 查看可操作的持久任务；可以恢复中断任务、重试失败任务或取消任务，`/queue history` 查看已完成和已取消记录。重启后需要重新选择的任务会重新显示选择项；下载计划或媒体规格变化时，bot 会暂停并要求确认。
+- macOS 上队列索引和记录通过 File Provider 协调读写，云端占位内容可在读取时按需物化。若系统无法协调访问，bot 会提示检查 Finder 中隐藏队列目录的下载状态并重试；读取失败不会清理队列或 staging 数据。
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
 - 视频下载会先写入隐藏 staging 目录，成功后再移动到最终目录；如果可从 URL 识别到本地已有相同 YouTube 或 Bilibili 视频，bot 会先提供两者并存或取消，只有能唯一定位现有文件时才同时提供覆盖按钮。
