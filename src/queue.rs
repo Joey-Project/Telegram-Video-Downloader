@@ -16,7 +16,8 @@ use tokio::sync::Notify;
 
 use crate::config::AppConfig;
 use crate::file_provider::{
-    QueueFileProvider, classify_deadlock_error, is_deadlock_error, platform_queue_file_provider,
+    QueueFileProvider, classify_deadlock_error, is_deadlock_error, is_file_provider_access_error,
+    platform_queue_file_provider,
 };
 use crate::router::JobRequest;
 use crate::safe_fs::{BoundFile, EntryIdentity, RootedFs};
@@ -37,6 +38,13 @@ const MAX_PERSISTED_MEDIA_HASHES: usize = 128;
 const MAX_PERSISTED_MEDIA_HASH_BYTES: usize = 256 * 1024;
 const QUEUE_PAGE_SIZE: usize = 10;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarMoveStatus {
+    Moved,
+    AlreadyAtTarget,
+    Missing,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -461,6 +469,7 @@ impl QueueManager {
         })
     }
 
+    #[cfg(test)]
     pub fn set_status(
         &self,
         id: &str,
@@ -682,7 +691,21 @@ impl QueueManager {
         entry.updated_at = record.updated_at;
         store.write_record(&record_path, &record)?;
         store.save_index_task(id, entry.clone())?;
-        store.move_record_to_sidecar(id, &record_path, &destination)?;
+        match store.move_record_to_sidecar(id, &record_path, &destination) {
+            Ok(SidecarMoveStatus::Moved | SidecarMoveStatus::AlreadyAtTarget) => {}
+            Ok(SidecarMoveStatus::Missing) => {
+                bail!("task record disappeared before sidecar migration")
+            }
+            Err(error) if is_file_provider_access_error(&error) => {
+                tracing::warn!(
+                    task_id = id,
+                    error = %error,
+                    "published task is complete; retaining its pending sidecar migration for recovery"
+                );
+                return Ok(record);
+            }
+            Err(error) => return Err(error),
+        }
         #[cfg(test)]
         if self.interrupt_after_sidecar_move.load(Ordering::Relaxed) {
             bail!("simulated interruption after task sidecar migration");
@@ -1630,11 +1653,15 @@ impl DownloadStore {
             && entry.record_path.parent() == Some(self.queue_dir.as_path())
         {
             let destination = self.terminal_history_path(&record.id)?;
-            self.ensure_private_history_directory()?;
             entry.move_target = Some(destination.clone());
             index.tasks.insert(record.id.clone(), entry.clone());
             self.write_index(&index)?;
-            self.move_record_to_sidecar(&record.id, &entry.record_path, &destination)?;
+            match self.move_record_to_sidecar(&record.id, &entry.record_path, &destination)? {
+                SidecarMoveStatus::Moved | SidecarMoveStatus::AlreadyAtTarget => {}
+                SidecarMoveStatus::Missing => {
+                    bail!("task record disappeared before sidecar migration")
+                }
+            }
             entry.record_path = destination;
             entry.move_target = None;
         }
@@ -1779,36 +1806,9 @@ impl DownloadStore {
             let Some(target) = entry.move_target.clone() else {
                 continue;
             };
-            let source_exists = self.root.entry_exists(&entry.record_path)?;
-            let target_exists = self.root.entry_exists(&target)?;
-            if source_exists {
-                let Some(source_record) = self.read_record(&entry.record_path)? else {
-                    continue;
-                };
-                if source_record.id != *id {
-                    bail!(
-                        "sidecar recovery found a mismatched task ID at {}",
-                        entry.record_path.display()
-                    );
-                }
-            }
-            if source_exists && !target_exists {
-                self.move_record_to_sidecar(id, &entry.record_path, &target)?;
-            }
-            if !source_exists && !target_exists {
+            let move_status = self.move_record_to_sidecar(id, &entry.record_path, &target)?;
+            if move_status == SidecarMoveStatus::Missing {
                 continue;
-            }
-            let Some(record) = self.read_record(&target)? else {
-                continue;
-            };
-            if record.id != *id {
-                bail!(
-                    "sidecar recovery found a mismatched task ID at {}",
-                    target.display()
-                );
-            }
-            if source_exists && target_exists {
-                self.move_record_to_sidecar(id, &entry.record_path, &target)?;
             }
             entry.record_path = target;
             entry.move_target = None;
@@ -1825,33 +1825,158 @@ impl DownloadStore {
         id: &str,
         source_path: &Path,
         target_path: &Path,
-    ) -> Result<()> {
-        self.ensure_private_directory()?;
-        let Some(file) = self.root.open_bound_file(source_path)? else {
-            if let Some(record) = self.read_record(target_path)?
-                && record.id == id
-            {
-                return Ok(());
-            }
-            bail!("task record disappeared before sidecar migration");
-        };
-        file.validate_private_single_link(0o600)?;
-        if self.root.entry_exists(target_path)? {
-            let Some(existing) = self.read_record(target_path)? else {
-                bail!("task sidecar target exists but is unreadable");
-            };
-            if existing.id != id {
-                bail!("refusing to overwrite an unrelated task sidecar");
-            }
-            let source = self.root.bind_entry(source_path, false)?;
-            self.root
-                .remove_bound_file_if_identity(&source, file.identity())?;
-            return Ok(());
+    ) -> Result<SidecarMoveStatus> {
+        let history_directory = self.queue_dir.join(TERMINAL_HISTORY_DIRECTORY);
+        if target_path.parent() == Some(history_directory.as_path()) {
+            self.ensure_private_history_directory_coordinated()?;
         }
-        let source = self.root.bind_entry(source_path, false)?;
-        let target = self.root.bind_entry(target_path, false)?;
-        self.root
-            .rename_via_bound_parents_noreplace_if_identity(&source, &target, file.identity())
+        let mut outcome = None;
+        let mut move_entries = |coordinated_source: &Path,
+                                coordinated_target: &Path|
+         -> Result<()> {
+            let source_path_from_provider = self.coordinated_queue_file_path(coordinated_source)?;
+            let target_path_from_provider = self.coordinated_queue_file_path(coordinated_target)?;
+            if source_path_from_provider != source_path || target_path_from_provider != target_path
+            {
+                bail!("File Provider changed a task sidecar migration path");
+            }
+            self.ensure_private_directory()?;
+
+            // Both source and destination are inspected only while the paired move is
+            // coordinated. Descriptor identity and owner-private checks protect the files
+            // selected for migration; path metadata outside this callback is not trusted.
+            let source_file = self.root.open_bound_file(source_path)?;
+            let target_file = self.root.open_bound_file(target_path)?;
+            let target_entry = target_file
+                .as_ref()
+                .map(|_| self.root.bind_entry(target_path, false))
+                .transpose()?;
+            if let Some(file) = &source_file {
+                let source_record = self.read_coordinated_record(source_path, file)?;
+                if source_record.id != id {
+                    bail!(
+                        "sidecar recovery found a mismatched task ID at {}",
+                        source_path.display()
+                    );
+                }
+            }
+            if let Some(file) = &target_file {
+                let target_record = self.read_coordinated_record(target_path, file)?;
+                if target_record.id != id {
+                    bail!(
+                        "sidecar recovery found a mismatched task ID at {}",
+                        target_path.display()
+                    );
+                }
+                self.validate_coordinated_record_entry(
+                    target_path,
+                    file,
+                    target_entry
+                        .as_ref()
+                        .expect("an opened target file should have a bound directory entry"),
+                )?;
+            }
+
+            match (&source_file, &target_file) {
+                (Some(source_file), None) => {
+                    source_file.validate_private_single_link(0o600)?;
+                    let source = self.root.bind_entry(source_path, false)?;
+                    let target = self.root.bind_entry(target_path, false)?;
+                    self.root.rename_via_bound_parents_noreplace_if_identity(
+                        &source,
+                        &target,
+                        source_file.identity(),
+                    )?;
+                    outcome = Some(SidecarMoveStatus::Moved);
+                }
+                (Some(source_file), Some(target_file)) => {
+                    source_file.validate_private_single_link(0o600)?;
+                    let source = self.root.bind_entry(source_path, false)?;
+                    let target_entry = target_entry
+                        .as_ref()
+                        .expect("matched target file should have a bound directory entry");
+                    self.validate_coordinated_record_entry(target_path, target_file, target_entry)?;
+                    self.root
+                        .remove_bound_file_if_identity(&source, source_file.identity())?;
+                    self.validate_coordinated_record_entry(target_path, target_file, target_entry)?;
+                    outcome = Some(SidecarMoveStatus::AlreadyAtTarget);
+                }
+                (None, Some(target_file)) => {
+                    self.validate_coordinated_record_entry(
+                        target_path,
+                        target_file,
+                        target_entry
+                            .as_ref()
+                            .expect("matched target file should have a bound directory entry"),
+                    )?;
+                    outcome = Some(SidecarMoveStatus::AlreadyAtTarget);
+                }
+                (None, None) => outcome = Some(SidecarMoveStatus::Missing),
+            }
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_move(source_path, target_path, &mut move_entries)
+            .map_err(|error| classify_deadlock_error(source_path, "move", error))?;
+        outcome.ok_or_else(|| anyhow!("File Provider did not supply a coordinated move"))
+    }
+
+    fn ensure_private_history_directory_coordinated(&self) -> Result<()> {
+        let path = self.queue_dir.join(TERMINAL_HISTORY_DIRECTORY);
+        let mut ensure = |coordinated_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(coordinated_path)?;
+            if coordinated_path != path {
+                bail!("File Provider changed the task history directory path");
+            }
+            self.ensure_private_history_directory()
+        };
+        self.file_provider
+            .coordinate_write(&path, &mut ensure)
+            .map_err(|error| classify_deadlock_error(&path, "write", error))
+    }
+
+    fn read_coordinated_record(&self, path: &Path, file: &BoundFile) -> Result<TaskRecord> {
+        file.validate_private_single_link(0o600)
+            .with_context(|| format!("private task record is unsafe: {}", path.display()))?;
+        if file.byte_len()? > MAX_RECORD_BYTES as u64 {
+            bail!(
+                "task queue file exceeds its {MAX_RECORD_BYTES}-byte limit: {}",
+                path.display()
+            );
+        }
+        let bytes = file
+            .read_limited(MAX_RECORD_BYTES)
+            .with_context(|| format!("failed to read task queue file {}", path.display()))?;
+        let record: TaskRecord = serde_json::from_slice(&bytes)
+            .with_context(|| format!("invalid task queue record {}", path.display()))?;
+        if record.schema_version != TASK_RECORD_VERSION {
+            bail!("unsupported task record version for task {}", record.id);
+        }
+        Ok(record)
+    }
+
+    fn validate_coordinated_record_entry(
+        &self,
+        path: &Path,
+        file: &BoundFile,
+        entry: &crate::safe_fs::BoundEntry,
+    ) -> Result<()> {
+        // Descriptor identity selects the record object, while owner/mode/link checks preserve
+        // its private access policy. The path check ensures recovery will not discard the active
+        // copy after the destination name has been replaced; timestamps are not mutation signals.
+        file.validate_private_single_link(0o600)?;
+        match self.root.bound_entry_identity(entry)? {
+            Some(identity) if identity == file.identity() => {}
+            Some(_) => bail!(
+                "coordinated task record path was replaced during migration: {}",
+                path.display()
+            ),
+            None => bail!(
+                "coordinated task record disappeared during migration: {}",
+                path.display()
+            ),
+        }
+        Ok(())
     }
 }
 
@@ -3000,7 +3125,10 @@ mod tests {
             .expect("move intent should persist before migration");
 
         drop(queue);
-        let reopened = QueueManager::open(&config).expect("interrupted move should recover");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let reopened = QueueManager::open_with_file_provider(&config, file_provider_trait)
+            .expect("interrupted move should recover");
         let recovered = reopened
             .get(id)
             .expect("cancelled task should load")
@@ -3022,6 +3150,11 @@ mod tests {
                 .tasks[id]
                 .move_target,
             None
+        );
+        assert_eq!(
+            file_provider.move_paths(),
+            vec![(entry.record_path.clone(), destination.clone())],
+            "restart recovery should coordinate the source and destination together"
         );
 
         drop(reopened);
@@ -3260,6 +3393,102 @@ mod tests {
                 .expect("active queue should load")
                 .is_empty()
         );
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn published_completion_survives_temporary_sidecar_move_failure() {
+        let temp_root = temp_queue_root("completed-sidecar-provider-retry");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
+            .expect("queue should open with the mock File Provider");
+        let id = "task-completed-sidecar-provider-retry";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Running, None)
+            .expect("task should start");
+        queue
+            .begin_verification(id)
+            .expect("verification should begin")
+            .expect("task should still exist");
+        let media_path = video_root.join("completed-output.mp4");
+        fs::write(&media_path, b"verified media").expect("published media fixture should write");
+        file_provider.fail_next_move("simulated temporary File Provider move failure");
+
+        let completed = queue
+            .complete(
+                id,
+                media_path.display().to_string(),
+                std::slice::from_ref(&media_path),
+                BTreeMap::new(),
+            )
+            .expect("published output should succeed while archival migration remains pending");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        let active_path = queue
+            .video
+            .task_path(id)
+            .expect("active task path should resolve");
+        let destination = queue
+            .video
+            .root_path
+            .join(".telegram-video-downloader-task-task-completed-sidecar-provider-retry.json");
+        assert!(
+            active_path.is_file(),
+            "the active record should remain recoverable"
+        );
+        assert!(
+            !destination.exists(),
+            "the sidecar should remain pending until File Provider access recovers"
+        );
+        assert_eq!(
+            queue
+                .video
+                .read_index()
+                .expect("queue index should read")
+                .tasks[id]
+                .move_target,
+            Some(destination.clone()),
+            "the durable move intent should survive the provider failure"
+        );
+
+        let recovered = queue
+            .get(id)
+            .expect("queue access should retry the pending sidecar migration")
+            .expect("completed task should remain indexed");
+        assert_eq!(recovered.status, TaskStatus::Completed);
+        assert!(
+            !active_path.exists(),
+            "recovery should remove the active record"
+        );
+        assert!(destination.is_file(), "recovery should install the sidecar");
+        assert_eq!(
+            file_provider.move_paths(),
+            vec![
+                (active_path.clone(), destination.clone()),
+                (active_path, destination),
+            ],
+            "completion and recovery should both coordinate both migration paths"
+        );
+
+        drop(queue);
         let _ = fs::remove_dir_all(temp_root);
     }
 }

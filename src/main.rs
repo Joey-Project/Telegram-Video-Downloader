@@ -79,6 +79,7 @@ const COLLECTION_DETAILS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_PENDING_COLLECTION_DETAILS: usize = 128;
 const COLLECTION_DETAILS_PAGE_SIZE: usize = 5;
 const BILIBILI_ACCESS_KEY_LOGIN_TTL: Duration = Duration::from_secs(30 * 60);
+const QUEUE_START_FILE_PROVIDER_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 struct PendingDuplicateJob {
@@ -159,6 +160,7 @@ struct BotContext {
     job_dispatch: JobDispatch,
     next_job_id: Arc<AtomicU64>,
     queue: Arc<QueueManager>,
+    queue_start_retry_delay: Duration,
 }
 
 struct JobProgressContext {
@@ -374,13 +376,22 @@ async fn process_telegram_updates(
         job_dispatch: job_dispatch.clone(),
         next_job_id: Arc::clone(next_job_id),
         queue: Arc::clone(queue),
+        queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
     };
+    process_telegram_updates_with_context(&context, updates, offset).await
+}
+
+async fn process_telegram_updates_with_context(
+    context: &BotContext,
+    updates: Vec<Update>,
+    offset: &mut Option<i64>,
+) -> Result<()> {
     for update in updates {
         let update_id = update.update_id;
         if let Some(message) = update.message {
             let chat_id = message.chat.id;
             if let Err(err) = handle_message(
-                context.clone(),
+                (*context).clone(),
                 update_id,
                 message.message_id,
                 message.from.map(|user| user.id),
@@ -399,7 +410,7 @@ async fn process_telegram_updates(
                         "File Provider blocked queue access; acknowledging for user retry"
                     );
                     let response = "macOS could not coordinate access to the task queue files. Wait until the hidden queue folder shows as downloaded in Finder, then retry your message. Check /queue first to avoid starting a duplicate; existing queue and staging data are retained.".to_string();
-                    send_or_log(telegram, chat_id, response).await;
+                    send_or_log(&context.telegram, chat_id, response).await;
                 } else {
                     warn!(
                         update_id,
@@ -412,7 +423,7 @@ async fn process_telegram_updates(
             }
         }
         if let Some(callback_query) = update.callback_query {
-            handle_callback_query(context.clone(), callback_query).await;
+            handle_callback_query((*context).clone(), callback_query).await;
         }
         *offset = Some(update_id + 1);
     }
@@ -2251,11 +2262,7 @@ fn queue_or_prompt_job(
     job: JobRequest,
 ) {
     tokio::spawn(async move {
-        if let Err(err) = context
-            .queue
-            .set_status(&task_id, TaskStatus::Preparing, None)
-        {
-            warn!(task_id, error = %err, "failed to update persistent task before preflight");
+        if !prepare_persisted_task_for_job(&context, chat_id, &task_id).await {
             return;
         }
         let needs_short_link_normalization = matches!(
@@ -2282,6 +2289,66 @@ fn queue_or_prompt_job(
         };
         queue_or_prompt_normalized_job(context, chat_id, job_id, task_id, job).await;
     });
+}
+
+async fn prepare_persisted_task_for_job(context: &BotContext, chat_id: i64, task_id: &str) -> bool {
+    let mut reported_file_provider_error = false;
+    loop {
+        match context.queue.set_status_if_current(
+            task_id,
+            &[TaskStatus::Received, TaskStatus::Preparing],
+            TaskStatus::Preparing,
+        ) {
+            Ok(Some(_)) => return true,
+            Ok(None) => return false,
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    task_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked background task setup; retaining task and retrying"
+                );
+                if !reported_file_provider_error {
+                    send_or_log(
+                        &context.telegram,
+                        chat_id,
+                        format!(
+                            "Task {task_id} is saved in the queue, but macOS temporarily cannot access its queue file. It will retry automatically. Check /queue before resending; the task and staging data are retained."
+                        ),
+                    )
+                    .await;
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(context.queue_start_retry_delay).await;
+            }
+            Err(error) => {
+                warn!(
+                    task_id,
+                    error = %format!("{error:#}"),
+                    "failed to prepare persistent task before preflight"
+                );
+                if let Err(mark_error) = context.queue.set_status_if_current(
+                    task_id,
+                    &[TaskStatus::Received, TaskStatus::Preparing],
+                    TaskStatus::Failed,
+                ) {
+                    warn!(
+                        task_id,
+                        error = %format!("{mark_error:#}"),
+                        "failed to persist background task setup failure"
+                    );
+                }
+                send_or_log(
+                    &context.telegram,
+                    chat_id,
+                    format!(
+                        "Task {task_id} was saved, but setup stopped because its queue state could not be updated. Use /queue to resume or retry it; resend the link only if the task is not listed."
+                    ),
+                )
+                .await;
+                return false;
+            }
+        }
+    }
 }
 
 async fn queue_or_prompt_normalized_job(
@@ -6065,6 +6132,7 @@ mod tests {
                 },
                 next_job_id: Arc::new(AtomicU64::new(1)),
                 queue: Arc::clone(&queue),
+                queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
             },
             crate::telegram::CallbackQuery {
                 id: "stale-bilibili-selection".to_string(),
@@ -6590,6 +6658,165 @@ mod tests {
         let _ = fs::remove_dir_all(queue_root);
     }
 
+    #[tokio::test]
+    async fn spawned_task_file_provider_failure_notifies_and_keeps_update_e2e() {
+        let queue_root = temp_main_test_dir("spawned-task-file-provider-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        config.telegram.allow_all_chats = true;
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        file_provider.fail_write_after(4, "simulated spawned setup File Provider failure");
+
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        update_sender
+            .send(vec![serde_json::json!({
+                "update_id": 941,
+                "message": {
+                    "message_id": 1041,
+                    "chat": {"id": 123456789, "type": "private"},
+                    "from": {"id": 701},
+                    "text": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+                }
+            })])
+            .expect("fake Telegram should accept the video update");
+        let updates = telegram
+            .get_updates(None, 0)
+            .await
+            .expect("fake Telegram should return the video update");
+        let config = Arc::new(config);
+        let job_dispatch = JobDispatch {
+            download_semaphore: Arc::new(Semaphore::new(1)),
+            duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+        };
+        let next_job_id = Arc::new(AtomicU64::new(1));
+        let mut offset = None;
+        let context = BotContext {
+            telegram: telegram.clone(),
+            config,
+            job_dispatch,
+            next_job_id,
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::from_secs(30),
+        };
+        process_telegram_updates_with_context(&context, updates, &mut offset)
+            .await
+            .expect("accepted updates should advance after persisting the task");
+        assert_eq!(offset, Some(942));
+
+        let notification = tokio_timeout(Duration::from_secs(3), async {
+            loop {
+                let request = requests
+                    .recv()
+                    .await
+                    .expect("fake Telegram request stream should remain open");
+                if request.method == "sendMessage"
+                    && request.body["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Task u941-0 is saved in the queue"))
+                {
+                    break request;
+                }
+            }
+        })
+        .await
+        .expect("background setup failure should produce an actionable Telegram message");
+        assert!(
+            notification.body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("retry automatically"))
+        );
+        let task = queue
+            .get("u941-0")
+            .expect("saved task should remain readable")
+            .expect("saved task should not be lost after background setup failure");
+        assert_eq!(task.status, TaskStatus::Received);
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn spawned_task_setup_retries_a_transient_file_provider_error() {
+        let queue_root = temp_main_test_dir("spawned-task-setup-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "task-setup-retry";
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    951,
+                    1051,
+                    123_456_789,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        file_provider.fail_next_file_provider_write("simulated transient setup write failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        assert!(
+            prepare_persisted_task_for_job(&context, 123_456_789, task_id).await,
+            "setup should retry after a transient File Provider error"
+        );
+        assert_eq!(
+            queue
+                .get(task_id)
+                .expect("retried task should load")
+                .expect("retried task should exist")
+                .status,
+            TaskStatus::Preparing
+        );
+        let notification = tokio_timeout(Duration::from_secs(1), requests.recv())
+            .await
+            .expect("File Provider failure should be reported")
+            .expect("fake Telegram request stream should remain open");
+        assert_eq!(notification.method, "sendMessage");
+        assert!(
+            notification.body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("retry automatically"))
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
     #[test]
     fn replayed_multi_link_updates_keep_stable_task_ids() {
         let queue_root = temp_main_test_dir("queue-update-idempotency");
@@ -6942,6 +7169,7 @@ mod tests {
                 },
                 next_job_id: Arc::new(AtomicU64::new(1)),
                 queue: Arc::clone(&queue),
+                queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
             },
             crate::telegram::CallbackQuery {
                 id: "next-page".to_string(),
