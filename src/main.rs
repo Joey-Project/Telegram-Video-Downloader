@@ -37,7 +37,7 @@ use crate::downloader::{
     recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both, sync_bilibili_rust_credentials,
 };
-use crate::file_provider::is_file_provider_access_error;
+use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 use crate::queue::{
     QueueManager, RestartSummary, TaskRecord, TaskStatus, hash_primary_media,
     sanitize_job_for_storage,
@@ -218,27 +218,55 @@ async fn main() -> Result<()> {
 
 async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>) -> Result<()> {
     let config = Arc::new(AppConfig::load(&config_path)?);
-    config.ensure_runtime_dirs()?;
+    let telegram = TelegramClient::new(config.telegram.token.clone());
+    let shutdown = wait_for_supervisor_shutdown(shutdown_receiver);
+    tokio::pin!(shutdown);
+    let setup_config = Arc::clone(&config);
+    let Some(()) = retry_file_provider_startup_operation(
+        move || setup_config.ensure_runtime_dirs(),
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        &mut shutdown,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     for recovery in bilibili_auth::recover_interrupted_auth_cleanup(
         &config.bilibili.auth.state_path,
         &config.bilibili.auth.credential_file,
     )? {
         warn!(message = %recovery, "recovered interrupted BBDown auth cleanup");
     }
-    for recovery in recover_pending_overwrite_transactions(&config.downloads.video_dir)? {
+    let recovery_video_dir = config.downloads.video_dir.clone();
+    let recovery_error_video_dir = recovery_video_dir.clone();
+    let Some(recoveries) = retry_file_provider_startup_operation(
+        move || {
+            recover_pending_overwrite_transactions(&recovery_video_dir).map_err(|error| {
+                classify_deadlock_error(
+                    &recovery_error_video_dir,
+                    "recover video output transactions",
+                    error,
+                )
+            })
+        },
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        &mut shutdown,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    for recovery in recoveries {
         warn!(message = %recovery, "recovered interrupted overwrite transaction");
     }
-    let telegram = TelegramClient::new(config.telegram.token.clone());
-    let shutdown = wait_for_supervisor_shutdown(shutdown_receiver);
-    tokio::pin!(shutdown);
     let startup_config = Arc::clone(&config);
-    let Some((queue, restart_summaries)) = retry_file_provider_queue_open(
+    let Some((queue, restart_summaries)) = retry_file_provider_startup_operation(
         move || {
             let queue = QueueManager::open(&startup_config)?;
             let restart_summaries = queue.startup_summaries()?;
             Ok((queue, restart_summaries))
         },
-        Duration::from_secs(5),
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
         &mut shutdown,
     )
     .await?
@@ -369,8 +397,8 @@ async fn wait_for_supervisor_shutdown(mut shutdown_receiver: watch::Receiver<boo
     }
 }
 
-async fn retry_file_provider_queue_open<T, F>(
-    open_queue: F,
+async fn retry_file_provider_startup_operation<T, F>(
+    operation: F,
     retry_delay: Duration,
     shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
 ) -> Result<Option<T>>
@@ -378,26 +406,27 @@ where
     T: Send + 'static,
     F: Fn() -> Result<T> + Send + Sync + 'static,
 {
-    let open_queue = Arc::new(open_queue);
+    let operation = Arc::new(operation);
     loop {
-        let open_queue = Arc::clone(&open_queue);
+        let operation = Arc::clone(&operation);
         let (result_sender, result_receiver) = oneshot::channel();
-        // Queue startup makes synchronous NSFileCoordinator calls. A detached OS thread lets
-        // the async runtime observe shutdown even if a File Provider call stalls indefinitely.
+        // Startup operations touch coordinated queue files and configured output directories.
+        // A detached OS thread lets the async runtime observe shutdown even if a provider call
+        // stalls indefinitely.
         std::thread::Builder::new()
-            .name("queue-startup".to_string())
+            .name("file-provider-startup".to_string())
             .spawn(move || {
-                let _ = result_sender.send(open_queue());
+                let _ = result_sender.send(operation());
             })
-            .context("failed to start task queue startup worker")?;
+            .context("failed to start File Provider startup worker")?;
         let opened = tokio::select! {
             signal = &mut *shutdown => {
                 signal?;
-                info!("shutdown requested while waiting for task queue access");
+                info!("shutdown requested while waiting for File Provider startup access");
                 return Ok(None);
             }
             result = result_receiver => {
-                result.context("task queue startup worker exited without a result")?
+                result.context("File Provider startup worker exited without a result")?
             }
         };
         match opened {
@@ -405,14 +434,14 @@ where
             Err(error) if is_file_provider_access_error(&error) => {
                 warn!(
                     error = %format!("{error:#}"),
-                    "File Provider blocked task queue startup; retrying without removing queue data"
+                    "File Provider blocked startup; retrying without removing queue or staging data"
                 );
                 if !retry_delay_or_shutdown(&mut *shutdown, retry_delay).await? {
-                    info!("shutdown requested while retrying task queue startup");
+                    info!("shutdown requested while retrying File Provider startup");
                     return Ok(None);
                 }
             }
-            Err(error) => return Err(error).context("failed to open task queue"),
+            Err(error) => return Err(error).context("File Provider startup operation failed"),
         }
     }
 }
@@ -3089,21 +3118,58 @@ async fn queue_job(
     run_mode: JobRunMode,
     expected_status: TaskStatus,
 ) {
-    match context
-        .queue
-        .set_status_if_current(&task_id, &[expected_status], TaskStatus::Queued)
-    {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            warn!(task_id, "task state changed before queue transition");
-            return;
-        }
-        Err(err) => {
-            warn!(task_id, error = %err, "failed to persist queued task state");
-            return;
-        }
+    if !persist_queued_task_state(&context, chat_id, &task_id, expected_status).await {
+        return;
     }
     queue_queued_task(context, chat_id, job_id, task_id, job, run_mode).await;
+}
+
+async fn persist_queued_task_state(
+    context: &BotContext,
+    chat_id: i64,
+    task_id: &str,
+    expected_status: TaskStatus,
+) -> bool {
+    let mut reported_file_provider_error = false;
+    loop {
+        match context
+            .queue
+            .set_status_if_current(task_id, &[expected_status], TaskStatus::Queued)
+        {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                warn!(task_id, "task state changed before queue transition");
+                return false;
+            }
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    task_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked queued task persistence; retaining task and retrying"
+                );
+                if !reported_file_provider_error {
+                    send_or_log(
+                        &context.telegram,
+                        chat_id,
+                        format!(
+                            "Task {task_id} is saved in the queue, but macOS temporarily cannot access its queue file. It will retry automatically. Check /queue before resending; the task and staging data are retained."
+                        ),
+                    )
+                    .await;
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(context.queue_start_retry_delay).await;
+            }
+            Err(error) => {
+                warn!(
+                    task_id,
+                    error = %error,
+                    "failed to persist queued task state"
+                );
+                return false;
+            }
+        }
+    }
 }
 
 async fn queue_queued_task(
@@ -6671,7 +6737,7 @@ mod tests {
         let open_file_provider = Arc::clone(&file_provider);
         let shutdown = std::future::pending::<Result<()>>();
         tokio::pin!(shutdown);
-        let queue = retry_file_provider_queue_open(
+        let queue = retry_file_provider_startup_operation(
             move || {
                 open_attempts.fetch_add(1, Ordering::Relaxed);
                 QueueManager::open_with_file_provider(&config, Arc::clone(&open_file_provider))
@@ -6686,6 +6752,43 @@ mod tests {
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
         drop(queue);
         let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn startup_retries_classified_output_recovery_deadlock() {
+        let output_root = temp_main_test_dir("output-recovery-file-provider-retry");
+        let recovery_path = output_root.clone();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let recovery_attempts = Arc::clone(&attempts);
+        let shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(shutdown);
+
+        let result = retry_file_provider_startup_operation(
+            move || {
+                let attempt = recovery_attempts.fetch_add(1, Ordering::Relaxed);
+                if attempt == 0 {
+                    let error =
+                        anyhow::Error::new(std::io::Error::from_raw_os_error(libc::EDEADLK))
+                            .context("simulated output recovery access failure");
+                    Err(classify_deadlock_error(
+                        &recovery_path,
+                        "recover video output transactions",
+                        error,
+                    ))
+                } else {
+                    Ok(Vec::<String>::new())
+                }
+            },
+            Duration::from_millis(1),
+            &mut shutdown,
+        )
+        .await
+        .expect("classified output recovery deadlocks should retry")
+        .expect("startup should finish before shutdown");
+
+        assert!(result.is_empty());
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        let _ = fs::remove_dir_all(output_root);
     }
 
     #[tokio::test]
@@ -6707,7 +6810,7 @@ mod tests {
         let open_file_provider = Arc::clone(&open_file_provider);
         let shutdown = std::future::pending::<Result<()>>();
         tokio::pin!(shutdown);
-        let queue = retry_file_provider_queue_open(
+        let queue = retry_file_provider_startup_operation(
             move || {
                 open_attempts.fetch_add(1, Ordering::Relaxed);
                 QueueManager::open_with_file_provider(&config, Arc::clone(&open_file_provider))
@@ -6747,7 +6850,7 @@ mod tests {
         let open_attempts = Arc::clone(&attempts);
         let shutdown = std::future::pending::<Result<()>>();
         tokio::pin!(shutdown);
-        let (queue, summaries) = retry_file_provider_queue_open(
+        let (queue, summaries) = retry_file_provider_startup_operation(
             move || {
                 let attempt = open_attempts.fetch_add(1, Ordering::Relaxed);
                 let queue = QueueManager::open_with_file_provider(
@@ -6780,7 +6883,7 @@ mod tests {
         let open_attempts = Arc::clone(&attempts);
         let shutdown = std::future::pending::<Result<()>>();
         tokio::pin!(shutdown);
-        let error = retry_file_provider_queue_open(
+        let error = retry_file_provider_startup_operation(
             move || {
                 open_attempts.fetch_add(1, Ordering::Relaxed);
                 Err::<(), _>(anyhow!("simulated permanent queue configuration failure"))
@@ -6834,8 +6937,11 @@ mod tests {
             Ok(())
         };
         tokio::pin!(shutdown);
-        let startup =
-            retry_file_provider_queue_open(open_queue, Duration::from_secs(30), &mut shutdown);
+        let startup = retry_file_provider_startup_operation(
+            open_queue,
+            Duration::from_secs(30),
+            &mut shutdown,
+        );
         tokio::pin!(startup);
         tokio::select! {
             result = &mut startup => panic!("startup returned before the blocking open: {result:?}"),
@@ -7292,6 +7398,91 @@ mod tests {
             .lock()
             .await
             .retain(|_, pending| pending.task_id != task_id);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn queued_transition_retries_file_provider_write_with_telegram_notice_e2e() {
+        let queue_root = temp_main_test_dir("queued-transition-file-provider-retry-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "queued-transition-file-provider";
+        let chat_id = 123_456_789;
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    955,
+                    1055,
+                    chat_id,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("task should enter preparing state");
+        file_provider.fail_next_file_provider_write("simulated queued transition write failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+
+        assert!(
+            persist_queued_task_state(&context, chat_id, task_id, TaskStatus::Preparing).await,
+            "queued state should persist after a transient File Provider error"
+        );
+        assert_eq!(
+            queue
+                .get(task_id)
+                .expect("retried task should load")
+                .expect("retried task should remain in queue")
+                .status,
+            TaskStatus::Queued
+        );
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let notices = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("retry automatically"))
+        );
+        assert!(
+            notices[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Check /queue before resending"))
+        );
+
+        drop(context);
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);

@@ -19,8 +19,10 @@ superseded_by:
 - `claims.lock` 和 `owner.lock` 的检查、创建、打开与路径身份复核都在协调访问中完成；文件锁等待在回调外进行，避免占用协调期间阻塞。
 - Telegram 仅确认已向用户说明的 File Provider 访问错误；其他队列失败保持 update offset 不变以便重试，多链接 update 使用稳定任务 ID 避免重放重复建任务。
 - 首次创建队列目录也通过 NSFileCoordinator 写回调执行，并检查 owner-private 权限。启动队列和读取重启摘要遇到已分类的 File Provider 错误时，每 5 秒重试；同步队列打开在独立 OS 线程执行，以便 shutdown 及时返回；其他启动错误仍立即返回。
+- Bot 启动时创建配置下载目录、恢复视频输出事务遇到 `EDEADLK` 会分类为暂时性 File Provider 错误，并在队列打开前重试；这些同步启动步骤运行在可被 shutdown 中断等待的独立线程。
 - 已持久化任务进入后台准备阶段后遇到 File Provider 错误时，向用户发送一次可操作提示并每 5 秒自动重试；其他准备错误会尽力标为失败并提示通过 `/queue` 恢复或重试。
 - Bilibili 短链规范化后的任务计划写入遇到 File Provider 错误时，同样保留任务、只发送一次提示并自动重试；队列按钮遇到已分类的 File Provider 错误时显示 callback 提示，并指导用户等 Finder 中隐藏队列目录可用后重试。
+- 任务持久化为 `Queued` 时遇到 File Provider 错误会保留当前任务、只发送一次提示并自动重试，成功后再启动下载工作。
 - 任务记录迁入历史目录或媒体旁 sidecar 时，通过单次双路径 `NSFileCoordinator` 移动协调同时访问源和目标；启动恢复中的源/目标读取、探测、去重删除与重命名都在同一协调访问内完成。
 - 发布文件后的 sidecar 移动若只因 File Provider 协调失败，保留已完成任务和持久化的迁移意图并报告下载成功；之后的队列访问或启动会继续完成迁移。
 - 每次扫描活动队列目录都通过协调读取完成；队列目录身份与 owner-private 权限只在协调回调内验证，覆盖 `/queue`、恢复和任务查找路径。
@@ -34,9 +36,10 @@ superseded_by:
 - mock Telegram E2E 覆盖可操作的 File Provider 错误提示、队列写入瞬时失败后的 update 重放、以及重放期间多链接任务 ID 幂等。
 - mock Telegram E2E 还覆盖后台任务准备时发生 File Provider 错误后的 update 确认、持久化保留、用户提示和自动重试，以及摘要确认暂时失败时的单次发送和重试。
 - mock Telegram E2E 还覆盖规范化任务写入暂时失败后自动重试并继续进入 Bilibili 选择流程，以及 Resume callback 读取失败后的 Finder 指引和任务保留。
+- mock Telegram E2E 还覆盖 `Preparing` 转为 `Queued` 的暂时写入失败、单次通知和重试成功；启动测试覆盖输出恢复的 `EDEADLK` 分类后重试。
 - mock provider 测试覆盖队列目录创建经过协调写、目录创建失败后启动重试、启动和重启摘要读写中的 File Provider 暂时失败后重试、普通配置错误不重试、队列锁文件及 `/queue` 目录的协调访问、双路径历史迁移及恢复、完成文件发布后迁移失败的成功语义，以及启动、Telegram 退避和 bot runtime 阻塞期间的 shutdown 中断。
 - Rust CI 的 `cargo test --all-targets --quiet` 已覆盖新增 E2E，无需增加另一条 workflow。
 
 ## 检查记录
 - `cargo fmt --all --manifest-path Cargo.toml -- --check`、`cargo check --all-targets --quiet --locked --offline`、`cargo clippy --all-targets --quiet --locked --offline -- -D warnings`、`cargo build --quiet --locked --offline` 和 `git diff --check` 通过。
-- `cargo test --all-targets --quiet --locked --offline` 通过：488 passed、11 ignored；包含 mock Telegram、队列目录和锁文件协调、File Provider 启动重试、启动摘要和后台任务准备及规范化任务重试、回调恢复指引、双路径 sidecar 迁移恢复、瞬时队列写入和 shutdown 中断回归测试。因测试使用 macOS 文件协调和 localhost，完整套件在沙盒外运行。
+- `cargo test --all-targets --quiet --locked --offline` 通过：490 passed、11 ignored；包含 mock Telegram、队列目录和锁文件协调、File Provider 启动与输出恢复重试、启动摘要和后台任务准备、规范化任务及 `Queued` 状态转换重试、回调恢复指引、双路径 sidecar 迁移恢复、瞬时队列写入和 shutdown 中断回归测试。因测试使用 macOS 文件协调和 localhost，完整套件在沙盒外运行。
