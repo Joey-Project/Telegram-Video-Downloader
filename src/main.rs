@@ -24,7 +24,7 @@ use bbdown_core::{
     AccessKeyLoginTicket, CredentialHealthReport, CredentialHealthScope, CredentialHealthStatus,
     CredentialKind, CredentialSource, QrLoginKind, QrLoginState, UgcCollectionReference,
 };
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
 
@@ -222,23 +222,27 @@ async fn main() -> Result<()> {
     let telegram = TelegramClient::new(config.telegram.token.clone());
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
-    let queue = tokio::select! {
-        signal = &mut shutdown => {
-            signal?;
-            info!("shutdown requested while waiting for task queue access");
-            return Ok(());
-        }
-        queue = retry_file_provider_queue_open(
-            || QueueManager::open(&config),
-            Duration::from_secs(5),
-        ) => Arc::new(queue?),
+    let startup_config = Arc::clone(&config);
+    let Some((queue, restart_summaries)) = retry_file_provider_queue_open(
+        move || {
+            let queue = QueueManager::open(&startup_config)?;
+            let restart_summaries = queue.startup_summaries()?;
+            Ok((queue, restart_summaries))
+        },
+        Duration::from_secs(5),
+        &mut shutdown,
+    )
+    .await?
+    else {
+        return Ok(());
     };
+    let queue = Arc::new(queue);
     tokio::spawn(expire_pending_duplicate_jobs());
 
     if let Err(err) = telegram.set_my_commands(default_bot_commands()).await {
         warn!(error = %err, "failed to register Telegram bot commands");
     }
-    notify_restart_summaries(&telegram, &queue).await?;
+    notify_restart_summaries(&telegram, &queue, &restart_summaries).await?;
     let job_dispatch = JobDispatch {
         download_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
         duplicate_scan_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
@@ -294,19 +298,48 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn retry_file_provider_queue_open(
-    mut open_queue: impl FnMut() -> Result<QueueManager>,
+async fn retry_file_provider_queue_open<T, F>(
+    open_queue: F,
     retry_delay: Duration,
-) -> Result<QueueManager> {
+    shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
+) -> Result<Option<T>>
+where
+    T: Send + 'static,
+    F: Fn() -> Result<T> + Send + Sync + 'static,
+{
+    let open_queue = Arc::new(open_queue);
     loop {
-        match open_queue() {
-            Ok(queue) => return Ok(queue),
+        let open_queue = Arc::clone(&open_queue);
+        let (result_sender, result_receiver) = oneshot::channel();
+        // Queue startup makes synchronous NSFileCoordinator calls. A detached OS thread lets
+        // the async runtime observe shutdown even if a File Provider call stalls indefinitely.
+        std::thread::Builder::new()
+            .name("queue-startup".to_string())
+            .spawn(move || {
+                let _ = result_sender.send(open_queue());
+            })
+            .context("failed to start task queue startup worker")?;
+        let opened = tokio::select! {
+            signal = &mut *shutdown => {
+                signal?;
+                info!("shutdown requested while waiting for task queue access");
+                return Ok(None);
+            }
+            result = result_receiver => {
+                result.context("task queue startup worker exited without a result")?
+            }
+        };
+        match opened {
+            Ok(value) => return Ok(Some(value)),
             Err(error) if is_file_provider_access_error(&error) => {
                 warn!(
                     error = %format!("{error:#}"),
                     "File Provider blocked task queue startup; retrying without removing queue data"
                 );
-                tokio::time::sleep(retry_delay).await;
+                if !retry_delay_or_shutdown(&mut *shutdown, retry_delay).await? {
+                    info!("shutdown requested while retrying task queue startup");
+                    return Ok(None);
+                }
             }
             Err(error) => return Err(error).context("failed to open task queue"),
         }
@@ -390,10 +423,14 @@ fn task_id_for_update(update_id: i64, ordinal: usize) -> String {
     format!("u{update_id}-{ordinal}")
 }
 
-async fn notify_restart_summaries(telegram: &TelegramClient, queue: &QueueManager) -> Result<()> {
-    for summary in queue.startup_summaries()? {
+async fn notify_restart_summaries(
+    telegram: &TelegramClient,
+    queue: &QueueManager,
+    summaries: &[RestartSummary],
+) -> Result<()> {
+    for summary in summaries {
         match telegram
-            .send_message(summary.chat_id, render_restart_summary(&summary))
+            .send_message(summary.chat_id, render_restart_summary(summary))
             .await
         {
             Ok(_) => queue.mark_restart_summary_sent(summary.chat_id)?,
@@ -5853,7 +5890,7 @@ mod tests {
             ])
             .expect("fake Telegram should accept scripted updates");
 
-        notify_restart_summaries(&telegram, &queue)
+        notify_restart_summaries(&telegram, &queue, &summaries)
             .await
             .expect("restart notice should be delivered");
         let updates = telegram
@@ -6272,16 +6309,23 @@ mod tests {
         let file_provider = Arc::new(MockQueueFileProvider::default());
         file_provider.fail_next_read("simulated startup File Provider deadlock");
         let file_provider: Arc<dyn QueueFileProvider> = file_provider;
-        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_attempts = Arc::clone(&attempts);
+        let config = Arc::new(config);
+        let open_file_provider = Arc::clone(&file_provider);
+        let shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(shutdown);
         let queue = retry_file_provider_queue_open(
-            || {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                QueueManager::open_with_file_provider(&config, Arc::clone(&file_provider))
+            move || {
+                open_attempts.fetch_add(1, Ordering::Relaxed);
+                QueueManager::open_with_file_provider(&config, Arc::clone(&open_file_provider))
             },
             Duration::from_millis(1),
+            &mut shutdown,
         )
         .await
-        .expect("startup should reopen the queue after a transient provider failure");
+        .expect("startup should reopen the queue after a transient provider failure")
+        .expect("startup should complete before shutdown");
 
         assert_eq!(attempts.load(Ordering::Relaxed), 2);
         drop(queue);
@@ -6289,21 +6333,136 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_does_not_retry_permanent_queue_open_failures() {
-        let attempts = std::sync::atomic::AtomicUsize::new(0);
-        let error = retry_file_provider_queue_open(
-            || {
-                attempts.fetch_add(1, Ordering::Relaxed);
-                Err(anyhow!("simulated permanent queue configuration failure"))
+    async fn startup_retries_file_provider_failure_during_restart_summaries() {
+        let queue_root = temp_main_test_dir("queue-startup-summary-file-provider-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let open_file_provider = Arc::clone(&file_provider);
+        let file_provider: Arc<dyn QueueFileProvider> = file_provider;
+        let open_queue_file_provider = Arc::clone(&file_provider);
+        let config = Arc::new(config);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_attempts = Arc::clone(&attempts);
+        let shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(shutdown);
+        let (queue, summaries) = retry_file_provider_queue_open(
+            move || {
+                let attempt = open_attempts.fetch_add(1, Ordering::Relaxed);
+                let queue = QueueManager::open_with_file_provider(
+                    &config,
+                    Arc::clone(&open_queue_file_provider),
+                )?;
+                if attempt == 0 {
+                    open_file_provider
+                        .fail_next_read("simulated restart summary File Provider failure");
+                }
+                let summaries = queue.startup_summaries()?;
+                Ok((queue, summaries))
             },
             Duration::from_millis(1),
+            &mut shutdown,
         )
         .await
-        .err()
-        .expect("permanent queue open errors should return immediately");
+        .expect("startup should retry summary reads after a transient provider failure")
+        .expect("startup should complete before shutdown");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(summaries.is_empty());
+        drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_retry_permanent_queue_open_failures() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_attempts = Arc::clone(&attempts);
+        let shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(shutdown);
+        let error = retry_file_provider_queue_open(
+            move || {
+                open_attempts.fetch_add(1, Ordering::Relaxed);
+                Err::<(), _>(anyhow!("simulated permanent queue configuration failure"))
+            },
+            Duration::from_millis(1),
+            &mut shutdown,
+        )
+        .await
+        .expect_err("permanent queue open errors should return immediately");
 
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
         assert!(format!("{error:#}").contains("simulated permanent queue configuration failure"));
+    }
+
+    #[tokio::test]
+    async fn startup_queue_open_wait_is_interrupted_by_shutdown() {
+        let (started_sender, mut started_receiver) = oneshot::channel();
+        let started_sender = Arc::new(std::sync::Mutex::new(Some(started_sender)));
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let release_receiver = Arc::new(std::sync::Mutex::new(release_receiver));
+        let (finished_sender, finished_receiver) = oneshot::channel();
+        let finished_sender = Arc::new(std::sync::Mutex::new(Some(finished_sender)));
+        let open_started_sender = Arc::clone(&started_sender);
+        let open_release_receiver = Arc::clone(&release_receiver);
+        let open_finished_sender = Arc::clone(&finished_sender);
+        let open_queue = move || {
+            if let Some(sender) = open_started_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            open_release_receiver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .expect("test should release the simulated blocking open");
+            if let Some(sender) = open_finished_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = sender.send(());
+            }
+            Err::<(), _>(anyhow!("simulated open should be abandoned after shutdown"))
+        };
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let shutdown = async move {
+            let _ = shutdown_receiver.await;
+            Ok(())
+        };
+        tokio::pin!(shutdown);
+        let startup =
+            retry_file_provider_queue_open(open_queue, Duration::from_secs(30), &mut shutdown);
+        tokio::pin!(startup);
+        tokio::select! {
+            result = &mut startup => panic!("startup returned before the blocking open: {result:?}"),
+            started = &mut started_receiver => {
+                started.expect("the blocking open worker should start");
+            }
+        }
+
+        shutdown_sender
+            .send(())
+            .expect("shutdown should reach the startup retry loop");
+        let outcome = tokio_timeout(Duration::from_secs(1), &mut startup)
+            .await
+            .expect("shutdown should not wait for the blocking open worker")
+            .expect("shutdown should complete without an error");
+        assert!(outcome.is_none());
+
+        release_sender
+            .send(())
+            .expect("the detached open worker should be released for test cleanup");
+        tokio_timeout(Duration::from_secs(1), finished_receiver)
+            .await
+            .expect("the detached open worker should finish after release")
+            .expect("the worker should report completion");
     }
 
     #[tokio::test]

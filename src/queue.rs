@@ -1089,44 +1089,123 @@ impl DownloadStore {
     }
 
     fn ensure_operation_lock_file(&self) -> Result<()> {
-        if let Some(file) = self.root.open_bound_file(&self.operation_lock_path)? {
-            file.validate_private_single_link(0o600)?;
+        self.ensure_coordinated_lock_file(&self.operation_lock_path)
+    }
+
+    fn ensure_coordinated_lock_file(&self, path: &Path) -> Result<()> {
+        if self.open_coordinated_lock_file(path)?.is_some() {
             return Ok(());
         }
-        if let Err(create_error) =
-            self.root
-                .create_new_bound_file(&self.operation_lock_path, &[], 0o600)
-        {
-            let Some(file) = self.root.open_bound_file(&self.operation_lock_path)? else {
-                return Err(create_error);
+
+        let mut created = false;
+        let mut create = |accessor_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(accessor_path)?;
+            if coordinated_path != path {
+                bail!("coordinated task queue lock path changed during creation");
+            }
+            self.ensure_private_directory()?;
+            let file = match self
+                .root
+                .create_new_bound_file(&coordinated_path, &[], 0o600)
+            {
+                Ok(_) => self
+                    .root
+                    .open_bound_file(&coordinated_path)?
+                    .ok_or_else(|| anyhow!("created task queue lock file disappeared"))?,
+                Err(create_error) => {
+                    let Some(file) = self.root.open_bound_file(&coordinated_path)? else {
+                        return Err(create_error);
+                    };
+                    file
+                }
             };
+            let identity = file.identity();
             file.validate_private_single_link(0o600)?;
+            let entry = self.root.bind_entry(&coordinated_path, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(identity) {
+                bail!("task queue lock file changed during coordinated creation");
+            }
+            file.validate_private_single_link(0o600)?;
+            self.ensure_private_directory()?;
+            created = true;
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_write(path, &mut create)
+            .map_err(|error| classify_deadlock_error(path, "write", error))?;
+        if !created {
+            bail!("File Provider did not supply a coordinated lock-file accessor");
         }
         Ok(())
     }
 
-    fn ensure_owner_lock_file(&self) -> Result<PathBuf> {
-        let path = self.queue_dir.join(QUEUE_OWNER_LOCK_FILE);
-        if let Some(file) = self.root.open_bound_file(&path)? {
-            file.validate_private_single_link(0o600)?;
-            return Ok(path);
-        }
-        if let Err(create_error) = self.root.create_new_bound_file(&path, &[], 0o600) {
-            let Some(file) = self.root.open_bound_file(&path)? else {
-                return Err(create_error);
+    fn open_coordinated_lock_file(&self, path: &Path) -> Result<Option<BoundFile>> {
+        let mut opened = None;
+        let mut open = |accessor_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(accessor_path)?;
+            if coordinated_path != path {
+                bail!("coordinated task queue lock path changed during access");
+            }
+            self.ensure_private_directory()?;
+            let Some(file) = self.root.open_bound_file(&coordinated_path)? else {
+                opened = Some(None);
+                return Ok(());
             };
+            let identity = file.identity();
             file.validate_private_single_link(0o600)?;
+            let entry = self.root.bind_entry(&coordinated_path, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(identity) {
+                bail!("task queue lock file changed during coordinated access");
+            }
+            file.validate_private_single_link(0o600)?;
+            self.ensure_private_directory()?;
+            opened = Some(Some(file));
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(path, &mut open)
+            .map_err(|error| classify_deadlock_error(path, "read", error))?;
+        opened
+            .ok_or_else(|| anyhow!("File Provider did not supply a coordinated lock-file accessor"))
+    }
+
+    fn validate_coordinated_lock_file(&self, path: &Path, expected: EntryIdentity) -> Result<()> {
+        let mut validated = false;
+        let mut validate = |accessor_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(accessor_path)?;
+            if coordinated_path != path {
+                bail!("coordinated task queue lock path changed while locking");
+            }
+            self.ensure_private_directory()?;
+            let entry = self.root.bind_entry(&coordinated_path, false)?;
+            let file = self
+                .root
+                .open_bound_file(&coordinated_path)?
+                .ok_or_else(|| anyhow!("task queue lock file disappeared while locking"))?;
+            if file.identity() != expected
+                || self.root.bound_entry_identity(&entry)? != Some(expected)
+            {
+                bail!("task queue lock file was replaced while locking");
+            }
+            file.validate_private_single_link(0o600)?;
+            self.ensure_private_directory()?;
+            validated = true;
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(path, &mut validate)
+            .map_err(|error| classify_deadlock_error(path, "read", error))?;
+        if !validated {
+            bail!("File Provider did not supply a coordinated lock-file validation");
         }
-        Ok(path)
+        Ok(())
     }
 
     fn lock_queue_owner(&self) -> Result<QueueOwnerLock> {
-        self.ensure_private_directory()?;
-        let path = self.ensure_owner_lock_file()?;
-        let entry = self.root.bind_entry(&path, false)?;
+        let path = self.queue_dir.join(QUEUE_OWNER_LOCK_FILE);
+        self.ensure_coordinated_lock_file(&path)?;
         let file = self
-            .root
-            .open_bound_file(&path)?
+            .open_coordinated_lock_file(&path)?
             .ok_or_else(|| anyhow!("task queue owner lock file is missing"))?;
         let identity = file.identity();
         file.validate_private_single_link(0o600)?;
@@ -1136,27 +1215,21 @@ impl DownloadStore {
                 self.root_path.display()
             );
         }
-        if self.root.bound_entry_identity(&entry)? != Some(identity) {
-            bail!("task queue owner lock file was replaced while locking");
-        }
         file.validate_private_single_link(0o600)?;
+        self.validate_coordinated_lock_file(&path, identity)?;
         Ok(QueueOwnerLock { _file: file })
     }
 
     fn lock_queue_operations(&self) -> Result<QueueOperationLock> {
-        self.ensure_private_directory()?;
-        let entry = self.root.bind_entry(&self.operation_lock_path, false)?;
+        self.ensure_coordinated_lock_file(&self.operation_lock_path)?;
         let file = self
-            .root
-            .open_bound_file(&self.operation_lock_path)?
+            .open_coordinated_lock_file(&self.operation_lock_path)?
             .ok_or_else(|| anyhow!("task queue operation lock file is missing"))?;
         let identity = file.identity();
         file.validate_private_single_link(0o600)?;
         file.lock_exclusive()?;
-        if self.root.bound_entry_identity(&entry)? != Some(identity) {
-            bail!("task queue claim lock file was replaced while locking");
-        }
         file.validate_private_single_link(0o600)?;
+        self.validate_coordinated_lock_file(&self.operation_lock_path, identity)?;
         Ok(QueueOperationLock { _file: file })
     }
 
@@ -2255,7 +2328,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_listing_coordinates_each_queue_directory_scan() {
+    fn queue_lock_files_and_queue_scans_use_coordinated_reads() {
         let temp_root = temp_queue_root("coordinated-queue-scans");
         let video_root = temp_root.join("videos");
         let pdf_root = temp_root.join("pdfs");
@@ -2269,6 +2342,18 @@ mod tests {
         let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
         let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
             .expect("queue should open with the mock File Provider");
+        let startup_reads = file_provider.read_paths();
+        for queue_root in [&video_root, &pdf_root] {
+            let queue_dir = queue_root.join(QUEUE_DIRECTORY);
+            assert!(
+                startup_reads.contains(&queue_dir.join(QUEUE_OPERATION_LOCK_FILE)),
+                "operation lock access should use coordinated reads: {startup_reads:?}"
+            );
+            assert!(
+                startup_reads.contains(&queue_dir.join(QUEUE_OWNER_LOCK_FILE)),
+                "owner lock access should use coordinated reads: {startup_reads:?}"
+            );
+        }
         let reads_before_listing = file_provider.read_paths().len();
 
         queue
