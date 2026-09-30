@@ -15,7 +15,6 @@ pub(crate) trait QueueFileProvider: Send + Sync {
     fn coordinate_write(
         &self,
         path: &Path,
-        replacing: bool,
         accessor: &mut dyn FnMut(&Path) -> Result<()>,
     ) -> Result<()>;
 }
@@ -104,7 +103,6 @@ impl QueueFileProvider for PassthroughQueueFileProvider {
     fn coordinate_write(
         &self,
         path: &Path,
-        _replacing: bool,
         accessor: &mut dyn FnMut(&Path) -> Result<()>,
     ) -> Result<()> {
         accessor(path)
@@ -121,16 +119,15 @@ impl QueueFileProvider for MacQueueFileProvider {
         path: &Path,
         accessor: &mut dyn FnMut(&Path) -> Result<()>,
     ) -> Result<()> {
-        coordinate(path, false, false, accessor)
+        coordinate(path, false, accessor)
     }
 
     fn coordinate_write(
         &self,
         path: &Path,
-        replacing: bool,
         accessor: &mut dyn FnMut(&Path) -> Result<()>,
     ) -> Result<()> {
-        coordinate(path, true, replacing, accessor)
+        coordinate(path, true, accessor)
     }
 }
 
@@ -138,7 +135,6 @@ impl QueueFileProvider for MacQueueFileProvider {
 fn coordinate(
     path: &Path,
     write: bool,
-    replacing: bool,
     accessor: &mut dyn FnMut(&Path) -> Result<()>,
 ) -> Result<()> {
     use std::cell::RefCell;
@@ -173,14 +169,9 @@ fn coordinate(
     let mut coordination_error: Option<Retained<NSError>> = None;
 
     if write {
-        let options = if replacing {
-            NSFileCoordinatorWritingOptions::ForReplacing
-        } else {
-            NSFileCoordinatorWritingOptions::empty()
-        };
         coordinator.coordinateWritingItemAtURL_options_error_byAccessor(
             &url,
-            options,
+            NSFileCoordinatorWritingOptions::ForReplacing,
             Some(&mut coordination_error),
             &block,
         );
@@ -221,7 +212,10 @@ fn operation_name(write: bool) -> &'static str {
 pub(crate) struct MockQueueFileProvider {
     reads: std::sync::Mutex<Vec<PathBuf>>,
     writes: std::sync::Mutex<Vec<PathBuf>>,
+    accessor_paths: std::sync::Mutex<Vec<PathBuf>>,
+    path_rewrites: std::sync::Mutex<Vec<(PathBuf, PathBuf)>>,
     next_read_failure: std::sync::Mutex<Option<String>>,
+    next_write_failure: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -238,6 +232,41 @@ impl MockQueueFileProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    pub(crate) fn rewrite_paths_under(&self, from: &Path, to: &Path) {
+        self.path_rewrites
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((from.to_path_buf(), to.to_path_buf()));
+    }
+
+    pub(crate) fn accessor_paths(&self) -> Vec<PathBuf> {
+        self.accessor_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn fail_next_write(&self, detail: impl Into<String>) {
+        *self
+            .next_write_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(detail.into());
+    }
+
+    fn accessor_path(&self, path: &Path) -> PathBuf {
+        self.path_rewrites
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find_map(|(from, to)| {
+                path.strip_prefix(from)
+                    .ok()
+                    .map(|relative| to.join(relative))
+            })
+            .unwrap_or_else(|| path.to_path_buf())
     }
 }
 
@@ -260,19 +289,36 @@ impl QueueFileProvider for MockQueueFileProvider {
         {
             return Err(FileProviderAccessError::new(path, "read", detail).into());
         }
-        accessor(path)
+        let accessor_path = self.accessor_path(path);
+        self.accessor_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(accessor_path.clone());
+        accessor(&accessor_path)
     }
 
     fn coordinate_write(
         &self,
         path: &Path,
-        _replacing: bool,
         accessor: &mut dyn FnMut(&Path) -> Result<()>,
     ) -> Result<()> {
         self.writes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(path.to_path_buf());
-        accessor(path)
+        if let Some(detail) = self
+            .next_write_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            return Err(anyhow::anyhow!(detail));
+        }
+        let accessor_path = self.accessor_path(path);
+        self.accessor_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(accessor_path.clone());
+        accessor(&accessor_path)
     }
 }

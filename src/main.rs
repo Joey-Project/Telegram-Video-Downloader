@@ -263,6 +263,7 @@ async fn main() -> Result<()> {
                         .await
                         {
                             warn!(error = %err, "failed to persist or handle telegram update");
+                            tokio::time::sleep(Duration::from_secs(5)).await;
                         }
                     }
                     Err(err) => {
@@ -309,18 +310,24 @@ async fn process_telegram_updates(
             .await
             .with_context(|| format!("telegram message update {update_id} failed"))
             {
-                warn!(
-                    update_id,
-                    chat_id,
-                    error = %format!("{err:#}"),
-                    "failed to handle telegram message update; acknowledging and continuing"
-                );
-                let response = if is_file_provider_access_error(&err) {
-                    "macOS could not coordinate access to the task queue files. Wait until the hidden queue folder shows as downloaded in Finder, then retry your message. Check /queue first to avoid starting a duplicate; existing queue and staging data are retained.".to_string()
+                if is_file_provider_access_error(&err) {
+                    warn!(
+                        update_id,
+                        chat_id,
+                        error = %format!("{err:#}"),
+                        "File Provider blocked queue access; acknowledging for user retry"
+                    );
+                    let response = "macOS could not coordinate access to the task queue files. Wait until the hidden queue folder shows as downloaded in Finder, then retry your message. Check /queue first to avoid starting a duplicate; existing queue and staging data are retained.".to_string();
+                    send_or_log(telegram, chat_id, response).await;
                 } else {
-                    "I couldn't process that message. Check /queue for any task that may have started. If it isn't listed, send the message again.".to_string()
-                };
-                send_or_log(telegram, chat_id, response).await;
+                    warn!(
+                        update_id,
+                        chat_id,
+                        error = %format!("{err:#}"),
+                        "failed to handle telegram message update; leaving it unacknowledged for retry"
+                    );
+                    return Err(err);
+                }
             }
         }
         if let Some(callback_query) = update.callback_query {
@@ -329,6 +336,10 @@ async fn process_telegram_updates(
         *offset = Some(update_id + 1);
     }
     Ok(())
+}
+
+fn task_id_for_update(update_id: i64, ordinal: usize) -> String {
+    format!("u{update_id}-{ordinal}")
 }
 
 async fn notify_restart_summaries(telegram: &TelegramClient, queue: &QueueManager) -> Result<()> {
@@ -510,7 +521,7 @@ async fn handle_message(
         RouteResult::Jobs(jobs) => {
             for (ordinal, job) in jobs.into_iter().enumerate() {
                 let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
-                let task_id = format!("u{update_id}-{ordinal}");
+                let task_id = task_id_for_update(update_id, ordinal);
                 let (stored_job, sanitized) = sanitize_job_for_storage(job.clone());
                 let mut task = TaskRecord::new(
                     task_id.clone(),
@@ -6182,7 +6193,7 @@ mod tests {
             &mut offset,
         )
         .await
-        .expect("a Telegram delivery failure should not block update processing");
+        .expect("a failed response delivery is logged while updates continue");
 
         assert_eq!(offset, Some(903));
         let recorded = take_fake_telegram_requests(&mut requests);
@@ -6198,6 +6209,165 @@ mod tests {
 
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn transient_queue_write_failure_retries_telegram_update_e2e() {
+        let queue_root = temp_main_test_dir("queue-write-retry-offset");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        config.telegram.allow_all_chats = true;
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        file_provider.fail_next_write("simulated transient queue write failure");
+
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        let scripted_updates = vec![
+            serde_json::json!({
+                "update_id": 931,
+                "message": {
+                    "message_id": 1031,
+                    "chat": {"id": 123456789, "type": "private"},
+                    "from": {"id": 701},
+                    "text": "/queue"
+                }
+            }),
+            serde_json::json!({
+                "update_id": 932,
+                "message": {
+                    "message_id": 1032,
+                    "chat": {"id": 123456789, "type": "private"},
+                    "from": {"id": 701},
+                    "text": "/help"
+                }
+            }),
+        ];
+        update_sender
+            .send(scripted_updates.clone())
+            .expect("fake Telegram should accept updates");
+        let config = Arc::new(config);
+        let job_dispatch = JobDispatch {
+            download_semaphore: Arc::new(Semaphore::new(1)),
+            duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+        };
+        let next_job_id = Arc::new(AtomicU64::new(1));
+        let mut offset = None;
+        let updates = telegram
+            .get_updates(offset, 0)
+            .await
+            .expect("fake Telegram should return the first delivery");
+        let error = process_telegram_updates(
+            &telegram,
+            &config,
+            &job_dispatch,
+            &next_job_id,
+            &queue,
+            updates,
+            &mut offset,
+        )
+        .await
+        .expect_err("transient queue write failure should leave the update unacknowledged");
+        assert!(format!("{error:#}").contains("simulated transient queue write failure"));
+        assert_eq!(offset, None);
+
+        update_sender
+            .send(scripted_updates)
+            .expect("fake Telegram should redeliver the unacknowledged updates");
+        let retried_updates = telegram
+            .get_updates(offset, 0)
+            .await
+            .expect("fake Telegram should return the retry");
+        process_telegram_updates(
+            &telegram,
+            &config,
+            &job_dispatch,
+            &next_job_id,
+            &queue,
+            retried_updates,
+            &mut offset,
+        )
+        .await
+        .expect("the redelivered updates should process after the transient failure clears");
+        assert_eq!(offset, Some(933));
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getUpdates", "getUpdates", "sendMessage", "sendMessage"]
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[test]
+    fn replayed_multi_link_updates_keep_stable_task_ids() {
+        let queue_root = temp_main_test_dir("queue-update-idempotency");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let jobs = [
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=first000001".to_string(),
+            },
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=second00002".to_string(),
+            },
+        ];
+        for (ordinal, job) in jobs.iter().cloned().enumerate() {
+            assert!(
+                queue
+                    .create(TaskRecord::new(
+                        task_id_for_update(941, ordinal),
+                        941,
+                        1041,
+                        123_456_789,
+                        Some(701),
+                        ordinal,
+                        job,
+                    ))
+                    .expect("first delivery should persist each task")
+            );
+        }
+        for (ordinal, job) in jobs.into_iter().enumerate() {
+            assert!(
+                !queue
+                    .create(TaskRecord::new(
+                        task_id_for_update(941, ordinal),
+                        941,
+                        1041,
+                        123_456_789,
+                        Some(701),
+                        ordinal,
+                        job,
+                    ))
+                    .expect("redelivery should be idempotent")
+            );
+        }
+        let tasks = queue
+            .list(123_456_789, false, 0)
+            .expect("active tasks should load");
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks.iter().any(|task| task.id == "u941-0"));
+        assert!(tasks.iter().any(|task| task.id == "u941-1"));
+
+        drop(queue);
         let _ = fs::remove_dir_all(queue_root);
     }
 

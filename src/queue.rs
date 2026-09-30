@@ -16,8 +16,7 @@ use tokio::sync::Notify;
 
 use crate::config::AppConfig;
 use crate::file_provider::{
-    FileProviderAccessError, QueueFileProvider, classify_deadlock_error, is_deadlock_error,
-    platform_queue_file_provider,
+    QueueFileProvider, classify_deadlock_error, is_deadlock_error, platform_queue_file_provider,
 };
 use crate::router::JobRequest;
 use crate::safe_fs::{BoundFile, EntryIdentity, RootedFs};
@@ -980,26 +979,76 @@ pub fn hash_primary_media(
 
 fn coordinate_directory_listing(file_provider: &dyn QueueFileProvider, path: &Path) -> Result<()> {
     let mut list_entries = |coordinated_path: &Path| -> Result<()> {
-        if coordinated_path != path {
-            return Err(FileProviderAccessError::new(
-                path,
-                "read",
-                "the download directory moved while access was being coordinated",
-            )
-            .into());
+        // Bind the configured root only after coordination, since File Provider can replace a
+        // directory placeholder while making it available. Accept its logical or canonical URL,
+        // then enumerate through the descriptor-bound root rather than reopening an unchecked
+        // accessor path.
+        let root = RootedFs::new(path)?;
+        let rooted_accessor = coordinated_path_under_root(&root, coordinated_path)?;
+        if rooted_accessor != root.logical_root_path() {
+            bail!("coordinated download directory is outside its configured root");
         }
-        // Enumerating within the accessor lets File Provider reveal cloud-only
-        // children before startup decides whether the queue directory is absent.
-        for entry in std::fs::read_dir(coordinated_path)
-            .with_context(|| format!("failed to enumerate download directory {}", path.display()))?
-        {
-            let _ = entry?.file_name();
-        }
+        let _ = root.list_root_directory()?;
         Ok(())
     };
     file_provider
         .coordinate_read(path, &mut list_entries)
         .map_err(|error| classify_deadlock_error(path, "read", error))
+}
+
+fn coordinate_bound_directory_listing(
+    file_provider: &dyn QueueFileProvider,
+    root: &RootedFs,
+    path: &Path,
+) -> Result<(PathBuf, EntryIdentity)> {
+    let mut result = None;
+    let mut list_entries = |coordinated_path: &Path| -> Result<()> {
+        let rooted_accessor = coordinated_path_under_root(root, coordinated_path)?;
+        if rooted_accessor == root.logical_root_path() {
+            bail!("coordinated queue directory resolved to the download root");
+        }
+        let entry = root.bind_entry(&rooted_accessor, false)?;
+        let identity = root
+            .bound_entry_identity(&entry)?
+            .ok_or_else(|| anyhow!("coordinated task queue directory disappeared"))?;
+        root.validate_private_bound_directory(&entry, identity, 0o700)
+            .context("task queue directory must be owner-private")?;
+        let _ = root.list_bound_directory(&entry, identity)?;
+        root.validate_private_bound_directory(&entry, identity, 0o700)
+            .context("task queue directory changed during coordinated listing")?;
+        result = Some((rooted_accessor, identity));
+        Ok(())
+    };
+    file_provider
+        .coordinate_read(path, &mut list_entries)
+        .map_err(|error| classify_deadlock_error(path, "read", error))?;
+    result.ok_or_else(|| anyhow!("File Provider did not supply a coordinated directory"))
+}
+
+fn coordinated_path_under_root(root: &RootedFs, coordinated_path: &Path) -> Result<PathBuf> {
+    // The configured root is the access-policy boundary. File Provider may return either its
+    // configured spelling or the canonical URL for that rooted item; reject escapes and
+    // non-normal components before translating back to the logical path used by RootedFs.
+    let relative = coordinated_path
+        .strip_prefix(root.logical_root_path())
+        .or_else(|_| coordinated_path.strip_prefix(root.root_path()))
+        .with_context(|| {
+            format!(
+                "coordinated File Provider URL is outside the configured download root: {}",
+                coordinated_path.display()
+            )
+        })?;
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            bail!(
+                "coordinated File Provider URL contains an invalid path component: {}",
+                coordinated_path.display()
+            );
+        };
+        normalized.push(name);
+    }
+    Ok(root.logical_root_path().join(normalized))
 }
 
 impl DownloadStore {
@@ -1009,14 +1058,15 @@ impl DownloadStore {
 
     fn from_root(root: RootedFs, file_provider: Arc<dyn QueueFileProvider>) -> Result<Self> {
         root.validate_configured_root()?;
-        let queue_dir = root.logical_root_path().join(QUEUE_DIRECTORY);
-        let _ = root.create_dir(&queue_dir, 0o700)?;
+        let requested_queue_dir = root.logical_root_path().join(QUEUE_DIRECTORY);
+        let _ = root.create_dir(&requested_queue_dir, 0o700)?;
         // File Provider may replace a directory placeholder while enumerating it.
         // Bind the current directory identity only after its children are available.
-        coordinate_directory_listing(file_provider.as_ref(), &queue_dir)?;
-        let queue_identity = root
-            .entry_identity(&queue_dir)?
-            .ok_or_else(|| anyhow!("task queue directory disappeared"))?;
+        let (queue_dir, queue_identity) = coordinate_bound_directory_listing(
+            file_provider.as_ref(),
+            &root,
+            &requested_queue_dir,
+        )?;
         let queue_entry = root.bind_entry(&queue_dir, false)?;
         root.validate_private_bound_directory(&queue_entry, queue_identity, 0o700)
             .context("task queue directory must be owner-private")?;
@@ -1135,6 +1185,15 @@ impl DownloadStore {
             .validate_private_bound_directory(&entry, self.queue_identity, 0o700)
     }
 
+    fn coordinated_queue_file_path(&self, accessor_path: &Path) -> Result<PathBuf> {
+        let rooted_path = coordinated_path_under_root(&self.root, accessor_path)?;
+        let relative = rooted_path.strip_prefix(self.root.logical_root_path())?;
+        if relative.as_os_str().is_empty() {
+            bail!("coordinated URL does not name a task queue file");
+        }
+        Ok(rooted_path)
+    }
+
     fn index_path(&self) -> PathBuf {
         self.queue_dir.join(INDEX_FILE)
     }
@@ -1183,19 +1242,12 @@ impl DownloadStore {
         }
 
         let mut contents = None;
-        let mut read = |coordinated_path: &Path| -> Result<()> {
-            if coordinated_path != path {
-                return Err(FileProviderAccessError::new(
-                    path,
-                    "read",
-                    "the queue file moved while access was being coordinated",
-                )
-                .into());
-            }
+        let mut read = |accessor_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(accessor_path)?;
             self.ensure_private_directory()?;
             let file = self
                 .root
-                .open_bound_file(coordinated_path)?
+                .open_bound_file(&coordinated_path)?
                 .ok_or_else(|| anyhow!("task queue file disappeared during coordinated access"))?;
             file.validate_private_single_link(0o600).with_context(|| {
                 format!(
@@ -1228,21 +1280,13 @@ impl DownloadStore {
         if contents.len() > MAX_RECORD_BYTES.max(MAX_INDEX_BYTES) {
             bail!("task queue record exceeds the configured size limit");
         }
-        let replacing = self.root.entry_identity(path)?.is_some();
-        let mut write = |coordinated_path: &Path| -> Result<()> {
-            if coordinated_path != path {
-                return Err(FileProviderAccessError::new(
-                    path,
-                    "write",
-                    "the queue file moved while access was being coordinated",
-                )
-                .into());
-            }
+        let mut write = |accessor_path: &Path| -> Result<()> {
+            let coordinated_path = self.coordinated_queue_file_path(accessor_path)?;
             self.ensure_private_directory()?;
-            let temporary = temporary_sibling(coordinated_path);
-            if let Some(file) = self.root.open_bound_file(coordinated_path)? {
+            let temporary = temporary_sibling(&coordinated_path);
+            if let Some(file) = self.root.open_bound_file(&coordinated_path)? {
                 file.validate_private_single_link(0o600)?;
-                let entry = self.root.bind_entry(coordinated_path, false)?;
+                let entry = self.root.bind_entry(&coordinated_path, false)?;
                 self.root.replace_bound_file_atomically_if_identity(
                     &entry,
                     file.identity(),
@@ -1254,7 +1298,7 @@ impl DownloadStore {
                 let (source, identity) = self
                     .root
                     .create_new_bound_file(&temporary, contents, 0o600)?;
-                let destination = self.root.bind_entry(coordinated_path, false)?;
+                let destination = self.root.bind_entry(&coordinated_path, false)?;
                 self.root.rename_via_bound_parents_noreplace_if_identity(
                     &source,
                     &destination,
@@ -1264,7 +1308,7 @@ impl DownloadStore {
             Ok(())
         };
         self.file_provider
-            .coordinate_write(path, replacing, &mut write)
+            .coordinate_write(path, &mut write)
             .map_err(|error| classify_deadlock_error(path, "write", error))
     }
 
@@ -2038,6 +2082,8 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use crate::file_provider::MockQueueFileProvider;
+
     use super::*;
 
     fn temp_queue_root(label: &str) -> PathBuf {
@@ -2175,6 +2221,69 @@ mod tests {
                 .len(),
             2
         );
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn coordinated_accessor_urls_are_rebased_and_stay_within_the_download_root() {
+        let temp_root = temp_queue_root("file-provider-accessor-url");
+        let physical_video_root = temp_root.join("physical-videos");
+        let video_alias = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&physical_video_root).expect("physical video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        symlink(&physical_video_root, &video_alias).expect("video root alias should create");
+
+        let rooted = RootedFs::new(&video_alias).expect("video root should bind");
+        let canonical_video_root = rooted.root_path().to_path_buf();
+        let accessor_record = canonical_video_root
+            .join(QUEUE_DIRECTORY)
+            .join("task-accessor.json");
+        assert_eq!(
+            coordinated_path_under_root(&rooted, &accessor_record)
+                .expect("canonical accessor path should map under its logical root"),
+            video_alias.join(QUEUE_DIRECTORY).join("task-accessor.json")
+        );
+        assert!(coordinated_path_under_root(&rooted, &temp_root.join("outside.json")).is_err());
+        assert!(
+            coordinated_path_under_root(&rooted, &rooted.root_path().join("../outside.json"))
+                .is_err()
+        );
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_alias.clone();
+        config.downloads.pdf_dir = pdf_root;
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        file_provider.rewrite_paths_under(&video_alias, &canonical_video_root);
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
+            .expect("queue should accept canonical accessor URLs within the configured root");
+        let task = test_task(
+            "task-canonical-accessor-url",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            },
+        );
+        assert!(
+            queue
+                .create(task)
+                .expect("task should write through accessor URL")
+        );
+        assert!(
+            queue
+                .get("task-canonical-accessor-url")
+                .expect("task should read through accessor URL")
+                .is_some()
+        );
+        assert!(
+            file_provider
+                .accessor_paths()
+                .iter()
+                .any(|path| path.starts_with(&canonical_video_root)),
+            "mock provider should pass its alternate canonical URL to accessors"
+        );
+
+        drop(queue);
         let _ = fs::remove_dir_all(temp_root);
     }
 
