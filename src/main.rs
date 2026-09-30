@@ -273,12 +273,18 @@ async fn main() -> Result<()> {
                         .await
                         {
                             warn!(error = %err, "failed to persist or handle telegram update");
-                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            if !retry_delay_or_shutdown(&mut shutdown, Duration::from_secs(5)).await? {
+                                info!("shutdown requested during Telegram update retry delay");
+                                break;
+                            }
                         }
                     }
                     Err(err) => {
                         warn!(error = %err, "failed to fetch telegram updates");
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        if !retry_delay_or_shutdown(&mut shutdown, Duration::from_secs(5)).await? {
+                            info!("shutdown requested during Telegram polling retry delay");
+                            break;
+                        }
                     }
                 }
             }
@@ -304,6 +310,19 @@ async fn retry_file_provider_queue_open(
             }
             Err(error) => return Err(error).context("failed to open task queue"),
         }
+    }
+}
+
+async fn retry_delay_or_shutdown(
+    shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
+    delay: Duration,
+) -> Result<bool> {
+    tokio::select! {
+        signal = shutdown => {
+            signal?;
+            Ok(false)
+        }
+        _ = tokio::time::sleep(delay) => Ok(true),
     }
 }
 
@@ -6285,6 +6304,30 @@ mod tests {
 
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
         assert!(format!("{error:#}").contains("simulated permanent queue configuration failure"));
+    }
+
+    #[tokio::test]
+    async fn telegram_retry_backoff_is_interrupted_by_shutdown() {
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let shutdown = async move {
+            let _ = shutdown_rx.await;
+            Ok(())
+        };
+        tokio::pin!(shutdown);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = shutdown_tx.send(());
+        });
+
+        let should_retry = tokio_timeout(
+            Duration::from_secs(1),
+            retry_delay_or_shutdown(&mut shutdown, Duration::from_secs(30)),
+        )
+        .await
+        .expect("shutdown should interrupt the retry backoff")
+        .expect("shutdown signal should be handled successfully");
+
+        assert!(!should_retry, "a shutdown signal must skip the retry");
     }
 
     #[tokio::test]

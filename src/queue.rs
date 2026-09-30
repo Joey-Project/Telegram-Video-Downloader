@@ -1621,10 +1621,7 @@ impl DownloadStore {
 
     fn scan_active_records(&self, index: &mut StoreIndex) -> Result<()> {
         self.ensure_private_directory()?;
-        let queue_entry = self.root.bind_entry(&self.queue_dir, false)?;
-        let entries = self
-            .root
-            .list_bound_directory(&queue_entry, self.queue_identity)?;
+        let entries = self.list_coordinated_queue_directory()?;
         if entries.len() > MAX_ACTIVE_RECORDS {
             bail!("task queue contains more than {MAX_ACTIVE_RECORDS} entries");
         }
@@ -1668,6 +1665,39 @@ impl DownloadStore {
             }
         }
         Ok(())
+    }
+
+    fn list_coordinated_queue_directory(&self) -> Result<Vec<(std::ffi::OsString, EntryIdentity)>> {
+        let mut entries = None;
+        let mut list_entries = |coordinated_path: &Path| -> Result<()> {
+            let rooted_accessor = coordinated_path_under_root(&self.root, coordinated_path)?;
+            if rooted_accessor != self.queue_dir {
+                bail!("coordinated task queue directory changed during listing");
+            }
+            let queue_entry = self.root.bind_entry(&rooted_accessor, false)?;
+            let identity = self
+                .root
+                .bound_entry_identity(&queue_entry)?
+                .ok_or_else(|| anyhow!("coordinated task queue directory disappeared"))?;
+            if identity != self.queue_identity {
+                bail!("task queue directory identity changed during coordinated access");
+            }
+            self.root
+                .validate_private_bound_directory(&queue_entry, self.queue_identity, 0o700)
+                .context("task queue directory must remain owner-private")?;
+            entries = Some(
+                self.root
+                    .list_bound_directory(&queue_entry, self.queue_identity)?,
+            );
+            self.root
+                .validate_private_bound_directory(&queue_entry, self.queue_identity, 0o700)
+                .context("task queue directory changed during coordinated listing")?;
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(&self.queue_dir, &mut list_entries)
+            .map_err(|error| classify_deadlock_error(&self.queue_dir, "read", error))?;
+        entries.ok_or_else(|| anyhow!("File Provider did not supply a coordinated queue listing"))
     }
 
     fn reconcile_move_targets(&self, index: &mut StoreIndex) -> Result<()> {
@@ -2221,6 +2251,42 @@ mod tests {
                 .len(),
             2
         );
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn queue_listing_coordinates_each_queue_directory_scan() {
+        let temp_root = temp_queue_root("coordinated-queue-scans");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root.clone();
+        config.downloads.pdf_dir = pdf_root.clone();
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
+            .expect("queue should open with the mock File Provider");
+        let reads_before_listing = file_provider.read_paths().len();
+
+        queue
+            .list(123_456_789, false, 0)
+            .expect("queue listing should scan both stores");
+
+        let reads = file_provider.read_paths();
+        let listing_reads = &reads[reads_before_listing..];
+        assert!(
+            listing_reads.contains(&video_root.join(QUEUE_DIRECTORY)),
+            "video queue directory scans should use coordinated reads: {listing_reads:?}"
+        );
+        assert!(
+            listing_reads.contains(&pdf_root.join(QUEUE_DIRECTORY)),
+            "PDF queue directory scans should use coordinated reads: {listing_reads:?}"
+        );
+
+        drop(queue);
         let _ = fs::remove_dir_all(temp_root);
     }
 
