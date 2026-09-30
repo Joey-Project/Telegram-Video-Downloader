@@ -913,6 +913,40 @@ async fn handle_queue_command(
     Ok(())
 }
 
+async fn report_queue_file_provider_callback_error(
+    telegram: &TelegramClient,
+    callback_id: &str,
+    chat_id: i64,
+    task_id: Option<&str>,
+    operation: &'static str,
+    error: &anyhow::Error,
+) -> bool {
+    if !is_file_provider_access_error(error) {
+        return false;
+    }
+
+    warn!(
+        chat_id,
+        task_id = task_id.unwrap_or("queue"),
+        operation,
+        error = %format!("{error:#}"),
+        "File Provider blocked a task queue button"
+    );
+    answer_callback_or_log(
+        telegram,
+        callback_id.to_string(),
+        "Queue files unavailable. Check Finder, then tap again.".to_string(),
+    )
+    .await;
+    send_or_log(
+        telegram,
+        chat_id,
+        "macOS could not coordinate access to the task queue files. Wait until the hidden queue folder is available in Finder, then tap the button again. Existing queue and staging data are retained.".to_string(),
+    )
+    .await;
+    true
+}
+
 async fn handle_queue_callback(
     context: BotContext,
     callback_id: String,
@@ -930,14 +964,38 @@ async fn handle_queue_callback(
                 QueueCallbackAction::Retry(id) => (id, true),
                 _ => unreachable!("matched resume or retry action"),
             };
-            if queue.validate_chat(&id, chat_id).ok().flatten().is_none() {
-                answer_callback_or_log(
-                    &telegram,
-                    callback_id,
-                    "Task not found in this chat.".to_string(),
-                )
-                .await;
-                return;
+            match queue.validate_chat(&id, chat_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Task not found in this chat.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                Err(err) => {
+                    if !report_queue_file_provider_callback_error(
+                        &telegram,
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "validate task before resume or retry",
+                        &err,
+                    )
+                    .await
+                    {
+                        warn!(task_id = %id, error = %err, "failed to validate task for restart");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not check this task.".to_string(),
+                        )
+                        .await;
+                    }
+                    return;
+                }
             }
             let claimed = match queue.claim_resume(&id, retry) {
                 Ok(Some(record)) => record,
@@ -951,13 +1009,24 @@ async fn handle_queue_callback(
                     return;
                 }
                 Err(err) => {
-                    warn!(task_id = %id, error = %err, "failed to claim task for restart");
-                    answer_callback_or_log(
+                    if !report_queue_file_provider_callback_error(
                         &telegram,
-                        callback_id,
-                        "Could not update this task.".to_string(),
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "claim task for restart",
+                        &err,
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(task_id = %id, error = %err, "failed to claim task for restart");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not update this task.".to_string(),
+                        )
+                        .await;
+                    }
                     return;
                 }
             };
@@ -1008,24 +1077,59 @@ async fn handle_queue_callback(
                 .await;
             }
             Err(err) => {
-                warn!(task_id = %id, error = %err, "failed to cancel persistent task");
-                answer_callback_or_log(
+                if !report_queue_file_provider_callback_error(
                     &telegram,
-                    callback_id,
-                    "Could not cancel this task.".to_string(),
+                    &callback_id,
+                    chat_id,
+                    Some(&id),
+                    "cancel task",
+                    &err,
                 )
-                .await;
+                .await
+                {
+                    warn!(task_id = %id, error = %err, "failed to cancel persistent task");
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Could not cancel this task.".to_string(),
+                    )
+                    .await;
+                }
             }
         },
         QueueCallbackAction::Confirm(id) => {
-            if queue.validate_chat(&id, chat_id).ok().flatten().is_none() {
-                answer_callback_or_log(
-                    &telegram,
-                    callback_id,
-                    "Task not found in this chat.".to_string(),
-                )
-                .await;
-                return;
+            match queue.validate_chat(&id, chat_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Task not found in this chat.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                Err(err) => {
+                    if !report_queue_file_provider_callback_error(
+                        &telegram,
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "validate task before confirming plan",
+                        &err,
+                    )
+                    .await
+                    {
+                        warn!(task_id = %id, error = %err, "failed to validate task for plan confirmation");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not check this task.".to_string(),
+                        )
+                        .await;
+                    }
+                    return;
+                }
             }
             let record = match queue.accept_proposed_plan(&id) {
                 Ok(Some(record)) => record,
@@ -1039,13 +1143,24 @@ async fn handle_queue_callback(
                     return;
                 }
                 Err(err) => {
-                    warn!(task_id = %id, error = %err, "failed to accept changed plan");
-                    answer_callback_or_log(
+                    if !report_queue_file_provider_callback_error(
                         &telegram,
-                        callback_id,
-                        "Could not save the plan confirmation.".to_string(),
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "confirm changed plan",
+                        &err,
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(task_id = %id, error = %err, "failed to accept changed plan");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not save the plan confirmation.".to_string(),
+                        )
+                        .await;
+                    }
                     return;
                 }
             };
@@ -1084,13 +1199,24 @@ async fn handle_queue_callback(
                         .await;
                 }
                 Err(err) => {
-                    warn!(chat_id, error = %err, "failed to load task queue page");
-                    answer_callback_or_log(
+                    if !report_queue_file_provider_callback_error(
                         &telegram,
-                        callback_id,
-                        "Could not load this queue page.".to_string(),
+                        &callback_id,
+                        chat_id,
+                        None,
+                        "load task queue page",
+                        &err,
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(chat_id, error = %err, "failed to load task queue page");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not load this queue page.".to_string(),
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -2470,23 +2596,49 @@ async fn queue_or_prompt_normalized_job(
     task_id: String,
     job: JobRequest,
 ) {
-    match context.queue.update_job_if_current(
-        &task_id,
-        &[TaskStatus::Received, TaskStatus::Preparing],
-        job.clone(),
-        TaskStatus::Preparing,
-    ) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            warn!(
-                task_id,
-                "task is no longer ready for normalized job processing"
-            );
-            return;
-        }
-        Err(err) => {
-            warn!(task_id, error = %err, "failed to persist normalized task plan");
-            return;
+    let mut reported_file_provider_error = false;
+    loop {
+        match context.queue.update_job_if_current(
+            &task_id,
+            &[TaskStatus::Received, TaskStatus::Preparing],
+            job.clone(),
+            TaskStatus::Preparing,
+        ) {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                warn!(
+                    task_id,
+                    "task is no longer ready for normalized job processing"
+                );
+                return;
+            }
+            Err(error) if is_file_provider_access_error(&error) => {
+                warn!(
+                    task_id,
+                    error = %format!("{error:#}"),
+                    "File Provider blocked normalized task persistence; retaining task and retrying"
+                );
+                if !reported_file_provider_error {
+                    send_or_log(
+                        &context.telegram,
+                        chat_id,
+                        format!(
+                            "Task {task_id} is saved in the queue, but macOS temporarily cannot access its queue file. It will retry automatically. Check /queue before resending; the task and staging data are retained."
+                        ),
+                    )
+                    .await;
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(context.queue_start_retry_delay).await;
+            }
+            Err(error) => {
+                warn!(
+                    task_id,
+                    error = %error,
+                    "failed to persist normalized task plan"
+                );
+                return;
+            }
         }
     }
     if job.requires_bilibili_selection() {
@@ -7046,6 +7198,105 @@ mod tests {
         let _ = fs::remove_dir_all(queue_root);
     }
 
+    #[tokio::test]
+    async fn normalized_job_file_provider_write_retries_with_telegram_notice_e2e() {
+        let queue_root = temp_main_test_dir("normalized-job-file-provider-retry-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "normalized-file-provider-retry";
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    952,
+                    1052,
+                    123_456_789,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("task should enter preparing state");
+        file_provider.fail_next_file_provider_write("simulated normalized-job write failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/bangumi/play/ss12345".to_string(),
+            selection: None,
+        };
+        assert!(job.requires_bilibili_selection());
+        queue_or_prompt_normalized_job(context, 123_456_789, 952, task_id.to_string(), job).await;
+
+        let task = queue
+            .get(task_id)
+            .expect("retried task should load")
+            .expect("retried task should remain in queue");
+        assert_eq!(task.status, TaskStatus::AwaitingSelection);
+        assert!(matches!(
+            task.job,
+            JobRequest::Bilibili {
+                selection: None,
+                ..
+            }
+        ));
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let sent_messages = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(sent_messages.len(), 2);
+        assert!(
+            sent_messages[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("retry automatically"))
+        );
+        assert!(
+            sent_messages[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Check /queue before resending"))
+        );
+        assert!(
+            sent_messages[1].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Bilibili"))
+        );
+        assert!(sent_messages[1].body["reply_markup"].is_object());
+
+        pending_bilibili_selection_jobs()
+            .lock()
+            .await
+            .retain(|_, pending| pending.task_id != task_id);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
     #[test]
     fn replayed_multi_link_updates_keep_stable_task_ids() {
         let queue_root = temp_main_test_dir("queue-update-idempotency");
@@ -7234,6 +7485,117 @@ mod tests {
                 .contains("Active and actionable tasks")
         );
 
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn queue_resume_callback_file_provider_read_failure_is_actionable_e2e() {
+        let queue_root = temp_main_test_dir("queue-resume-callback-file-provider-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        config.telegram.allow_all_chats = true;
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "resume-callback-file-provider";
+        let chat_id = 123_456_789;
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    953,
+                    1053,
+                    chat_id,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Interrupted, None)
+            .expect("task should be resumable");
+
+        let (telegram, mut requests, update_sender, shutdown, server) =
+            spawn_fake_telegram_api().await;
+        update_sender
+            .send(vec![serde_json::json!({
+                "update_id": 954,
+                "callback_query": {
+                    "id": "resume-file-provider-1",
+                    "data": queue_callback_data("resume", task_id),
+                    "message": {
+                        "message_id": 1054,
+                        "chat": {"id": chat_id, "type": "private"}
+                    }
+                }
+            })])
+            .expect("fake Telegram should accept callback update");
+        let updates = telegram
+            .get_updates(None, 0)
+            .await
+            .expect("fake Telegram should return callback update");
+        file_provider.fail_next_read("simulated callback File Provider read failure");
+
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        let mut offset = None;
+        process_telegram_updates_with_context(&context, updates, &mut offset)
+            .await
+            .expect("File Provider callback errors should be acknowledged with recovery guidance");
+
+        assert_eq!(offset, Some(955));
+        assert_eq!(
+            queue
+                .get(task_id)
+                .expect("task should load after callback failure")
+                .expect("task should be retained")
+                .status,
+            TaskStatus::Interrupted
+        );
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| request.method.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getUpdates", "answerCallbackQuery", "sendMessage"]
+        );
+        assert!(
+            recorded[1].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Check Finder, then tap again"))
+        );
+        assert!(recorded[2].body["text"].as_str().is_some_and(|text| {
+            text.contains("Wait until the hidden queue folder is available in Finder")
+        }));
+        assert!(
+            recorded[2].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Existing queue and staging data are retained"))
+        );
+
+        drop(context);
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
