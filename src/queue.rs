@@ -1019,6 +1019,37 @@ fn coordinate_directory_listing(file_provider: &dyn QueueFileProvider, path: &Pa
         .map_err(|error| classify_deadlock_error(path, "read", error))
 }
 
+fn coordinate_private_directory_creation(
+    file_provider: &dyn QueueFileProvider,
+    root: &RootedFs,
+    path: &Path,
+    mode: u16,
+) -> Result<()> {
+    let mut created = false;
+    let mut create_directory = |coordinated_path: &Path| -> Result<()> {
+        let rooted_accessor = coordinated_path_under_root(root, coordinated_path)?;
+        if rooted_accessor == root.logical_root_path() {
+            bail!("coordinated queue directory resolved to the download root");
+        }
+        let _ = root.create_dir(&rooted_accessor, mode)?;
+        let entry = root.bind_entry(&rooted_accessor, false)?;
+        let identity = root
+            .bound_entry_identity(&entry)?
+            .ok_or_else(|| anyhow!("coordinated task queue directory disappeared"))?;
+        root.validate_private_bound_directory(&entry, identity, mode)
+            .context("task queue directory must be owner-private")?;
+        created = true;
+        Ok(())
+    };
+    file_provider
+        .coordinate_write(path, &mut create_directory)
+        .map_err(|error| classify_deadlock_error(path, "write", error))?;
+    if !created {
+        bail!("File Provider did not supply a coordinated directory accessor");
+    }
+    Ok(())
+}
+
 fn coordinate_bound_directory_listing(
     file_provider: &dyn QueueFileProvider,
     root: &RootedFs,
@@ -1082,7 +1113,12 @@ impl DownloadStore {
     fn from_root(root: RootedFs, file_provider: Arc<dyn QueueFileProvider>) -> Result<Self> {
         root.validate_configured_root()?;
         let requested_queue_dir = root.logical_root_path().join(QUEUE_DIRECTORY);
-        let _ = root.create_dir(&requested_queue_dir, 0o700)?;
+        coordinate_private_directory_creation(
+            file_provider.as_ref(),
+            &root,
+            &requested_queue_dir,
+            0o700,
+        )?;
         // File Provider may replace a directory placeholder while enumerating it.
         // Bind the current directory identity only after its children are available.
         let (queue_dir, queue_identity) = coordinate_bound_directory_listing(
@@ -2467,9 +2503,14 @@ mod tests {
         let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
         let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
             .expect("queue should open with the mock File Provider");
+        let startup_writes = file_provider.write_paths();
         let startup_reads = file_provider.read_paths();
         for queue_root in [&video_root, &pdf_root] {
             let queue_dir = queue_root.join(QUEUE_DIRECTORY);
+            assert!(
+                startup_writes.contains(&queue_dir),
+                "queue directory creation should use coordinated writes: {startup_writes:?}"
+            );
             assert!(
                 startup_reads.contains(&queue_dir.join(QUEUE_OPERATION_LOCK_FILE)),
                 "operation lock access should use coordinated reads: {startup_reads:?}"

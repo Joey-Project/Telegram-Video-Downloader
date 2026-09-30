@@ -322,6 +322,13 @@ impl MockQueueFileProvider {
             .clone()
     }
 
+    pub(crate) fn write_paths(&self) -> Vec<PathBuf> {
+        self.writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) fn move_paths(&self) -> Vec<(PathBuf, PathBuf)> {
         self.moves
             .lock()

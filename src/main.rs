@@ -24,7 +24,7 @@ use bbdown_core::{
     AccessKeyLoginTicket, CredentialHealthReport, CredentialHealthScope, CredentialHealthStatus,
     CredentialKind, CredentialSource, QrLoginKind, QrLoginState, UgcCollectionReference,
 };
-use tokio::sync::{Mutex, Notify, Semaphore, oneshot};
+use tokio::sync::{Mutex, Notify, Semaphore, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
 
@@ -210,6 +210,13 @@ async fn main() -> Result<()> {
         .first()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
+    // Keep synchronous File Provider coordination off the runtime that observes OS shutdown.
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let worker_result = spawn_bot_runtime_worker(run_bot(config_path, shutdown_receiver))?;
+    supervise_bot_runtime(worker_result, shutdown_sender, shutdown_signal()).await
+}
+
+async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>) -> Result<()> {
     let config = Arc::new(AppConfig::load(&config_path)?);
     config.ensure_runtime_dirs()?;
     for recovery in bilibili_auth::recover_interrupted_auth_cleanup(
@@ -222,7 +229,7 @@ async fn main() -> Result<()> {
         warn!(message = %recovery, "recovered interrupted overwrite transaction");
     }
     let telegram = TelegramClient::new(config.telegram.token.clone());
-    let shutdown = shutdown_signal();
+    let shutdown = wait_for_supervisor_shutdown(shutdown_receiver);
     tokio::pin!(shutdown);
     let startup_config = Arc::clone(&config);
     let Some((queue, restart_summaries)) = retry_file_provider_queue_open(
@@ -298,6 +305,58 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn spawn_bot_runtime_worker<F>(future: F) -> Result<oneshot::Receiver<Result<()>>>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    let (result_sender, result_receiver) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("telegram-bot-runtime".to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build Telegram bot runtime")
+                .and_then(|runtime| runtime.block_on(future));
+            let _ = result_sender.send(result);
+        })
+        .context("failed to start Telegram bot runtime worker")?;
+    Ok(result_receiver)
+}
+
+async fn supervise_bot_runtime(
+    worker_result: oneshot::Receiver<Result<()>>,
+    shutdown_sender: watch::Sender<bool>,
+    shutdown: impl Future<Output = Result<()>>,
+) -> Result<()> {
+    tokio::pin!(shutdown);
+    tokio::select! {
+        signal = &mut shutdown => {
+            signal?;
+            // A synchronous coordinator call may remain blocked. The queue is durable, so let
+            // the process exit without joining the bot runtime and allow LaunchAgent recovery.
+            let _ = shutdown_sender.send_replace(true);
+            info!("shutdown requested");
+            Ok(())
+        }
+        result = worker_result => {
+            result.context("Telegram bot runtime worker exited without a result")?
+        }
+    }
+}
+
+async fn wait_for_supervisor_shutdown(mut shutdown_receiver: watch::Receiver<bool>) -> Result<()> {
+    loop {
+        if *shutdown_receiver.borrow_and_update() {
+            return Ok(());
+        }
+        shutdown_receiver
+            .changed()
+            .await
+            .context("Telegram bot shutdown supervisor exited unexpectedly")?;
+    }
 }
 
 async fn retry_file_provider_queue_open<T, F>(
@@ -6401,6 +6460,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_retries_file_provider_queue_directory_creation_failures() {
+        let queue_root = temp_main_test_dir("queue-directory-file-provider-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        file_provider
+            .fail_next_file_provider_write("simulated queue directory coordination failure");
+        let open_file_provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let config = Arc::new(config);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open_attempts = Arc::clone(&attempts);
+        let open_file_provider = Arc::clone(&open_file_provider);
+        let shutdown = std::future::pending::<Result<()>>();
+        tokio::pin!(shutdown);
+        let queue = retry_file_provider_queue_open(
+            move || {
+                open_attempts.fetch_add(1, Ordering::Relaxed);
+                QueueManager::open_with_file_provider(&config, Arc::clone(&open_file_provider))
+            },
+            Duration::from_millis(1),
+            &mut shutdown,
+        )
+        .await
+        .expect("startup should retry coordinated queue directory creation")
+        .expect("startup should complete before shutdown");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            file_provider.write_paths().first(),
+            Some(&queue_root.join("videos/.telegram-video-downloader-queue")),
+            "the first startup mutation should coordinate queue directory creation"
+        );
+        drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
     async fn startup_retries_file_provider_failure_during_restart_summaries() {
         let queue_root = temp_main_test_dir("queue-startup-summary-file-provider-retry");
         let mut config = AppConfig::for_test();
@@ -6531,6 +6631,58 @@ mod tests {
             .await
             .expect("the detached open worker should finish after release")
             .expect("the worker should report completion");
+    }
+
+    #[tokio::test]
+    async fn shutdown_supervisor_returns_while_bot_runtime_is_blocked() {
+        let (started_sender, started_receiver) = oneshot::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = oneshot::channel();
+        let worker_result = spawn_bot_runtime_worker(async move {
+            started_sender
+                .send(())
+                .expect("test should observe the blocked bot runtime");
+            release_receiver
+                .recv()
+                .expect("test should release the blocked bot runtime");
+            finished_sender
+                .send(())
+                .expect("test should observe bot runtime cleanup");
+            Ok(())
+        })
+        .expect("bot runtime worker should start");
+        tokio_timeout(Duration::from_secs(1), started_receiver)
+            .await
+            .expect("bot runtime should enter its blocking operation")
+            .expect("bot runtime should report that it started");
+
+        let (signal_sender, signal_receiver) = oneshot::channel();
+        let (shutdown_sender, mut shutdown_receiver) = watch::channel(false);
+        let shutdown = async move {
+            signal_receiver
+                .await
+                .context("simulated shutdown signal sender dropped")?;
+            Ok(())
+        };
+        let supervisor = supervise_bot_runtime(worker_result, shutdown_sender, shutdown);
+        tokio::pin!(supervisor);
+
+        signal_sender
+            .send(())
+            .expect("simulated shutdown signal should be delivered");
+        tokio_timeout(Duration::from_secs(1), &mut supervisor)
+            .await
+            .expect("shutdown supervisor must not wait for blocked File Provider work")
+            .expect("shutdown supervision should succeed");
+        assert!(*shutdown_receiver.borrow_and_update());
+
+        release_sender
+            .send(())
+            .expect("test should release the detached runtime worker");
+        tokio_timeout(Duration::from_secs(1), finished_receiver)
+            .await
+            .expect("blocked worker should finish after release")
+            .expect("worker should report test cleanup");
     }
 
     #[tokio::test]
