@@ -2535,7 +2535,12 @@ fn queue_or_prompt_job(
     job: JobRequest,
 ) {
     tokio::spawn(async move {
-        let suppress_extra_file_provider_notice = is_bilibili_ugc_collection_job(&job);
+        let needs_short_link_normalization = matches!(
+            &job,
+            JobRequest::Bilibili { url, .. } if is_b23_short_link_url(url)
+        );
+        let suppress_extra_file_provider_notice =
+            should_suppress_extra_setup_file_provider_notice(&job);
         if !prepare_persisted_task_for_job(
             &context,
             chat_id,
@@ -2546,10 +2551,6 @@ fn queue_or_prompt_job(
         {
             return;
         }
-        let needs_short_link_normalization = matches!(
-            &job,
-            JobRequest::Bilibili { url, .. } if is_b23_short_link_url(url)
-        );
         let job = if needs_short_link_normalization {
             match Arc::clone(&context.job_dispatch.duplicate_scan_semaphore)
                 .acquire_owned()
@@ -2644,7 +2645,8 @@ async fn queue_or_prompt_normalized_job(
     task_id: String,
     job: JobRequest,
 ) {
-    let suppress_extra_file_provider_notice = is_bilibili_ugc_collection_job(&job);
+    let suppress_extra_file_provider_notice =
+        should_suppress_extra_setup_file_provider_notice(&job);
     let mut reported_file_provider_error = false;
     loop {
         match context.queue.update_job_if_current(
@@ -3043,6 +3045,14 @@ fn is_bilibili_ugc_collection_job(job: &JobRequest) -> bool {
         job,
         JobRequest::Bilibili { url, .. } if is_bilibili_ugc_collection_url(url)
     )
+}
+
+fn should_suppress_extra_setup_file_provider_notice(job: &JobRequest) -> bool {
+    is_bilibili_ugc_collection_job(job)
+        || matches!(
+            job,
+            JobRequest::Bilibili { url, .. } if is_b23_short_link_url(url)
+        )
 }
 
 fn is_confirmed_bilibili_ugc_collection_job(job: &JobRequest) -> bool {
@@ -4947,6 +4957,23 @@ async fn forward_progress(
     context: JobProgressContext,
     progress_rx: JobProgressReceiver,
 ) -> Option<CollectionProgressDelivery> {
+    forward_progress_with_retry_delay(
+        telegram,
+        queue,
+        context,
+        progress_rx,
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+    )
+    .await
+}
+
+async fn forward_progress_with_retry_delay(
+    telegram: TelegramClient,
+    queue: Arc<QueueManager>,
+    context: JobProgressContext,
+    progress_rx: JobProgressReceiver,
+    generation_retry_delay: Duration,
+) -> Option<CollectionProgressDelivery> {
     let JobProgressContext {
         chat_id,
         job_id,
@@ -4979,7 +5006,14 @@ async fn forward_progress(
     let mut latest_open = true;
     let mut lifecycle_open = true;
     loop {
-        if !generation_is_current(&queue, &task_id, generation) {
+        if !generation_is_current_with_retry_delay(
+            &queue,
+            &task_id,
+            generation,
+            generation_retry_delay,
+        )
+        .await
+        {
             break;
         }
         if !latest_open && !lifecycle_open {
@@ -4998,7 +5032,14 @@ async fn forward_progress(
             event = lifecycle.recv(), if lifecycle_open => {
                 match event {
                     Some(event) => {
-                        if !generation_is_current(&queue, &task_id, generation) {
+                        if !generation_is_current_with_retry_delay(
+                            &queue,
+                            &task_id,
+                            generation,
+                            generation_retry_delay,
+                        )
+                        .await
+                        {
                             break;
                         }
                         if let JobProgressLifecycleEvent::StagingAttempt { path } = &event {
@@ -5028,7 +5069,14 @@ async fn forward_progress(
                 if changed.is_err() {
                     latest_open = false;
                     } else {
-                        if generation_is_current(&queue, &task_id, generation) {
+                        if generation_is_current_with_retry_delay(
+                            &queue,
+                            &task_id,
+                            generation,
+                            generation_retry_delay,
+                        )
+                        .await
+                        {
                             pending = latest.borrow_and_update().clone();
                         } else {
                             break;
@@ -5324,12 +5372,47 @@ async fn deliver_collection_overview(
     deliver_collection_main_message(context, delivery, overview).await
 }
 
-fn generation_is_current(queue: &QueueManager, task_id: &str, generation: u64) -> bool {
-    match queue.generation_matches(task_id, generation) {
-        Ok(matches) => matches,
-        Err(err) => {
-            warn!(task_id, generation, error = %err, "failed to validate task generation before delivery");
-            false
+async fn generation_is_current(queue: &QueueManager, task_id: &str, generation: u64) -> bool {
+    generation_is_current_with_retry_delay(
+        queue,
+        task_id,
+        generation,
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+    )
+    .await
+}
+
+async fn generation_is_current_with_retry_delay(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    retry_delay: Duration,
+) -> bool {
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.generation_matches(task_id, generation) {
+            Ok(matches) => return matches,
+            Err(err) if is_file_provider_access_error(&err) => {
+                if !reported_file_provider_error {
+                    warn!(
+                        task_id,
+                        generation,
+                        error = %format!("{err:#}"),
+                        "File Provider blocked task generation lookup; retrying before progress delivery"
+                    );
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(err) => {
+                warn!(
+                    task_id,
+                    generation,
+                    error = %format!("{err:#}"),
+                    "failed to validate task generation before delivery"
+                );
+                return false;
+            }
         }
     }
 }
@@ -5343,7 +5426,7 @@ async fn edit_task_message_if_current(
     message_id: i64,
     message: String,
 ) -> bool {
-    if !generation_is_current(queue, task_id, generation) {
+    if !generation_is_current(queue, task_id, generation).await {
         return false;
     }
     match telegram
@@ -5367,7 +5450,7 @@ async fn edit_task_message_without_keyboard_if_current(
     message_id: i64,
     message: String,
 ) -> bool {
-    if !generation_is_current(queue, task_id, generation) {
+    if !generation_is_current(queue, task_id, generation).await {
         return false;
     }
     match telegram
@@ -5393,7 +5476,7 @@ async fn edit_task_message_with_keyboard_if_current(
     message: String,
     keyboard: InlineKeyboardMarkup,
 ) -> bool {
-    if !generation_is_current(queue, task_id, generation) {
+    if !generation_is_current(queue, task_id, generation).await {
         return false;
     }
     match telegram
@@ -5412,7 +5495,7 @@ async fn send_task_message_id_if_current(
     context: ProgressDeliveryContext<'_>,
     message: String,
 ) -> Option<i64> {
-    if !generation_is_current(context.queue, context.task_id, context.generation) {
+    if !generation_is_current(context.queue, context.task_id, context.generation).await {
         return None;
     }
     send_or_log_message_id(context.telegram, context.chat_id, message).await
@@ -5423,7 +5506,7 @@ async fn send_task_message_with_keyboard_id_if_current(
     message: String,
     keyboard: InlineKeyboardMarkup,
 ) -> Option<i64> {
-    if !generation_is_current(context.queue, context.task_id, context.generation) {
+    if !generation_is_current(context.queue, context.task_id, context.generation).await {
         return None;
     }
     match context
@@ -5447,7 +5530,7 @@ async fn edit_collection_entry_message(
     let Some(message_id) = delivery.message_id else {
         return;
     };
-    if !generation_is_current(context.queue, context.task_id, context.generation) {
+    if !generation_is_current(context.queue, context.task_id, context.generation).await {
         return;
     }
     if let Err(err) = context
@@ -5488,7 +5571,7 @@ async fn deliver_collection_main_message(
             .as_ref()
             .map(|manifest| collection_details_keyboard(token, manifest, delivery.details_page))
     });
-    if !generation_is_current(context.queue, context.task_id, context.generation) {
+    if !generation_is_current(context.queue, context.task_id, context.generation).await {
         return delivery.main_delivery;
     }
     match delivery.main_delivery {
@@ -5645,7 +5728,7 @@ async fn deliver_progress_message(
     message: String,
     fallback_progress: &str,
 ) -> ProgressDelivery {
-    if !generation_is_current(context.queue, context.task_id, context.generation) {
+    if !generation_is_current(context.queue, context.task_id, context.generation).await {
         return delivery;
     }
     match delivery {
@@ -5654,7 +5737,7 @@ async fn deliver_progress_message(
                 return delivery;
             }
             delivery = delivery.after_edit_result(false);
-            if !generation_is_current(context.queue, context.task_id, context.generation) {
+            if !generation_is_current(context.queue, context.task_id, context.generation).await {
                 return delivery;
             }
             send_or_log(
@@ -6888,6 +6971,52 @@ mod tests {
             completed_entries,
             current_entry,
         }
+    }
+
+    fn generation_guard_collection_queue(
+        label: &str,
+        task_id: &str,
+        job_id: u64,
+        chat_id: i64,
+    ) -> (
+        PathBuf,
+        AppConfig,
+        Arc<QueueManager>,
+        Arc<MockQueueFileProvider>,
+    ) {
+        let queue_root = temp_main_test_dir(label);
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open with mock File Provider access"),
+        );
+        let job = JobRequest::Bilibili {
+            url: "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+                .to_string(),
+            selection: Some(BilibiliSelection::All),
+        };
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    job_id as i64,
+                    job_id as i64 + 1_000,
+                    chat_id,
+                    Some(42),
+                    0,
+                    job,
+                ))
+                .expect("collection task should persist")
+        );
+
+        (queue_root, config, queue, file_provider)
     }
 
     #[test]
@@ -8124,6 +8253,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawned_short_link_setup_retries_file_provider_without_extra_notice_e2e() {
+        let queue_root = temp_main_test_dir("spawned-short-link-setup-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "task-short-link-setup-retry";
+        let short_link_job = JobRequest::Bilibili {
+            url: "https://b23.tv/season-short-link".to_string(),
+            selection: None,
+        };
+        assert!(should_suppress_extra_setup_file_provider_notice(
+            &short_link_job
+        ));
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    960,
+                    1060,
+                    123_456_789,
+                    Some(701),
+                    0,
+                    short_link_job.clone(),
+                ))
+                .expect("short-link task should persist")
+        );
+        file_provider.fail_next_file_provider_write("simulated short-link setup write failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        assert!(
+            prepare_persisted_task_for_job(
+                &context,
+                123_456_789,
+                task_id,
+                should_suppress_extra_setup_file_provider_notice(&short_link_job),
+            )
+            .await
+        );
+        assert_eq!(
+            queue
+                .get(task_id)
+                .expect("retried short-link task should load")
+                .expect("short-link task should remain queued for normalization")
+                .status,
+            TaskStatus::Preparing
+        );
+        assert!(
+            take_fake_telegram_requests(&mut requests).is_empty(),
+            "unresolved Bilibili short-link setup should not send an extra retry notice"
+        );
+
+        drop(context);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
     async fn normalized_job_file_provider_write_retries_with_telegram_notice_e2e() {
         let queue_root = temp_main_test_dir("normalized-job-file-provider-retry-e2e");
         let mut config = AppConfig::for_test();
@@ -8589,6 +8795,175 @@ mod tests {
         );
 
         drop(context);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn collection_progress_retries_file_provider_generation_lookup_without_duplicate_entry_send_e2e()
+     {
+        let task_id = "collection-generation-lookup-retry";
+        let job_id = 958;
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, file_provider) = generation_guard_collection_queue(
+            "collection-generation-lookup-retry-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        queue
+            .set_status(task_id, TaskStatus::Running, None)
+            .expect("collection task should be running");
+        queue
+            .set_status_message_id(task_id, 700)
+            .expect("main collection message should be associated");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let reads_before_lookup = file_provider.read_paths().len();
+        file_provider.fail_next_read("simulated transient generation lookup failure");
+        let mut manifest = test_collection_manifest(1);
+        manifest.skipped_entries = 0;
+        manifest.planned_entries = 1;
+        manifest.entries[0].status = BilibiliCollectionEntryStatus::Queued;
+        let entry = test_collection_entry_progress(&manifest, 1);
+        let (progress, progress_rx) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress_with_retry_delay(
+            telegram,
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id,
+                job_id,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: true,
+                status_message_id: Some(700),
+                update_interval: Duration::from_secs(60),
+            },
+            progress_rx,
+            Duration::ZERO,
+        ));
+
+        progress.send_lifecycle(JobProgressLifecycleEvent::Resolved {
+            manifest: manifest.clone(),
+            snapshot: test_collection_snapshot(&manifest, 0, None),
+        });
+        progress.send_lifecycle(JobProgressLifecycleEvent::EntryStarted {
+            entry: entry.clone(),
+            snapshot: test_collection_snapshot(&manifest, 0, Some(entry)),
+        });
+        drop(progress);
+
+        let delivery = tokio_timeout(Duration::from_secs(5), progress_task)
+            .await
+            .expect("progress forwarding should resume after the transient lookup error")
+            .expect("progress forwarding task should not panic")
+            .expect("resolved collection should retain its message tracker");
+        assert_eq!(delivery.entries.len(), 1);
+        assert_eq!(delivery.entries[&1].message_id, Some(1_000));
+        assert!(
+            file_provider.read_paths().len() >= reads_before_lookup + 2,
+            "generation lookup should retry the failed File Provider read"
+        );
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let sends = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sends.len(),
+            1,
+            "retrying generation lookup must not duplicate sends"
+        );
+        assert!(
+            sends[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Entry: 1/1"))
+        );
+        assert!(recorded.iter().any(|request| {
+            request.method == "editMessageText" && request.body["message_id"].as_i64() == Some(700)
+        }));
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn collection_progress_discards_events_when_generation_changes_during_file_provider_retry_e2e()
+     {
+        let task_id = "collection-generation-changes-during-retry";
+        let job_id = 959;
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, file_provider) = generation_guard_collection_queue(
+            "collection-generation-changes-during-retry-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        queue
+            .fail_if_generation(task_id, 0, "simulated prior failure".to_string())
+            .expect("task should enter the failed state")
+            .expect("current generation should fail");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let reads_before_lookup = file_provider.read_paths().len();
+        file_provider.fail_next_read("simulated transient generation lookup failure");
+        let mut manifest = test_collection_manifest(1);
+        manifest.skipped_entries = 0;
+        manifest.planned_entries = 1;
+        manifest.entries[0].status = BilibiliCollectionEntryStatus::Queued;
+        let entry = test_collection_entry_progress(&manifest, 1);
+        let (progress, progress_rx) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress_with_retry_delay(
+            telegram,
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id,
+                job_id,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: true,
+                status_message_id: None,
+                update_interval: Duration::from_secs(60),
+            },
+            progress_rx,
+            Duration::from_millis(250),
+        ));
+        progress.send_lifecycle(JobProgressLifecycleEvent::Resolved {
+            manifest: manifest.clone(),
+            snapshot: test_collection_snapshot(&manifest, 0, None),
+        });
+        progress.send_lifecycle(JobProgressLifecycleEvent::EntryStarted {
+            entry: entry.clone(),
+            snapshot: test_collection_snapshot(&manifest, 0, Some(entry)),
+        });
+        drop(progress);
+
+        tokio_timeout(Duration::from_secs(2), async {
+            while file_provider.read_paths().len() <= reads_before_lookup {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the injected generation read should fail before resume");
+        let resumed = queue
+            .claim_resume(task_id, true)
+            .expect("failed collection should resume")
+            .expect("failed task should be eligible for resume");
+        assert_eq!(resumed.generation, 1);
+
+        let delivery = tokio_timeout(Duration::from_secs(2), progress_task)
+            .await
+            .expect("stale progress forwarding should stop after retry")
+            .expect("progress forwarding task should not panic")
+            .expect("collection tracker should be returned");
+        assert!(delivery.entries.is_empty());
+        assert!(take_fake_telegram_requests(&mut requests).is_empty());
+
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
