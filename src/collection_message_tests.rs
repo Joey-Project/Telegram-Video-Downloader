@@ -134,19 +134,24 @@ mod collection_message_tests {
         start_entry: bool,
         complete_entry: bool,
         fail: bool,
+        requests: &mut mpsc::UnboundedReceiver<FakeTelegramRequest>,
     ) -> Option<CollectionProgressDelivery> {
+        let started_at = std::time::Instant::now();
         let (progress, progress_rx) = job_progress_channel();
-        let progress_task = tokio::spawn(forward_progress(
+        let mut progress_task = tokio::spawn(forward_progress(
             telegram.clone(),
             Arc::clone(&queue),
             progress_context(task_id, chat_id, job_id, generation, None),
             progress_rx,
         ));
 
+        let mut lifecycle_event_count = 0;
+        let mut progress_update_count = 0;
         progress.send_lifecycle(JobProgressLifecycleEvent::Resolved {
             snapshot: test_collection_snapshot(&manifest, 0, None),
             manifest: manifest.clone(),
         });
+        lifecycle_event_count += 1;
 
         let entry = test_collection_entry_progress(&manifest, 1);
         if start_entry {
@@ -154,7 +159,9 @@ mod collection_message_tests {
                 entry: entry.clone(),
                 snapshot: test_collection_snapshot(&manifest, 0, Some(entry.clone())),
             });
+            lifecycle_event_count += 1;
             progress.send_replace(Some(collection_progress(&manifest)));
+            progress_update_count += 1;
         }
 
         if complete_entry {
@@ -163,20 +170,49 @@ mod collection_message_tests {
                 file_count: 1,
                 snapshot: test_collection_snapshot(&manifest, 1, None),
             });
+            lifecycle_event_count += 1;
             progress.send_lifecycle(JobProgressLifecycleEvent::Completed {
                 snapshot: test_collection_snapshot(&manifest, 1, None),
             });
+            lifecycle_event_count += 1;
         } else if fail {
             progress.send_lifecycle(JobProgressLifecycleEvent::Failed {
                 snapshot: test_collection_snapshot(&manifest, 0, start_entry.then_some(entry)),
             });
+            lifecycle_event_count += 1;
         }
 
         drop(progress);
-        tokio_timeout(Duration::from_secs(5), progress_task)
-            .await
-            .expect("collection progress forwarding should finish")
-            .expect("collection progress task should not panic")
+        match tokio_timeout(Duration::from_secs(5), &mut progress_task).await {
+            Ok(result) => result.expect("collection progress task should not panic"),
+            Err(_) => {
+                progress_task.abort();
+                let _ = progress_task.await;
+                let observed = take_fake_telegram_requests(requests);
+                let sends = observed
+                    .iter()
+                    .filter(|request| request.method == "sendMessage")
+                    .count();
+                let edits = observed
+                    .iter()
+                    .filter(|request| request.method == "editMessageText")
+                    .count();
+                let last_request = observed
+                    .last()
+                    .map(|request| {
+                        format!(
+                            "{} message_id={:?}",
+                            request.method,
+                            request.body["message_id"].as_i64()
+                        )
+                    })
+                    .unwrap_or_else(|| "none".to_string());
+                panic!(
+                    "collection progress forwarding timed out after {:?}; queued {lifecycle_event_count} lifecycle events and {progress_update_count} progress updates; observed {sends} sends and {edits} edits; last request: {last_request}",
+                    started_at.elapsed()
+                );
+            }
+        }
     }
 
     fn sent_entry_message_ids(requests: &[FakeTelegramRequest]) -> HashMap<u32, i64> {
@@ -511,6 +547,7 @@ mod collection_message_tests {
             true,
             false,
             false,
+            &mut requests,
         )
         .await
         .expect("first generation should create collection delivery state");
@@ -568,6 +605,7 @@ mod collection_message_tests {
             true,
             true,
             false,
+            &mut requests,
         )
         .await;
         assert!(
@@ -595,6 +633,7 @@ mod collection_message_tests {
             true,
             true,
             false,
+            &mut requests,
         )
         .await
         .expect("new generation should create collection delivery state");
@@ -667,6 +706,7 @@ mod collection_message_tests {
             true,
             false,
             true,
+            &mut requests,
         )
         .await
         .expect("failed collection should retain delivery state");
@@ -737,6 +777,7 @@ mod collection_message_tests {
             false,
             false,
             true,
+            &mut requests,
         )
         .await
         .expect("resolved collection should keep its main message tracker");
@@ -790,6 +831,7 @@ mod collection_message_tests {
             true,
             true,
             false,
+            &mut requests,
         )
         .await
         .expect("verified collection should keep delivery state");

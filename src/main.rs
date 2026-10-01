@@ -4692,14 +4692,25 @@ async fn run_queued_job(
     {
         warn!(task_id, error = %err, "failed to persist task cancellation");
     }
-    if result.as_ref().is_some_and(Result::is_err)
-        && queue
-            .get_if_generation(&task_id, generation)
-            .ok()
-            .flatten()
-            .is_some_and(|task| task.status != TaskStatus::Cancelled)
-    {
-        send_collection_failure_lifecycle(&completion_progress);
+    if result.as_ref().is_some_and(Result::is_err) {
+        match task_if_generation_with_retry_delay(
+            &queue,
+            &task_id,
+            generation,
+            context.queue_start_retry_delay,
+        )
+        .await
+        {
+            Ok(Some(task)) if task.status != TaskStatus::Cancelled => {
+                send_collection_failure_lifecycle(&completion_progress);
+            }
+            Ok(_) => {}
+            Err(err) => warn!(
+                task_id,
+                error = %err,
+                "failed to read task state before collection failure progress"
+            ),
+        }
     }
     drop(completion_progress);
     let collection_delivery = match progress_task.await {
@@ -4787,7 +4798,14 @@ async fn run_queued_job(
                     final_outcome = CollectionFinalOutcome::Verified;
                     success_message
                 }
-                Ok(None) => match queue.get_if_generation(&task_id, generation) {
+                Ok(None) => match task_if_generation_with_retry_delay(
+                    &queue,
+                    &task_id,
+                    generation,
+                    context.queue_start_retry_delay,
+                )
+                .await
+                {
                     Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
                         final_outcome = CollectionFinalOutcome::Cancelled;
                         format!("Canceled job #{job_id}: {}", job.label())
@@ -4801,17 +4819,28 @@ async fn run_queued_job(
                     let error_chain = redact_sensitive_text(&format!(
                         "failed to verify or persist published outputs: {err:#}"
                     ));
-                    match queue.get_if_generation(&task_id, generation) {
+                    match task_if_generation_with_retry_delay(
+                        &queue,
+                        &task_id,
+                        generation,
+                        context.queue_start_retry_delay,
+                    )
+                    .await
+                    {
                         Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
                             final_outcome = CollectionFinalOutcome::Cancelled;
                             format!("Canceled job #{job_id}: {}", job.label())
                         }
-                        Ok(Some(task)) if task.status == TaskStatus::Completed => format!(
-                            "Finished job #{job_id}: {}\nSaved: {}\nTask history could not be relocated beside the media file: {}",
-                            job.label(),
-                            report.saved_location,
-                            truncate(&error_chain),
-                        ),
+                        Ok(Some(task)) if task.status == TaskStatus::Completed => {
+                            let (outcome, message) = completed_task_finalization_fallback(
+                                job_id,
+                                job.label(),
+                                &report.saved_location,
+                                &error_chain,
+                            );
+                            final_outcome = outcome;
+                            message
+                        }
                         Ok(Some(_)) => {
                             match queue.fail_if_generation(
                                 &task_id,
@@ -4844,7 +4873,14 @@ async fn run_queued_job(
         Some(Err(err)) => {
             let error_chain = redact_sensitive_text(&format!("{err:#}"));
             error!(job_id, error = %error_chain, "job failed");
-            match queue.get_if_generation(&task_id, generation) {
+            match task_if_generation_with_retry_delay(
+                &queue,
+                &task_id,
+                generation,
+                context.queue_start_retry_delay,
+            )
+            .await
+            {
                 Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
                     final_outcome = CollectionFinalOutcome::Cancelled;
                     format!("Canceled job #{job_id}: {}", job.label())
@@ -4872,7 +4908,14 @@ async fn run_queued_job(
                 }
             }
         }
-        None => match queue.get_if_generation(&task_id, generation) {
+        None => match task_if_generation_with_retry_delay(
+            &queue,
+            &task_id,
+            generation,
+            context.queue_start_retry_delay,
+        )
+        .await
+        {
             Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
                 final_outcome = CollectionFinalOutcome::Cancelled;
                 format!("Canceled job #{job_id}: {}", job.label())
@@ -5405,14 +5448,36 @@ async fn generation_is_current_with_retry_delay(
                 tokio::time::sleep(retry_delay).await;
             }
             Err(err) => {
-                warn!(
-                    task_id,
-                    generation,
-                    error = %format!("{err:#}"),
-                    "failed to validate task generation before delivery"
-                );
+                warn!(task_id, generation, error = %format!("{err:#}"), "failed to validate task generation before delivery");
                 return false;
             }
+        }
+    }
+}
+
+async fn task_if_generation_with_retry_delay(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    retry_delay: Duration,
+) -> Result<Option<TaskRecord>> {
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.get_if_generation(task_id, generation) {
+            Ok(task) => return Ok(task),
+            Err(err) if is_file_provider_access_error(&err) => {
+                if !reported_file_provider_error {
+                    warn!(
+                        task_id,
+                        generation,
+                        error = %format!("{err:#}"),
+                        "File Provider blocked task record lookup; retrying before final delivery"
+                    );
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(err) => return Err(err),
         }
     }
 }
@@ -6056,6 +6121,21 @@ enum CollectionFinalOutcome {
     Verified,
     Failed,
     Cancelled,
+}
+
+fn completed_task_finalization_fallback(
+    job_id: u64,
+    job_label: &str,
+    saved_location: &str,
+    error_chain: &str,
+) -> (CollectionFinalOutcome, String) {
+    (
+        CollectionFinalOutcome::Verified,
+        format!(
+            "Finished job #{job_id}: {job_label}\nSaved: {saved_location}\nTask history could not be relocated beside the media file: {}",
+            truncate(error_chain),
+        ),
+    )
 }
 
 fn render_job_progress(progress: &JobProgress) -> String {
@@ -8634,6 +8714,130 @@ mod tests {
             stop_fake_telegram_api(shutdown, server).await;
             let _ = fs::remove_dir_all(queue_root);
         }
+    }
+
+    #[tokio::test]
+    async fn completed_collection_with_sidecar_relocation_error_stays_verified_e2e() {
+        let task_id = "completed-collection-sidecar-relocation-error";
+        let job_id = 961;
+        let chat_id = 123_456_789;
+        let (queue_root, config, queue, file_provider) = generation_guard_collection_queue(
+            "completed-collection-sidecar-relocation-error-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        queue
+            .set_status(task_id, TaskStatus::Running, None)
+            .expect("collection task should run before verification");
+        queue
+            .begin_verification_if_generation(task_id, 0)
+            .expect("collection verification should begin")
+            .expect("current collection should remain present");
+
+        let media_path = config.downloads.video_dir.join("published-output.mp4");
+        fs::write(&media_path, b"verified published media")
+            .expect("published collection output should write");
+        // Queue reads write the index once; completion writes the completed record and move intent
+        // twice; fail the next record write after the sidecar move has happened.
+        file_provider.fail_write_after(3, "simulated sidecar relocation write failure");
+        let sidecar_error = queue
+            .complete_if_generation(
+                task_id,
+                0,
+                media_path.display().to_string(),
+                std::slice::from_ref(&media_path),
+                BTreeMap::new(),
+            )
+            .expect_err("sidecar relocation should fail after completion persistence");
+        assert!(is_file_provider_access_error(&sidecar_error));
+
+        file_provider.fail_next_read("simulated transient terminal task lookup failure");
+        let completed_task =
+            task_if_generation_with_retry_delay(&queue, task_id, 0, Duration::ZERO)
+                .await
+                .expect("terminal generation lookup should retry a transient File Provider error")
+                .expect("completed task should remain in the current generation");
+        assert_eq!(completed_task.status, TaskStatus::Completed);
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let mut manifest = test_collection_manifest(1);
+        manifest.skipped_entries = 0;
+        manifest.planned_entries = 1;
+        manifest.entries[0].status = BilibiliCollectionEntryStatus::Queued;
+        let entry = test_collection_entry_progress(&manifest, 1);
+        let snapshot = test_collection_snapshot(&manifest, 1, None);
+        let error_chain =
+            format!("failed to verify or persist published outputs: {sidecar_error:#}");
+        let (outcome, final_message) = completed_task_finalization_fallback(
+            job_id,
+            "Bilibili download",
+            &media_path.display().to_string(),
+            &error_chain,
+        );
+        assert_eq!(outcome, CollectionFinalOutcome::Verified);
+        assert!(
+            final_message.contains("Task history could not be relocated beside the media file")
+        );
+
+        let delivery = CollectionProgressDelivery {
+            main_delivery: ProgressDelivery::Edit(700),
+            entries: HashMap::from([(
+                1,
+                CollectionEntryDelivery {
+                    message_id: Some(701),
+                    entry,
+                    snapshot,
+                    state: CollectionEntryDeliveryState::DownloadedPendingVerification,
+                },
+            )]),
+            manifest: None,
+            details_token: None,
+            details_page: 0,
+            overview: String::new(),
+        };
+        finalize_collection_messages(
+            ProgressDeliveryContext {
+                telegram: &telegram,
+                queue: &queue,
+                task_id,
+                generation: 0,
+                chat_id,
+                job_id,
+                job_label: "Bilibili download",
+            },
+            delivery,
+            final_message,
+            outcome,
+        )
+        .await;
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| (request.method.as_str(), request.body["message_id"].as_i64()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("editMessageText", Some(701)),
+                ("editMessageText", Some(700))
+            ]
+        );
+        assert!(
+            recorded[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Downloaded, published, and verified."))
+        );
+        assert!(
+            recorded[1].body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Finished job #961")
+                    && text.contains("Task history could not be relocated beside the media file"))
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
     }
 
     #[tokio::test]
