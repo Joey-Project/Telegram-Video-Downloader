@@ -1,6 +1,6 @@
 mod collection_message_tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     const CHAT_ID: i64 = 123_456_789;
     const JOB_LABEL: &str = "Bilibili download";
@@ -393,6 +393,133 @@ mod collection_message_tests {
             shutdown_tx,
             server,
             failed_once,
+        )
+    }
+
+    async fn spawn_fake_telegram_api_with_two_terminal_entry_edit_failures() -> (
+        TelegramClient,
+        mpsc::UnboundedReceiver<FakeTelegramRequest>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram API should bind localhost");
+        let address = listener
+            .local_addr()
+            .expect("fake Telegram API should expose its address");
+        let (requests_tx, requests_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let terminal_edit_attempts = Arc::new(AtomicUsize::new(0));
+        let terminal_edit_attempts_for_server = Arc::clone(&terminal_edit_attempts);
+        let server = tokio::spawn(async move {
+            let mut next_message_id = 1_000_i64;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => return Ok(()),
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.context("fake Telegram API accept failed")?;
+                        let request = read_fake_telegram_request(&mut stream).await?;
+                        let is_terminal_entry_edit = request.method == "editMessageText"
+                            && request.body["message_id"].as_i64() == Some(1_001)
+                            && request.body["text"]
+                                .as_str()
+                                .is_some_and(|text| text.contains("Downloaded, published, and verified."));
+                        let fail_this_edit = is_terminal_entry_edit
+                            && terminal_edit_attempts_for_server.fetch_add(1, Ordering::SeqCst) < 2;
+                        let response = if fail_this_edit {
+                            let payload = serde_json::json!({
+                                "ok": false,
+                                "error_code": 500,
+                                "description": "simulated transient terminal entry edit failure"
+                            })
+                            .to_string();
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                                payload.len()
+                            )
+                        } else {
+                            fake_telegram_response(&request, &mut next_message_id, Vec::new())
+                        };
+                        stream
+                            .write_all(response.as_bytes())
+                            .await
+                            .context("fake Telegram API response write failed")?;
+                        let _ = requests_tx.send(request);
+                    }
+                }
+            }
+        });
+        let token = AppConfig::for_test().telegram.token;
+        (
+            TelegramClient::with_test_api_base_url(token, format!("http://{address}")),
+            requests_rx,
+            shutdown_tx,
+            server,
+            terminal_edit_attempts,
+        )
+    }
+
+    async fn spawn_fake_telegram_api_with_blocked_failed_terminal_entry_edit() -> (
+        TelegramClient,
+        mpsc::UnboundedReceiver<(FakeTelegramRequest, oneshot::Sender<String>)>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram API should bind localhost");
+        let address = listener
+            .local_addr()
+            .expect("fake Telegram API should expose its address");
+        let (terminal_tx, terminal_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let send_attempts = Arc::new(AtomicUsize::new(0));
+        let send_attempts_for_server = Arc::clone(&send_attempts);
+        let server = tokio::spawn(async move {
+            let mut next_message_id = 1_000_i64;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => return Ok(()),
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.context("fake Telegram API accept failed")?;
+                        let request = read_fake_telegram_request(&mut stream).await?;
+                        if request.method == "sendMessage" {
+                            send_attempts_for_server.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let is_failed_terminal_edit = request.method == "editMessageText"
+                            && request.body["message_id"].as_i64() == Some(1_001)
+                            && request.body["text"]
+                                .as_str()
+                                .is_some_and(|text| text.contains("Downloaded, but collection publication or final verification failed."));
+                        let response = if is_failed_terminal_edit {
+                            let (response_tx, response_rx) = oneshot::channel();
+                            if terminal_tx.send((request, response_tx)).is_err() {
+                                return Ok(());
+                            }
+                            response_rx
+                                .await
+                                .context("test should release the terminal edit response")?
+                        } else {
+                            fake_telegram_response(&request, &mut next_message_id, Vec::new())
+                        };
+                        stream
+                            .write_all(response.as_bytes())
+                            .await
+                            .context("fake Telegram API response write failed")?;
+                    }
+                }
+            }
+        });
+        let token = AppConfig::for_test().telegram.token;
+        (
+            TelegramClient::with_test_api_base_url(token, format!("http://{address}")),
+            terminal_rx,
+            shutdown_tx,
+            server,
+            send_attempts,
         )
     }
 
@@ -1426,6 +1553,221 @@ mod collection_message_tests {
                 .status_message_id,
             Some(1_000)
         );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn verified_terminal_entry_edit_retries_same_id_without_duplicate_send_e2e() {
+        let (telegram, mut requests, shutdown, server, terminal_edit_attempts) =
+            spawn_fake_telegram_api_with_two_terminal_entry_edit_failures().await;
+        let task_id = "task-collection-terminal-entry-edit-retry";
+        let (queue_root, config, queue) = create_running_collection_queue(
+            "collection-terminal-entry-edit-retry",
+            task_id,
+            CHAT_ID,
+            82,
+        );
+        let delivery = track_single_entry_collection(
+            &telegram,
+            Arc::clone(&queue),
+            task_id,
+            CHAT_ID,
+            82,
+            0,
+            queued_only_manifest(),
+            true,
+            true,
+            false,
+            &mut requests,
+        )
+        .await
+        .expect("resolved collection should retain terminal entry delivery state");
+        assert!(
+            queue
+                .begin_verification_if_generation(task_id, 0)
+                .expect("verification should begin")
+                .is_some()
+        );
+        assert!(
+            queue
+                .complete_if_generation(
+                    task_id,
+                    0,
+                    config
+                        .downloads
+                        .video_dir
+                        .join("mock-terminal-entry-output")
+                        .display()
+                        .to_string(),
+                    &[],
+                    BTreeMap::new(),
+                )
+                .expect("mock verification should complete")
+                .is_some()
+        );
+
+        finalize_collection_messages(
+            finalization_context(&telegram, &queue, task_id, 0, CHAT_ID, 82),
+            delivery,
+            "Finished job #82: Bilibili download\nSaved: mock output".to_string(),
+            CollectionFinalOutcome::Verified,
+        )
+        .await;
+
+        assert_eq!(
+            terminal_edit_attempts.load(Ordering::SeqCst),
+            3,
+            "two transient failures should be followed by one successful bounded retry"
+        );
+        let observed = take_fake_telegram_requests(&mut requests);
+        let sends = observed
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .count();
+        assert_eq!(
+            sends, 2,
+            "terminal edit failures must not send replacement main or entry messages"
+        );
+        let terminal_edits = observed
+            .iter()
+            .filter(|request| {
+                request.method == "editMessageText"
+                    && request.body["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Downloaded, published, and verified."))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_edits.len(), 3);
+        assert!(
+            terminal_edits
+                .iter()
+                .all(|request| request.body["message_id"].as_i64() == Some(1_001))
+        );
+        assert!(observed.iter().any(|request| {
+            request.method == "editMessageText"
+                && request.body["message_id"].as_i64() == Some(1_000)
+                && request.body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Finished job #82"))
+        }));
+        let completed = queue
+            .get(task_id)
+            .expect("completed collection should load")
+            .expect("completed collection should remain");
+        assert_eq!(completed.status, TaskStatus::Completed);
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_entry_retry_stops_after_generation_changes_e2e() {
+        let (telegram, mut terminal_requests, shutdown, server, send_attempts) =
+            spawn_fake_telegram_api_with_blocked_failed_terminal_entry_edit().await;
+        let task_id = "task-collection-terminal-entry-stale-retry";
+        let (queue_root, _config, queue) = create_running_collection_queue(
+            "collection-terminal-entry-stale-retry",
+            task_id,
+            CHAT_ID,
+            83,
+        );
+        let (_unused_sender, mut unused_requests) = mpsc::unbounded_channel();
+        let delivery = track_single_entry_collection(
+            &telegram,
+            Arc::clone(&queue),
+            task_id,
+            CHAT_ID,
+            83,
+            0,
+            queued_only_manifest(),
+            true,
+            true,
+            false,
+            &mut unused_requests,
+        )
+        .await
+        .expect("resolved collection should retain terminal entry delivery state");
+        queue
+            .fail_if_generation(task_id, 0, "simulated verification failure".to_string())
+            .expect("collection failure should persist")
+            .expect("generation zero should still be current");
+
+        let finalizer_telegram = telegram.clone();
+        let finalizer_queue = Arc::clone(&queue);
+        let finalizer_task_id = task_id.to_string();
+        let mut finalizer = tokio::spawn(async move {
+            finalize_collection_messages(
+                finalization_context(
+                    &finalizer_telegram,
+                    &finalizer_queue,
+                    &finalizer_task_id,
+                    0,
+                    CHAT_ID,
+                    83,
+                ),
+                delivery,
+                "Failed job #83: Bilibili download\nsimulated verification failure".to_string(),
+                CollectionFinalOutcome::Failed,
+            )
+            .await;
+        });
+        let (terminal_edit, terminal_response) =
+            receive_controllable_request(&mut terminal_requests).await;
+        assert_eq!(terminal_edit.method, "editMessageText");
+        assert_eq!(terminal_edit.body["message_id"].as_i64(), Some(1_001));
+        assert!(terminal_edit.body["text"].as_str().is_some_and(|text| {
+            text.contains("Downloaded, but collection publication or final verification failed.")
+        }));
+
+        let resumed = queue
+            .claim_resume(task_id, true)
+            .expect("failed collection should be retryable")
+            .expect("retry should create a new generation during the old terminal edit");
+        assert_eq!(resumed.generation, 1);
+        terminal_response
+            .send(controlled_failure_response())
+            .expect("old-generation terminal edit should receive its transient failure");
+
+        let mut unexpected_retry = false;
+        match tokio_timeout(Duration::from_secs(3), &mut finalizer).await {
+            Ok(result) => result.expect("old-generation finalizer should finish"),
+            Err(_) => {
+                if let Ok(Some((_request, response))) =
+                    tokio_timeout(Duration::from_secs(1), terminal_requests.recv()).await
+                {
+                    unexpected_retry = true;
+                    let _ = response.send(controlled_success_response());
+                    tokio_timeout(Duration::from_secs(3), &mut finalizer)
+                        .await
+                        .expect("finalizer should finish after releasing an unexpected retry")
+                        .expect("old-generation finalizer should not panic");
+                } else {
+                    finalizer.abort();
+                    let _ = finalizer.await;
+                    panic!("old-generation finalizer timed out without a retry request");
+                }
+            }
+        }
+        assert!(
+            !unexpected_retry && terminal_requests.try_recv().is_err(),
+            "generation change during a failed terminal edit must stop further attempts"
+        );
+        assert_eq!(
+            send_attempts.load(Ordering::SeqCst),
+            2,
+            "stale terminal edit handling must not send a replacement message"
+        );
+        let current = queue
+            .get(task_id)
+            .expect("resumed collection should load")
+            .expect("resumed collection should remain");
+        assert_eq!(current.generation, 1);
+        assert_eq!(current.status, TaskStatus::Preparing);
+        assert_eq!(current.status_message_id, None);
 
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;

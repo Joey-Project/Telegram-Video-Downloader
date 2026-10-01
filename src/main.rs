@@ -5982,6 +5982,52 @@ async fn edit_collection_entry_message(
     }
 }
 
+async fn edit_collection_entry_terminal_message(
+    context: ProgressDeliveryContext<'_>,
+    delivery: &CollectionEntryDelivery,
+    message: String,
+) {
+    let Some(message_id) = delivery.message_id else {
+        return;
+    };
+    for attempt in 1..=COLLECTION_MAIN_EDIT_ATTEMPTS {
+        if !generation_is_current(context.queue, context.task_id, context.generation).await {
+            return;
+        }
+        match context
+            .telegram
+            .edit_message_text(context.chat_id, message_id, truncate(&message))
+            .await
+        {
+            Ok(()) => return,
+            Err(err) if attempt < COLLECTION_MAIN_EDIT_ATTEMPTS => {
+                warn!(
+                    task_id = context.task_id,
+                    generation = context.generation,
+                    chat_id = context.chat_id,
+                    message_id,
+                    attempt,
+                    error = %err,
+                    "failed to edit terminal collection entry status; retrying the same message"
+                );
+                tokio::time::sleep(COLLECTION_MAIN_EDIT_RETRY_DELAY).await;
+            }
+            Err(err) => {
+                warn!(
+                    task_id = context.task_id,
+                    generation = context.generation,
+                    chat_id = context.chat_id,
+                    message_id,
+                    attempt,
+                    error = %err,
+                    "failed to edit terminal collection entry status after bounded retries"
+                );
+                return;
+            }
+        }
+    }
+}
+
 async fn deliver_collection_main_message(
     context: ProgressDeliveryContext<'_>,
     delivery: &mut CollectionProgressDelivery,
@@ -6176,7 +6222,7 @@ async fn finalize_collection_messages(
             state,
             state_text,
         );
-        edit_collection_entry_message(context, entry_delivery, message).await;
+        edit_collection_entry_terminal_message(context, entry_delivery, message).await;
     }
     if delivery.main_delivery.message_id().is_some() {
         deliver_collection_main_message(context, &mut delivery, final_main_message).await;
