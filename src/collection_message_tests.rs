@@ -101,6 +101,25 @@ mod collection_message_tests {
         }
     }
 
+    fn bot_context(
+        telegram: TelegramClient,
+        config: AppConfig,
+        queue: Arc<QueueManager>,
+        next_job_id: u64,
+    ) -> BotContext {
+        BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(next_job_id)),
+            queue,
+            queue_start_retry_delay: Duration::ZERO,
+        }
+    }
+
     fn queued_only_manifest() -> BilibiliCollectionManifest {
         let mut manifest = test_collection_manifest(1);
         manifest.skipped_entries = 0;
@@ -110,6 +129,20 @@ mod collection_message_tests {
         entry.video = Some("1080P 1920x1080 60fps H.264".to_string());
         entry.audio = Some("Japanese AAC 128 kbps".to_string());
         entry.estimated_media = "240.0 MiB".to_string();
+        manifest
+    }
+
+    fn all_already_present_manifest(entry_count: u32) -> BilibiliCollectionManifest {
+        let mut manifest = test_collection_manifest(entry_count);
+        manifest.skipped_entries = entry_count as usize;
+        manifest.planned_entries = 0;
+        manifest.estimated_media = "0 bytes to download".to_string();
+        for entry in &mut manifest.entries {
+            entry.status = BilibiliCollectionEntryStatus::AlreadyPresent;
+            entry.video = None;
+            entry.audio = None;
+            entry.estimated_media = "already present".to_string();
+        }
         manifest
     }
 
@@ -296,6 +329,168 @@ mod collection_message_tests {
             server,
             failed_once,
         )
+    }
+
+    async fn spawn_fake_telegram_api_with_one_final_main_edit_failure(
+        final_prefix: &'static str,
+    ) -> (
+        TelegramClient,
+        mpsc::UnboundedReceiver<FakeTelegramRequest>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<AtomicBool>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram API should bind localhost");
+        let address = listener
+            .local_addr()
+            .expect("fake Telegram API should expose its address");
+        let (requests_tx, requests_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let failed_once = Arc::new(AtomicBool::new(false));
+        let failed_once_for_server = Arc::clone(&failed_once);
+        let server = tokio::spawn(async move {
+            let mut next_message_id = 1_000_i64;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => return Ok(()),
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.context("fake Telegram API accept failed")?;
+                        let request = read_fake_telegram_request(&mut stream).await?;
+                        let is_final_main_edit = request.method == "editMessageText"
+                            && request.body["message_id"].as_i64() == Some(1_000)
+                            && request.body["text"].as_str().is_some_and(|text| text.starts_with(final_prefix));
+                        let fail_this_edit = is_final_main_edit
+                            && !failed_once_for_server.swap(true, Ordering::SeqCst);
+                        let response = if fail_this_edit {
+                            let payload = serde_json::json!({
+                                "ok": false,
+                                "error_code": 500,
+                                "description": "simulated transient final edit failure"
+                            })
+                            .to_string();
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                                payload.len()
+                            )
+                        } else {
+                            fake_telegram_response(&request, &mut next_message_id, Vec::new())
+                        };
+                        stream
+                            .write_all(response.as_bytes())
+                            .await
+                            .context("fake Telegram API response write failed")?;
+                        let _ = requests_tx.send(request);
+                    }
+                }
+            }
+        });
+        let token = AppConfig::for_test().telegram.token;
+        (
+            TelegramClient::with_test_api_base_url(token, format!("http://{address}")),
+            requests_rx,
+            shutdown_tx,
+            server,
+            failed_once,
+        )
+    }
+
+    async fn spawn_controllable_fake_telegram_api() -> (
+        TelegramClient,
+        mpsc::UnboundedReceiver<(FakeTelegramRequest, oneshot::Sender<String>)>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram API should bind localhost");
+        let address = listener
+            .local_addr()
+            .expect("fake Telegram API should expose its address");
+        let (requests_tx, requests_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => return Ok(()),
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.context("fake Telegram API accept failed")?;
+                        let requests_tx = requests_tx.clone();
+                        tokio::spawn(async move {
+                            let Ok(request) = read_fake_telegram_request(&mut stream).await else {
+                                return;
+                            };
+                            let (response_tx, response_rx) = oneshot::channel::<String>();
+                            if requests_tx.send((request, response_tx)).is_err() {
+                                return;
+                            }
+                            if let Ok(response) = response_rx.await {
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        let token = AppConfig::for_test().telegram.token;
+        (
+            TelegramClient::with_test_api_base_url(token, format!("http://{address}")),
+            requests_rx,
+            shutdown_tx,
+            server,
+        )
+    }
+
+    async fn receive_controllable_request(
+        requests: &mut mpsc::UnboundedReceiver<(FakeTelegramRequest, oneshot::Sender<String>)>,
+    ) -> (FakeTelegramRequest, oneshot::Sender<String>) {
+        tokio_timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .expect("controlled fake Telegram request should arrive")
+            .expect("controlled fake Telegram request channel should remain open")
+    }
+
+    fn controlled_telegram_response(payload: serde_json::Value) -> String {
+        let payload = payload.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+            payload.len()
+        )
+    }
+
+    fn controlled_send_message_response(message_id: i64, chat_id: i64) -> String {
+        controlled_telegram_response(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": message_id,
+                "chat": { "id": chat_id, "type": "private" }
+            }
+        }))
+    }
+
+    fn controlled_success_response() -> String {
+        controlled_telegram_response(serde_json::json!({ "ok": true, "result": true }))
+    }
+
+    fn controlled_failure_response() -> String {
+        controlled_telegram_response(serde_json::json!({
+            "ok": false,
+            "error_code": 500,
+            "description": "simulated delayed prompt delivery failure"
+        }))
+    }
+
+    fn inline_keyboard_callback_data(request: &FakeTelegramRequest, suffix: &str) -> String {
+        request.body["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .expect("prompt should have an inline keyboard")
+            .iter()
+            .flat_map(|row| row.as_array().into_iter().flatten())
+            .filter_map(|button| button["callback_data"].as_str())
+            .find(|data| data.ends_with(suffix))
+            .expect("prompt keyboard should contain the requested callback action")
+            .to_string()
     }
 
     pub(super) async fn receive_request(
@@ -1075,6 +1270,7 @@ mod collection_message_tests {
             task_id.to_string(),
             job,
             JobRunMode::Direct,
+            None,
         )
         .await;
 
@@ -1128,6 +1324,603 @@ mod collection_message_tests {
         );
 
         tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn collection_final_main_edit_retries_same_id_without_duplicate_send() {
+        let final_prefix = "Finished job #62";
+        let (telegram, mut requests, shutdown, server, failed_once) =
+            spawn_fake_telegram_api_with_one_final_main_edit_failure(final_prefix).await;
+        let task_id = "task-collection-final-main-edit-retry";
+        let (queue_root, config, queue) = create_running_collection_queue(
+            "collection-final-main-edit-retry",
+            task_id,
+            CHAT_ID,
+            62,
+        );
+        let delivery = track_single_entry_collection(
+            &telegram,
+            Arc::clone(&queue),
+            task_id,
+            CHAT_ID,
+            62,
+            0,
+            queued_only_manifest(),
+            true,
+            true,
+            false,
+            &mut requests,
+        )
+        .await
+        .expect("resolved collection should retain message delivery state");
+        assert!(
+            queue
+                .begin_verification_if_generation(task_id, 0)
+                .expect("verification should begin")
+                .is_some()
+        );
+        assert!(
+            queue
+                .complete_if_generation(
+                    task_id,
+                    0,
+                    config
+                        .downloads
+                        .video_dir
+                        .join("mock-final-output")
+                        .display()
+                        .to_string(),
+                    &[],
+                    BTreeMap::new(),
+                )
+                .expect("mock verification should complete")
+                .is_some()
+        );
+
+        finalize_collection_messages(
+            finalization_context(&telegram, &queue, task_id, 0, CHAT_ID, 62),
+            delivery,
+            "Finished job #62: Bilibili download\nSaved: mock output".to_string(),
+            CollectionFinalOutcome::Verified,
+        )
+        .await;
+
+        assert!(
+            failed_once.load(Ordering::SeqCst),
+            "the fake Telegram API should fail the first final main edit"
+        );
+        let observed = take_fake_telegram_requests(&mut requests);
+        let sends = observed
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .count();
+        assert_eq!(sends, 2, "a failed final edit must not send a replacement");
+        let final_edits = observed
+            .iter()
+            .filter(|request| {
+                request.method == "editMessageText"
+                    && request.body["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with(final_prefix))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            final_edits.len(),
+            2,
+            "the failed final edit should receive one bounded retry"
+        );
+        assert!(
+            final_edits
+                .iter()
+                .all(|request| request.body["message_id"].as_i64() == Some(1_000)),
+            "every final edit attempt should target the original main message"
+        );
+        assert_eq!(
+            queue
+                .get(task_id)
+                .expect("completed task should load")
+                .expect("completed task should remain")
+                .status_message_id,
+            Some(1_000)
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn all_already_present_collection_edits_main_details_and_every_video_status() {
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let task_id = "task-collection-all-already-present";
+        let (queue_root, config, queue) =
+            create_running_collection_queue("collection-all-already-present", task_id, CHAT_ID, 63);
+        let manifest = all_already_present_manifest(7);
+        let (progress, progress_rx) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress(
+            telegram.clone(),
+            Arc::clone(&queue),
+            progress_context(task_id, CHAT_ID, 63, 0, None),
+            progress_rx,
+        ));
+        progress.send_lifecycle(JobProgressLifecycleEvent::Resolved {
+            snapshot: test_collection_snapshot(&manifest, 0, None),
+            manifest: manifest.clone(),
+        });
+        progress.send_lifecycle(JobProgressLifecycleEvent::Completed {
+            snapshot: test_collection_snapshot(&manifest, 0, None),
+        });
+        drop(progress);
+        let delivery = tokio_timeout(Duration::from_secs(30), progress_task)
+            .await
+            .expect("all-present collection progress should finish")
+            .expect("collection progress task should not panic")
+            .expect("resolved all-present manifest should create a delivery tracker");
+        assert_eq!(delivery.entries.len(), 7);
+        assert!(delivery.entries.values().all(|entry| {
+            entry.state == CollectionEntryDeliveryState::SkippedPendingVerification
+        }));
+        let main_message_id = delivery
+            .main_delivery
+            .message_id()
+            .expect("resolved collection should have one main message");
+        let details_token = delivery
+            .details_token
+            .expect("multiple entries should register main-message details paging");
+        assert!(
+            queue
+                .begin_verification_if_generation(task_id, 0)
+                .expect("verification should begin")
+                .is_some()
+        );
+        assert!(
+            queue
+                .complete_if_generation(
+                    task_id,
+                    0,
+                    config
+                        .downloads
+                        .video_dir
+                        .join("already-present-output")
+                        .display()
+                        .to_string(),
+                    &[],
+                    BTreeMap::new(),
+                )
+                .expect("all-present collection should complete")
+                .is_some()
+        );
+        finalize_collection_messages(
+            finalization_context(&telegram, &queue, task_id, 0, CHAT_ID, 63),
+            delivery,
+            "Finished job #63: Bilibili download\nAll selected videos are already present."
+                .to_string(),
+            CollectionFinalOutcome::Verified,
+        )
+        .await;
+
+        let lifecycle_requests = take_fake_telegram_requests(&mut requests);
+        let sends = lifecycle_requests
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sends.len(),
+            8,
+            "all selected existing videos should have one status each plus one main message"
+        );
+        let main_send = sends
+            .iter()
+            .find(|request| {
+                request.body["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.contains("Entry: "))
+            })
+            .expect("one send should be the collection main message");
+        assert!(main_send.body["text"].as_str().is_some_and(|text| {
+            text.contains("Example collection")
+                && text.contains("Sync: 7 total; 7 already present; 0 queued")
+        }));
+        let entry_ids = sent_entry_message_ids(&lifecycle_requests);
+        assert_eq!(entry_ids.len(), 7);
+        for index in 1..=7 {
+            let message_id = entry_ids
+                .get(&index)
+                .copied()
+                .expect("each selected existing video should have its own message");
+            assert!(lifecycle_requests.iter().any(|request| {
+                request.method == "editMessageText"
+                    && request.body["message_id"].as_i64() == Some(message_id)
+                    && request.body["text"].as_str().is_some_and(|text| {
+                        text.contains("Existing video verified; download skipped.")
+                    })
+            }));
+        }
+        assert!(lifecycle_requests.iter().any(|request| {
+            request.method == "editMessageText"
+                && request.body["message_id"].as_i64() == Some(main_message_id)
+                && request.body["text"].as_str().is_some_and(|text| {
+                    text.starts_with("Finished job #63") && text.contains("Entry 1")
+                })
+        }));
+
+        handle_callback_query(
+            bot_context(telegram.clone(), config, Arc::clone(&queue), 64),
+            crate::telegram::CallbackQuery {
+                id: "all-present-details-page".to_string(),
+                data: Some(collection_details_callback_data(details_token, 1)),
+                message: Some(crate::telegram::Message {
+                    message_id: main_message_id,
+                    chat: crate::telegram::Chat {
+                        id: CHAT_ID,
+                        kind: Some("private".to_string()),
+                    },
+                    text: None,
+                    from: None,
+                }),
+            },
+        )
+        .await;
+        let details_requests = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            details_requests
+                .iter()
+                .filter(|request| request.method == "sendMessage")
+                .count(),
+            0,
+            "details paging should edit the collection main message instead of sending another"
+        );
+        assert!(details_requests.iter().any(|request| {
+            request.method == "editMessageText"
+                && request.body["message_id"].as_i64() == Some(main_message_id)
+                && request.body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Entries 6-7 of 7 (page 2/2)"))
+        }));
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn selection_prompt_response_after_resume_cannot_replace_new_generation_or_apply_old_callback()
+     {
+        let (telegram, mut requests, shutdown, server) =
+            spawn_controllable_fake_telegram_api().await;
+        let task_id = "task-selection-prompt-generation-race";
+        let job = JobRequest::Bilibili {
+            url: "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+                .to_string(),
+            selection: None,
+        };
+        let (queue_root, config, queue) = create_collection_queue_with_job(
+            "selection-prompt-generation-race",
+            task_id,
+            CHAT_ID,
+            64,
+            job.clone(),
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("selection task should enter preparation");
+        let old_prompt_context =
+            bot_context(telegram.clone(), config.clone(), Arc::clone(&queue), 65);
+        let old_task_id = task_id.to_string();
+        let old_job = job.clone();
+        let old_prompt = tokio::spawn(async move {
+            prompt_bilibili_selection(
+                &old_prompt_context,
+                CHAT_ID,
+                64,
+                old_task_id,
+                0,
+                old_job,
+                BilibiliSelectionPrompt::UgcCollection,
+            )
+            .await;
+        });
+        let (old_request, old_response) = receive_controllable_request(&mut requests).await;
+        assert_eq!(old_request.method, "sendMessage");
+        let old_callback_data = inline_keyboard_callback_data(&old_request, ":all");
+
+        let resumed = queue
+            .claim_resume(task_id, false)
+            .expect("awaiting selection should be resumable while Telegram send is in flight")
+            .expect("old selection generation should resume");
+        assert_eq!(resumed.generation, 1);
+        let new_prompt_context =
+            bot_context(telegram.clone(), config.clone(), Arc::clone(&queue), 66);
+        let new_task_id = task_id.to_string();
+        let new_job = job.clone();
+        let new_prompt = tokio::spawn(async move {
+            prompt_bilibili_selection(
+                &new_prompt_context,
+                CHAT_ID,
+                64,
+                new_task_id,
+                1,
+                new_job,
+                BilibiliSelectionPrompt::UgcCollection,
+            )
+            .await;
+        });
+        let (new_request, new_response) = receive_controllable_request(&mut requests).await;
+        assert_eq!(new_request.method, "sendMessage");
+        let new_callback_data = inline_keyboard_callback_data(&new_request, ":all");
+        assert_ne!(old_callback_data, new_callback_data);
+        new_response
+            .send(controlled_send_message_response(1_101, CHAT_ID))
+            .expect("new generation response should reach its waiting prompt");
+        new_prompt
+            .await
+            .expect("new generation selection prompt should finish");
+
+        let current = queue
+            .get(task_id)
+            .expect("current task should load")
+            .expect("current task should remain");
+        assert_eq!(current.generation, 1);
+        assert_eq!(current.status, TaskStatus::AwaitingSelection);
+        assert_eq!(current.status_message_id, Some(1_101));
+
+        old_response
+            .send(controlled_send_message_response(1_100, CHAT_ID))
+            .expect("late old response should reach its waiting prompt");
+        old_prompt
+            .await
+            .expect("late old selection prompt should finish without changing state");
+        let after_late_response = queue
+            .get(task_id)
+            .expect("task after late response should load")
+            .expect("task after late response should remain");
+        assert_eq!(after_late_response.generation, 1);
+        assert_eq!(after_late_response.status, TaskStatus::AwaitingSelection);
+        assert_eq!(after_late_response.status_message_id, Some(1_101));
+
+        let stale_callback = tokio::spawn(handle_callback_query(
+            bot_context(telegram, config, Arc::clone(&queue), 67),
+            crate::telegram::CallbackQuery {
+                id: "late-old-selection-callback".to_string(),
+                data: Some(old_callback_data),
+                message: Some(crate::telegram::Message {
+                    message_id: 1_100,
+                    chat: crate::telegram::Chat {
+                        id: CHAT_ID,
+                        kind: Some("private".to_string()),
+                    },
+                    text: None,
+                    from: None,
+                }),
+            },
+        ));
+        let (callback_request, callback_response) =
+            receive_controllable_request(&mut requests).await;
+        assert_eq!(callback_request.method, "answerCallbackQuery");
+        assert_eq!(
+            callback_request.body["text"].as_str(),
+            Some("This choice has expired.")
+        );
+        callback_response
+            .send(controlled_success_response())
+            .expect("expired callback acknowledgement should be accepted");
+        stale_callback
+            .await
+            .expect("stale callback handler should finish");
+        assert!(
+            requests.try_recv().is_err(),
+            "a stale callback must not edit or send another message"
+        );
+        let after_stale_callback = queue
+            .get(task_id)
+            .expect("task after stale callback should load")
+            .expect("task after stale callback should remain");
+        assert_eq!(after_stale_callback.generation, 1);
+        assert_eq!(after_stale_callback.status, TaskStatus::AwaitingSelection);
+        assert_eq!(after_stale_callback.status_message_id, Some(1_101));
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn stale_duplicate_callback_and_delayed_old_prompt_failure_cannot_change_current_generation()
+     {
+        let (telegram, mut requests, shutdown, server) =
+            spawn_controllable_fake_telegram_api().await;
+        let task_id = "task-duplicate-prompt-generation-race";
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV1234567890".to_string(),
+            selection: Some(BilibiliSelection::All),
+        };
+        let duplicate = VideoDuplicate {
+            identity: crate::downloader::VideoIdentity {
+                provider: crate::downloader::VideoProvider::Bilibili,
+                id: "cid-generation-fixture".to_string(),
+            },
+            existing_videos: vec![PathBuf::from("/fixture/already-downloaded.mp4")],
+            overwrite_confirmation: None,
+        };
+        let (queue_root, config, queue) = create_collection_queue_with_job(
+            "duplicate-prompt-generation-race",
+            task_id,
+            CHAT_ID,
+            68,
+            job.clone(),
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("duplicate task should enter preparation");
+
+        let old_task_id = task_id.to_string();
+        let old_job = job.clone();
+        let old_duplicate = duplicate.clone();
+        let old_telegram = telegram.clone();
+        let old_queue = Arc::clone(&queue);
+        let old_prompt = tokio::spawn(async move {
+            prompt_duplicate_choice(
+                &old_telegram,
+                &old_queue,
+                CHAT_ID,
+                68,
+                old_task_id,
+                0,
+                old_job,
+                old_duplicate,
+            )
+            .await;
+        });
+        let (first_request, first_response) = receive_controllable_request(&mut requests).await;
+        assert_eq!(first_request.method, "sendMessage");
+        let first_cancel_callback = inline_keyboard_callback_data(&first_request, ":cancel");
+        first_response
+            .send(controlled_send_message_response(2_100, CHAT_ID))
+            .expect("first duplicate prompt should receive its response");
+        old_prompt
+            .await
+            .expect("first duplicate prompt should finish");
+        let first_prompt_record = queue
+            .get(task_id)
+            .expect("first prompt task should load")
+            .expect("first prompt task should remain");
+        assert_eq!(first_prompt_record.generation, 0);
+        assert_eq!(
+            first_prompt_record.status,
+            TaskStatus::AwaitingDuplicateChoice
+        );
+        assert_eq!(first_prompt_record.status_message_id, Some(2_100));
+
+        let resumed = queue
+            .claim_resume(task_id, false)
+            .expect("duplicate prompt should be resumable")
+            .expect("first duplicate generation should resume");
+        assert_eq!(resumed.generation, 1);
+        let delayed_task_id = task_id.to_string();
+        let delayed_job = job.clone();
+        let delayed_duplicate = duplicate.clone();
+        let delayed_telegram = telegram.clone();
+        let delayed_queue = Arc::clone(&queue);
+        let delayed_prompt = tokio::spawn(async move {
+            prompt_duplicate_choice(
+                &delayed_telegram,
+                &delayed_queue,
+                CHAT_ID,
+                68,
+                delayed_task_id,
+                1,
+                delayed_job,
+                delayed_duplicate,
+            )
+            .await;
+        });
+        let (delayed_request, delayed_response) = receive_controllable_request(&mut requests).await;
+        assert_eq!(delayed_request.method, "sendMessage");
+        let during_delayed_prompt = queue
+            .get(task_id)
+            .expect("delayed generation task should load")
+            .expect("delayed generation task should remain");
+        assert_eq!(during_delayed_prompt.generation, 1);
+        assert_eq!(
+            during_delayed_prompt.status,
+            TaskStatus::AwaitingDuplicateChoice
+        );
+        assert_eq!(during_delayed_prompt.status_message_id, None);
+
+        let stale_callback = tokio::spawn(handle_callback_query(
+            bot_context(telegram.clone(), config.clone(), Arc::clone(&queue), 69),
+            crate::telegram::CallbackQuery {
+                id: "old-duplicate-cancel".to_string(),
+                data: Some(first_cancel_callback),
+                message: Some(crate::telegram::Message {
+                    message_id: 2_100,
+                    chat: crate::telegram::Chat {
+                        id: CHAT_ID,
+                        kind: Some("private".to_string()),
+                    },
+                    text: None,
+                    from: None,
+                }),
+            },
+        ));
+        let (callback_request, callback_response) =
+            receive_controllable_request(&mut requests).await;
+        assert_eq!(callback_request.method, "answerCallbackQuery");
+        assert_eq!(
+            callback_request.body["text"].as_str(),
+            Some("This choice has expired.")
+        );
+        callback_response
+            .send(controlled_success_response())
+            .expect("stale callback acknowledgement should succeed");
+        stale_callback
+            .await
+            .expect("stale duplicate callback should finish");
+        let after_stale_callback = queue
+            .get(task_id)
+            .expect("task after stale callback should load")
+            .expect("task after stale callback should remain");
+        assert_eq!(after_stale_callback.generation, 1);
+        assert_eq!(
+            after_stale_callback.status,
+            TaskStatus::AwaitingDuplicateChoice
+        );
+        assert_eq!(after_stale_callback.status_message_id, None);
+
+        let resumed_again = queue
+            .claim_resume(task_id, false)
+            .expect("delayed duplicate generation should be resumable")
+            .expect("delayed duplicate generation should resume");
+        assert_eq!(resumed_again.generation, 2);
+        let current_task_id = task_id.to_string();
+        let current_job = job.clone();
+        let current_duplicate = duplicate.clone();
+        let current_telegram = telegram.clone();
+        let current_queue = Arc::clone(&queue);
+        let current_prompt = tokio::spawn(async move {
+            prompt_duplicate_choice(
+                &current_telegram,
+                &current_queue,
+                CHAT_ID,
+                68,
+                current_task_id,
+                2,
+                current_job,
+                current_duplicate,
+            )
+            .await;
+        });
+        let (current_request, current_response) = receive_controllable_request(&mut requests).await;
+        assert_eq!(current_request.method, "sendMessage");
+        current_response
+            .send(controlled_send_message_response(2_102, CHAT_ID))
+            .expect("current duplicate prompt response should succeed");
+        current_prompt
+            .await
+            .expect("current duplicate prompt should finish");
+
+        delayed_response
+            .send(controlled_failure_response())
+            .expect("old in-flight prompt should receive its delayed failure");
+        delayed_prompt
+            .await
+            .expect("old failed prompt should finish without canceling current generation");
+        assert!(
+            requests.try_recv().is_err(),
+            "an obsolete prompt failure must not emit a replacement or failure notice"
+        );
+        let current = queue
+            .get(task_id)
+            .expect("current duplicate task should load")
+            .expect("current duplicate task should remain");
+        assert_eq!(current.generation, 2);
+        assert_eq!(current.status, TaskStatus::AwaitingDuplicateChoice);
+        assert_eq!(current.status_message_id, Some(2_102));
+        assert_eq!(current.job, job);
+
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);

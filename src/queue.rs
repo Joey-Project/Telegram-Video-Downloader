@@ -470,6 +470,7 @@ impl QueueManager {
         store.save_mutated_record(record, entry, true).map(Some)
     }
 
+    #[cfg(test)]
     pub fn update_job_if_current(
         &self,
         id: &str,
@@ -490,6 +491,35 @@ impl QueueManager {
             record.error = None;
             Ok(())
         })
+    }
+
+    pub fn update_job_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        expected_statuses: &[TaskStatus],
+        job: JobRequest,
+        status: TaskStatus,
+    ) -> Result<Option<TaskRecord>> {
+        let (job, url_was_sanitized) = sanitize_job_for_storage(job);
+        self.update_if_generation_and_status(
+            id,
+            expected_generation,
+            expected_statuses,
+            true,
+            |record| {
+                if matches!(record.status, TaskStatus::Cancelled | TaskStatus::Completed) {
+                    bail!("task {id} is already terminal");
+                }
+                record.original_url = job_url(&job).to_string();
+                record.url_was_sanitized |= url_was_sanitized;
+                record.job = job;
+                record.status = status;
+                record.cancel_requested = false;
+                record.error = None;
+                Ok(())
+            },
+        )
     }
 
     #[cfg(test)]
@@ -541,6 +571,38 @@ impl QueueManager {
             record.error = None;
             Ok(())
         })
+    }
+
+    pub fn set_status_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        expected_statuses: &[TaskStatus],
+        status: TaskStatus,
+    ) -> Result<Option<TaskRecord>> {
+        self.update_if_generation_and_status(
+            id,
+            expected_generation,
+            expected_statuses,
+            true,
+            |record| {
+                if record.status == TaskStatus::Cancelled && status != TaskStatus::Cancelled {
+                    bail!("task {id} was canceled");
+                }
+                if record.status == TaskStatus::Completed && status != TaskStatus::Completed {
+                    bail!("task {id} is already complete");
+                }
+                record.status = status;
+                if !matches!(
+                    status,
+                    TaskStatus::Running | TaskStatus::AwaitingConfirmation
+                ) {
+                    record.cancel_requested = false;
+                }
+                record.error = None;
+                Ok(())
+            },
+        )
     }
 
     #[cfg(test)]
@@ -722,6 +784,7 @@ impl QueueManager {
         })
     }
 
+    #[cfg(test)]
     pub fn set_status_message_id(&self, id: &str, message_id: i64) -> Result<TaskRecord> {
         self.update(id, false, |record| {
             record.status_message_id = Some(message_id);
@@ -739,6 +802,25 @@ impl QueueManager {
             record.status_message_id = Some(message_id);
             Ok(())
         })
+    }
+
+    pub fn set_status_message_id_if_generation_and_status(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        expected_statuses: &[TaskStatus],
+        message_id: i64,
+    ) -> Result<Option<TaskRecord>> {
+        self.update_if_generation_and_status(
+            id,
+            expected_generation,
+            expected_statuses,
+            false,
+            |record| {
+                record.status_message_id = Some(message_id);
+                Ok(())
+            },
+        )
     }
 
     pub fn register_cancellation(&self, id: &str) -> Result<Arc<Notify>> {
@@ -928,21 +1010,6 @@ impl QueueManager {
         store.save_mutated_record(record, entry, true)
     }
 
-    pub fn fail(&self, id: &str, message: String) -> Result<TaskRecord> {
-        self.update(id, true, |record| {
-            if matches!(record.status, TaskStatus::Cancelled | TaskStatus::Completed) {
-                bail!("task {id} is already terminal");
-            }
-            record.status = TaskStatus::Failed;
-            record.cancel_requested = false;
-            record.error = Some(message);
-            if record.media_entries_total <= 1 && record.media_entries_completed == 0 {
-                record.media_entries_failed = 1;
-            }
-            Ok(())
-        })
-    }
-
     pub fn fail_if_generation(
         &self,
         id: &str,
@@ -1028,6 +1095,7 @@ impl QueueManager {
         Ok(Some(result))
     }
 
+    #[cfg(test)]
     pub fn cancel_if_current(
         &self,
         id: &str,
@@ -1043,6 +1111,42 @@ impl QueueManager {
             || !record.status.is_unfinished()
         {
             return Ok(None);
+        }
+        record.status = TaskStatus::Cancelled;
+        record.cancel_requested = false;
+        record.error = None;
+        record.user_actions = record.user_actions.saturating_add(1);
+        let result = store.save_mutated_record(record, entry, true)?;
+        drop(_guard);
+        self.notify_cancel(id)?;
+        Ok(Some(result))
+    }
+
+    pub fn cancel_if_generation_and_status(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        chat_id: i64,
+        expected_statuses: &[TaskStatus],
+    ) -> Result<Option<TaskRecord>> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
+            return Ok(None);
+        };
+        if record.generation != expected_generation
+            || record.chat_id != chat_id
+            || !expected_statuses.contains(&record.status)
+            || !record.status.is_unfinished()
+        {
+            return Ok(None);
+        }
+        if record.status == TaskStatus::Running {
+            record.cancel_requested = true;
+            record.user_actions = record.user_actions.saturating_add(1);
+            let result = store.save_mutated_record(record, entry, false)?;
+            drop(_guard);
+            self.notify_cancel(id)?;
+            return Ok(Some(result));
         }
         record.status = TaskStatus::Cancelled;
         record.cancel_requested = false;
@@ -1171,6 +1275,7 @@ impl QueueManager {
         Ok(())
     }
 
+    #[cfg(test)]
     fn update<F>(&self, id: &str, activity: bool, mutate: F) -> Result<TaskRecord>
     where
         F: FnOnce(&mut TaskRecord) -> Result<()>,
@@ -1218,6 +1323,28 @@ impl QueueManager {
             return Ok(None);
         };
         if record.generation != expected_generation {
+            return Ok(None);
+        }
+        mutate(&mut record)?;
+        store.save_mutated_record(record, entry, activity).map(Some)
+    }
+
+    fn update_if_generation_and_status<F>(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        expected_statuses: &[TaskStatus],
+        activity: bool,
+        mutate: F,
+    ) -> Result<Option<TaskRecord>>
+    where
+        F: FnOnce(&mut TaskRecord) -> Result<()>,
+    {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
+            return Ok(None);
+        };
+        if record.generation != expected_generation || !expected_statuses.contains(&record.status) {
             return Ok(None);
         }
         mutate(&mut record)?;
@@ -2907,6 +3034,190 @@ mod tests {
         assert_eq!(current.media_entries_completed, 2);
         assert_eq!(current.media_entries_failed, 1);
         assert!(current.staging_attempts.is_empty());
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn prompt_transitions_require_matching_generation_and_status() {
+        let temp_root = temp_queue_root("prompt-generation-status-guards");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root;
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-prompt-generation-status-guards";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=prompt-guard".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::AwaitingSelection, None)
+            .expect("task should await selection");
+        let replacement_job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV1234567890".to_string(),
+            selection: None,
+        };
+
+        assert!(
+            queue
+                .set_status_if_generation(
+                    id,
+                    1,
+                    &[TaskStatus::AwaitingSelection],
+                    TaskStatus::Queued,
+                )
+                .expect("stale status transition should not fail")
+                .is_none()
+        );
+        assert!(
+            queue
+                .set_status_if_generation(
+                    id,
+                    0,
+                    &[TaskStatus::AwaitingDuplicateChoice],
+                    TaskStatus::Queued,
+                )
+                .expect("wrong-status transition should not fail")
+                .is_none()
+        );
+        assert!(
+            queue
+                .update_job_if_generation(
+                    id,
+                    1,
+                    &[TaskStatus::AwaitingSelection],
+                    replacement_job.clone(),
+                    TaskStatus::Queued,
+                )
+                .expect("stale job update should not fail")
+                .is_none()
+        );
+        assert!(
+            queue
+                .update_job_if_generation(
+                    id,
+                    0,
+                    &[TaskStatus::AwaitingDuplicateChoice],
+                    replacement_job.clone(),
+                    TaskStatus::Queued,
+                )
+                .expect("wrong-status job update should not fail")
+                .is_none()
+        );
+        assert!(
+            queue
+                .set_status_message_id_if_generation_and_status(
+                    id,
+                    1,
+                    &[TaskStatus::AwaitingSelection],
+                    99,
+                )
+                .expect("stale prompt message association should not fail")
+                .is_none()
+        );
+        assert!(
+            queue
+                .set_status_message_id_if_generation_and_status(
+                    id,
+                    0,
+                    &[TaskStatus::AwaitingDuplicateChoice],
+                    99,
+                )
+                .expect("wrong-status prompt message association should not fail")
+                .is_none()
+        );
+        assert!(
+            queue
+                .cancel_if_generation_and_status(
+                    id,
+                    1,
+                    123_456_789,
+                    &[TaskStatus::AwaitingSelection],
+                )
+                .expect("stale prompt cancellation should not fail")
+                .is_none()
+        );
+        assert!(
+            queue
+                .cancel_if_generation_and_status(
+                    id,
+                    0,
+                    123_456_789,
+                    &[TaskStatus::AwaitingDuplicateChoice],
+                )
+                .expect("wrong-status prompt cancellation should not fail")
+                .is_none()
+        );
+
+        let unchanged = queue
+            .get(id)
+            .expect("task should load after guarded no-ops")
+            .expect("task should remain present");
+        assert_eq!(unchanged.status, TaskStatus::AwaitingSelection);
+        assert_eq!(unchanged.status_message_id, None);
+        assert!(matches!(unchanged.job, JobRequest::Youtube { .. }));
+
+        let updated = queue
+            .update_job_if_generation(
+                id,
+                0,
+                &[TaskStatus::AwaitingSelection],
+                replacement_job,
+                TaskStatus::AwaitingDuplicateChoice,
+            )
+            .expect("current prompt job update should succeed")
+            .expect("current prompt state should match");
+        assert_eq!(updated.status, TaskStatus::AwaitingDuplicateChoice);
+        assert!(updated.original_url.contains("BV1234567890"));
+        assert!(
+            queue
+                .set_status_message_id_if_generation_and_status(
+                    id,
+                    0,
+                    &[TaskStatus::AwaitingDuplicateChoice],
+                    123,
+                )
+                .expect("current prompt message association should succeed")
+                .is_some()
+        );
+        assert!(
+            queue
+                .set_status_if_generation(
+                    id,
+                    0,
+                    &[TaskStatus::AwaitingDuplicateChoice],
+                    TaskStatus::AwaitingSelection,
+                )
+                .expect("current prompt transition should succeed")
+                .is_some()
+        );
+        let cancelled = queue
+            .cancel_if_generation_and_status(id, 0, 123_456_789, &[TaskStatus::AwaitingSelection])
+            .expect("current prompt cancellation should succeed")
+            .expect("current prompt state should match");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert!(
+            queue
+                .cancel_if_generation_and_status(
+                    id,
+                    0,
+                    123_456_789,
+                    &[TaskStatus::AwaitingSelection],
+                )
+                .expect("terminal prompt cancellation should not fail")
+                .is_none()
+        );
 
         drop(queue);
         let _ = fs::remove_dir_all(temp_root);

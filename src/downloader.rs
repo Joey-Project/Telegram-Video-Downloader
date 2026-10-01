@@ -980,14 +980,17 @@ fn bilibili_resolved_download_summary(
 
 fn bilibili_collection_manifest(
     collection: &BilibiliUgcCollectionDownload,
-    plan: &bbdown_core::DownloadPlan,
+    plan: Option<&bbdown_core::DownloadPlan>,
     options: &bbdown_core::DownloadOptions,
 ) -> BilibiliCollectionManifest {
-    let planned_entries = plan
-        .entries
-        .iter()
-        .map(|entry| (entry.index, entry))
-        .collect::<BTreeMap<_, _>>();
+    let planned_entries: BTreeMap<u32, &bbdown_core::DownloadEntry> = plan
+        .map(|plan| {
+            plan.entries
+                .iter()
+                .map(|entry| (entry.index, entry))
+                .collect()
+        })
+        .unwrap_or_default();
     let queued_indices = collection
         .missing_indices
         .iter()
@@ -2893,10 +2896,13 @@ async fn run_bilibili_job_locked(
         let collection =
             prepare_bilibili_ugc_collection_download(&client, final_output_root, url, options.mode)
                 .await?;
-        if collection.missing_indices.is_empty() {
-            return Ok(BilibiliJobOutcome::AlreadyComplete(
-                collection.already_complete_report(final_output_root),
-            ));
+        if let Some(outcome) = bilibili_collection_already_complete_outcome(
+            &collection,
+            final_output_root,
+            &options,
+            progress.as_ref(),
+        ) {
+            return Ok(outcome);
         }
         options = options.with_output_template(collection.output_template.clone());
         send_progress(progress.as_ref(), collection.progress_summary());
@@ -2977,7 +2983,7 @@ async fn run_bilibili_job_locked(
     }
     let collection_manifest = collection_download
         .as_ref()
-        .map(|collection| bilibili_collection_manifest(collection, &core_plan, &options));
+        .map(|collection| bilibili_collection_manifest(collection, Some(&core_plan), &options));
     let collection_progress = collection_manifest
         .clone()
         .map(BilibiliCollectionProgress::from_manifest);
@@ -3096,6 +3102,43 @@ async fn run_bilibili_job_locked(
         details: nonempty_join(details),
         primary_media_paths: reported_primary_videos,
     }))
+}
+
+fn bilibili_collection_already_complete_outcome(
+    collection: &BilibiliUgcCollectionDownload,
+    output_root: &RootedFs,
+    options: &bbdown_core::DownloadOptions,
+    progress: Option<&JobProgressSender>,
+) -> Option<BilibiliJobOutcome> {
+    if !collection.missing_indices.is_empty() {
+        return None;
+    }
+
+    send_progress(progress, collection.progress_summary());
+    let manifest = bilibili_collection_manifest(collection, None, options);
+    let collection_progress = BilibiliCollectionProgress::from_manifest(manifest.clone());
+    let snapshot = collection_progress.snapshot();
+    send_collection_lifecycle(
+        progress,
+        JobProgressLifecycleEvent::Resolved {
+            manifest: manifest.clone(),
+            snapshot: snapshot.clone(),
+        },
+    );
+    send_collection_progress(
+        progress,
+        "BBDown-rust: resolved collection media".to_string(),
+        snapshot,
+    );
+    send_resolved_download_summary(
+        progress,
+        "BBDown-rust: resolved media".to_string(),
+        manifest.overview_summary(),
+    );
+
+    Some(BilibiliJobOutcome::AlreadyComplete(
+        collection.already_complete_report(output_root),
+    ))
 }
 
 #[derive(Clone)]
@@ -15095,7 +15138,7 @@ mod tests {
         )]);
         let manifest = bilibili_collection_manifest(
             &collection,
-            &plan,
+            Some(&plan),
             &bbdown_core::DownloadOptions::new("downloads"),
         );
 
@@ -15124,6 +15167,110 @@ mod tests {
             manifest.overview_summary(),
             "Collection: Collection\nSync: 2 total; 1 already present; 1 queued\nEstimated download: 4.0 MiB\nDetails: 2 entries available below"
         );
+    }
+
+    #[test]
+    fn already_complete_collection_emits_full_resolved_manifest_before_returning() {
+        let output_root_path = temp_test_dir("all-present-collection-resolution");
+        let first_media = output_root_path.join("entry-1.mp4");
+        let second_media = output_root_path.join("entry-2.mp4");
+        fs::write(&first_media, b"first existing video").expect("first media should write");
+        fs::write(&second_media, b"second existing video").expect("second media should write");
+        let output_root = RootedFs::new(&output_root_path).expect("output root should bind");
+        let items = vec![
+            test_bilibili_collection_item(1, 101, "BVpresent1", 1001),
+            test_bilibili_collection_item(2, 102, "BVpresent2", 1002),
+        ];
+        let collection = BilibiliUgcCollectionDownload {
+            folder: "Collection [collection-1]".to_string(),
+            output_template: "Collection [collection-1]".to_string(),
+            existing_media_paths: vec![first_media.clone(), second_media.clone()],
+            title: "Collection".to_string(),
+            total_entries: items.len(),
+            skipped_entries: items.len(),
+            missing_indices: Vec::new(),
+            resolution: VideoCollectionResolution {
+                collection: VideoCollectionMetadata {
+                    id: Some(1),
+                    kind: VideoCollectionKind::Collection,
+                    title: "Collection".to_string(),
+                    description: String::new(),
+                    cover_url: None,
+                    pub_time: None,
+                    owner: None,
+                    items: items.clone(),
+                },
+                selected_items: items,
+            },
+        };
+        let (progress, receiver) = job_progress_channel();
+
+        let outcome = bilibili_collection_already_complete_outcome(
+            &collection,
+            &output_root,
+            &bbdown_core::DownloadOptions::new("downloads"),
+            Some(&progress),
+        )
+        .expect("an all-present collection should take the early-complete path");
+
+        let BilibiliJobOutcome::AlreadyComplete(report) = outcome else {
+            panic!("all-present collection should preserve AlreadyComplete semantics");
+        };
+        assert_eq!(report.primary_media_paths, vec![first_media, second_media]);
+        assert!(report.details.contains("2 total, 2 already present"));
+
+        let (latest, mut lifecycle) = receiver.into_parts();
+        let event = lifecycle
+            .try_recv()
+            .expect("early-complete path should emit a resolved lifecycle event");
+        let JobProgressLifecycleEvent::Resolved { manifest, snapshot } = event else {
+            panic!("early-complete lifecycle event should resolve the collection manifest");
+        };
+        assert_eq!(
+            manifest
+                .entries
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(
+            manifest
+                .entries
+                .iter()
+                .all(|entry| { entry.status == BilibiliCollectionEntryStatus::AlreadyPresent })
+        );
+        assert_eq!(manifest.total_entries, 2);
+        assert_eq!(manifest.skipped_entries, 2);
+        assert_eq!(manifest.planned_entries, 0);
+        assert_eq!(snapshot.skipped_entries, 2);
+        assert_eq!(snapshot.planned_entries, 0);
+        assert_eq!(snapshot.completed_entries, 0);
+        assert!(
+            lifecycle.try_recv().is_err(),
+            "all-present fast path should await the normal outer hash verification without claiming download completion"
+        );
+
+        let latest_progress = latest
+            .borrow()
+            .as_ref()
+            .cloned()
+            .expect("early-complete path should retain collection progress");
+        assert_eq!(
+            latest_progress
+                .collection
+                .as_ref()
+                .map(|snapshot| (snapshot.skipped_entries, snapshot.planned_entries)),
+            Some((2, 0))
+        );
+        assert!(
+            latest_progress
+                .resolved_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("2 already present; 0 queued"))
+        );
+
+        let _ = fs::remove_dir_all(output_root_path);
     }
 
     #[test]

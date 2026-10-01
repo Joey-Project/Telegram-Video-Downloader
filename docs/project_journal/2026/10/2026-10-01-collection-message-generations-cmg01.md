@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-01
 updated: 2026-10-01
 branch: wip/collection-message-generations
-pr:
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/22
 supersedes: []
 superseded_by:
 ---
@@ -24,6 +24,9 @@ superseded_by:
 - 已确定合集的 File Provider 内部重试保持消息数量不变。
 - Bilibili 短链接在解析目标前的队列重试同样不新增提示；进度读取遇到临时 File Provider 错误时等待并重验轮次，不丢弃该轮事件。
 - 文件已校验且完成记录已保存后，历史记录搬移失败仅在主消息中提示，视频保持已验证；终态读取也会重试临时 File Provider 错误。
+- 合集主消息的终态编辑遇到临时失败时，最多重试三次，始终复用同一消息 ID，并在每次尝试前核对轮次。
+- 所有已选视频都已存在时，下载器在提前返回前仍发送完整合集清单，创建逐视频跳过状态并保留主消息中的详情分页。
+- 选择提示的发送结果、失败处理及按钮回调同时核对轮次与等待状态，旧提示不能改写、取消或重新排队恢复后的任务。
 
 ## 验证范围
 - mock Telegram E2E 覆盖 37 视频共 38 条消息、同 ID 更新、恢复新轮次、旧轮事件隔离、失败、取消、最终校验状态和编辑重试。
@@ -31,7 +34,9 @@ superseded_by:
 
 ## 检查记录
 - 已对照合并后的任务入队、合集详情、进度生命周期、恢复领取与最终已发布文件校验流程。
-- 隔离 worktree 的格式检查、构建与 Clippy 通过；完整 Rust 测试集 508 通过、11 忽略、0 失败。
+- 隔离 worktree 的格式检查、构建与 Clippy 通过；完整 Rust 测试集 514 通过、11 忽略、0 失败。
 - mock File Provider 回归覆盖短链接静默重试、临时轮次读取失败后继续投递，以及等待期间新轮次领取后拦截旧事件。
 - 已通过真实队列完成记录的搬移失败与终态读取重试回归，确认仍复用原视频消息和主消息。
+- 九条合集消息 mock E2E 全部通过；新增回归覆盖主消息终态编辑重试、全条目已存在，以及选择/去重提示迟到的成功、失败与回调。
+- 下载器单测直接验证全部已存在时的生产提前返回 helper 发出完整清单；队列单测验证轮次与等待状态的原子保护。
 - Rust CI 的 `cargo test --all-targets --quiet` 自动运行新增 Rust mock Telegram E2E。
