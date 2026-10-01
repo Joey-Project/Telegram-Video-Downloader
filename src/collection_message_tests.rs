@@ -1771,6 +1771,7 @@ mod collection_message_tests {
                 0,
                 old_job,
                 old_duplicate,
+                Duration::ZERO,
             )
             .await;
         });
@@ -1814,6 +1815,7 @@ mod collection_message_tests {
                 1,
                 delayed_job,
                 delayed_duplicate,
+                Duration::ZERO,
             )
             .await;
         });
@@ -1890,6 +1892,7 @@ mod collection_message_tests {
                 2,
                 current_job,
                 current_duplicate,
+                Duration::ZERO,
             )
             .await;
         });
@@ -1920,6 +1923,329 @@ mod collection_message_tests {
         assert_eq!(current.status, TaskStatus::AwaitingDuplicateChoice);
         assert_eq!(current.status_message_id, Some(2_102));
         assert_eq!(current.job, job);
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn collection_cancel_during_queued_edit_finishes_original_message_e2e() {
+        let (telegram, mut requests, shutdown, server) =
+            spawn_controllable_fake_telegram_api().await;
+        let task_id = "collection-cancel-during-queued-edit";
+        let job = JobRequest::Bilibili {
+            url: "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+                .to_string(),
+            selection: Some(BilibiliSelection::All),
+        };
+        let (queue_root, config, queue) = create_collection_queue_with_job(
+            "collection-cancel-during-queued-edit",
+            task_id,
+            CHAT_ID,
+            71,
+            job.clone(),
+        );
+        queue
+            .set_status(task_id, TaskStatus::Queued, None)
+            .expect("collection task should enter the queue");
+        queue
+            .set_status_message_id_if_generation(task_id, 0, 4_100)
+            .expect("queued message ID should persist")
+            .expect("queued task generation should still match");
+
+        let mut context = bot_context(telegram, config, Arc::clone(&queue), 72);
+        context.job_dispatch.download_semaphore = Arc::new(Semaphore::new(0));
+        let queued_task = tokio::spawn(queue_queued_task(
+            context,
+            CHAT_ID,
+            71,
+            task_id.to_string(),
+            job,
+            JobRunMode::Direct,
+            Some(0),
+        ));
+
+        let (queued_edit, queued_response) = receive_controllable_request(&mut requests).await;
+        assert_eq!(queued_edit.method, "editMessageText");
+        assert_eq!(queued_edit.body["message_id"].as_i64(), Some(4_100));
+        assert!(
+            queued_edit.body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Queued job #71"))
+        );
+
+        let cancelled = queue
+            .cancel_for_chat_if_generation(task_id, 0, CHAT_ID)
+            .expect("queued cancellation should persist")
+            .expect("queued task should remain cancellable while its edit is in flight");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        queued_response
+            .send(controlled_success_response())
+            .expect("delayed queued edit response should be released");
+        queued_task
+            .await
+            .expect("queued message delivery should finish after release");
+
+        let (cancelled_edit, cancelled_response) =
+            receive_controllable_request(&mut requests).await;
+        assert_eq!(cancelled_edit.method, "editMessageText");
+        assert_eq!(cancelled_edit.body["message_id"].as_i64(), Some(4_100));
+        assert!(
+            cancelled_edit.body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Canceled job #71"))
+        );
+        cancelled_response
+            .send(controlled_success_response())
+            .expect("canceled main-message edit should succeed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            requests.try_recv().is_err(),
+            "cancellation must not send a replacement message"
+        );
+        let current = queue
+            .get(task_id)
+            .expect("canceled task should load")
+            .expect("canceled task should remain in the queue history");
+        assert_eq!(current.status, TaskStatus::Cancelled);
+        assert_eq!(current.status_message_id, Some(4_100));
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn collection_prompt_message_association_retries_and_queued_delivery_reuses_id_e2e() {
+        let (telegram, mut requests, shutdown, server) =
+            spawn_controllable_fake_telegram_api().await;
+        let task_id = "collection-prompt-association-file-provider-retry";
+        let (queue_root, config, queue, file_provider) = generation_guard_collection_queue(
+            "collection-prompt-association-file-provider-retry",
+            task_id,
+            73,
+            CHAT_ID,
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("selection callback should already be in preparation");
+        let before_retry = queue
+            .get(task_id)
+            .expect("preparing task should load")
+            .expect("preparing task should exist");
+        assert_eq!(before_retry.status, TaskStatus::Preparing);
+        assert_eq!(before_retry.status_message_id, None);
+
+        let reads_before = file_provider.read_paths().len();
+        file_provider.fail_next_read("simulated transient callback association read failure");
+        let associated = set_status_message_id_if_generation_and_status_with_retry_delay(
+            &queue,
+            task_id,
+            0,
+            &[TaskStatus::Preparing],
+            4_200,
+            Duration::ZERO,
+        )
+        .await
+        .expect("association helper should retry a File Provider read failure")
+        .expect("current Preparing generation should retain its prompt ID");
+        assert_eq!(associated.status, TaskStatus::Preparing);
+        assert_eq!(associated.status_message_id, Some(4_200));
+        assert!(
+            file_provider.read_paths().len() >= reads_before + 2,
+            "one failed lookup and one successful retry should both be observed"
+        );
+
+        queue
+            .set_status(task_id, TaskStatus::Queued, None)
+            .expect("selected collection should enter the queue");
+        let job = associated.job.clone();
+        let mut context = bot_context(telegram, config, Arc::clone(&queue), 74);
+        context.queue_start_retry_delay = Duration::ZERO;
+        context.job_dispatch.download_semaphore = Arc::new(Semaphore::new(0));
+        let queued_task = tokio::spawn(queue_queued_task(
+            context,
+            CHAT_ID,
+            73,
+            task_id.to_string(),
+            job,
+            JobRunMode::Direct,
+            Some(0),
+        ));
+
+        let (queued_edit, queued_response) = receive_controllable_request(&mut requests).await;
+        assert_eq!(queued_edit.method, "editMessageText");
+        assert_eq!(queued_edit.body["message_id"].as_i64(), Some(4_200));
+        assert!(
+            queued_edit.body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Queued job #73"))
+        );
+        queued_response
+            .send(controlled_success_response())
+            .expect("queued edit should complete on the callback prompt");
+        queued_task
+            .await
+            .expect("queue transition should finish without another status send");
+
+        let cancelled = queue
+            .cancel_for_chat_if_generation(task_id, 0, CHAT_ID)
+            .expect("blocked worker cancellation should persist")
+            .expect("queued task should be cancellable");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        let (cancelled_edit, cancelled_response) =
+            receive_controllable_request(&mut requests).await;
+        assert_eq!(cancelled_edit.method, "editMessageText");
+        assert_eq!(cancelled_edit.body["message_id"].as_i64(), Some(4_200));
+        assert!(
+            cancelled_edit.body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Canceled job #73"))
+        );
+        cancelled_response
+            .send(controlled_success_response())
+            .expect("canceled prompt edit should succeed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            requests.try_recv().is_err(),
+            "association retry must not create a second prompt"
+        );
+        let current = queue
+            .get(task_id)
+            .expect("queued task should load")
+            .expect("queued task should remain");
+        assert_eq!(current.generation, 0);
+        assert_eq!(current.status, TaskStatus::Cancelled);
+        assert_eq!(current.status_message_id, Some(4_200));
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn old_generation_queue_actions_cannot_mutate_current_tasks_e2e() {
+        let (telegram, mut requests, shutdown, server) =
+            spawn_controllable_fake_telegram_api().await;
+        let task_id = "old-generation-queue-cancel";
+        let job = JobRequest::Youtube {
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+        };
+        let (queue_root, mut config, queue) = create_collection_queue_with_job(
+            "old-generation-queue-actions",
+            task_id,
+            CHAT_ID,
+            75,
+            job.clone(),
+        );
+        config.telegram.allow_all_chats = true;
+
+        let cases = [
+            (
+                "old-generation-queue-cancel",
+                "cancel",
+                TaskStatus::Queued,
+                "Task is no longer cancellable.",
+            ),
+            (
+                "old-generation-queue-confirm",
+                "confirm",
+                TaskStatus::AwaitingConfirmation,
+                "There is no pending plan change to confirm.",
+            ),
+            (
+                "old-generation-queue-resume",
+                "resume",
+                TaskStatus::Interrupted,
+                "Task state changed; refresh /queue.",
+            ),
+            (
+                "old-generation-queue-retry",
+                "retry",
+                TaskStatus::Failed,
+                "Task state changed; refresh /queue.",
+            ),
+        ];
+
+        for (index, (id, _, current_status, _)) in cases.iter().enumerate() {
+            if index > 0 {
+                assert!(
+                    queue
+                        .create(TaskRecord::new(
+                            (*id).to_string(),
+                            75 + index as i64,
+                            1_075 + index as i64,
+                            CHAT_ID,
+                            Some(42),
+                            0,
+                            job.clone(),
+                        ))
+                        .expect("stale-action task should persist")
+                );
+            }
+            queue
+                .set_status(id, TaskStatus::AwaitingSelection, None)
+                .expect("each task should start from a resumable prompt state");
+            let resumed = queue
+                .claim_resume(id, false)
+                .expect("test setup should advance the generation")
+                .expect("awaiting-selection task should resume");
+            assert_eq!(resumed.generation, 1);
+            queue
+                .set_status(id, *current_status, None)
+                .expect("current generation should enter the action-specific state");
+            queue
+                .set_status_message_id_if_generation(id, 1, 5_000 + index as i64)
+                .expect("current status message ID should persist")
+                .expect("current task generation should match");
+        }
+
+        for (index, (id, action, _, expected_answer)) in cases.iter().enumerate() {
+            let before = queue
+                .get(id)
+                .expect("current task should load before stale callback")
+                .expect("current task should exist before stale callback");
+            let context = bot_context(telegram.clone(), config.clone(), Arc::clone(&queue), 80);
+            let callback = crate::telegram::CallbackQuery {
+                id: format!("stale-queue-action-{index}"),
+                data: Some(queue_callback_data(action, id, 0)),
+                message: Some(crate::telegram::Message {
+                    message_id: 6_000 + index as i64,
+                    chat: crate::telegram::Chat {
+                        id: CHAT_ID,
+                        kind: Some("private".to_string()),
+                    },
+                    text: None,
+                    from: None,
+                }),
+            };
+            let handler = tokio::spawn(handle_callback_query(context, callback));
+            let (request, response) = receive_controllable_request(&mut requests).await;
+            assert_eq!(request.method, "answerCallbackQuery");
+            assert_eq!(request.body["text"].as_str(), Some(*expected_answer));
+            response
+                .send(controlled_success_response())
+                .expect("stale callback acknowledgement should succeed");
+            handler
+                .await
+                .expect("stale queue callback handler should finish");
+            assert!(
+                requests.try_recv().is_err(),
+                "stale {action} must not send or edit a task message"
+            );
+
+            let after = queue
+                .get(id)
+                .expect("current task should load after stale callback")
+                .expect("current task should remain after stale callback");
+            assert_eq!(after.generation, before.generation);
+            assert_eq!(after.status, before.status);
+            assert_eq!(after.status_message_id, before.status_message_id);
+            assert_eq!(after.job, before.job);
+        }
 
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;

@@ -225,9 +225,14 @@ pub struct QueueManager {
     _video_owner_lock: QueueOwnerLock,
     _pdf_owner_lock: Option<QueueOwnerLock>,
     operation_lock: Mutex<()>,
-    cancellations: Mutex<HashMap<String, Arc<Notify>>>,
+    cancellations: Mutex<HashMap<String, CancellationRegistration>>,
     #[cfg(test)]
     interrupt_after_sidecar_move: AtomicBool,
+}
+
+struct CancellationRegistration {
+    generation: Option<u64>,
+    notify: Arc<Notify>,
 }
 
 impl TaskRecord {
@@ -420,11 +425,44 @@ impl QueueManager {
         Ok(count.div_ceil(QUEUE_PAGE_SIZE).max(1))
     }
 
+    #[cfg(test)]
     pub fn claim_resume(&self, id: &str, retry_failed: bool) -> Result<Option<TaskRecord>> {
+        self.claim_resume_with_constraints(id, None, None, retry_failed)
+    }
+
+    pub fn claim_resume_for_chat_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        chat_id: i64,
+        retry_failed: bool,
+    ) -> Result<Option<TaskRecord>> {
+        self.claim_resume_with_constraints(
+            id,
+            Some(expected_generation),
+            Some(chat_id),
+            retry_failed,
+        )
+    }
+
+    fn claim_resume_with_constraints(
+        &self,
+        id: &str,
+        expected_generation: Option<u64>,
+        expected_chat_id: Option<i64>,
+        retry_failed: bool,
+    ) -> Result<Option<TaskRecord>> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         let video_operation_lock = self.video.lock_queue_operations()?;
         if let Some((record, entry)) = self.video.get_task(id)? {
-            return Self::claim_resume_in_store(&self.video, retry_failed, record, entry);
+            return Self::claim_resume_in_store(
+                &self.video,
+                retry_failed,
+                expected_generation,
+                expected_chat_id,
+                record,
+                entry,
+            );
         }
         drop(video_operation_lock);
         if self.video.shares_root(&self.pdf) {
@@ -434,15 +472,29 @@ impl QueueManager {
         let Some((record, entry)) = self.pdf.get_task(id)? else {
             return Ok(None);
         };
-        Self::claim_resume_in_store(&self.pdf, retry_failed, record, entry)
+        Self::claim_resume_in_store(
+            &self.pdf,
+            retry_failed,
+            expected_generation,
+            expected_chat_id,
+            record,
+            entry,
+        )
     }
 
     fn claim_resume_in_store(
         store: &DownloadStore,
         retry_failed: bool,
+        expected_generation: Option<u64>,
+        expected_chat_id: Option<i64>,
         mut record: TaskRecord,
         entry: TaskIndexEntry,
     ) -> Result<Option<TaskRecord>> {
+        if expected_generation.is_some_and(|generation| record.generation != generation)
+            || expected_chat_id.is_some_and(|chat_id| record.chat_id != chat_id)
+        {
+            return Ok(None);
+        }
         let allowed = if retry_failed {
             record.status == TaskStatus::Failed
         } else {
@@ -720,22 +772,48 @@ impl QueueManager {
         Ok(Some((record, differences)))
     }
 
-    pub fn accept_proposed_plan(&self, id: &str) -> Result<Option<TaskRecord>> {
+    pub fn accept_proposed_plan_for_chat_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        chat_id: i64,
+    ) -> Result<Option<TaskRecord>> {
+        self.accept_proposed_plan_with_constraints(id, Some(expected_generation), Some(chat_id))
+    }
+
+    fn accept_proposed_plan_with_constraints(
+        &self,
+        id: &str,
+        expected_generation: Option<u64>,
+        expected_chat_id: Option<i64>,
+    ) -> Result<Option<TaskRecord>> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.status != TaskStatus::AwaitingConfirmation {
+        if expected_generation.is_some_and(|generation| record.generation != generation)
+            || expected_chat_id.is_some_and(|chat_id| record.chat_id != chat_id)
+            || record.status != TaskStatus::AwaitingConfirmation
+        {
             return Ok(None);
         }
         let Some(plan) = record.proposed_plan.take() else {
             return Ok(None);
         };
+        let generation = record.generation;
         record.plan = Some(plan);
         record.status = TaskStatus::Preparing;
         record.cancel_requested = false;
         record.user_actions = record.user_actions.saturating_add(1);
-        store.save_mutated_record(record, entry, true).map(Some)
+        let record = store.save_mutated_record(record, entry, true)?;
+        let mut cancellations = self.cancellations.lock().map_err(poisoned_lock)?;
+        if cancellations
+            .get(id)
+            .is_some_and(|registration| registration.generation == Some(generation))
+        {
+            cancellations.remove(id);
+        }
+        Ok(Some(record))
     }
 
     #[cfg(test)]
@@ -823,11 +901,51 @@ impl QueueManager {
         )
     }
 
+    #[cfg(test)]
     pub fn register_cancellation(&self, id: &str) -> Result<Arc<Notify>> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         let notify = Arc::new(Notify::new());
         let mut active = self.cancellations.lock().map_err(poisoned_lock)?;
-        active.insert(id.to_string(), Arc::clone(&notify));
+        active.insert(
+            id.to_string(),
+            CancellationRegistration {
+                generation: None,
+                notify: Arc::clone(&notify),
+            },
+        );
         Ok(notify)
+    }
+
+    pub fn register_cancellation_if_queued_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+    ) -> Result<Option<(TaskRecord, Arc<Notify>)>> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let Some(record) = self.find_record_unlocked(id)? else {
+            return Ok(None);
+        };
+        if record.generation != expected_generation || record.status != TaskStatus::Queued {
+            return Ok(None);
+        }
+
+        let mut active = self.cancellations.lock().map_err(poisoned_lock)?;
+        if let Some(current) = active
+            .get(id)
+            .filter(|current| current.generation == Some(expected_generation))
+        {
+            return Ok(Some((record, Arc::clone(&current.notify))));
+        }
+
+        let notify = Arc::new(Notify::new());
+        active.insert(
+            id.to_string(),
+            CancellationRegistration {
+                generation: Some(expected_generation),
+                notify: Arc::clone(&notify),
+            },
+        );
+        Ok(Some((record, notify)))
     }
 
     #[cfg(test)]
@@ -841,18 +959,20 @@ impl QueueManager {
         let mut active = self.cancellations.lock().map_err(poisoned_lock)?;
         if active
             .get(id)
-            .is_some_and(|current| Arc::ptr_eq(current, notify))
+            .is_some_and(|current| Arc::ptr_eq(&current.notify, notify))
         {
             active.remove(id);
         }
         Ok(())
     }
 
-    pub fn notify_cancel(&self, id: &str) -> Result<()> {
-        if let Some(notify) = self.cancellations.lock().map_err(poisoned_lock)?.get(id) {
-            notify.notify_one();
-        }
-        Ok(())
+    fn cancellation_target_unlocked(&self, id: &str) -> Result<Option<Arc<Notify>>> {
+        Ok(self
+            .cancellations
+            .lock()
+            .map_err(poisoned_lock)?
+            .get(id)
+            .map(|registration| Arc::clone(&registration.notify)))
     }
 
     #[cfg(test)]
@@ -1030,33 +1150,18 @@ impl QueueManager {
         })
     }
 
+    #[cfg(test)]
     pub fn cancel(&self, id: &str, chat_id: i64) -> Result<Option<TaskRecord>> {
-        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
-        let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
-            return Ok(None);
-        };
-        if record.chat_id != chat_id
-            || !record.status.is_unfinished()
-            || record.status == TaskStatus::Verifying
-        {
-            return Ok(None);
-        }
-        if record.status == TaskStatus::Running {
-            record.cancel_requested = true;
-            record.user_actions = record.user_actions.saturating_add(1);
-            let result = store.save_mutated_record(record, entry, false)?;
-            drop(_guard);
-            self.notify_cancel(id)?;
-            return Ok(Some(result));
-        }
-        record.status = TaskStatus::Cancelled;
-        record.cancel_requested = false;
-        record.error = None;
-        record.user_actions = record.user_actions.saturating_add(1);
-        let result = store.save_mutated_record(record, entry, true)?;
-        drop(_guard);
-        self.notify_cancel(id)?;
-        Ok(Some(result))
+        self.cancel_matching(id, None, chat_id, None, true, true)
+    }
+
+    pub fn cancel_for_chat_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        chat_id: i64,
+    ) -> Result<Option<TaskRecord>> {
+        self.cancel_matching(id, Some(expected_generation), chat_id, None, true, true)
     }
 
     #[cfg(test)]
@@ -1066,33 +1171,7 @@ impl QueueManager {
         expected_generation: u64,
         chat_id: i64,
     ) -> Result<Option<TaskRecord>> {
-        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
-        let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
-            return Ok(None);
-        };
-        if record.generation != expected_generation
-            || record.chat_id != chat_id
-            || !record.status.is_unfinished()
-            || record.status == TaskStatus::Verifying
-        {
-            return Ok(None);
-        }
-        if record.status == TaskStatus::Running {
-            record.cancel_requested = true;
-            record.user_actions = record.user_actions.saturating_add(1);
-            let result = store.save_mutated_record(record, entry, false)?;
-            drop(_guard);
-            self.notify_cancel(id)?;
-            return Ok(Some(result));
-        }
-        record.status = TaskStatus::Cancelled;
-        record.cancel_requested = false;
-        record.error = None;
-        record.user_actions = record.user_actions.saturating_add(1);
-        let result = store.save_mutated_record(record, entry, true)?;
-        drop(_guard);
-        self.notify_cancel(id)?;
-        Ok(Some(result))
+        self.cancel_matching(id, Some(expected_generation), chat_id, None, true, true)
     }
 
     #[cfg(test)]
@@ -1102,24 +1181,7 @@ impl QueueManager {
         chat_id: i64,
         expected_statuses: &[TaskStatus],
     ) -> Result<Option<TaskRecord>> {
-        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
-        let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
-            return Ok(None);
-        };
-        if record.chat_id != chat_id
-            || !expected_statuses.contains(&record.status)
-            || !record.status.is_unfinished()
-        {
-            return Ok(None);
-        }
-        record.status = TaskStatus::Cancelled;
-        record.cancel_requested = false;
-        record.error = None;
-        record.user_actions = record.user_actions.saturating_add(1);
-        let result = store.save_mutated_record(record, entry, true)?;
-        drop(_guard);
-        self.notify_cancel(id)?;
-        Ok(Some(result))
+        self.cancel_matching(id, None, chat_id, Some(expected_statuses), false, false)
     }
 
     pub fn cancel_if_generation_and_status(
@@ -1129,24 +1191,73 @@ impl QueueManager {
         chat_id: i64,
         expected_statuses: &[TaskStatus],
     ) -> Result<Option<TaskRecord>> {
+        self.cancel_matching(
+            id,
+            Some(expected_generation),
+            chat_id,
+            Some(expected_statuses),
+            false,
+            true,
+        )
+    }
+
+    fn cancel_matching(
+        &self,
+        id: &str,
+        expected_generation: Option<u64>,
+        chat_id: i64,
+        expected_statuses: Option<&[TaskStatus]>,
+        reject_verifying: bool,
+        running_sets_request: bool,
+    ) -> Result<Option<TaskRecord>> {
+        let Some((record, cancellation_target)) = self.cancel_matching_and_capture(
+            id,
+            expected_generation,
+            chat_id,
+            expected_statuses,
+            reject_verifying,
+            running_sets_request,
+        )?
+        else {
+            return Ok(None);
+        };
+        if let Some(notify) = cancellation_target {
+            notify.notify_one();
+        }
+        Ok(Some(record))
+    }
+
+    // Keep the captured token with the persisted transition so a later generation cannot
+    // replace the map entry before the caller delivers this cancellation notification.
+    fn cancel_matching_and_capture(
+        &self,
+        id: &str,
+        expected_generation: Option<u64>,
+        chat_id: i64,
+        expected_statuses: Option<&[TaskStatus]>,
+        reject_verifying: bool,
+        running_sets_request: bool,
+    ) -> Result<Option<(TaskRecord, Option<Arc<Notify>>)>> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.generation != expected_generation
+        if expected_generation.is_some_and(|generation| record.generation != generation)
             || record.chat_id != chat_id
-            || !expected_statuses.contains(&record.status)
+            || expected_statuses.is_some_and(|statuses| !statuses.contains(&record.status))
             || !record.status.is_unfinished()
+            || (reject_verifying && record.status == TaskStatus::Verifying)
         {
             return Ok(None);
         }
-        if record.status == TaskStatus::Running {
+
+        let cancellation_target = self.cancellation_target_unlocked(id)?;
+        if running_sets_request && record.status == TaskStatus::Running {
             record.cancel_requested = true;
             record.user_actions = record.user_actions.saturating_add(1);
             let result = store.save_mutated_record(record, entry, false)?;
             drop(_guard);
-            self.notify_cancel(id)?;
-            return Ok(Some(result));
+            return Ok(Some((result, cancellation_target)));
         }
         record.status = TaskStatus::Cancelled;
         record.cancel_requested = false;
@@ -1154,8 +1265,7 @@ impl QueueManager {
         record.user_actions = record.user_actions.saturating_add(1);
         let result = store.save_mutated_record(record, entry, true)?;
         drop(_guard);
-        self.notify_cancel(id)?;
-        Ok(Some(result))
+        Ok(Some((result, cancellation_target)))
     }
 
     #[cfg(test)]
@@ -1202,12 +1312,9 @@ impl QueueManager {
         store.save_mutated_record(record, entry, true).map(Some)
     }
 
+    #[cfg(test)]
     pub fn cancel_for_chat(&self, id: &str, chat_id: i64) -> Result<Option<TaskRecord>> {
         self.cancel(id, chat_id)
-    }
-
-    pub fn validate_chat(&self, id: &str, chat_id: i64) -> Result<Option<TaskRecord>> {
-        Ok(self.get(id)?.filter(|record| record.chat_id == chat_id))
     }
 
     pub fn startup_summaries(&self) -> Result<Vec<RestartSummary>> {
@@ -2835,7 +2942,7 @@ mod tests {
             let registered = active
                 .get(id)
                 .expect("replacement token should remain registered");
-            assert!(Arc::ptr_eq(registered, &current_token));
+            assert!(Arc::ptr_eq(&registered.notify, &current_token));
         }
 
         queue
@@ -2847,6 +2954,469 @@ mod tests {
                 .lock()
                 .expect("cancellation map should remain available")
                 .contains_key(id)
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn cancellation_registration_requires_current_queued_generation() {
+        let temp_root = temp_queue_root("queued-generation-cancellation-registration");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root;
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-queued-generation-cancellation-registration";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=registration".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Queued, None)
+            .expect("task should queue");
+
+        let previous = queue
+            .register_cancellation(id)
+            .expect("existing token should register");
+        assert!(
+            queue
+                .register_cancellation_if_queued_generation(id, 1)
+                .expect("stale generation should be checked")
+                .is_none()
+        );
+        {
+            let active = queue
+                .cancellations
+                .lock()
+                .expect("cancellation map should remain available");
+            assert!(Arc::ptr_eq(
+                &active.get(id).expect("existing token should remain").notify,
+                &previous
+            ));
+        }
+
+        let (record, current) = queue
+            .register_cancellation_if_queued_generation(id, 0)
+            .expect("current queued generation should register")
+            .expect("current queued task should remain available");
+        assert_eq!(record.status, TaskStatus::Queued);
+        assert_eq!(record.generation, 0);
+        let (same_record, repeated) = queue
+            .register_cancellation_if_queued_generation(id, 0)
+            .expect("repeated registration should succeed")
+            .expect("queued task should remain available");
+        assert_eq!(same_record.generation, 0);
+        assert!(Arc::ptr_eq(&current, &repeated));
+
+        queue
+            .set_status(id, TaskStatus::Cancelled, None)
+            .expect("task should cancel");
+        assert!(
+            queue
+                .register_cancellation_if_queued_generation(id, 0)
+                .expect("terminal status should be checked")
+                .is_none()
+        );
+        {
+            let active = queue
+                .cancellations
+                .lock()
+                .expect("cancellation map should remain available");
+            assert!(Arc::ptr_eq(
+                &active.get(id).expect("current token should remain").notify,
+                &current
+            ));
+        }
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn cancellation_registration_preserves_file_provider_read_errors() {
+        let temp_root = temp_queue_root("queued-generation-cancellation-read-error");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root;
+        config.downloads.pdf_dir = pdf_root;
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let queue = QueueManager::open_with_file_provider(&config, provider.clone())
+            .expect("task queue should open");
+        let id = "task-queued-generation-cancellation-read-error";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=read-error".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Queued, None)
+            .expect("task should queue");
+        provider.fail_next_read("registration read failed");
+
+        let error = match queue.register_cancellation_if_queued_generation(id, 0) {
+            Ok(_) => panic!("file provider read failure should propagate"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("registration read failed"));
+        assert!(
+            queue
+                .cancellations
+                .lock()
+                .expect("cancellation map should remain available")
+                .get(id)
+                .is_none()
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn callback_transitions_require_current_generation_and_chat() {
+        let temp_root = temp_queue_root("generation-guarded-callbacks");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root;
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-generation-guarded-callbacks";
+        let chat_id = 123_456_789;
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=callback-guard".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+
+        assert!(
+            queue
+                .claim_resume_for_chat_if_generation(id, 1, chat_id, false)
+                .expect("stale resume generation should be checked")
+                .is_none()
+        );
+        assert!(
+            queue
+                .claim_resume_for_chat_if_generation(id, 0, chat_id + 1, false)
+                .expect("foreign chat should be checked")
+                .is_none()
+        );
+        let resumed = queue
+            .claim_resume_for_chat_if_generation(id, 0, chat_id, false)
+            .expect("current resume callback should be checked")
+            .expect("current generation and chat should claim resume");
+        assert_eq!(resumed.generation, 1);
+        assert_eq!(resumed.status, TaskStatus::Preparing);
+        assert!(
+            queue
+                .claim_resume_for_chat_if_generation(id, 0, chat_id, false)
+                .expect("stale resumed generation should be checked")
+                .is_none()
+        );
+
+        queue
+            .set_status(id, TaskStatus::Running, None)
+            .expect("resumed task should run");
+        let original_plan = PlanValidationSnapshot {
+            stable_media_ids: vec!["original".to_string()],
+            ..PlanValidationSnapshot::default()
+        };
+        queue
+            .set_plan_if_generation(id, 1, original_plan)
+            .expect("initial validation should succeed")
+            .expect("current task should accept initial validation");
+        let proposed_plan = PlanValidationSnapshot {
+            stable_media_ids: vec!["changed".to_string()],
+            ..PlanValidationSnapshot::default()
+        };
+        queue
+            .set_plan_if_generation(id, 1, proposed_plan)
+            .expect("proposed validation should succeed")
+            .expect("current task should propose changed plan");
+        assert!(
+            queue
+                .accept_proposed_plan_for_chat_if_generation(id, 0, chat_id)
+                .expect("stale confirmation generation should be checked")
+                .is_none()
+        );
+        assert!(
+            queue
+                .accept_proposed_plan_for_chat_if_generation(id, 1, chat_id + 1)
+                .expect("foreign confirmation chat should be checked")
+                .is_none()
+        );
+        assert_eq!(
+            queue
+                .get(id)
+                .expect("task should remain readable")
+                .unwrap()
+                .status,
+            TaskStatus::AwaitingConfirmation
+        );
+        let confirmed = queue
+            .accept_proposed_plan_for_chat_if_generation(id, 1, chat_id)
+            .expect("current confirmation callback should be checked")
+            .expect("current generation and chat should accept the plan");
+        assert_eq!(confirmed.status, TaskStatus::Preparing);
+
+        assert!(
+            queue
+                .cancel_for_chat_if_generation(id, 0, chat_id)
+                .expect("stale cancel generation should be checked")
+                .is_none()
+        );
+        assert!(
+            queue
+                .cancel_for_chat_if_generation(id, 1, chat_id + 1)
+                .expect("foreign cancel chat should be checked")
+                .is_none()
+        );
+        assert_eq!(
+            queue
+                .get(id)
+                .expect("task should remain readable")
+                .unwrap()
+                .status,
+            TaskStatus::Preparing
+        );
+        let cancelled = queue
+            .cancel_for_chat_if_generation(id, 1, chat_id)
+            .expect("current cancel callback should be checked")
+            .expect("current generation and chat should cancel the task");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+
+        let retry_id = "task-generation-guarded-callback-retry";
+        assert!(
+            queue
+                .create(test_task(
+                    retry_id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=callback-retry".to_string(),
+                    },
+                ))
+                .expect("retry task should persist")
+        );
+        queue
+            .set_status(retry_id, TaskStatus::Failed, Some("retry me".to_string()))
+            .expect("retry task should fail");
+        assert!(
+            queue
+                .claim_resume_for_chat_if_generation(retry_id, 0, chat_id + 1, true)
+                .expect("foreign retry chat should be checked")
+                .is_none()
+        );
+        assert!(
+            queue
+                .claim_resume_for_chat_if_generation(retry_id, 1, chat_id, true)
+                .expect("stale retry generation should be checked")
+                .is_none()
+        );
+        let retried = queue
+            .claim_resume_for_chat_if_generation(retry_id, 0, chat_id, true)
+            .expect("current retry callback should be checked")
+            .expect("current generation and chat should claim retry");
+        assert_eq!(retried.generation, 1);
+        assert_eq!(retried.status, TaskStatus::Preparing);
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn accepting_plan_retires_old_token_before_next_queued_run() {
+        let temp_root = temp_queue_root("confirmed-plan-cancellation-token");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root;
+        config.downloads.pdf_dir = pdf_root;
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let queue = QueueManager::open_with_file_provider(&config, file_provider)
+            .expect("task queue should open");
+        let id = "task-confirmed-plan-cancellation-token";
+        let chat_id = 123_456_789;
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=confirmed-plan-token".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Queued, None)
+            .expect("task should queue for its first run");
+        let (_, old_token) = queue
+            .register_cancellation_if_queued_generation(id, 0)
+            .expect("first-run cancellation token should register")
+            .expect("task should still be queued");
+        queue
+            .begin_run_if_generation(id, 0)
+            .expect("first run should begin")
+            .expect("generation zero should be current");
+        queue
+            .set_plan_if_generation(
+                id,
+                0,
+                PlanValidationSnapshot {
+                    stable_media_ids: vec!["old-plan".to_string()],
+                    ..PlanValidationSnapshot::default()
+                },
+            )
+            .expect("initial plan should validate")
+            .expect("task should remain current");
+        queue
+            .set_plan_if_generation(
+                id,
+                0,
+                PlanValidationSnapshot {
+                    stable_media_ids: vec!["new-plan".to_string()],
+                    ..PlanValidationSnapshot::default()
+                },
+            )
+            .expect("changed plan should be recorded")
+            .expect("task should await plan confirmation");
+
+        queue
+            .accept_proposed_plan_for_chat_if_generation(id, 0, chat_id)
+            .expect("plan confirmation should persist")
+            .expect("current plan should be accepted");
+        queue
+            .set_status_if_generation(id, 0, &[TaskStatus::Preparing], TaskStatus::Queued)
+            .expect("confirmed task should queue for its next run")
+            .expect("same generation should still be current");
+        let (_, new_token) = queue
+            .register_cancellation_if_queued_generation(id, 0)
+            .expect("next-run token should register")
+            .expect("confirmed task should be queued");
+        assert!(!Arc::ptr_eq(&old_token, &new_token));
+
+        queue
+            .unregister_cancellation_if_current(id, &old_token)
+            .expect("old worker cleanup should complete");
+        {
+            let active = queue
+                .cancellations
+                .lock()
+                .expect("cancellation map should remain available");
+            assert!(Arc::ptr_eq(
+                &active
+                    .get(id)
+                    .expect("new worker cancellation token should remain registered")
+                    .notify,
+                &new_token
+            ));
+        }
+
+        let cancelled = queue
+            .cancel_for_chat_if_generation(id, 0, chat_id)
+            .expect("cancellation should persist")
+            .expect("current queued generation should be cancellable");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        tokio::time::timeout(Duration::from_millis(100), new_token.notified())
+            .await
+            .expect("cancellation should notify the new worker token");
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn cancellation_notifies_the_captured_token_after_generation_replacement() {
+        let temp_root = temp_queue_root("cancellation-token-generation-interleaving");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root;
+        config.downloads.pdf_dir = pdf_root;
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-cancellation-token-generation-interleaving";
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=token-interleaving".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Queued, None)
+            .expect("task should queue");
+        let (_, old_token) = queue
+            .register_cancellation_if_queued_generation(id, 0)
+            .expect("current token should register")
+            .expect("queued task should remain available");
+        queue
+            .begin_run_if_generation(id, 0)
+            .expect("task should start for generation zero")
+            .expect("current queued task should start");
+
+        let (cancelled, captured) = queue
+            .cancel_matching_and_capture(id, Some(0), 123_456_789, None, true, true)
+            .expect("cancellation should persist")
+            .expect("running task should accept cancellation");
+        assert!(cancelled.cancel_requested);
+        let captured = captured.expect("active generation token should be captured");
+        assert!(Arc::ptr_eq(&captured, &old_token));
+
+        queue
+            .fail_if_generation(id, 0, "resume fixture".to_string())
+            .expect("test task should become retryable")
+            .expect("generation zero should remain current");
+        queue
+            .claim_resume(id, true)
+            .expect("retry should claim generation one")
+            .expect("failed task should be retryable");
+        queue
+            .set_status(id, TaskStatus::Queued, None)
+            .expect("retried task should queue");
+        let (_, new_token) = queue
+            .register_cancellation_if_queued_generation(id, 1)
+            .expect("new generation token should register")
+            .expect("generation one should be queued");
+        assert!(!Arc::ptr_eq(&captured, &new_token));
+
+        captured.notify_one();
+        tokio::time::timeout(Duration::from_millis(100), captured.notified())
+            .await
+            .expect("captured old token should receive the cancellation");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), new_token.notified())
+                .await
+                .is_err()
         );
 
         drop(queue);
