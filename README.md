@@ -55,6 +55,8 @@ staging 下载成功后会先持久化身份绑定的 `.retained.json`；Bilibil
 
 `bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。进度通道只保留最新状态，Telegram 按该间隔合并刷新，不会因全集任务的高频事件积压消息。视频计划解析得到的媒体摘要会作为进度上下文保留，后续速度、文件增长、下载和 mux 阶段更新不会覆盖它。YouTube/PDF 外部命令会刷新文件增长快照；Bilibili 会转发 `bbdown-core` 的关键 plan、download 和 mux 阶段。`bot.command_timeout_seconds` 是单个外部命令的总超时；direct Bilibili 下载不受这个总时限约束，而是把 `bot.command_idle_timeout_seconds` 作为媒体读取 idle timeout 传给 `bbdown-core`。Bilibili API 请求仍受独立的 request timeout 约束，bot 调用的 ffmpeg 等外部命令仍受总超时和 idle timeout 约束。
 
+Bilibili 合集每轮执行只发送一条入队主消息和每个所选视频的一条状态消息；合集详情、进度、处理和最终结果编辑已有消息，下载完成后还会等待已发布文件校验。已存在且通过核验的视频显示跳过下载状态；取消时不为尚未开始的视频补发消息。通过 `/queue` 恢复或手动重试会开启新一轮，保留旧轮消息并创建新轮消息；网络和文件提供器的内部重试不会另开一轮。
+
 ## 运行
 
 ```sh

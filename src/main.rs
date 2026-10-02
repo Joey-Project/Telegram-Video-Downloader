@@ -78,6 +78,8 @@ const MAX_PENDING_BILIBILI_SELECTION_JOBS: usize = 256;
 const COLLECTION_DETAILS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_PENDING_COLLECTION_DETAILS: usize = 128;
 const COLLECTION_DETAILS_PAGE_SIZE: usize = 5;
+const COLLECTION_MAIN_EDIT_ATTEMPTS: usize = 3;
+const COLLECTION_MAIN_EDIT_RETRY_DELAY: Duration = Duration::from_millis(250);
 const BILIBILI_ACCESS_KEY_LOGIN_TTL: Duration = Duration::from_secs(30 * 60);
 const QUEUE_START_FILE_PROVIDER_RETRY_DELAY: Duration = Duration::from_secs(5);
 
@@ -86,6 +88,7 @@ struct PendingDuplicateJob {
     chat_id: i64,
     job_id: u64,
     task_id: String,
+    generation: u64,
     job: JobRequest,
     duplicate: VideoDuplicate,
     created_at: Instant,
@@ -96,6 +99,7 @@ struct PendingBilibiliSelectionJob {
     chat_id: i64,
     job_id: u64,
     task_id: String,
+    generation: u64,
     job: JobRequest,
     prompt: BilibiliSelectionPrompt,
     created_at: Instant,
@@ -106,7 +110,13 @@ struct PendingCollectionDetails {
     chat_id: i64,
     message_id: i64,
     job_id: u64,
+    task_id: String,
+    generation: u64,
     manifest: BilibiliCollectionManifest,
+    page: usize,
+    overview: String,
+    terminal: bool,
+    edit_lock: Arc<Mutex<()>>,
     created_at: Instant,
 }
 
@@ -167,7 +177,9 @@ struct JobProgressContext {
     chat_id: i64,
     job_id: u64,
     task_id: String,
+    generation: u64,
     job_label: &'static str,
+    is_collection: bool,
     status_message_id: Option<i64>,
     update_interval: Duration,
 }
@@ -770,10 +782,11 @@ async fn handle_message(
                     stored_job,
                 );
                 task.url_was_sanitized = sanitized;
+                let generation = task.generation;
                 if !queue.create(task)? {
                     continue;
                 }
-                queue_or_prompt_job(context.clone(), chat_id, job_id, task_id, job);
+                queue_or_prompt_job(context.clone(), chat_id, job_id, task_id, generation, job);
             }
         }
         RouteResult::BilibiliAuth(command) => {
@@ -859,10 +872,11 @@ struct QueueCommand {
 
 #[derive(Debug, Clone)]
 enum QueueCallbackAction {
-    Resume(String),
-    Retry(String),
-    Cancel(String),
-    Confirm(String),
+    Resume { id: String, generation: u64 },
+    Retry { id: String, generation: u64 },
+    Cancel { id: String, generation: u64 },
+    Confirm { id: String, generation: u64 },
+    StaleTaskAction,
     ActivePage(usize),
     HistoryPage(usize),
 }
@@ -886,25 +900,67 @@ fn parse_queue_command(text: &str) -> Option<QueueCommand> {
 }
 
 fn parse_queue_callback_data(data: &str) -> Option<QueueCallbackAction> {
-    let mut parts = data.splitn(3, ':');
+    let mut parts = data.split(':');
     if parts.next()? != "q" {
         return None;
     }
     let action = parts.next()?;
     let value = parts.next()?;
     match action {
-        "resume" => Some(QueueCallbackAction::Resume(value.to_string())),
-        "retry" => Some(QueueCallbackAction::Retry(value.to_string())),
-        "cancel" => Some(QueueCallbackAction::Cancel(value.to_string())),
-        "confirm" => Some(QueueCallbackAction::Confirm(value.to_string())),
-        "active" => value.parse().ok().map(QueueCallbackAction::ActivePage),
-        "history" => value.parse().ok().map(QueueCallbackAction::HistoryPage),
+        "r" | "t" | "c" | "f" => {
+            let generation = u64::from_str_radix(parts.next()?, 16).ok()?;
+            if parts.next().is_some() {
+                return None;
+            }
+            let action = match action {
+                "r" => QueueCallbackAction::Resume {
+                    id: value.to_string(),
+                    generation,
+                },
+                "t" => QueueCallbackAction::Retry {
+                    id: value.to_string(),
+                    generation,
+                },
+                "c" => QueueCallbackAction::Cancel {
+                    id: value.to_string(),
+                    generation,
+                },
+                "f" => QueueCallbackAction::Confirm {
+                    id: value.to_string(),
+                    generation,
+                },
+                _ => unreachable!("matched task action code"),
+            };
+            Some(action)
+        }
+        "resume" | "retry" | "cancel" | "confirm" => {
+            // Task buttons without a generation belong to an older queue view.
+            Some(QueueCallbackAction::StaleTaskAction)
+        }
+        "active" if parts.next().is_none() => {
+            value.parse().ok().map(QueueCallbackAction::ActivePage)
+        }
+        "history" if parts.next().is_none() => {
+            value.parse().ok().map(QueueCallbackAction::HistoryPage)
+        }
         _ => None,
     }
 }
 
-fn queue_callback_data(action: &str, id: &str) -> String {
-    format!("q:{action}:{id}")
+fn queue_callback_data(action: &str, id: &str, generation: u64) -> String {
+    let action_code = match action {
+        "resume" => "r",
+        "retry" => "t",
+        "cancel" => "c",
+        "confirm" => "f",
+        _ => panic!("unsupported queue task action: {action}"),
+    };
+    let data = format!("q:{action_code}:{id}:{generation:x}");
+    debug_assert!(
+        data.len() <= 64,
+        "queue callback data exceeds Telegram's 64-byte limit"
+    );
+    data
 }
 
 fn task_action_keyboard(buttons: &[(String, String)]) -> InlineKeyboardMarkup {
@@ -987,78 +1043,47 @@ async fn handle_queue_callback(
     let queue = Arc::clone(&context.queue);
     let next_job_id = Arc::clone(&context.next_job_id);
     match action {
-        action @ QueueCallbackAction::Resume(_) | action @ QueueCallbackAction::Retry(_) => {
-            let (id, retry) = match action {
-                QueueCallbackAction::Resume(id) => (id, false),
-                QueueCallbackAction::Retry(id) => (id, true),
+        action @ QueueCallbackAction::Resume { .. }
+        | action @ QueueCallbackAction::Retry { .. } => {
+            let (id, generation, retry) = match action {
+                QueueCallbackAction::Resume { id, generation } => (id, generation, false),
+                QueueCallbackAction::Retry { id, generation } => (id, generation, true),
                 _ => unreachable!("matched resume or retry action"),
             };
-            match queue.validate_chat(&id, chat_id) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    answer_callback_or_log(
-                        &telegram,
-                        callback_id,
-                        "Task not found in this chat.".to_string(),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    if !report_queue_file_provider_callback_error(
-                        &telegram,
-                        &callback_id,
-                        chat_id,
-                        Some(&id),
-                        "validate task before resume or retry",
-                        &err,
-                    )
-                    .await
-                    {
-                        warn!(task_id = %id, error = %err, "failed to validate task for restart");
+            let claimed =
+                match queue.claim_resume_for_chat_if_generation(&id, generation, chat_id, retry) {
+                    Ok(Some(record)) => record,
+                    Ok(None) => {
                         answer_callback_or_log(
                             &telegram,
                             callback_id,
-                            "Could not check this task.".to_string(),
+                            "Task state changed; refresh /queue.".to_string(),
                         )
                         .await;
+                        return;
                     }
-                    return;
-                }
-            }
-            let claimed = match queue.claim_resume(&id, retry) {
-                Ok(Some(record)) => record,
-                Ok(None) => {
-                    answer_callback_or_log(
-                        &telegram,
-                        callback_id,
-                        "Task state changed; refresh /queue.".to_string(),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    if !report_queue_file_provider_callback_error(
-                        &telegram,
-                        &callback_id,
-                        chat_id,
-                        Some(&id),
-                        "claim task for restart",
-                        &err,
-                    )
-                    .await
-                    {
-                        warn!(task_id = %id, error = %err, "failed to claim task for restart");
-                        answer_callback_or_log(
+                    Err(err) => {
+                        if !report_queue_file_provider_callback_error(
                             &telegram,
-                            callback_id,
-                            "Could not update this task.".to_string(),
+                            &callback_id,
+                            chat_id,
+                            Some(&id),
+                            "claim task generation for restart",
+                            &err,
                         )
-                        .await;
+                        .await
+                        {
+                            warn!(task_id = %id, error = %err, "failed to claim task for restart");
+                            answer_callback_or_log(
+                                &telegram,
+                                callback_id,
+                                "Could not update this task.".to_string(),
+                            )
+                            .await;
+                        }
+                        return;
                     }
-                    return;
-                }
-            };
+                };
             answer_callback_or_log(
                 &telegram,
                 callback_id,
@@ -1077,122 +1102,113 @@ async fn handle_queue_callback(
                 .await;
             }
             let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
-            queue_or_prompt_job(context, chat_id, job_id, claimed.id, claimed.job);
+            queue_or_prompt_job(
+                context,
+                chat_id,
+                job_id,
+                claimed.id,
+                claimed.generation,
+                claimed.job,
+            );
         }
-        QueueCallbackAction::Cancel(id) => match queue.cancel_for_chat(&id, chat_id) {
-            Ok(Some(task)) => {
-                let (answer, message) = if task.status == TaskStatus::Running {
-                    (
-                        "Cancellation requested.",
-                        "Cancellation requested. Use /queue to refresh the list.",
+        QueueCallbackAction::Cancel { id, generation } => {
+            match queue.cancel_for_chat_if_generation(&id, generation, chat_id) {
+                Ok(Some(task)) => {
+                    let (answer, message) = if task.status == TaskStatus::Running {
+                        (
+                            "Cancellation requested.",
+                            "Cancellation requested. Use /queue to refresh the list.",
+                        )
+                    } else {
+                        (
+                            "Task canceled.",
+                            "Task canceled. Use /queue to refresh the list.",
+                        )
+                    };
+                    answer_callback_or_log(&telegram, callback_id, answer.to_string()).await;
+                    let _ = telegram
+                        .edit_message_text(chat_id, message_id, message.to_string())
+                        .await;
+                    if is_confirmed_bilibili_ugc_collection_job(&task.job)
+                        && let Some(status_message_id) = task.status_message_id
+                    {
+                        edit_task_message_if_current(
+                            &queue,
+                            &id,
+                            generation,
+                            &telegram,
+                            chat_id,
+                            status_message_id,
+                            message.to_string(),
+                        )
+                        .await;
+                    }
+                }
+                Ok(None) => {
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Task is no longer cancellable.".to_string(),
                     )
-                } else {
-                    (
-                        "Task canceled.",
-                        "Task canceled. Use /queue to refresh the list.",
+                    .await;
+                }
+                Err(err) => {
+                    if !report_queue_file_provider_callback_error(
+                        &telegram,
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "cancel task",
+                        &err,
                     )
+                    .await
+                    {
+                        warn!(task_id = %id, error = %err, "failed to cancel persistent task");
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not cancel this task.".to_string(),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        QueueCallbackAction::Confirm { id, generation } => {
+            let record =
+                match queue.accept_proposed_plan_for_chat_if_generation(&id, generation, chat_id) {
+                    Ok(Some(record)) => record,
+                    Ok(None) => {
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "There is no pending plan change to confirm.".to_string(),
+                        )
+                        .await;
+                        return;
+                    }
+                    Err(err) => {
+                        if !report_queue_file_provider_callback_error(
+                            &telegram,
+                            &callback_id,
+                            chat_id,
+                            Some(&id),
+                            "confirm changed plan",
+                            &err,
+                        )
+                        .await
+                        {
+                            warn!(task_id = %id, error = %err, "failed to accept changed plan");
+                            answer_callback_or_log(
+                                &telegram,
+                                callback_id,
+                                "Could not save the plan confirmation.".to_string(),
+                            )
+                            .await;
+                        }
+                        return;
+                    }
                 };
-                answer_callback_or_log(&telegram, callback_id, answer.to_string()).await;
-                let _ = telegram
-                    .edit_message_text(chat_id, message_id, message.to_string())
-                    .await;
-            }
-            Ok(None) => {
-                answer_callback_or_log(
-                    &telegram,
-                    callback_id,
-                    "Task is no longer cancellable.".to_string(),
-                )
-                .await;
-            }
-            Err(err) => {
-                if !report_queue_file_provider_callback_error(
-                    &telegram,
-                    &callback_id,
-                    chat_id,
-                    Some(&id),
-                    "cancel task",
-                    &err,
-                )
-                .await
-                {
-                    warn!(task_id = %id, error = %err, "failed to cancel persistent task");
-                    answer_callback_or_log(
-                        &telegram,
-                        callback_id,
-                        "Could not cancel this task.".to_string(),
-                    )
-                    .await;
-                }
-            }
-        },
-        QueueCallbackAction::Confirm(id) => {
-            match queue.validate_chat(&id, chat_id) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    answer_callback_or_log(
-                        &telegram,
-                        callback_id,
-                        "Task not found in this chat.".to_string(),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    if !report_queue_file_provider_callback_error(
-                        &telegram,
-                        &callback_id,
-                        chat_id,
-                        Some(&id),
-                        "validate task before confirming plan",
-                        &err,
-                    )
-                    .await
-                    {
-                        warn!(task_id = %id, error = %err, "failed to validate task for plan confirmation");
-                        answer_callback_or_log(
-                            &telegram,
-                            callback_id,
-                            "Could not check this task.".to_string(),
-                        )
-                        .await;
-                    }
-                    return;
-                }
-            }
-            let record = match queue.accept_proposed_plan(&id) {
-                Ok(Some(record)) => record,
-                Ok(None) => {
-                    answer_callback_or_log(
-                        &telegram,
-                        callback_id,
-                        "There is no pending plan change to confirm.".to_string(),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    if !report_queue_file_provider_callback_error(
-                        &telegram,
-                        &callback_id,
-                        chat_id,
-                        Some(&id),
-                        "confirm changed plan",
-                        &err,
-                    )
-                    .await
-                    {
-                        warn!(task_id = %id, error = %err, "failed to accept changed plan");
-                        answer_callback_or_log(
-                            &telegram,
-                            callback_id,
-                            "Could not save the plan confirmation.".to_string(),
-                        )
-                        .await;
-                    }
-                    return;
-                }
-            };
             answer_callback_or_log(
                 &telegram,
                 callback_id,
@@ -1200,7 +1216,22 @@ async fn handle_queue_callback(
             )
             .await;
             let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
-            queue_or_prompt_job(context, chat_id, job_id, record.id, record.job);
+            queue_or_prompt_job(
+                context,
+                chat_id,
+                job_id,
+                record.id,
+                record.generation,
+                record.job,
+            );
+        }
+        QueueCallbackAction::StaleTaskAction => {
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                "This task button expired. Refresh /queue and try again.".to_string(),
+            )
+            .await;
         }
         action @ QueueCallbackAction::ActivePage(_)
         | action @ QueueCallbackAction::HistoryPage(_) => {
@@ -1295,21 +1326,21 @@ fn render_queue_page(
         match record.status {
             TaskStatus::Failed => buttons.push((
                 "Retry failed".to_string(),
-                queue_callback_data("retry", &record.id),
+                queue_callback_data("retry", &record.id, record.generation),
             )),
             TaskStatus::Received | TaskStatus::AwaitingSelection | TaskStatus::Interrupted => {
                 buttons.push((
                     "Resume".to_string(),
-                    queue_callback_data("resume", &record.id),
+                    queue_callback_data("resume", &record.id, record.generation),
                 ))
             }
             TaskStatus::AwaitingConfirmation => buttons.push((
                 "Confirm updated plan".to_string(),
-                queue_callback_data("confirm", &record.id),
+                queue_callback_data("confirm", &record.id, record.generation),
             )),
             TaskStatus::AwaitingDuplicateChoice => buttons.push((
                 "Resume".to_string(),
-                queue_callback_data("resume", &record.id),
+                queue_callback_data("resume", &record.id, record.generation),
             )),
             TaskStatus::Preparing => {}
             TaskStatus::Queued | TaskStatus::Running | TaskStatus::Verifying => {}
@@ -1318,7 +1349,7 @@ fn render_queue_page(
         if record.status.is_unfinished() && record.status != TaskStatus::Verifying {
             buttons.push((
                 "Cancel".to_string(),
-                queue_callback_data("cancel", &record.id),
+                queue_callback_data("cancel", &record.id, record.generation),
             ));
         }
         if !buttons.is_empty() {
@@ -2526,16 +2557,27 @@ fn queue_or_prompt_job(
     chat_id: i64,
     job_id: u64,
     task_id: String,
+    generation: u64,
     job: JobRequest,
 ) {
     tokio::spawn(async move {
-        if !prepare_persisted_task_for_job(&context, chat_id, &task_id).await {
-            return;
-        }
         let needs_short_link_normalization = matches!(
             &job,
             JobRequest::Bilibili { url, .. } if is_b23_short_link_url(url)
         );
+        let suppress_extra_file_provider_notice =
+            should_suppress_extra_setup_file_provider_notice(&job);
+        if !prepare_persisted_task_for_job(
+            &context,
+            chat_id,
+            &task_id,
+            generation,
+            suppress_extra_file_provider_notice,
+        )
+        .await
+        {
+            return;
+        }
         let job = if needs_short_link_normalization {
             match Arc::clone(&context.job_dispatch.duplicate_scan_semaphore)
                 .acquire_owned()
@@ -2554,15 +2596,22 @@ fn queue_or_prompt_job(
         } else {
             job
         };
-        queue_or_prompt_normalized_job(context, chat_id, job_id, task_id, job).await;
+        queue_or_prompt_normalized_job(context, chat_id, job_id, task_id, generation, job).await;
     });
 }
 
-async fn prepare_persisted_task_for_job(context: &BotContext, chat_id: i64, task_id: &str) -> bool {
+async fn prepare_persisted_task_for_job(
+    context: &BotContext,
+    chat_id: i64,
+    task_id: &str,
+    generation: u64,
+    suppress_extra_file_provider_notice: bool,
+) -> bool {
     let mut reported_file_provider_error = false;
     loop {
-        match context.queue.set_status_if_current(
+        match context.queue.set_status_if_generation(
             task_id,
+            generation,
             &[TaskStatus::Received, TaskStatus::Preparing],
             TaskStatus::Preparing,
         ) {
@@ -2574,7 +2623,7 @@ async fn prepare_persisted_task_for_job(context: &BotContext, chat_id: i64, task
                     error = %format!("{error:#}"),
                     "File Provider blocked background task setup; retaining task and retrying"
                 );
-                if !reported_file_provider_error {
+                if !reported_file_provider_error && !suppress_extra_file_provider_notice {
                     send_or_log(
                         &context.telegram,
                         chat_id,
@@ -2593,8 +2642,9 @@ async fn prepare_persisted_task_for_job(context: &BotContext, chat_id: i64, task
                     error = %format!("{error:#}"),
                     "failed to prepare persistent task before preflight"
                 );
-                if let Err(mark_error) = context.queue.set_status_if_current(
+                if let Err(mark_error) = context.queue.set_status_if_generation(
                     task_id,
+                    generation,
                     &[TaskStatus::Received, TaskStatus::Preparing],
                     TaskStatus::Failed,
                 ) {
@@ -2623,17 +2673,21 @@ async fn queue_or_prompt_normalized_job(
     chat_id: i64,
     job_id: u64,
     task_id: String,
+    generation: u64,
     job: JobRequest,
 ) {
+    let suppress_extra_file_provider_notice =
+        should_suppress_extra_setup_file_provider_notice(&job);
     let mut reported_file_provider_error = false;
-    loop {
-        match context.queue.update_job_if_current(
+    let generation = loop {
+        match context.queue.update_job_if_generation(
             &task_id,
+            generation,
             &[TaskStatus::Received, TaskStatus::Preparing],
             job.clone(),
             TaskStatus::Preparing,
         ) {
-            Ok(Some(_)) => break,
+            Ok(Some(task)) => break task.generation,
             Ok(None) => {
                 warn!(
                     task_id,
@@ -2647,7 +2701,7 @@ async fn queue_or_prompt_normalized_job(
                     error = %format!("{error:#}"),
                     "File Provider blocked normalized task persistence; retaining task and retrying"
                 );
-                if !reported_file_provider_error {
+                if !reported_file_provider_error && !suppress_extra_file_provider_notice {
                     send_or_log(
                         &context.telegram,
                         chat_id,
@@ -2669,13 +2723,14 @@ async fn queue_or_prompt_normalized_job(
                 return;
             }
         }
-    }
+    };
     if job.requires_bilibili_selection() {
         prompt_bilibili_selection(
             &context,
             chat_id,
             job_id,
             task_id,
+            generation,
             job,
             BilibiliSelectionPrompt::SeasonMedia,
         )
@@ -2685,7 +2740,8 @@ async fn queue_or_prompt_normalized_job(
 
     match bilibili_ugc_selection_prompt(context.config.as_ref(), &job).await {
         Ok(Some(prompt)) => {
-            prompt_bilibili_selection(&context, chat_id, job_id, task_id, job, prompt).await;
+            prompt_bilibili_selection(&context, chat_id, job_id, task_id, generation, job, prompt)
+                .await;
             return;
         }
         Ok(None) => {}
@@ -2701,15 +2757,16 @@ async fn queue_or_prompt_normalized_job(
                 bilibili_membership_probe_failure_message().to_string(),
             )
             .await;
-            let _ = context.queue.fail(
+            let _ = context.queue.fail_if_generation(
                 &task_id,
+                generation,
                 truncate(&redact_sensitive_text(&format!("{err:#}"))),
             );
             return;
         }
     }
 
-    process_job_after_duplicate_check(context, chat_id, job_id, task_id, job).await;
+    process_job_after_duplicate_check(context, chat_id, job_id, task_id, generation, job).await;
 }
 
 async fn bilibili_ugc_selection_prompt(
@@ -2786,45 +2843,29 @@ async fn prompt_bilibili_selection(
     chat_id: i64,
     job_id: u64,
     task_id: String,
+    expected_generation: u64,
     job: JobRequest,
     prompt: BilibiliSelectionPrompt,
 ) {
     let telegram = &context.telegram;
     let queue = &context.queue;
     let retry_delay = context.queue_start_retry_delay;
+    let suppress_extra_file_provider_notice = matches!(
+        &prompt,
+        BilibiliSelectionPrompt::UgcCollection | BilibiliSelectionPrompt::UgcMembership(_)
+    );
     let token = next_bilibili_selection_callback_token(job_id);
-    let now = Instant::now();
-    {
-        let mut pending_jobs = pending_bilibili_selection_jobs().lock().await;
-        prune_expired_pending_bilibili_selection_jobs(&mut pending_jobs, now);
-        pending_jobs.insert(
-            token,
-            PendingBilibiliSelectionJob {
-                chat_id,
-                job_id,
-                task_id: task_id.clone(),
-                job: job.clone(),
-                prompt: prompt.clone(),
-                created_at: now,
-            },
-        );
-        cap_pending_bilibili_selection_jobs(&mut pending_jobs, Some(token));
-    }
-
     let mut reported_file_provider_error = false;
-    loop {
-        match queue.update_job_if_current(
+    let generation = loop {
+        match queue.update_job_if_generation(
             &task_id,
+            expected_generation,
             &[TaskStatus::Preparing, TaskStatus::AwaitingSelection],
             job.clone(),
             TaskStatus::AwaitingSelection,
         ) {
-            Ok(Some(_)) => break,
+            Ok(Some(task)) => break task.generation,
             Ok(None) => {
-                pending_bilibili_selection_jobs()
-                    .lock()
-                    .await
-                    .remove(&token);
                 return;
             }
             Err(error) if is_file_provider_access_error(&error) => {
@@ -2833,7 +2874,7 @@ async fn prompt_bilibili_selection(
                     error = %format!("{error:#}"),
                     "File Provider blocked Bilibili selection persistence; retaining task and retrying"
                 );
-                if !reported_file_provider_error {
+                if !reported_file_provider_error && !suppress_extra_file_provider_notice {
                     send_or_log(
                         telegram,
                         chat_id,
@@ -2855,6 +2896,24 @@ async fn prompt_bilibili_selection(
                 return;
             }
         }
+    };
+    let now = Instant::now();
+    {
+        let mut pending_jobs = pending_bilibili_selection_jobs().lock().await;
+        prune_expired_pending_bilibili_selection_jobs(&mut pending_jobs, now);
+        pending_jobs.insert(
+            token,
+            PendingBilibiliSelectionJob {
+                chat_id,
+                job_id,
+                task_id: task_id.clone(),
+                generation,
+                job: job.clone(),
+                prompt: prompt.clone(),
+                created_at: now,
+            },
+        );
+        cap_pending_bilibili_selection_jobs(&mut pending_jobs, Some(token));
     }
 
     match telegram
@@ -2866,8 +2925,34 @@ async fn prompt_bilibili_selection(
         .await
     {
         Ok(message_id) => {
-            if let Err(err) = queue.set_status_message_id(&task_id, message_id) {
-                warn!(task_id, error = %err, "failed to persist Bilibili prompt message association");
+            match set_status_message_id_if_generation_and_status_with_retry_delay(
+                queue,
+                &task_id,
+                generation,
+                &[TaskStatus::AwaitingSelection],
+                message_id,
+                retry_delay,
+            )
+            .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    pending_bilibili_selection_jobs()
+                        .lock()
+                        .await
+                        .remove(&token);
+                    warn!(
+                        task_id,
+                        generation,
+                        "selection prompt completed after its task state changed; ignoring its message association"
+                    );
+                }
+                Err(err) => warn!(
+                    task_id,
+                    generation,
+                    error = %err,
+                    "failed to persist Bilibili prompt message association"
+                ),
             }
         }
         Err(err) => {
@@ -2876,16 +2961,41 @@ async fn prompt_bilibili_selection(
                 .await
                 .remove(&token);
             warn!(chat_id, job_id, error = %err, "failed to send Bilibili selection prompt");
-            let _ = queue.cancel_if_current(&task_id, chat_id, &[TaskStatus::AwaitingSelection]);
-            send_or_log(
-                telegram,
+            match queue.cancel_if_generation_and_status(
+                &task_id,
+                generation,
                 chat_id,
-                format!(
-                    "Bilibili selection prompt failed for job #{job_id}; job canceled. Send the link again to retry.\n{}",
-                    truncate(&err.to_string())
+                &[TaskStatus::AwaitingSelection],
+            ) {
+                Ok(Some(_)) => {
+                    send_or_log(
+                        telegram,
+                        chat_id,
+                        format!(
+                            "Bilibili selection prompt failed for job #{job_id}; job canceled. Send the link again to retry.\n{}",
+                            truncate(&err.to_string())
+                        ),
+                    )
+                    .await;
+                }
+                Ok(None) => warn!(
+                    task_id,
+                    generation,
+                    "selection prompt failed after its task state changed; leaving the current generation untouched"
                 ),
-            )
-            .await;
+                Err(cancel_error) => {
+                    warn!(task_id, generation, error = %cancel_error, "failed to cancel Bilibili selection task after prompt delivery failed");
+                    send_or_log(
+                        telegram,
+                        chat_id,
+                        format!(
+                            "Bilibili selection prompt failed for job #{job_id}; check /queue before retrying.\n{}",
+                            truncate(&err.to_string())
+                        ),
+                    )
+                    .await;
+                }
+            }
         }
     }
 }
@@ -2895,6 +3005,7 @@ async fn process_job_after_duplicate_check(
     chat_id: i64,
     job_id: u64,
     task_id: String,
+    generation: u64,
     job: JobRequest,
 ) {
     let telegram = context.telegram.clone();
@@ -2909,6 +3020,7 @@ async fn process_job_after_duplicate_check(
             job,
             JobRunMode::Direct,
             TaskStatus::Preparing,
+            generation,
         )
         .await;
         return;
@@ -2923,6 +3035,7 @@ async fn process_job_after_duplicate_check(
             job,
             JobRunMode::StagedKeepBoth,
             TaskStatus::Preparing,
+            generation,
         )
         .await;
         return;
@@ -2952,6 +3065,7 @@ async fn process_job_after_duplicate_check(
                 job,
                 run_mode,
                 TaskStatus::Preparing,
+                generation,
             )
             .await;
             return;
@@ -2962,8 +3076,18 @@ async fn process_job_after_duplicate_check(
 
     match duplicate_scan_result {
         Ok(Some(duplicate)) => {
-            prompt_duplicate_choice(&telegram, &queue, chat_id, job_id, task_id, job, duplicate)
-                .await;
+            prompt_duplicate_choice(
+                &telegram,
+                &queue,
+                chat_id,
+                job_id,
+                task_id,
+                generation,
+                job,
+                duplicate,
+                context.queue_start_retry_delay,
+            )
+            .await;
         }
         Ok(None) => {
             let run_mode = default_run_mode(&job);
@@ -2975,6 +3099,7 @@ async fn process_job_after_duplicate_check(
                 job,
                 run_mode,
                 TaskStatus::Preparing,
+                generation,
             )
             .await;
         }
@@ -2984,6 +3109,7 @@ async fn process_job_after_duplicate_check(
                 chat_id,
                 job_id,
                 task_id,
+                generation,
                 job,
                 BilibiliSelectionPrompt::SeasonMedia,
             )
@@ -3008,10 +3134,26 @@ async fn process_job_after_duplicate_check(
                 job,
                 run_mode,
                 TaskStatus::Preparing,
+                generation,
             )
             .await;
         }
     }
+}
+
+fn is_bilibili_ugc_collection_job(job: &JobRequest) -> bool {
+    matches!(
+        job,
+        JobRequest::Bilibili { url, .. } if is_bilibili_ugc_collection_url(url)
+    )
+}
+
+fn should_suppress_extra_setup_file_provider_notice(job: &JobRequest) -> bool {
+    is_bilibili_ugc_collection_job(job)
+        || matches!(
+            job,
+            JobRequest::Bilibili { url, .. } if is_b23_short_link_url(url)
+        )
 }
 
 fn is_confirmed_bilibili_ugc_collection_job(job: &JobRequest) -> bool {
@@ -3052,31 +3194,35 @@ async fn find_video_duplicate_async(
     find_video_duplicate_with_probe(&config, &job).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prompt_duplicate_choice(
     telegram: &TelegramClient,
     queue: &QueueManager,
     chat_id: i64,
     job_id: u64,
     task_id: String,
+    generation: u64,
     job: JobRequest,
     duplicate: VideoDuplicate,
+    retry_delay: Duration,
 ) {
     let token = next_duplicate_callback_token(job_id);
     let prompt = duplicate_choice_message(job_id, job.label(), &duplicate);
     let allow_overwrite = job_allows_duplicate_overwrite(&job, &duplicate);
-    match queue.update_job_if_current(
+    let generation = match queue.update_job_if_generation(
         &task_id,
+        generation,
         &[TaskStatus::Preparing],
         job.clone(),
         TaskStatus::AwaitingDuplicateChoice,
     ) {
-        Ok(Some(_)) => {}
+        Ok(Some(task)) => task.generation,
         Ok(None) => return,
         Err(err) => {
             warn!(task_id, error = %err, "failed to persist duplicate choice prompt");
             return;
         }
-    }
+    };
     let now = Instant::now();
     {
         let mut pending_jobs = pending_duplicate_jobs().lock().await;
@@ -3087,6 +3233,7 @@ async fn prompt_duplicate_choice(
                 chat_id,
                 job_id,
                 task_id: task_id.clone(),
+                generation,
                 job,
                 duplicate,
                 created_at: now,
@@ -3103,25 +3250,70 @@ async fn prompt_duplicate_choice(
         .await
     {
         Ok(message_id) => {
-            if let Err(err) = queue.set_status_message_id(&task_id, message_id) {
-                warn!(task_id, error = %err, "failed to persist duplicate prompt message association");
+            match set_status_message_id_if_generation_and_status_with_retry_delay(
+                queue,
+                &task_id,
+                generation,
+                &[TaskStatus::AwaitingDuplicateChoice],
+                message_id,
+                retry_delay,
+            )
+            .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    pending_duplicate_jobs().lock().await.remove(&token);
+                    warn!(
+                        task_id,
+                        generation,
+                        "duplicate prompt completed after its task state changed; ignoring its message association"
+                    );
+                }
+                Err(err) => warn!(
+                    task_id,
+                    generation,
+                    error = %err,
+                    "failed to persist duplicate prompt message association"
+                ),
             }
         }
         Err(err) => {
             pending_duplicate_jobs().lock().await.remove(&token);
             warn!(chat_id, job_id, error = %err, "failed to send duplicate choice prompt");
-            let _ =
-                queue.cancel_if_current(&task_id, chat_id, &[TaskStatus::AwaitingDuplicateChoice]);
-            send_or_log(
-                telegram,
+            match queue.cancel_if_generation_and_status(
+                &task_id,
+                generation,
                 chat_id,
-                format!("Duplicate found for job #{job_id}, but Telegram choice prompt failed. Job canceled; send the link again to retry."),
-            )
-            .await;
+                &[TaskStatus::AwaitingDuplicateChoice],
+            ) {
+                Ok(Some(_)) => {
+                    send_or_log(
+                        telegram,
+                        chat_id,
+                        format!("Duplicate found for job #{job_id}, but Telegram choice prompt failed. Job canceled; send the link again to retry."),
+                    )
+                    .await;
+                }
+                Ok(None) => warn!(
+                    task_id,
+                    generation,
+                    "duplicate prompt failed after its task state changed; leaving the current generation untouched"
+                ),
+                Err(cancel_error) => {
+                    warn!(task_id, generation, error = %cancel_error, "failed to cancel duplicate-choice task after prompt delivery failed");
+                    send_or_log(
+                        telegram,
+                        chat_id,
+                        format!("Duplicate found for job #{job_id}, but Telegram choice prompt failed. Check /queue before retrying."),
+                    )
+                    .await;
+                }
+            }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn queue_job(
     context: BotContext,
     chat_id: i64,
@@ -3130,11 +3322,31 @@ async fn queue_job(
     job: JobRequest,
     run_mode: JobRunMode,
     expected_status: TaskStatus,
+    generation: u64,
 ) {
-    if !persist_queued_task_state(&context, chat_id, &task_id, expected_status).await {
+    let suppress_extra_file_provider_notice = is_confirmed_bilibili_ugc_collection_job(&job);
+    if !persist_queued_task_state(
+        &context,
+        chat_id,
+        &task_id,
+        expected_status,
+        suppress_extra_file_provider_notice,
+        Some(generation),
+    )
+    .await
+    {
         return;
     }
-    queue_queued_task(context, chat_id, job_id, task_id, job, run_mode).await;
+    queue_queued_task(
+        context,
+        chat_id,
+        job_id,
+        task_id,
+        job,
+        run_mode,
+        Some(generation),
+    )
+    .await;
 }
 
 async fn persist_queued_task_state(
@@ -3142,13 +3354,25 @@ async fn persist_queued_task_state(
     chat_id: i64,
     task_id: &str,
     expected_status: TaskStatus,
+    suppress_extra_file_provider_notice: bool,
+    expected_generation: Option<u64>,
 ) -> bool {
     let mut reported_file_provider_error = false;
     loop {
-        match context
-            .queue
-            .set_status_if_current(task_id, &[expected_status], TaskStatus::Queued)
-        {
+        let result = match expected_generation {
+            Some(generation) => context.queue.set_status_if_generation(
+                task_id,
+                generation,
+                &[expected_status],
+                TaskStatus::Queued,
+            ),
+            None => {
+                context
+                    .queue
+                    .set_status_if_current(task_id, &[expected_status], TaskStatus::Queued)
+            }
+        };
+        match result {
             Ok(Some(_)) => return true,
             Ok(None) => {
                 warn!(task_id, "task state changed before queue transition");
@@ -3160,7 +3384,7 @@ async fn persist_queued_task_state(
                     error = %format!("{error:#}"),
                     "File Provider blocked queued task persistence; retaining task and retrying"
                 );
-                if !reported_file_provider_error {
+                if !reported_file_provider_error && !suppress_extra_file_provider_notice {
                     send_or_log(
                         &context.telegram,
                         chat_id,
@@ -3192,29 +3416,178 @@ async fn queue_queued_task(
     task_id: String,
     job: JobRequest,
     run_mode: JobRunMode,
+    expected_generation: Option<u64>,
 ) {
     let telegram = context.telegram.clone();
-    let cancel = match context.queue.register_cancellation(&task_id) {
-        Ok(cancel) => cancel,
-        Err(err) => {
-            warn!(task_id, error = %err, "failed to register task cancellation");
-            return;
+    let is_collection = is_confirmed_bilibili_ugc_collection_job(&job);
+    let mut reported_file_provider_error = false;
+    let mut expected_generation = expected_generation;
+    let (generation, previous_status_message_id, cancel) = loop {
+        if expected_generation.is_none() {
+            match context.queue.get(&task_id) {
+                Ok(Some(task)) if task.status == TaskStatus::Queued => {
+                    expected_generation = Some(task.generation);
+                }
+                Ok(Some(task)) => {
+                    warn!(
+                        task_id,
+                        status = ?task.status,
+                        "task is no longer queued before queued message delivery"
+                    );
+                    return;
+                }
+                Ok(None) => {
+                    warn!(task_id, "task disappeared before queued message delivery");
+                    return;
+                }
+                Err(err) if is_file_provider_access_error(&err) => {
+                    if !reported_file_provider_error {
+                        warn!(
+                            task_id,
+                            error = %format!("{err:#}"),
+                            "File Provider blocked queued task generation lookup; retrying without sending another message"
+                        );
+                        reported_file_provider_error = true;
+                    }
+                    tokio::time::sleep(context.queue_start_retry_delay).await;
+                    continue;
+                }
+                Err(err) => {
+                    warn!(task_id, error = %err, "failed to read task generation before queued message delivery");
+                    return;
+                }
+            }
+        }
+        let generation = expected_generation.expect("generation was loaded or provided");
+        match context
+            .queue
+            .register_cancellation_if_queued_generation(&task_id, generation)
+        {
+            Ok(Some((task, cancel))) => {
+                break (generation, task.status_message_id, cancel);
+            }
+            Ok(None) => {
+                if is_collection {
+                    match task_if_generation_with_retry_delay(
+                        &context.queue,
+                        &task_id,
+                        generation,
+                        context.queue_start_retry_delay,
+                    )
+                    .await
+                    {
+                        Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
+                            if let Some(message_id) = task.status_message_id {
+                                edit_task_message_if_current(
+                                    &context.queue,
+                                    &task_id,
+                                    generation,
+                                    &telegram,
+                                    chat_id,
+                                    message_id,
+                                    format!("Canceled job #{job_id}: {}", job.label()),
+                                )
+                                .await;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => warn!(
+                            task_id,
+                            generation,
+                            error = %err,
+                            "failed to read collection state after queued registration was rejected"
+                        ),
+                    }
+                }
+                warn!(
+                    task_id,
+                    generation,
+                    "task is no longer queued in this generation before queued message delivery"
+                );
+                return;
+            }
+            Err(err) if is_file_provider_access_error(&err) => {
+                if !reported_file_provider_error {
+                    warn!(
+                        task_id,
+                        generation,
+                        error = %format!("{err:#}"),
+                        "File Provider blocked queued task registration; retrying without sending another message"
+                    );
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(context.queue_start_retry_delay).await;
+            }
+            Err(err) => {
+                warn!(task_id, generation, error = %err, "failed to register queued task cancellation");
+                return;
+            }
         }
     };
-    let queued_message_id = send_or_log_message_id(
-        &telegram,
-        chat_id,
-        format!("Queued job #{job_id}: {}", job.label()),
-    )
-    .await;
-    if let Some(message_id) = queued_message_id
-        && let Err(err) = context.queue.set_status_message_id(&task_id, message_id)
-    {
-        warn!(task_id, error = %err, "failed to persist queued message association");
+    let queued_text = format!("Queued job #{job_id}: {}", job.label());
+    let queued_message_id = if is_collection {
+        if let Some(message_id) = previous_status_message_id {
+            edit_task_message_without_keyboard_if_current(
+                &context.queue,
+                &task_id,
+                generation,
+                &telegram,
+                chat_id,
+                message_id,
+                queued_text,
+            )
+            .await;
+            Some(message_id)
+        } else {
+            send_task_message_id_if_current(
+                ProgressDeliveryContext {
+                    telegram: &telegram,
+                    queue: &context.queue,
+                    task_id: &task_id,
+                    generation,
+                    chat_id,
+                    job_id,
+                    job_label: job.label(),
+                },
+                queued_text,
+            )
+            .await
+        }
+    } else {
+        send_or_log_message_id(&telegram, chat_id, queued_text).await
+    };
+    if let Some(message_id) = queued_message_id {
+        match set_status_message_id_if_generation_and_status_with_retry_delay(
+            &context.queue,
+            &task_id,
+            generation,
+            &[TaskStatus::Queued],
+            message_id,
+            context.queue_start_retry_delay,
+        )
+        .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => warn!(
+                task_id,
+                generation, "task generation changed before queued message association was saved"
+            ),
+            Err(err) => {
+                warn!(task_id, error = %err, "failed to persist queued message association")
+            }
+        }
     }
 
     tokio::spawn(run_queued_job(
-        context, cancel, chat_id, job_id, task_id, job, run_mode,
+        context,
+        cancel,
+        chat_id,
+        job_id,
+        task_id,
+        generation,
+        queued_message_id,
+        job,
+        run_mode,
     ));
 }
 
@@ -3257,7 +3630,7 @@ async fn handle_callback_query(context: BotContext, callback_query: CallbackQuer
 
     if let Some(callback) = parse_collection_details_callback_data(data) {
         handle_collection_details_callback(
-            telegram,
+            context.clone(),
             callback_id,
             chat_id,
             message.message_id,
@@ -3297,8 +3670,9 @@ async fn handle_callback_query(context: BotContext, callback_query: CallbackQuer
 
     match callback.action {
         DuplicateCallbackAction::Cancel => {
-            match queue.cancel_if_current(
+            match queue.cancel_if_generation_and_status(
                 &pending.task_id,
+                pending.generation,
                 chat_id,
                 &[TaskStatus::AwaitingDuplicateChoice],
             ) {
@@ -3336,8 +3710,9 @@ async fn handle_callback_query(context: BotContext, callback_query: CallbackQuer
             if matches!(action, VideoDuplicateAction::Overwrite)
                 && !job_allows_duplicate_overwrite(&pending.job, &pending.duplicate)
             {
-                match queue.cancel_if_current(
+                match queue.cancel_if_generation_and_status(
                     &pending.task_id,
+                    pending.generation,
                     chat_id,
                     &[TaskStatus::AwaitingDuplicateChoice],
                 ) {
@@ -3380,12 +3755,13 @@ async fn handle_callback_query(context: BotContext, callback_query: CallbackQuer
                 VideoDuplicateAction::Overwrite => "overwrite",
                 VideoDuplicateAction::KeepBoth => "keep both",
             };
-            match queue.set_status_if_current(
+            let queued_generation = match queue.set_status_if_generation(
                 &pending.task_id,
+                pending.generation,
                 &[TaskStatus::AwaitingDuplicateChoice],
                 TaskStatus::Queued,
             ) {
-                Ok(Some(_)) => {}
+                Ok(Some(task)) => task.generation,
                 Ok(None) => {
                     answer_callback_or_log(
                         &telegram,
@@ -3405,6 +3781,29 @@ async fn handle_callback_query(context: BotContext, callback_query: CallbackQuer
                     .await;
                     return;
                 }
+            };
+            match set_status_message_id_if_generation_and_status_with_retry_delay(
+                &queue,
+                &pending.task_id,
+                queued_generation,
+                &[TaskStatus::Queued],
+                message.message_id,
+                context.queue_start_retry_delay,
+            )
+            .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => warn!(
+                    task_id = %pending.task_id,
+                    generation = queued_generation,
+                    "duplicate choice advanced before its prompt message was associated"
+                ),
+                Err(err) => warn!(
+                    task_id = %pending.task_id,
+                    generation = queued_generation,
+                    error = %err,
+                    "failed to retain duplicate choice message as queued status"
+                ),
             }
             answer_callback_or_log(&telegram, callback_id, "Queued.".to_string()).await;
             edit_without_keyboard_or_send(
@@ -3428,6 +3827,7 @@ async fn handle_callback_query(context: BotContext, callback_query: CallbackQuer
                     action,
                     duplicate: pending.duplicate,
                 }),
+                Some(queued_generation),
             )
             .await;
         }
@@ -3456,8 +3856,9 @@ async fn handle_bilibili_selection_callback(
 
     match callback.action {
         BilibiliSelectionCallbackAction::Cancel => {
-            match queue.cancel_if_current(
+            match queue.cancel_if_generation_and_status(
                 &pending.task_id,
+                pending.generation,
                 chat_id,
                 &[TaskStatus::AwaitingSelection],
             ) {
@@ -3496,8 +3897,9 @@ async fn handle_bilibili_selection_callback(
             let Some((job, selection_label)) =
                 apply_bilibili_selection(pending.job, &pending.prompt, action)
             else {
-                match queue.cancel_if_current(
+                match queue.cancel_if_generation_and_status(
                     &pending.task_id,
+                    pending.generation,
                     chat_id,
                     &[TaskStatus::AwaitingSelection],
                 ) {
@@ -3537,13 +3939,14 @@ async fn handle_bilibili_selection_callback(
                 .await;
                 return;
             };
-            match queue.update_job_if_current(
+            let selection_generation = match queue.update_job_if_generation(
                 &pending.task_id,
+                pending.generation,
                 &[TaskStatus::AwaitingSelection],
                 job.clone(),
                 TaskStatus::Preparing,
             ) {
-                Ok(Some(_)) => {}
+                Ok(Some(task)) => task.generation,
                 Ok(None) => {
                     answer_callback_or_log(
                         &telegram,
@@ -3563,24 +3966,50 @@ async fn handle_bilibili_selection_callback(
                     warn!(task_id = %pending.task_id, error = %err, "failed to persist Bilibili selection");
                     return;
                 }
+            };
+            match set_status_message_id_if_generation_and_status_with_retry_delay(
+                &queue,
+                &pending.task_id,
+                selection_generation,
+                &[TaskStatus::Preparing],
+                message_id,
+                context.queue_start_retry_delay,
+            )
+            .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => warn!(
+                    task_id = %pending.task_id,
+                    generation = selection_generation,
+                    "Bilibili selection advanced before its prompt message was associated"
+                ),
+                Err(err) => warn!(
+                    task_id = %pending.task_id,
+                    generation = selection_generation,
+                    error = %err,
+                    "failed to retain Bilibili selection message as current status"
+                ),
             }
             answer_callback_or_log(&telegram, callback_id, "Queued.".to_string()).await;
-            edit_without_keyboard_or_send(
-                &telegram,
-                chat_id,
-                message_id,
-                format!(
-                    "Selected {selection_label} for job #{}: {}",
-                    pending.job_id,
-                    job.label()
-                ),
-            )
-            .await;
+            if !is_confirmed_bilibili_ugc_collection_job(&job) {
+                edit_without_keyboard_or_send(
+                    &telegram,
+                    chat_id,
+                    message_id,
+                    format!(
+                        "Selected {selection_label} for job #{}: {}",
+                        pending.job_id,
+                        job.label()
+                    ),
+                )
+                .await;
+            }
             tokio::spawn(process_job_after_duplicate_check(
                 context,
                 chat_id,
                 pending.job_id,
                 pending.task_id,
+                selection_generation,
                 job,
             ));
         }
@@ -3649,26 +4078,15 @@ fn pending_collection_details() -> &'static Mutex<HashMap<u64, PendingCollection
 }
 
 async fn register_collection_details(
-    telegram: &TelegramClient,
     chat_id: i64,
+    message_id: Option<i64>,
     job_id: u64,
+    task_id: &str,
+    generation: u64,
     manifest: BilibiliCollectionManifest,
-) {
+) -> Option<u64> {
+    let message_id = message_id?;
     let token = next_collection_details_callback_token(job_id);
-    let page = 0;
-    let text = collection_details_message(job_id, &manifest, page);
-    let keyboard = collection_details_keyboard(token, &manifest, page);
-    let message_id = match telegram
-        .send_message_with_inline_keyboard(chat_id, truncate(&text), keyboard)
-        .await
-    {
-        Ok(message_id) => message_id,
-        Err(err) => {
-            warn!(chat_id, job_id, error = %err, "failed to send collection details message");
-            return;
-        }
-    };
-
     let mut details = pending_collection_details().lock().await;
     prune_expired_collection_details(&mut details, Instant::now());
     details.insert(
@@ -3677,11 +4095,45 @@ async fn register_collection_details(
             chat_id,
             message_id,
             job_id,
+            task_id: task_id.to_string(),
+            generation,
             manifest,
+            page: 0,
+            overview: String::new(),
+            terminal: false,
+            edit_lock: Arc::new(Mutex::new(())),
             created_at: Instant::now(),
         },
     );
     cap_pending_collection_details(&mut details, Some(token));
+    Some(token)
+}
+
+async fn update_collection_details_overview(token: u64, overview: String) -> Option<usize> {
+    let mut details = pending_collection_details().lock().await;
+    if let Some(details) = details.get_mut(&token) {
+        if !details.terminal {
+            details.overview = overview;
+        }
+        Some(details.page)
+    } else {
+        None
+    }
+}
+
+async fn mark_collection_details_terminal(
+    token: u64,
+    generation: u64,
+    overview: String,
+) -> Option<Arc<Mutex<()>>> {
+    let mut details = pending_collection_details().lock().await;
+    let current = details.get_mut(&token)?;
+    if current.generation != generation {
+        return None;
+    }
+    current.overview = overview;
+    current.terminal = true;
+    Some(Arc::clone(&current.edit_lock))
 }
 
 async fn find_collection_details(
@@ -3722,13 +4174,15 @@ fn cap_pending_collection_details(
 }
 
 async fn handle_collection_details_callback(
-    telegram: TelegramClient,
+    context: BotContext,
     callback_id: String,
     chat_id: i64,
     message_id: i64,
     callback: CollectionDetailsCallback,
 ) {
-    let Some(details) = find_collection_details(callback.token, chat_id, message_id).await else {
+    let telegram = context.telegram.clone();
+    let Some(initial_details) = find_collection_details(callback.token, chat_id, message_id).await
+    else {
         answer_callback_or_log(
             &telegram,
             callback_id,
@@ -3737,8 +4191,63 @@ async fn handle_collection_details_callback(
         .await;
         return;
     };
+    let edit_lock = Arc::clone(&initial_details.edit_lock);
+    let edit_guard = edit_lock.lock().await;
+    let Some(details) = find_collection_details(callback.token, chat_id, message_id).await else {
+        drop(edit_guard);
+        answer_callback_or_log(
+            &telegram,
+            callback_id,
+            "Collection details have expired.".to_string(),
+        )
+        .await;
+        return;
+    };
+    match context
+        .queue
+        .get_if_generation(&details.task_id, details.generation)
+    {
+        Ok(Some(task))
+            if details.terminal
+                || !matches!(
+                    task.status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                ) => {}
+        Ok(Some(_)) => {
+            drop(edit_guard);
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                "This collection run has finished.".to_string(),
+            )
+            .await;
+            return;
+        }
+        Ok(None) => {
+            drop(edit_guard);
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                "This collection run has expired.".to_string(),
+            )
+            .await;
+            return;
+        }
+        Err(err) => {
+            warn!(task_id = details.task_id, error = %err, "failed to validate collection details generation");
+            drop(edit_guard);
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                "Could not check this collection run.".to_string(),
+            )
+            .await;
+            return;
+        }
+    }
     let page_count = collection_details_page_count(&details.manifest);
     if callback.page >= page_count {
+        drop(edit_guard);
         answer_callback_or_log(
             &telegram,
             callback_id,
@@ -3747,13 +4256,27 @@ async fn handle_collection_details_callback(
         .await;
         return;
     }
-    let text = collection_details_message(details.job_id, &details.manifest, callback.page);
+    let text = collection_details_page_text(
+        details.job_id,
+        &details.manifest,
+        callback.page,
+        &details.overview,
+    );
     let keyboard = collection_details_keyboard(callback.token, &details.manifest, callback.page);
     match telegram
         .edit_message_text_with_inline_keyboard(chat_id, message_id, truncate(&text), keyboard)
         .await
     {
         Ok(()) => {
+            let mut pending = pending_collection_details().lock().await;
+            if let Some(current) = pending.get_mut(&callback.token)
+                && current.generation == details.generation
+                && current.message_id == message_id
+            {
+                current.page = callback.page;
+            }
+            drop(pending);
+            drop(edit_guard);
             answer_callback_or_log(
                 &telegram,
                 callback_id,
@@ -3763,6 +4286,7 @@ async fn handle_collection_details_callback(
         }
         Err(err) => {
             warn!(chat_id, message_id, error = %err, "failed to edit collection details page");
+            drop(edit_guard);
             answer_callback_or_log(
                 &telegram,
                 callback_id,
@@ -3770,6 +4294,20 @@ async fn handle_collection_details_callback(
             )
             .await;
         }
+    }
+}
+
+fn collection_details_page_text(
+    job_id: u64,
+    manifest: &BilibiliCollectionManifest,
+    page: usize,
+    overview: &str,
+) -> String {
+    let details = collection_details_message(job_id, manifest, page);
+    if overview.trim().is_empty() {
+        details
+    } else {
+        format!("{overview}\n\n{details}")
     }
 }
 
@@ -4126,11 +4664,12 @@ async fn complete_published_task_with_retry(
     queue: &QueueManager,
     completion: PublishedTaskCompletion<'_>,
     retry_delay: Duration,
-) -> Result<TaskRecord> {
+) -> Result<Option<TaskRecord>> {
     let mut reported_file_provider_error = false;
     loop {
-        match queue.complete(
+        match queue.complete_if_generation(
             completion.task_id,
+            completion.generation,
             completion.saved_location.to_string(),
             completion.media_paths,
             completion.hashes.clone(),
@@ -4143,15 +4682,26 @@ async fn complete_published_task_with_retry(
                     "File Provider blocked completion persistence; retaining published outputs and retrying"
                 );
                 if !reported_file_provider_error {
-                    send_or_log(
-                        telegram,
-                        completion.chat_id,
-                        format!(
-                            "Task {} has published its files, but macOS temporarily cannot save the completion record. It will retry automatically; the output and staging data are being kept. Check /queue before resending.",
-                            completion.task_id
-                        ),
-                    )
-                    .await;
+                    let message = format!(
+                        "Task {} has published its files, but macOS temporarily cannot save the completion record. It will retry automatically; the output and staging data are being kept. Check /queue before resending.",
+                        completion.task_id
+                    );
+                    if completion.is_collection {
+                        if let Some(message_id) = completion.collection_status_message_id {
+                            edit_task_message_if_current(
+                                queue,
+                                completion.task_id,
+                                completion.generation,
+                                telegram,
+                                completion.chat_id,
+                                message_id,
+                                message,
+                            )
+                            .await;
+                        }
+                    } else {
+                        send_or_log(telegram, completion.chat_id, message).await;
+                    }
                     reported_file_provider_error = true;
                 }
                 tokio::time::sleep(retry_delay).await;
@@ -4164,17 +4714,23 @@ async fn complete_published_task_with_retry(
 struct PublishedTaskCompletion<'a> {
     chat_id: i64,
     task_id: &'a str,
+    generation: u64,
     saved_location: &'a str,
     media_paths: &'a [PathBuf],
     hashes: BTreeMap<String, String>,
+    is_collection: bool,
+    collection_status_message_id: Option<i64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_queued_job(
     context: BotContext,
     cancel: Arc<Notify>,
     chat_id: i64,
     job_id: u64,
     task_id: String,
+    generation: u64,
+    queued_message_id: Option<i64>,
     job: JobRequest,
     run_mode: JobRunMode,
 ) {
@@ -4182,50 +4738,125 @@ async fn run_queued_job(
     let config = Arc::clone(&context.config);
     let queue = Arc::clone(&context.queue);
     let semaphore = Arc::clone(&context.job_dispatch.download_semaphore);
+    let is_collection = is_confirmed_bilibili_ugc_collection_job(&job);
     let permit = tokio::select! {
         biased;
         _ = cancel.notified() => {
-            let _ = queue.unregister_cancellation(&task_id);
-            send_or_log(&telegram, chat_id, format!("Canceled job #{job_id}: {}", job.label())).await;
+            let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+            let message = format!("Canceled job #{job_id}: {}", job.label());
+            if is_collection {
+                if let Some(message_id) = queued_message_id {
+                    edit_task_message_if_current(
+                        &queue,
+                        &task_id,
+                        generation,
+                        &telegram,
+                        chat_id,
+                        message_id,
+                        message,
+                    )
+                    .await;
+                }
+            } else {
+                send_or_log(&telegram, chat_id, message).await;
+            }
             return;
         }
         result = semaphore.acquire_owned() => match result {
             Ok(permit) => permit,
             Err(err) => {
                 error!(job_id, error = %err, "job semaphore closed");
-                let _ = queue.fail(&task_id, truncate(&err.to_string()));
-                let _ = queue.unregister_cancellation(&task_id);
+                let message = redact_sensitive_text(&err.to_string());
+                let _ = queue.fail_if_generation(&task_id, generation, truncate(&message));
+                let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+                if is_collection && let Some(message_id) = queued_message_id {
+                    edit_task_message_if_current(
+                        &queue,
+                        &task_id,
+                        generation,
+                        &telegram,
+                        chat_id,
+                        message_id,
+                        failed_job_message(job_id, job.label(), &message),
+                    )
+                    .await;
+                }
                 return;
             }
         }
     };
 
-    match queue.begin_run(&task_id) {
-        Ok(true) => {}
-        Ok(false) => {
+    match queue.begin_run_if_generation(&task_id, generation) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
             drop(permit);
-            let _ = queue.unregister_cancellation(&task_id);
+            if is_collection {
+                match task_if_generation_with_retry_delay(
+                    &queue,
+                    &task_id,
+                    generation,
+                    context.queue_start_retry_delay,
+                )
+                .await
+                {
+                    Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
+                        if let Some(message_id) = queued_message_id.or(task.status_message_id) {
+                            edit_task_message_if_current(
+                                &queue,
+                                &task_id,
+                                generation,
+                                &telegram,
+                                chat_id,
+                                message_id,
+                                format!("Canceled job #{job_id}: {}", job.label()),
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!(
+                        task_id,
+                        generation,
+                        error = %err,
+                        "failed to read collection state after task could not begin running"
+                    ),
+                }
+            }
+            let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
             return;
         }
         Err(err) => {
             error!(task_id, error = %err, "failed to persist running task state");
             drop(permit);
-            let _ = queue.unregister_cancellation(&task_id);
+            let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
             return;
         }
     }
 
-    let status_message_id = send_or_log_message_id(
-        &telegram,
-        chat_id,
-        job_status_message(job_id, job.label(), "Started", None),
-    )
-    .await;
-    if let Some(message_id) = status_message_id
-        && let Err(err) = queue.set_status_message_id(&task_id, message_id)
-    {
-        warn!(task_id, error = %err, "failed to persist running message association");
-    }
+    let status_message_id = if is_collection {
+        queued_message_id
+    } else {
+        let message_id = send_or_log_message_id(
+            &telegram,
+            chat_id,
+            job_status_message(job_id, job.label(), "Started", None),
+        )
+        .await;
+        if let Some(message_id) = message_id {
+            match queue.set_status_message_id_if_generation(&task_id, generation, message_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => warn!(
+                    task_id,
+                    generation,
+                    "task generation changed before running message association was saved"
+                ),
+                Err(err) => {
+                    warn!(task_id, error = %err, "failed to persist running message association")
+                }
+            }
+        }
+        message_id
+    };
 
     let current_plan = tokio::select! {
         biased;
@@ -4233,19 +4864,21 @@ async fn run_queued_job(
         result = inspect_job_plan(&config, &job) => Some(result),
     };
     let Some(current_plan) = current_plan else {
-        if let Err(err) = queue.finish_cancellation(&task_id) {
+        if let Err(err) = queue.finish_cancellation_if_generation(&task_id, generation) {
             warn!(task_id, error = %err, "failed to persist task cancellation");
         }
         drop(permit);
-        let _ = queue.unregister_cancellation(&task_id);
+        let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
         if let Some(message_id) = status_message_id {
-            edit_or_send(
-                &telegram,
-                chat_id,
-                message_id,
-                format!("Canceled job #{job_id}: {}", job.label()),
-            )
-            .await;
+            let message = format!("Canceled job #{job_id}: {}", job.label());
+            if is_collection {
+                edit_task_message_if_current(
+                    &queue, &task_id, generation, &telegram, chat_id, message_id, message,
+                )
+                .await;
+            } else {
+                edit_or_send(&telegram, chat_id, message_id, message).await;
+            }
         }
         return;
     };
@@ -4253,51 +4886,74 @@ async fn run_queued_job(
         Ok(plan) => plan,
         Err(err) => {
             let message = redact_sensitive_text(&format!("{err:#}"));
-            let _ = queue.fail(&task_id, truncate(&message));
+            let _ = queue.fail_if_generation(&task_id, generation, truncate(&message));
             drop(permit);
-            let _ = queue.unregister_cancellation(&task_id);
-            send_or_log(
-                &telegram,
-                chat_id,
-                failed_job_message(job_id, job.label(), &message),
-            )
-            .await;
+            let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+            let final_message = failed_job_message(job_id, job.label(), &message);
+            if is_collection {
+                if let Some(message_id) = status_message_id {
+                    edit_task_message_if_current(
+                        &queue,
+                        &task_id,
+                        generation,
+                        &telegram,
+                        chat_id,
+                        message_id,
+                        final_message,
+                    )
+                    .await;
+                }
+            } else {
+                send_or_log(&telegram, chat_id, final_message).await;
+            }
             return;
         }
     };
-    let (updated_task, differences) = match queue.set_plan(&task_id, current_plan) {
-        Ok(result) => result,
-        Err(err) => {
-            let _ = queue.unregister_cancellation(&task_id);
-            drop(permit);
-            warn!(task_id, error = %err, "task plan validation could not be persisted");
-            return;
-        }
-    };
-    let cancellation_finished =
-        queue
-            .finish_cancellation(&task_id)
-            .and_then(|finished| match finished {
-                Some(_) => Ok(true),
-                None => Ok(queue
-                    .get(&task_id)?
-                    .is_none_or(|task| task.status == TaskStatus::Cancelled)),
-            });
+    let (updated_task, differences) =
+        match queue.set_plan_if_generation(&task_id, generation, current_plan) {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                drop(permit);
+                let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+                return;
+            }
+            Err(err) => {
+                let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+                drop(permit);
+                warn!(task_id, error = %err, "task plan validation could not be persisted");
+                return;
+            }
+        };
+    let cancellation_finished = queue
+        .finish_cancellation_if_generation(&task_id, generation)
+        .and_then(|finished| match finished {
+            Some(_) => Ok(true),
+            None => Ok(queue
+                .get_if_generation(&task_id, generation)?
+                .is_some_and(|task| task.status == TaskStatus::Cancelled)),
+        });
     let cancellation_finished = match cancellation_finished {
         Ok(finished) => finished,
         Err(err) => {
             warn!(task_id, error = %err, "failed to resolve task cancellation state");
             drop(permit);
-            let _ = queue.unregister_cancellation(&task_id);
+            let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
             return;
         }
     };
     if cancellation_finished {
         drop(permit);
-        let _ = queue.unregister_cancellation(&task_id);
+        let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
         let message = format!("Canceled job #{job_id}: {}", job.label());
         if let Some(message_id) = status_message_id {
-            edit_or_send(&telegram, chat_id, message_id, message).await;
+            if is_collection {
+                edit_task_message_if_current(
+                    &queue, &task_id, generation, &telegram, chat_id, message_id, message,
+                )
+                .await;
+            } else {
+                edit_or_send(&telegram, chat_id, message_id, message).await;
+            }
         } else {
             send_or_log(&telegram, chat_id, message).await;
         }
@@ -4307,11 +4963,11 @@ async fn run_queued_job(
         let keyboard = task_action_keyboard(&[
             (
                 "Use updated plan".to_string(),
-                queue_callback_data("confirm", &task_id),
+                queue_callback_data("confirm", &task_id, generation),
             ),
             (
                 "Cancel".to_string(),
-                queue_callback_data("cancel", &task_id),
+                queue_callback_data("cancel", &task_id, generation),
             ),
         ]);
         let text = format!(
@@ -4320,7 +4976,12 @@ async fn run_queued_job(
             differences.join(", ")
         );
         if let Some(message_id) = status_message_id {
-            if let Err(err) = telegram
+            if is_collection {
+                edit_task_message_with_keyboard_if_current(
+                    &queue, &task_id, generation, &telegram, chat_id, message_id, text, keyboard,
+                )
+                .await;
+            } else if let Err(err) = telegram
                 .edit_message_text_with_inline_keyboard(chat_id, message_id, text, keyboard)
                 .await
             {
@@ -4332,13 +4993,41 @@ async fn run_queued_job(
                 )
                 .await;
             }
+        } else if is_collection {
+            if let Some(message_id) = send_task_message_with_keyboard_id_if_current(
+                ProgressDeliveryContext {
+                    telegram: &telegram,
+                    queue: &queue,
+                    task_id: &task_id,
+                    generation,
+                    chat_id,
+                    job_id,
+                    job_label: job.label(),
+                },
+                text,
+                keyboard,
+            )
+            .await
+            {
+                match queue.set_status_message_id_if_generation(&task_id, generation, message_id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => warn!(
+                        task_id,
+                        generation,
+                        "task generation changed before plan message association was saved"
+                    ),
+                    Err(err) => {
+                        warn!(task_id, error = %err, "failed to persist collection plan message association")
+                    }
+                }
+            }
         } else {
             let _ = telegram
                 .send_message_with_inline_keyboard(chat_id, text, keyboard)
                 .await;
         }
         drop(permit);
-        let _ = queue.unregister_cancellation(&task_id);
+        let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
         return;
     }
 
@@ -4350,65 +5039,108 @@ async fn run_queued_job(
             chat_id,
             job_id,
             task_id: task_id.clone(),
+            generation,
             job_label: job.label(),
+            is_collection,
             status_message_id,
             update_interval: Duration::from_secs(config.bot.progress_update_seconds),
         },
         progress_rx,
     ));
     let completion_progress = progress_tx.clone();
-    let result = select_worker_result_or_cancel(&cancel, async {
-        match run_mode {
-            JobRunMode::Duplicate(duplicate_run) => {
-                run_job_with_duplicate_action(
-                    &config,
-                    &job,
-                    duplicate_run.action,
-                    &duplicate_run.duplicate,
-                    Some(progress_tx),
-                )
-                .await
+    let result = release_download_permit_after(
+        permit,
+        select_worker_result_or_cancel(&cancel, async {
+            match run_mode {
+                JobRunMode::Duplicate(duplicate_run) => {
+                    run_job_with_duplicate_action(
+                        &config,
+                        &job,
+                        duplicate_run.action,
+                        &duplicate_run.duplicate,
+                        Some(progress_tx),
+                    )
+                    .await
+                }
+                JobRunMode::StagedKeepBoth => {
+                    run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
+                }
+                JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
             }
-            JobRunMode::StagedKeepBoth => {
-                run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
-            }
-            JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
-        }
-    })
+        }),
+    )
     .await;
     if (result.is_none() || result.as_ref().is_some_and(Result::is_err))
-        && let Err(err) = queue.finish_cancellation(&task_id)
+        && let Err(err) = queue.finish_cancellation_if_generation(&task_id, generation)
     {
         warn!(task_id, error = %err, "failed to persist task cancellation");
     }
-    if result.as_ref().is_some_and(Result::is_err) || result.is_none() {
-        send_collection_failure_lifecycle(&completion_progress);
+    if result.as_ref().is_some_and(Result::is_err) {
+        match task_if_generation_with_retry_delay(
+            &queue,
+            &task_id,
+            generation,
+            context.queue_start_retry_delay,
+        )
+        .await
+        {
+            Ok(Some(task)) if task.status != TaskStatus::Cancelled => {
+                send_collection_failure_lifecycle(&completion_progress);
+            }
+            Ok(_) => {}
+            Err(err) => warn!(
+                task_id,
+                error = %err,
+                "failed to read task state before collection failure progress"
+            ),
+        }
     }
     drop(completion_progress);
-    let _ = progress_task.await;
-    drop(permit);
+    let collection_delivery = match progress_task.await {
+        Ok(delivery) => delivery,
+        Err(err) => {
+            warn!(task_id, error = %err, "collection progress delivery task failed to join");
+            None
+        }
+    };
+    let collection_status_message_id = collection_delivery
+        .as_ref()
+        .and_then(|delivery| delivery.main_delivery.message_id())
+        .or(status_message_id);
 
+    let mut final_outcome = CollectionFinalOutcome::Failed;
+    let mut deliver_final_message = true;
     let message = match result {
         Some(Ok(report)) => {
+            let details = if report.details.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", report.details)
+            };
+            let success_message = format!(
+                "Finished job #{job_id}: {}\nSaved: {}{}",
+                job.label(),
+                report.saved_location,
+                details
+            );
             let finalize = async {
-                queue.begin_verification(&task_id)?.ok_or_else(|| {
-                    anyhow::anyhow!("task changed state before file verification")
-                })?;
-                if let Some(message_id) = status_message_id
-                    && let Err(err) = telegram
-                        .edit_message_text(
-                            chat_id,
-                            message_id,
-                            job_status_message(
-                                job_id,
-                                job.label(),
-                                "Verifying published files",
-                                None,
-                            ),
-                        )
-                        .await
+                if queue
+                    .begin_verification_if_generation(&task_id, generation)?
+                    .is_none()
                 {
-                    warn!(task_id, error = %err, "failed to update task verification status");
+                    return Ok::<Option<TaskRecord>, anyhow::Error>(None);
+                }
+                if let Some(message_id) = status_message_id {
+                    edit_task_message_if_current(
+                        &queue,
+                        &task_id,
+                        generation,
+                        &telegram,
+                        chat_id,
+                        message_id,
+                        job_status_message(job_id, job.label(), "Verifying published files", None),
+                    )
+                    .await;
                 }
                 let media_root = if matches!(job, JobRequest::Pdf { .. }) {
                     config.downloads.pdf_dir.clone()
@@ -4427,47 +5159,94 @@ async fn run_queued_job(
                     PublishedTaskCompletion {
                         chat_id,
                         task_id: &task_id,
+                        generation,
                         saved_location: &report.saved_location,
                         media_paths: &report.primary_media_paths,
                         hashes,
+                        is_collection,
+                        collection_status_message_id: if is_collection {
+                            collection_status_message_id
+                        } else {
+                            None
+                        },
                     },
                     context.queue_start_retry_delay,
                 )
-                .await?;
-                Ok::<(), anyhow::Error>(())
+                .await
             }
             .await;
             match finalize {
-                Ok(()) => {
-                    let details = if report.details.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n{}", report.details)
-                    };
-                    format!(
-                        "Finished job #{job_id}: {}\nSaved: {}{}",
-                        job.label(),
-                        report.saved_location,
-                        details
-                    )
+                Ok(Some(_)) => {
+                    final_outcome = CollectionFinalOutcome::Verified;
+                    success_message
                 }
+                Ok(None) => match task_if_generation_with_retry_delay(
+                    &queue,
+                    &task_id,
+                    generation,
+                    context.queue_start_retry_delay,
+                )
+                .await
+                {
+                    Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
+                        final_outcome = CollectionFinalOutcome::Cancelled;
+                        format!("Canceled job #{job_id}: {}", job.label())
+                    }
+                    _ => {
+                        deliver_final_message = false;
+                        String::new()
+                    }
+                },
                 Err(err) => {
                     let error_chain = redact_sensitive_text(&format!(
                         "failed to verify or persist published outputs: {err:#}"
                     ));
-                    match queue.get(&task_id).ok().flatten().map(|task| task.status) {
-                        Some(TaskStatus::Cancelled) => {
+                    match task_if_generation_with_retry_delay(
+                        &queue,
+                        &task_id,
+                        generation,
+                        context.queue_start_retry_delay,
+                    )
+                    .await
+                    {
+                        Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
+                            final_outcome = CollectionFinalOutcome::Cancelled;
                             format!("Canceled job #{job_id}: {}", job.label())
                         }
-                        Some(TaskStatus::Completed) => format!(
-                            "Finished job #{job_id}: {}\nSaved: {}\nTask history could not be relocated beside the media file: {}",
-                            job.label(),
-                            report.saved_location,
-                            truncate(&error_chain),
-                        ),
-                        _ => {
-                            let _ = queue.fail(&task_id, truncate(&error_chain));
+                        Ok(Some(task)) if task.status == TaskStatus::Completed => {
+                            let (outcome, message) = completed_task_finalization_fallback(
+                                job_id,
+                                job.label(),
+                                &report.saved_location,
+                                &error_chain,
+                            );
+                            final_outcome = outcome;
+                            message
+                        }
+                        Ok(Some(_)) => {
+                            match queue.fail_if_generation(
+                                &task_id,
+                                generation,
+                                truncate(&error_chain),
+                            ) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => deliver_final_message = false,
+                                Err(fail_error) => warn!(
+                                    task_id,
+                                    error = %fail_error,
+                                    "failed to persist task failure state"
+                                ),
+                            }
                             failed_job_message(job_id, job.label(), &error_chain)
+                        }
+                        Ok(None) => {
+                            deliver_final_message = false;
+                            String::new()
+                        }
+                        Err(get_error) => {
+                            warn!(task_id, error = %get_error, "failed to read task generation after finalization error");
+                            deliver_final_message = false;
+                            String::new()
                         }
                     }
                 }
@@ -4476,30 +5255,104 @@ async fn run_queued_job(
         Some(Err(err)) => {
             let error_chain = redact_sensitive_text(&format!("{err:#}"));
             error!(job_id, error = %error_chain, "job failed");
-            if queue
-                .get(&task_id)
-                .ok()
-                .flatten()
-                .is_some_and(|record| record.status != TaskStatus::Cancelled)
+            match task_if_generation_with_retry_delay(
+                &queue,
+                &task_id,
+                generation,
+                context.queue_start_retry_delay,
+            )
+            .await
             {
-                let _ = queue.fail(&task_id, truncate(&error_chain));
-                failed_job_message(job_id, job.label(), &error_chain)
-            } else {
-                format!("Canceled job #{job_id}: {}", job.label())
+                Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
+                    final_outcome = CollectionFinalOutcome::Cancelled;
+                    format!("Canceled job #{job_id}: {}", job.label())
+                }
+                Ok(Some(_)) => {
+                    match queue.fail_if_generation(&task_id, generation, truncate(&error_chain)) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => deliver_final_message = false,
+                        Err(fail_error) => warn!(
+                            task_id,
+                            error = %fail_error,
+                            "failed to persist task failure state"
+                        ),
+                    }
+                    failed_job_message(job_id, job.label(), &error_chain)
+                }
+                Ok(None) => {
+                    deliver_final_message = false;
+                    String::new()
+                }
+                Err(get_error) => {
+                    warn!(task_id, error = %get_error, "failed to read task generation after job error");
+                    deliver_final_message = false;
+                    String::new()
+                }
             }
         }
-        None => {
-            format!("Canceled job #{job_id}: {}", job.label())
-        }
+        None => match task_if_generation_with_retry_delay(
+            &queue,
+            &task_id,
+            generation,
+            context.queue_start_retry_delay,
+        )
+        .await
+        {
+            Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
+                final_outcome = CollectionFinalOutcome::Cancelled;
+                format!("Canceled job #{job_id}: {}", job.label())
+            }
+            _ => {
+                deliver_final_message = false;
+                String::new()
+            }
+        },
     };
 
-    let _ = queue.unregister_cancellation(&task_id);
+    if let Err(err) = queue.unregister_cancellation_if_current(&task_id, &cancel) {
+        warn!(task_id, error = %err, "failed to unregister current cancellation token");
+    }
+    if !deliver_final_message {
+        return;
+    }
 
-    if let Some(message_id) = status_message_id {
+    if is_collection {
+        let mut delivery = collection_delivery.unwrap_or_default();
+        if let Some(message_id) = delivery.main_delivery.message_id().or(status_message_id) {
+            delivery.main_delivery = ProgressDelivery::Edit(message_id);
+        }
+        finalize_collection_messages(
+            ProgressDeliveryContext {
+                telegram: &telegram,
+                queue: &queue,
+                task_id: &task_id,
+                generation,
+                chat_id,
+                job_id,
+                job_label: job.label(),
+            },
+            delivery,
+            message,
+            final_outcome,
+        )
+        .await;
+    } else if let Some(message_id) = status_message_id {
         edit_or_send(&telegram, chat_id, message_id, message).await;
     } else {
         send_or_log(&telegram, chat_id, message).await;
     }
+}
+
+async fn release_download_permit_after<F>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    download: F,
+) -> F::Output
+where
+    F: Future,
+{
+    let result = download.await;
+    drop(permit);
+    result
 }
 
 async fn select_worker_result_or_cancel<F>(cancel: &Notify, worker: F) -> Option<F::Output>
@@ -4540,18 +5393,49 @@ async fn forward_progress(
     queue: Arc<QueueManager>,
     context: JobProgressContext,
     progress_rx: JobProgressReceiver,
-) {
+) -> Option<CollectionProgressDelivery> {
+    forward_progress_with_retry_delay(
+        telegram,
+        queue,
+        context,
+        progress_rx,
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+    )
+    .await
+}
+
+async fn forward_progress_with_retry_delay(
+    telegram: TelegramClient,
+    queue: Arc<QueueManager>,
+    context: JobProgressContext,
+    progress_rx: JobProgressReceiver,
+    generation_retry_delay: Duration,
+) -> Option<CollectionProgressDelivery> {
     let JobProgressContext {
         chat_id,
         job_id,
         task_id,
+        generation,
         job_label,
+        is_collection,
         status_message_id,
         update_interval,
     } = context;
     let (mut latest, mut lifecycle) = progress_rx.into_parts();
     let mut status_delivery = ProgressDelivery::from_message_id(status_message_id);
-    let mut collection_delivery = None;
+    let mut collection_delivery = is_collection.then(|| CollectionProgressDelivery {
+        main_delivery: status_delivery,
+        ..CollectionProgressDelivery::default()
+    });
+    let delivery_context = ProgressDeliveryContext {
+        telegram: &telegram,
+        queue: &queue,
+        task_id: &task_id,
+        generation,
+        chat_id,
+        job_id,
+        job_label,
+    };
     let mut ticker = interval(update_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
@@ -4559,13 +5443,20 @@ async fn forward_progress(
     let mut latest_open = true;
     let mut lifecycle_open = true;
     loop {
+        if !generation_is_current_with_retry_delay(
+            &queue,
+            &task_id,
+            generation,
+            generation_retry_delay,
+        )
+        .await
+        {
+            break;
+        }
         if !latest_open && !lifecycle_open {
             if let Some(progress) = pending.take() {
                 let _ = deliver_pending_progress(
-                    &telegram,
-                    chat_id,
-                    job_id,
-                    job_label,
+                    delivery_context,
                     status_delivery,
                     &mut collection_delivery,
                     progress,
@@ -4578,19 +5469,30 @@ async fn forward_progress(
             event = lifecycle.recv(), if lifecycle_open => {
                 match event {
                     Some(event) => {
+                        if !generation_is_current_with_retry_delay(
+                            &queue,
+                            &task_id,
+                            generation,
+                            generation_retry_delay,
+                        )
+                        .await
+                        {
+                            break;
+                        }
                         if let JobProgressLifecycleEvent::StagingAttempt { path } = &event {
-                            if let Err(err) = queue.record_staging_path(&task_id, path.clone()) {
-                                warn!(task_id, error = %err, "failed to persist staging attempt path");
+                            match queue.record_staging_path_if_generation(&task_id, generation, path.clone()) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => continue,
+                                Err(err) => warn!(task_id, error = %err, "failed to persist staging attempt path"),
                             }
                         } else {
-                            if let Err(err) = persist_collection_progress(&queue, &task_id, &event) {
-                                warn!(task_id, error = %err, "failed to persist collection progress");
+                            match persist_collection_progress(&queue, &task_id, generation, &event) {
+                                Ok(true) => {}
+                                Ok(false) => continue,
+                                Err(err) => warn!(task_id, error = %err, "failed to persist collection progress"),
                             }
                             status_delivery = deliver_collection_lifecycle(
-                                &telegram,
-                                chat_id,
-                                job_id,
-                                job_label,
+                                delivery_context,
                                 status_delivery,
                                 &mut collection_delivery,
                                 event,
@@ -4603,17 +5505,25 @@ async fn forward_progress(
             changed = latest.changed(), if latest_open => {
                 if changed.is_err() {
                     latest_open = false;
-                } else {
-                    pending = latest.borrow_and_update().clone();
-                }
+                    } else {
+                        if generation_is_current_with_retry_delay(
+                            &queue,
+                            &task_id,
+                            generation,
+                            generation_retry_delay,
+                        )
+                        .await
+                        {
+                            pending = latest.borrow_and_update().clone();
+                        } else {
+                            break;
+                        }
+                    }
             }
             _ = ticker.tick(), if pending.is_some() => {
                 let progress = pending.take().expect("guarded by is_some");
                 status_delivery = deliver_pending_progress(
-                    &telegram,
-                    chat_id,
-                    job_id,
-                    job_label,
+                    delivery_context,
                     status_delivery,
                     &mut collection_delivery,
                     progress,
@@ -4621,15 +5531,17 @@ async fn forward_progress(
             }
         }
     }
+    collection_delivery
 }
 
 fn persist_collection_progress(
     queue: &QueueManager,
     task_id: &str,
+    generation: u64,
     event: &JobProgressLifecycleEvent,
-) -> Result<()> {
+) -> Result<bool> {
     let (total, completed, failed) = match event {
-        JobProgressLifecycleEvent::StagingAttempt { .. } => return Ok(()),
+        JobProgressLifecycleEvent::StagingAttempt { .. } => return Ok(true),
         JobProgressLifecycleEvent::Resolved { manifest, .. } => {
             (manifest.total_entries, manifest.skipped_entries, 0)
         }
@@ -4648,194 +5560,219 @@ fn persist_collection_progress(
             (snapshot.total_entries, completed, failed)
         }
     };
-    queue.set_collection_progress(task_id, total, completed, failed)?;
-    Ok(())
+    Ok(queue
+        .set_collection_progress_if_generation(task_id, generation, total, completed, failed)?
+        .is_some())
 }
 
 #[derive(Clone, Copy)]
 struct ProgressDeliveryContext<'a> {
     telegram: &'a TelegramClient,
+    queue: &'a QueueManager,
+    task_id: &'a str,
+    generation: u64,
     chat_id: i64,
     job_id: u64,
     job_label: &'static str,
 }
 
 async fn deliver_pending_progress(
-    telegram: &TelegramClient,
-    chat_id: i64,
-    job_id: u64,
-    job_label: &'static str,
+    context: ProgressDeliveryContext<'_>,
     status_delivery: ProgressDelivery,
     collection_delivery: &mut Option<CollectionProgressDelivery>,
     progress: JobProgress,
 ) -> ProgressDelivery {
     let Some(snapshot) = progress.collection.clone() else {
-        return deliver_progress(
-            telegram,
-            chat_id,
-            job_id,
-            job_label,
-            status_delivery,
-            progress,
-        )
-        .await;
+        if let Some(delivery) = collection_delivery.as_mut() {
+            let rendered_progress = render_job_progress(&progress);
+            let message = job_status_message(
+                context.job_id,
+                context.job_label,
+                "Running",
+                Some(&rendered_progress),
+            );
+            return deliver_collection_main_message(context, delivery, message).await;
+        }
+        return deliver_progress(context, status_delivery, progress).await;
     };
-    let delivery = collection_delivery.get_or_insert_with(CollectionProgressDelivery::default);
-    deliver_collection_progress(
-        ProgressDeliveryContext {
-            telegram,
-            chat_id,
-            job_id,
-            job_label,
-        },
-        status_delivery,
-        delivery,
-        &snapshot,
-        &progress,
-    )
-    .await
+    let Some(delivery) = collection_delivery.as_mut() else {
+        return deliver_progress(context, status_delivery, progress).await;
+    };
+    deliver_collection_progress(context, delivery, &snapshot, &progress).await
 }
 
 async fn deliver_collection_lifecycle(
-    telegram: &TelegramClient,
-    chat_id: i64,
-    job_id: u64,
-    job_label: &'static str,
+    context: ProgressDeliveryContext<'_>,
     mut status_delivery: ProgressDelivery,
     collection_delivery: &mut Option<CollectionProgressDelivery>,
     event: JobProgressLifecycleEvent,
 ) -> ProgressDelivery {
-    let delivery = collection_delivery.get_or_insert_with(CollectionProgressDelivery::default);
-    let context = ProgressDeliveryContext {
-        telegram,
-        chat_id,
-        job_id,
-        job_label,
+    let Some(delivery) = collection_delivery.as_mut() else {
+        return status_delivery;
     };
     match event {
         JobProgressLifecycleEvent::StagingAttempt { .. } => {}
         JobProgressLifecycleEvent::Resolved { manifest, snapshot } => {
-            if !delivery.details_sent {
-                register_collection_details(telegram, chat_id, job_id, manifest.clone()).await;
-                delivery.details_sent = true;
+            if delivery.manifest.is_none() {
+                delivery.manifest = Some(manifest.clone());
+                delivery.details_page = 0;
+                status_delivery = deliver_collection_overview(
+                    context,
+                    delivery,
+                    &snapshot,
+                    Some("Collection resolved; ready to download selected entries."),
+                )
+                .await;
+                delivery.details_token = register_collection_details(
+                    context.chat_id,
+                    status_delivery.message_id(),
+                    context.job_id,
+                    context.task_id,
+                    context.generation,
+                    manifest.clone(),
+                )
+                .await;
+                for manifest_entry in &manifest.entries {
+                    if manifest_entry.status != BilibiliCollectionEntryStatus::AlreadyPresent {
+                        continue;
+                    }
+                    let entry = collection_manifest_entry_progress(manifest_entry);
+                    let message = collection_entry_skipped_message(
+                        context.job_id,
+                        context.job_label,
+                        &snapshot,
+                        &entry,
+                    );
+                    let message_id = send_task_message_id_if_current(context, message).await;
+                    delivery.entries.insert(
+                        entry.index,
+                        CollectionEntryDelivery {
+                            message_id,
+                            entry,
+                            snapshot: snapshot.clone(),
+                            state: CollectionEntryDeliveryState::SkippedPendingVerification,
+                        },
+                    );
+                }
             }
             status_delivery = deliver_collection_overview(
                 context,
-                status_delivery,
+                delivery,
                 &snapshot,
-                Some(&manifest.overview_summary()),
-                None,
+                Some("Collection resolved; ready to download selected entries."),
             )
             .await;
         }
         JobProgressLifecycleEvent::EntryStarted { entry, snapshot } => {
-            if let Some(previous) = delivery.current_entry.take() {
-                let previous_text = collection_entry_transition_message(
-                    job_id,
-                    job_label,
+            let entry_index = entry.index;
+            if let Some(existing) = delivery.entries.get_mut(&entry_index) {
+                if existing.state == CollectionEntryDeliveryState::Started {
+                    existing.snapshot = snapshot.clone();
+                    let entry_text = collection_entry_running_message(
+                        context.job_id,
+                        context.job_label,
+                        &snapshot,
+                        &entry,
+                        "BBDown-rust: collection entry started",
+                    );
+                    edit_collection_entry_message(context, existing, entry_text).await;
+                }
+            } else {
+                let entry_index = entry.index;
+                let entry_text = collection_entry_running_message(
+                    context.job_id,
+                    context.job_label,
                     &snapshot,
-                    "Advanced to the next collection entry before this progress message was finalized.",
+                    &entry,
+                    "BBDown-rust: collection entry started",
                 );
-                deliver_collection_terminal_message(
-                    telegram,
-                    chat_id,
-                    job_id,
-                    previous,
-                    previous_text,
-                )
-                .await;
+                let message_id = send_task_message_id_if_current(context, entry_text).await;
+                delivery.entries.insert(
+                    entry_index,
+                    CollectionEntryDelivery {
+                        message_id,
+                        entry,
+                        snapshot: snapshot.clone(),
+                        state: CollectionEntryDeliveryState::Started,
+                    },
+                );
             }
-            let entry_text = collection_entry_running_message(
-                job_id,
-                job_label,
+            status_delivery = deliver_collection_overview(
+                context,
+                delivery,
                 &snapshot,
-                &entry,
-                "BBDown-rust: collection entry started",
-            );
-            let message_id = send_or_log_message_id(telegram, chat_id, entry_text).await;
-            delivery.current_entry = Some(ProgressDelivery::from_message_id(message_id));
-            status_delivery =
-                deliver_collection_overview(context, status_delivery, &snapshot, None, None).await;
+                Some(&format!(
+                    "Downloading entry {}/{}.",
+                    entry_index, snapshot.total_entries
+                )),
+            )
+            .await;
         }
         JobProgressLifecycleEvent::EntryCompleted {
             entry,
             file_count,
             snapshot,
         } => {
-            let entry_text = collection_entry_completed_message(
-                job_id, job_label, &snapshot, &entry, file_count,
-            );
-            if let Some(entry_delivery) = delivery.current_entry.take() {
-                deliver_collection_terminal_message(
-                    telegram,
-                    chat_id,
-                    job_id,
+            if let Some(entry_delivery) = delivery.entries.get_mut(&entry.index)
+                && entry_delivery.state == CollectionEntryDeliveryState::Started
+            {
+                entry_delivery.snapshot = snapshot.clone();
+                entry_delivery.state = CollectionEntryDeliveryState::DownloadedPendingVerification;
+                edit_collection_entry_message(
+                    context,
                     entry_delivery,
-                    entry_text,
+                    collection_entry_completed_message(
+                        context.job_id,
+                        context.job_label,
+                        &snapshot,
+                        &entry,
+                        file_count,
+                    ),
                 )
                 .await;
-            } else {
-                send_or_log(telegram, chat_id, entry_text).await;
             }
-            status_delivery =
-                deliver_collection_overview(context, status_delivery, &snapshot, None, None).await;
+            status_delivery = deliver_collection_overview(
+                context,
+                delivery,
+                &snapshot,
+                Some("Entry download finished; awaiting collection publication and final verification."),
+            )
+            .await;
         }
         JobProgressLifecycleEvent::Completed { snapshot } => {
             status_delivery = deliver_collection_overview(
                 context,
-                status_delivery,
+                delivery,
                 &snapshot,
-                None,
-                Some("BBDown-rust: collection entries downloaded"),
+                Some("Collection downloads finished; publication and final verification are in progress."),
             )
             .await;
         }
         JobProgressLifecycleEvent::Failed { snapshot } => {
-            if let Some(entry_delivery) = delivery.current_entry.take() {
-                let entry_text = snapshot.current_entry.as_ref().map_or_else(
-                    || {
-                        collection_entry_transition_message(
-                            job_id,
-                            job_label,
-                            &snapshot,
-                            "The job failed before this collection entry was finalized. See the final job status for details.",
-                        )
-                    },
-                    |entry| collection_entry_failed_message(job_id, job_label, &snapshot, entry),
-                );
-                deliver_collection_terminal_message(
-                    telegram,
-                    chat_id,
-                    job_id,
-                    entry_delivery,
-                    entry_text,
-                )
-                .await;
-            }
             status_delivery = deliver_collection_overview(
                 context,
-                status_delivery,
+                delivery,
                 &snapshot,
-                None,
-                Some("Collection download failed; see final job status for details."),
+                Some("Collection stopped; final job status is being resolved."),
             )
             .await;
         }
     }
+    delivery.main_delivery = status_delivery;
     status_delivery
 }
 
 async fn deliver_collection_progress(
     context: ProgressDeliveryContext<'_>,
-    status_delivery: ProgressDelivery,
     collection_delivery: &mut CollectionProgressDelivery,
     snapshot: &BilibiliCollectionProgressSnapshot,
     progress: &JobProgress,
 ) -> ProgressDelivery {
-    if let (Some(entry_delivery), Some(entry)) = (
-        collection_delivery.current_entry,
-        snapshot.current_entry.as_ref(),
-    ) {
+    if let Some(entry) = snapshot.current_entry.as_ref()
+        && let Some(entry_delivery) = collection_delivery.entries.get_mut(&entry.index)
+        && entry_delivery.state == CollectionEntryDeliveryState::Started
+    {
+        entry_delivery.snapshot = snapshot.clone();
         let entry_text = collection_entry_running_message(
             context.job_id,
             context.job_label,
@@ -4843,24 +5780,14 @@ async fn deliver_collection_progress(
             entry,
             &progress.message,
         );
-        collection_delivery.current_entry = Some(
-            deliver_collection_running_message(
-                context.telegram,
-                context.chat_id,
-                context.job_id,
-                entry_delivery,
-                entry_text,
-            )
-            .await,
-        );
-        return status_delivery;
+        edit_collection_entry_message(context, entry_delivery, entry_text).await;
+        return collection_delivery.main_delivery;
     }
 
     deliver_collection_overview(
         context,
-        status_delivery,
+        collection_delivery,
         snapshot,
-        progress.resolved_summary.as_deref(),
         Some(&progress.message),
     )
     .await
@@ -4868,123 +5795,594 @@ async fn deliver_collection_progress(
 
 async fn deliver_collection_overview(
     context: ProgressDeliveryContext<'_>,
-    delivery: ProgressDelivery,
+    delivery: &mut CollectionProgressDelivery,
     snapshot: &BilibiliCollectionProgressSnapshot,
-    resolved_summary: Option<&str>,
     activity: Option<&str>,
 ) -> ProgressDelivery {
-    let rendered = render_collection_overview(snapshot, resolved_summary, activity);
-    let message = job_status_message(
+    let rendered = render_collection_overview(snapshot, activity);
+    let overview = job_status_message(
         context.job_id,
         context.job_label,
         "Running",
         Some(&rendered),
     );
-    deliver_progress_message(
-        context.telegram,
-        context.chat_id,
-        context.job_id,
-        delivery,
-        message,
-        &rendered,
+    deliver_collection_main_message(context, delivery, overview).await
+}
+
+async fn generation_is_current(queue: &QueueManager, task_id: &str, generation: u64) -> bool {
+    generation_is_current_with_retry_delay(
+        queue,
+        task_id,
+        generation,
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
     )
     .await
 }
 
-async fn deliver_collection_running_message(
-    telegram: &TelegramClient,
-    chat_id: i64,
-    job_id: u64,
-    delivery: ProgressDelivery,
-    message: String,
-) -> ProgressDelivery {
-    deliver_progress_message(
-        telegram,
-        chat_id,
-        job_id,
-        delivery,
-        message.clone(),
-        &message,
-    )
-    .await
-}
-
-async fn deliver_collection_terminal_message(
-    telegram: &TelegramClient,
-    chat_id: i64,
-    job_id: u64,
-    delivery: ProgressDelivery,
-    message: String,
-) {
-    match delivery {
-        ProgressDelivery::Edit(message_id) => {
-            if !edit_or_log(telegram, chat_id, message_id, message.clone()).await {
-                send_or_log(
-                    telegram,
-                    chat_id,
-                    format!("Collection update for job #{job_id}: {message}"),
-                )
-                .await;
+async fn generation_is_current_with_retry_delay(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    retry_delay: Duration,
+) -> bool {
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.generation_matches(task_id, generation) {
+            Ok(matches) => return matches,
+            Err(err) if is_file_provider_access_error(&err) => {
+                if !reported_file_provider_error {
+                    warn!(
+                        task_id,
+                        generation,
+                        error = %format!("{err:#}"),
+                        "File Provider blocked task generation lookup; retrying before progress delivery"
+                    );
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
             }
-        }
-        ProgressDelivery::Send => {
-            send_or_log(
-                telegram,
-                chat_id,
-                format!("Collection update for job #{job_id}: {message}"),
-            )
-            .await;
+            Err(err) => {
+                warn!(task_id, generation, error = %format!("{err:#}"), "failed to validate task generation before delivery");
+                return false;
+            }
         }
     }
 }
 
-async fn deliver_progress(
+async fn task_if_generation_with_retry_delay(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    retry_delay: Duration,
+) -> Result<Option<TaskRecord>> {
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.get_if_generation(task_id, generation) {
+            Ok(task) => return Ok(task),
+            Err(err) if is_file_provider_access_error(&err) => {
+                if !reported_file_provider_error {
+                    warn!(
+                        task_id,
+                        generation,
+                        error = %format!("{err:#}"),
+                        "File Provider blocked task record lookup; retrying before final delivery"
+                    );
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn set_status_message_id_if_generation_and_status_with_retry_delay(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    expected_statuses: &[TaskStatus],
+    message_id: i64,
+    retry_delay: Duration,
+) -> Result<Option<TaskRecord>> {
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.set_status_message_id_if_generation_and_status(
+            task_id,
+            generation,
+            expected_statuses,
+            message_id,
+        ) {
+            Ok(record) => return Ok(record),
+            Err(err) if is_file_provider_access_error(&err) => {
+                if !reported_file_provider_error {
+                    warn!(
+                        task_id,
+                        generation,
+                        message_id,
+                        error = %format!("{err:#}"),
+                        "File Provider blocked prompt message association; retrying with generation and status guard"
+                    );
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn edit_task_message_if_current(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
     telegram: &TelegramClient,
     chat_id: i64,
-    job_id: u64,
-    job_label: &'static str,
+    message_id: i64,
+    message: String,
+) -> bool {
+    if !generation_is_current(queue, task_id, generation).await {
+        return false;
+    }
+    match telegram
+        .edit_message_text(chat_id, message_id, truncate(&message))
+        .await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(task_id, generation, chat_id, message_id, error = %err, "failed to edit task message");
+            false
+        }
+    }
+}
+
+async fn edit_task_message_without_keyboard_if_current(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    telegram: &TelegramClient,
+    chat_id: i64,
+    message_id: i64,
+    message: String,
+) -> bool {
+    if !generation_is_current(queue, task_id, generation).await {
+        return false;
+    }
+    match telegram
+        .edit_message_text_without_inline_keyboard(chat_id, message_id, truncate(&message))
+        .await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(task_id, generation, chat_id, message_id, error = %err, "failed to edit task message and clear its keyboard");
+            false
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn edit_task_message_with_keyboard_if_current(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    telegram: &TelegramClient,
+    chat_id: i64,
+    message_id: i64,
+    message: String,
+    keyboard: InlineKeyboardMarkup,
+) -> bool {
+    if !generation_is_current(queue, task_id, generation).await {
+        return false;
+    }
+    match telegram
+        .edit_message_text_with_inline_keyboard(chat_id, message_id, truncate(&message), keyboard)
+        .await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            warn!(task_id, generation, chat_id, message_id, error = %err, "failed to edit task message with keyboard");
+            false
+        }
+    }
+}
+
+async fn send_task_message_id_if_current(
+    context: ProgressDeliveryContext<'_>,
+    message: String,
+) -> Option<i64> {
+    if !generation_is_current(context.queue, context.task_id, context.generation).await {
+        return None;
+    }
+    send_or_log_message_id(context.telegram, context.chat_id, message).await
+}
+
+async fn send_task_message_with_keyboard_id_if_current(
+    context: ProgressDeliveryContext<'_>,
+    message: String,
+    keyboard: InlineKeyboardMarkup,
+) -> Option<i64> {
+    if !generation_is_current(context.queue, context.task_id, context.generation).await {
+        return None;
+    }
+    match context
+        .telegram
+        .send_message_with_inline_keyboard(context.chat_id, truncate(&message), keyboard)
+        .await
+    {
+        Ok(message_id) => Some(message_id),
+        Err(err) => {
+            warn!(chat_id = context.chat_id, error = %err, "failed to send generation-guarded task message");
+            None
+        }
+    }
+}
+
+async fn edit_collection_entry_message(
+    context: ProgressDeliveryContext<'_>,
+    delivery: &CollectionEntryDelivery,
+    message: String,
+) {
+    let Some(message_id) = delivery.message_id else {
+        return;
+    };
+    if !generation_is_current(context.queue, context.task_id, context.generation).await {
+        return;
+    }
+    if let Err(err) = context
+        .telegram
+        .edit_message_text(context.chat_id, message_id, truncate(&message))
+        .await
+    {
+        warn!(chat_id = context.chat_id, message_id, error = %err, "failed to edit collection entry status");
+    }
+}
+
+async fn edit_collection_entry_terminal_message(
+    context: ProgressDeliveryContext<'_>,
+    delivery: &CollectionEntryDelivery,
+    message: String,
+) {
+    let Some(message_id) = delivery.message_id else {
+        return;
+    };
+    for attempt in 1..=COLLECTION_MAIN_EDIT_ATTEMPTS {
+        if !generation_is_current(context.queue, context.task_id, context.generation).await {
+            return;
+        }
+        match context
+            .telegram
+            .edit_message_text(context.chat_id, message_id, truncate(&message))
+            .await
+        {
+            Ok(()) => return,
+            Err(err) if attempt < COLLECTION_MAIN_EDIT_ATTEMPTS => {
+                warn!(
+                    task_id = context.task_id,
+                    generation = context.generation,
+                    chat_id = context.chat_id,
+                    message_id,
+                    attempt,
+                    error = %err,
+                    "failed to edit terminal collection entry status; retrying the same message"
+                );
+                tokio::time::sleep(COLLECTION_MAIN_EDIT_RETRY_DELAY).await;
+            }
+            Err(err) => {
+                warn!(
+                    task_id = context.task_id,
+                    generation = context.generation,
+                    chat_id = context.chat_id,
+                    message_id,
+                    attempt,
+                    error = %err,
+                    "failed to edit terminal collection entry status after bounded retries"
+                );
+                return;
+            }
+        }
+    }
+}
+
+async fn deliver_collection_main_message(
+    context: ProgressDeliveryContext<'_>,
+    delivery: &mut CollectionProgressDelivery,
+    overview: String,
+) -> ProgressDelivery {
+    delivery.overview = overview;
+    if let Some(token) = delivery.details_token
+        && let Some(page) =
+            update_collection_details_overview(token, delivery.overview.clone()).await
+    {
+        delivery.details_page = page;
+    }
+    let message = delivery.manifest.as_ref().map_or_else(
+        || delivery.overview.clone(),
+        |manifest| {
+            collection_details_page_text(
+                context.job_id,
+                manifest,
+                delivery.details_page,
+                &delivery.overview,
+            )
+        },
+    );
+    let keyboard = delivery.details_token.and_then(|token| {
+        delivery
+            .manifest
+            .as_ref()
+            .map(|manifest| collection_details_keyboard(token, manifest, delivery.details_page))
+    });
+    match delivery.main_delivery {
+        ProgressDelivery::Edit(message_id) => {
+            edit_collection_main_message_if_current(context, message_id, &message, keyboard).await;
+        }
+        ProgressDelivery::Send => {
+            let Some(message_id) = send_task_message_id_if_current(context, message.clone()).await
+            else {
+                return delivery.main_delivery;
+            };
+            delivery.main_delivery = ProgressDelivery::Edit(message_id);
+            match context.queue.set_status_message_id_if_generation(
+                context.task_id,
+                context.generation,
+                message_id,
+            ) {
+                Ok(Some(_)) => {}
+                Ok(None) => warn!(
+                    task_id = context.task_id,
+                    generation = context.generation,
+                    "task generation changed before collection main message association was saved"
+                ),
+                Err(err) => {
+                    warn!(task_id = context.task_id, error = %err, "failed to persist collection main message association")
+                }
+            }
+        }
+    }
+    delivery.main_delivery
+}
+
+async fn edit_collection_main_message_if_current(
+    context: ProgressDeliveryContext<'_>,
+    message_id: i64,
+    message: &str,
+    keyboard: Option<InlineKeyboardMarkup>,
+) -> bool {
+    for attempt in 1..=COLLECTION_MAIN_EDIT_ATTEMPTS {
+        if !generation_is_current(context.queue, context.task_id, context.generation).await {
+            return false;
+        }
+        let result = match keyboard.as_ref() {
+            Some(keyboard) => {
+                context
+                    .telegram
+                    .edit_message_text_with_inline_keyboard(
+                        context.chat_id,
+                        message_id,
+                        truncate(message),
+                        keyboard.clone(),
+                    )
+                    .await
+            }
+            None => {
+                context
+                    .telegram
+                    .edit_message_text(context.chat_id, message_id, truncate(message))
+                    .await
+            }
+        };
+        match result {
+            Ok(()) => return true,
+            Err(err) if attempt < COLLECTION_MAIN_EDIT_ATTEMPTS => {
+                warn!(
+                    task_id = context.task_id,
+                    generation = context.generation,
+                    chat_id = context.chat_id,
+                    message_id,
+                    attempt,
+                    error = %err,
+                    "failed to edit collection main message; retrying the same message"
+                );
+                tokio::time::sleep(COLLECTION_MAIN_EDIT_RETRY_DELAY).await;
+            }
+            Err(err) => {
+                warn!(
+                    task_id = context.task_id,
+                    generation = context.generation,
+                    chat_id = context.chat_id,
+                    message_id,
+                    attempt,
+                    error = %err,
+                    "failed to edit collection main message after bounded retries"
+                );
+                return false;
+            }
+        }
+    }
+    false
+}
+
+async fn deliver_collection_terminal_main_message(
+    context: ProgressDeliveryContext<'_>,
+    delivery: &mut CollectionProgressDelivery,
+    overview: String,
+) {
+    delivery.overview = overview.clone();
+    let Some(message_id) = delivery.main_delivery.message_id() else {
+        return;
+    };
+
+    if let Some(token) = delivery.details_token
+        && let Some(edit_lock) =
+            mark_collection_details_terminal(token, context.generation, overview.clone()).await
+    {
+        let _edit_guard = edit_lock.lock().await;
+        let current_details = find_collection_details(token, context.chat_id, message_id)
+            .await
+            .filter(|details| details.generation == context.generation && details.terminal);
+        let page = current_details
+            .as_ref()
+            .map_or(delivery.details_page, |details| details.page);
+        delivery.details_page = page;
+        let message = delivery.manifest.as_ref().map_or_else(
+            || delivery.overview.clone(),
+            |manifest| {
+                collection_details_page_text(context.job_id, manifest, page, &delivery.overview)
+            },
+        );
+        let keyboard = current_details.as_ref().and_then(|_| {
+            delivery
+                .manifest
+                .as_ref()
+                .map(|manifest| collection_details_keyboard(token, manifest, page))
+        });
+        edit_collection_main_message_if_current(context, message_id, &message, keyboard).await;
+        return;
+    }
+
+    let message = delivery.manifest.as_ref().map_or_else(
+        || delivery.overview.clone(),
+        |manifest| {
+            collection_details_page_text(
+                context.job_id,
+                manifest,
+                delivery.details_page,
+                &delivery.overview,
+            )
+        },
+    );
+    edit_collection_main_message_if_current(context, message_id, &message, None).await;
+}
+
+async fn finalize_collection_messages(
+    context: ProgressDeliveryContext<'_>,
+    mut delivery: CollectionProgressDelivery,
+    final_main_message: String,
+    outcome: CollectionFinalOutcome,
+) {
+    if let Some(token) = delivery.details_token {
+        let _ =
+            mark_collection_details_terminal(token, context.generation, final_main_message.clone())
+                .await;
+    }
+    for entry_delivery in delivery.entries.values_mut() {
+        let (state, state_text) = match (entry_delivery.state, outcome) {
+            (CollectionEntryDeliveryState::Verified, _) => continue,
+            (CollectionEntryDeliveryState::Failed, _) => continue,
+            (CollectionEntryDeliveryState::Cancelled, _) => continue,
+            (
+                CollectionEntryDeliveryState::SkippedPendingVerification,
+                CollectionFinalOutcome::Verified,
+            ) => (
+                CollectionEntryDeliveryState::Verified,
+                "Existing video verified; download skipped.",
+            ),
+            (
+                CollectionEntryDeliveryState::SkippedPendingVerification,
+                CollectionFinalOutcome::Failed,
+            ) => (
+                CollectionEntryDeliveryState::Failed,
+                "Existing video was found during sync; collection finalization failed.",
+            ),
+            (
+                CollectionEntryDeliveryState::SkippedPendingVerification,
+                CollectionFinalOutcome::Cancelled,
+            ) => (
+                CollectionEntryDeliveryState::Cancelled,
+                "Existing video was found during sync; the collection run was canceled.",
+            ),
+            (
+                CollectionEntryDeliveryState::DownloadedPendingVerification,
+                CollectionFinalOutcome::Verified,
+            ) => (
+                CollectionEntryDeliveryState::Verified,
+                "Downloaded, published, and verified.",
+            ),
+            (
+                CollectionEntryDeliveryState::DownloadedPendingVerification,
+                CollectionFinalOutcome::Failed,
+            ) => (
+                CollectionEntryDeliveryState::Failed,
+                "Downloaded, but collection publication or final verification failed.",
+            ),
+            (
+                CollectionEntryDeliveryState::DownloadedPendingVerification,
+                CollectionFinalOutcome::Cancelled,
+            ) => (
+                CollectionEntryDeliveryState::Cancelled,
+                "Downloaded, but final verification was canceled.",
+            ),
+            (CollectionEntryDeliveryState::Started, CollectionFinalOutcome::Verified) => (
+                CollectionEntryDeliveryState::Verified,
+                "Published and verified.",
+            ),
+            (CollectionEntryDeliveryState::Started, CollectionFinalOutcome::Failed) => (
+                CollectionEntryDeliveryState::Failed,
+                "Download failed before this entry completed.",
+            ),
+            (CollectionEntryDeliveryState::Started, CollectionFinalOutcome::Cancelled) => (
+                CollectionEntryDeliveryState::Cancelled,
+                "Download canceled before this entry completed.",
+            ),
+        };
+        entry_delivery.state = state;
+        let message = collection_entry_final_message(
+            context.job_id,
+            context.job_label,
+            &entry_delivery.snapshot,
+            &entry_delivery.entry,
+            state,
+            state_text,
+        );
+        edit_collection_entry_terminal_message(context, entry_delivery, message).await;
+    }
+    deliver_collection_terminal_main_message(context, &mut delivery, final_main_message).await;
+}
+
+async fn deliver_progress(
+    context: ProgressDeliveryContext<'_>,
     delivery: ProgressDelivery,
     progress: JobProgress,
 ) -> ProgressDelivery {
     let rendered_progress = render_job_progress(&progress);
-    let message = job_status_message(job_id, job_label, "Running", Some(&rendered_progress));
-    deliver_progress_message(
-        telegram,
-        chat_id,
-        job_id,
-        delivery,
-        message,
-        &rendered_progress,
-    )
-    .await
+    let message = job_status_message(
+        context.job_id,
+        context.job_label,
+        "Running",
+        Some(&rendered_progress),
+    );
+    deliver_progress_message(context, delivery, message, &rendered_progress).await
 }
 
 async fn deliver_progress_message(
-    telegram: &TelegramClient,
-    chat_id: i64,
-    job_id: u64,
+    context: ProgressDeliveryContext<'_>,
     mut delivery: ProgressDelivery,
     message: String,
     fallback_progress: &str,
 ) -> ProgressDelivery {
+    if !generation_is_current(context.queue, context.task_id, context.generation).await {
+        return delivery;
+    }
     match delivery {
         ProgressDelivery::Edit(message_id) => {
-            if edit_or_log(telegram, chat_id, message_id, message).await {
+            if edit_or_log(context.telegram, context.chat_id, message_id, message).await {
                 return delivery;
             }
             delivery = delivery.after_edit_result(false);
+            if !generation_is_current(context.queue, context.task_id, context.generation).await {
+                return delivery;
+            }
             send_or_log(
-                telegram,
-                chat_id,
-                progress_fallback_message(job_id, fallback_progress),
+                context.telegram,
+                context.chat_id,
+                progress_fallback_message(context.job_id, fallback_progress),
             )
             .await;
         }
         ProgressDelivery::Send => {
             send_or_log(
-                telegram,
-                chat_id,
-                progress_fallback_message(job_id, fallback_progress),
+                context.telegram,
+                context.chat_id,
+                progress_fallback_message(context.job_id, fallback_progress),
             )
             .await;
         }
@@ -4994,29 +6392,23 @@ async fn deliver_progress_message(
 
 fn render_collection_overview(
     snapshot: &BilibiliCollectionProgressSnapshot,
-    resolved_summary: Option<&str>,
     activity: Option<&str>,
 ) -> String {
-    let mut lines = Vec::new();
-    if let Some(summary) = resolved_summary.filter(|summary| !summary.trim().is_empty()) {
-        lines.push("Resolved collection:".to_string());
-        lines.push(summary.to_string());
-    } else {
-        lines.push(format!("Collection: {}", snapshot.title));
-        lines.push(format!(
-            "Sync: {} total; {} already present; {} queued",
+    let processed_entries = snapshot
+        .skipped_entries
+        .saturating_add(snapshot.completed_entries);
+    let remaining_entries = snapshot.total_entries.saturating_sub(processed_entries);
+    let mut lines = vec![
+        format!("Collection: {}", snapshot.title),
+        format!(
+            "Sync: {} selected; {} already present; {} to download",
             snapshot.total_entries, snapshot.skipped_entries, snapshot.planned_entries
-        ));
-    }
-    lines.push(format!(
-        "Progress: {}/{} downloaded; {} already present; {} queued",
-        snapshot.completed_entries,
-        snapshot.planned_entries,
-        snapshot.skipped_entries,
-        snapshot
-            .planned_entries
-            .saturating_sub(snapshot.completed_entries)
-    ));
+        ),
+        format!(
+            "Progress: {processed_entries}/{} selected entries processed; {remaining_entries} remaining",
+            snapshot.total_entries
+        ),
+    ];
     if let Some(activity) = activity.filter(|activity| !activity.trim().is_empty()) {
         lines.push(activity.to_string());
     }
@@ -5054,53 +6446,72 @@ fn collection_entry_completed_message(
         "Collection progress: {}/{} downloaded; {} already present",
         snapshot.completed_entries, snapshot.planned_entries, snapshot.skipped_entries
     ));
-    lines.push("Download complete; collection finalization follows.".to_string());
+    lines.push("Download complete; awaiting final publication and verification.".to_string());
     job_status_message(
         job_id,
         job_label,
-        "Downloaded collection entry",
+        "Processing collection entry",
         Some(&lines.join("\n")),
     )
 }
 
-fn collection_entry_failed_message(
+fn collection_entry_skipped_message(
     job_id: u64,
     job_label: &str,
     snapshot: &BilibiliCollectionProgressSnapshot,
     entry: &BilibiliCollectionEntryProgress,
 ) -> String {
-    let mut lines = collection_entry_header(snapshot, entry);
-    lines.push(format!(
-        "Collection progress: {}/{} downloaded; {} already present",
-        snapshot.completed_entries, snapshot.planned_entries, snapshot.skipped_entries
-    ));
-    lines.push(
-        "Download failed before this entry completed. See the final job status for details."
-            .to_string(),
-    );
-    job_status_message(
+    collection_entry_final_message(
         job_id,
         job_label,
-        "Failed collection entry",
-        Some(&lines.join("\n")),
+        snapshot,
+        entry,
+        CollectionEntryDeliveryState::SkippedPendingVerification,
+        "Existing video found during sync; download skipped while collection verification is pending.",
     )
 }
 
-fn collection_entry_transition_message(
+fn collection_entry_final_message(
     job_id: u64,
     job_label: &str,
     snapshot: &BilibiliCollectionProgressSnapshot,
-    activity: &str,
+    entry: &BilibiliCollectionEntryProgress,
+    state: CollectionEntryDeliveryState,
+    description: &str,
 ) -> String {
-    let body = format!(
-        "Collection: {}\nProgress: {}/{} downloaded; {} already present\n{}",
-        snapshot.title,
-        snapshot.completed_entries,
-        snapshot.planned_entries,
-        snapshot.skipped_entries,
-        activity
-    );
-    job_status_message(job_id, job_label, "Collection progress", Some(&body))
+    let title = match state {
+        CollectionEntryDeliveryState::Started => "Running collection entry",
+        CollectionEntryDeliveryState::DownloadedPendingVerification => {
+            "Processing collection entry"
+        }
+        CollectionEntryDeliveryState::SkippedPendingVerification => "Skipped collection entry",
+        CollectionEntryDeliveryState::Verified => "Verified collection entry",
+        CollectionEntryDeliveryState::Failed => "Failed collection entry",
+        CollectionEntryDeliveryState::Cancelled => "Canceled collection entry",
+    };
+    let mut lines = collection_entry_header(snapshot, entry);
+    lines.push(format!(
+        "Collection progress: {}/{} selected entries processed",
+        snapshot
+            .skipped_entries
+            .saturating_add(snapshot.completed_entries),
+        snapshot.total_entries
+    ));
+    lines.push(description.to_string());
+    job_status_message(job_id, job_label, title, Some(&lines.join("\n")))
+}
+
+fn collection_manifest_entry_progress(
+    entry: &BilibiliCollectionManifestEntry,
+) -> BilibiliCollectionEntryProgress {
+    BilibiliCollectionEntryProgress {
+        index: entry.index,
+        title: entry.title.clone(),
+        duration_seconds: entry.duration_seconds,
+        video: entry.video.clone(),
+        audio: entry.audio.clone(),
+        estimated_media: entry.estimated_media.clone(),
+    }
 }
 
 fn collection_entry_header(
@@ -5232,10 +6643,65 @@ fn collection_details_keyboard(
     }
 }
 
-#[derive(Default)]
 struct CollectionProgressDelivery {
-    current_entry: Option<ProgressDelivery>,
-    details_sent: bool,
+    main_delivery: ProgressDelivery,
+    entries: HashMap<u32, CollectionEntryDelivery>,
+    manifest: Option<BilibiliCollectionManifest>,
+    details_token: Option<u64>,
+    details_page: usize,
+    overview: String,
+}
+
+impl Default for CollectionProgressDelivery {
+    fn default() -> Self {
+        Self {
+            main_delivery: ProgressDelivery::Send,
+            entries: HashMap::new(),
+            manifest: None,
+            details_token: None,
+            details_page: 0,
+            overview: String::new(),
+        }
+    }
+}
+
+struct CollectionEntryDelivery {
+    message_id: Option<i64>,
+    entry: BilibiliCollectionEntryProgress,
+    snapshot: BilibiliCollectionProgressSnapshot,
+    state: CollectionEntryDeliveryState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionEntryDeliveryState {
+    Started,
+    DownloadedPendingVerification,
+    SkippedPendingVerification,
+    Verified,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionFinalOutcome {
+    Verified,
+    Failed,
+    Cancelled,
+}
+
+fn completed_task_finalization_fallback(
+    job_id: u64,
+    job_label: &str,
+    saved_location: &str,
+    error_chain: &str,
+) -> (CollectionFinalOutcome, String) {
+    (
+        CollectionFinalOutcome::Verified,
+        format!(
+            "Finished job #{job_id}: {job_label}\nSaved: {saved_location}\nTask history could not be relocated beside the media file: {}",
+            truncate(error_chain),
+        ),
+    )
 }
 
 fn render_job_progress(progress: &JobProgress) -> String {
@@ -5261,6 +6727,13 @@ enum ProgressDelivery {
 impl ProgressDelivery {
     fn from_message_id(message_id: Option<i64>) -> Self {
         message_id.map_or(Self::Send, Self::Edit)
+    }
+
+    fn message_id(self) -> Option<i64> {
+        match self {
+            Self::Edit(message_id) => Some(message_id),
+            Self::Send => None,
+        }
     }
 
     fn after_edit_result(self, succeeded: bool) -> Self {
@@ -5392,6 +6865,22 @@ mod tests {
     use super::*;
 
     static TEST_AUTH_GENERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn queue_task_callbacks_carry_generation_within_telegram_limit() {
+        let task_id = task_id_for_update(i64::MIN, usize::MAX);
+        let callback_data = queue_callback_data("confirm", &task_id, u64::MAX);
+
+        assert!(callback_data.len() <= 64, "{callback_data}");
+        assert!(matches!(
+            parse_queue_callback_data(&callback_data),
+            Some(QueueCallbackAction::Confirm { id, generation: u64::MAX }) if id == task_id
+        ));
+        assert!(matches!(
+            parse_queue_callback_data("q:confirm:old-task-id"),
+            Some(QueueCallbackAction::StaleTaskAction)
+        ));
+    }
 
     #[derive(Debug)]
     struct FakeTelegramRequest {
@@ -6146,6 +7635,52 @@ mod tests {
         }
     }
 
+    fn generation_guard_collection_queue(
+        label: &str,
+        task_id: &str,
+        job_id: u64,
+        chat_id: i64,
+    ) -> (
+        PathBuf,
+        AppConfig,
+        Arc<QueueManager>,
+        Arc<MockQueueFileProvider>,
+    ) {
+        let queue_root = temp_main_test_dir(label);
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open with mock File Provider access"),
+        );
+        let job = JobRequest::Bilibili {
+            url: "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+                .to_string(),
+            selection: Some(BilibiliSelection::All),
+        };
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    job_id as i64,
+                    job_id as i64 + 1_000,
+                    chat_id,
+                    Some(42),
+                    0,
+                    job,
+                ))
+                .expect("collection task should persist")
+        );
+
+        (queue_root, config, queue, file_provider)
+    }
+
     #[test]
     fn collection_details_paginate_per_entry_metadata() {
         let manifest = test_collection_manifest(6);
@@ -6227,7 +7762,14 @@ mod tests {
             current_entry: Some(entry.clone()),
         };
 
-        let rendered = collection_entry_failed_message(17, "Bilibili download", &snapshot, &entry);
+        let rendered = collection_entry_final_message(
+            17,
+            "Bilibili download",
+            &snapshot,
+            &entry,
+            CollectionEntryDeliveryState::Failed,
+            "Download failed before this entry completed. See the final job status for details.",
+        );
 
         assert!(rendered.starts_with("Failed collection entry job #17: Bilibili download"));
         assert!(rendered.contains("Entry: 1/2"));
@@ -6327,7 +7869,7 @@ mod tests {
 
         let (telegram, mut requests, update_sender, shutdown, server) =
             spawn_fake_telegram_api().await;
-        let cancel_data = queue_callback_data("cancel", task_id);
+        let cancel_data = queue_callback_data("cancel", task_id, 0);
         update_sender
             .send(vec![
                 serde_json::json!({
@@ -6457,7 +7999,7 @@ mod tests {
         let active_buttons = active_page["reply_markup"]["inline_keyboard"][0]
             .as_array()
             .expect("interrupted task should have action buttons");
-        let resume_data = format!("q:resume:{task_id}");
+        let resume_data = queue_callback_data("resume", task_id, 0);
         assert_eq!(active_buttons[0]["text"].as_str(), Some("Resume"));
         assert_eq!(
             active_buttons[0]["callback_data"].as_str(),
@@ -6530,6 +8072,7 @@ mod tests {
                 chat_id,
                 job_id: 901,
                 task_id: task_id.to_string(),
+                generation: 0,
                 job: job.clone(),
                 prompt: BilibiliSelectionPrompt::SeasonMedia,
                 created_at: Instant::now(),
@@ -6604,6 +8147,35 @@ mod tests {
         let result = select_worker_result_or_cancel(&cancellation, async { "published" }).await;
 
         assert_eq!(result, Some("published"));
+    }
+
+    #[tokio::test]
+    async fn download_permit_is_released_before_post_download_work() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("download permit should be available");
+        let (finish_download, wait_for_finish) = oneshot::channel();
+        let download = tokio::spawn(release_download_permit_after(permit, async move {
+            wait_for_finish
+                .await
+                .expect("test should release the download future")
+        }));
+
+        assert_eq!(semaphore.available_permits(), 0);
+        finish_download
+            .send(())
+            .expect("download future should still be waiting");
+        download
+            .await
+            .expect("download completion task should finish");
+
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "post-download terminal and progress work must not hold the download slot"
+        );
     }
 
     #[test]
@@ -6706,7 +8278,7 @@ mod tests {
         assert_eq!(buttons[0][0].text, "Cancel");
         assert_eq!(
             buttons[0][0].callback_data,
-            queue_callback_data("cancel", task_id)
+            queue_callback_data("cancel", task_id, 0)
         );
 
         drop(queue);
@@ -7345,7 +8917,7 @@ mod tests {
             queue_start_retry_delay: Duration::ZERO,
         };
         assert!(
-            prepare_persisted_task_for_job(&context, 123_456_789, task_id).await,
+            prepare_persisted_task_for_job(&context, 123_456_789, task_id, 0, false).await,
             "setup should retry after a transient File Provider error"
         );
         assert_eq!(
@@ -7367,6 +8939,84 @@ mod tests {
                 .is_some_and(|text| text.contains("retry automatically"))
         );
 
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn spawned_short_link_setup_retries_file_provider_without_extra_notice_e2e() {
+        let queue_root = temp_main_test_dir("spawned-short-link-setup-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "task-short-link-setup-retry";
+        let short_link_job = JobRequest::Bilibili {
+            url: "https://b23.tv/season-short-link".to_string(),
+            selection: None,
+        };
+        assert!(should_suppress_extra_setup_file_provider_notice(
+            &short_link_job
+        ));
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    960,
+                    1060,
+                    123_456_789,
+                    Some(701),
+                    0,
+                    short_link_job.clone(),
+                ))
+                .expect("short-link task should persist")
+        );
+        file_provider.fail_next_file_provider_write("simulated short-link setup write failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        assert!(
+            prepare_persisted_task_for_job(
+                &context,
+                123_456_789,
+                task_id,
+                0,
+                should_suppress_extra_setup_file_provider_notice(&short_link_job),
+            )
+            .await
+        );
+        assert_eq!(
+            queue
+                .get(task_id)
+                .expect("retried short-link task should load")
+                .expect("short-link task should remain queued for normalization")
+                .status,
+            TaskStatus::Preparing
+        );
+        assert!(
+            take_fake_telegram_requests(&mut requests).is_empty(),
+            "unresolved Bilibili short-link setup should not send an extra retry notice"
+        );
+
+        drop(context);
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
@@ -7425,7 +9075,8 @@ mod tests {
             selection: None,
         };
         assert!(job.requires_bilibili_selection());
-        queue_or_prompt_normalized_job(context, 123_456_789, 952, task_id.to_string(), job).await;
+        queue_or_prompt_normalized_job(context, 123_456_789, 952, task_id.to_string(), 0, job)
+            .await;
 
         let task = queue
             .get(task_id)
@@ -7529,6 +9180,7 @@ mod tests {
             chat_id,
             953,
             task_id.to_string(),
+            0,
             job,
             BilibiliSelectionPrompt::SeasonMedia,
         )
@@ -7625,14 +9277,18 @@ mod tests {
                 PublishedTaskCompletion {
                     chat_id,
                     task_id: &task_id,
+                    generation: 0,
+                    is_collection: false,
                     saved_location: &saved_location,
                     media_paths: std::slice::from_ref(&output),
                     hashes: BTreeMap::new(),
+                    collection_status_message_id: None,
                 },
                 Duration::ZERO,
             )
             .await
-            .expect("completion persistence should retry after a transient failure");
+            .expect("completion persistence should retry after a transient failure")
+            .expect("current task generation should complete");
             assert_eq!(completed.status, TaskStatus::Completed);
             assert_eq!(
                 fs::read(&output).expect("published output should still be readable"),
@@ -7673,6 +9329,130 @@ mod tests {
             stop_fake_telegram_api(shutdown, server).await;
             let _ = fs::remove_dir_all(queue_root);
         }
+    }
+
+    #[tokio::test]
+    async fn completed_collection_with_sidecar_relocation_error_stays_verified_e2e() {
+        let task_id = "completed-collection-sidecar-relocation-error";
+        let job_id = 961;
+        let chat_id = 123_456_789;
+        let (queue_root, config, queue, file_provider) = generation_guard_collection_queue(
+            "completed-collection-sidecar-relocation-error-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        queue
+            .set_status(task_id, TaskStatus::Running, None)
+            .expect("collection task should run before verification");
+        queue
+            .begin_verification_if_generation(task_id, 0)
+            .expect("collection verification should begin")
+            .expect("current collection should remain present");
+
+        let media_path = config.downloads.video_dir.join("published-output.mp4");
+        fs::write(&media_path, b"verified published media")
+            .expect("published collection output should write");
+        // Queue reads write the index once; completion writes the completed record and move intent
+        // twice; fail the next record write after the sidecar move has happened.
+        file_provider.fail_write_after(3, "simulated sidecar relocation write failure");
+        let sidecar_error = queue
+            .complete_if_generation(
+                task_id,
+                0,
+                media_path.display().to_string(),
+                std::slice::from_ref(&media_path),
+                BTreeMap::new(),
+            )
+            .expect_err("sidecar relocation should fail after completion persistence");
+        assert!(is_file_provider_access_error(&sidecar_error));
+
+        file_provider.fail_next_read("simulated transient terminal task lookup failure");
+        let completed_task =
+            task_if_generation_with_retry_delay(&queue, task_id, 0, Duration::ZERO)
+                .await
+                .expect("terminal generation lookup should retry a transient File Provider error")
+                .expect("completed task should remain in the current generation");
+        assert_eq!(completed_task.status, TaskStatus::Completed);
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let mut manifest = test_collection_manifest(1);
+        manifest.skipped_entries = 0;
+        manifest.planned_entries = 1;
+        manifest.entries[0].status = BilibiliCollectionEntryStatus::Queued;
+        let entry = test_collection_entry_progress(&manifest, 1);
+        let snapshot = test_collection_snapshot(&manifest, 1, None);
+        let error_chain =
+            format!("failed to verify or persist published outputs: {sidecar_error:#}");
+        let (outcome, final_message) = completed_task_finalization_fallback(
+            job_id,
+            "Bilibili download",
+            &media_path.display().to_string(),
+            &error_chain,
+        );
+        assert_eq!(outcome, CollectionFinalOutcome::Verified);
+        assert!(
+            final_message.contains("Task history could not be relocated beside the media file")
+        );
+
+        let delivery = CollectionProgressDelivery {
+            main_delivery: ProgressDelivery::Edit(700),
+            entries: HashMap::from([(
+                1,
+                CollectionEntryDelivery {
+                    message_id: Some(701),
+                    entry,
+                    snapshot,
+                    state: CollectionEntryDeliveryState::DownloadedPendingVerification,
+                },
+            )]),
+            manifest: None,
+            details_token: None,
+            details_page: 0,
+            overview: String::new(),
+        };
+        finalize_collection_messages(
+            ProgressDeliveryContext {
+                telegram: &telegram,
+                queue: &queue,
+                task_id,
+                generation: 0,
+                chat_id,
+                job_id,
+                job_label: "Bilibili download",
+            },
+            delivery,
+            final_message,
+            outcome,
+        )
+        .await;
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|request| (request.method.as_str(), request.body["message_id"].as_i64()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("editMessageText", Some(701)),
+                ("editMessageText", Some(700))
+            ]
+        );
+        assert!(
+            recorded[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Downloaded, published, and verified."))
+        );
+        assert!(
+            recorded[1].body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Finished job #961")
+                    && text.contains("Task history could not be relocated beside the media file"))
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
     }
 
     #[tokio::test]
@@ -7726,7 +9506,15 @@ mod tests {
         };
 
         assert!(
-            persist_queued_task_state(&context, chat_id, task_id, TaskStatus::Preparing).await,
+            persist_queued_task_state(
+                &context,
+                chat_id,
+                task_id,
+                TaskStatus::Preparing,
+                false,
+                None
+            )
+            .await,
             "queued state should persist after a transient File Provider error"
         );
         assert_eq!(
@@ -7755,6 +9543,415 @@ mod tests {
         );
 
         drop(context);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn queued_collection_transition_retries_file_provider_without_extra_notice_e2e() {
+        let queue_root = temp_main_test_dir("queued-collection-transition-file-provider-retry-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video queue root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF queue root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "queued-collection-transition-file-provider";
+        let chat_id = 123_456_789;
+        let job = JobRequest::Bilibili {
+            url: "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+                .to_string(),
+            selection: Some(BilibiliSelection::All),
+        };
+        assert!(is_confirmed_bilibili_ugc_collection_job(&job));
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    957,
+                    1057,
+                    chat_id,
+                    Some(701),
+                    0,
+                    job,
+                ))
+                .expect("collection task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("task should enter preparing state");
+        file_provider.fail_next_file_provider_write("simulated queued transition write failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+
+        assert!(
+            persist_queued_task_state(
+                &context,
+                chat_id,
+                task_id,
+                TaskStatus::Preparing,
+                true,
+                None
+            )
+            .await,
+            "collection queued state should persist after a transient File Provider error"
+        );
+        assert_eq!(
+            queue
+                .get(task_id)
+                .expect("retried collection task should load")
+                .expect("collection task should remain in queue")
+                .status,
+            TaskStatus::Queued
+        );
+        assert!(
+            take_fake_telegram_requests(&mut requests).is_empty(),
+            "the collection retry should not send an extra standalone Telegram notice"
+        );
+
+        drop(context);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn collection_progress_retries_file_provider_generation_lookup_without_duplicate_entry_send_e2e()
+     {
+        let task_id = "collection-generation-lookup-retry";
+        let job_id = 958;
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, file_provider) = generation_guard_collection_queue(
+            "collection-generation-lookup-retry-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        queue
+            .set_status(task_id, TaskStatus::Running, None)
+            .expect("collection task should be running");
+        queue
+            .set_status_message_id(task_id, 700)
+            .expect("main collection message should be associated");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let reads_before_lookup = file_provider.read_paths().len();
+        file_provider.fail_next_read("simulated transient generation lookup failure");
+        let mut manifest = test_collection_manifest(1);
+        manifest.skipped_entries = 0;
+        manifest.planned_entries = 1;
+        manifest.entries[0].status = BilibiliCollectionEntryStatus::Queued;
+        let entry = test_collection_entry_progress(&manifest, 1);
+        let (progress, progress_rx) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress_with_retry_delay(
+            telegram,
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id,
+                job_id,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: true,
+                status_message_id: Some(700),
+                update_interval: Duration::from_secs(60),
+            },
+            progress_rx,
+            Duration::ZERO,
+        ));
+
+        progress.send_lifecycle(JobProgressLifecycleEvent::Resolved {
+            manifest: manifest.clone(),
+            snapshot: test_collection_snapshot(&manifest, 0, None),
+        });
+        progress.send_lifecycle(JobProgressLifecycleEvent::EntryStarted {
+            entry: entry.clone(),
+            snapshot: test_collection_snapshot(&manifest, 0, Some(entry)),
+        });
+        drop(progress);
+
+        let delivery = tokio_timeout(Duration::from_secs(5), progress_task)
+            .await
+            .expect("progress forwarding should resume after the transient lookup error")
+            .expect("progress forwarding task should not panic")
+            .expect("resolved collection should retain its message tracker");
+        assert_eq!(delivery.entries.len(), 1);
+        assert_eq!(delivery.entries[&1].message_id, Some(1_000));
+        assert!(
+            file_provider.read_paths().len() >= reads_before_lookup + 2,
+            "generation lookup should retry the failed File Provider read"
+        );
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let sends = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sends.len(),
+            1,
+            "retrying generation lookup must not duplicate sends"
+        );
+        assert!(
+            sends[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Entry: 1/1"))
+        );
+        assert!(recorded.iter().any(|request| {
+            request.method == "editMessageText" && request.body["message_id"].as_i64() == Some(700)
+        }));
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn collection_progress_discards_events_when_generation_changes_during_file_provider_retry_e2e()
+     {
+        let task_id = "collection-generation-changes-during-retry";
+        let job_id = 959;
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, file_provider) = generation_guard_collection_queue(
+            "collection-generation-changes-during-retry-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        queue
+            .fail_if_generation(task_id, 0, "simulated prior failure".to_string())
+            .expect("task should enter the failed state")
+            .expect("current generation should fail");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let reads_before_lookup = file_provider.read_paths().len();
+        file_provider.fail_next_read("simulated transient generation lookup failure");
+        let mut manifest = test_collection_manifest(1);
+        manifest.skipped_entries = 0;
+        manifest.planned_entries = 1;
+        manifest.entries[0].status = BilibiliCollectionEntryStatus::Queued;
+        let entry = test_collection_entry_progress(&manifest, 1);
+        let (progress, progress_rx) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress_with_retry_delay(
+            telegram,
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id,
+                job_id,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: true,
+                status_message_id: None,
+                update_interval: Duration::from_secs(60),
+            },
+            progress_rx,
+            Duration::from_millis(250),
+        ));
+        progress.send_lifecycle(JobProgressLifecycleEvent::Resolved {
+            manifest: manifest.clone(),
+            snapshot: test_collection_snapshot(&manifest, 0, None),
+        });
+        progress.send_lifecycle(JobProgressLifecycleEvent::EntryStarted {
+            entry: entry.clone(),
+            snapshot: test_collection_snapshot(&manifest, 0, Some(entry)),
+        });
+        drop(progress);
+
+        tokio_timeout(Duration::from_secs(2), async {
+            while file_provider.read_paths().len() <= reads_before_lookup {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the injected generation read should fail before resume");
+        let resumed = queue
+            .claim_resume(task_id, true)
+            .expect("failed collection should resume")
+            .expect("failed task should be eligible for resume");
+        assert_eq!(resumed.generation, 1);
+
+        let delivery = tokio_timeout(Duration::from_secs(2), progress_task)
+            .await
+            .expect("stale progress forwarding should stop after retry")
+            .expect("progress forwarding task should not panic")
+            .expect("collection tracker should be returned");
+        assert!(delivery.entries.is_empty());
+        assert!(take_fake_telegram_requests(&mut requests).is_empty());
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn queued_message_lookup_retries_file_provider_failure_before_worker_registration_e2e() {
+        let queue_root = temp_main_test_dir("queued-message-lookup-file-provider-retry-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, file_provider_trait)
+                .expect("task queue should open"),
+        );
+        let task_id = "queued-message-lookup-file-provider-retry";
+        let job_id = 956;
+        let chat_id = 123_456_789;
+        let job = JobRequest::Bilibili {
+            url: "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+                .to_string(),
+            selection: Some(BilibiliSelection::All),
+        };
+        assert!(is_confirmed_bilibili_ugc_collection_job(&job));
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    job_id as i64,
+                    job_id as i64 + 1_000,
+                    chat_id,
+                    Some(42),
+                    0,
+                    job.clone(),
+                ))
+                .expect("collection task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Preparing, None)
+            .expect("collection task should enter preparing state");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let selection_prompt_id = telegram
+            .send_message(
+                chat_id,
+                "Choose the collection entries to download.".to_string(),
+            )
+            .await
+            .expect("selection prompt should send");
+        let prompt_request = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(prompt_request.method, "sendMessage");
+        queue
+            .set_status_message_id(task_id, selection_prompt_id)
+            .expect("selection prompt message should be associated with the task");
+
+        let context = BotContext {
+            telegram: telegram.clone(),
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(0)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(job_id + 1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        assert!(
+            persist_queued_task_state(
+                &context,
+                chat_id,
+                task_id,
+                TaskStatus::Preparing,
+                true,
+                None
+            )
+            .await,
+            "collection task should transition to Queued before the injected read failure"
+        );
+        let reads_before_lookup = file_provider.read_paths().len();
+        file_provider.fail_next_read("simulated transient queued-task lookup failure");
+
+        queue_queued_task(
+            context,
+            chat_id,
+            job_id,
+            task_id.to_string(),
+            job,
+            JobRunMode::StagedKeepBoth,
+            None,
+        )
+        .await;
+
+        assert!(
+            file_provider.read_paths().len() >= reads_before_lookup + 2,
+            "the injected failed lookup should be followed by a successful retry"
+        );
+        let queued_request = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(queued_request.method, "editMessageText");
+        assert_eq!(
+            queued_request.body["message_id"].as_i64(),
+            Some(selection_prompt_id),
+            "queued status should reuse the selection prompt message"
+        );
+        assert!(
+            queued_request.body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Queued job #956"))
+        );
+        let queued_record = queue
+            .get(task_id)
+            .expect("retried task lookup should succeed")
+            .expect("queued collection should remain persisted");
+        assert_eq!(queued_record.status, TaskStatus::Queued);
+        assert_eq!(queued_record.status_message_id, Some(selection_prompt_id));
+
+        queue
+            .cancel_for_chat(task_id, chat_id)
+            .expect("queued collection should cancel")
+            .expect("registered worker should leave the queued task cancellable");
+        let cancel_request = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(cancel_request.method, "editMessageText");
+        assert_eq!(
+            cancel_request.body["message_id"].as_i64(),
+            Some(selection_prompt_id)
+        );
+        assert!(
+            cancel_request.body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Canceled job #956"))
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let recorded = [prompt_request, queued_request, cancel_request];
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|request| request.method == "sendMessage")
+                .count(),
+            1,
+            "the run should retain its original collection main message"
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|request| request.method == "editMessageText")
+                .count(),
+            2,
+            "queued and canceled statuses should edit the same message"
+        );
+
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
@@ -7997,7 +10194,7 @@ mod tests {
                 "update_id": 954,
                 "callback_query": {
                     "id": "resume-file-provider-1",
-                    "data": queue_callback_data("resume", task_id),
+                    "data": queue_callback_data("resume", task_id, 0),
                     "message": {
                         "message_id": 1054,
                         "chat": {"id": chat_id, "type": "private"}
@@ -8108,7 +10305,9 @@ mod tests {
                 chat_id: 123_456_789,
                 job_id: 17,
                 task_id: task_id.to_string(),
+                generation: 0,
                 job_label: "Bilibili download",
+                is_collection: true,
                 status_message_id: Some(700),
                 update_interval: Duration::from_secs(60),
             },
@@ -8137,33 +10336,43 @@ mod tests {
         });
         drop(progress);
 
-        tokio_timeout(Duration::from_secs(5), progress_task)
+        let delivery = tokio_timeout(Duration::from_secs(5), progress_task)
             .await
             .expect("collection progress forwarding should finish within timeout")
-            .expect("collection progress forwarding task should not panic");
+            .expect("collection progress forwarding task should not panic")
+            .expect("collection tracker should be returned");
+        finalize_collection_messages(
+            ProgressDeliveryContext {
+                telegram: &telegram,
+                queue: &queue,
+                task_id,
+                generation: 0,
+                chat_id: 123_456_789,
+                job_id: 17,
+                job_label: "Bilibili download",
+            },
+            delivery,
+            "Failed job #17: Bilibili download\nsimulated failure".to_string(),
+            CollectionFinalOutcome::Failed,
+        )
+        .await;
 
         let lifecycle_requests = take_fake_telegram_requests(&mut requests);
-        let lifecycle_methods = lifecycle_requests
-            .iter()
-            .map(|request| request.method.as_str())
-            .collect::<Vec<_>>();
         assert_eq!(
-            lifecycle_methods,
-            vec![
-                "sendMessage",
-                "editMessageText",
-                "sendMessage",
-                "editMessageText",
-                "editMessageText",
-                "editMessageText",
-                "sendMessage",
-                "editMessageText",
-                "editMessageText",
-                "editMessageText",
-            ]
+            lifecycle_requests
+                .iter()
+                .filter(|request| request.method == "sendMessage")
+                .count(),
+            3,
+            "the run edits its existing main message and sends one status per selected entry"
         );
 
-        let details_request = &lifecycle_requests[0];
+        let details_request = lifecycle_requests
+            .iter()
+            .find(|request| {
+                request.method == "editMessageText" && !request.body["reply_markup"].is_null()
+            })
+            .expect("resolved details should be folded into the main message");
         let details_text = details_request.body["text"]
             .as_str()
             .expect("collection details should include text");
@@ -8178,40 +10387,38 @@ mod tests {
             .expect("collection next callback should parse");
         assert_eq!(next_callback.page, 1);
 
-        assert!(
-            lifecycle_requests[1].body["text"]
-                .as_str()
-                .expect("resolved overview should include text")
-                .contains("Resolved collection:")
-        );
-        assert!(
-            lifecycle_requests[4].body["text"]
-                .as_str()
-                .expect("completed entry should include text")
-                .starts_with("Downloaded collection entry job #17: Bilibili download")
-        );
-        assert_eq!(
-            lifecycle_requests[4].body["message_id"].as_i64(),
-            Some(1_001)
-        );
-        assert!(
-            lifecycle_requests[8].body["text"]
-                .as_str()
-                .expect("failed entry should include text")
-                .starts_with("Failed collection entry job #17: Bilibili download")
-        );
-        assert_eq!(
-            lifecycle_requests[8].body["message_id"].as_i64(),
-            Some(1_002)
-        );
-        let failed_overview = lifecycle_requests[9].body["text"]
-            .as_str()
-            .expect("failed overview should include text");
-        assert!(
-            failed_overview
-                .contains("Collection download failed; see final job status for details."),
-            "failed overview did not preserve the lifecycle activity: {failed_overview}"
-        );
+        assert_eq!(details_request.body["message_id"].as_i64(), Some(700));
+        let entry_one_status_id = lifecycle_requests
+            .iter()
+            .find(|request| {
+                request.method == "sendMessage"
+                    && request.body["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Entry: 1/6"))
+            })
+            .map(|_| 1_001_i64)
+            .expect("first selected entry should have a status message");
+        assert!(lifecycle_requests.iter().any(|request| {
+            request.method == "editMessageText"
+                && request.body["message_id"].as_i64() == Some(entry_one_status_id)
+                && request.body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Processing collection entry job #17"))
+        }));
+        assert!(lifecycle_requests.iter().any(|request| {
+            request.method == "editMessageText"
+                && request.body["message_id"].as_i64() == Some(entry_one_status_id)
+                && request.body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Failed collection entry job #17"))
+        }));
+        assert!(lifecycle_requests.iter().any(|request| {
+            request.method == "editMessageText"
+                && request.body["message_id"].as_i64() == Some(700)
+                && request.body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Failed job #17"))
+        }));
 
         handle_callback_query(
             BotContext {
@@ -8229,7 +10436,7 @@ mod tests {
                 id: "next-page".to_string(),
                 data: Some(next_callback_data),
                 message: Some(crate::telegram::Message {
-                    message_id: 1_000,
+                    message_id: 700,
                     chat: crate::telegram::Chat {
                         id: 123_456_789,
                         kind: Some("private".to_string()),
@@ -8249,10 +10456,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["editMessageText", "answerCallbackQuery"]
         );
-        assert_eq!(
-            callback_requests[0].body["message_id"].as_i64(),
-            Some(1_000)
-        );
+        assert_eq!(callback_requests[0].body["message_id"].as_i64(), Some(700));
         assert!(
             callback_requests[0].body["text"]
                 .as_str()
@@ -8803,6 +11007,7 @@ mod tests {
             chat_id: 1,
             job_id,
             task_id: format!("task-{job_id}"),
+            generation: 0,
             job: JobRequest::Youtube {
                 url: format!("https://youtu.be/{job_id}"),
             },
@@ -9162,4 +11367,6 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!("telegram-video-downloader-{label}-{unique}"))
     }
+
+    include!("collection_message_tests.rs");
 }
