@@ -9177,7 +9177,7 @@ fn collect_file_sizes_recursive(root: &Path, files: &mut BTreeMap<PathBuf, u64>)
     Ok(())
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
     const GIB: f64 = MIB * 1024.0;
