@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-02
 updated: 2026-10-02
 branch: codex/fix-published-output-verification
-pr:
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/23
 supersedes: []
 superseded_by:
 ---
