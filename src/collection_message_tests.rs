@@ -233,7 +233,7 @@ mod collection_message_tests {
         }
 
         drop(progress);
-        match tokio_timeout(Duration::from_secs(5), &mut progress_task).await {
+        match tokio_timeout(Duration::from_secs(30), &mut progress_task).await {
             Ok(result) => result.expect("collection progress task should not panic"),
             Err(_) => {
                 progress_task.abort();

@@ -565,7 +565,7 @@ fn is_bilibili_entry_identity(id: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StagedPrimaryMediaKind {
+pub(crate) enum StagedPrimaryMediaKind {
     Video,
     VideoOrAudio,
 }
@@ -5902,6 +5902,7 @@ async fn run_staged_video_job(
     guard.begin_operation();
     let final_dir = config.downloads.video_dir.clone();
     let primary_media_kind = staged_primary_media_kind(config, job)?;
+    let artifact_only = bilibili_downloads_artifacts_only(config, job)?;
     let root = guard.root().clone();
     let staging = create_video_staging_dir(&root)?;
     let staging_dir = staging.path().to_path_buf();
@@ -5946,7 +5947,44 @@ async fn run_staged_video_job(
             .await
             {
                 Ok(BilibiliWorkerOutcome::Completed(report)) => Ok(report),
-                Ok(BilibiliWorkerOutcome::AlreadyComplete(report)) => {
+                Ok(BilibiliWorkerOutcome::AlreadyComplete(mut report)) => {
+                    let report_references_staging =
+                        match validate_already_complete_primary_media_paths(
+                            &root,
+                            &staging_dir,
+                            &report.primary_media_paths,
+                            primary_media_kind,
+                            !artifact_only,
+                        ) {
+                            Ok(references_staging) => references_staging,
+                            Err(err) => {
+                                staging.preserve_for_recovery();
+                                return Err(err.context(
+                                    "failed to validate already-complete Bilibili media paths",
+                                ));
+                            }
+                        };
+                    if report_references_staging {
+                        staging.preserve_for_recovery();
+                        return Err(anyhow!(
+                            "already-complete Bilibili report referenced active staging media; staging was retained"
+                        ));
+                    }
+                    report.primary_media_paths = match reconstruct_published_primary_media_paths(
+                        &root,
+                        &staging_dir,
+                        &BTreeMap::new(),
+                        &report.primary_media_paths,
+                        primary_media_kind,
+                    ) {
+                        Ok(paths) => paths,
+                        Err(err) => {
+                            staging.preserve_for_recovery();
+                            return Err(
+                                err.context("failed to validate already-complete Bilibili outputs")
+                            );
+                        }
+                    };
                     if let Err(err) = staging.discard_incomplete() {
                         return Err(err.context(
                             "Bilibili collection was already complete but its empty staging directory could not be discarded",
@@ -6030,7 +6068,6 @@ async fn run_staged_video_job(
         .filter(|path| is_primary_media_file(path, primary_media_kind))
         .cloned()
         .collect::<Vec<_>>();
-    let artifact_only = bilibili_downloads_artifacts_only(config, job)?;
     if staged_media.is_empty() && !artifact_only {
         bail!(
             "staged video download finished but no primary media files were found in {}",
@@ -6074,18 +6111,21 @@ async fn run_staged_video_job(
         root: &root,
         staging: Some(&staging),
     };
-    let moved_files = if staged_media.is_empty() && artifact_only {
-        move_staged_artifact_files_with_root(
-            move_context,
-            &staging_dir,
-            &final_dir,
-            &staged_files,
-            action,
-            duplicate,
-            primary_media_kind,
+    let (moved_files, moved_source_destinations) = if staged_media.is_empty() && artifact_only {
+        (
+            move_staged_artifact_files_with_root(
+                move_context,
+                &staging_dir,
+                &final_dir,
+                &staged_files,
+                action,
+                duplicate,
+                primary_media_kind,
+            ),
+            BTreeMap::new(),
         )
     } else {
-        move_staged_video_files_with_root(
+        let publication = move_staged_video_files_with_root_and_sources(
             move_context,
             &staging_dir,
             &final_dir,
@@ -6094,12 +6134,25 @@ async fn run_staged_video_job(
             duplicate,
             primary_media_kind,
         )
-    }
-    .with_context(|| format!("failed to move staged files from {}", staging_dir.display()))?;
+        .with_context(|| format!("failed to move staged files from {}", staging_dir.display()))?;
+        (
+            Ok(publication.primary_destinations),
+            publication.primary_source_destinations,
+        )
+    };
+    let moved_files = moved_files
+        .with_context(|| format!("failed to move staged files from {}", staging_dir.display()))?;
     send_progress(
         progress.as_ref(),
         format!("staging: moved {} file(s)", moved_files.len()),
     );
+    let primary_media_paths = reconstruct_published_primary_media_paths(
+        &root,
+        &staging_dir,
+        &moved_source_destinations,
+        &report.primary_media_paths,
+        primary_media_kind,
+    )?;
 
     let saved_location = if moved_files.len() == 1 {
         moved_files[0].display().to_string()
@@ -6120,29 +6173,164 @@ async fn run_staged_video_job(
     let report = JobReport {
         saved_location,
         details,
-        primary_media_paths: moved_files
-            .iter()
-            .filter(|path| is_primary_media_file(path, primary_media_kind))
-            .cloned()
-            .chain(
-                report
-                    .primary_media_paths
-                    .iter()
-                    .filter(|path| {
-                        path.starts_with(&final_dir)
-                            && is_primary_media_file(path, primary_media_kind)
-                    })
-                    .cloned(),
-            )
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect(),
+        primary_media_paths,
     };
     staging
         .finish()
         .context("failed to durably finalize the staged video job")?;
     guard.mark_operation_clean();
     Ok(report)
+}
+
+pub(crate) fn reconstruct_published_primary_media_paths(
+    root: &RootedFs,
+    staging_dir: &Path,
+    moved_source_destinations: &BTreeMap<PathBuf, PathBuf>,
+    worker_report_paths: &[PathBuf],
+    primary_media_kind: StagedPrimaryMediaKind,
+) -> Result<Vec<PathBuf>> {
+    root.validate_configured_root()?;
+    let staging_path = logical_download_root_path(root, staging_dir)?
+        .context("active staging directory is outside its configured download root")?;
+    if staging_path == root.logical_root_path() {
+        bail!("active staging directory resolves to the configured download root");
+    }
+
+    let mut published_paths = BTreeSet::new();
+    let mut published_destinations_by_source = BTreeMap::new();
+    for (source, destination) in moved_source_destinations {
+        if !is_primary_media_file(source, primary_media_kind)
+            || !is_primary_media_file(destination, primary_media_kind)
+        {
+            bail!("staged primary-media publication map contains a non-primary path");
+        }
+        let source_path = logical_download_root_path(root, source)?
+            .context("published media source is outside its configured download root")?;
+        if !source_path.starts_with(&staging_path) || source_path == staging_path {
+            bail!("published primary-media source is outside active staging");
+        }
+        let published_path = logical_download_root_path(root, destination)?
+            .context("published media path is outside its configured download root")?;
+        if published_path.starts_with(&staging_path) {
+            bail!("published media destination remains inside active staging");
+        }
+        validate_published_primary_media_path(root, &published_path)?;
+        if published_destinations_by_source
+            .insert(source_path, published_path.clone())
+            .is_some()
+        {
+            bail!("staged primary-media source was published more than once");
+        }
+        published_paths.insert(published_path);
+    }
+
+    for path in worker_report_paths
+        .iter()
+        .filter(|path| is_primary_media_file(path, primary_media_kind))
+    {
+        let Some(published_path) = logical_download_root_path(root, path)? else {
+            // Preserve the prior behavior for worker-reported paths outside this download root.
+            continue;
+        };
+        if published_path.starts_with(&staging_path) {
+            let destination = published_destinations_by_source
+                .get(&published_path)
+                .with_context(|| {
+                    format!(
+                        "reported primary media was not successfully published from active staging: {}",
+                        path.display()
+                    )
+                })?;
+            published_paths.insert(destination.clone());
+            continue;
+        }
+        validate_published_primary_media_path(root, &published_path)?;
+        published_paths.insert(published_path);
+    }
+
+    root.validate_configured_root()?;
+    Ok(published_paths.into_iter().collect())
+}
+
+fn validate_already_complete_primary_media_paths(
+    root: &RootedFs,
+    staging_dir: &Path,
+    worker_report_paths: &[PathBuf],
+    primary_media_kind: StagedPrimaryMediaKind,
+    require_primary_media: bool,
+) -> Result<bool> {
+    root.validate_configured_root()?;
+    let staging_path = logical_download_root_path(root, staging_dir)?
+        .context("active staging directory is outside its configured download root")?;
+    let mut primary_media_count = 0usize;
+    for path in worker_report_paths
+        .iter()
+        .filter(|path| is_primary_media_file(path, primary_media_kind))
+    {
+        primary_media_count += 1;
+        let report_path = logical_download_root_path(root, path)?.context(
+            "already-complete primary media path is outside its configured download root",
+        )?;
+        if report_path.starts_with(&staging_path) {
+            return Ok(true);
+        }
+    }
+    if require_primary_media && primary_media_count == 0 {
+        bail!("already-complete report contains no primary media for a media download");
+    }
+    Ok(false)
+}
+
+fn logical_download_root_path(root: &RootedFs, path: &Path) -> Result<Option<PathBuf>> {
+    let relative = if let Ok(relative) = path.strip_prefix(root.logical_root_path()) {
+        relative
+    } else if let Ok(relative) = path.strip_prefix(root.root_path()) {
+        relative
+    } else {
+        return Ok(None);
+    };
+
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => normalized.push(name),
+            _ => bail!("download path contains an invalid root-relative component"),
+        }
+    }
+    Ok(Some(root.logical_root_path().join(normalized)))
+}
+
+fn validate_published_primary_media_path(root: &RootedFs, path: &Path) -> Result<()> {
+    root.validate_configured_root()?;
+    let file = root.open_bound_file(path)?.with_context(|| {
+        format!(
+            "published primary media is missing while rebuilding the final report: {}",
+            path.display()
+        )
+    })?;
+    let identity = file.identity();
+    if !identity.is_file() {
+        bail!(
+            "published primary media is not a regular file while rebuilding the final report: {}",
+            path.display()
+        );
+    }
+    // Protect the selected filesystem object and configured-root access policy here. Content
+    // stability is checked later by the queue's descriptor-bound hash operation.
+    let current = root.entry_identity(path)?;
+    if !current.is_some_and(|current| {
+        current.is_file()
+            && current.device() == identity.device()
+            && current.inode() == identity.inode()
+    }) {
+        bail!(
+            "published primary media object changed while rebuilding the final report: {}",
+            path.display()
+        );
+    }
+    root.validate_configured_root()?;
+    Ok(())
 }
 
 fn retain_or_discard_failed_staged_video_download(
@@ -11072,6 +11260,12 @@ struct MovePlanResult {
 }
 
 #[derive(Debug)]
+struct StagedVideoMoveResult {
+    primary_destinations: Vec<PathBuf>,
+    primary_source_destinations: BTreeMap<PathBuf, PathBuf>,
+}
+
+#[derive(Debug)]
 struct FileBackup {
     original: PathBuf,
     backup: PathBuf,
@@ -12517,6 +12711,27 @@ fn move_staged_video_files_with_root(
     duplicate: &VideoDuplicate,
     primary_media_kind: StagedPrimaryMediaKind,
 ) -> Result<Vec<PathBuf>> {
+    Ok(move_staged_video_files_with_root_and_sources(
+        context,
+        staging_dir,
+        final_dir,
+        staged_files,
+        action,
+        duplicate,
+        primary_media_kind,
+    )?
+    .primary_destinations)
+}
+
+fn move_staged_video_files_with_root_and_sources(
+    context: MoveExecutionContext<'_>,
+    staging_dir: &Path,
+    final_dir: &Path,
+    staged_files: &[PathBuf],
+    action: VideoDuplicateAction,
+    duplicate: &VideoDuplicate,
+    primary_media_kind: StagedPrimaryMediaKind,
+) -> Result<StagedVideoMoveResult> {
     let root = context.root;
     let staged_media_count = staged_files
         .iter()
@@ -12553,6 +12768,12 @@ fn move_staged_video_files_with_root(
     );
     match move_result {
         Ok(moved) => {
+            let primary_source_destinations = moved
+                .moved
+                .iter()
+                .filter(|file| is_primary_media_file(&file.source, primary_media_kind))
+                .map(|file| (file.source.clone(), file.destination.clone()))
+                .collect();
             if let Some(acquisition) = acquisition {
                 let committed_target = moved
                     .moved_videos
@@ -12566,7 +12787,10 @@ fn move_staged_video_files_with_root(
                 )
                 .context("video overwrite succeeded but old-file cleanup failed")?;
             }
-            Ok(moved.moved_videos)
+            Ok(StagedVideoMoveResult {
+                primary_destinations: moved.moved_videos,
+                primary_source_destinations,
+            })
         }
         Err(err) => Err(finish_failed_staged_move(err, acquisition, context.staging)),
     }
@@ -16493,6 +16717,185 @@ mod tests {
             report.iter().any(|line| {
                 line.contains("Rolled forward interrupted staged video publication")
             })
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn published_media_report_excludes_nested_staging_paths_and_hashes_final_outputs() {
+        let final_dir = temp_test_dir("published-media-report-nested-staging");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("completed staging marker should persist");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_video = staging_dir.join("Episode.mkv");
+        fs::write(&staged_video, "new-video").expect("staged video should write");
+
+        let existing_dir = final_dir.join("collection").join("existing");
+        fs::create_dir_all(&existing_dir).expect("existing collection path should create");
+        let existing_video = existing_dir.join("Episode.mkv");
+        fs::write(&existing_video, "already-published").expect("existing video should write");
+
+        let duplicate = VideoDuplicate {
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: "cid123".to_string(),
+            },
+            existing_videos: Vec::new(),
+        };
+        let publication = move_staged_video_files_with_root_and_sources(
+            MoveExecutionContext {
+                root: &root,
+                staging: Some(&staging),
+            },
+            &staging_dir,
+            &final_dir,
+            std::slice::from_ref(&staged_video),
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("staged media should publish through the protected move path");
+        assert_eq!(publication.primary_destinations.len(), 1);
+        let primary_media_paths = reconstruct_published_primary_media_paths(
+            &root,
+            &staging_dir,
+            &publication.primary_source_destinations,
+            &[staged_video.clone(), existing_video.clone()],
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("report should contain only verified final media paths");
+
+        assert!(!primary_media_paths.contains(&staged_video));
+        assert!(primary_media_paths.contains(&publication.primary_destinations[0]));
+        assert!(primary_media_paths.contains(&existing_video));
+
+        staging
+            .finish()
+            .expect("published staging directory should be removed");
+        assert!(!staging_dir.exists());
+        let hashes =
+            crate::queue::hash_primary_media(root.logical_root_path(), &primary_media_paths)
+                .expect("final output paths should hash after staging cleanup");
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains_key(&publication.primary_destinations[0].display().to_string()));
+        assert!(hashes.contains_key(&existing_video.display().to_string()));
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn published_media_report_rejects_unmoved_staging_source() {
+        let final_dir = temp_test_dir("published-media-report-unmoved-source");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("attempt");
+        let staged_source = staging_dir.join("Episode.mkv");
+        let published = final_dir.join("Episode.mkv");
+        fs::write(&published, "some other published media").expect("published media should write");
+
+        let error = reconstruct_published_primary_media_paths(
+            &root,
+            &staging_dir,
+            &BTreeMap::new(),
+            &[staged_source],
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect_err("staging source without a successful move must fail report reconstruction");
+
+        assert!(format!("{error:#}").contains("not successfully published"));
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn already_complete_media_report_rejects_staging_foreign_and_empty_paths() {
+        let final_dir = temp_test_dir("already-complete-media-path-validation");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let staging_dir = final_dir.join(VIDEO_STAGING_DIR_NAME).join("attempt");
+        let staged_source = staging_dir.join("Episode.mkv");
+
+        assert!(
+            validate_already_complete_primary_media_paths(
+                &root,
+                &staging_dir,
+                std::slice::from_ref(&staged_source),
+                StagedPrimaryMediaKind::Video,
+                true,
+            )
+            .expect("active staging should be classified")
+        );
+
+        let foreign_path = final_dir
+            .parent()
+            .expect("temporary output root should have a parent")
+            .join("outside-output.mkv");
+        let foreign_error = validate_already_complete_primary_media_paths(
+            &root,
+            &staging_dir,
+            &[foreign_path],
+            StagedPrimaryMediaKind::Video,
+            true,
+        )
+        .expect_err("already-complete reports must reject foreign media paths");
+        assert!(format!("{foreign_error:#}").contains("outside its configured download root"));
+
+        let empty_error = validate_already_complete_primary_media_paths(
+            &root,
+            &staging_dir,
+            &[],
+            StagedPrimaryMediaKind::Video,
+            true,
+        )
+        .expect_err("media downloads must reject empty already-complete reports");
+        assert!(format!("{empty_error:#}").contains("contains no primary media"));
+
+        assert!(
+            !validate_already_complete_primary_media_paths(
+                &root,
+                &staging_dir,
+                &[],
+                StagedPrimaryMediaKind::Video,
+                false,
+            )
+            .expect("artifact-only completion may have no primary media")
+        );
+        let _ = fs::remove_dir_all(final_dir);
+    }
+
+    #[test]
+    fn published_media_report_rejects_missing_final_file_without_creating_parent() {
+        let final_dir = temp_test_dir("published-media-report-missing-final");
+        let root = RootedFs::new(&final_dir).expect("output root should bind");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("completed staging marker should persist");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_video = staging_dir.join("Episode.mkv");
+        fs::write(&staged_video, "new-video").expect("staged video should write");
+        let missing_parent = final_dir.join("missing").join("nested");
+        let missing_final = missing_parent.join("Episode.mkv");
+
+        let _error = reconstruct_published_primary_media_paths(
+            &root,
+            &staging_dir,
+            &BTreeMap::new(),
+            &[missing_final],
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect_err("missing reported final media must fail report reconstruction");
+
+        assert!(
+            !missing_parent.exists(),
+            "verification must not create output paths"
+        );
+        drop(staging);
+        assert!(
+            staging_dir.exists(),
+            "a failed publication report must leave recoverable staging intact"
         );
         let _ = fs::remove_dir_all(final_dir);
     }

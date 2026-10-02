@@ -9332,6 +9332,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_staging_paths_are_excluded_before_published_completion_e2e() {
+        let queue_root = temp_main_test_dir("nested-staging-published-completion-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let media_root = crate::safe_fs::RootedFs::new(&config.downloads.video_dir)
+            .expect("video root should bind");
+        let published = config.downloads.video_dir.join("published-output.mp4");
+        fs::write(&published, b"new published media").expect("published output should write");
+        let existing = config
+            .downloads
+            .video_dir
+            .join("collection")
+            .join("existing-output.mp4");
+        fs::create_dir_all(
+            existing
+                .parent()
+                .expect("existing output should have a parent"),
+        )
+        .expect("existing collection directory should create");
+        fs::write(&existing, b"already published media").expect("existing output should write");
+        let staging_dir = config
+            .downloads
+            .video_dir
+            .join(".telegram-video-downloader-staging")
+            .join("job-test-attempt");
+        let staging_source = staging_dir.join("new-output.mp4");
+        let moved_source_destinations =
+            BTreeMap::from([(staging_source.clone(), published.clone())]);
+        let media_paths = crate::downloader::reconstruct_published_primary_media_paths(
+            &media_root,
+            &staging_dir,
+            &moved_source_destinations,
+            &[staging_source.clone(), existing.clone()],
+            crate::downloader::StagedPrimaryMediaKind::Video,
+        )
+        .expect("production report reconstruction should retain only final media paths");
+        assert!(!media_paths.contains(&staging_source));
+        assert!(media_paths.contains(&published));
+        assert!(media_paths.contains(&existing));
+        let hashes = hash_primary_media(&config.downloads.video_dir, &media_paths)
+            .expect("all reported final media should hash");
+        assert_eq!(hashes.len(), 2);
+        assert!(
+            hashes
+                .keys()
+                .all(|path| !PathBuf::from(path).starts_with(&staging_dir))
+        );
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
+            .expect("task queue should open");
+        let task_id = "nested-staging-published-completion-e2e";
+        let chat_id = 123_456_789;
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    task_id.to_string(),
+                    955,
+                    1055,
+                    chat_id,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(task_id, TaskStatus::Running, None)
+            .expect("task should start");
+        queue
+            .begin_verification(task_id)
+            .expect("verification should begin")
+            .expect("task should remain present");
+        file_provider.fail_write_after(1, "simulated completion record File Provider failure");
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let completed = complete_published_task_with_retry(
+            &telegram,
+            &queue,
+            PublishedTaskCompletion {
+                chat_id,
+                task_id,
+                generation: 0,
+                is_collection: false,
+                saved_location: &published.display().to_string(),
+                media_paths: &media_paths,
+                hashes: hashes.clone(),
+                collection_status_message_id: None,
+            },
+            Duration::ZERO,
+        )
+        .await
+        .expect("completion persistence should retry after a transient failure")
+        .expect("current task generation should complete");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(completed.primary_media_hashes, hashes);
+        assert!(
+            completed
+                .primary_media_hashes
+                .keys()
+                .all(|path| !PathBuf::from(path).starts_with(&staging_dir))
+        );
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        let notices = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1, "a retry sequence should notify only once");
+        assert!(
+            notices[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("published its files"))
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
     async fn completed_collection_with_sidecar_relocation_error_stays_verified_e2e() {
         let task_id = "completed-collection-sidecar-relocation-error";
         let job_id = 961;
