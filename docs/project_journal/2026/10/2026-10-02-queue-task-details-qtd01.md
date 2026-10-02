@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-02
 updated: 2026-10-02
 branch: codex/queue-task-details
-pr:
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/24
 supersedes: []
 superseded_by:
 ---
