@@ -33,14 +33,14 @@ use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
     BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
     JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, VideoDuplicate,
-    VideoDuplicateAction, find_video_duplicate_with_probe, inspect_job_plan, job_progress_channel,
-    recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
+    VideoDuplicateAction, find_video_duplicate_with_probe, human_bytes, inspect_job_plan,
+    job_progress_channel, recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both, sync_bilibili_rust_credentials,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 use crate::queue::{
-    QueueManager, RestartSummary, TaskRecord, TaskStatus, hash_primary_media,
-    sanitize_job_for_storage,
+    PlanValidationSnapshot, QueueManager, RestartSummary, TaskRecord, TaskStatus,
+    hash_primary_media, sanitize_job_for_storage,
 };
 use crate::redaction::redact_sensitive_text;
 use crate::router::{
@@ -1307,61 +1307,51 @@ fn render_queue_page(
         ));
     }
     let mut lines = vec![format!("{title} (page {}/{pages}):", command.page + 1)];
+    lines.push(
+        "Size is the expected total for selected streams; final files may differ.".to_string(),
+    );
     let mut rows = Vec::new();
-    for record in records {
+    for (page_index, record) in records.into_iter().enumerate() {
+        let task_number = command
+            .page
+            .saturating_mul(QUEUE_TASKS_PER_PAGE)
+            .saturating_add(page_index + 1);
+        let display = queue_task_display(&record);
+        let collection = queue_task_collection_label(&record);
+        let mut task_context = vec![
+            format!("#{task_number}"),
+            task_status_label(record.status).to_string(),
+        ];
+        if let Some(collection) = collection {
+            task_context.push(collection);
+        }
+        if let Some(source) = display.title_source {
+            task_context.push(source.to_string());
+        }
         lines.push(format!(
-            "\n{} · {} · {} · media {}/{} done, {} failed\n{}",
-            record.id,
-            task_status_label(record.status),
-            record.job.label(),
-            record.media_entries_completed,
-            record.media_entries_total,
-            record.media_entries_failed,
-            truncate_utf16_units(&record.original_url, QUEUE_URL_PREVIEW_UNITS),
+            "\n{}\nTitle: {}\n{} · {} · media {}/{}, {} failed · ID {}\nURL: {}",
+            task_context.join(" · "),
+            truncate_utf16_units(&display.title, QUEUE_TASK_TITLE_UNITS),
+            truncate_utf16_units(&display.quality, QUEUE_TASK_QUALITY_UNITS),
+            truncate_utf16_units(&display.size, QUEUE_TASK_SIZE_UNITS),
+            truncate_queue_count(record.media_entries_completed),
+            truncate_queue_count(record.media_entries_total),
+            truncate_queue_count(record.media_entries_failed),
+            truncate_utf16_units(
+                &sanitize_queue_display_text(&record.id),
+                QUEUE_TASK_ID_PREVIEW_UNITS,
+            ),
+            truncate_utf16_units(
+                &sanitize_queue_display_text(&record.original_url),
+                QUEUE_URL_PREVIEW_UNITS,
+            ),
         ));
         if command.history {
             continue;
         }
-        let mut buttons = Vec::new();
-        match record.status {
-            TaskStatus::Failed => buttons.push((
-                "Retry failed".to_string(),
-                queue_callback_data("retry", &record.id, record.generation),
-            )),
-            TaskStatus::Received | TaskStatus::AwaitingSelection | TaskStatus::Interrupted => {
-                buttons.push((
-                    "Resume".to_string(),
-                    queue_callback_data("resume", &record.id, record.generation),
-                ))
-            }
-            TaskStatus::AwaitingConfirmation => buttons.push((
-                "Confirm updated plan".to_string(),
-                queue_callback_data("confirm", &record.id, record.generation),
-            )),
-            TaskStatus::AwaitingDuplicateChoice => buttons.push((
-                "Resume".to_string(),
-                queue_callback_data("resume", &record.id, record.generation),
-            )),
-            TaskStatus::Preparing => {}
-            TaskStatus::Queued | TaskStatus::Running | TaskStatus::Verifying => {}
-            TaskStatus::Cancelled | TaskStatus::Completed => {}
-        }
-        if record.status.is_unfinished() && record.status != TaskStatus::Verifying {
-            buttons.push((
-                "Cancel".to_string(),
-                queue_callback_data("cancel", &record.id, record.generation),
-            ));
-        }
+        let buttons = queue_task_buttons(&record, task_number, &display);
         if !buttons.is_empty() {
-            rows.push(
-                buttons
-                    .into_iter()
-                    .map(|(text, callback_data)| InlineKeyboardButton {
-                        text,
-                        callback_data,
-                    })
-                    .collect(),
-            );
+            rows.push(buttons);
         }
     }
     if pages > 1 {
@@ -1394,7 +1384,349 @@ fn render_queue_page(
 }
 
 const QUEUE_PAGE_MAX_TEXT_UNITS: usize = 3_500;
-const QUEUE_URL_PREVIEW_UNITS: usize = 128;
+const QUEUE_TASKS_PER_PAGE: usize = 10;
+const QUEUE_URL_PREVIEW_UNITS: usize = 48;
+const QUEUE_TASK_TITLE_UNITS: usize = 64;
+const QUEUE_TASK_QUALITY_UNITS: usize = 22;
+const QUEUE_TASK_SIZE_UNITS: usize = 20;
+const QUEUE_TASK_ID_PREVIEW_UNITS: usize = 24;
+const QUEUE_COUNT_PREVIEW_UNITS: usize = 12;
+const QUEUE_BUTTON_LABEL_MAX_UNITS: usize = 64;
+const QUEUE_BUTTON_QUALITY_UNITS: usize = 12;
+const QUEUE_BUTTON_SIZE_UNITS: usize = 16;
+
+struct QueueTaskDisplay {
+    title: String,
+    title_source: Option<&'static str>,
+    quality: String,
+    button_quality: String,
+    size: String,
+    button_size: String,
+}
+
+fn queue_task_display(record: &TaskRecord) -> QueueTaskDisplay {
+    let (plan, title_source) = if record.status == TaskStatus::AwaitingConfirmation {
+        record
+            .proposed_plan
+            .as_ref()
+            .map(|plan| (Some(plan), Some("Updated plan")))
+            .unwrap_or_else(|| (record.plan.as_ref(), None))
+    } else if let Some(plan) = record.plan.as_ref() {
+        (Some(plan), None)
+    } else if let Some(plan) = record.proposed_plan.as_ref() {
+        (Some(plan), Some("Proposed plan"))
+    } else {
+        (None, None)
+    };
+
+    let title = plan
+        .and_then(|plan| plan.title.as_deref())
+        .map(sanitize_queue_display_text)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| record.job.label().to_string());
+    let quality = plan
+        .map(queue_plan_quality)
+        .unwrap_or_else(|| queue_unknown_quality(&record.job));
+    let (size, button_size) = plan
+        .map(queue_plan_size)
+        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+    let button_quality = if quality.starts_with("mixed (") {
+        "mixed".to_string()
+    } else {
+        quality.clone()
+    };
+
+    QueueTaskDisplay {
+        title,
+        title_source,
+        quality,
+        button_quality,
+        size,
+        button_size,
+    }
+}
+
+fn queue_task_collection_label(record: &TaskRecord) -> Option<String> {
+    if !is_bilibili_ugc_collection_job(&record.job) {
+        return None;
+    }
+    let plan = if record.status == TaskStatus::AwaitingConfirmation {
+        record.proposed_plan.as_ref().or(record.plan.as_ref())
+    } else {
+        record.plan.as_ref().or(record.proposed_plan.as_ref())
+    };
+    let count = if record.media_entries_total > 1 {
+        Some(record.media_entries_total)
+    } else {
+        plan.map(|plan| plan.stable_media_ids.len())
+            .filter(|count| *count > 0)
+    };
+    Some(match count {
+        Some(1) => "Collection · 1 entry".to_string(),
+        Some(count) => format!("Collection · {count} entries"),
+        None => "Collection · entries pending".to_string(),
+    })
+}
+
+fn queue_task_buttons(
+    record: &TaskRecord,
+    task_number: usize,
+    display: &QueueTaskDisplay,
+) -> Vec<InlineKeyboardButton> {
+    let mut buttons = Vec::new();
+    let task_action = match record.status {
+        TaskStatus::Failed => Some(("Retry", "retry")),
+        TaskStatus::Received
+        | TaskStatus::AwaitingSelection
+        | TaskStatus::Interrupted
+        | TaskStatus::AwaitingDuplicateChoice => Some(("Resume", "resume")),
+        TaskStatus::AwaitingConfirmation => Some(("Confirm", "confirm")),
+        TaskStatus::Preparing
+        | TaskStatus::Queued
+        | TaskStatus::Running
+        | TaskStatus::Verifying
+        | TaskStatus::Cancelled
+        | TaskStatus::Completed => None,
+    };
+    if let Some((action, callback_action)) = task_action {
+        buttons.push(queue_task_action_button(
+            record,
+            task_number,
+            display,
+            action,
+            callback_action,
+        ));
+    }
+    if record.status.is_unfinished() && record.status != TaskStatus::Verifying {
+        buttons.push(queue_task_action_button(
+            record,
+            task_number,
+            display,
+            "Cancel",
+            "cancel",
+        ));
+    }
+    buttons
+}
+
+fn queue_task_action_button(
+    record: &TaskRecord,
+    task_number: usize,
+    display: &QueueTaskDisplay,
+    action: &'static str,
+    callback_action: &'static str,
+) -> InlineKeyboardButton {
+    InlineKeyboardButton {
+        text: queue_button_label(action, task_number, display),
+        callback_data: queue_callback_data(callback_action, &record.id, record.generation),
+    }
+}
+
+fn queue_button_label(action: &str, task_number: usize, display: &QueueTaskDisplay) -> String {
+    let prefix = format!("{action} · #{task_number} · ");
+    let quality = truncate_utf16_units(&display.button_quality, QUEUE_BUTTON_QUALITY_UNITS);
+    let size = truncate_utf16_units(&display.button_size, QUEUE_BUTTON_SIZE_UNITS);
+    let details = format!(" · {quality} · {size}");
+    let title_budget = QUEUE_BUTTON_LABEL_MAX_UNITS
+        .saturating_sub(prefix.encode_utf16().count())
+        .saturating_sub(details.encode_utf16().count());
+    format!(
+        "{prefix}{}{details}",
+        truncate_utf16_units(&display.title, title_budget)
+    )
+}
+
+fn sanitize_queue_display_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate_queue_count(count: usize) -> String {
+    truncate_utf16_units(&count.to_string(), QUEUE_COUNT_PREVIEW_UNITS)
+}
+
+fn queue_unknown_quality(job: &JobRequest) -> String {
+    if matches!(job, JobRequest::Pdf { .. }) {
+        "n/a".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn queue_plan_quality(plan: &PlanValidationSnapshot) -> String {
+    let mut selected_ids = Vec::new();
+    for id in &plan.selected_format_ids {
+        if !selected_ids.contains(&id) {
+            selected_ids.push(id);
+        }
+    }
+    let mut resolutions = Vec::new();
+    let mut has_unknown_video_resolution = false;
+    for id in selected_ids {
+        let prefix = format!("{id}:");
+        let encoded_details = plan
+            .resolution_codecs
+            .iter()
+            .filter_map(|encoded| encoded.strip_prefix(&prefix))
+            .collect::<Vec<_>>();
+        let is_bilibili_video = id.contains(":video:");
+        let is_bilibili_audio = id.contains(":audio:");
+        let is_youtube_video = !is_bilibili_audio
+            && encoded_details.iter().any(|details| {
+                let mut fields = details.split(':');
+                let resolution = fields.next().unwrap_or_default();
+                is_queue_resolution(resolution)
+                    || fields
+                        .next()
+                        .is_some_and(|codec| !is_unknown_plan_codec(codec))
+            });
+        if !is_bilibili_video && !is_youtube_video {
+            continue;
+        }
+        if encoded_details.is_empty() {
+            has_unknown_video_resolution = true;
+            continue;
+        }
+        let mut known_for_video = false;
+        for details in encoded_details {
+            let resolution = details.split(':').next().unwrap_or_default().trim();
+            if is_queue_resolution(resolution) {
+                known_for_video = true;
+                if !resolutions.iter().any(|existing| existing == resolution) {
+                    resolutions.push(resolution.to_string());
+                }
+            } else {
+                has_unknown_video_resolution = true;
+            }
+        }
+        if !known_for_video {
+            has_unknown_video_resolution = true;
+        }
+    }
+    if resolutions.is_empty() && has_unknown_video_resolution {
+        return "unknown".to_string();
+    }
+    if resolutions.is_empty() {
+        return "unknown".to_string();
+    }
+    if resolutions.len() == 1 && !has_unknown_video_resolution {
+        return resolutions[0].clone();
+    }
+    let mut listed = resolutions.iter().take(3).cloned().collect::<Vec<_>>();
+    if has_unknown_video_resolution {
+        listed.push("unknown".to_string());
+    }
+    let suffix = if resolutions.len() > 3 {
+        format!(", +{}", resolutions.len() - 3)
+    } else {
+        String::new()
+    };
+    format!("mixed ({}{suffix})", listed.join(", "))
+}
+
+fn is_unknown_plan_codec(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "none" | "unknown"
+    )
+}
+
+fn is_queue_resolution(value: &str) -> bool {
+    if let Some((width, height)) = value.split_once('x') {
+        return is_positive_queue_dimension(width) && is_positive_queue_dimension(height);
+    }
+    value
+        .strip_suffix('p')
+        .is_some_and(is_positive_queue_dimension)
+}
+
+fn is_positive_queue_dimension(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 10
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<u32>().is_ok_and(|dimension| dimension > 0)
+}
+
+fn queue_plan_size(plan: &PlanValidationSnapshot) -> (String, String) {
+    let mut selected_ids = Vec::new();
+    for id in &plan.selected_format_ids {
+        if !selected_ids.contains(&id) {
+            selected_ids.push(id);
+        }
+    }
+    if selected_ids.is_empty() {
+        return ("unknown".to_string(), "unknown".to_string());
+    }
+
+    let mut total_bytes = 0_u64;
+    let mut known_subjects = 0_usize;
+    let mut approximate = false;
+    for id in &selected_ids {
+        let exact = plan
+            .exact_sizes
+            .iter()
+            .filter(|size| size.subject.as_str() == id.as_str())
+            .map(|size| size.bytes)
+            .collect::<Vec<_>>();
+        let (subject_bytes, subject_approximate) = if exact.is_empty() {
+            let approximate_sizes = plan
+                .approximate_sizes
+                .iter()
+                .filter(|size| size.subject.as_str() == id.as_str())
+                .map(|size| size.bytes)
+                .collect::<Vec<_>>();
+            if approximate_sizes.is_empty() {
+                continue;
+            }
+            let max_size = approximate_sizes.iter().copied().max().unwrap_or_default();
+            if approximate_sizes.iter().any(|size| *size != max_size) {
+                continue;
+            }
+            (max_size, true)
+        } else {
+            let max_size = exact.iter().copied().max().unwrap_or_default();
+            if exact.iter().any(|size| *size != max_size) {
+                continue;
+            }
+            (max_size, false)
+        };
+        let Some(sum) = total_bytes.checked_add(subject_bytes) else {
+            return ("unknown".to_string(), "unknown".to_string());
+        };
+        total_bytes = sum;
+        known_subjects += 1;
+        approximate |= subject_approximate;
+    }
+    if known_subjects == 0 {
+        return ("unknown".to_string(), "unknown".to_string());
+    }
+    let incomplete = known_subjects < selected_ids.len();
+    let formatted_bytes = human_bytes(total_bytes);
+    let body = match (incomplete, approximate) {
+        (true, true) => format!("at least about {formatted_bytes}"),
+        (true, false) => format!("at least {formatted_bytes}"),
+        (false, true) => format!("about {formatted_bytes}"),
+        (false, false) => formatted_bytes.clone(),
+    };
+    let button = format!(
+        "{}{}{}",
+        if incomplete { "≥" } else { "" },
+        if approximate { "~" } else { "" },
+        formatted_bytes
+    );
+    (body, button)
+}
 
 fn truncate_utf16_units(text: &str, max_units: usize) -> String {
     if text.encode_utf16().count() <= max_units {
@@ -7827,7 +8159,7 @@ mod tests {
         let initial_queue =
             QueueManager::open_with_file_provider(&config, Arc::clone(&file_provider_trait))
                 .expect("task queue should open");
-        let task = TaskRecord::new(
+        let mut task = TaskRecord::new(
             task_id.to_string(),
             501,
             601,
@@ -7838,6 +8170,25 @@ mod tests {
                 url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
             },
         );
+        task.plan = Some(PlanValidationSnapshot {
+            selected_format_ids: vec!["youtube-video".to_string(), "youtube-audio".to_string()],
+            exact_sizes: vec![crate::queue::PlanSize {
+                subject: "youtube-video".to_string(),
+                bytes: 2 * 1024 * 1024,
+                provenance: "test exact size".to_string(),
+            }],
+            approximate_sizes: vec![crate::queue::PlanSize {
+                subject: "youtube-audio".to_string(),
+                bytes: 512 * 1024,
+                provenance: "test estimate".to_string(),
+            }],
+            resolution_codecs: vec![
+                "youtube-video:1920x1080:avc1:unknown".to_string(),
+                "youtube-audio:unknown:unknown:mp4a".to_string(),
+            ],
+            title: Some("Restart-persistent video title".to_string()),
+            ..PlanValidationSnapshot::default()
+        });
         assert!(
             initial_queue
                 .create(task)
@@ -7996,16 +8347,30 @@ mod tests {
             .expect("active queue page should include text");
         assert!(active_text.contains(task_id));
         assert!(active_text.contains("interrupted"));
+        assert!(active_text.contains("Restart-persistent video title"));
+        assert!(active_text.contains("1920x1080"));
+        assert!(active_text.contains("about 2.5 MiB"));
         let active_buttons = active_page["reply_markup"]["inline_keyboard"][0]
             .as_array()
             .expect("interrupted task should have action buttons");
         let resume_data = queue_callback_data("resume", task_id, 0);
-        assert_eq!(active_buttons[0]["text"].as_str(), Some("Resume"));
+        let resume_label = active_buttons[0]["text"]
+            .as_str()
+            .expect("resume button should include its task details");
+        assert!(resume_label.starts_with("Resume · #1 · "));
+        assert!(resume_label.contains("Restart-persistent"));
+        assert!(resume_label.contains("1920x1080"));
+        assert!(resume_label.contains("~2.5 MiB"));
         assert_eq!(
             active_buttons[0]["callback_data"].as_str(),
             Some(resume_data.as_str())
         );
-        assert_eq!(active_buttons[1]["text"].as_str(), Some("Cancel"));
+        assert!(
+            active_buttons[1]["text"]
+                .as_str()
+                .expect("cancel button should include its task details")
+                .starts_with("Cancel · #1 · ")
+        );
         assert_eq!(
             active_buttons[1]["callback_data"].as_str(),
             Some(cancel_data.as_str())
@@ -8191,21 +8556,29 @@ mod tests {
 
         for ordinal in 0..10 {
             let id = format!("task-queue-size-{ordinal}");
-            assert!(
-                queue
-                    .create(TaskRecord::new(
-                        id,
-                        ordinal,
-                        ordinal,
-                        chat_id,
-                        None,
-                        ordinal as usize,
-                        JobRequest::Youtube {
-                            url: format!("https://example.invalid/{}", "😀".repeat(2_000)),
-                        },
-                    ))
-                    .expect("task should persist")
+            let mut task = TaskRecord::new(
+                id,
+                ordinal,
+                ordinal,
+                chat_id,
+                None,
+                ordinal as usize,
+                JobRequest::Youtube {
+                    url: format!("https://example.invalid/{}", "😀".repeat(2_000)),
+                },
             );
+            task.plan = Some(PlanValidationSnapshot {
+                selected_format_ids: vec!["video-format".to_string()],
+                exact_sizes: vec![crate::queue::PlanSize {
+                    subject: "video-format".to_string(),
+                    bytes: 5 * 1024 * 1024,
+                    provenance: "test exact size".to_string(),
+                }],
+                resolution_codecs: vec!["video-format:1920x1080:avc1:unknown".to_string()],
+                title: Some(format!("Long family title\n{}", "👨‍👩‍👧‍👦".repeat(100))),
+                ..PlanValidationSnapshot::default()
+            });
+            assert!(queue.create(task).expect("task should persist"));
         }
 
         let (text, keyboard) = render_queue_page(
@@ -8219,16 +8592,351 @@ mod tests {
         .expect("queue page should render");
         assert!(text.encode_utf16().count() <= QUEUE_PAGE_MAX_TEXT_UNITS);
         assert!(text.contains('…'));
-        assert_eq!(
-            keyboard
-                .expect("queue page should retain its actions")
-                .inline_keyboard
-                .len(),
-            10
-        );
+        assert!(text.contains("Title: Long family title"));
+        let rows = keyboard
+            .expect("queue page should retain its actions")
+            .inline_keyboard;
+        assert_eq!(rows.len(), 10);
+        for row in rows {
+            assert_eq!(row.len(), 2);
+            for button in &row {
+                assert!(button.text.encode_utf16().count() <= QUEUE_BUTTON_LABEL_MAX_UNITS);
+                assert!(!button.text.contains('\n'));
+                assert!(button.text.contains("1920x1080"));
+                assert!(button.text.contains("5.0 MiB"));
+            }
+            assert!(row[0].text.starts_with("Resume · #"));
+            assert!(row[0].text.contains("Long family title"));
+            assert!(row[1].text.starts_with("Cancel · #"));
+            assert!(matches!(
+                parse_queue_callback_data(&row[0].callback_data),
+                Some(QueueCallbackAction::Resume { generation: 0, .. })
+            ));
+            assert!(matches!(
+                parse_queue_callback_data(&row[1].callback_data),
+                Some(QueueCallbackAction::Cancel { generation: 0, .. })
+            ));
+        }
 
         drop(queue);
         let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[test]
+    fn queue_plan_quality_marks_mixed_and_unknown_collection_resolutions() {
+        assert!(is_queue_resolution("1920x1080"));
+        assert!(is_queue_resolution("720p"));
+        assert!(!is_queue_resolution("0x0"));
+        assert!(!is_queue_resolution("1920x0"));
+        assert!(!is_queue_resolution("0p"));
+        let plan = PlanValidationSnapshot {
+            stable_media_ids: vec![
+                "entry-one".to_string(),
+                "entry-two".to_string(),
+                "entry-three".to_string(),
+            ],
+            selected_format_ids: vec![
+                "bvid:entry-one:video:80".to_string(),
+                "bvid:entry-two:video:64".to_string(),
+                "bvid:entry-three:video:32".to_string(),
+                "bvid:entry-one:audio:30280".to_string(),
+            ],
+            resolution_codecs: vec![
+                "bvid:entry-one:video:80:1920x1080:avc1".to_string(),
+                "bvid:entry-two:video:64:0x0:avc1".to_string(),
+                "bvid:entry-three:video:32:1280x720:avc1".to_string(),
+                "bvid:entry-one:audio:30280:unknown".to_string(),
+            ],
+            title: Some("Mixed resolution collection".to_string()),
+            ..PlanValidationSnapshot::default()
+        };
+        assert_eq!(
+            queue_plan_quality(&plan),
+            "mixed (1920x1080, 1280x720, unknown)"
+        );
+
+        let record = TaskRecord::new(
+            "collection-display".to_string(),
+            1,
+            2,
+            123_456_789,
+            None,
+            0,
+            JobRequest::Bilibili {
+                url: "https://space.bilibili.com/210798/channel/collectiondetail?sid=167822"
+                    .to_string(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        let mut record = record;
+        record.plan = Some(plan);
+        assert_eq!(
+            queue_task_collection_label(&record).as_deref(),
+            Some("Collection · 3 entries")
+        );
+        let display = queue_task_display(&record);
+        assert_eq!(display.title, "Mixed resolution collection");
+        assert!(display.quality.contains("unknown"));
+        assert!(display.quality.contains("1920x1080"));
+        assert!(display.quality.contains("1280x720"));
+
+        let youtube_codec_unknown = PlanValidationSnapshot {
+            selected_format_ids: vec!["137".to_string()],
+            resolution_codecs: vec!["137:1920x1080:unknown:unknown".to_string()],
+            ..PlanValidationSnapshot::default()
+        };
+        assert_eq!(queue_plan_quality(&youtube_codec_unknown), "1920x1080");
+    }
+
+    #[test]
+    fn queue_plan_size_deduplicates_subjects_and_preserves_uncertainty() {
+        let plan = PlanValidationSnapshot {
+            selected_format_ids: vec![
+                "video".to_string(),
+                "audio".to_string(),
+                "missing".to_string(),
+                "video".to_string(),
+            ],
+            exact_sizes: vec![
+                crate::queue::PlanSize {
+                    subject: "video".to_string(),
+                    bytes: 2 * 1024 * 1024,
+                    provenance: "exact".to_string(),
+                },
+                crate::queue::PlanSize {
+                    subject: "video".to_string(),
+                    bytes: 2 * 1024 * 1024,
+                    provenance: "duplicate exact".to_string(),
+                },
+            ],
+            approximate_sizes: vec![
+                crate::queue::PlanSize {
+                    subject: "video".to_string(),
+                    bytes: 99 * 1024 * 1024,
+                    provenance: "ignored estimate".to_string(),
+                },
+                crate::queue::PlanSize {
+                    subject: "audio".to_string(),
+                    bytes: 1024 * 1024,
+                    provenance: "estimate".to_string(),
+                },
+            ],
+            ..PlanValidationSnapshot::default()
+        };
+        assert_eq!(
+            queue_plan_size(&plan),
+            (
+                "at least about 3.0 MiB".to_string(),
+                "≥~3.0 MiB".to_string()
+            )
+        );
+
+        let conflicting = PlanValidationSnapshot {
+            selected_format_ids: vec!["video".to_string()],
+            exact_sizes: vec![
+                crate::queue::PlanSize {
+                    subject: "video".to_string(),
+                    bytes: 100,
+                    provenance: "conflicting exact A".to_string(),
+                },
+                crate::queue::PlanSize {
+                    subject: "video".to_string(),
+                    bytes: 200,
+                    provenance: "conflicting exact B".to_string(),
+                },
+            ],
+            approximate_sizes: vec![crate::queue::PlanSize {
+                subject: "video".to_string(),
+                bytes: 300,
+                provenance: "estimate does not resolve conflicting exact data".to_string(),
+            }],
+            ..PlanValidationSnapshot::default()
+        };
+        assert_eq!(
+            queue_plan_size(&conflicting),
+            ("unknown".to_string(), "unknown".to_string())
+        );
+
+        let overflow = PlanValidationSnapshot {
+            selected_format_ids: vec!["large-a".to_string(), "large-b".to_string()],
+            exact_sizes: vec![
+                crate::queue::PlanSize {
+                    subject: "large-a".to_string(),
+                    bytes: u64::MAX,
+                    provenance: "exact".to_string(),
+                },
+                crate::queue::PlanSize {
+                    subject: "large-b".to_string(),
+                    bytes: 1,
+                    provenance: "exact".to_string(),
+                },
+            ],
+            ..PlanValidationSnapshot::default()
+        };
+        assert_eq!(
+            queue_plan_size(&overflow),
+            ("unknown".to_string(), "unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn queue_display_prefers_the_plan_that_matches_the_task_state() {
+        let mut record = TaskRecord::new(
+            "plan-precedence".to_string(),
+            1,
+            2,
+            123_456_789,
+            None,
+            0,
+            JobRequest::Youtube {
+                url: "https://example.invalid/video".to_string(),
+            },
+        );
+        record.plan = Some(PlanValidationSnapshot {
+            selected_format_ids: vec!["saved-video".to_string()],
+            exact_sizes: vec![crate::queue::PlanSize {
+                subject: "saved-video".to_string(),
+                bytes: 2 * 1024 * 1024,
+                provenance: "saved exact size".to_string(),
+            }],
+            resolution_codecs: vec!["saved-video:1920x1080:avc1:unknown".to_string()],
+            title: Some("Saved title".to_string()),
+            ..PlanValidationSnapshot::default()
+        });
+        record.proposed_plan = Some(PlanValidationSnapshot {
+            selected_format_ids: vec!["proposed-video".to_string()],
+            approximate_sizes: vec![crate::queue::PlanSize {
+                subject: "proposed-video".to_string(),
+                bytes: 3 * 1024 * 1024,
+                provenance: "proposed estimate".to_string(),
+            }],
+            resolution_codecs: vec!["proposed-video:1280x720:avc1:unknown".to_string()],
+            title: Some("Proposed\nplan title".to_string()),
+            ..PlanValidationSnapshot::default()
+        });
+
+        record.status = TaskStatus::AwaitingConfirmation;
+        let updated = queue_task_display(&record);
+        assert_eq!(updated.title, "Proposed plan title");
+        assert_eq!(updated.title_source, Some("Updated plan"));
+        assert_eq!(updated.quality, "1280x720");
+        assert_eq!(updated.size, "about 3.0 MiB");
+
+        record.status = TaskStatus::Failed;
+        let saved = queue_task_display(&record);
+        assert_eq!(saved.title, "Saved title");
+        assert_eq!(saved.title_source, None);
+        assert_eq!(saved.quality, "1920x1080");
+        assert_eq!(saved.size, "2.0 MiB");
+
+        record.plan = None;
+        record.status = TaskStatus::Received;
+        let proposed = queue_task_display(&record);
+        assert_eq!(proposed.title, "Proposed plan title");
+        assert_eq!(proposed.title_source, Some("Proposed plan"));
+
+        record.proposed_plan = Some(PlanValidationSnapshot {
+            title: Some(" \n ".to_string()),
+            ..PlanValidationSnapshot::default()
+        });
+        let fallback = queue_task_display(&record);
+        assert_eq!(fallback.title, "YouTube download");
+        assert_eq!(fallback.quality, "unknown");
+        assert_eq!(fallback.size, "unknown");
+    }
+
+    #[test]
+    fn queue_buttons_keep_action_callbacks_bound_to_task_generation() {
+        let mut record = TaskRecord::new(
+            "queue-button-map".to_string(),
+            1,
+            2,
+            123_456_789,
+            None,
+            0,
+            JobRequest::Youtube {
+                url: "https://example.invalid/video".to_string(),
+            },
+        );
+        record.generation = 7;
+        record.plan = Some(PlanValidationSnapshot {
+            selected_format_ids: vec!["video".to_string()],
+            exact_sizes: vec![crate::queue::PlanSize {
+                subject: "video".to_string(),
+                bytes: 1024 * 1024,
+                provenance: "exact".to_string(),
+            }],
+            resolution_codecs: vec!["video:1920x1080:avc1:unknown".to_string()],
+            title: Some("Queue title".to_string()),
+            ..PlanValidationSnapshot::default()
+        });
+        let cases: &[(TaskStatus, &[&str])] = &[
+            (TaskStatus::Received, &["resume", "cancel"]),
+            (TaskStatus::AwaitingSelection, &["resume", "cancel"]),
+            (TaskStatus::Interrupted, &["resume", "cancel"]),
+            (TaskStatus::AwaitingDuplicateChoice, &["resume", "cancel"]),
+            (TaskStatus::Failed, &["retry"]),
+            (TaskStatus::AwaitingConfirmation, &["confirm", "cancel"]),
+            (TaskStatus::Preparing, &["cancel"]),
+            (TaskStatus::Queued, &["cancel"]),
+            (TaskStatus::Running, &["cancel"]),
+            (TaskStatus::Verifying, &[]),
+            (TaskStatus::Cancelled, &[]),
+            (TaskStatus::Completed, &[]),
+        ];
+        for (status, expected_actions) in cases {
+            record.status = *status;
+            let display = queue_task_display(&record);
+            let buttons = queue_task_buttons(&record, 9, &display);
+            assert_eq!(buttons.len(), expected_actions.len(), "{status:?}");
+            for (button, expected_action) in buttons.iter().zip(*expected_actions) {
+                assert!(button.text.contains("#9"), "{}", button.text);
+                assert!(button.text.contains("Queue title"), "{}", button.text);
+                assert!(button.text.contains("1920x1080"), "{}", button.text);
+                assert!(button.text.contains("1.0 MiB"), "{}", button.text);
+                assert_eq!(
+                    button.callback_data,
+                    queue_callback_data(expected_action, &record.id, record.generation)
+                );
+                let parsed = parse_queue_callback_data(&button.callback_data)
+                    .expect("task action callback should parse");
+                match (*expected_action, parsed) {
+                    ("resume", QueueCallbackAction::Resume { id, generation })
+                    | ("retry", QueueCallbackAction::Retry { id, generation })
+                    | ("cancel", QueueCallbackAction::Cancel { id, generation })
+                    | ("confirm", QueueCallbackAction::Confirm { id, generation }) => {
+                        assert_eq!(id, record.id);
+                        assert_eq!(generation, 7);
+                    }
+                    _ => panic!("unexpected callback variant for {expected_action}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queue_button_labels_reserve_fixed_quality_and_size_budgets() {
+        let display = QueueTaskDisplay {
+            title: "Long video title that should still be visible".to_string(),
+            title_source: None,
+            quality: "4294967295x4294967295".to_string(),
+            button_quality: "4294967295x4294967295".to_string(),
+            size: "at least about 16777216.0 GiB".to_string(),
+            button_size: "≥~16777216.0 GiB".to_string(),
+        };
+        for (action, task_number) in [
+            ("Retry", 1),
+            ("Resume", 10),
+            ("Confirm", 20_000),
+            ("Cancel", 9),
+        ] {
+            let label = queue_button_label(action, task_number, &display);
+            assert!(label.encode_utf16().count() <= QUEUE_BUTTON_LABEL_MAX_UNITS);
+            assert!(label.starts_with(&format!("{action} · #{task_number} · ")));
+            assert!(label.contains("Long"), "{label}");
+            assert!(label.contains("x…"), "{label}");
+            assert!(label.ends_with("≥~16777216.0 GiB"), "{label}");
+        }
     }
 
     #[test]
@@ -8275,7 +8983,12 @@ mod tests {
             .inline_keyboard;
         assert_eq!(buttons.len(), 1);
         assert_eq!(buttons[0].len(), 1);
-        assert_eq!(buttons[0][0].text, "Cancel");
+        assert!(
+            buttons[0][0]
+                .text
+                .starts_with("Cancel · #1 · YouTube download")
+        );
+        assert!(buttons[0][0].text.contains("unknown"));
         assert_eq!(
             buttons[0][0].callback_data,
             queue_callback_data("cancel", task_id, 0)
