@@ -146,6 +146,23 @@ mod collection_message_tests {
         manifest
     }
 
+    fn all_queued_details_manifest(entry_count: u32) -> BilibiliCollectionManifest {
+        let mut manifest = test_collection_manifest(entry_count);
+        manifest.skipped_entries = 0;
+        manifest.planned_entries = entry_count as usize;
+        for entry in &mut manifest.entries {
+            entry.status = BilibiliCollectionEntryStatus::Queued;
+            if entry.video.is_none() {
+                entry.video = Some("1080P 1920x1080 60fps H.264".to_string());
+            }
+            if entry.audio.is_none() {
+                entry.audio = Some("Japanese AAC 128 kbps".to_string());
+            }
+            entry.estimated_media = "240.0 MiB".to_string();
+        }
+        manifest
+    }
+
     fn collection_progress(manifest: &BilibiliCollectionManifest) -> JobProgress {
         let entry = test_collection_entry_progress(manifest, 1);
         JobProgress {
@@ -606,6 +623,96 @@ mod collection_message_tests {
             "error_code": 500,
             "description": "simulated delayed prompt delivery failure"
         }))
+    }
+
+    async fn spawn_fake_telegram_api_with_controlled_collection_detail_edits() -> (
+        TelegramClient,
+        mpsc::UnboundedReceiver<FakeTelegramRequest>,
+        mpsc::UnboundedReceiver<(FakeTelegramRequest, oneshot::Sender<String>)>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+        Arc<AtomicUsize>,
+        Arc<AtomicBool>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake Telegram API should bind localhost");
+        let address = listener
+            .local_addr()
+            .expect("fake Telegram API should expose its address");
+        let (request_log_tx, request_log_rx) = mpsc::unbounded_channel();
+        let (controlled_tx, controlled_rx) = mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let send_attempts = Arc::new(AtomicUsize::new(0));
+        let send_attempts_for_server = Arc::clone(&send_attempts);
+        let control_page_edits = Arc::new(AtomicBool::new(false));
+        let control_page_edits_for_server = Arc::clone(&control_page_edits);
+        let message_ids = Arc::new(AtomicUsize::new(1_000));
+        let message_ids_for_server = Arc::clone(&message_ids);
+        let server = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => return Ok(()),
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.context("fake Telegram API accept failed")?;
+                        let request_log_tx = request_log_tx.clone();
+                        let controlled_tx = controlled_tx.clone();
+                        let send_attempts = Arc::clone(&send_attempts_for_server);
+                        let control_page_edits = Arc::clone(&control_page_edits_for_server);
+                        let message_ids = Arc::clone(&message_ids_for_server);
+                        tokio::spawn(async move {
+                            let Ok(request) = read_fake_telegram_request(&mut stream).await else {
+                                return;
+                            };
+                            let _ = request_log_tx.send(FakeTelegramRequest {
+                                method: request.method.clone(),
+                                query: request.query.clone(),
+                                body: request.body.clone(),
+                            });
+                            if request.method == "sendMessage" {
+                                send_attempts.fetch_add(1, Ordering::SeqCst);
+                            }
+                            let text = request.body["text"].as_str().unwrap_or_default();
+                            let is_controlled_collection_edit = request.method == "editMessageText"
+                                && request.body["message_id"].as_i64() == Some(1_000)
+                                && (text.contains("Entries 6-6 of 6 (page 2/2)")
+                                    || (control_page_edits.load(Ordering::SeqCst)
+                                        && text.contains("Entries 1-5 of 6 (page 1/2)"))
+                                    || text.starts_with("Finished job #84:"));
+                            let response = if is_controlled_collection_edit {
+                                let (response_tx, response_rx) = oneshot::channel();
+                                if controlled_tx.send((request, response_tx)).is_err() {
+                                    return;
+                                }
+                                let Ok(response) = response_rx.await else {
+                                    return;
+                                };
+                                response
+                            } else {
+                                let mut next_message_id = if request.method == "sendMessage" {
+                                    i64::try_from(message_ids.fetch_add(1, Ordering::SeqCst))
+                                        .expect("fake Telegram message ID should fit in i64")
+                                } else {
+                                    1_000
+                                };
+                                fake_telegram_response(&request, &mut next_message_id, Vec::new())
+                            };
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        });
+                    }
+                }
+            }
+        });
+        let token = AppConfig::for_test().telegram.token;
+        (
+            TelegramClient::with_test_api_base_url(token, format!("http://{address}")),
+            request_log_rx,
+            controlled_rx,
+            shutdown_tx,
+            server,
+            send_attempts,
+            control_page_edits,
+        )
     }
 
     fn inline_keyboard_callback_data(request: &FakeTelegramRequest, suffix: &str) -> String {
@@ -1918,10 +2025,272 @@ mod collection_message_tests {
         assert!(details_requests.iter().any(|request| {
             request.method == "editMessageText"
                 && request.body["message_id"].as_i64() == Some(main_message_id)
-                && request.body["text"]
-                    .as_str()
-                    .is_some_and(|text| text.contains("Entries 6-7 of 7 (page 2/2)"))
+                && request.body["text"].as_str().is_some_and(|text| {
+                    text.contains("Entries 6-7 of 7 (page 2/2)")
+                        && text.contains("Finished job #63")
+                })
         }));
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn in_flight_collection_details_edit_cannot_overwrite_terminal_overview_e2e() {
+        let (
+            telegram,
+            mut requests,
+            mut controlled_edits,
+            shutdown,
+            server,
+            send_attempts,
+            control_page_edits,
+        ) = spawn_fake_telegram_api_with_controlled_collection_detail_edits().await;
+        let task_id = "task-collection-details-terminal-race";
+        let (queue_root, config, queue) = create_running_collection_queue(
+            "collection-details-terminal-race",
+            task_id,
+            CHAT_ID,
+            84,
+        );
+        let manifest = all_queued_details_manifest(6);
+        let delivery = track_single_entry_collection(
+            &telegram,
+            Arc::clone(&queue),
+            task_id,
+            CHAT_ID,
+            84,
+            0,
+            manifest,
+            true,
+            false,
+            false,
+            &mut requests,
+        )
+        .await
+        .expect("running collection should retain main and entry delivery state");
+        let main_message_id = delivery
+            .main_delivery
+            .message_id()
+            .expect("running collection should have one main message");
+        assert_eq!(main_message_id, 1_000);
+        let details_token = delivery
+            .details_token
+            .expect("six selected entries should register a details pager");
+        assert_eq!(
+            send_attempts.load(Ordering::SeqCst),
+            2,
+            "setup should send exactly one main message and one started-entry message"
+        );
+        control_page_edits.store(true, Ordering::SeqCst);
+
+        let callback_context =
+            bot_context(telegram.clone(), config.clone(), Arc::clone(&queue), 85);
+        let callback = tokio::spawn(handle_callback_query(
+            callback_context,
+            crate::telegram::CallbackQuery {
+                id: "details-running-edit-held".to_string(),
+                data: Some(collection_details_callback_data(details_token, 1)),
+                message: Some(crate::telegram::Message {
+                    message_id: main_message_id,
+                    chat: crate::telegram::Chat {
+                        id: CHAT_ID,
+                        kind: Some("private".to_string()),
+                    },
+                    text: None,
+                    from: None,
+                }),
+            },
+        ));
+        let (pager_edit, pager_response) =
+            receive_controllable_request(&mut controlled_edits).await;
+        assert_eq!(pager_edit.method, "editMessageText");
+        assert_eq!(
+            pager_edit.body["message_id"].as_i64(),
+            Some(main_message_id)
+        );
+        let running_page_text = pager_edit.body["text"]
+            .as_str()
+            .expect("running pager edit should contain text")
+            .to_string();
+        assert!(running_page_text.contains("Entries 6-6 of 6 (page 2/2)"));
+        assert!(running_page_text.contains("Downloading entry 1/6."));
+        assert!(!running_page_text.contains("Finished job #84"));
+
+        assert!(
+            queue
+                .begin_verification_if_generation(task_id, 0)
+                .expect("running collection should enter verification")
+                .is_some()
+        );
+        assert!(
+            queue
+                .complete_if_generation(
+                    task_id,
+                    0,
+                    config
+                        .downloads
+                        .video_dir
+                        .join("collection-details-terminal-race-output")
+                        .display()
+                        .to_string(),
+                    &[],
+                    BTreeMap::new(),
+                )
+                .expect("collection completion should persist")
+                .is_some()
+        );
+
+        let finalizer_telegram = telegram.clone();
+        let finalizer_queue = Arc::clone(&queue);
+        let finalizer_task_id = task_id.to_string();
+        let (finalization_started_tx, finalization_started_rx) = oneshot::channel();
+        let finalizer = tokio::spawn(async move {
+            let _ = finalization_started_tx.send(());
+            finalize_collection_messages(
+                finalization_context(
+                    &finalizer_telegram,
+                    &finalizer_queue,
+                    &finalizer_task_id,
+                    0,
+                    CHAT_ID,
+                    84,
+                ),
+                delivery,
+                "Finished job #84: Bilibili download\nSaved: collection output".to_string(),
+                CollectionFinalOutcome::Verified,
+            )
+            .await;
+        });
+        finalization_started_rx
+            .await
+            .expect("terminal finalization should start");
+        tokio_timeout(Duration::from_secs(5), async {
+            loop {
+                let terminal = pending_collection_details()
+                    .lock()
+                    .await
+                    .get(&details_token)
+                    .is_some_and(|details| details.terminal);
+                if terminal {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal overview should be published before locking the main edit");
+
+        let early_terminal_edit =
+            match tokio_timeout(Duration::from_millis(100), controlled_edits.recv()).await {
+                Ok(Some((request, response))) => {
+                    let text = request.body["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let is_terminal = text.starts_with("Finished job #84:");
+                    let _ = response.send(controlled_success_response());
+                    Some((is_terminal, text))
+                }
+                Ok(None) => panic!("controlled edit channel should remain open"),
+                Err(_) => None,
+            };
+        pager_response
+            .send(controlled_success_response())
+            .expect("held Running pager edit should be released");
+
+        if early_terminal_edit.is_none() {
+            let (terminal_edit, terminal_response) =
+                receive_controllable_request(&mut controlled_edits).await;
+            assert_eq!(terminal_edit.method, "editMessageText");
+            assert_eq!(
+                terminal_edit.body["message_id"].as_i64(),
+                Some(main_message_id)
+            );
+            let terminal_text = terminal_edit.body["text"]
+                .as_str()
+                .expect("terminal main edit should contain text")
+                .to_string();
+            assert!(terminal_text.starts_with("Finished job #84:"));
+            assert!(terminal_text.contains("Entries 6-6 of 6 (page 2/2)"));
+            assert!(!terminal_text.contains("Downloading entry 1/6."));
+            terminal_response
+                .send(controlled_success_response())
+                .expect("terminal main edit should be accepted");
+        }
+
+        tokio_timeout(Duration::from_secs(5), callback)
+            .await
+            .expect("details callback should finish after its edit response")
+            .expect("details callback should not panic");
+        tokio_timeout(Duration::from_secs(5), finalizer)
+            .await
+            .expect("finalizer should finish after the main edit response")
+            .expect("collection finalizer should not panic");
+
+        if let Some((is_terminal, text)) = early_terminal_edit {
+            drop(queue);
+            stop_fake_telegram_api(shutdown, server).await;
+            let _ = fs::remove_dir_all(queue_root);
+            assert!(
+                is_terminal,
+                "only the final main edit should be controlled: {text}"
+            );
+            panic!("terminal main edit overtook the in-flight Running pager edit");
+        }
+
+        let completed = queue
+            .get(task_id)
+            .expect("completed collection should load")
+            .expect("completed collection should remain");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        let sends_before_terminal_paging = send_attempts.load(Ordering::SeqCst);
+        assert_eq!(sends_before_terminal_paging, 2);
+
+        let completed_context = bot_context(telegram.clone(), config, Arc::clone(&queue), 86);
+        let completed_callback = tokio::spawn(handle_callback_query(
+            completed_context,
+            crate::telegram::CallbackQuery {
+                id: "details-terminal-page-back".to_string(),
+                data: Some(collection_details_callback_data(details_token, 0)),
+                message: Some(crate::telegram::Message {
+                    message_id: main_message_id,
+                    chat: crate::telegram::Chat {
+                        id: CHAT_ID,
+                        kind: Some("private".to_string()),
+                    },
+                    text: None,
+                    from: None,
+                }),
+            },
+        ));
+        let (completed_page, completed_page_response) =
+            receive_controllable_request(&mut controlled_edits).await;
+        assert_eq!(completed_page.method, "editMessageText");
+        assert_eq!(
+            completed_page.body["message_id"].as_i64(),
+            Some(main_message_id)
+        );
+        let completed_page_text = completed_page.body["text"]
+            .as_str()
+            .expect("completed detail page should contain text");
+        assert!(completed_page_text.starts_with("Finished job #84:"));
+        assert!(completed_page_text.contains("Entries 1-5 of 6 (page 1/2)"));
+        assert!(completed_page_text.contains("Entry 1"));
+        assert!(!completed_page_text.contains("Downloading entry 1/6."));
+        completed_page_response
+            .send(controlled_success_response())
+            .expect("completed detail page should remain pageable");
+        tokio_timeout(Duration::from_secs(5), completed_callback)
+            .await
+            .expect("completed details callback should finish")
+            .expect("completed details callback should not panic");
+        assert_eq!(
+            send_attempts.load(Ordering::SeqCst),
+            sends_before_terminal_paging,
+            "details paging before or after completion must not send replacement messages"
+        );
 
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;

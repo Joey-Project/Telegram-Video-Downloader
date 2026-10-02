@@ -115,6 +115,8 @@ struct PendingCollectionDetails {
     manifest: BilibiliCollectionManifest,
     page: usize,
     overview: String,
+    terminal: bool,
+    edit_lock: Arc<Mutex<()>>,
     created_at: Instant,
 }
 
@@ -4098,6 +4100,8 @@ async fn register_collection_details(
             manifest,
             page: 0,
             overview: String::new(),
+            terminal: false,
+            edit_lock: Arc::new(Mutex::new(())),
             created_at: Instant::now(),
         },
     );
@@ -4108,11 +4112,28 @@ async fn register_collection_details(
 async fn update_collection_details_overview(token: u64, overview: String) -> Option<usize> {
     let mut details = pending_collection_details().lock().await;
     if let Some(details) = details.get_mut(&token) {
-        details.overview = overview;
+        if !details.terminal {
+            details.overview = overview;
+        }
         Some(details.page)
     } else {
         None
     }
+}
+
+async fn mark_collection_details_terminal(
+    token: u64,
+    generation: u64,
+    overview: String,
+) -> Option<Arc<Mutex<()>>> {
+    let mut details = pending_collection_details().lock().await;
+    let current = details.get_mut(&token)?;
+    if current.generation != generation {
+        return None;
+    }
+    current.overview = overview;
+    current.terminal = true;
+    Some(Arc::clone(&current.edit_lock))
 }
 
 async fn find_collection_details(
@@ -4160,7 +4181,20 @@ async fn handle_collection_details_callback(
     callback: CollectionDetailsCallback,
 ) {
     let telegram = context.telegram.clone();
+    let Some(initial_details) = find_collection_details(callback.token, chat_id, message_id).await
+    else {
+        answer_callback_or_log(
+            &telegram,
+            callback_id,
+            "Collection details have expired.".to_string(),
+        )
+        .await;
+        return;
+    };
+    let edit_lock = Arc::clone(&initial_details.edit_lock);
+    let edit_guard = edit_lock.lock().await;
     let Some(details) = find_collection_details(callback.token, chat_id, message_id).await else {
+        drop(edit_guard);
         answer_callback_or_log(
             &telegram,
             callback_id,
@@ -4173,8 +4207,24 @@ async fn handle_collection_details_callback(
         .queue
         .get_if_generation(&details.task_id, details.generation)
     {
-        Ok(Some(_)) => {}
+        Ok(Some(task))
+            if details.terminal
+                || !matches!(
+                    task.status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                ) => {}
+        Ok(Some(_)) => {
+            drop(edit_guard);
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                "This collection run has finished.".to_string(),
+            )
+            .await;
+            return;
+        }
         Ok(None) => {
+            drop(edit_guard);
             answer_callback_or_log(
                 &telegram,
                 callback_id,
@@ -4185,6 +4235,7 @@ async fn handle_collection_details_callback(
         }
         Err(err) => {
             warn!(task_id = details.task_id, error = %err, "failed to validate collection details generation");
+            drop(edit_guard);
             answer_callback_or_log(
                 &telegram,
                 callback_id,
@@ -4196,6 +4247,7 @@ async fn handle_collection_details_callback(
     }
     let page_count = collection_details_page_count(&details.manifest);
     if callback.page >= page_count {
+        drop(edit_guard);
         answer_callback_or_log(
             &telegram,
             callback_id,
@@ -4224,6 +4276,7 @@ async fn handle_collection_details_callback(
                 current.page = callback.page;
             }
             drop(pending);
+            drop(edit_guard);
             answer_callback_or_log(
                 &telegram,
                 callback_id,
@@ -4233,6 +4286,7 @@ async fn handle_collection_details_callback(
         }
         Err(err) => {
             warn!(chat_id, message_id, error = %err, "failed to edit collection details page");
+            drop(edit_guard);
             answer_callback_or_log(
                 &telegram,
                 callback_id,
@@ -6147,12 +6201,69 @@ async fn edit_collection_main_message_if_current(
     false
 }
 
+async fn deliver_collection_terminal_main_message(
+    context: ProgressDeliveryContext<'_>,
+    delivery: &mut CollectionProgressDelivery,
+    overview: String,
+) {
+    delivery.overview = overview.clone();
+    let Some(message_id) = delivery.main_delivery.message_id() else {
+        return;
+    };
+
+    if let Some(token) = delivery.details_token
+        && let Some(edit_lock) =
+            mark_collection_details_terminal(token, context.generation, overview.clone()).await
+    {
+        let _edit_guard = edit_lock.lock().await;
+        let current_details = find_collection_details(token, context.chat_id, message_id)
+            .await
+            .filter(|details| details.generation == context.generation && details.terminal);
+        let page = current_details
+            .as_ref()
+            .map_or(delivery.details_page, |details| details.page);
+        delivery.details_page = page;
+        let message = delivery.manifest.as_ref().map_or_else(
+            || delivery.overview.clone(),
+            |manifest| {
+                collection_details_page_text(context.job_id, manifest, page, &delivery.overview)
+            },
+        );
+        let keyboard = current_details.as_ref().and_then(|_| {
+            delivery
+                .manifest
+                .as_ref()
+                .map(|manifest| collection_details_keyboard(token, manifest, page))
+        });
+        edit_collection_main_message_if_current(context, message_id, &message, keyboard).await;
+        return;
+    }
+
+    let message = delivery.manifest.as_ref().map_or_else(
+        || delivery.overview.clone(),
+        |manifest| {
+            collection_details_page_text(
+                context.job_id,
+                manifest,
+                delivery.details_page,
+                &delivery.overview,
+            )
+        },
+    );
+    edit_collection_main_message_if_current(context, message_id, &message, None).await;
+}
+
 async fn finalize_collection_messages(
     context: ProgressDeliveryContext<'_>,
     mut delivery: CollectionProgressDelivery,
     final_main_message: String,
     outcome: CollectionFinalOutcome,
 ) {
+    if let Some(token) = delivery.details_token {
+        let _ =
+            mark_collection_details_terminal(token, context.generation, final_main_message.clone())
+                .await;
+    }
     for entry_delivery in delivery.entries.values_mut() {
         let (state, state_text) = match (entry_delivery.state, outcome) {
             (CollectionEntryDeliveryState::Verified, _) => continue,
@@ -6224,9 +6335,7 @@ async fn finalize_collection_messages(
         );
         edit_collection_entry_terminal_message(context, entry_delivery, message).await;
     }
-    if delivery.main_delivery.message_id().is_some() {
-        deliver_collection_main_message(context, &mut delivery, final_main_message).await;
-    }
+    deliver_collection_terminal_main_message(context, &mut delivery, final_main_message).await;
 }
 
 async fn deliver_progress(
