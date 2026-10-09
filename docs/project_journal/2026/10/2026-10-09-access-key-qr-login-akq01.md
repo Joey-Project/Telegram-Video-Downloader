@@ -1,7 +1,7 @@
 ---
 id: 20261009-akq01
 title: Automatic Access-Key QR Authorization
-status: completed
+status: blocked
 created: 2026-10-09
 updated: 2026-10-09
 branch: wip/access-key-qr-login
@@ -56,3 +56,22 @@ superseded_by:
 - `cargo fmt --all -- --check`, `git diff --check`, and project-journal
   validation: passed.
 - Local review was explicitly omitted for this task.
+
+## Runtime Deployment
+
+- Built from the worktree into the existing canonical checkout's release target.
+  The existing LaunchAgent continued to use the canonical binary, config, and
+  working directory. Process inventory confirmed only one bot instance.
+- The updated binary did not reach `telegram local downloader started`. A
+  bounded process sample showed `QueueManager::open` waiting inside macOS
+  `NSFileCoordinator` and `__open` while coordinating a download-root read.
+  One restart reproduced the same startup block.
+- Restored the pre-update binary and restarted the same LaunchAgent. A second
+  bounded sample showed the identical directory-coordination block in that
+  original binary as well. The restored process exists but is not verified ready.
+- The access-key fix is committed and locally validated. Runtime deployment and
+  real scan/confirmation remain blocked by the download-root startup issue.
+  No logout, credential deletion, task cleanup, or resolver configuration change
+  was performed.
+- The fixed binary and bounded validation/sample artifacts are retained in
+  `/private/tmp/telegram-access-key-flow` for recovery.
