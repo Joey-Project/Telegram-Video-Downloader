@@ -57,6 +57,8 @@ staging 下载成功后会先持久化身份绑定的 `.retained.json`；Bilibil
 
 Bilibili 合集每轮执行只发送一条入队主消息和每个所选视频的一条状态消息；合集详情、进度、处理和最终结果编辑已有消息，下载完成后还会等待已发布文件校验。已存在且通过核验的视频显示跳过下载状态；取消时不为尚未开始的视频补发消息。通过 `/queue` 恢复或手动重试会开启新一轮，保留旧轮消息并创建新轮消息；网络和文件提供器的内部重试不会另开一轮。
 
+Bilibili 的文件描述符输出保留 MP4 索引（`moov`）在文件末尾，不启用 `faststart`。FFmpeg 的 `faststart` 第二遍搬移会重新打开输出；`fd:` 重新打开后共享文件偏移，可导致媒体数据被覆盖，即使命令返回成功。完整下载后的文件可正常本地播放。此前因此损坏的文件不会自动恢复；若原始音视频流已清理，需要重新下载，完成记录中的 SHA-256 一致只能证明文件未变化，不能证明内容可解码。
+
 ## 运行
 
 ```sh
@@ -134,4 +136,10 @@ scripts/test_launch_agent.sh
 uv run ruff format --check
 uv run ruff check
 uv run python -m unittest discover -s tests
+```
+
+安装了支持 `fd:`、libx264 和 AAC 的 FFmpeg 时，可以显式运行真实合并回归测试。测试生成临时音视频，执行完整 Bilibili 合并与原始流清理，比较合并前后的音视频包 SHA-256，并完整解码输出：
+
+```sh
+cargo test bilibili_fd_mux_preserves_streams_and_decodes_with_real_ffmpeg -- --ignored
 ```

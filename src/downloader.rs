@@ -4203,11 +4203,11 @@ fn bilibili_local_mux_command_spec(
     let output_index = inherited_files.len();
     inherited_files.push(output.clone());
     let output_descriptor = inherited_command_descriptor(output_index, inherited_fd_base)?;
+    // Keep moov at the end: faststart reopens fd: for reading, and the duplicated
+    // descriptor shares the writer's file offset, corrupting the second-pass move.
     args.extend([
         "-c".to_string(),
         "copy".to_string(),
-        "-movflags".to_string(),
-        "+faststart".to_string(),
         "-f".to_string(),
         "mp4".to_string(),
         "-fd".to_string(),
@@ -21517,6 +21517,7 @@ mod tests {
         assert!(spec.args.windows(2).any(|args| args == ["-map", "1:0"]));
         assert!(!spec.args.windows(2).any(|args| args == ["-f", "concat"]));
         assert!(spec.args.windows(2).any(|args| args == ["-f", "mp4"]));
+        assert!(!spec.args.iter().any(|arg| arg.contains("faststart")));
         assert!(spec.args.windows(2).any(|args| args == ["-fd", "66"]));
         assert_eq!(spec.args.last().map(String::as_str), Some("fd:"));
         assert_eq!(
@@ -21524,6 +21525,128 @@ mod tests {
             "user-owned"
         );
         let _ = fs::remove_dir_all(entry_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires real FFmpeg with fd: support, libx264 and AAC encoders"]
+    async fn bilibili_fd_mux_preserves_streams_and_decodes_with_real_ffmpeg() {
+        async fn checked_ffmpeg(mut command: Command) -> std::process::Output {
+            command.kill_on_drop(true);
+            let output = tokio_timeout(Duration::from_secs(30), command.output())
+                .await
+                .expect("FFmpeg test command should finish within 30 seconds")
+                .expect("real FFmpeg should run");
+            assert!(
+                output.status.success(),
+                "FFmpeg failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        async fn stream_hash(ffmpeg: &Path, path: &Path, selector: &str) -> Vec<u8> {
+            let mut command = Command::new(ffmpeg);
+            command
+                .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+                .arg(path)
+                .args([
+                    "-map", selector, "-c", "copy", "-f", "hash", "-hash", "sha256", "-",
+                ]);
+            let output = checked_ffmpeg(command).await.stdout;
+            assert!(output.starts_with(b"SHA256="));
+            output
+        }
+
+        let root = temp_test_dir("bilibili-fd-mux-real-ffmpeg");
+        let video = root.join("video.m4s");
+        let audio = root.join("audio.m4s");
+        let mut config = test_config();
+        config.tools.ffmpeg = PathBuf::from("ffmpeg");
+        config.bot.command_timeout_seconds = 30;
+        config.bot.command_idle_timeout_seconds = 30;
+        let mut generate = Command::new(&config.tools.ffmpeg);
+        generate
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100",
+                "-map",
+                "0:v:0",
+                "-t",
+                "2",
+                "-c:v",
+                "libx264",
+                "-threads",
+                "1",
+                "-preset",
+                "ultrafast",
+                "-f",
+                "mp4",
+            ])
+            .arg(&video)
+            .args(["-map", "1:a:0", "-t", "2", "-c:a", "aac", "-f", "mp4"])
+            .arg(&audio);
+        checked_ffmpeg(generate).await;
+        let expected_video = stream_hash(&config.tools.ffmpeg, &video, "0:v:0").await;
+        let expected_audio = stream_hash(&config.tools.ffmpeg, &audio, "0:a:0").await;
+        let mut report = parse_bilibili_download_report(
+            r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","files":[{"kind":"video","path":"video.m4s"},{"kind":"audio","path":"audio.m4s"}]}]}"#,
+        )
+        .expect("fixture download report should parse");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        mux_bilibili_report_media(&config, &rooted, &root, &mut report, UNIX_EPOCH, None)
+            .await
+            .expect("descriptor-bound mux should succeed");
+        let mux = report.entries[0]
+            .mux
+            .as_ref()
+            .expect("mux output should be reported");
+        assert!(mux.output_path.is_file());
+        assert!(!video.exists(), "committed mux should clean the raw video");
+        assert!(!audio.exists(), "committed mux should clean the raw audio");
+        assert_eq!(
+            stream_hash(&config.tools.ffmpeg, &mux.output_path, "0:v:0").await,
+            expected_video,
+            "every encoded video packet should survive the mux"
+        );
+        assert_eq!(
+            stream_hash(&config.tools.ffmpeg, &mux.output_path, "0:a:0").await,
+            expected_audio,
+            "every encoded audio packet should survive the mux"
+        );
+        let mut decode = Command::new(&config.tools.ffmpeg);
+        decode
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-xerror",
+                "-threads",
+                "1",
+                "-i",
+            ])
+            .arg(&mux.output_path)
+            .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"]);
+        let decoded = checked_ffmpeg(decode).await;
+        assert!(
+            decoded.stderr.is_empty(),
+            "full decode should report no errors"
+        );
+        drop(report);
+        drop(rooted);
+        fs::remove_dir_all(root).expect("FFmpeg fixture directory should clean up");
     }
 
     #[cfg(unix)]
@@ -21869,6 +21992,7 @@ mv video.original video.m4s || exit 46
         );
         assert!(!spec.args.iter().any(|arg| arg.starts_with("/dev/fd/")));
         assert!(spec.args.windows(2).any(|args| args == ["-f", "mp4"]));
+        assert!(!spec.args.iter().any(|arg| arg.contains("faststart")));
         assert!(spec.args.windows(2).any(|args| args == ["-fd", "67"]));
         assert_eq!(spec.args.last().map(String::as_str), Some("fd:"));
         drop(concat_file);
