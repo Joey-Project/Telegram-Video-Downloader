@@ -185,8 +185,34 @@ superseded_by:
 - Other responses included a disabled Web API, HTTP 404/567, invalid JSON,
   redirects, and transport failures. Transport failures were recorded without
   asserting that every failure was DNS-related. Credential egress to these
-  hosts was not performed; the existing authorization covered `bili.lli.cx`.
+  hosts was not performed during the anonymous phase; the existing authorization
+  then covered only `bili.lli.cx`.
 - Each request was bounded to eight seconds and 1 MiB, redirects were disabled,
   concurrency was capped at four, and the initial run had a 180-second deadline.
   Anonymous probe scripts and compact JSON reports were retained under
   `/private/tmp/telegram-other-resolvers-20261009` for follow-up.
+
+## Authorized Resolver Verification
+
+- Joey explicitly authorized login-information egress to all four nominated
+  hosts. The saved generic access-key was sent only to those exact HTTPS hosts,
+  without Web cookies, redirects, or media downloads.
+- A 24-request probe tested both Web routes in `cn`, `hk`, and `tw`. The
+  `/pgc/player/web/playurl` route in `cn` returned code zero with 19 DASH video
+  streams and three audio streams for each of `atri.ink`, `bili.nepnep.moe`,
+  `bstar.kirara-fantasia.moe`, and `bilibili.suysker.xyz`.
+- `bili.nepnep.moe` also returned streams for the HK/TW query variants. The
+  other three hosts returned region errors for HK/TW. The v2 routes were
+  unsupported or returned no playable streams; code zero alone was not counted
+  as a playable result.
+- The cached `bbdown-core` release library also passed actual `plan_download`
+  calls for the media URL with `Selection::Latest` against each mainland proxy:
+  one entry, `ep247472`, `StreamSource::PgcProxy`, 19 videos, three audios.
+  A temporary loopback relay enforced the exact episode/area/route allowlist and
+  no-redirect credential forwarding because the library's default HTTP client
+  otherwise follows redirects. Credentials stayed in the relay's memory; the
+  library received the original upstream JSON and did not download media.
+- The verified configuration is Web mode, mainland area, and a restricted API
+  proxy such as `cn=https://atri.ink`, with `cn=https://bili.nepnep.moe` as an
+  optional fallback. These validation runs did not install runtime configuration
+  or restart the LaunchAgent.
