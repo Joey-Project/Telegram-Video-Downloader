@@ -663,7 +663,7 @@ fn validate_endpoint_base(value: &str, flag: &str) -> Result<()> {
     Ok(())
 }
 
-fn request_timeout(config: &AppConfig) -> Result<Duration> {
+pub(crate) fn request_timeout(config: &AppConfig) -> Result<Duration> {
     match last_bilibili_arg_value(config, "--request-timeout-seconds") {
         Some(value) => parse_request_timeout(value),
         None => Ok(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECONDS)),

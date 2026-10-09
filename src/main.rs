@@ -1,3 +1,4 @@
+mod bilibili_access_key;
 mod bilibili_auth;
 mod bilibili_core;
 mod config;
@@ -1803,7 +1804,7 @@ async fn handle_bilibili_auth_command(
                 send_or_log(
                     &telegram,
                     chat_id,
-                    "BBDown login is already waiting for an access-key callback. Send the callback message, or use /bbdown logout to cancel."
+                    "BBDown access-key QR login is already pending. Scan and confirm it in the Bilibili app, or use /bbdown logout to cancel."
                         .to_string(),
                 )
                 .await;
@@ -2036,26 +2037,28 @@ async fn start_bbdown_access_key_login(
     auth_epoch: bilibili_auth::AuthEpoch,
 ) -> Result<()> {
     ensure_bbdown_login_active(auth_generation)?;
+    let client =
+        bilibili_access_key::AccessKeyQrClient::new(bilibili_core::request_timeout(config)?)?;
+    let qr_ticket = await_bbdown_login_active(auth_generation, client.create_ticket()).await??;
+    // Keep the existing private-chat ownership marker so competing logins, manual callback
+    // messages, and /bbdown logout all observe the same in-flight authorization.
     let ticket = bilibili_core::create_access_key_ticket()?;
     let ticket_id = BILIBILI_ACCESS_KEY_TICKET_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let output = ticket.output();
+    let pending = PendingBilibiliAccessKeyLogin {
+        auth_generation,
+        auth_epoch,
+        ticket_id,
+        ticket,
+        created_at: Instant::now(),
+        in_progress: true,
+    };
     {
         let mut logins =
             await_bbdown_login_active(auth_generation, pending_bilibili_access_key_logins().lock())
                 .await?;
         prune_expired_pending_bilibili_access_key_logins(&mut logins, Instant::now());
         ensure_bbdown_login_active(auth_generation)?;
-        logins.insert(
-            chat_id,
-            PendingBilibiliAccessKeyLogin {
-                auth_generation,
-                auth_epoch,
-                ticket_id,
-                ticket,
-                created_at: Instant::now(),
-                in_progress: false,
-            },
-        );
+        logins.insert(chat_id, pending.clone());
     }
     let delivery = await_bbdown_login_active(
         auth_generation,
@@ -2063,8 +2066,8 @@ async fn start_bbdown_access_key_login(
             telegram,
             chat_id,
             BilibiliAuthLoginMode::AccessKey,
-            &output.url,
-            &output.qr_payload,
+            qr_ticket.url(),
+            qr_ticket.url(),
             config.bilibili.auth.login_timeout_seconds,
         ),
     )
@@ -2074,17 +2077,128 @@ async fn start_bbdown_access_key_login(
         clear_pending_bilibili_access_key_login(chat_id, auth_generation, ticket_id).await;
         return Err(err);
     }
-    await_bbdown_login_active(
-        auth_generation,
-        send_or_log(
-            telegram,
-            chat_id,
-            "After authorizing, send the callback URL or balh-login-credentials message to this private chat. Use /bbdown logout to cancel."
-                .to_string(),
-        ),
-    )
-    .await?;
+    let telegram = telegram.clone();
+    let config = Arc::new(config.clone());
+    tokio::spawn(async move {
+        finish_bbdown_access_key_qr_login(telegram, config, chat_id, pending, client, qr_ticket)
+            .await;
+    });
     Ok(())
+}
+
+async fn finish_bbdown_access_key_qr_login(
+    telegram: TelegramClient,
+    config: Arc<AppConfig>,
+    chat_id: i64,
+    pending: PendingBilibiliAccessKeyLogin,
+    client: bilibili_access_key::AccessKeyQrClient,
+    ticket: bilibili_access_key::AccessKeyQrTicket,
+) {
+    let result =
+        run_bbdown_access_key_qr_login(&telegram, &config, chat_id, &pending, &client, &ticket)
+            .await;
+    clear_pending_bilibili_access_key_login(chat_id, pending.auth_generation, pending.ticket_id)
+        .await;
+    match result {
+        Ok(saved) => {
+            send_current_bbdown_login_success(
+                &telegram,
+                &config,
+                chat_id,
+                &saved,
+                format!(
+                    "BBDown access-key login saved.\n{}",
+                    format_bbdown_credential_summary(&saved.summary)
+                ),
+            )
+            .await;
+        }
+        Err(err) => {
+            if ensure_bbdown_login_active(pending.auth_generation).is_ok() {
+                send_or_log(
+                    &telegram,
+                    chat_id,
+                    format!(
+                        "BBDown access-key login failed:\n{}",
+                        summarize_bbdown_auth_error(&err)
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+async fn run_bbdown_access_key_qr_login(
+    telegram: &TelegramClient,
+    config: &AppConfig,
+    chat_id: i64,
+    pending: &PendingBilibiliAccessKeyLogin,
+    client: &bilibili_access_key::AccessKeyQrClient,
+    ticket: &bilibili_access_key::AccessKeyQrTicket,
+) -> Result<SavedBilibiliLogin> {
+    let auth_generation = pending.auth_generation;
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(
+            config.bilibili.auth.login_timeout_seconds,
+        ))
+        .ok_or_else(|| anyhow::anyhow!("BBDown login timeout is too large"))?;
+    let interval = Duration::from_secs(config.bilibili.auth.poll_interval_seconds);
+    let cancel = bbdown_login_cancel_notify().notified();
+    tokio::pin!(cancel);
+    cancel.as_mut().enable();
+    let mut last_waiting_state: Option<&'static str> = None;
+
+    loop {
+        ensure_bbdown_login_active(auth_generation)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| anyhow::anyhow!("BBDown access-key login timed out"))?;
+        tokio::select! {
+            () = &mut cancel => {
+                bail!("BBDown login was canceled by a later /bbdown logout");
+            }
+            state = tokio_timeout(remaining, client.poll(ticket)) => {
+                match state.context("BBDown access-key QR polling timed out")?? {
+                    QrLoginState::WaitingForScan => {
+                        last_waiting_state = Some("waiting_for_scan");
+                    }
+                    QrLoginState::WaitingForConfirm => {
+                        if last_waiting_state != Some("waiting_for_confirm") {
+                            await_bbdown_login_active(
+                                auth_generation,
+                                send_or_log(
+                                    telegram,
+                                    chat_id,
+                                    "BBDown QR scanned; confirm the login in the Bilibili app."
+                                        .to_string(),
+                                ),
+                            )
+                            .await?;
+                        }
+                        last_waiting_state = Some("waiting_for_confirm");
+                    }
+                    QrLoginState::Expired => bail!("BBDown access-key QR code expired"),
+                    QrLoginState::Succeeded { credentials } => {
+                        return save_bbdown_login_credentials(
+                            config,
+                            auth_generation,
+                            pending.auth_epoch,
+                            credentials,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+        let sleep_duration = deadline
+            .checked_duration_since(Instant::now())
+            .map_or(Duration::ZERO, |remaining| remaining.min(interval));
+        if !sleep_duration.is_zero() {
+            await_bbdown_login_active(auth_generation, sleep(sleep_duration)).await?;
+        }
+    }
 }
 
 async fn maybe_complete_pending_bilibili_access_key_login(
@@ -2389,8 +2503,9 @@ async fn send_bbdown_auth_ticket(
             timeout_seconds
         ),
         BilibiliAuthLoginMode::AccessKey => {
-            "Scan this BBDown access-key authorization QR, or use the authorization link sent above."
-                .to_string()
+            format!(
+                "Scan this BBDown access-key QR in the Bilibili app. After scanning, confirm the login in the app; credentials will be saved automatically. It expires in {timeout_seconds} seconds."
+            )
         }
     };
     if matches!(mode, BilibiliAuthLoginMode::AccessKey) {
@@ -7540,6 +7655,47 @@ mod tests {
 
         assert_eq!(second.auth_generation, first.auth_generation);
         assert_eq!(second.created_at, first.created_at);
+    }
+
+    #[test]
+    fn automatic_access_key_login_owns_chat_until_exact_ticket_cleanup() {
+        let chat_id = 123;
+        let auth_generation = 42;
+        let ticket_id = 7;
+        let now = Instant::now();
+        let mut logins = HashMap::from([(
+            chat_id,
+            PendingBilibiliAccessKeyLogin {
+                auth_generation,
+                auth_epoch: test_auth_epoch(3),
+                ticket_id,
+                ticket: bilibili_core::create_access_key_ticket()
+                    .expect("access-key ticket should be created"),
+                created_at: now,
+                in_progress: true,
+            },
+        )]);
+
+        assert!(matches!(
+            claim_pending_bilibili_access_key_login(&mut logins, chat_id, now),
+            PendingBilibiliAccessKeyLoginClaim::InProgress
+        ));
+        assert!(!clear_claimed_bilibili_access_key_login(
+            &mut logins,
+            chat_id,
+            auth_generation,
+            ticket_id + 1,
+        ));
+        assert!(clear_claimed_bilibili_access_key_login(
+            &mut logins,
+            chat_id,
+            auth_generation,
+            ticket_id,
+        ));
+        assert!(matches!(
+            claim_pending_bilibili_access_key_login(&mut logins, chat_id, now),
+            PendingBilibiliAccessKeyLoginClaim::Missing
+        ));
     }
 
     #[test]
