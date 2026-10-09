@@ -7210,7 +7210,7 @@ impl Drop for VideoRecoveryState {
     }
 }
 
-fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
+pub(crate) fn video_output_lock_file(root: &RootedFs) -> Result<BoundFile> {
     // Protected property: every process must flock the same inode. The authenticated control
     // directory keeps that inode alive if the legacy root-level path is unlinked.
     let control = video_control_directory(root)?;

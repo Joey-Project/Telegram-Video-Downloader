@@ -100,7 +100,15 @@ pub struct InlineKeyboardMarkup {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct InlineKeyboardButton {
     pub text: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub callback_data: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_app: Option<WebAppInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WebAppInfo {
+    pub url: String,
 }
 
 #[derive(Debug, Serialize)]

@@ -226,6 +226,7 @@ pub struct QueueManager {
     _pdf_owner_lock: Option<QueueOwnerLock>,
     operation_lock: Mutex<()>,
     cancellations: Mutex<HashMap<String, CancellationRegistration>>,
+    publication_notify: Arc<Notify>,
     #[cfg(test)]
     interrupt_after_sidecar_move: AtomicBool,
 }
@@ -324,6 +325,7 @@ impl QueueManager {
             _pdf_owner_lock: pdf_owner_lock,
             operation_lock: Mutex::new(()),
             cancellations: Mutex::new(HashMap::new()),
+            publication_notify: Arc::new(Notify::new()),
             #[cfg(test)]
             interrupt_after_sidecar_move: AtomicBool::new(false),
         };
@@ -343,6 +345,11 @@ impl QueueManager {
         }
         manager.recover_interrupted_tasks()?;
         Ok(manager)
+    }
+
+    /// Subscribe to newly published outputs without polling or rescanning task history.
+    pub fn publication_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.publication_notify)
     }
 
     pub fn create(&self, mut task: TaskRecord) -> Result<bool> {
@@ -403,6 +410,24 @@ impl QueueManager {
             .skip(start)
             .take(QUEUE_PAGE_SIZE)
             .collect())
+    }
+
+    /// Return completed queue records that point to published outputs.
+    ///
+    /// This is used to seed the media library's source hints. It intentionally does not filter
+    /// by chat ID because the local library belongs to the single configured bot instance and
+    /// `allow_all_chats` has no finite configured chat list.
+    pub fn published_records(&self) -> Result<Vec<TaskRecord>> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let mut records = self.video.list_records()?;
+        if !self.video.shares_root(&self.pdf) {
+            records.extend(self.pdf.list_records()?);
+        }
+        records.retain(|record| {
+            record.status == TaskStatus::Completed && record.saved_location.is_some()
+        });
+        records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
+        Ok(records)
     }
 
     pub fn page_count(&self, chat_id: i64, history: bool) -> Result<usize> {
@@ -1005,6 +1030,29 @@ impl QueueManager {
     }
 
     fn complete_if_generation_inner(
+        &self,
+        id: &str,
+        expected_generation: Option<u64>,
+        saved_location: String,
+        media_paths: &[PathBuf],
+        hashes: BTreeMap<String, String>,
+    ) -> Result<Option<TaskRecord>> {
+        let result = self.complete_if_generation_unnotified(
+            id,
+            expected_generation,
+            saved_location,
+            media_paths,
+            hashes,
+        )?;
+        if result.as_ref().is_some_and(|record| {
+            record.status == TaskStatus::Completed && record.saved_location.is_some()
+        }) {
+            self.publication_notify.notify_one();
+        }
+        Ok(result)
+    }
+
+    fn complete_if_generation_unnotified(
         &self,
         id: &str,
         expected_generation: Option<u64>,

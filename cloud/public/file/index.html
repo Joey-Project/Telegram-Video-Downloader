@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#f4f6f4">
+    <meta name="description" content="Browse and organize your local video library.">
+    <title>Video Library</title>
+    <link rel="stylesheet" href="/file/styles.css">
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script type="module" src="/file/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/file/" aria-label="Video Library home">
+          <span class="brand-mark" aria-hidden="true">V</span>
+          <span><strong>Video Library</strong><small>Private file manager</small></span>
+        </a>
+        <div class="connection-wrap">
+          <span id="connection-dot" class="connection-dot" aria-hidden="true"></span>
+          <span id="connection-label">Connecting</span>
+          <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh library" title="Refresh">↻</button>
+        </div>
+      </header>
+
+      <main>
+        <section id="auth-gate" class="auth-gate hidden" aria-live="polite">
+          <div class="auth-icon" aria-hidden="true">↗</div>
+          <h1>Open from Telegram</h1>
+          <p>This private library is available from the bot’s Mini App button. Open it in the owner’s private chat to continue.</p>
+        </section>
+
+        <div id="app-content" class="hidden">
+          <section class="hero">
+            <div>
+              <p class="eyebrow">YOUR PRIVATE LIBRARY</p>
+              <h1>Find it. File it.</h1>
+              <p class="hero-copy">Browse your media, review file changes, and keep every move under your control.</p>
+            </div>
+            <button id="scan-button" class="primary-button" type="button"><span aria-hidden="true">⌕</span> Scan library</button>
+          </section>
+
+          <section id="sync-card" class="sync-card" aria-live="polite">
+            <div class="sync-icon" aria-hidden="true">◷</div>
+            <div class="sync-copy"><strong id="sync-title">Waiting for your computer</strong><span id="sync-detail">Your library appears here after the desktop app connects.</span></div>
+            <span id="sync-badge" class="badge">Not synced</span>
+          </section>
+
+          <nav class="view-tabs" aria-label="Library sections">
+            <button class="view-tab active" data-view="library" type="button" aria-current="page">Library <span id="library-count" class="tab-count">—</span></button>
+            <button class="view-tab" data-view="needs" type="button">Needs organizing <span id="needs-count" class="tab-count">0</span></button>
+            <button class="view-tab" data-view="waiting" type="button">Requests <span id="waiting-count" class="tab-count">0</span></button>
+            <button class="view-tab" data-view="organizing" type="button">Organizing <span id="organizing-count" class="tab-count">0</span></button>
+          </nav>
+
+          <section id="view-library" class="view-panel">
+            <div class="toolbar">
+              <label class="search-box"><span aria-hidden="true">⌕</span><input id="search-input" type="search" placeholder="Search titles, folders, or IDs" autocomplete="off" aria-label="Search library"></label>
+              <select id="category-filter" class="select-control" aria-label="Filter by folder"><option value="">All folders</option></select>
+              <select id="status-filter" class="select-control" aria-label="Filter by file status"><option value="">All statuses</option><option value="present">Available</option><option value="unavailable">Unavailable</option><option value="missing">Missing</option><option value="unknown">Unknown</option></select>
+              <button id="select-visible" class="quiet-button" type="button">Select visible</button>
+            </div>
+            <div id="library-summary" class="section-summary"></div>
+            <div id="library-empty" class="empty-state hidden"><div class="empty-art" aria-hidden="true">▱</div><h2>Your library is ready when you are</h2><p>Start a scan on the connected computer to discover videos and their sidecar files.</p><button class="primary-button" data-scan type="button">Scan library</button></div>
+            <div id="library-list" class="library-list" aria-live="polite"></div>
+          </section>
+
+          <section id="view-needs" class="view-panel hidden">
+            <div class="panel-heading"><div><p class="eyebrow">NEEDS A LOOK</p><h2>Needs organizing</h2><p>Items with incomplete details, uncertain matches, or no collection.</p></div></div>
+            <div id="needs-summary" class="section-summary"></div>
+            <div id="needs-list" class="library-list" aria-live="polite"></div>
+            <div id="needs-empty" class="empty-state hidden"><div class="empty-art" aria-hidden="true">✓</div><h2>Everything looks organized</h2><p>Items needing metadata review or a collection will appear here.</p></div>
+          </section>
+
+          <section id="view-waiting" class="view-panel hidden">
+            <div class="panel-heading"><div><p class="eyebrow">INBOX</p><h2>Waiting for your computer</h2><p>Requests stay here until the desktop app has saved them locally.</p></div></div>
+            <div id="waiting-list" class="stack-list"></div>
+          </section>
+
+          <section id="view-organizing" class="view-panel hidden">
+            <div class="panel-heading"><div><p class="eyebrow">SAFE CHANGES</p><h2>Review before applying</h2><p>Every move and metadata update needs a preview and a separate confirmation.</p></div></div>
+            <section class="organize-card">
+              <div class="organize-card-heading"><span class="step-number">1</span><div><h3>Move selected files</h3><p>Choose a destination and review the complete plan before moving anything.</p></div></div>
+              <div class="organize-controls">
+                <label class="field-label" for="target-dir">Destination folder <span class="field-hint">Use / for nested folders. Leave blank for the library root.</span></label>
+                <div class="directory-row"><input id="target-dir" class="text-control" type="text" maxlength="512" placeholder="e.g. Films/Recently added" list="known-folders"><datalist id="known-folders"></datalist><button id="root-target" class="quiet-button" type="button">Use root</button></div>
+                <div class="option-row"><label class="check-option"><input id="rename-toggle" type="checkbox"><span>Use standard names <small class="field-hint">Series, episode, title, source ID, resolution, and codec when available</small></span></label>
+                  <label class="inline-select">If a file already exists <select id="conflict-select" class="select-control"><option value="skip">Skip it</option><option value="keep_both">Keep both</option></select></label></div>
+                <p class="field-hint naming-help">The preview shows the exact filenames. Related files follow the same media name.</p>
+                <button id="preview-move" class="primary-button" type="button" disabled>Preview move <span aria-hidden="true">→</span></button>
+              </div>
+            </section>
+
+            <section class="organize-card legacy-card">
+              <div class="organize-card-heading"><span class="step-number lavender">2</span><div><h3>Bring in older links</h3><p>Paste a legacy list, then choose exactly which hint belongs to which video.</p></div></div>
+              <label class="field-label" for="legacy-text">Legacy text <span class="field-hint">Up to 256 KB. Nothing is applied until you review and confirm.</span></label>
+              <label class="file-picker">Choose a text file <input id="legacy-file" type="file" accept=".txt,text/plain"></label>
+              <textarea id="legacy-text" class="text-control legacy-input" maxlength="262144" placeholder="Paste titles, source links, or an older library list…"></textarea>
+              <div class="legacy-footer"><span id="legacy-size" class="field-hint">0 / 256 KB</span><button id="import-legacy" class="secondary-button" type="button">Read legacy list</button></div>
+              <div id="legacy-mappings" class="legacy-mappings hidden"></div>
+            </section>
+            <div id="preview-list" class="stack-list"></div>
+            <div id="operation-list" class="stack-list"></div>
+          </section>
+        </div>
+      </main>
+      <footer class="footer"><span>Actions run on your connected computer.</span><span id="queued-actions"></span></footer>
+      <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+    </div>
+  </body>
+</html>

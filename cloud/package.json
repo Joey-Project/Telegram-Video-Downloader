@@ -1,0 +1,17 @@
+{
+  "name": "telegram-video-downloader-cloud",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "typecheck": "wrangler types && tsc --noEmit && tsc -p test/tsconfig.json --noEmit && node --check public/file/app.js && node --check public/file/action-queue.js && node --check public/file/state-view.js && node --check public/file/legacy-mapping-state.js && node --check public/file/metadata-preview.js",
+    "test": "vitest run",
+    "build": "wrangler deploy --dry-run --outdir .wrangler-build"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.11",
+    "wrangler": "4.149.0"
+  }
+}

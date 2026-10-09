@@ -10,6 +10,8 @@
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
 - `/queue` 查看可操作的持久任务；可以恢复中断任务、重试失败任务或取消任务，`/queue history` 查看已完成和已取消记录。重启后需要重新选择的任务会重新显示选择项；下载计划或媒体规格变化时，bot 会暂停并要求确认。
+- 可选的 Cloudflare 接收模式把 Telegram 更新先写入 D1，再通过休眠 WebSocket 通知本机；断线后经 HTTPS 补领。本机落盘后才确认接收，Telegram 回复仍由本机直接发送。
+- 启用云端模式后，`/file` 打开文件管理 Mini App：扫描下载根目录、搜索和选择媒体、预览整理方案，再确认移动视频及可靠关联的附件。旧消息线索可用于补齐 NFO，无需重新下载完整视频。
 - macOS 上队列索引和记录通过 File Provider 协调读写，云端占位内容可在读取时按需物化。若系统无法协调访问，bot 会提示检查 Finder 中隐藏队列目录的下载状态并重试；读取失败不会清理队列或 staging 数据。
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
@@ -34,6 +36,8 @@ cp config.example.toml config.toml
 - PDF：`~/Documents/Downloads`
 
 `telegram.allowed_chat_ids` 必须配置为允许使用这个 bot 的 chat id。个人私聊通常是你的用户 chat id；群组使用群组 chat id。确实需要临时放开时，可以显式设置 `allow_all_chats = true`。
+
+云端文件管理首期仅支持单一用户私聊。示例配置中的 `[cloud]` 默认保持注释，未配置时继续使用现有长轮询。云端资源、私有密钥和 webhook 切换步骤见 [Cloud ingress and file management](docs/CLOUD_FILE_MANAGEMENT.md) 和 [Cloud Worker](cloud/README.md)。本地测试和构建不会切换 webhook 或重启已安装的 bot；`/settings` 与新下载位置选择留待下一阶段设计。
 
 `pdf.auto_domains` 默认包含 `mp.weixin.qq.com`。Bilibili 视频和 YouTube 链接始终优先按视频处理，不会被 PDF 白名单吞掉；Bilibili `opus` 文章链接会自动走 PDF，并丢弃分享 query 参数。Bilibili `opus` PDF 会使用 archive print 样式隐藏页面导航、目录、分享和反馈控件，保留作者、标题、正文、图片和版权信息。
 
