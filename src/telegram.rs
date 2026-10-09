@@ -204,7 +204,7 @@ impl TelegramClient {
         let text = prepare_outbound_text(text, policy);
         info!(
             chat_id,
-            text = %redact_sensitive_text(&text),
+            text = %outbound_log_text(&text, policy),
             "telegram outbound message"
         );
         let payload = SendMessageRequest {
@@ -454,6 +454,13 @@ fn prepare_outbound_text(text: String, policy: OutboundTextPolicy) -> String {
     }
 }
 
+fn outbound_log_text(text: &str, policy: OutboundTextPolicy) -> String {
+    match policy {
+        OutboundTextPolicy::RedactCredentials => redact_sensitive_text(text),
+        OutboundTextPolicy::AllowAuthSecret => "<redacted authorization message>".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,6 +531,22 @@ mod tests {
 
         assert!(!redacted.contains("secret"));
         assert_eq!(explicit, text);
+    }
+
+    #[test]
+    fn authorization_links_reach_the_chat_without_reaching_logs() {
+        // synthetic-token-fixtures: joey-private-v3 / access-a.
+        let auth_code = "codex_synth_v1_access_a";
+        let text = format!(
+            "Authorization link:\nhttps://passport.bilibili.com/login/app/third?auth_code={auth_code}"
+        );
+        assert_eq!(
+            prepare_outbound_text(text.clone(), OutboundTextPolicy::AllowAuthSecret),
+            text
+        );
+        let log = outbound_log_text(&text, OutboundTextPolicy::AllowAuthSecret);
+        assert!(!log.contains(auth_code));
+        assert!(!log.contains("passport.bilibili.com"));
     }
 
     #[test]
