@@ -101,3 +101,31 @@ superseded_by:
   startup-coordination block is unresolved. The canonical release path currently
   contains the fixed binary; the original binary and bounded diagnostic samples
   remain in the task-scoped temporary directory for recovery.
+
+## Signing Diagnosis and Deployment Policy
+
+- Independent read-only probes opened both download roots and completed default
+  `NSFileCoordinator` reads from background threads immediately, including file
+  URLs with the same non-directory hint as the Rust wrapper. This did not reproduce
+  the bot's process-specific wait and reduced the likelihood of a path, URL-hint,
+  materialization, or queue-owner-lock explanation.
+- Scoped TCC logs on 2026-10-09 reported a Documents code-requirement mismatch
+  after the release build. The trusted original used identifier
+  `io.github.telegram-local-downloader.bot` and certificate root fingerprint
+  `C24FE0C91539BD95BA4081CD944A8E17053FB304`; the rebuilt release instead used
+  linker ad-hoc signing with a `cdhash`-only requirement.
+- Restored the existing `Telegram Video Downloader Local Signing` identity on
+  a staged copy. `codesign --verify --strict --verbose=2 --test-requirement`
+  confirmed signature integrity and the exact existing identifier/certificate
+  requirement before atomic deployment to the canonical path.
+- The restarted canonical process is recognized by TCC under the original
+  identifier. Startup is still unverified. TCC also retains a Full Disk Access
+  grant tied to an old `cdhash`; the initial Documents prompting request has no
+  completion in the scoped evidence. These observations do not prove that signing
+  alone resolves every remaining access wait. No TCC reset, database modification,
+  or broader privacy grant was performed.
+- Added repo-level `AGENTS.md` and `docs/macos-bot-signing.md`: preserve the existing
+  identity, isolate release build output from the live executable, sign and verify
+  before deployment, and require readiness evidence after restarting. Documentation
+  validation used `git diff --check`, project-journal validation, and existence
+  checks for the new Markdown links. Runtime code and test fixtures were unchanged.
