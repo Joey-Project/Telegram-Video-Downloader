@@ -144,9 +144,28 @@ superseded_by:
 - Non-sandbox `codesign --verify --strict --verbose=2 --test-requirement` confirms
   the deployed binary matches the original identifier/certificate requirement.
   The sandbox-only certificate trust error was not a bad application signature.
-- Automatic access-key QR login is deployed and available. Actual account
-  scan/confirmation and credential-backed resolver validation still require
-  Joey to initiate `/bbdown login access-key` and complete authorization.
+- Automatic access-key QR login was verified with Joey's actual account at
+  2026-10-09 16:31 UTC: the bot observed scanning and saved the access-key after
+  app confirmation, without manual callback extraction.
 - The original binary and bounded build/test/sample evidence remain in
   `/private/tmp/telegram-access-key-flow` for rollback and follow-up. The separate
   directory-coordination probe and generated Swift module cache were cleaned up.
+
+## Credential-Backed Bangumi Follow-Up
+
+- At 16:31:46 UTC, the new `md1376` latest-episode job failed during plan probing
+  with API code `-10403` (region unavailable). The live bot configuration has no
+  restricted-area API proxies configured, so this job used the official API.
+- At 16:33:54 UTC, an ordinary Bilibili video completed downloading, muxing,
+  publication, and verification. Directory access and the ordinary download
+  pipeline are operational.
+- After Joey explicitly authorized access-key egress to `https://bili.lli.cx`,
+  a bounded probe used the newly saved generic access-key, without forwarding
+  Web cookies or following redirects. For `ep247472`, both `/pgc/player/web/playurl`
+  and `/pgc/player/web/v2/playurl` returned `-10403` in all three configured probe
+  areas (`cn`, `hk`, `tw`), with no playable streams. Official anonymous season
+  metadata returned all 203 episodes successfully.
+- Earlier success recorded for this proxy concerned a different series and
+  episode. These results do not establish that the proxy can resolve `md1376`.
+  No ineffective proxy configuration was installed and the service was not
+  restarted during this follow-up.
