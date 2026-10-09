@@ -169,3 +169,24 @@ superseded_by:
   episode. These results do not establish that the proxy can resolve `md1376`.
   No ineffective proxy configuration was installed and the service was not
   restarted during this follow-up.
+
+## Other Public Resolver Probes
+
+- Joey requested testing other servers in the stored proxy catalog. Anonymous
+  probes covered 19 other hosts, excluding the previously tested `bili.lli.cx`
+  and the SEA-only entry. The initial pass made 23 requests; a mainland/Taiwan
+  follow-up to `bilibili.suysker.xyz` made four more. No playable streams were
+  found in these anonymous responses.
+- `atri.ink` explicitly required `access_key`; `bili.nepnep.moe` and
+  `bstar.kirara-fantasia.moe` reported that the account was not logged in.
+  `bilibili.suysker.xyz` reported a region restriction for Hong Kong/Taiwan and
+  an unsigned-in account for mainland China. These are credential-gated
+  candidates, not verified working resolvers for this episode.
+- Other responses included a disabled Web API, HTTP 404/567, invalid JSON,
+  redirects, and transport failures. Transport failures were recorded without
+  asserting that every failure was DNS-related. Credential egress to these
+  hosts was not performed; the existing authorization covered `bili.lli.cx`.
+- Each request was bounded to eight seconds and 1 MiB, redirects were disabled,
+  concurrency was capped at four, and the initial run had a 180-second deadline.
+  Anonymous probe scripts and compact JSON reports were retained under
+  `/private/tmp/telegram-other-resolvers-20261009` for follow-up.
