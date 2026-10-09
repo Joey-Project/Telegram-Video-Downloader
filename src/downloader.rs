@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
@@ -22,6 +22,7 @@ use bbdown_core::{
     VideoCollectionKind, VideoCollectionMetadata, VideoCollectionResolution,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -3037,6 +3038,20 @@ async fn run_bilibili_job_locked(
             progress.clone(),
         )
         .await?;
+    } else {
+        for entry in &report.entries {
+            for input in bilibili_entry_media_inputs(&output_dir, entry) {
+                verify_downloaded_media_path(
+                    config,
+                    root,
+                    &input.path,
+                    input.kind != "audio",
+                    progress.clone(),
+                    CommandExecutionPolicy::BILIBILI_MUX,
+                )
+                .await?;
+            }
+        }
     }
     cleanup_bilibili_mux_input_files(root, &mut report)?;
     let primary_videos = bilibili_report_primary_media(&output_dir, &report);
@@ -3634,6 +3649,30 @@ impl ReservedMuxOutput {
         self.staging_dir_entry.path()
     }
 
+    fn validate_for_verification(&self) -> Result<()> {
+        if self.root.entry_identity(self.staging_dir_entry.path())?
+            != Some(self.staging_dir_identity)
+        {
+            bail!(
+                "Bilibili mux staging directory access path changed: {}",
+                self.staging_dir_entry.path().display()
+            );
+        }
+        if self.root.bound_entry_identity(&self.staged_entry)? != Some(self.file.identity()) {
+            bail!(
+                "reserved Bilibili mux output identity changed: {}",
+                self.staged_entry.path().display()
+            );
+        }
+        if self.file.byte_len()? == 0 {
+            bail!(
+                "Bilibili mux command did not write the reserved output: {}",
+                self.staged_entry.path().display()
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn staged_path(&self) -> &Path {
         self.staged_entry.path()
@@ -4079,6 +4118,16 @@ async fn mux_bilibili_report_media(
                 )
             );
         }
+        output_reservation.validate_for_verification()?;
+        verify_downloaded_media_file(
+            config,
+            output_reservation.bound_file(),
+            &output_path,
+            media_inputs.iter().any(|input| input.kind != "audio"),
+            progress.clone(),
+            CommandExecutionPolicy::BILIBILI_MUX,
+        )
+        .await?;
         let (bound_output, recovery) = output_reservation.commit()?;
         entry.mux = Some(BilibiliMuxReport {
             output_path,
@@ -4092,6 +4141,177 @@ async fn mux_bilibili_report_media(
             .expect("Bilibili mux state was just installed");
         cleanup_bilibili_mux_entry_inputs(root, mux)?;
     }
+    Ok(())
+}
+
+async fn verify_downloaded_media_path(
+    config: &AppConfig,
+    root: &RootedFs,
+    path: &Path,
+    require_video: bool,
+    progress: Option<JobProgressSender>,
+    policy: CommandExecutionPolicy,
+) -> Result<()> {
+    let file = root
+        .open_bound_file(path)?
+        .with_context(|| format!("media verification input is missing: {}", path.display()))?;
+    verify_downloaded_media_file(config, &file, path, require_video, progress, policy).await?;
+    if root.entry_identity(path)? != Some(file.identity()) {
+        bail!(
+            "media verification input identity changed: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+async fn verified_media_digest(file: &BoundFile) -> Result<[u8; 32]> {
+    let file = file.clone();
+    tokio::task::spawn_blocking(move || {
+        file.validate_identity()?;
+        let length = file.byte_len()?;
+        if length == 0 {
+            bail!("media verification input is empty");
+        }
+        let mut reader = file.duplicate_std_file()?;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut limited = reader.take(length.saturating_add(1));
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        let mut read_length = 0_u64;
+        loop {
+            let count = limited.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            read_length += count as u64;
+            digest.update(&buffer[..count]);
+        }
+        // Duplicated descriptors share offsets. Rewind before FFmpeg inherits this file.
+        limited.into_inner().seek(SeekFrom::Start(0))?;
+        file.validate_identity()?;
+        if read_length != length || file.byte_len()? != length {
+            bail!("media content length changed while hashing");
+        }
+        Ok(digest.finalize().into())
+    })
+    .await
+    .context("media verification hashing task failed")?
+}
+
+fn media_decode_completed(stdout: &[u8], require_video: bool) -> bool {
+    let progress = String::from_utf8_lossy(stdout);
+    let mut ended = false;
+    let mut positive_time = false;
+    let mut positive_frames = false;
+    for line in progress.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        match key {
+            "progress" => ended = value == "end",
+            "out_time_us" => positive_time |= value.parse::<u64>().is_ok_and(|value| value > 0),
+            "frame" => positive_frames |= value.trim().parse::<u64>().is_ok_and(|value| value > 0),
+            _ => {}
+        }
+    }
+    ended && positive_time && (!require_video || positive_frames)
+}
+
+async fn verify_downloaded_media_file(
+    config: &AppConfig,
+    file: &BoundFile,
+    path: &Path,
+    require_video: bool,
+    progress: Option<JobProgressSender>,
+    policy: CommandExecutionPolicy,
+) -> Result<()> {
+    let label = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    send_progress(
+        progress.as_ref(),
+        format!("Playback check: decoding {label}"),
+    );
+    // Protect object identity and content stability; timestamp or materialization changes
+    // alone do not invalidate the decoded media. SHA-256 comparisons bind both checks
+    // to the same bytes, while descriptor identity prevents opening a substituted path.
+    let before = verified_media_digest(file).await?;
+    let descriptor = select_bilibili_mux_inherited_fd_base(1)?;
+    let spec = CommandSpec {
+        program: config.tools.ffmpeg.clone(),
+        args: [
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-xerror",
+            "-err_detect",
+            "explode",
+            "-threads",
+            "4",
+            "-protocol_whitelist",
+            BILIBILI_FFMPEG_CONCAT_PROTOCOL_WHITELIST,
+            "-fd",
+            &descriptor.to_string(),
+            "-i",
+            "fd:",
+            "-map",
+            "0:v?",
+            "-map",
+            "0:a?",
+            "-fps_mode:v",
+            "passthrough",
+            "-enc_time_base:v",
+            "demux",
+            "-stats_period",
+            "5",
+            "-progress",
+            "pipe:1",
+            "-f",
+            "null",
+            "-",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        cwd: path
+            .parent()
+            .unwrap_or(&config.downloads.video_dir)
+            .to_path_buf(),
+        activity_dir: None,
+        cleanup_paths: Vec::new(),
+        inherited_fd_base: Some(descriptor),
+    };
+    let output = run_command_with_execution_context(
+        config,
+        &spec,
+        None,
+        std::slice::from_ref(file),
+        progress.clone(),
+        policy,
+    )
+    .await
+    .with_context(|| format!("playback verification failed: {}", path.display()))?;
+    if !output.status.success() || !media_decode_completed(&output.stdout, require_video) {
+        bail!(
+            "playback verification failed for {} (status {}): full audio/video decode did not complete\n{}",
+            path.display(),
+            output.status,
+            summarize_output(
+                &String::from_utf8_lossy(&output.stdout),
+                &String::from_utf8_lossy(&output.stderr)
+            ),
+        );
+    }
+    if verified_media_digest(file).await? != before {
+        bail!(
+            "media content changed during playback verification: {}",
+            path.display()
+        );
+    }
+    send_progress(progress.as_ref(), format!("Playback check passed: {label}"));
     Ok(())
 }
 
@@ -4203,11 +4423,11 @@ fn bilibili_local_mux_command_spec(
     let output_index = inherited_files.len();
     inherited_files.push(output.clone());
     let output_descriptor = inherited_command_descriptor(output_index, inherited_fd_base)?;
+    // Keep moov at the end: faststart reopens fd: for reading, and the duplicated
+    // descriptor shares the writer's file offset, corrupting the second-pass move.
     args.extend([
         "-c".to_string(),
         "copy".to_string(),
-        "-movflags".to_string(),
-        "+faststart".to_string(),
         "-f".to_string(),
         "mp4".to_string(),
         "-fd".to_string(),
@@ -6073,6 +6293,20 @@ async fn run_staged_video_job(
             "staged video download finished but no primary media files were found in {}",
             staging_dir.display()
         );
+    }
+
+    if matches!(job, JobRequest::Youtube { .. }) {
+        for path in &staged_media {
+            verify_downloaded_media_path(
+                config,
+                &root,
+                path,
+                true,
+                progress.clone(),
+                CommandExecutionPolicy::EXTERNAL,
+            )
+            .await?;
+        }
     }
 
     if config.video.write_nfo
@@ -9513,6 +9747,15 @@ fn summarize_progress_chunk(
     stream: CommandStream,
     text: &str,
 ) -> Option<String> {
+    if matches!(stream, CommandStream::Stdout)
+        && command_name.to_ascii_lowercase().contains("ffmpeg")
+        && let Some(media_time) = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("out_time="))
+            .rfind(|value| value.contains(':'))
+    {
+        return Some(format!("Playback check: decoded {}", media_time.trim()));
+    }
     if let Some(percent) = extract_last_percent(text) {
         return Some(format!("{command_name}: {percent}%"));
     }
@@ -21517,6 +21760,7 @@ mod tests {
         assert!(spec.args.windows(2).any(|args| args == ["-map", "1:0"]));
         assert!(!spec.args.windows(2).any(|args| args == ["-f", "concat"]));
         assert!(spec.args.windows(2).any(|args| args == ["-f", "mp4"]));
+        assert!(!spec.args.iter().any(|arg| arg.contains("faststart")));
         assert!(spec.args.windows(2).any(|args| args == ["-fd", "66"]));
         assert_eq!(spec.args.last().map(String::as_str), Some("fd:"));
         assert_eq!(
@@ -21524,6 +21768,281 @@ mod tests {
             "user-owned"
         );
         let _ = fs::remove_dir_all(entry_dir);
+    }
+
+    #[test]
+    fn media_decode_requires_completed_positive_audio_video_output() {
+        assert!(!media_decode_completed(b"", true));
+        assert!(!media_decode_completed(
+            b"frame=12\nout_time_us=1000000\nprogress=continue\n",
+            true
+        ));
+        assert!(!media_decode_completed(
+            b"frame=0\nout_time_us=1000000\nprogress=end\n",
+            true
+        ));
+        assert!(!media_decode_completed(
+            b"frame=12\nout_time_us=0\nprogress=end\n",
+            true
+        ));
+        assert!(media_decode_completed(
+            b"frame=12\nout_time_us=1000000\nprogress=end\n",
+            true
+        ));
+        assert!(media_decode_completed(
+            b"frame=0\nout_time_us=1000000\nprogress=end\n",
+            false
+        ));
+    }
+
+    #[test]
+    fn playback_progress_reports_decoded_time() {
+        assert_eq!(
+            summarize_progress_chunk(
+                "ffmpeg",
+                CommandStream::Stdout,
+                "out_time=00:01:30.500000\nprogress=continue\n"
+            ),
+            Some("Playback check: decoded 00:01:30.500000".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn playback_check_accepts_metadata_churn_but_rejects_content_and_object_changes() {
+        for (label, action, should_pass) in [
+            (
+                "metadata-churn",
+                "touch clip.mp4; printf helper > transient; rm transient",
+                true,
+            ),
+            ("content-change", "printf changed! > clip.mp4", false),
+            (
+                "object-change",
+                "mv clip.mp4 old.mp4; printf original > clip.mp4",
+                false,
+            ),
+        ] {
+            let directory = temp_test_dir(label);
+            let media = directory.join("clip.mp4");
+            fs::write(&media, "original").unwrap();
+            let ffmpeg = directory.join("fake-ffmpeg.sh");
+            fs::write(&ffmpeg, format!("#!/bin/sh\n{action}\nprintf 'frame=1\\nout_time_us=1000000\\nprogress=end\\n'\n")).unwrap();
+            fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o700)).unwrap();
+            let mut config = test_config();
+            config.tools.ffmpeg = ffmpeg;
+            let rooted = RootedFs::new(&directory).unwrap();
+            let result = verify_downloaded_media_path(
+                &config,
+                &rooted,
+                &media,
+                true,
+                None,
+                CommandExecutionPolicy::EXTERNAL,
+            )
+            .await;
+            if should_pass {
+                result.expect("metadata and child-entry churn must not invalidate identical media");
+            } else {
+                let error = result
+                    .expect_err("changed bytes or object identity must invalidate verification");
+                assert!(format!("{error:#}").contains("changed"));
+            }
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_failed_mux_playback_check_retains_inputs(verify_script: &str, label: &str) {
+        let root = temp_test_dir(label);
+        let video = root.join("video.m4s");
+        let audio = root.join("audio.m4s");
+        fs::write(&video, "original-video").unwrap();
+        fs::write(&audio, "original-audio").unwrap();
+        let ffmpeg = root.join("fake-ffmpeg.sh");
+        fs::write(&ffmpeg, format!(
+            "#!/bin/sh\nfor arg do\n    if test \"$arg\" = -progress; then\n        {verify_script}\n    fi\ndone\noutput_fd=\nnext_is_fd=no\nfor arg do\n    if test \"$next_is_fd\" = yes; then\n        output_fd=$arg\n        next_is_fd=no\n    elif test \"$arg\" = -fd; then\n        next_is_fd=yes\n    fi\ndone\ntest -n \"$output_fd\" || exit 41\neval \"printf corrupt-output >&$output_fd\"\n"
+        )).unwrap();
+        fs::set_permissions(&ffmpeg, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = test_config();
+        config.tools.ffmpeg = ffmpeg;
+        config.bot.command_timeout_seconds = 10;
+        config.bot.command_idle_timeout_seconds = 10;
+        let mut report = parse_bilibili_download_report(
+            r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","files":[{"kind":"video","path":"video.m4s"},{"kind":"audio","path":"audio.m4s"}]}]}"#,
+        ).unwrap();
+        let rooted = RootedFs::new(&root).unwrap();
+        let error =
+            mux_bilibili_report_media(&config, &rooted, &root, &mut report, UNIX_EPOCH, None)
+                .await
+                .expect_err("successful mux must still pass the playback check");
+        assert!(format!("{error:#}").contains("playback verification failed"));
+        assert_eq!(fs::read_to_string(video).unwrap(), "original-video");
+        assert_eq!(fs::read_to_string(audio).unwrap(), "original-audio");
+        assert!(!root.join("Episode.mp4").exists());
+        assert!(report.entries[0].mux.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_mux_rejects_a_failed_playback_check_and_retains_raw_streams() {
+        assert_failed_mux_playback_check_retains_inputs(
+            "printf 'decode error\\n' >&2; exit 2",
+            "mux-playback-failed",
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bilibili_mux_rejects_success_without_decoded_media_and_retains_raw_streams() {
+        assert_failed_mux_playback_check_retains_inputs("exit 0", "mux-playback-empty").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires real FFmpeg with fd: support"]
+    async fn bilibili_mux_rejects_corrupt_media_with_real_ffmpeg() {
+        assert_failed_mux_playback_check_retains_inputs(
+            "exec ffmpeg \"$@\"",
+            "mux-playback-real-corrupt",
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires real FFmpeg with fd: support, libx264 and AAC encoders"]
+    async fn bilibili_fd_mux_preserves_streams_and_decodes_with_real_ffmpeg() {
+        async fn checked_ffmpeg(mut command: Command) -> std::process::Output {
+            command.kill_on_drop(true);
+            let output = tokio_timeout(Duration::from_secs(30), command.output())
+                .await
+                .expect("FFmpeg test command should finish within 30 seconds")
+                .expect("real FFmpeg should run");
+            assert!(
+                output.status.success(),
+                "FFmpeg failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        }
+
+        async fn stream_hash(ffmpeg: &Path, path: &Path, selector: &str) -> Vec<u8> {
+            let mut command = Command::new(ffmpeg);
+            command
+                .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+                .arg(path)
+                .args([
+                    "-map", selector, "-c", "copy", "-f", "hash", "-hash", "sha256", "-",
+                ]);
+            let output = checked_ffmpeg(command).await.stdout;
+            assert!(output.starts_with(b"SHA256="));
+            output
+        }
+
+        let root = temp_test_dir("bilibili-fd-mux-real-ffmpeg");
+        let video = root.join("video.m4s");
+        let audio = root.join("audio.m4s");
+        let mut config = test_config();
+        config.tools.ffmpeg = PathBuf::from("ffmpeg");
+        config.bot.command_timeout_seconds = 30;
+        config.bot.command_idle_timeout_seconds = 30;
+        let mut generate = Command::new(&config.tools.ffmpeg);
+        generate
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x180:rate=30",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100",
+                "-map",
+                "0:v:0",
+                "-t",
+                "2",
+                "-c:v",
+                "libx264",
+                "-threads",
+                "1",
+                "-preset",
+                "ultrafast",
+                "-f",
+                "mp4",
+            ])
+            .arg(&video)
+            .args(["-map", "1:a:0", "-t", "2", "-c:a", "aac", "-f", "mp4"])
+            .arg(&audio);
+        checked_ffmpeg(generate).await;
+        let expected_video = stream_hash(&config.tools.ffmpeg, &video, "0:v:0").await;
+        let expected_audio = stream_hash(&config.tools.ffmpeg, &audio, "0:a:0").await;
+        let mut report = parse_bilibili_download_report(
+            r#"{"title":"Episode","output_dir":".","entries":[{"index":1,"title":"Episode","files":[{"kind":"video","path":"video.m4s"},{"kind":"audio","path":"audio.m4s"}]}]}"#,
+        )
+        .expect("fixture download report should parse");
+        let rooted = RootedFs::new(&root).expect("output root should bind");
+        for (path, require_video) in [(&video, true), (&audio, false)] {
+            verify_downloaded_media_path(
+                &config,
+                &rooted,
+                path,
+                require_video,
+                None,
+                CommandExecutionPolicy::EXTERNAL,
+            )
+            .await
+            .expect("standalone video and audio streams should pass full decoding");
+        }
+        mux_bilibili_report_media(&config, &rooted, &root, &mut report, UNIX_EPOCH, None)
+            .await
+            .expect("descriptor-bound mux should succeed");
+        let mux = report.entries[0]
+            .mux
+            .as_ref()
+            .expect("mux output should be reported");
+        assert!(mux.output_path.is_file());
+        assert!(!video.exists(), "committed mux should clean the raw video");
+        assert!(!audio.exists(), "committed mux should clean the raw audio");
+        assert_eq!(
+            stream_hash(&config.tools.ffmpeg, &mux.output_path, "0:v:0").await,
+            expected_video,
+            "every encoded video packet should survive the mux"
+        );
+        assert_eq!(
+            stream_hash(&config.tools.ffmpeg, &mux.output_path, "0:a:0").await,
+            expected_audio,
+            "every encoded audio packet should survive the mux"
+        );
+        let mut decode = Command::new(&config.tools.ffmpeg);
+        decode
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-xerror",
+                "-threads",
+                "1",
+                "-i",
+            ])
+            .arg(&mux.output_path)
+            .args(["-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"]);
+        let decoded = checked_ffmpeg(decode).await;
+        assert!(
+            decoded.stderr.is_empty(),
+            "full decode should report no errors"
+        );
+        drop(report);
+        drop(rooted);
+        fs::remove_dir_all(root).expect("FFmpeg fixture directory should clean up");
     }
 
     #[cfg(unix)]
@@ -21743,6 +22262,12 @@ printf ancestor-replacement > ancestor-replacement-proof
         fs::write(
             &fake_ffmpeg,
             r#"#!/bin/sh
+for arg do
+    if test "$arg" = -progress; then
+        printf 'frame=1\nout_time_us=1000000\nprogress=end\n'
+        exit 0
+    fi
+done
 input=
 input_fd=
 output_fd=
@@ -21869,6 +22394,7 @@ mv video.original video.m4s || exit 46
         );
         assert!(!spec.args.iter().any(|arg| arg.starts_with("/dev/fd/")));
         assert!(spec.args.windows(2).any(|args| args == ["-f", "mp4"]));
+        assert!(!spec.args.iter().any(|arg| arg.contains("faststart")));
         assert!(spec.args.windows(2).any(|args| args == ["-fd", "67"]));
         assert_eq!(spec.args.last().map(String::as_str), Some("fd:"));
         drop(concat_file);
@@ -23762,7 +24288,7 @@ mv video.original video.m4s || exit 46
         let fake_ffmpeg = root.join("fake-ffmpeg.sh");
         fs::write(
             &fake_ffmpeg,
-            "#!/bin/sh\noutput_fd=\nnext_is_fd=no\nfor arg do\n    if test \"$next_is_fd\" = yes; then\n        output_fd=$arg\n        next_is_fd=no\n    elif test \"$arg\" = -fd; then\n        next_is_fd=yes\n    fi\ndone\ntest -n \"$output_fd\" || exit 41\nprintf '%s' \"$output_fd\" > mux-output-fd\neval \"printf muxed >&$output_fd\"\n",
+            "#!/bin/sh\nfor arg do\n    if test \"$arg\" = -progress; then\n        printf 'frame=1\\nout_time_us=1000000\\nprogress=end\\n'\n        exit 0\n    fi\ndone\noutput_fd=\nnext_is_fd=no\nfor arg do\n    if test \"$next_is_fd\" = yes; then\n        output_fd=$arg\n        next_is_fd=no\n    elif test \"$arg\" = -fd; then\n        next_is_fd=yes\n    fi\ndone\ntest -n \"$output_fd\" || exit 41\nprintf '%s' \"$output_fd\" > mux-output-fd\neval \"printf muxed >&$output_fd\"\n",
         )
         .expect("fake ffmpeg should write");
         fs::set_permissions(&fake_ffmpeg, fs::Permissions::from_mode(0o700))
