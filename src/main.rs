@@ -1,8 +1,13 @@
 mod bilibili_auth;
 mod bilibili_core;
+mod cloud;
+#[cfg(test)]
+mod cloud_bot_tests;
 mod config;
 mod downloader;
+mod file_manager;
 mod file_provider;
+mod library;
 mod queue;
 mod redaction;
 mod router;
@@ -28,7 +33,11 @@ use tokio::sync::{Mutex, Notify, Semaphore, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
 
-use crate::config::AppConfig;
+use crate::cloud::{
+    CloudClient, CloudInbox, CloudRequest, CloudSettings, CloudState, CloudWebSocket, InboxRecord,
+    InboxStatus, next_websocket_request, now_millis, now_seconds,
+};
+use crate::config::{AppConfig, CloudConfig};
 use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
     BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
@@ -37,7 +46,11 @@ use crate::downloader::{
     job_progress_channel, recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both, sync_bilibili_rust_credentials,
 };
+use crate::file_manager::LibraryManager;
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
+use crate::library::{
+    ConflictPolicy, HintOrigin, LibrarySnapshot, MetadataPatch, MovePreview, SourceHint,
+};
 use crate::queue::{
     PlanValidationSnapshot, QueueManager, RestartSummary, TaskRecord, TaskStatus,
     hash_primary_media, sanitize_job_for_storage,
@@ -45,11 +58,12 @@ use crate::queue::{
 use crate::redaction::redact_sensitive_text;
 use crate::router::{
     BilibiliAuthCommand, BilibiliAuthLoginMode, BilibiliSelection, JobRequest, RouteResult,
-    bilibili_selection_from_url, bilibili_url_ep_id_selects_episode, is_b23_short_link_url,
-    is_bilibili_ugc_collection_url, route_message,
+    bilibili_bvid_from_url, bilibili_selection_from_url, bilibili_url_ep_id_selects_episode,
+    is_b23_short_link_url, is_bilibili_ugc_collection_url, route_message,
 };
 use crate::telegram::{
     BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, TelegramClient, Update,
+    WebAppInfo,
 };
 
 static BILIBILI_LOGIN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -307,6 +321,17 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
         duplicate_scan_semaphore: Arc::new(Semaphore::new(config.bot.concurrency)),
     };
     let next_job_id = Arc::new(AtomicU64::new(1));
+    if let Some(cloud_config) = &config.cloud {
+        let context = BotContext {
+            telegram: telegram.clone(),
+            config: Arc::clone(&config),
+            job_dispatch,
+            next_job_id,
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        };
+        return run_cloud_bot(context, cloud_config.clone(), &mut shutdown).await;
+    }
     let mut offset = None;
 
     info!(
@@ -355,6 +380,1743 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
     }
 
     Ok(())
+}
+
+#[derive(Clone)]
+struct CloudBotRuntime {
+    bot: BotContext,
+    client: CloudClient,
+    inbox: Arc<CloudInbox>,
+    request_notify: Arc<Notify>,
+    state_notify: Arc<Notify>,
+    library_snapshot: Arc<Mutex<Option<LibrarySnapshot>>>,
+    library_scan_warning: Arc<Mutex<Option<String>>>,
+    telegram_dispatch: Arc<Semaphore>,
+    management_dispatch: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+struct CloudStateSnapshot {
+    revision: String,
+    library: serde_json::Value,
+    previews: Vec<serde_json::Value>,
+    operations: Vec<serde_json::Value>,
+    tasks: Vec<serde_json::Value>,
+    download_dir: String,
+}
+
+impl CloudStateSnapshot {
+    fn fingerprint(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(&serde_json::json!({
+            "revision": self.revision,
+            "library": self.library,
+            "previews": self.previews,
+            "operations": self.operations,
+            "tasks": self.tasks,
+            "settings": {"download_dir": self.download_dir},
+        }))
+        .context("failed to fingerprint local cloud state")
+    }
+
+    async fn post(&self, runtime: &CloudBotRuntime, state_version: u64) -> Result<()> {
+        let state = CloudState {
+            state_version,
+            revision: Some(&self.revision),
+            reported_at: now_millis(),
+            library: &self.library,
+            previews: &self.previews,
+            operations: &self.operations,
+            tasks: &self.tasks,
+            settings: CloudSettings {
+                download_dir: &self.download_dir,
+            },
+        };
+        runtime.client.post_state(&state).await
+    }
+}
+
+struct PendingCloudState {
+    snapshot: CloudStateSnapshot,
+    fingerprint: Vec<u8>,
+    state_version: u64,
+}
+
+async fn run_cloud_bot(
+    bot: BotContext,
+    cloud_config: CloudConfig,
+    shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
+) -> Result<()> {
+    let client = CloudClient::new(&cloud_config)?;
+    let inbox_root = bot.config.downloads.video_dir.clone();
+    let Some(inbox) = retry_file_provider_startup_operation(
+        move || CloudInbox::open(&inbox_root),
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        shutdown,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    let runtime = CloudBotRuntime {
+        bot,
+        client,
+        inbox: Arc::new(inbox),
+        request_notify: Arc::new(Notify::new()),
+        state_notify: Arc::new(Notify::new()),
+        library_snapshot: Arc::new(Mutex::new(None)),
+        library_scan_warning: Arc::new(Mutex::new(None)),
+        telegram_dispatch: Arc::new(Semaphore::new(1)),
+        management_dispatch: Arc::new(Semaphore::new(1)),
+    };
+
+    info!(
+        fallback_poll_seconds = cloud_config.fallback_poll_seconds,
+        "telegram local cloud ingress started"
+    );
+    tokio::spawn(cloud_initial_library_scan(runtime.clone()));
+    tokio::spawn(cloud_library_publication_watcher(runtime.clone()));
+    tokio::spawn(cloud_rest_fallback(
+        runtime.clone(),
+        cloud_config.fallback_poll_seconds,
+    ));
+    tokio::spawn(cloud_websocket_receiver(runtime.clone()));
+    tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    runtime.state_notify.notify_one();
+    tokio::spawn(cloud_state_reporter(runtime));
+
+    shutdown.await?;
+    info!("shutdown requested");
+    Ok(())
+}
+
+async fn cloud_initial_library_scan(runtime: CloudBotRuntime) {
+    let context = runtime.bot.clone();
+    match tokio::task::spawn_blocking(move || scan_cloud_library(&context)).await {
+        Ok(Ok(snapshot)) => {
+            *runtime.library_snapshot.lock().await = Some(snapshot);
+            *runtime.library_scan_warning.lock().await = None;
+            runtime.state_notify.notify_one();
+        }
+        Ok(Err(error)) => {
+            warn!(error = %format!("{error:#}"), "initial media-library scan failed");
+            *runtime.library_scan_warning.lock().await =
+                Some(redact_sensitive_text(&format!("{error:#}")));
+            runtime.state_notify.notify_one();
+        }
+        Err(error) => {
+            warn!(error = %error, "initial media-library worker failed");
+            *runtime.library_scan_warning.lock().await =
+                Some(redact_sensitive_text(&error.to_string()));
+            runtime.state_notify.notify_one();
+        }
+    }
+}
+
+async fn cloud_library_publication_watcher(runtime: CloudBotRuntime) {
+    let published = runtime.bot.queue.publication_notify();
+    loop {
+        published.notified().await;
+        // Coalesce collection and multi-part completions into one scan after their queue
+        // publication records have settled. The scan reads the existing library and queue hints;
+        // it does not change download scheduling or block Telegram dispatch.
+        sleep(Duration::from_secs(2)).await;
+        let context = runtime.bot.clone();
+        let scan = tokio::task::spawn_blocking(move || scan_cloud_library(&context)).await;
+        match scan {
+            Ok(Ok(snapshot)) => {
+                *runtime.library_snapshot.lock().await = Some(snapshot);
+                *runtime.library_scan_warning.lock().await = None;
+                runtime.state_notify.notify_one();
+            }
+            Ok(Err(error)) => {
+                warn!(error = %format!("{error:#}"), "media-library refresh after published output failed");
+                *runtime.library_scan_warning.lock().await =
+                    Some(redact_sensitive_text(&format!("{error:#}")));
+                // Keep the previous snapshot visible while exposing the latest scan failure.
+                runtime.state_notify.notify_one();
+            }
+            Err(error) => {
+                warn!(error = %error, "media-library refresh worker failed");
+                *runtime.library_scan_warning.lock().await =
+                    Some(redact_sensitive_text(&error.to_string()));
+                runtime.state_notify.notify_one();
+            }
+        }
+    }
+}
+
+async fn cloud_state_reporter(runtime: CloudBotRuntime) {
+    let mut heartbeat = interval(Duration::from_secs(5 * 60));
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+    let mut published_fingerprint: Option<Vec<u8>> = None;
+    let mut published_version: Option<u64> = None;
+    let mut pending: Option<PendingCloudState> = None;
+
+    loop {
+        if pending.is_none() {
+            let heartbeat_due = tokio::select! {
+                _ = runtime.state_notify.notified() => false,
+                _ = heartbeat.tick() => true,
+            };
+            match build_cloud_state_snapshot(&runtime).await {
+                Ok(Some(snapshot)) => {
+                    let fingerprint = match snapshot.fingerprint() {
+                        Ok(fingerprint) => fingerprint,
+                        Err(error) => {
+                            warn!(error = %format!("{error:#}"), "failed to fingerprint local cloud state");
+                            continue;
+                        }
+                    };
+                    let changed = published_fingerprint.as_ref() != Some(&fingerprint);
+                    if !changed && !heartbeat_due {
+                        continue;
+                    }
+                    let state_version = match (changed, published_version) {
+                        (false, Some(version)) => version,
+                        _ => match next_cloud_state_version(&runtime).await {
+                            Ok(version) => version,
+                            Err(error) => {
+                                warn!(error = %format!("{error:#}"), "failed to persist local cloud state version");
+                                sleep(Duration::from_secs(5)).await;
+                                runtime.state_notify.notify_one();
+                                continue;
+                            }
+                        },
+                    };
+                    pending = Some(PendingCloudState {
+                        snapshot,
+                        fingerprint,
+                        state_version,
+                    });
+                }
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(error = %format!("{error:#}"), "failed to assemble local cloud state");
+                    sleep(Duration::from_secs(5)).await;
+                    runtime.state_notify.notify_one();
+                    continue;
+                }
+            }
+        }
+
+        let Some(state) = pending.as_ref() else {
+            continue;
+        };
+        match state.snapshot.post(&runtime, state.state_version).await {
+            Ok(()) => {
+                published_fingerprint = Some(state.fingerprint.clone());
+                published_version = Some(state.state_version);
+                pending = None;
+            }
+            Err(error) => {
+                warn!(
+                    state_version = state.state_version,
+                    error = %format!("{error:#}"),
+                    "local cloud state update failed; retrying the same version"
+                );
+                // Reuse the exact state version and content on retry. If the previous request
+                // reached the Worker before a timeout, its idempotence check accepts this copy.
+                sleep(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
+async fn next_cloud_state_version(runtime: &CloudBotRuntime) -> Result<u64> {
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || inbox.next_state_version())
+        .await
+        .context("cloud state-version persistence worker failed")?
+}
+
+async fn build_cloud_state_snapshot(
+    runtime: &CloudBotRuntime,
+) -> Result<Option<CloudStateSnapshot>> {
+    let library = runtime.library_snapshot.lock().await.clone();
+    let records = cloud_inbox_records(runtime).await?;
+    let mut management_records = records
+        .iter()
+        .filter(|record| record.request.kind != "telegram")
+        .collect::<Vec<_>>();
+    management_records.sort_by_key(|record| record.request.seq);
+    let operations = management_records
+        .iter()
+        .rev()
+        .take(100)
+        .rev()
+        .map(|record| {
+            let result = record.result.as_ref().map(|result| {
+                if record.request.kind == "library_scan" {
+                    serde_json::json!({
+                        "revision": result.get("revision"),
+                        "scanned_at": result.get("scanned_at"),
+                    })
+                } else {
+                    result.clone()
+                }
+            });
+            serde_json::json!({
+                "seq": record.request.seq,
+                "kind": record.request.kind,
+                "status": record.status,
+                "created_at": record.request.created_at,
+                "updated_at": record.updated_at,
+                "attempts": record.attempts,
+                "next_attempt_at": record.next_attempt_at,
+                "result": result,
+                "error": record.error,
+            })
+        })
+        .collect::<Vec<_>>();
+    let previews = management_records
+        .iter()
+        .filter(|record| record.status == InboxStatus::AwaitingConfirmation)
+        .filter_map(|record| record.result.as_ref()?.get("preview").cloned())
+        .collect::<Vec<_>>();
+    let config = Arc::clone(&runtime.bot.config);
+    let queue = Arc::clone(&runtime.bot.queue);
+    let tasks = tokio::task::spawn_blocking(move || cloud_task_summaries(&config, &queue))
+        .await
+        .context("cloud task summary worker failed")??;
+    let (revision, library_value) = match library {
+        Some(library) => (
+            library.revision.clone(),
+            serde_json::to_value(library).context("failed to serialize local library snapshot")?,
+        ),
+        None => {
+            let root_label = runtime
+                .bot
+                .config
+                .downloads
+                .video_dir
+                .file_name()
+                .and_then(|label| label.to_str())
+                .unwrap_or("Downloads")
+                .to_string();
+            let scan_warning = runtime.library_scan_warning.lock().await.clone();
+            let warnings = scan_warning
+                .map(|warning| {
+                    format!(
+                        "The local media-library scan failed: {}",
+                        redact_sensitive_text(&warning)
+                    )
+                })
+                .unwrap_or_else(|| "The local media-library scan has not completed.".to_string());
+            (
+                "not-scanned".to_string(),
+                serde_json::json!({
+                    "revision": "not-scanned",
+                    "scanned_at": 0,
+                    "root_label": root_label,
+                    "items": [],
+                    "categories": [],
+                    "warnings": [warnings],
+                    "ready": false,
+                }),
+            )
+        }
+    };
+    Ok(Some(CloudStateSnapshot {
+        revision,
+        library: library_value,
+        previews,
+        operations,
+        tasks,
+        download_dir: runtime
+            .bot
+            .config
+            .downloads
+            .video_dir
+            .to_string_lossy()
+            .into_owned(),
+    }))
+}
+
+fn cloud_task_summaries(
+    config: &AppConfig,
+    queue: &QueueManager,
+) -> Result<Vec<serde_json::Value>> {
+    // `allow_all_chats` has no explicit owner set, so do not publish any chat task data to the
+    // remote management UI in that mode. Local Telegram command handling retains its existing
+    // authorization policy.
+    if config.telegram.allow_all_chats {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::<TaskRecord>::new();
+    for chat_id in &config.telegram.allowed_chat_ids {
+        records.extend(queue.list(*chat_id, false, 0)?);
+    }
+    records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
+    records.truncate(100);
+    records
+        .into_iter()
+        .map(|record| {
+            Ok(serde_json::json!({
+                "id": record.id,
+                "status": record.status,
+                "label": record.plan.as_ref().and_then(|plan| plan.title.clone()).unwrap_or_else(|| record.job.label().to_string()),
+                "media_entries_total": record.media_entries_total,
+                "media_entries_completed": record.media_entries_completed,
+                "media_entries_failed": record.media_entries_failed,
+                "updated_at": record.updated_at,
+                "error": record.error.map(|error| redact_sensitive_text(&error)),
+            }))
+        })
+        .collect()
+}
+
+async fn cloud_rest_fallback(runtime: CloudBotRuntime, poll_seconds: u64) {
+    loop {
+        if let Err(error) = sync_cloud_backlog(&runtime).await {
+            warn!(error = %format!("{error:#}"), "local cloud HTTPS fallback poll failed");
+        }
+        sleep(Duration::from_secs(poll_seconds)).await;
+    }
+}
+
+async fn cloud_websocket_receiver(runtime: CloudBotRuntime) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        // The REST queue is authoritative. Reconcile it before every WebSocket connection so
+        // messages missed during disconnection are durably accepted and acknowledged first.
+        if let Err(error) = sync_cloud_backlog(&runtime).await {
+            warn!(error = %format!("{error:#}"), "local cloud reconnect backlog fetch failed");
+        }
+        match runtime.client.connect_websocket().await {
+            Ok(mut socket) => {
+                backoff = Duration::from_secs(1);
+                info!("connected to local cloud request WebSocket");
+                match receive_cloud_websocket_session(&runtime, &mut socket, None).await {
+                    Ok(()) => warn!("local cloud request WebSocket closed"),
+                    Err(error) => {
+                        warn!(error = %format!("{error:#}"), "local cloud request WebSocket failed");
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "local cloud WebSocket connection failed");
+            }
+        }
+        sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(Duration::from_secs(60));
+    }
+}
+
+async fn receive_cloud_websocket_session(
+    runtime: &CloudBotRuntime,
+    socket: &mut CloudWebSocket,
+    waiting: Option<Arc<Notify>>,
+) -> Result<()> {
+    loop {
+        let next = next_websocket_request(socket);
+        // The test hook marks that the production receive loop is waiting on this socket. It
+        // lets the regression test advance virtual time without introducing a polling timer.
+        if let Some(waiting) = &waiting {
+            waiting.notify_one();
+        }
+        match next.await? {
+            Some(request) => {
+                let seq = request.seq;
+                if let Err(error) = persist_cloud_request(runtime, request).await {
+                    warn!(seq, error = %format!("{error:#}"), "failed to persist WebSocket request");
+                } else if let Err(error) = runtime.client.acknowledge(&[seq]).await {
+                    warn!(seq, error = %format!("{error:#}"), "failed to acknowledge durable WebSocket request");
+                }
+            }
+            None => return Ok(()),
+        }
+    }
+}
+
+async fn sync_cloud_backlog(runtime: &CloudBotRuntime) -> Result<()> {
+    let mut requests = runtime.client.fetch_requests().await?;
+    requests.sort_by_key(|request| request.seq);
+    for request in requests {
+        let seq = request.seq;
+        persist_cloud_request(runtime, request).await?;
+        // Acknowledge only after persist() has fsynced the complete private envelope. Repeated
+        // delivery after a lost ACK is safe because persist() deduplicates by exact sequence and
+        // exact envelope, not by a high-water mark.
+        runtime.client.acknowledge(&[seq]).await?;
+    }
+    Ok(())
+}
+
+async fn persist_cloud_request(runtime: &CloudBotRuntime, request: CloudRequest) -> Result<()> {
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || inbox.persist(request))
+        .await
+        .context("cloud inbox persistence worker failed")??;
+    // A previous process may have persisted but not yet dispatched an event; waking the
+    // dispatcher is harmless and makes restart/reconnect recovery prompt. Also publish the
+    // durable pending receipt immediately so the cloud UI stays informed after its D1 row is ACKed.
+    runtime.request_notify.notify_one();
+    runtime.state_notify.notify_one();
+    Ok(())
+}
+
+async fn cloud_request_dispatcher(runtime: CloudBotRuntime) {
+    loop {
+        tokio::select! {
+            _ = runtime.request_notify.notified() => {},
+            _ = sleep(Duration::from_secs(1)) => {},
+        }
+        let inbox = Arc::clone(&runtime.inbox);
+        let pending = match tokio::task::spawn_blocking(move || inbox.pending()).await {
+            Ok(Ok(pending)) => pending,
+            Ok(Err(error)) => {
+                warn!(error = %format!("{error:#}"), "failed to read pending local cloud requests");
+                continue;
+            }
+            Err(error) => {
+                warn!(error = %error, "cloud inbox listing worker failed");
+                continue;
+            }
+        };
+        for record in pending {
+            let seq = record.request.seq;
+            let inbox = Arc::clone(&runtime.inbox);
+            let marked = tokio::task::spawn_blocking(move || {
+                inbox.update(seq, |record| {
+                    record.status = InboxStatus::Processing;
+                    record.attempts = record.attempts.saturating_add(1);
+                    record.next_attempt_at = 0;
+                    record.error = None;
+                })
+            })
+            .await;
+            let record = match marked {
+                Ok(Ok(record)) => record,
+                Ok(Err(error)) => {
+                    warn!(seq, error = %format!("{error:#}"), "failed to claim local cloud request");
+                    continue;
+                }
+                Err(error) => {
+                    warn!(seq, error = %error, "cloud request claim worker failed");
+                    continue;
+                }
+            };
+            runtime.state_notify.notify_one();
+            let task_runtime = runtime.clone();
+            let semaphore = if record.request.kind == "telegram" {
+                Arc::clone(&runtime.telegram_dispatch)
+            } else {
+                Arc::clone(&runtime.management_dispatch)
+            };
+            tokio::spawn(async move {
+                let _permit = match semaphore.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
+                dispatch_cloud_record(task_runtime, record).await;
+            });
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CloudDispatchOutcome {
+    status: InboxStatus,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+    related_preview_seq: Option<u64>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilePreviewPayload {
+    #[serde(default)]
+    item_ids: Option<Vec<String>>,
+    #[serde(default)]
+    target_relative_dir: Option<String>,
+    #[serde(default)]
+    rename: bool,
+    #[serde(default)]
+    conflict: Option<ConflictPolicy>,
+    #[serde(default)]
+    metadata_patches: Vec<MetadataPatchInput>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetadataPatchInput {
+    item_id: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    source_ids: Vec<String>,
+    #[serde(default)]
+    collection: Option<crate::library::CollectionMetadata>,
+    #[serde(default)]
+    hint_index: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfirmPayload {
+    preview_id: String,
+    revision: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyImportPayload {
+    text: String,
+}
+
+async fn dispatch_cloud_record(runtime: CloudBotRuntime, record: InboxRecord) {
+    let outcome = if record.request.kind == "telegram" {
+        dispatch_cloud_telegram(&runtime, &record.request).await
+    } else {
+        match dispatch_cloud_management(&runtime, &record.request).await {
+            Err(error) if is_file_provider_access_error(&error) => Err(error),
+            Err(error) => Ok(cloud_dispatch_failure(format!("{error:#}"))),
+            outcome => outcome,
+        }
+    };
+    let seq = record.request.seq;
+    match outcome {
+        Ok(outcome) => {
+            let inbox = Arc::clone(&runtime.inbox);
+            let update = tokio::task::spawn_blocking(move || {
+                inbox.update(seq, |record| {
+                    record.status = outcome.status;
+                    record.result = outcome.result;
+                    record.error = outcome.error;
+                    record.next_attempt_at = 0;
+                })
+            })
+            .await;
+            match update {
+                Ok(Ok(_)) => {
+                    if let Some(preview_seq) = outcome.related_preview_seq {
+                        let inbox = Arc::clone(&runtime.inbox);
+                        if let Err(error) = tokio::task::spawn_blocking(move || {
+                            inbox.update(preview_seq, |preview| {
+                                preview.status = InboxStatus::Completed;
+                                preview.error = None;
+                            })
+                        })
+                        .await
+                        .context("cloud preview completion worker failed")
+                        .and_then(|result| result.map(|_| ()))
+                        {
+                            warn!(seq, preview_seq, error = %format!("{error:#}"), "failed to close confirmed preview record");
+                        }
+                    }
+                    runtime.state_notify.notify_one();
+                }
+                Ok(Err(error)) => {
+                    warn!(seq, error = %format!("{error:#}"), "failed to persist local cloud operation result")
+                }
+                Err(error) => warn!(seq, error = %error, "cloud operation result worker failed"),
+            }
+        }
+        Err(error) => {
+            let message = redact_sensitive_text(&format!("{error:#}"));
+            warn!(seq, error = %message, "local cloud operation will remain retryable");
+            let delay = cloud_retry_delay_seconds(record.attempts);
+            let next_attempt_at = now_seconds().saturating_add(delay);
+            let inbox = Arc::clone(&runtime.inbox);
+            let _ = tokio::task::spawn_blocking(move || {
+                inbox.update(seq, |record| {
+                    record.status = InboxStatus::Retryable;
+                    record.error = Some(message);
+                    record.next_attempt_at = next_attempt_at;
+                })
+            })
+            .await;
+            runtime.state_notify.notify_one();
+            // Keep transient File Provider failures locally retryable with a persisted exponential
+            // backoff. The next periodic scan also checks next_attempt_at after restart.
+            let notify = Arc::clone(&runtime.request_notify);
+            tokio::spawn(async move {
+                sleep(Duration::from_secs(delay)).await;
+                notify.notify_one();
+            });
+        }
+    }
+}
+
+fn cloud_retry_delay_seconds(attempts: u32) -> u64 {
+    let shift = attempts.saturating_sub(1).min(4);
+    5_u64.saturating_mul(1_u64 << shift).min(60)
+}
+
+async fn dispatch_cloud_telegram(
+    runtime: &CloudBotRuntime,
+    request: &CloudRequest,
+) -> Result<CloudDispatchOutcome> {
+    let update: Update = match serde_json::from_value(request.payload.clone()) {
+        Ok(update) => update,
+        Err(error) => {
+            return Ok(cloud_dispatch_failure(format!(
+                "invalid Telegram update: {error}"
+            )));
+        }
+    };
+    let bot = runtime.bot.clone();
+    if let Some(message) = update.message {
+        handle_message(
+            bot.clone(),
+            update.update_id,
+            message.message_id,
+            message.from.map(|user| user.id),
+            message.chat.id,
+            message.chat.is_private(),
+            message.text.as_deref(),
+        )
+        .await
+        .with_context(|| format!("Telegram cloud update {} failed", update.update_id))?;
+    }
+    if let Some(callback_query) = update.callback_query {
+        handle_callback_query(bot, callback_query).await;
+    }
+    Ok(CloudDispatchOutcome {
+        status: InboxStatus::Completed,
+        result: None,
+        error: None,
+        related_preview_seq: None,
+    })
+}
+
+async fn dispatch_cloud_management(
+    runtime: &CloudBotRuntime,
+    request: &CloudRequest,
+) -> Result<CloudDispatchOutcome> {
+    match request.kind.as_str() {
+        "library_scan" => {
+            if !request
+                .payload
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            {
+                return Ok(cloud_dispatch_failure("library_scan payload must be empty"));
+            }
+            let context = runtime.bot.clone();
+            let snapshot = tokio::task::spawn_blocking(move || scan_cloud_library(&context))
+                .await
+                .context("media-library scan worker failed")??;
+            *runtime.library_snapshot.lock().await = Some(snapshot.clone());
+            Ok(CloudDispatchOutcome {
+                status: InboxStatus::Completed,
+                result: Some(serde_json::to_value(snapshot)?),
+                error: None,
+                related_preview_seq: None,
+            })
+        }
+        "file_preview" => {
+            let payload: FilePreviewPayload = match serde_json::from_value(request.payload.clone())
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(cloud_dispatch_failure(format!(
+                        "invalid file_preview payload: {error}"
+                    )));
+                }
+            };
+            let parsed = match validate_file_preview_payload(payload) {
+                Ok(parsed) => parsed,
+                Err(error) => return Ok(cloud_dispatch_failure(error)),
+            };
+            let context = runtime.bot.clone();
+            let records = cloud_inbox_records(runtime).await?;
+            let (preview, snapshot) = tokio::task::spawn_blocking(move || {
+                create_cloud_file_preview(&context, parsed, &records)
+            })
+            .await
+            .context("file preview worker failed")??;
+            *runtime.library_snapshot.lock().await = Some(snapshot);
+            let preview_id = preview.id.clone();
+            let revision = preview.revision.clone();
+            Ok(CloudDispatchOutcome {
+                status: InboxStatus::AwaitingConfirmation,
+                result: Some(serde_json::json!({
+                    "preview_id": preview_id,
+                    "revision": revision,
+                    "preview": preview,
+                })),
+                error: None,
+                related_preview_seq: None,
+            })
+        }
+        "file_confirm" => {
+            let payload: FileConfirmPayload = match serde_json::from_value(request.payload.clone())
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(cloud_dispatch_failure(format!(
+                        "invalid file_confirm payload: {error}"
+                    )));
+                }
+            };
+            let records = cloud_inbox_records(runtime).await?;
+            let Some(preview_record) = records.iter().find(|record| {
+                record.status == InboxStatus::AwaitingConfirmation
+                    && record.request.kind == "file_preview"
+                    && record
+                        .result
+                        .as_ref()
+                        .and_then(|value| value.get("preview_id"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(payload.preview_id.as_str())
+            }) else {
+                return Ok(cloud_dispatch_failure(
+                    "This preview is no longer awaiting confirmation. Run a fresh preview.",
+                ));
+            };
+            let Some(preview_value) = preview_record
+                .result
+                .as_ref()
+                .and_then(|value| value.get("preview"))
+            else {
+                return Ok(cloud_dispatch_failure(
+                    "The persisted preview is incomplete. Run a fresh preview.",
+                ));
+            };
+            let preview: MovePreview = match serde_json::from_value(preview_value.clone()) {
+                Ok(preview) => preview,
+                Err(error) => {
+                    return Ok(cloud_dispatch_failure(format!(
+                        "persisted preview is invalid: {error}"
+                    )));
+                }
+            };
+            if preview.id != payload.preview_id || preview.revision != payload.revision {
+                return Ok(cloud_dispatch_failure(
+                    "Preview identity or revision did not match. Run a fresh preview.",
+                ));
+            }
+            let preview_seq = preview_record.request.seq;
+            let status_message_id =
+                begin_cloud_batch_message(runtime, preview_seq, &payload.preview_id).await?;
+            let start_message_warning = status_message_id.is_none().then(|| {
+                "Telegram progress message could not be linked or verified after a prior attempt; check /file for the batch status.".to_string()
+            });
+            let confirm_preview_id = payload.preview_id.clone();
+            let confirm_revision = payload.revision.clone();
+            let preview_id_for_execution = confirm_preview_id.clone();
+            let revision_for_execution = confirm_revision.clone();
+            let context = runtime.bot.clone();
+            let execution = tokio::task::spawn_blocking(move || {
+                execute_cloud_file_preview(
+                    &context,
+                    &preview_id_for_execution,
+                    &revision_for_execution,
+                )
+            })
+            .await;
+            let (result, snapshot) = match execution {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) if is_file_provider_access_error(&error) => {
+                    let warning = edit_cloud_batch_message(
+                        runtime,
+                        preview_seq,
+                        format!(
+                            "File batch {} is waiting for local file access. It will retry automatically.",
+                            confirm_preview_id
+                        ),
+                    )
+                    .await;
+                    if let Some(warning_message) = warning.as_deref() {
+                        warn!(preview_seq, message = %warning_message, "could not update retryable file-batch status");
+                    }
+                    persist_cloud_retry_receipt(
+                        runtime,
+                        request.seq,
+                        &confirm_preview_id,
+                        &confirm_revision,
+                        warning,
+                    )
+                    .await?;
+                    return Err(error)
+                        .context("file confirmation could not access the local file provider");
+                }
+                Ok(Err(error)) => {
+                    let message = redact_sensitive_text(&format!("{error:#}"));
+                    let edit_warning = edit_cloud_batch_message(
+                        runtime,
+                        preview_seq,
+                        format!(
+                            "File batch {} failed before it could complete. Run a fresh preview before confirming again.",
+                            confirm_preview_id
+                        ),
+                    )
+                    .await;
+                    let telegram_progress_warning = edit_warning.or(start_message_warning);
+                    return Ok(cloud_file_confirm_failure(
+                        &confirm_preview_id,
+                        &confirm_revision,
+                        message,
+                        telegram_progress_warning,
+                    ));
+                }
+                Err(error) => {
+                    let message =
+                        redact_sensitive_text(&format!("file confirmation worker failed: {error}"));
+                    let edit_warning = edit_cloud_batch_message(
+                        runtime,
+                        preview_seq,
+                        format!(
+                            "File batch {} stopped because its local worker failed. Run a fresh preview before confirming again.",
+                            confirm_preview_id
+                        ),
+                    )
+                    .await;
+                    let telegram_progress_warning = edit_warning.or(start_message_warning);
+                    return Ok(cloud_file_confirm_failure(
+                        &confirm_preview_id,
+                        &confirm_revision,
+                        message,
+                        telegram_progress_warning,
+                    ));
+                }
+            };
+            *runtime.library_snapshot.lock().await = Some(snapshot);
+            let final_message_warning =
+                edit_cloud_batch_message(runtime, preview_seq, render_cloud_batch_result(&result))
+                    .await;
+            let telegram_progress_warning = final_message_warning.or(start_message_warning);
+            let result_json = serde_json::to_value(&result)?;
+            let completed = result.status == crate::library::BatchStatus::Complete;
+            Ok(CloudDispatchOutcome {
+                status: if completed { InboxStatus::Completed } else { InboxStatus::Failed },
+                result: Some(serde_json::json!({
+                    "preview_id": result.id,
+                    "revision": result.revision,
+                    "operation": result_json,
+                    "telegram_progress_warning": telegram_progress_warning,
+                })),
+                error: (!completed).then(|| "The confirmed operation completed with skipped or failed items; review the per-item result before retrying.".to_string()),
+                related_preview_seq: completed.then_some(preview_seq),
+            })
+        }
+        "legacy_import" => {
+            let payload: LegacyImportPayload = match serde_json::from_value(request.payload.clone())
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return Ok(cloud_dispatch_failure(format!(
+                        "invalid legacy_import payload: {error}"
+                    )));
+                }
+            };
+            if payload.text.len() > 256 * 1024 {
+                return Ok(cloud_dispatch_failure(
+                    "legacy_import payload exceeds the 256 KiB limit",
+                ));
+            }
+            let context = runtime.bot.clone();
+            let (report, snapshot) = tokio::task::spawn_blocking(move || {
+                import_cloud_legacy_metadata(&context, &payload.text)
+            })
+            .await
+            .context("legacy import worker failed")??;
+            *runtime.library_snapshot.lock().await = Some(snapshot.clone());
+            Ok(CloudDispatchOutcome {
+                status: InboxStatus::Completed,
+                result: Some(serde_json::json!({
+                    "revision": report.revision,
+                    "hints": report.hints,
+                    "warnings": report.warnings,
+                    "needs_confirmation": report.needs_confirmation,
+                    "candidates": report.candidates,
+                    "library_revision": snapshot.revision,
+                })),
+                error: None,
+                related_preview_seq: None,
+            })
+        }
+        _ => Ok(cloud_dispatch_failure(format!(
+            "unsupported cloud request kind: {}",
+            request.kind
+        ))),
+    }
+}
+
+fn cloud_dispatch_failure(message: impl Into<String>) -> CloudDispatchOutcome {
+    let message = redact_sensitive_text(&message.into());
+    CloudDispatchOutcome {
+        status: InboxStatus::Failed,
+        result: None,
+        error: Some(message),
+        related_preview_seq: None,
+    }
+}
+
+fn cloud_file_confirm_failure(
+    preview_id: &str,
+    revision: &str,
+    error: String,
+    telegram_progress_warning: Option<String>,
+) -> CloudDispatchOutcome {
+    let result_error = error.clone();
+    CloudDispatchOutcome {
+        status: InboxStatus::Failed,
+        result: Some(serde_json::json!({
+            "preview_id": preview_id,
+            "revision": revision,
+            "error": result_error,
+            "telegram_progress_warning": telegram_progress_warning,
+        })),
+        error: Some(error),
+        related_preview_seq: None,
+    }
+}
+
+async fn persist_cloud_retry_receipt(
+    runtime: &CloudBotRuntime,
+    seq: u64,
+    preview_id: &str,
+    revision: &str,
+    telegram_progress_warning: Option<String>,
+) -> Result<()> {
+    let inbox = Arc::clone(&runtime.inbox);
+    let preview_id = preview_id.to_string();
+    let revision = revision.to_string();
+    tokio::task::spawn_blocking(move || {
+        inbox.update(seq, |record| {
+            record.result = Some(serde_json::json!({
+                "preview_id": preview_id,
+                "revision": revision,
+                "status": "retrying",
+                "telegram_progress_warning": telegram_progress_warning,
+            }));
+        })
+    })
+    .await
+    .context("cloud file confirmation retry receipt worker failed")??;
+    Ok(())
+}
+
+fn validate_file_preview_payload(
+    payload: FilePreviewPayload,
+) -> std::result::Result<PreparedFilePreview, String> {
+    let patch_inputs = payload.metadata_patches;
+    if patch_inputs
+        .iter()
+        .any(|patch| patch.hint_index.is_some_and(|index| index > 999))
+    {
+        return Err("A metadata hint index is outside the allowed range.".to_string());
+    }
+    let patches = patch_inputs
+        .iter()
+        .map(|patch| MetadataPatch {
+            item_id: patch.item_id.clone(),
+            title: patch.title.clone(),
+            source_ids: patch.source_ids.clone(),
+            collection: patch.collection.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut item_ids = payload.item_ids.unwrap_or_default();
+    if item_ids.len() > 100 || patch_inputs.len() > 100 {
+        return Err("A file preview can include at most 100 items.".to_string());
+    }
+    let selected_item_count = item_ids.len();
+    if item_ids
+        .iter()
+        .any(|id| id.trim().is_empty() || id.len() > 256)
+    {
+        return Err("A file preview contains an invalid item ID.".to_string());
+    }
+    if let Some(target) = payload.target_relative_dir.as_deref()
+        && target.len() > 1024
+    {
+        return Err("The target folder is too long.".to_string());
+    }
+    for patch in &patches {
+        if patch.item_id.trim().is_empty()
+            || patch.item_id.len() > 256
+            || (patch
+                .title
+                .as_ref()
+                .is_none_or(|title| title.trim().is_empty())
+                && patch.source_ids.is_empty()
+                && patch.collection.is_none())
+            || patch
+                .title
+                .as_ref()
+                .is_some_and(|title| title.trim().is_empty())
+            || patch.title.as_ref().is_some_and(|title| title.len() > 500)
+            || patch.source_ids.len() > 20
+            || patch
+                .source_ids
+                .iter()
+                .any(|source_id| source_id.trim().is_empty() || source_id.len() > 128)
+            || patch.collection.as_ref().is_some_and(|collection| {
+                collection.title.len() > 256
+                    || collection.kind.len() > 64
+                    || collection.id.as_ref().is_some_and(|id| id.len() > 128)
+                    || collection.part_id.as_ref().is_some_and(|id| id.len() > 128)
+            })
+        {
+            return Err("A metadata patch contains a field outside its allowed size.".to_string());
+        }
+    }
+    let is_move = payload.target_relative_dir.is_some();
+    if !is_move && patches.is_empty() {
+        return Err("A file preview must include a move or a metadata patch.".to_string());
+    }
+    if is_move && item_ids.is_empty() {
+        return Err("A move preview needs selected items and a target folder.".to_string());
+    }
+    if item_ids.is_empty() {
+        item_ids = patches.iter().map(|patch| patch.item_id.clone()).collect();
+    }
+    if !is_move {
+        let mut patched_ids = patches
+            .iter()
+            .map(|patch| patch.item_id.clone())
+            .collect::<Vec<_>>();
+        patched_ids.sort();
+        patched_ids.dedup();
+        let mut supplied_ids = item_ids.clone();
+        supplied_ids.sort();
+        supplied_ids.dedup();
+        if supplied_ids != patched_ids {
+            return Err("A metadata-only preview must select exactly the items included in its metadata patches.".to_string());
+        }
+    }
+    item_ids.sort();
+    item_ids.dedup();
+    if selected_item_count > 0 && item_ids.len() != selected_item_count {
+        return Err("A file preview cannot select the same item more than once.".to_string());
+    }
+    let patch_ids = patches
+        .iter()
+        .map(|patch| patch.item_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if patch_ids.len() != patches.len() {
+        return Err("A metadata preview cannot patch the same item more than once.".to_string());
+    }
+    if !patches.is_empty()
+        && patches
+            .iter()
+            .any(|patch| !item_ids.contains(&patch.item_id))
+    {
+        return Err(
+            "Every metadata patch must target an item selected for this preview.".to_string(),
+        );
+    }
+    Ok(PreparedFilePreview {
+        item_ids,
+        target_relative_dir: payload.target_relative_dir,
+        rename: payload.rename,
+        conflict: payload.conflict.unwrap_or(ConflictPolicy::Skip),
+        patches,
+        hint_indices: patch_inputs
+            .into_iter()
+            .map(|patch| (patch.item_id, patch.hint_index))
+            .collect(),
+    })
+}
+
+struct PreparedFilePreview {
+    item_ids: Vec<String>,
+    target_relative_dir: Option<String>,
+    rename: bool,
+    conflict: ConflictPolicy,
+    patches: Vec<MetadataPatch>,
+    hint_indices: Vec<(String, Option<usize>)>,
+}
+
+fn create_cloud_file_preview(
+    bot: &BotContext,
+    prepared: PreparedFilePreview,
+    records: &[InboxRecord],
+) -> Result<(MovePreview, LibrarySnapshot)> {
+    validate_legacy_metadata_patches(bot, records, &prepared.patches, &prepared.hint_indices)?;
+    let manager = LibraryManager::open(&bot.config.downloads.video_dir)?;
+    let hints = queue_source_hints(bot)?;
+    let snapshot = manager.scan(&hints)?;
+    let preview = manager.preview_with_hints_and_patches(
+        if prepared.target_relative_dir.is_some() {
+            &prepared.item_ids
+        } else {
+            &[]
+        },
+        prepared.target_relative_dir.as_deref(),
+        prepared.rename,
+        prepared.conflict,
+        &hints,
+        &prepared.patches,
+    )?;
+    let refreshed = manager.scan(&hints).unwrap_or(snapshot);
+    Ok((preview, refreshed))
+}
+
+fn validate_legacy_metadata_patches(
+    bot: &BotContext,
+    records: &[InboxRecord],
+    patches: &[MetadataPatch],
+    hint_indices: &[(String, Option<usize>)],
+) -> Result<()> {
+    if patches.is_empty() {
+        return Ok(());
+    }
+    let imports = records
+        .iter()
+        .filter(|record| {
+            record.request.kind == "legacy_import" && record.status == InboxStatus::Completed
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if imports.is_empty() {
+        bail!("metadata patches must come from a completed legacy import");
+    }
+    let manager = LibraryManager::open(&bot.config.downloads.video_dir)?;
+    let snapshot = manager.scan(&queue_source_hints(bot)?)?;
+    for patch in patches {
+        if !snapshot.items.iter().any(|item| item.id == patch.item_id) {
+            bail!("metadata patch item is not present in the current library snapshot");
+        }
+        let selected_hint_index = hint_indices
+            .iter()
+            .find(|(item_id, _)| item_id == &patch.item_id)
+            .and_then(|(_, hint_index)| *hint_index);
+        let Some(selected_hint_index) = selected_hint_index else {
+            // A patch without hint_index is a manually authored edit. It still goes through a
+            // persistent preview and explicit file_confirm before any NFO is changed.
+            continue;
+        };
+        let mut confirmed_mapping_found = false;
+        for import in &imports {
+            let Some(result) = &import.result else {
+                continue;
+            };
+            let Ok(hints) = serde_json::from_value::<Vec<SourceHint>>(
+                result.get("hints").cloned().unwrap_or_default(),
+            ) else {
+                continue;
+            };
+            let Ok(candidates) = serde_json::from_value::<Vec<crate::library::LegacyCandidate>>(
+                result.get("candidates").cloned().unwrap_or_default(),
+            ) else {
+                continue;
+            };
+            for (hint_index, hint) in hints.iter().enumerate() {
+                if hint_index != selected_hint_index || !hint.requires_confirmation {
+                    continue;
+                }
+                if metadata_patch_matches_legacy_hint(patch, hint)
+                    && candidates.iter().any(|candidate| {
+                        candidate.hint_index == hint_index && candidate.item_id == patch.item_id
+                    })
+                {
+                    confirmed_mapping_found = true;
+                    break;
+                }
+            }
+            if confirmed_mapping_found {
+                break;
+            }
+        }
+        if !confirmed_mapping_found {
+            bail!("metadata patch does not match a selected candidate from a legacy import");
+        }
+    }
+    Ok(())
+}
+
+fn metadata_patch_matches_legacy_hint(patch: &MetadataPatch, hint: &SourceHint) -> bool {
+    let title_matches = patch
+        .title
+        .as_ref()
+        .is_none_or(|title| hint.title.as_ref() == Some(title));
+    let source_ids_match = patch
+        .source_ids
+        .iter()
+        .all(|source_id| hint.source_ids.contains(source_id));
+    let collection_matches = patch
+        .collection
+        .as_ref()
+        .is_none_or(|collection| hint.collection.as_ref() == Some(collection));
+    title_matches && source_ids_match && collection_matches
+}
+
+async fn cloud_inbox_records(runtime: &CloudBotRuntime) -> Result<Vec<InboxRecord>> {
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || inbox.records())
+        .await
+        .context("cloud inbox listing worker failed")?
+}
+
+fn configured_cloud_management_chat_id(config: &AppConfig) -> Option<i64> {
+    if config.telegram.allow_all_chats || config.telegram.allowed_chat_ids.len() != 1 {
+        return None;
+    }
+    config
+        .telegram
+        .allowed_chat_ids
+        .first()
+        .copied()
+        .filter(|chat_id| *chat_id > 0)
+}
+
+async fn begin_cloud_batch_message(
+    runtime: &CloudBotRuntime,
+    preview_seq: u64,
+    preview_id: &str,
+) -> Result<Option<i64>> {
+    let Some(chat_id) = configured_cloud_management_chat_id(&runtime.bot.config) else {
+        return Ok(None);
+    };
+    let inbox = Arc::clone(&runtime.inbox);
+    let record = tokio::task::spawn_blocking(move || {
+        inbox
+            .records()?
+            .into_iter()
+            .find(|record| record.request.seq == preview_seq)
+            .ok_or_else(|| anyhow::anyhow!("confirmed preview disappeared from the local inbox"))
+    })
+    .await
+    .context("cloud preview record worker failed")??;
+    let existing_result = record
+        .result
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if let Some(message_id) = existing_result
+        .get("telegram_status_message_id")
+        .and_then(serde_json::Value::as_i64)
+    {
+        let prior_chat_id = existing_result
+            .get("telegram_status_chat_id")
+            .and_then(serde_json::Value::as_i64);
+        if prior_chat_id != Some(chat_id) {
+            warn!(
+                preview_seq,
+                "skipping file-batch message edit because its original private chat changed"
+            );
+            return Ok(None);
+        }
+        if let Err(error) = runtime
+            .bot
+            .telegram
+            .edit_message_text(
+                chat_id,
+                message_id,
+                format!(
+                    "File batch {preview_id} is processing. Closing the mini app will not stop it."
+                ),
+            )
+            .await
+        {
+            warn!(preview_seq, error = %error, "failed to edit file-batch progress message");
+        }
+        return Ok(Some(message_id));
+    }
+    if existing_result
+        .get("telegram_status_delivery")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|state| state == "sending" || state == "sent")
+    {
+        // Telegram sendMessage has no idempotency key. A durable `sending` receipt avoids making
+        // a second message if the process stopped after Telegram accepted the first request.
+        return Ok(None);
+    }
+
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || {
+        inbox.update(preview_seq, |record| {
+            let result = record.result.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = result.as_object_mut() {
+                object.insert(
+                    "telegram_status_delivery".to_string(),
+                    serde_json::json!("sending"),
+                );
+                object.insert(
+                    "telegram_status_chat_id".to_string(),
+                    serde_json::json!(chat_id),
+                );
+            }
+        })
+    })
+    .await
+    .context("cloud preview status receipt worker failed")??;
+
+    let message_id = match runtime
+        .bot
+        .telegram
+        .send_message(
+            chat_id,
+            format!(
+                "File batch {preview_id} is processing. Closing the mini app will not stop it."
+            ),
+        )
+        .await
+    {
+        Ok(message_id) => message_id,
+        Err(error) => {
+            warn!(preview_seq, error = %error, "could not send file-batch progress message");
+            return Ok(None);
+        }
+    };
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || {
+        inbox.update(preview_seq, |record| {
+            let result = record.result.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(object) = result.as_object_mut() {
+                object.insert(
+                    "telegram_status_delivery".to_string(),
+                    serde_json::json!("sent"),
+                );
+                object.insert(
+                    "telegram_status_message_id".to_string(),
+                    serde_json::json!(message_id),
+                );
+                object.insert(
+                    "telegram_status_chat_id".to_string(),
+                    serde_json::json!(chat_id),
+                );
+            }
+        })
+    })
+    .await
+    .context("cloud preview status message receipt worker failed")??;
+    Ok(Some(message_id))
+}
+
+async fn edit_cloud_batch_message(
+    runtime: &CloudBotRuntime,
+    preview_seq: u64,
+    text: String,
+) -> Option<String> {
+    let unavailable = "Telegram progress message could not be linked or updated; check /file for the persisted batch result.".to_string();
+    let inbox = Arc::clone(&runtime.inbox);
+    let record = match tokio::task::spawn_blocking(move || {
+        inbox
+            .records()?
+            .into_iter()
+            .find(|record| record.request.seq == preview_seq)
+            .ok_or_else(|| anyhow::anyhow!("preview record is missing"))
+    })
+    .await
+    {
+        Ok(Ok(record)) => record,
+        Ok(Err(error)) => {
+            warn!(preview_seq, error = %format!("{error:#}"), "could not read file-batch Telegram receipt");
+            return Some(unavailable);
+        }
+        Err(error) => {
+            warn!(preview_seq, error = %error, "file-batch Telegram receipt worker failed");
+            return Some(unavailable);
+        }
+    };
+    let Some(result) = record.result.as_ref() else {
+        return Some(unavailable);
+    };
+    let (Some(message_id), Some(chat_id)) = (
+        result
+            .get("telegram_status_message_id")
+            .and_then(serde_json::Value::as_i64),
+        result
+            .get("telegram_status_chat_id")
+            .and_then(serde_json::Value::as_i64),
+    ) else {
+        return Some(unavailable);
+    };
+    if configured_cloud_management_chat_id(&runtime.bot.config) != Some(chat_id) {
+        warn!(
+            preview_seq,
+            "skipping file-batch message edit because the configured private chat changed"
+        );
+        return Some(unavailable);
+    }
+    if let Err(error) = runtime
+        .bot
+        .telegram
+        .edit_message_text(chat_id, message_id, text)
+        .await
+    {
+        warn!(preview_seq, error = %error, "failed to edit file-batch progress message");
+        return Some(unavailable);
+    }
+    None
+}
+
+fn render_cloud_batch_result(result: &crate::library::BatchMoveResult) -> String {
+    let failed = result
+        .items
+        .iter()
+        .filter(|item| item.error.is_some() || item.outcome == crate::library::MoveOutcome::Skip)
+        .count();
+    let moved_files = result
+        .items
+        .iter()
+        .map(|item| item.moved_files)
+        .sum::<usize>();
+    let patched = result
+        .items
+        .iter()
+        .filter(|item| item.metadata_patched)
+        .count();
+    let summary = match result.status {
+        crate::library::BatchStatus::Complete => "completed",
+        crate::library::BatchStatus::Partial => "partially completed",
+        crate::library::BatchStatus::Failed => "failed",
+    };
+    let retry = if result.status == crate::library::BatchStatus::Complete {
+        String::new()
+    } else {
+        " Review the per-item result in /file; retry the same confirmation after resolving the issue.".to_string()
+    };
+    format!(
+        "File batch {} {summary}: {moved_files} file(s) moved, {patched} metadata item(s) updated, {failed} item(s) need review.{retry}",
+        result.id
+    )
+}
+
+fn execute_cloud_file_preview(
+    bot: &BotContext,
+    preview_id: &str,
+    revision: &str,
+) -> Result<(crate::library::BatchMoveResult, LibrarySnapshot)> {
+    let manager = LibraryManager::open(&bot.config.downloads.video_dir)?;
+    let result = manager.execute_preview(preview_id, revision)?;
+    let snapshot = manager.scan(&queue_source_hints(bot)?)?;
+    Ok((result, snapshot))
+}
+
+fn import_cloud_legacy_metadata(
+    bot: &BotContext,
+    text: &str,
+) -> Result<(crate::library::LegacyImportReport, LibrarySnapshot)> {
+    let manager = LibraryManager::open(&bot.config.downloads.video_dir)?;
+    let mut report = manager.import_legacy(text)?;
+    let snapshot = manager.scan(&queue_source_hints(bot)?)?;
+    report.revision = Some(snapshot.revision.clone());
+    Ok((report, snapshot))
+}
+
+fn scan_cloud_library(bot: &BotContext) -> Result<LibrarySnapshot> {
+    let manager = LibraryManager::open(&bot.config.downloads.video_dir)?;
+    manager.scan(&queue_source_hints(bot)?)
+}
+
+fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
+    let root = &bot.config.downloads.video_dir;
+    let records = bot.queue.published_records()?;
+    let mut hints = Vec::new();
+    for record in records {
+        let primary_paths = published_primary_relative_paths(&record, root);
+        let stable_ids = record
+            .plan
+            .as_ref()
+            .map(|plan| plan.stable_media_ids.as_slice())
+            .unwrap_or_default();
+        match &record.job {
+            JobRequest::Bilibili { url, .. } => {
+                let is_collection = is_bilibili_ugc_collection_url(url);
+                let parsed = stable_ids
+                    .iter()
+                    .map(|stable_id| parse_bilibili_stable_media_id(stable_id))
+                    .collect::<Vec<_>>();
+                let repeated_bvids = parsed
+                    .iter()
+                    .filter_map(|entry| entry.as_ref().and_then(|entry| entry.bvid.as_ref()))
+                    .filter(|bvid| {
+                        parsed
+                            .iter()
+                            .filter(|entry| {
+                                entry
+                                    .as_ref()
+                                    .is_some_and(|entry| entry.bvid.as_ref() == Some(*bvid))
+                            })
+                            .count()
+                            > 1
+                    })
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                let has_multiple_parts =
+                    !is_collection && parsed.len() > 1 && !repeated_bvids.is_empty();
+                let collection_title = record
+                    .plan
+                    .as_ref()
+                    .and_then(|plan| plan.title.as_deref())
+                    .filter(|title| !title.trim().is_empty())
+                    .map(str::to_string);
+
+                if !parsed.is_empty() {
+                    for (index, parsed_id) in parsed.iter().enumerate() {
+                        let Some(parsed_id) = parsed_id else { continue };
+                        let mut source_ids = parsed_id.source_ids.clone();
+                        if parsed_id
+                            .bvid
+                            .as_ref()
+                            .is_some_and(|bvid| repeated_bvids.contains(bvid))
+                        {
+                            source_ids.retain(|source_id| {
+                                parsed_id.bvid.as_deref() != Some(source_id.as_str())
+                            });
+                        }
+                        if source_ids.is_empty() {
+                            continue;
+                        }
+                        let collection = if is_collection || has_multiple_parts {
+                            collection_title.as_ref().map(|title| {
+                                crate::library::CollectionMetadata {
+                                    id: if has_multiple_parts {
+                                        parsed_id.bvid.clone()
+                                    } else {
+                                        None
+                                    },
+                                    title: title.clone(),
+                                    kind: if is_collection {
+                                        "bilibili_collection".to_string()
+                                    } else {
+                                        "multi_part".to_string()
+                                    },
+                                    order: Some((index + 1).try_into().unwrap_or(u32::MAX)),
+                                    part_id: parsed_id
+                                        .epid
+                                        .clone()
+                                        .or_else(|| parsed_id.cid.clone()),
+                                }
+                            })
+                        } else {
+                            None
+                        };
+                        hints.push(SourceHint {
+                            source_ids,
+                            // A collection-level plan title must not replace each entry's NFO
+                            // title. Normal one-video tasks still seed their own title.
+                            title: if is_collection || has_multiple_parts {
+                                None
+                            } else {
+                                record.plan.as_ref().and_then(|plan| plan.title.clone())
+                            },
+                            relative_path: (parsed.len() == 1 && primary_paths.len() == 1)
+                                .then(|| primary_paths[0].clone()),
+                            collection,
+                            origin: HintOrigin::Queue,
+                            requires_confirmation: false,
+                        });
+                    }
+                    continue;
+                }
+
+                let source_ids = bilibili_bvid_from_url(url).into_iter().collect::<Vec<_>>();
+                if !source_ids.is_empty() {
+                    hints.push(SourceHint {
+                        source_ids,
+                        title: record.plan.as_ref().and_then(|plan| plan.title.clone()),
+                        relative_path: (primary_paths.len() == 1).then(|| primary_paths[0].clone()),
+                        collection: None,
+                        origin: HintOrigin::Queue,
+                        requires_confirmation: false,
+                    });
+                }
+            }
+            JobRequest::Youtube { url } => {
+                if let Some(video_id) = youtube_video_id(url) {
+                    hints.push(SourceHint {
+                        source_ids: vec![video_id],
+                        title: record.plan.as_ref().and_then(|plan| plan.title.clone()),
+                        relative_path: (primary_paths.len() == 1).then(|| primary_paths[0].clone()),
+                        collection: None,
+                        origin: HintOrigin::Queue,
+                        requires_confirmation: false,
+                    });
+                }
+            }
+            JobRequest::Pdf { .. } => continue,
+        }
+    }
+    Ok(hints)
+}
+
+#[derive(Debug)]
+struct ParsedBilibiliStableMediaId {
+    bvid: Option<String>,
+    cid: Option<String>,
+    epid: Option<String>,
+    source_ids: Vec<String>,
+}
+
+fn parse_bilibili_stable_media_id(value: &str) -> Option<ParsedBilibiliStableMediaId> {
+    let fields = value.split(':').collect::<Vec<_>>();
+    if fields.len() < 4 || fields.len() % 2 != 0 {
+        return None;
+    }
+    let mut bvid = None;
+    let mut aid = None;
+    let mut cid = None;
+    let mut epid = None;
+    for pair in fields.chunks_exact(2) {
+        match pair[0] {
+            "bvid" if pair[1].starts_with("BV") => bvid = Some(pair[1].to_string()),
+            "aid" if pair[1].bytes().all(|byte| byte.is_ascii_digit()) => {
+                aid = Some(pair[1].to_string());
+            }
+            "cid" if pair[1].bytes().all(|byte| byte.is_ascii_digit()) => {
+                cid = Some(pair[1].to_string());
+            }
+            "epid" if pair[1] != "none" && pair[1].bytes().all(|byte| byte.is_ascii_digit()) => {
+                epid = Some(pair[1].to_string());
+            }
+            _ => {}
+        }
+    }
+    let mut source_ids = Vec::new();
+    if let Some(id) = &bvid {
+        source_ids.push(id.clone());
+    }
+    if let Some(id) = &aid {
+        source_ids.push(format!("av{id}"));
+    }
+    if let Some(id) = &cid {
+        source_ids.push(format!("cid{id}"));
+    }
+    if let Some(id) = &epid {
+        source_ids.push(format!("ep{id}"));
+    }
+    (!source_ids.is_empty()).then_some(ParsedBilibiliStableMediaId {
+        bvid,
+        cid,
+        epid,
+        source_ids,
+    })
+}
+
+fn published_primary_relative_paths(record: &TaskRecord, root: &std::path::Path) -> Vec<String> {
+    let mut paths = record
+        .primary_media_hashes
+        .keys()
+        .filter_map(|raw_path| {
+            let path = PathBuf::from(raw_path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            };
+            path.strip_prefix(root)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn youtube_video_id(raw_url: &str) -> Option<String> {
+    let url = url::Url::parse(raw_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host == "youtu.be" || host.ends_with(".youtu.be") {
+        return url
+            .path_segments()?
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string);
+    }
+    if host == "youtube.com" || host.ends_with(".youtube.com") {
+        return url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "v").then(|| value.into_owned()));
+    }
+    None
 }
 
 fn spawn_bot_runtime_worker<F>(future: F) -> Result<oneshot::Receiver<Result<()>>>
@@ -766,6 +2528,11 @@ async fn handle_message(
         return Ok(());
     }
 
+    if is_file_command(text) {
+        handle_file_command(&telegram, &config, chat_id, is_private_chat).await?;
+        return Ok(());
+    }
+
     match route_message(text, &config.pdf.auto_domains) {
         RouteResult::Jobs(jobs) => {
             for (ordinal, job) in jobs.into_iter().enumerate() {
@@ -840,10 +2607,74 @@ fn default_bot_commands() -> Vec<BotCommand> {
             description: "View, resume, retry, or cancel saved tasks.".to_string(),
         },
         BotCommand {
+            command: "file".to_string(),
+            description: "Open the private file manager.".to_string(),
+        },
+        BotCommand {
             command: "bbdown".to_string(),
             description: "Manage BBDown Bilibili login state.".to_string(),
         },
     ]
+}
+
+fn is_file_command(text: &str) -> bool {
+    text.split_whitespace().next().is_some_and(|command| {
+        let command = command.to_ascii_lowercase();
+        command == "/file" || command.starts_with("/file@")
+    })
+}
+
+async fn handle_file_command(
+    telegram: &TelegramClient,
+    config: &AppConfig,
+    chat_id: i64,
+    is_private_chat: bool,
+) -> Result<()> {
+    if !is_private_chat {
+        telegram
+            .send_message(
+                chat_id,
+                "Open /file in a private chat with this bot.".to_string(),
+            )
+            .await?;
+        return Ok(());
+    }
+    let Some(cloud) = &config.cloud else {
+        telegram
+            .send_message(
+                chat_id,
+                "The file manager is unavailable until the local Cloudflare Worker is configured."
+                    .to_string(),
+            )
+            .await?;
+        return Ok(());
+    };
+    let mut worker_url =
+        url::Url::parse(&cloud.worker_url).context("cloud.worker_url must be a valid URL")?;
+    if !worker_url.path().ends_with('/') {
+        let path = format!("{}/", worker_url.path());
+        worker_url.set_path(&path);
+    }
+    let web_app_url = worker_url
+        .join("file/")
+        .context("failed to build the local file-manager URL")?;
+    let markup = InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![InlineKeyboardButton {
+            text: "Open File Manager".to_string(),
+            callback_data: String::new(),
+            web_app: Some(WebAppInfo {
+                url: web_app_url.to_string(),
+            }),
+        }]],
+    };
+    telegram
+        .send_message_with_inline_keyboard(
+            chat_id,
+            "Open your private file manager.".to_string(),
+            markup,
+        )
+        .await?;
+    Ok(())
 }
 
 fn help_message() -> String {
@@ -856,6 +2687,7 @@ fn help_message() -> String {
         "Commands:",
         "/help - Show this help.",
         "/pdf URL - Save a webpage as PDF.",
+        "/file - Open the private file manager in a private chat.",
         "/queue - View active tasks; use /queue history [page] for history.",
         "/bbdown login [web|tv|access-key] - Log in to Bilibili for BBDown downloads.",
         "/bbdown status - Check saved BBDown credentials.",
@@ -971,6 +2803,7 @@ fn task_action_keyboard(buttons: &[(String, String)]) -> InlineKeyboardMarkup {
                 .map(|(text, callback_data)| InlineKeyboardButton {
                     text: text.clone(),
                     callback_data: callback_data.clone(),
+                    web_app: None,
                 })
                 .collect(),
         ],
@@ -1364,6 +3197,7 @@ fn render_queue_page(
                     "q:{}:{previous}",
                     if command.history { "history" } else { "active" }
                 ),
+                web_app: None,
             },
             InlineKeyboardButton {
                 text: "Next".to_string(),
@@ -1371,6 +3205,7 @@ fn render_queue_page(
                     "q:{}:{next}",
                     if command.history { "history" } else { "active" }
                 ),
+                web_app: None,
             },
         ]);
     }
@@ -1519,6 +3354,7 @@ fn queue_task_action_button(
     InlineKeyboardButton {
         text: queue_button_label(action, task_number, display),
         callback_data: queue_callback_data(callback_action, &record.id, record.generation),
+        web_app: None,
     }
 }
 
@@ -4727,30 +6563,36 @@ fn bilibili_selection_keyboard(
             InlineKeyboardButton {
                 text: "Latest episode".to_string(),
                 callback_data: bilibili_selection_callback_data(token, "latest"),
+                web_app: None,
             },
             InlineKeyboardButton {
                 text: "All episodes".to_string(),
                 callback_data: bilibili_selection_callback_data(token, "all"),
+                web_app: None,
             },
         ]],
         BilibiliSelectionPrompt::UgcMembership(_) => vec![vec![
             InlineKeyboardButton {
                 text: "Current video".to_string(),
                 callback_data: bilibili_selection_callback_data(token, "current"),
+                web_app: None,
             },
             InlineKeyboardButton {
                 text: "Entire collection".to_string(),
                 callback_data: bilibili_selection_callback_data(token, "all"),
+                web_app: None,
             },
         ]],
         BilibiliSelectionPrompt::UgcCollection => vec![vec![InlineKeyboardButton {
             text: "Entire collection".to_string(),
             callback_data: bilibili_selection_callback_data(token, "all"),
+            web_app: None,
         }]],
     };
     inline_keyboard.push(vec![InlineKeyboardButton {
         text: "Cancel".to_string(),
         callback_data: bilibili_selection_callback_data(token, "cancel"),
+        web_app: None,
     }]);
     InlineKeyboardMarkup { inline_keyboard }
 }
@@ -4952,11 +6794,13 @@ fn duplicate_choice_keyboard(token: u64, allow_overwrite: bool) -> InlineKeyboar
         first_row.push(InlineKeyboardButton {
             text: "Overwrite".to_string(),
             callback_data: duplicate_callback_data(token, "overwrite"),
+            web_app: None,
         });
     }
     first_row.push(InlineKeyboardButton {
         text: "Keep both".to_string(),
         callback_data: duplicate_callback_data(token, "keep"),
+        web_app: None,
     });
     InlineKeyboardMarkup {
         inline_keyboard: vec![
@@ -4964,6 +6808,7 @@ fn duplicate_choice_keyboard(token: u64, allow_overwrite: bool) -> InlineKeyboar
             vec![InlineKeyboardButton {
                 text: "Cancel".to_string(),
                 callback_data: duplicate_callback_data(token, "cancel"),
+                web_app: None,
             }],
         ],
     }
@@ -6962,12 +8807,14 @@ fn collection_details_keyboard(
         buttons.push(InlineKeyboardButton {
             text: "Previous".to_string(),
             callback_data: collection_details_callback_data(token, page - 1),
+            web_app: None,
         });
     }
     if page + 1 < page_count {
         buttons.push(InlineKeyboardButton {
             text: "Next".to_string(),
             callback_data: collection_details_callback_data(token, page + 1),
+            web_app: None,
         });
     }
     InlineKeyboardMarkup {
@@ -7855,7 +9702,14 @@ mod tests {
                 .iter()
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["help", "pdf", "queue", "bbdown"]
+            vec!["help", "pdf", "queue", "file", "bbdown"]
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .find(|command| command.command == "file")
+                .map(|command| command.description.as_str()),
+            Some("Open the private file manager.")
         );
     }
 

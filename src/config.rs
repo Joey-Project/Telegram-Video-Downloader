@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::{env, fs};
+use std::{env, fmt, fs};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,8 @@ use crate::file_provider::classify_deadlock_error;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub telegram: TelegramConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudConfig>,
     #[serde(default)]
     pub downloads: DownloadsConfig,
     #[serde(default)]
@@ -28,6 +30,46 @@ pub struct AppConfig {
     pub bot: BotConfig,
     #[serde(skip)]
     project_dir: PathBuf,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct CloudConfig {
+    pub worker_url: String,
+    #[serde(default, skip_serializing)]
+    pub shared_secret: Option<String>,
+    #[serde(default = "default_cloud_fallback_poll_seconds")]
+    pub fallback_poll_seconds: u64,
+}
+
+impl fmt::Debug for CloudConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CloudConfig")
+            .field("worker_url", &self.worker_url)
+            .field(
+                "shared_secret",
+                &self.shared_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("fallback_poll_seconds", &self.fallback_poll_seconds)
+            .finish()
+    }
+}
+
+impl CloudConfig {
+    pub fn resolved_shared_secret(&self) -> Result<String> {
+        let secret = env::var("TELEGRAM_VIDEO_DOWNLOADER_CLOUD_SHARED_SECRET")
+            .ok()
+            .or_else(|| self.shared_secret.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cloud.shared_secret or TELEGRAM_VIDEO_DOWNLOADER_CLOUD_SHARED_SECRET must be configured"
+                )
+            })?;
+        if secret.trim().is_empty() || secret.chars().any(char::is_whitespace) {
+            bail!("cloud shared secret must be a non-empty bearer token without whitespace");
+        }
+        Ok(secret)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -149,6 +191,7 @@ impl AppConfig {
                 allowed_chat_ids: vec![123456789],
                 allow_all_chats: false,
             },
+            cloud: None,
             downloads: DownloadsConfig::default(),
             tools: ToolsConfig::default(),
             pdf: PdfConfig::default(),
@@ -241,7 +284,10 @@ impl AppConfig {
         if self.telegram.token.trim().is_empty() {
             bail!("telegram.token must not be empty");
         }
-        if !self.telegram.allow_all_chats && self.telegram.allowed_chat_ids.is_empty() {
+        if self.cloud.is_none()
+            && !self.telegram.allow_all_chats
+            && self.telegram.allowed_chat_ids.is_empty()
+        {
             bail!("telegram.allowed_chat_ids must not be empty unless allow_all_chats is true");
         }
         if self.bot.concurrency == 0 {
@@ -258,6 +304,33 @@ impl AppConfig {
         }
         if self.bot.command_idle_timeout_seconds == 0 {
             bail!("bot.command_idle_timeout_seconds must be at least 1");
+        }
+        if let Some(cloud) = &self.cloud {
+            let worker_url = url::Url::parse(&cloud.worker_url)
+                .context("cloud.worker_url must be a valid HTTPS URL")?;
+            if worker_url.scheme() != "https"
+                || worker_url.host_str().is_none()
+                || !worker_url.username().is_empty()
+                || worker_url.password().is_some()
+                || worker_url.query().is_some()
+                || worker_url.fragment().is_some()
+            {
+                bail!(
+                    "cloud.worker_url must be an HTTPS origin or base path without credentials, query, or fragment"
+                );
+            }
+            if cloud.fallback_poll_seconds < 5 {
+                bail!("cloud.fallback_poll_seconds must be at least 5");
+            }
+            if self.telegram.allow_all_chats
+                || self.telegram.allowed_chat_ids.len() != 1
+                || self.telegram.allowed_chat_ids[0] <= 0
+            {
+                bail!(
+                    "cloud mode requires allow_all_chats = false and exactly one positive telegram.allowed_chat_ids entry for the private owner chat"
+                );
+            }
+            cloud.resolved_shared_secret()?;
         }
         if self.bilibili.auth.login_timeout_seconds == 0 {
             bail!("bilibili.auth.login_timeout_seconds must be at least 1");
@@ -703,6 +776,10 @@ fn default_poll_timeout_seconds() -> u64 {
     50
 }
 
+fn default_cloud_fallback_poll_seconds() -> u64 {
+    30
+}
+
 fn default_progress_update_seconds() -> u64 {
     5
 }
@@ -831,6 +908,7 @@ mod tests {
         assert_eq!(config.bot.progress_update_seconds, 5);
         assert_eq!(config.bot.command_timeout_seconds, 7200);
         assert_eq!(config.bot.command_idle_timeout_seconds, 300);
+        assert!(config.cloud.is_none());
         assert_eq!(config.pdf.auto_domains, vec!["mp.weixin.qq.com"]);
         assert_eq!(
             config.video.subtitle_languages,
@@ -865,6 +943,48 @@ mod tests {
         assert_eq!(config.bilibili.auth.credential_profile, None);
         assert_eq!(config.bilibili.auth.login_timeout_seconds, 180);
         assert_eq!(config.bilibili.auth.poll_interval_seconds, 2);
+    }
+
+    #[test]
+    fn cloud_config_never_serializes_or_debug_prints_the_shared_secret() {
+        // Synthetic catalog joey-private-v3: bearer-a (active bearer).
+        let config = CloudConfig {
+            worker_url: "https://worker.example.test".to_string(),
+            shared_secret: Some("codex_synth_v1_bearer_a".to_string()),
+            fallback_poll_seconds: 30,
+        };
+        let serialized = serde_json::to_string(&config).expect("cloud config should serialize");
+        let debug = format!("{config:?}");
+        assert!(!serialized.contains("shared_secret"));
+        assert!(!serialized.contains("codex_synth_v1_bearer_a"));
+        assert!(!debug.contains("codex_synth_v1_bearer_a"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn cloud_mode_rejects_ambiguous_or_group_owner_allowlists() {
+        let mut config = AppConfig::for_test();
+        config.cloud = Some(CloudConfig {
+            worker_url: "https://worker.example.test".to_string(),
+            shared_secret: Some("codex_synth_v1_bearer_a".to_string()),
+            fallback_poll_seconds: 30,
+        });
+        config.telegram.allow_all_chats = true;
+        let error = config
+            .validate()
+            .expect_err("cloud must reject allow-all mode");
+        assert!(error.to_string().contains("exactly one positive"));
+
+        config.telegram.allow_all_chats = false;
+        config.telegram.allowed_chat_ids.clear();
+        let error = config
+            .validate()
+            .expect_err("cloud must require an owner ID");
+        assert!(error.to_string().contains("exactly one positive"));
+
+        config.telegram.allowed_chat_ids = vec![-123_456_789];
+        let error = config.validate().expect_err("cloud must reject group IDs");
+        assert!(error.to_string().contains("exactly one positive"));
     }
 
     #[test]
