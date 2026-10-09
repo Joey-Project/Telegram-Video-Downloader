@@ -216,3 +216,24 @@ superseded_by:
   proxy such as `cn=https://atri.ink`, with `cn=https://bili.nepnep.moe` as an
   optional fallback. These validation runs did not install runtime configuration
   or restart the LaunchAgent.
+
+## Runtime Proxy Configuration
+
+- Joey authorized applying the verified settings. The canonical `config.toml`
+  now has Web playurl mode, area `cn`, and ordered restricted API proxies
+  `cn=https://atri.ink` and `cn=https://bili.nepnep.moe`. TOML parsing and comparison
+  confirmed that all other configuration settings were preserved.
+- A concurrent video-fix deployment changed the canonical executable during
+  preflight. The signing gate caught its temporary ad-hoc signature; that
+  deployment then restored the original certificate and identifier. Non-sandbox
+  strict verification against the original requirement passed before this
+  workstream restarted the service. This workstream did not rebuild or replace
+  the other deployment's executable.
+- The existing GUI LaunchAgent was restarted once to load the proxy settings.
+  It logged `telegram local downloader started` at 2026-10-09 17:20:57 UTC
+  (18:20:57 Europe/London). Exactly one bot process was observed, PID `93790`,
+  with its canonical config path and an established Telegram HTTPS connection.
+- A follow-up more than one minute later showed the same PID and run count,
+  the Telegram connection still established, and no new polling/startup errors.
+  The temporary configuration rollback copy was removed after verification;
+  login state and the existing download queue were preserved.
