@@ -75,3 +75,29 @@ superseded_by:
   was performed.
 - The fixed binary and bounded validation/sample artifacts are retained in
   `/private/tmp/telegram-access-key-flow` for recovery.
+
+## Download-Root Pinning
+
+- On 2026-10-09, Joey authorized pinning the configured download roots. The video
+  root `/Users/joey/Movies/Downloads` has no managed File Provider item according
+  to `fileproviderctl evaluate`; the PDF root is managed by File Provider.
+- The PDF root was initially downloaded but not kept downloaded, and was not
+  recursively downloaded. After checking the implementation in
+  [icloud-tools Pinner.swift](https://github.com/icanhasjonas/icloud-tools/blob/main/Sources/icloud/Core/Pinner.swift),
+  wrote the File Provider pin marker `com.apple.fileprovider.pinned#PX` with byte
+  `0x31` to `/Users/joey/Documents/Downloads` only. No third-party tool was installed.
+- System verification with `fileproviderctl evaluate` confirmed
+  `isKeepDownloaded = 1`, followed by `isRecursivelyDownloaded = 1`. The hidden
+  `.telegram-video-downloader-queue` directory also reports both flags as `1`
+  through the inherited pin. File contents and access permissions were not edited.
+- Read-only API research used GPT-6 Luna at high reasoning. Public File Provider
+  download requests do not provide an equivalent client-facing pin setter; the
+  pin marker is an implementation detail, and the actual system state was verified.
+- Re-deployed the previously validated fixed binary to the canonical release
+  path and restarted the existing LaunchAgent. A final restart after recursive
+  downloading completed still did not reach the startup-ready log. A one-second
+  process sample confirmed the same `QueueManager::open` -> `NSFileCoordinator`
+  -> `__open` wait. Pinning and materialization are complete; the remaining
+  startup-coordination block is unresolved. The canonical release path currently
+  contains the fixed binary; the original binary and bounded diagnostic samples
+  remain in the task-scoped temporary directory for recovery.
