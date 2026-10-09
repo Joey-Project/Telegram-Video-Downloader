@@ -1,7 +1,7 @@
 ---
 id: 20261009-akq01
 title: Automatic Access-Key QR Authorization
-status: blocked
+status: completed
 created: 2026-10-09
 updated: 2026-10-09
 branch: wip/access-key-qr-login
@@ -129,3 +129,24 @@ superseded_by:
   before deployment, and require readiness evidence after restarting. Documentation
   validation used `git diff --check`, project-journal validation, and existence
   checks for the new Markdown links. Runtime code and test fixtures were unchanged.
+
+## Runtime Recovery
+
+- Joey completed the macOS authorization prompt. The previously pending
+  Documents request `55269.99` returned `authValue=2` without an error at
+  2026-10-09 16:13:33 UTC. The existing signed process then logged
+  `telegram local downloader started` at 16:13:35 UTC, without another restart
+  or any change to its binary location, working directory, or download roots.
+- The canonical LaunchAgent has one instance, PID `89764`. Its TCP connection to
+  Telegram is established, and the scoped startup evidence contains no subsequent
+  polling errors. This confirms that the pending privacy authorization was the
+  remaining startup gate; directory pinning alone could not finish that request.
+- Non-sandbox `codesign --verify --strict --verbose=2 --test-requirement` confirms
+  the deployed binary matches the original identifier/certificate requirement.
+  The sandbox-only certificate trust error was not a bad application signature.
+- Automatic access-key QR login is deployed and available. Actual account
+  scan/confirmation and credential-backed resolver validation still require
+  Joey to initiate `/bbdown login access-key` and complete authorization.
+- The original binary and bounded build/test/sample evidence remain in
+  `/private/tmp/telegram-access-key-flow` for rollback and follow-up. The separate
+  directory-coordination probe and generated Swift module cache were cleaned up.

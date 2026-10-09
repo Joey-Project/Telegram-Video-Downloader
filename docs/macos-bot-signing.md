@@ -40,6 +40,12 @@ probes succeeded. Pinning and recursive materialization did not remove that wait
    certificate signature. Report the exact remaining authorization gate and let
    Joey approve any privacy-permission change; do not reset TCC or edit its database.
 
+Restoring a valid signature does not itself complete an authorization prompt that
+was already pending. On 2026-10-09, the earlier Documents request completed only
+after Joey approved it; the existing signed process reached startup-ready two
+seconds later, without moving the executable or changing its working directory.
+Check the specific request's result and the runtime log before restarting again.
+
 ## Current Local Identity
 
 The verified identity on Joey's current Mac is `Telegram Video Downloader Local
