@@ -39,9 +39,11 @@ superseded_by:
   episode metadata, without claiming content stability or rejecting harmless
   File Provider timestamp changes.
 - Stream probing reads an inherited descriptor for the held media object rather
-  than reopening its pathname. Existing-entry checks use at most two concurrent
-  probes and retain their verified evidence, so collecting skipped outputs only
-  revalidates identities and sidecars rather than repeating stream probes.
+  than reopening its pathname, selecting its number within the process limit.
+  Existing-entry checks use at most two concurrent probes, close the held files
+  after probing, and retain verified identity metadata. Collecting skipped
+  outputs revalidates identities and sidecars without retaining one open file
+  per episode or repeating stream probes.
 - The worker compares its lock-protected filtered plan with the queued snapshot
   before downloading. A changed plan stops with retry/requeue guidance so the
   queue can validate the new plan.
@@ -60,7 +62,7 @@ superseded_by:
   the skipped episode receives zero playback requests, the missing episode
   receives one, and an all-existing season produces a valid empty plan.
 - `cargo test --all-targets --locked --offline --quiet -- --test-threads=4`:
-  581 passed, 14 ignored, zero failures after target-branch integration.
+  582 passed, 15 ignored, zero failures after target-branch integration.
   Coverage includes actual file
   removal/replacement, changed and newly conflicting sidecars, benign
   directory-entry churn. The separate real video/audio stream fixture test is
@@ -77,6 +79,9 @@ superseded_by:
   concurrent probes, preserved order, and conservative timeout handling. The
   localhost mock counts three probes across partial/all-existing planning and
   verifies that final output collection does not probe those files again.
+- An isolated child process with a 64-FD limit probes 200 matching entries while
+  retaining lightweight evidence. This covers both dynamic descriptor selection
+  and release of each media descriptor rather than whole-season accumulation.
 - The explicit real-media test passed separately (one test); both controlled
   probe scripts passed `bash -n` and ShellCheck.
 - Strict Clippy and formatting passed with Cargo/rustc 1.95.0. Queue and HTTP

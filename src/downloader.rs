@@ -2000,12 +2000,13 @@ async fn bilibili_plan_entry_compatible_existing_media(
             continue;
         };
         if bound_file.validate_identity().is_ok()
+            && index.file_identities.get(&video) == Some(&bound_file.identity())
             && bilibili_media_path_has_exact_existing_metadata(index, &video, entry)
             && media_satisfies_download_mode(mode, has_video, has_audio)
         {
             return Some(ExistingEpisodeEvidence {
                 path: video,
-                bound_file,
+                identity: bound_file.identity(),
             });
         }
     }
@@ -2015,9 +2016,8 @@ async fn bilibili_plan_entry_compatible_existing_media(
 #[derive(Debug)]
 struct ExistingEpisodeEvidence {
     path: PathBuf,
-    // Pins and revalidates the selected filesystem object across ffprobe and final planning.
-    // This protects object identity, not against in-place media content mutation.
-    bound_file: BoundFile,
+    // Device/inode/type identity observed on the bound descriptor; no content-stability claim.
+    identity: EntryIdentity,
 }
 
 fn bilibili_missing_skip_mode_supported(mode: DownloadMode) -> bool {
@@ -2063,7 +2063,7 @@ async fn probe_media_streams(
 ) -> Option<(bool, bool)> {
     #[cfg(unix)]
     let (media_arg, inherited_fd_base) = {
-        let base = 64;
+        let base = select_bilibili_mux_inherited_fd_base(1).ok()?;
         (PathBuf::from(format!("/dev/fd/{base}")), Some(base))
     };
     #[cfg(not(unix))]
@@ -2291,8 +2291,17 @@ async fn plan_bilibili_missing_season(
             uploader: None,
             publish_date: None,
         };
-        if !bilibili_media_path_has_exact_existing_metadata(&index, &evidence.path, &entry)
-            || evidence.bound_file.validate_identity().is_err()
+        let Some(root) = index.root.as_ref() else {
+            bail!("Bilibili output root became unavailable while validating skipped episodes");
+        };
+        let current = root
+            .open_bound_file(&evidence.path)
+            .context("failed to revalidate skipped Bilibili media; retry the season")?;
+        let Some(current) = current else {
+            bail!("skipped Bilibili media disappeared while planning; retry the season");
+        };
+        if current.identity() != evidence.identity
+            || !bilibili_media_path_has_exact_existing_metadata(&index, &evidence.path, &entry)
         {
             bail!(
                 "Bilibili episode identity or media evidence changed while planning; retry the season so the updated plan can be reviewed"
@@ -17216,6 +17225,112 @@ mod tests {
             .unwrap()
             .expect("replacement path should be present");
         assert_ne!(replacement.identity(), original_identity);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_season_evidence_releases_descriptors_under_low_limit() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("test binary should resolve"),
+        );
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("downloader::tests::missing_season_many_existing_entries_low_limit_child")
+            .arg("--nocapture")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut limits = limits.assume_init();
+                limits.rlim_cur = limits.rlim_cur.min(64 as libc::rlim_t);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for descriptor in (libc::STDERR_FILENO + 1)..64 {
+                    libc::close(descriptor);
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().expect("low-limit helper should run");
+        assert!(
+            output.status.success(),
+            "low-limit helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "spawned by missing_season_evidence_releases_descriptors_under_low_limit"]
+    async fn missing_season_many_existing_entries_low_limit_child() {
+        let root = temp_test_dir("missing-season-many-existing-low-fd");
+        fs::create_dir_all(&root).expect("fixture root should create");
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) },
+            0
+        );
+        assert!(unsafe { limits.assume_init() }.rlim_cur <= 64 as libc::rlim_t);
+
+        let ffprobe = root.join("ffprobe-fixture");
+        fs::write(&ffprobe, "#!/bin/sh\nprintf 'video\\naudio\\n'\n")
+            .expect("controlled probe should write");
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755))
+            .expect("probe should be executable");
+        for index in 0..200_u64 {
+            let video = root.join(format!("Episode {index:03}.mp4"));
+            fs::write(&video, b"synthetic media").expect("media should write");
+            fs::write(
+                video.with_extension("nfo"),
+                format!(
+                    "<movie><uniqueid type=\"bilibili-cid\">cid{}</uniqueid><uniqueid type=\"bilibili-epid\">ep{}</uniqueid></movie>",
+                    index + 1000,
+                    index + 2000
+                ),
+            )
+            .expect("identity sidecar should write");
+        }
+        let index = build_video_identity_index_in_dir(
+            &root,
+            StagedPrimaryMediaKind::Video,
+            IdentityIndexReadPolicy::BestEffort,
+        )
+        .expect("existing media should index");
+        let config = test_config();
+        let mut evidence = Vec::with_capacity(200);
+        for ordinal in 0..200_u64 {
+            let entry = BilibiliDownloadEntry {
+                cid: ordinal + 1000,
+                epid: Some(ordinal + 2000),
+                ..Default::default()
+            };
+            evidence.push(
+                bilibili_plan_entry_compatible_existing_media(
+                    &config,
+                    &index,
+                    &entry,
+                    DownloadMode::All,
+                    &ffprobe,
+                )
+                .await
+                .expect("matching episode should retain lightweight evidence"),
+            );
+        }
+        assert_eq!(evidence.len(), 200);
+        assert!(
+            evidence
+                .iter()
+                .all(|item| item.identity.is_file() && item.path.is_file())
+        );
         let _ = fs::remove_dir_all(root);
     }
 
