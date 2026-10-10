@@ -3,7 +3,6 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -44,7 +43,7 @@ use crate::safe_fs::{
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 // Credential migration can block on the cross-process auth lock. Keep callers waiting
 // asynchronously so inbound Bilibili links cannot consume Tokio blocking workers.
-static BILIBILI_CREDENTIAL_SYNC_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+static BILIBILI_CREDENTIAL_SYNC_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 #[cfg(unix)]
 static BILIBILI_WORKER_PROCESS: AtomicBool = AtomicBool::new(false);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -6739,34 +6738,37 @@ pub(crate) async fn sync_bilibili_rust_credentials(config: &AppConfig) -> Result
     let state_path = config.bilibili.auth.state_path.clone();
     let credential_file = config.bilibili.auth.credential_file.clone();
     let credential_profile = config.bilibili.auth.credential_profile.clone();
-    run_with_bilibili_credential_sync_limit(bilibili_credential_sync_semaphore(), async move {
-        tokio::task::spawn_blocking(move || {
-            bilibili_auth::sync_bbdown_rust_credentials_from_state(
-                &state_path,
-                &credential_file,
-                credential_profile.as_deref(),
-            )
-        })
-        .await
-        .context("BBDown credential migration task failed")??;
-        Ok(())
+    run_with_bilibili_credential_sync_limit(bilibili_credential_sync_semaphore(), move || {
+        bilibili_auth::sync_bbdown_rust_credentials_from_state(
+            &state_path,
+            &credential_file,
+            credential_profile.as_deref(),
+        )
     })
-    .await
+    .await??;
+    Ok(())
 }
 
-fn bilibili_credential_sync_semaphore() -> &'static Semaphore {
-    BILIBILI_CREDENTIAL_SYNC_SEMAPHORE.get_or_init(|| Semaphore::new(1))
+fn bilibili_credential_sync_semaphore() -> Arc<Semaphore> {
+    Arc::clone(BILIBILI_CREDENTIAL_SYNC_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(1))))
 }
 
-async fn run_with_bilibili_credential_sync_limit<T>(
-    semaphore: &Semaphore,
-    operation: impl Future<Output = T>,
-) -> T {
-    let _permit = semaphore
-        .acquire()
+async fn run_with_bilibili_credential_sync_limit<T: Send + 'static>(
+    semaphore: Arc<Semaphore>,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let permit = semaphore
+        .acquire_owned()
         .await
         .expect("Bilibili credential sync semaphore should remain open");
-    operation.await
+    // Blocking work continues after its caller is cancelled. The worker must own
+    // the permit so a timeout cannot admit another credential migration early.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .context("BBDown credential migration task failed")
 }
 
 pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
@@ -15115,17 +15117,17 @@ mod tests {
             .await
             .expect("test semaphore should remain open");
         let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let waiting_semaphore = Arc::clone(&semaphore);
         let waiting_task = tokio::spawn(async move {
-            run_with_bilibili_credential_sync_limit(&waiting_semaphore, async move {
+            run_with_bilibili_credential_sync_limit(waiting_semaphore, move || {
                 started_tx
-                    .send(())
-                    .await
+                    .blocking_send(())
                     .expect("test receiver should remain open");
-                release_rx.await.expect("test sender should remain open");
+                release_rx.recv().expect("test sender should remain open");
             })
-            .await;
+            .await
+            .expect("credential sync worker should finish");
         });
 
         assert!(
@@ -15147,6 +15149,52 @@ mod tests {
             .await
             .expect("waiting credential sync task should finish")
             .expect("waiting credential sync task should not panic");
+    }
+
+    #[tokio::test]
+    async fn bilibili_credential_sync_limit_survives_caller_cancellation() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_semaphore = Arc::clone(&semaphore);
+        let first_task = tokio::spawn(async move {
+            run_with_bilibili_credential_sync_limit(first_semaphore, move || {
+                started_tx.blocking_send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+            .await
+            .unwrap();
+        });
+        tokio_timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        first_task.abort();
+        assert!(first_task.await.unwrap_err().is_cancelled());
+
+        let (next_started_tx, mut next_started_rx) = tokio::sync::mpsc::channel(1);
+        let second_task = tokio::spawn(async move {
+            run_with_bilibili_credential_sync_limit(semaphore, move || {
+                next_started_tx.blocking_send(()).unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        assert!(
+            tokio_timeout(Duration::from_millis(50), next_started_rx.recv())
+                .await
+                .is_err(),
+            "cancelling the caller must not release a running worker's permit"
+        );
+        release_tx.send(()).unwrap();
+        tokio_timeout(Duration::from_secs(1), next_started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio_timeout(Duration::from_secs(1), second_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     fn test_home() -> PathBuf {

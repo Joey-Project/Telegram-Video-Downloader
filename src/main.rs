@@ -1484,7 +1484,10 @@ fn queue_task_detail_notice(record: &TaskRecord) -> Option<String> {
         let error = sanitize_queue_display_text(&redact_sensitive_text(error));
         let error = error
             .find("API returned code ")
-            .map_or(error.as_str(), |index| &error[index..]);
+            .map_or(error.as_str(), |index| {
+                let start = error[..index].rfind("episode index ").unwrap_or(index);
+                &error[start..]
+            });
         if !error.is_empty() {
             return Some(truncate_utf16_units(error, QUEUE_TASK_DETAIL_NOTICE_UNITS));
         }
@@ -1496,7 +1499,9 @@ fn queue_task_detail_notice(record: &TaskRecord) -> Option<String> {
             .as_ref()
             .is_none_or(|metadata| metadata.selected_format_ids.is_empty())
     {
-        return Some(if record.display_metadata.is_some() {
+        return Some(if matches!(record.job, JobRequest::Pdf { .. }) {
+            "Document information is not available yet.".to_string()
+        } else if record.display_metadata.is_some() {
             "Stream information is not available yet.".to_string()
         } else {
             "Video information is not available yet.".to_string()

@@ -31,9 +31,12 @@ superseded_by:
 - If planning fails without cached details, attempt a bounded title-only lookup.
   Its five-second budget includes credential synchronization and semaphore waits,
   so a blocked fallback cannot hide the original failure or keep the task running.
+  The blocking credential worker owns its limiter permit until it actually exits,
+  preventing retries from accumulating blocked workers after caller cancellation.
   Queue rows show the available title and a concise failure/interruption reason.
   API denial codes/messages remain redacted and bounded; HTTP/IO details stay
-  generic.
+  generic. Episode planning errors retain their episode index, and missing PDF
+  metadata uses a document-specific notice.
 - Prefer exact stream sizes, otherwise estimate from positive bitrate and duration
   using checked arithmetic. Estimates are marked `about`; missing or overflowing
   inputs remain unknown.
@@ -43,11 +46,12 @@ superseded_by:
 
 ## Validation
 
-- Eight new regressions cover duplicate preview persistence through restart,
+- Eleven new regressions cover duplicate preview persistence through restart,
   denied preview and failed plan title retention, stale writes and request changes,
   legacy records, long error pages, bitrate estimate boundaries, and per-episode
-  API denial reporting, and fallback timeout while credential synchronization waits.
-- `cargo test --all-targets --locked --offline --quiet`: 568 passed, 13 ignored,
+  API denial reporting, fallback timeout while credential synchronization waits,
+  cancellation-safe credential serialization, PDF notices, and episode error context.
+- `cargo test --all-targets --locked --offline --quiet`: 571 passed, 13 ignored,
   zero failures. Localhost and macOS File Provider fixtures ran outside the sandbox.
 - `cargo build --locked --offline`, strict Clippy, and format checks passed with
   Cargo/rustc 1.95.0. Build targets were isolated under a task-scoped temporary

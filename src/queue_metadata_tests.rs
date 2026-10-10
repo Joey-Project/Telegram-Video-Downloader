@@ -237,6 +237,40 @@ mod queue_metadata_tests {
     }
 
     #[test]
+    fn missing_pdf_metadata_uses_document_notice() {
+        let mut task = TaskRecord::new(
+            "document-notice".to_string(), 1, 2, CHAT_ID, None, 0,
+            JobRequest::Pdf { url: "https://example.com/document.pdf".to_string() },
+        );
+        for status in [TaskStatus::Received, TaskStatus::Cancelled] {
+            task.status = status;
+            assert_eq!(
+                queue_task_detail_notice(&task).as_deref(),
+                Some("Document information is not available yet."),
+            );
+        }
+    }
+
+    #[test]
+    fn failed_episode_notice_keeps_episode_index_and_api_code() {
+        let mut task = TaskRecord::new(
+            "episode-notice".to_string(), 1, 2, CHAT_ID, None, 0,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".to_string(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Failed;
+        task.error = Some(format!(
+            "{}: episode index 203 planning failed: API returned code -10403: {}",
+            "Outer planning context".repeat(10), "Denied".repeat(50),
+        ));
+        let notice = queue_task_detail_notice(&task).unwrap();
+        assert!(notice.starts_with("episode index 203 planning failed: API returned code -10403:"));
+        assert!(notice.encode_utf16().count() <= QUEUE_TASK_DETAIL_NOTICE_UNITS);
+    }
+
+    #[test]
     fn failed_queue_page_keeps_all_buttons_with_long_details() {
         let (root, _, queue, job) = queue_fixture("queue-metadata-page-limit");
         for ordinal in 0..10 {
