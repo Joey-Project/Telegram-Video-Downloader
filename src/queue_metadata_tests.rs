@@ -127,7 +127,7 @@ mod queue_metadata_tests {
         let (endpoint, stop_api, api) = spawn_metadata_api(true).await;
         config.bilibili.global_args = vec![endpoint];
         fs::write(config.downloads.video_dir.join(format!("{BVID}.mp4")), b"existing").unwrap();
-        let check = find_video_duplicate_with_probe(&config, &job).await.unwrap();
+        let check = crate::downloader::find_video_duplicate_with_probe(&config, &job).await.unwrap();
         assert!(check.duplicate.is_some());
         let metadata = check.display_metadata.unwrap();
         assert_eq!(metadata.title.as_deref(), Some("Queue fixture video"));
@@ -148,7 +148,7 @@ mod queue_metadata_tests {
         task.status = TaskStatus::Running;
         queue.create(task).unwrap();
         let error = tokio_timeout(Duration::from_secs(10), inspect_and_preserve_job_plan(
-            &config, &queue, id, 0, &job,
+            &config, &queue, id, 0, &job, None,
         )).await.unwrap().expect_err("denied streams must remain a failed plan");
         queue.fail_if_generation(id, 0, format!("{error:#}")).unwrap();
         let task = queue.get(id).unwrap().unwrap();
