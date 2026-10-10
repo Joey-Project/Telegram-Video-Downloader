@@ -44,6 +44,9 @@ superseded_by:
   after probing, and retain verified identity metadata. Collecting skipped
   outputs revalidates identities and sidecars without retaining one open file
   per episode or repeating stream probes.
+- The final report repeats skipped-file identity and sidecar validation after
+  downloading the remaining episodes, preventing a changed skipped file from
+  being reported complete using stale planning evidence.
 - The worker compares its lock-protected filtered plan with the queued snapshot
   before downloading. A changed plan stops with retry/requeue guidance so the
   queue can validate the new plan.
@@ -62,7 +65,7 @@ superseded_by:
   the skipped episode receives zero playback requests, the missing episode
   receives one, and an all-existing season produces a valid empty plan.
 - `cargo test --all-targets --locked --offline --quiet -- --test-threads=4`:
-  582 passed, 15 ignored, zero failures after target-branch integration.
+  583 passed, 15 ignored, zero failures after target-branch integration.
   Coverage includes actual file
   removal/replacement, changed and newly conflicting sidecars, benign
   directory-entry churn. The separate real video/audio stream fixture test is
@@ -82,6 +85,9 @@ superseded_by:
 - An isolated child process with a 64-FD limit probes 200 matching entries while
   retaining lightweight evidence. This covers both dynamic descriptor selection
   and release of each media descriptor rather than whole-season accumulation.
+- Final-report regression coverage accepts unchanged evidence and directory
+  churn while rejecting missing/replaced media and missing, unreadable, or
+  conflicting sidecars with distinct errors.
 - The explicit real-media test passed separately (one test); both controlled
   probe scripts passed `bash -n` and ShellCheck.
 - Strict Clippy and formatting passed with Cargo/rustc 1.95.0. Queue and HTTP

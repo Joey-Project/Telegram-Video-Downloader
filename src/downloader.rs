@@ -2182,36 +2182,157 @@ fn current_bilibili_sidecars_match_entry(
     video: &Path,
     entry: &BilibiliDownloadEntry,
 ) -> bool {
-    let Ok(paths) = existing_metadata_sidecar_paths(video) else {
-        return false;
-    };
+    matches!(
+        validate_current_bilibili_sidecars(root, video, entry),
+        Ok(CurrentBilibiliSidecarEvidence::Matches)
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CurrentBilibiliSidecarEvidence {
+    Matches,
+    Missing,
+    Mismatched,
+}
+
+fn validate_current_bilibili_sidecars(
+    root: &RootedFs,
+    video: &Path,
+    entry: &BilibiliDownloadEntry,
+) -> Result<CurrentBilibiliSidecarEvidence> {
+    let paths = existing_metadata_sidecar_paths(video)?;
+    if paths.is_empty() {
+        return Ok(CurrentBilibiliSidecarEvidence::Missing);
+    }
     let mut sidecars = Vec::with_capacity(paths.len());
     for path in paths {
-        let Ok(Some(file)) = root.open_bound_file(&path) else {
-            // A disappearing, replaced, unreadable, or non-regular sidecar makes the
-            // identity evidence uncertain, so this episode must be planned for download.
-            return false;
+        let Some(file) = root.open_bound_file(&path).with_context(|| {
+            format!("failed to open current identity sidecar {}", path.display())
+        })?
+        else {
+            return Ok(CurrentBilibiliSidecarEvidence::Missing);
         };
-        let Ok(contents) = file.read_limited(IDENTITY_METADATA_SIDECAR_READ_LIMIT) else {
-            return false;
-        };
-        let Ok(contents) = String::from_utf8(contents) else {
-            return false;
-        };
-        let Ok(identities) = metadata_sidecar_identities(&path, &contents) else {
-            return false;
-        };
+        let contents = file
+            .read_limited(IDENTITY_METADATA_SIDECAR_READ_LIMIT)
+            .with_context(|| {
+                format!("failed to read current identity sidecar {}", path.display())
+            })?;
+        let contents = String::from_utf8(contents).with_context(|| {
+            format!("current identity sidecar is not UTF-8: {}", path.display())
+        })?;
+        let identities = metadata_sidecar_identities(&path, &contents).with_context(|| {
+            format!(
+                "failed to parse current identity sidecar {}",
+                path.display()
+            )
+        })?;
         sidecars.push(identities);
     }
-    !sidecars.is_empty() && bilibili_sidecars_match_entry(&sidecars, entry)
+    if bilibili_sidecars_match_entry(&sidecars, entry) {
+        Ok(CurrentBilibiliSidecarEvidence::Matches)
+    } else {
+        Ok(CurrentBilibiliSidecarEvidence::Mismatched)
+    }
 }
 
 struct BilibiliMissingSeasonPlan {
     plan: bbdown_core::DownloadPlan,
     resolved: ResolvedContent,
     skipped: Vec<(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)>,
-    existing_media_paths: BTreeSet<PathBuf>,
     total_entries: usize,
+}
+
+fn bilibili_entry_from_episode_metadata(
+    episode: &bbdown_core::EpisodeMetadata,
+) -> BilibiliDownloadEntry {
+    BilibiliDownloadEntry {
+        index: episode.index,
+        aid: episode.aid,
+        bvid: None,
+        cid: episode.cid,
+        epid: Some(episode.epid),
+        title: episode.title.clone(),
+        uploader: None,
+        publish_date: None,
+    }
+}
+
+fn revalidate_missing_season_evidence_for_report(
+    root: &RootedFs,
+    skipped: &[(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)],
+) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    for (episode, evidence) in skipped {
+        revalidate_missing_episode_evidence(root, episode, evidence, "final report")?;
+        paths.insert(evidence.path.clone());
+    }
+    Ok(paths.into_iter().collect())
+}
+
+fn revalidate_missing_episode_evidence(
+    root: &RootedFs,
+    episode: &bbdown_core::EpisodeMetadata,
+    evidence: &ExistingEpisodeEvidence,
+    phase: &str,
+) -> Result<()> {
+    let current = root.open_bound_file(&evidence.path).with_context(|| {
+        format!(
+            "failed to read existing Bilibili media during {phase} validation: {}",
+            evidence.path.display()
+        )
+    })?;
+    let Some(current) = current else {
+        bail!(
+            "existing Bilibili media disappeared during {phase} validation: {}",
+            evidence.path.display()
+        );
+    };
+    if current.identity() != evidence.identity || !current.identity().is_file() {
+        bail!(
+            "existing Bilibili media identity changed during {phase} validation: {}",
+            evidence.path.display()
+        );
+    }
+    match validate_current_bilibili_sidecars(
+        root,
+        &evidence.path,
+        &bilibili_entry_from_episode_metadata(episode),
+    )
+    .with_context(|| {
+        format!(
+            "failed to read current Bilibili identity sidecar during {phase} validation for {}",
+            evidence.path.display()
+        )
+    })? {
+        CurrentBilibiliSidecarEvidence::Matches => {}
+        CurrentBilibiliSidecarEvidence::Missing => bail!(
+            "Bilibili identity sidecar disappeared during {phase} validation: {}",
+            evidence.path.display()
+        ),
+        CurrentBilibiliSidecarEvidence::Mismatched => bail!(
+            "Bilibili identity sidecar changed during {phase} validation: {}",
+            evidence.path.display()
+        ),
+    };
+    let current_after_sidecars = root.open_bound_file(&evidence.path).with_context(|| {
+        format!(
+            "failed to recheck existing Bilibili media after sidecar validation during {phase}: {}",
+            evidence.path.display()
+        )
+    })?;
+    let Some(current_after_sidecars) = current_after_sidecars else {
+        bail!(
+            "existing Bilibili media disappeared during {phase} validation: {}",
+            evidence.path.display()
+        );
+    };
+    if current_after_sidecars.identity() != evidence.identity {
+        bail!(
+            "existing Bilibili media identity changed during {phase} validation: {}",
+            evidence.path.display()
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2253,16 +2374,7 @@ async fn plan_bilibili_missing_season(
         timeout,
         progress,
         move |episode| {
-            let entry = BilibiliDownloadEntry {
-                index: episode.index,
-                aid: episode.aid,
-                bvid: None,
-                cid: episode.cid,
-                epid: Some(episode.epid),
-                title: episode.title.clone(),
-                uploader: None,
-                publish_date: None,
-            };
+            let entry = bilibili_entry_from_episode_metadata(&episode);
             let ffprobe = ffprobe.clone();
             let index = Arc::clone(&filter_index);
             let config = Arc::clone(&probe_config);
@@ -2279,41 +2391,17 @@ async fn plan_bilibili_missing_season(
         bail!("missing Bilibili episode download requires a season URL");
     };
     let total_entries = season.selected_episodes.len();
-    let mut existing_media_paths = BTreeSet::new();
     for (episode, evidence) in &skipped {
-        let entry = BilibiliDownloadEntry {
-            index: episode.index,
-            aid: episode.aid,
-            bvid: None,
-            cid: episode.cid,
-            epid: Some(episode.epid),
-            title: episode.title.clone(),
-            uploader: None,
-            publish_date: None,
-        };
         let Some(root) = index.root.as_ref() else {
             bail!("Bilibili output root became unavailable while validating skipped episodes");
         };
-        let current = root
-            .open_bound_file(&evidence.path)
-            .context("failed to revalidate skipped Bilibili media; retry the season")?;
-        let Some(current) = current else {
-            bail!("skipped Bilibili media disappeared while planning; retry the season");
-        };
-        if current.identity() != evidence.identity
-            || !bilibili_media_path_has_exact_existing_metadata(&index, &evidence.path, &entry)
-        {
-            bail!(
-                "Bilibili episode identity or media evidence changed while planning; retry the season so the updated plan can be reviewed"
-            );
-        }
-        existing_media_paths.insert(evidence.path.clone());
+        revalidate_missing_episode_evidence(root, episode, evidence, "planning")
+            .context("retry the season so the updated plan can be reviewed")?;
     }
     Ok(BilibiliMissingSeasonPlan {
         plan,
         resolved,
         skipped,
-        existing_media_paths,
         total_entries,
     })
 }
@@ -3544,7 +3632,7 @@ async fn run_bilibili_job_locked(
             "missing-episode job has no persisted plan snapshot; retry the queued job to generate and review a plan before downloading"
         );
     }
-    let mut missing_existing_media_paths = BTreeSet::new();
+    let mut missing_season_skip_evidence = Vec::new();
     let mut missing_season_summary = None;
     let (core_plan, resolved_metadata): (
         bbdown_core::DownloadPlan,
@@ -3589,7 +3677,6 @@ async fn run_bilibili_job_locked(
             let current = bilibili_plan_validation_snapshot(&missing.plan, &options);
             validate_missing_plan_snapshot(expected, &current)?;
         }
-        missing_existing_media_paths = missing.existing_media_paths;
         let total_entries = missing.total_entries;
         let skipped_entries = missing.skipped.len();
         missing_season_summary = Some((total_entries, skipped_entries));
@@ -3601,10 +3688,10 @@ async fn run_bilibili_job_locked(
             ),
         );
         if missing.plan.entries.is_empty() {
-            let existing_media_paths = missing_existing_media_paths
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
+            let existing_media_paths = revalidate_missing_season_evidence_for_report(
+                worker_context.final_output_root,
+                &missing.skipped,
+            )?;
             let ResolvedContent::Season(season) = &missing.resolved else {
                 bail!("missing Bilibili episode download requires a season URL");
             };
@@ -3621,6 +3708,7 @@ async fn run_bilibili_job_locked(
                 primary_media_paths: existing_media_paths,
             }));
         }
+        missing_season_skip_evidence = missing.skipped;
         let metadata = config.video.write_nfo.then_some(missing.resolved);
         (missing.plan, Ok(metadata))
     } else {
@@ -3781,6 +3869,10 @@ async fn run_bilibili_job_locked(
                 .map(|path| rebase_download_path(path, &output_dir, reported_output_dir)),
         );
     }
+    let missing_existing_media_paths = revalidate_missing_season_evidence_for_report(
+        worker_context.final_output_root,
+        &missing_season_skip_evidence,
+    )?;
     reported_primary_videos.extend(
         missing_existing_media_paths
             .iter()
@@ -17184,6 +17276,80 @@ mod tests {
             assert!(!bilibili_missing_skip_mode_supported(mode));
             assert!(!media_satisfies_download_mode(mode, true, true));
         }
+    }
+
+    #[test]
+    fn missing_season_final_report_revalidates_media_sidecars_and_allows_directory_churn() {
+        let output = temp_test_dir("missing-season-final-evidence");
+        fs::create_dir_all(&output).expect("output directory should create");
+        let root = RootedFs::new(&output).expect("output root should bind");
+        let media_path = output.join("Episode.mp4");
+        let sidecar_path = media_path.with_extension("nfo");
+        fs::write(&media_path, b"existing media").expect("media should write");
+        let matching_sidecar = r#"<movie><uniqueid type="bilibili-cid">cid123</uniqueid><uniqueid type="bilibili-epid">ep456</uniqueid></movie>"#;
+        fs::write(&sidecar_path, matching_sidecar).expect("sidecar should write");
+        let media = root
+            .open_bound_file(&media_path)
+            .unwrap()
+            .expect("media should bind");
+        let episode = bbdown_core::EpisodeMetadata {
+            index: 1,
+            aid: 789,
+            bvid: None,
+            cid: 123,
+            epid: 456,
+            title: "Episode one".to_string(),
+            long_title: None,
+            pub_time: None,
+        };
+        let skipped = vec![(
+            episode,
+            ExistingEpisodeEvidence {
+                path: media_path.clone(),
+                identity: media.identity(),
+            },
+        )];
+
+        assert_eq!(
+            revalidate_missing_season_evidence_for_report(&root, &skipped)
+                .expect("unchanged media should remain reportable"),
+            vec![media_path.clone()]
+        );
+        fs::write(output.join("unrelated-directory-churn.txt"), b"new sibling")
+            .expect("benign directory churn should write");
+        assert!(revalidate_missing_season_evidence_for_report(&root, &skipped).is_ok());
+
+        fs::remove_file(&sidecar_path).expect("sidecar should remove");
+        let missing_sidecar = revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .expect_err("a missing identity sidecar must invalidate the report");
+        assert!(format!("{missing_sidecar:#}").contains("sidecar disappeared"));
+        fs::create_dir(&sidecar_path).expect("invalid sidecar object should create");
+        let unreadable_sidecar = revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .expect_err("an unreadable identity sidecar must remain distinct from missing");
+        assert!(
+            format!("{unreadable_sidecar:#}")
+                .contains("failed to read current Bilibili identity sidecar")
+        );
+        fs::remove_dir(&sidecar_path).expect("invalid sidecar object should remove");
+        fs::write(&sidecar_path, matching_sidecar.replace("cid123", "cid999"))
+            .expect("conflicting sidecar should write");
+        let changed_sidecar = revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .expect_err("a changed identity sidecar must invalidate the report");
+        assert!(format!("{changed_sidecar:#}").contains("sidecar changed"));
+
+        fs::write(&sidecar_path, matching_sidecar).expect("matching sidecar should restore");
+        let moved_original = output.join("Episode.original.mp4");
+        fs::rename(&media_path, &moved_original).expect("original media should remain allocated");
+        fs::write(&media_path, b"replacement media").expect("replacement media should write");
+        let replaced_media = revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .expect_err("a replacement media object must invalidate the report");
+        assert!(format!("{replaced_media:#}").contains("media identity changed"));
+
+        fs::remove_file(&media_path).expect("replacement should remove");
+        let missing_media = revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .expect_err("a missing media object must remain distinct from replacement");
+        assert!(format!("{missing_media:#}").contains("media disappeared"));
+        let _ = fs::remove_dir_all(output);
     }
 
     #[cfg(unix)]
