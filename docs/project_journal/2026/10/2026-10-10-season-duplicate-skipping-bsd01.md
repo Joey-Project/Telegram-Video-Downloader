@@ -33,6 +33,11 @@ superseded_by:
   prevents skipping the ambiguous file.
 - Filtering rereads current sidecars and uses bounded stream probes for the
   requested audio/video mode. Artifact-only modes cannot skip from video evidence.
+- Identity and stream evidence must belong to the same current media object;
+  only that verified path is returned as an existing output. Sidecars are checked
+  again after probing. The guard protects device/inode/type identity and current
+  episode metadata, without claiming content stability or rejecting harmless
+  File Provider timestamp changes.
 - The worker compares its lock-protected filtered plan with the queued snapshot
   before downloading. A changed plan stops with retry/requeue guidance so the
   queue can validate the new plan.
@@ -53,7 +58,8 @@ superseded_by:
   580 passed, 13 ignored, zero failures after target-branch integration.
   Coverage includes actual file
   removal/replacement, changed and newly conflicting sidecars, benign
-  directory-entry churn, and real video/audio stream fixtures. Snapshot mismatch
+  directory-entry churn, and real video/audio stream fixtures, including mixed
+  identity/completeness evidence from separate files. Snapshot mismatch
   rejection and worker IPC propagation are tested directly; a full subprocess
   download race was not exercised.
 - An initial parallel run hit an existing local Telegram progress timeout; the

@@ -1926,16 +1926,22 @@ fn bilibili_plan_entry_has_exact_existing_metadata(
     index: &VideoIdentityIndex,
     entry: &BilibiliDownloadEntry,
 ) -> bool {
+    bilibili_exact_entry_metadata_paths(index, entry)
+        .iter()
+        .any(|video| bilibili_media_path_has_exact_existing_metadata(index, video, entry))
+}
+
+fn bilibili_media_path_has_exact_existing_metadata(
+    index: &VideoIdentityIndex,
+    video: &Path,
+    entry: &BilibiliDownloadEntry,
+) -> bool {
     let Some(root) = index.root.as_ref() else {
         return false;
     };
-    bilibili_exact_entry_metadata_paths(index, entry)
-        .iter()
-        .any(|video| {
-            index.metadata_video_is_current(video)
-                && current_bilibili_sidecars_match_entry(root, video, entry)
-                && index.metadata_video_is_current(video)
-        })
+    index.metadata_video_is_current(video)
+        && current_bilibili_sidecars_match_entry(root, video, entry)
+        && index.metadata_video_is_current(video)
 }
 
 async fn bilibili_plan_entry_has_compatible_existing_media(
@@ -1944,14 +1950,25 @@ async fn bilibili_plan_entry_has_compatible_existing_media(
     mode: DownloadMode,
     ffprobe: &Path,
 ) -> bool {
+    bilibili_plan_entry_compatible_existing_media(index, entry, mode, ffprobe)
+        .await
+        .is_some()
+}
+
+async fn bilibili_plan_entry_compatible_existing_media(
+    index: &VideoIdentityIndex,
+    entry: &BilibiliDownloadEntry,
+    mode: DownloadMode,
+    ffprobe: &Path,
+) -> Option<PathBuf> {
     if !bilibili_missing_skip_mode_supported(mode) {
-        return false;
+        return None;
     }
     if !bilibili_plan_entry_has_exact_existing_metadata(index, entry) {
-        return false;
+        return None;
     }
     for video in bilibili_exact_entry_metadata_paths(index, entry) {
-        if !index.metadata_video_is_current(&video) {
+        if !bilibili_media_path_has_exact_existing_metadata(index, &video, entry) {
             continue;
         }
         let Some((has_video, has_audio)) = probe_media_streams(ffprobe, &video).await else {
@@ -1960,13 +1977,13 @@ async fn bilibili_plan_entry_has_compatible_existing_media(
             );
             continue;
         };
-        if index.metadata_video_is_current(&video)
+        if bilibili_media_path_has_exact_existing_metadata(index, &video, entry)
             && media_satisfies_download_mode(mode, has_video, has_audio)
         {
-            return true;
+            return Some(video);
         }
     }
-    false
+    None
 }
 
 fn bilibili_missing_skip_mode_supported(mode: DownloadMode) -> bool {
@@ -2223,13 +2240,14 @@ async fn plan_bilibili_missing_season(
             uploader: None,
             publish_date: None,
         };
-        if !bilibili_plan_entry_has_compatible_existing_media(&index, &entry, mode, &ffprobe).await
-        {
+        let Some(video) =
+            bilibili_plan_entry_compatible_existing_media(&index, &entry, mode, &ffprobe).await
+        else {
             bail!(
                 "Bilibili episode identity or media evidence changed while planning; retry the season so the updated plan can be reviewed"
             );
-        }
-        existing_media_paths.extend(bilibili_exact_entry_metadata_paths(&index, &entry));
+        };
+        existing_media_paths.insert(video);
     }
     Ok(BilibiliMissingSeasonPlan {
         plan,
@@ -17190,6 +17208,62 @@ mod tests {
             audio_streams.0,
             audio_streams.1
         ));
+        let matching_nfo = r#"<movie><uniqueid type="bilibili-cid">cid403</uniqueid><uniqueid type="bilibili-epid">ep503</uniqueid></movie>"#;
+        for media in [&video_only, &audiovisual] {
+            fs::write(media.with_extension("nfo"), matching_nfo).unwrap();
+        }
+        let entry = BilibiliDownloadEntry {
+            cid: 403,
+            epid: Some(503),
+            ..Default::default()
+        };
+        let index = build_video_identity_index_in_dir(
+            &root,
+            StagedPrimaryMediaKind::Video,
+            IdentityIndexReadPolicy::BestEffort,
+        )
+        .unwrap();
+        fs::write(
+            audiovisual.with_extension("nfo"),
+            matching_nfo.replace("cid403", "cid404"),
+        )
+        .unwrap();
+        // The identity-valid file lacks audio; the complete file now belongs to
+        // another episode. Evidence from different files cannot justify a skip.
+        assert!(bilibili_plan_entry_has_exact_existing_metadata(
+            &index, &entry
+        ));
+        assert!(
+            bilibili_plan_entry_compatible_existing_media(
+                &index,
+                &entry,
+                DownloadMode::All,
+                &ffprobe,
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(
+            bilibili_plan_entry_compatible_existing_media(
+                &index,
+                &entry,
+                DownloadMode::VideoOnly,
+                &ffprobe,
+            )
+            .await,
+            Some(video_only)
+        );
+        fs::write(audiovisual.with_extension("nfo"), matching_nfo).unwrap();
+        assert_eq!(
+            bilibili_plan_entry_compatible_existing_media(
+                &index,
+                &entry,
+                DownloadMode::All,
+                &ffprobe,
+            )
+            .await,
+            Some(audiovisual)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
