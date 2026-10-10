@@ -2912,6 +2912,66 @@ mod tests {
     }
 
     #[test]
+    fn missing_season_selection_survives_queue_reopen_and_stale_choice() {
+        use crate::router::BilibiliSelection;
+
+        let temp_root = temp_queue_root("missing-season-choice");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = temp_root.join("videos");
+        config.downloads.pdf_dir = temp_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "missing-season",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".to_string(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::AwaitingDuplicateChoice;
+        queue.create(task.clone()).unwrap();
+        let JobRequest::Bilibili { url, .. } = &task.job else {
+            unreachable!()
+        };
+        let missing_job = JobRequest::Bilibili {
+            url: url.clone(),
+            selection: Some(BilibiliSelection::Missing),
+        };
+        let saved = queue
+            .update_job_if_generation(
+                &task.id,
+                task.generation,
+                &[TaskStatus::AwaitingDuplicateChoice],
+                missing_job.clone(),
+                TaskStatus::Queued,
+            )
+            .unwrap()
+            .expect("current skip decision should persist atomically");
+        assert_eq!(saved.job, missing_job);
+        assert!(
+            queue
+                .update_job_if_generation(
+                    &task.id,
+                    task.generation,
+                    &[TaskStatus::AwaitingDuplicateChoice],
+                    task.job,
+                    TaskStatus::Queued,
+                )
+                .unwrap()
+                .is_none(),
+            "repeated choice must not reset skipping"
+        );
+        drop(queue);
+        let reopened = QueueManager::open(&config).unwrap();
+        let restored = reopened.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.job, missing_job);
+        assert!(!restored.cancel_requested);
+        drop(reopened);
+        fs::remove_dir_all(temp_root).unwrap();
+    }
+
+    #[test]
     fn stale_cancellation_cleanup_preserves_replacement_token() {
         let temp_root = temp_queue_root("cancellation-cleanup-identity");
         let video_root = temp_root.join("videos");

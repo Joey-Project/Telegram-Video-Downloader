@@ -480,7 +480,14 @@ pub enum VideoDuplicateAction {
 pub struct VideoDuplicate {
     pub identity: VideoIdentity,
     pub existing_videos: Vec<PathBuf>,
+    pub skip_summary: Option<BilibiliSkipSummary>,
     pub(crate) overwrite_confirmation: Option<VideoOverwriteConfirmation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BilibiliSkipSummary {
+    pub total_entries: usize,
+    pub duplicate_entries: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,14 +521,32 @@ impl VideoDuplicate {
         match (job, self.identity.provider) {
             (JobRequest::Youtube { .. }, VideoProvider::Youtube) => true,
             (JobRequest::Bilibili { selection, .. }, VideoProvider::Bilibili) => {
-                !matches!(selection, Some(BilibiliSelection::All))
-                    && is_bilibili_entry_identity(&self.identity.id)
+                !matches!(
+                    selection,
+                    Some(BilibiliSelection::All | BilibiliSelection::Missing)
+                ) && is_bilibili_entry_identity(&self.identity.id)
                     && self.existing_videos.first().is_some_and(|video| {
                         metadata_sidecars_match_identity(video, &self.identity)
                     })
             }
             _ => false,
         }
+    }
+
+    pub fn allows_skip_for(&self, job: &JobRequest) -> bool {
+        matches!(
+            (job, self.skip_summary),
+            (
+                JobRequest::Bilibili {
+                    selection: Some(BilibiliSelection::All),
+                    ..
+                },
+                Some(BilibiliSkipSummary {
+                    total_entries,
+                    duplicate_entries,
+                })
+            ) if total_entries > 0 && duplicate_entries > 0
+        )
     }
 
     fn overwrite_target(&self) -> Option<&PathBuf> {
@@ -1666,6 +1691,7 @@ pub async fn run_video_job_staged_keep_both(
         return run_simple_job(config, job, progress).await;
     };
     let duplicate = VideoDuplicate {
+        skip_summary: None,
         overwrite_confirmation: None,
         identity,
         existing_videos: Vec::new(),
@@ -1694,6 +1720,7 @@ pub async fn find_video_duplicate_with_probe(
     let direct_duplicate =
         find_video_duplicate_in_index(&index, &identities, &direct_overwrite_identities);
     let mut overwrite_identities = Vec::new();
+    let mut skip_summary = None;
 
     if let JobRequest::Bilibili { url, selection } = job {
         let probe_timeout = if direct_duplicate.is_some() {
@@ -1702,9 +1729,23 @@ pub async fn find_video_duplicate_with_probe(
             BILIBILI_METADATA_PROBE_TIMEOUT
         };
         match probe_bilibili_duplicate_metadata(config, url, *selection, probe_timeout).await {
-            Ok(plan) => {
+            Ok(probe) => {
+                let plan = probe.plan;
                 push_bilibili_plan_identities(&mut identities, &plan);
                 overwrite_identities = bilibili_plan_overwrite_identities(&plan);
+                skip_summary = probe.season_total.and_then(|total_entries| {
+                    let duplicate_entries = plan
+                        .entries
+                        .iter()
+                        .filter(|entry| {
+                            bilibili_plan_entry_has_exact_existing_metadata(&index, entry)
+                        })
+                        .count();
+                    (duplicate_entries > 0).then_some(BilibiliSkipSummary {
+                        total_entries,
+                        duplicate_entries,
+                    })
+                });
             }
             Err(err) if should_propagate_bilibili_probe_error(*selection, &err) => {
                 return Err(err).with_context(|| {
@@ -1729,10 +1770,94 @@ pub async fn find_video_duplicate_with_probe(
         return Ok(direct_duplicate);
     }
 
-    match find_video_duplicate_in_index(&index, &identities, &overwrite_identities) {
-        Some(duplicate) => Ok(Some(duplicate)),
-        None => Ok(direct_duplicate),
+    let mut duplicate = find_video_duplicate_in_index(&index, &identities, &overwrite_identities)
+        .or(direct_duplicate);
+    if let Some(duplicate) = duplicate.as_mut() {
+        duplicate.skip_summary = skip_summary;
     }
+    Ok(duplicate)
+}
+
+fn bilibili_plan_entry_has_exact_existing_metadata(
+    index: &VideoIdentityIndex,
+    entry: &BilibiliDownloadEntry,
+) -> bool {
+    bilibili_exact_entry_metadata_paths(index, entry)
+        .iter()
+        .any(|video| {
+            index.metadata_video_is_current(video)
+                && index
+                    .metadata_sidecar_identities_by_video
+                    .get(video)
+                    .is_some_and(|sidecars| {
+                        sidecars
+                            .iter()
+                            .any(|identities| bilibili_sidecar_matches_entry(identities, entry))
+                    })
+        })
+}
+
+fn bilibili_exact_entry_metadata_paths(
+    index: &VideoIdentityIndex,
+    entry: &BilibiliDownloadEntry,
+) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    if entry.cid != 0 {
+        paths.extend(
+            index
+                .metadata_videos(&bilibili_collection_cid_identity(entry.cid))
+                .iter()
+                .cloned(),
+        );
+    }
+    if let Some(epid) = entry.epid.filter(|epid| *epid != 0) {
+        paths.extend(
+            index
+                .metadata_videos(&VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: format!("ep{epid}"),
+                })
+                .iter()
+                .cloned(),
+        );
+    }
+    paths.retain(|video| {
+        index.metadata_video_is_current(video)
+            && index
+                .metadata_sidecar_identities_by_video
+                .get(video)
+                .is_some_and(|sidecars| {
+                    sidecars
+                        .iter()
+                        .any(|identities| bilibili_sidecar_matches_entry(identities, entry))
+                })
+    });
+    paths
+}
+
+fn bilibili_sidecar_matches_entry(
+    identities: &[VideoIdentity],
+    entry: &BilibiliDownloadEntry,
+) -> bool {
+    let cid_matches = entry.cid != 0
+        && identities.iter().any(|identity| {
+            identity.provider == VideoProvider::Bilibili
+                && identity.id == format!("cid{}", entry.cid)
+        });
+    let epid_matches = entry.epid.is_some_and(|epid| {
+        epid != 0
+            && identities.iter().any(|identity| {
+                identity.provider == VideoProvider::Bilibili && identity.id == format!("ep{epid}")
+            })
+    });
+    let has_cid = identities.iter().any(|identity| {
+        identity.provider == VideoProvider::Bilibili && identity.id.starts_with("cid")
+    });
+    let has_epid = identities.iter().any(|identity| {
+        identity.provider == VideoProvider::Bilibili && identity.id.starts_with("ep")
+    });
+
+    (has_cid || has_epid) && (!has_cid || cid_matches) && (!has_epid || epid_matches)
 }
 
 async fn scan_video_identity_index(
@@ -1764,6 +1889,7 @@ struct VideoIdentityIndex {
     videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
     overwrite_videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
     metadata_videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
+    metadata_sidecar_identities_by_video: BTreeMap<PathBuf, Vec<Vec<VideoIdentity>>>,
     root: Option<RootedFs>,
     file_identities: BTreeMap<PathBuf, EntryIdentity>,
 }
@@ -1789,6 +1915,13 @@ impl VideoIdentityIndex {
         insert_identity_path(&mut self.metadata_videos_by_identity, identity, video);
     }
 
+    fn insert_metadata_sidecar_evidence(&mut self, video: &Path, identities: Vec<VideoIdentity>) {
+        self.metadata_sidecar_identities_by_video
+            .entry(video.to_path_buf())
+            .or_default()
+            .push(identities);
+    }
+
     fn videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
         identity_paths(&self.videos_by_identity, identity)
     }
@@ -1799,6 +1932,29 @@ impl VideoIdentityIndex {
 
     fn metadata_videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
         identity_paths(&self.metadata_videos_by_identity, identity)
+    }
+
+    fn metadata_video_is_current(&self, video: &Path) -> bool {
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        let Some(expected) = self.file_identities.get(video) else {
+            return false;
+        };
+        // Protect media object identity (device/inode/type), rather than
+        // timestamps changed by ordinary File Provider materialization.
+        match root.open_bound_file(video) {
+            Ok(Some(file)) => file.identity() == *expected && file.identity().is_file(),
+            Ok(None) => false,
+            Err(error) => {
+                info!(
+                    path = %video.display(),
+                    error = %redact_sensitive_text(&format!("{error:#}")),
+                    "existing episode revalidation failed; planning it instead of skipping"
+                );
+                false
+            }
+        }
     }
 
     fn overwrite_confirmation(&self, video: &Path) -> Option<VideoOverwriteConfirmation> {
@@ -1898,6 +2054,7 @@ fn find_video_duplicate_in_index(
             overwrite_confirmation,
             identity,
             existing_videos,
+            skip_summary: None,
         });
     }
 
@@ -1924,6 +2081,7 @@ fn find_video_duplicate_in_index(
             overwrite_confirmation,
             identity,
             existing_videos,
+            skip_summary: None,
         }
     })
 }
@@ -2917,6 +3075,9 @@ async fn run_bilibili_job_locked(
         .map(BilibiliUgcCollectionDownload::missing_selection)
         .transpose()?
         .or_else(|| bilibili_core::selection(selection));
+    let missing_selection = matches!(selection, Some(BilibiliSelection::Missing));
+    let mut missing_existing_media_paths = BTreeSet::new();
+    let mut missing_season_summary = None;
     let (core_plan, resolved_metadata): (
         bbdown_core::DownloadPlan,
         Result<Option<ResolvedContent>>,
@@ -2933,6 +3094,94 @@ async fn run_bilibili_job_locked(
             .write_nfo
             .then(|| ResolvedContent::Collection(collection.resolution.clone()));
         (core_plan, Ok(metadata))
+    } else if missing_selection {
+        send_progress(
+            progress.as_ref(),
+            "BBDown-rust: re-resolving selected season for missing episodes".to_string(),
+        );
+        let index = build_video_identity_index_in_dir(
+            worker_context.final_output_root.logical_root_path(),
+            StagedPrimaryMediaKind::Video,
+            IdentityIndexReadPolicy::BestEffort,
+        )?;
+        let (plan, resolved, skipped) = bilibili_planning::plan_download_filtered(
+            &client,
+            url,
+            Some(Selection::All),
+            options.mode,
+            BILIBILI_METADATA_PROBE_TIMEOUT,
+            |done, total| {
+                send_progress(
+                    progress.as_ref(),
+                    format!(
+                        "BBDown-rust: planned missing episodes {done}/{total} (up to 2 at a time)"
+                    ),
+                );
+            },
+            |episode| {
+                bilibili_plan_entry_has_exact_existing_metadata(
+                    &index,
+                    &BilibiliDownloadEntry {
+                        index: episode.index,
+                        aid: episode.aid,
+                        bvid: None,
+                        cid: episode.cid,
+                        epid: Some(episode.epid),
+                        title: episode.title.clone(),
+                        uploader: None,
+                        publish_date: None,
+                    },
+                )
+            },
+        )
+        .await?;
+        let ResolvedContent::Season(season) = &resolved else {
+            bail!("missing Bilibili episode download requires a season URL");
+        };
+        for episode in &skipped {
+            let entry = BilibiliDownloadEntry {
+                index: episode.index,
+                aid: episode.aid,
+                bvid: None,
+                cid: episode.cid,
+                epid: Some(episode.epid),
+                title: episode.title.clone(),
+                uploader: None,
+                publish_date: None,
+            };
+            missing_existing_media_paths
+                .extend(bilibili_exact_entry_metadata_paths(&index, &entry));
+        }
+        let total_entries = season.selected_episodes.len();
+        let skipped_entries = skipped.len();
+        missing_season_summary = Some((total_entries, skipped_entries));
+        send_progress(
+            progress.as_ref(),
+            format!(
+                "Season sync: {total_entries} total; {skipped_entries} already present; {} queued",
+                total_entries.saturating_sub(skipped_entries)
+            ),
+        );
+        if plan.entries.is_empty() {
+            let existing_media_paths = missing_existing_media_paths
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            return Ok(BilibiliJobOutcome::AlreadyComplete(JobReport {
+                saved_location: if existing_media_paths.len() == 1 {
+                    existing_media_paths[0].display().to_string()
+                } else {
+                    join_paths(&existing_media_paths)
+                },
+                details: format!(
+                    "Bilibili season already complete: {} ({total_entries} total, {skipped_entries} already present)",
+                    season.season.title
+                ),
+                primary_media_paths: existing_media_paths,
+            }));
+        }
+        let metadata = config.video.write_nfo.then_some(resolved);
+        (plan, Ok(metadata))
     } else {
         send_progress(
             progress.as_ref(),
@@ -3054,6 +3303,12 @@ async fn run_bilibili_job_locked(
     if let Some(collection) = collection_download.as_ref() {
         details.push(collection.details_summary(report.entries.len()));
     }
+    if let Some((total_entries, skipped_entries)) = missing_season_summary {
+        details.push(format!(
+            "Season sync: {total_entries} total; {skipped_entries} already present; {} downloaded",
+            report.entries.len()
+        ));
+    }
     if !report.title.trim().is_empty() {
         details.push(format!("Title: {}", report.title));
     }
@@ -3085,6 +3340,11 @@ async fn run_bilibili_job_locked(
                 .map(|path| rebase_download_path(path, &output_dir, reported_output_dir)),
         );
     }
+    reported_primary_videos.extend(
+        missing_existing_media_paths
+            .iter()
+            .map(|path| rebase_download_path(path, &output_dir, reported_output_dir)),
+    );
     let reported_primary_videos = reported_primary_videos.into_iter().collect::<Vec<_>>();
     let fallback_output = rebase_download_path(
         &resolve_command_output_path(&output_dir, &report.output_dir),
@@ -7174,11 +7434,23 @@ async fn probe_bilibili_duplicate_metadata(
     url: &str,
     selection: Option<BilibiliSelection>,
     timeout: Duration,
-) -> Result<BilibiliDownloadPlan> {
+) -> Result<BilibiliDuplicateMetadataProbe> {
     sync_bilibili_rust_credentials(config).await?;
     let client = bilibili_core::client(config)?;
     let metadata = probe_bilibili_resolved_content(&client, url, selection, timeout).await?;
-    Ok(bilibili_metadata_identity_plan(&metadata))
+    let season_total = match &metadata {
+        ResolvedContent::Season(season) => Some(season.selected_episodes.len()),
+        _ => None,
+    };
+    Ok(BilibiliDuplicateMetadataProbe {
+        plan: bilibili_metadata_identity_plan(&metadata),
+        season_total,
+    })
+}
+
+struct BilibiliDuplicateMetadataProbe {
+    plan: BilibiliDownloadPlan,
+    season_total: Option<usize>,
 }
 
 fn bilibili_metadata_identity_plan(metadata: &ResolvedContent) -> BilibiliDownloadPlan {
@@ -10237,6 +10509,7 @@ fn index_metadata_sidecar(
             });
         }
     };
+    index.insert_metadata_sidecar_evidence(video, identities.clone());
     for identity in identities {
         index.insert_metadata_evidence(identity, video);
     }
@@ -10309,9 +10582,6 @@ fn identity_metadata_kind(path: &Path) -> Option<IdentityMetadataKind> {
 }
 
 fn info_json_identities(metadata: &serde_json::Value) -> Vec<VideoIdentity> {
-    let Some(id) = json_string_field(metadata, "id").filter(|id| !id.trim().is_empty()) else {
-        return Vec::new();
-    };
     let mut providers = BTreeSet::new();
     for value in ["extractor", "extractor_key", "ie_key"]
         .into_iter()
@@ -10327,13 +10597,46 @@ fn info_json_identities(metadata: &serde_json::Value) -> Vec<VideoIdentity> {
     if let Some(provider) = json_string_field(metadata, "webpage_url").and_then(provider_from_url) {
         providers.insert(provider);
     }
-    providers
+    let mut identities = json_string_field(metadata, "webpage_url")
+        .and_then(provider_from_url)
+        .filter(|provider| *provider == VideoProvider::Bilibili)
         .into_iter()
-        .map(|provider| VideoIdentity {
-            provider,
-            id: id.to_string(),
+        .chain(providers.iter().copied())
+        .map(|provider| {
+            let id = json_string_field(metadata, "id")
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_default();
+            VideoIdentity {
+                provider,
+                id: id.to_string(),
+            }
         })
-        .collect()
+        .filter(|identity| !identity.id.is_empty())
+        .collect::<Vec<_>>();
+    let bilibili = providers.contains(&VideoProvider::Bilibili)
+        || json_string_field(metadata, "webpage_url").and_then(provider_from_url)
+            == Some(VideoProvider::Bilibili);
+    if bilibili {
+        for (field, prefix) in [("cid", "cid"), ("epid", "ep")] {
+            if let Some(value) = json_u64_field(metadata, field).filter(|value| *value != 0) {
+                push_unique_video_identity(
+                    &mut identities,
+                    VideoIdentity {
+                        provider: VideoProvider::Bilibili,
+                        id: format!("{prefix}{value}"),
+                    },
+                );
+            }
+        }
+    }
+    identities
+}
+
+fn json_u64_field(metadata: &serde_json::Value, key: &str) -> Option<u64> {
+    metadata
+        .get(key)?
+        .as_u64()
+        .or_else(|| metadata.get(key)?.as_str()?.trim().parse::<u64>().ok())
 }
 
 fn json_string_field<'a>(metadata: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -15386,6 +15689,7 @@ mod tests {
         write_bilibili_identity_nfo(&existing, "cid123");
         let root = RootedFs::new(&final_dir).expect("output root should bind");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -16085,6 +16389,118 @@ mod tests {
     }
 
     #[test]
+    fn season_skip_matches_exact_episode_metadata_and_rejects_conflicts() {
+        let video_dir = temp_test_dir("bilibili-season-skip-exact-metadata");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        let video = video_dir.join("episode.mkv");
+        fs::write(&video, "video").expect("video should write");
+        let root = RootedFs::new(&video_dir).expect("root should bind");
+        let identity = root
+            .entry_identity(&video)
+            .expect("video identity should read")
+            .expect("video should exist");
+        let cid = |cid| VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: format!("cid{cid}"),
+        };
+        let epid = |epid| VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: format!("ep{epid}"),
+        };
+        let expected = BilibiliDownloadEntry {
+            index: 203,
+            aid: 999,
+            cid: 403,
+            epid: Some(503),
+            title: "Episode 203".to_string(),
+            ..Default::default()
+        };
+        let mut index = VideoIdentityIndex {
+            root: Some(root),
+            file_identities: BTreeMap::from([(video.clone(), identity)]),
+            ..VideoIdentityIndex::default()
+        };
+        index.insert_metadata_sidecar_evidence(&video, vec![cid(403), epid(503)]);
+        index.insert_metadata_evidence(cid(403), &video);
+        index.insert_metadata_evidence(epid(503), &video);
+        assert!(bilibili_plan_entry_has_exact_existing_metadata(
+            &index, &expected
+        ));
+        let duplicate_entries = (1..=203)
+            .filter(|episode_index| {
+                bilibili_plan_entry_has_exact_existing_metadata(
+                    &index,
+                    &BilibiliDownloadEntry {
+                        index: *episode_index,
+                        aid: u64::from(*episode_index) + 100,
+                        cid: u64::from(*episode_index) + 200,
+                        epid: Some(u64::from(*episode_index) + 300),
+                        title: format!("Episode {episode_index}"),
+                        ..Default::default()
+                    },
+                )
+            })
+            .count();
+        assert_eq!(duplicate_entries, 1);
+
+        let other_cid = BilibiliDownloadEntry {
+            cid: 404,
+            ..expected.clone()
+        };
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index, &other_cid
+        ));
+        let coarse_bv = BilibiliDownloadEntry {
+            cid: 0,
+            epid: None,
+            ..expected
+        };
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index, &coarse_bv
+        ));
+
+        let mut conflicting_index = VideoIdentityIndex {
+            root: index.root.clone(),
+            file_identities: index.file_identities.clone(),
+            ..VideoIdentityIndex::default()
+        };
+        conflicting_index.insert_metadata_sidecar_evidence(&video, vec![cid(404), epid(503)]);
+        conflicting_index.insert_metadata_evidence(cid(404), &video);
+        conflicting_index.insert_metadata_evidence(epid(503), &video);
+        let conflicting_expected = BilibiliDownloadEntry {
+            index: 203,
+            aid: 999,
+            cid: 403,
+            epid: Some(503),
+            title: "Episode 203".to_string(),
+            ..Default::default()
+        };
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &conflicting_index,
+            &conflicting_expected
+        ));
+        // Directory entry churn does not replace the media object.
+        fs::create_dir(video_dir.join("unrelated-entry")).unwrap();
+        assert!(bilibili_plan_entry_has_exact_existing_metadata(
+            &index,
+            &conflicting_expected
+        ));
+        // Preserve the old inode while replacing its path with a new object.
+        fs::rename(&video, video_dir.join("retained-original")).unwrap();
+        fs::write(&video, b"replacement").unwrap();
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index,
+            &conflicting_expected
+        ));
+        fs::remove_file(&video).unwrap();
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index,
+            &conflicting_expected
+        ));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
     fn metadata_duplicate_inventory_never_uses_unknown_zero_ids() {
         let plan = BilibiliDownloadPlan {
             title: "Inventory".to_string(),
@@ -16378,6 +16794,11 @@ mod tests {
         assert_eq!(exact_duplicate.identity.id, "cid222");
         assert_eq!(exact_duplicate.existing_videos, vec![second_entry.clone()]);
         assert!(exact_duplicate.allows_overwrite_for(&job));
+        let missing_job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV123?p=2".to_string(),
+            selection: Some(BilibiliSelection::Missing),
+        };
+        assert!(!exact_duplicate.allows_overwrite_for(&missing_job));
 
         let conflicting_entry = video_dir.join("Conflicting episode identity.mp4");
         fs::write(&conflicting_entry, "conflict").expect("conflicting entry should write");
@@ -16428,6 +16849,7 @@ mod tests {
             .overwrite_confirmation(&video)
             .expect("indexed video should retain an overwrite handle");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: Some(overwrite_confirmation),
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -16479,6 +16901,7 @@ mod tests {
     #[test]
     fn duplicate_without_a_retained_target_handle_never_allows_overwrite() {
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -17092,6 +17515,7 @@ mod tests {
         fs::write(&existing_video, "already-published").expect("existing video should write");
 
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -17615,6 +18039,7 @@ mod tests {
         write_bilibili_identity_nfo(&existing, "cid123");
         let root = RootedFs::new(&final_dir).expect("output root should bind");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -17702,6 +18127,7 @@ mod tests {
         write_bilibili_identity_nfo(&existing, "cid123");
         let root = RootedFs::new(&final_dir).expect("output root should bind");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -17807,6 +18233,7 @@ mod tests {
         write_bilibili_identity_nfo(&existing, "cid123");
         let root = RootedFs::new(&final_dir).expect("output root should bind");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -17968,6 +18395,7 @@ mod tests {
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
         fs::write(staged.with_extension("info.json"), "new-json").expect("new json should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18020,6 +18448,7 @@ mod tests {
         fs::write(&staged, "new-video").expect("staged video should write");
         fs::write(staged.with_extension("xml"), "new-xml").expect("staged xml should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18064,6 +18493,7 @@ mod tests {
         fs::write(staged.with_extension("info.json"), "new-json")
             .expect("staged info json should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18118,6 +18548,7 @@ mod tests {
         fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
             .expect("part2 nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18164,6 +18595,7 @@ mod tests {
         fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
             .expect("part2 nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18228,6 +18660,7 @@ mod tests {
         fs::write(&staged_b, "new-b").expect("movie b should write");
         fs::write(staged_b.with_extension("nfo"), "new-b-nfo").expect("movie b nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18272,6 +18705,7 @@ mod tests {
         fs::write(&staged_audio, "new-audio").expect("audio should write");
         fs::write(staged_audio.with_extension("nfo"), "new-nfo").expect("nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18315,6 +18749,7 @@ mod tests {
         fs::write(staging_dir.join("Episode.cover.jpg"), "cover").expect("cover should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18372,6 +18807,7 @@ mod tests {
             .expect("cover should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18444,6 +18880,7 @@ mod tests {
         fs::write(staging_dir.join("New.Title.xml"), "new-xml").expect("new xml should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18482,6 +18919,7 @@ mod tests {
         fs::write(&staged_xml, "new-xml").expect("staged xml should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18528,6 +18966,7 @@ mod tests {
         let staged_flv = staging_dir.join("Episode Part 2.flv");
         fs::write(&staged_flv, "new-flv").expect("flv segment should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18588,6 +19027,7 @@ mod tests {
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
         fs::write(staged.with_extension("xml"), "new-xml").expect("new xml should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18649,6 +19089,7 @@ mod tests {
         fs::write(&staged, "new-video").expect("staged video should write");
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18695,6 +19136,7 @@ mod tests {
         fs::write(staging_dir.join("danmaku.xml"), "new-danmaku")
             .expect("new bare danmaku should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18751,6 +19193,7 @@ mod tests {
         fs::write(staging_dir.join("subtitle-zh-01-new.ass"), "new-subtitle")
             .expect("new unbound subtitle should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18803,6 +19246,7 @@ mod tests {
         fs::write(staging_dir.join("cover-image-new.jpg"), "new-cover")
             .expect("new unbound cover should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19454,6 +19898,7 @@ mod tests {
         let staged = staging_dir.join("New [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -19506,6 +19951,7 @@ mod tests {
         fs::write(&first_staged, "new-first").expect("first staged video should write");
         fs::write(&second_staged, "new-second").expect("second staged video should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19555,6 +20001,7 @@ mod tests {
         fs::write(&staged, "new-video").expect("staged video should write");
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("staged NFO should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19599,6 +20046,7 @@ mod tests {
         fs::write(staged.with_extension("info.json"), r#"{"id":"cid123"}"#)
             .expect("staged info JSON should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19637,6 +20085,7 @@ mod tests {
         let staged = staging_dir.join("New [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -19676,6 +20125,7 @@ mod tests {
         let staged = staging_dir.join("New [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -19718,6 +20168,7 @@ mod tests {
         let staged = staging_dir.join("New [BV123].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19764,6 +20215,7 @@ mod tests {
         let staged = staging_dir.join("New [BV123].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19810,6 +20262,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19862,6 +20315,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19907,6 +20361,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19944,6 +20399,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20089,6 +20545,7 @@ mod tests {
         write_bilibili_identity_nfo(&existing, "cid123");
         let root = RootedFs::new(&final_dir).expect("output root should bind");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20211,6 +20668,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20254,6 +20712,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20318,6 +20777,7 @@ mod tests {
         let existing = final_dir.join("Episode.mkv");
         fs::write(&existing, "original-video").expect("existing file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20392,6 +20852,7 @@ mod tests {
         let existing = final_dir.join("Episode.mkv");
         fs::write(&existing, "original-video").expect("existing file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20482,6 +20943,7 @@ mod tests {
         fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
             .expect("staged part2 nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -23393,6 +23855,7 @@ mv video.original video.m4s || exit 46
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,

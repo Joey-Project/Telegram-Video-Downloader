@@ -7,6 +7,7 @@
 - 普通消息中的 Bilibili 链接通过 `BBDown-rust` 的 `bbdown-core` crate 解析和下载，保存到视频下载目录，并默认保留 XML/ASS 弹幕 sidecar。
 - Bilibili 番剧和 intl 链接走内嵌 plan/download API；`ss/md` 系列入口会先提示选择最新一集或全集。
 - 番剧按所选剧集分别规划播放地址，最多同时解析 2 集，每集有独立的 60 秒期限；全集不再共用一分钟总期限。规划进度显示已完成集数，单集失败或超时会报告具体集号并终止其他在途规划，结果仍按原剧集顺序下载。
+- 番剧全集命中已下载剧集时，可以选择 `Skip duplicates`，仅跳过 sidecar 里精确 CID/EPID 匹配的剧集，并继续下载其余集数；`Cancel entire job` 才会取消整个任务。跳过选择保存在队列中，恢复时会重新核对现有文件，已删除的集数仍会下载。
 - 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
