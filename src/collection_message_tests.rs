@@ -234,7 +234,11 @@ mod collection_message_tests {
 
         drop(progress);
         match tokio_timeout(Duration::from_secs(30), &mut progress_task).await {
-            Ok(result) => result.expect("collection progress task should not panic"),
+            Ok(result) => {
+                result
+                    .expect("collection progress task should not panic")
+                    .collection_delivery
+            }
             Err(_) => {
                 progress_task.abort();
                 let _ = progress_task.await;
@@ -850,6 +854,7 @@ mod collection_message_tests {
         let delivery = match tokio_timeout(Duration::from_secs(30), &mut progress_task).await {
             Ok(result) => result
                 .expect("collection progress task should not panic")
+                .collection_delivery
                 .expect("resolved collection should produce a delivery tracker"),
             Err(_) => {
                 progress_task.abort();
@@ -1411,6 +1416,7 @@ mod collection_message_tests {
             .await
             .expect("collection retry tracker should finish")
             .expect("collection progress task should not panic")
+            .collection_delivery
             .expect("resolved collection should retain delivery state");
         assert!(delivery.entries.contains_key(&1));
 
@@ -1907,6 +1913,7 @@ mod collection_message_tests {
             .await
             .expect("all-present collection progress should finish")
             .expect("collection progress task should not panic")
+            .collection_delivery
             .expect("resolved all-present manifest should create a delivery tracker");
         assert_eq!(delivery.entries.len(), 7);
         assert!(delivery.entries.values().all(|entry| {

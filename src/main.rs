@@ -5468,6 +5468,8 @@ async fn run_queued_job(
                         message,
                     )
                     .await;
+                } else {
+                    send_or_log(&telegram, chat_id, message).await;
                 }
             } else {
                 send_or_log(&telegram, chat_id, message).await;
@@ -5523,6 +5525,13 @@ async fn run_queued_job(
                                 format!("Canceled job #{job_id}: {}", job.label()),
                             )
                             .await;
+                        } else {
+                            send_or_log(
+                                &telegram,
+                                chat_id,
+                                format!("Canceled job #{job_id}: {}", job.label()),
+                            )
+                            .await;
                         }
                     }
                     Ok(_) => {}
@@ -5545,7 +5554,7 @@ async fn run_queued_job(
         }
     }
 
-    let status_message_id = if is_collection {
+    let mut status_message_id = if is_collection {
         queued_message_id
     } else if let Some(message_id) = queued_message_id {
         edit_task_message_if_current(
@@ -5610,9 +5619,9 @@ async fn run_queued_job(
         }
         drop(permit);
         let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
-        finish_job_progress(progress_tx, progress_task).await;
+        status_message_id = finish_job_progress(progress_tx, progress_task).await;
+        let message = format!("Canceled job #{job_id}: {}", job.label());
         if let Some(message_id) = status_message_id {
-            let message = format!("Canceled job #{job_id}: {}", job.label());
             if is_collection {
                 edit_task_message_if_current(
                     &queue, &task_id, generation, &telegram, chat_id, message_id, message,
@@ -5621,6 +5630,8 @@ async fn run_queued_job(
             } else {
                 edit_or_send(&telegram, chat_id, message_id, message).await;
             }
+        } else {
+            send_or_log(&telegram, chat_id, message).await;
         }
         return;
     };
@@ -5631,7 +5642,7 @@ async fn run_queued_job(
             let _ = queue.fail_if_generation(&task_id, generation, truncate(&message));
             drop(permit);
             let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
-            finish_job_progress(progress_tx, progress_task).await;
+            status_message_id = finish_job_progress(progress_tx, progress_task).await;
             let final_message = failed_job_message(job_id, job.label(), &message);
             if is_collection {
                 if let Some(message_id) = status_message_id {
@@ -5692,7 +5703,7 @@ async fn run_queued_job(
     if cancellation_finished {
         drop(permit);
         let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
-        finish_job_progress(progress_tx, progress_task).await;
+        status_message_id = finish_job_progress(progress_tx, progress_task).await;
         let message = format!("Canceled job #{job_id}: {}", job.label());
         if let Some(message_id) = status_message_id {
             if is_collection {
@@ -5709,7 +5720,7 @@ async fn run_queued_job(
         return;
     }
     if !differences.is_empty() {
-        finish_job_progress(progress_tx, progress_task).await;
+        status_message_id = finish_job_progress(progress_tx, progress_task).await;
         let keyboard = task_action_keyboard(&[
             (
                 "Use updated plan".to_string(),
@@ -5836,14 +5847,16 @@ async fn run_queued_job(
         }
     }
     drop(completion_progress);
-    let collection_delivery = match progress_task.await {
-        Ok(delivery) => delivery,
+    let progress_result = match progress_task.await {
+        Ok(result) => result,
         Err(err) => {
             warn!(task_id, error = %err, "collection progress delivery task failed to join");
-            None
+            ProgressForwardResult::default()
         }
     };
-    let collection_status_message_id = collection_delivery
+    status_message_id = progress_result.main_delivery.message_id();
+    let collection_status_message_id = progress_result
+        .collection_delivery
         .as_ref()
         .and_then(|delivery| delivery.main_delivery.message_id())
         .or(status_message_id);
@@ -6068,7 +6081,7 @@ async fn run_queued_job(
     }
 
     if is_collection {
-        let mut delivery = collection_delivery.unwrap_or_default();
+        let mut delivery = progress_result.collection_delivery.unwrap_or_default();
         if let Some(message_id) = delivery.main_delivery.message_id().or(status_message_id) {
             delivery.main_delivery = ProgressDelivery::Edit(message_id);
         }
@@ -6141,12 +6154,16 @@ fn failed_job_message(job_id: u64, job_label: &str, error_chain: &str) -> String
 
 async fn finish_job_progress(
     progress: JobProgressSender,
-    task: tokio::task::JoinHandle<Option<CollectionProgressDelivery>>,
-) {
+    task: tokio::task::JoinHandle<ProgressForwardResult>,
+) -> Option<i64> {
     // Drain pending edits before publishing a terminal state or confirmation.
     drop(progress);
-    if let Err(err) = task.await {
-        warn!(error = %err, "planning progress delivery task failed to join");
+    match task.await {
+        Ok(result) => result.main_delivery.message_id(),
+        Err(err) => {
+            warn!(error = %err, "planning progress delivery task failed to join");
+            None
+        }
     }
 }
 
@@ -6155,7 +6172,7 @@ async fn forward_progress(
     queue: Arc<QueueManager>,
     context: JobProgressContext,
     progress_rx: JobProgressReceiver,
-) -> Option<CollectionProgressDelivery> {
+) -> ProgressForwardResult {
     forward_progress_with_retry_delay(
         telegram,
         queue,
@@ -6172,7 +6189,7 @@ async fn forward_progress_with_retry_delay(
     context: JobProgressContext,
     progress_rx: JobProgressReceiver,
     generation_retry_delay: Duration,
-) -> Option<CollectionProgressDelivery> {
+) -> ProgressForwardResult {
     forward_progress_with_close_policy(
         telegram,
         queue,
@@ -6189,7 +6206,7 @@ async fn forward_preparation_progress(
     queue: Arc<QueueManager>,
     context: JobProgressContext,
     progress_rx: JobProgressReceiver,
-) -> Option<CollectionProgressDelivery> {
+) -> ProgressForwardResult {
     forward_progress_with_close_policy(
         telegram,
         queue,
@@ -6208,7 +6225,7 @@ async fn forward_progress_with_close_policy(
     progress_rx: JobProgressReceiver,
     generation_retry_delay: Duration,
     flush_on_close: bool,
-) -> Option<CollectionProgressDelivery> {
+) -> ProgressForwardResult {
     let JobProgressContext {
         chat_id,
         job_id,
@@ -6253,7 +6270,7 @@ async fn forward_progress_with_close_policy(
         }
         if !latest_open && !lifecycle_open {
             if flush_on_close && let Some(progress) = pending.take() {
-                let _ = deliver_pending_progress(
+                status_delivery = deliver_pending_progress(
                     delivery_context,
                     status_delivery,
                     &mut collection_delivery,
@@ -6331,7 +6348,10 @@ async fn forward_progress_with_close_policy(
             }
         }
     }
-    collection_delivery
+    ProgressForwardResult {
+        main_delivery: status_delivery,
+        collection_delivery,
+    }
 }
 
 fn persist_collection_progress(
@@ -7452,6 +7472,20 @@ struct CollectionProgressDelivery {
     details_token: Option<u64>,
     details_page: usize,
     overview: String,
+}
+
+struct ProgressForwardResult {
+    main_delivery: ProgressDelivery,
+    collection_delivery: Option<CollectionProgressDelivery>,
+}
+
+impl Default for ProgressForwardResult {
+    fn default() -> Self {
+        Self {
+            main_delivery: ProgressDelivery::Send,
+            collection_delivery: None,
+        }
+    }
 }
 
 impl Default for CollectionProgressDelivery {
@@ -11056,6 +11090,7 @@ mod tests {
             .await
             .expect("progress forwarding should resume after the transient lookup error")
             .expect("progress forwarding task should not panic")
+            .collection_delivery
             .expect("resolved collection should retain its message tracker");
         assert_eq!(delivery.entries.len(), 1);
         assert_eq!(delivery.entries[&1].message_id, Some(1_000));
@@ -11157,6 +11192,7 @@ mod tests {
             .await
             .expect("stale progress forwarding should stop after retry")
             .expect("progress forwarding task should not panic")
+            .collection_delivery
             .expect("collection tracker should be returned");
         assert!(delivery.entries.is_empty());
         assert!(take_fake_telegram_requests(&mut requests).is_empty());
@@ -11346,50 +11382,120 @@ mod tests {
             chat_id,
         );
         let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
-        let context = ProgressDeliveryContext {
-            telegram: &telegram,
-            queue: &queue,
-            task_id,
-            generation: 0,
+        let (progress, receiver) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress(
+            telegram.clone(),
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id,
+                job_id,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: false,
+                status_message_id: Some(-404_405),
+                update_interval: Duration::from_millis(100),
+            },
+            receiver,
+        ));
+        progress.send_replace(Some(JobProgress {
+            message: "Planning episodes: 64/202".to_string(),
+            resolved_summary: None,
+            collection: None,
+        }));
+        let failed_update = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(failed_update.method, "editMessageText");
+        assert_eq!(failed_update.body["message_id"].as_i64(), Some(-404_405));
+        assert!(take_fake_telegram_requests(&mut requests).is_empty());
+        progress.send_replace(Some(JobProgress {
+            message: "Planning episodes: 65/202".to_string(),
+            resolved_summary: None,
+            collection: None,
+        }));
+        let replacement = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(replacement.method, "sendMessage");
+        progress.send_replace(Some(JobProgress {
+            message: "Planning episodes: 66/202".to_string(),
+            resolved_summary: None,
+            collection: None,
+        }));
+        let next_update = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(next_update.method, "editMessageText");
+        assert_eq!(next_update.body["message_id"].as_i64(), Some(1_000));
+        let message_id = finish_job_progress(progress, progress_task).await;
+        assert_eq!(message_id, Some(1_000));
+        edit_or_send(
+            &telegram,
             chat_id,
-            job_id,
-            job_label: "Bilibili download",
-        };
-        let delivery = deliver_progress_message(
-            context,
-            ProgressDelivery::Edit(-404_405),
-            "Planning episodes: 64/202".to_string(),
-            "Planning episodes: 64/202",
+            message_id.unwrap(),
+            "Failed job #965".to_string(),
         )
         .await;
-        assert_eq!(delivery, ProgressDelivery::Send);
-        let failed_update = take_fake_telegram_requests(&mut requests);
-        assert_eq!(
-            failed_update.len(),
-            1,
-            "one update must not also send a replacement"
+        let terminal = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(terminal.method, "editMessageText");
+        assert_eq!(terminal.body["message_id"].as_i64(), Some(1_000));
+        assert_eq!(terminal.body["text"].as_str(), Some("Failed job #965"));
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn progress_close_flush_returns_replacement_for_terminal_message_e2e() {
+        let task_id = "planning-progress-close-flush";
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, _file_provider) = generation_guard_collection_queue(
+            "planning-progress-close-flush-e2e",
+            task_id,
+            969,
+            chat_id,
         );
-        assert_eq!(failed_update[0].method, "editMessageText");
-        let delivery = deliver_progress_message(
-            context,
-            delivery,
-            "Planning episodes: 65/202".to_string(),
-            "Planning episodes: 65/202",
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let (progress, receiver) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress(
+            telegram.clone(),
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id,
+                job_id: 969,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: false,
+                status_message_id: None,
+                update_interval: Duration::from_secs(5),
+            },
+            receiver,
+        ));
+        progress.send_replace(Some(JobProgress {
+            message: "Planning episodes: 1/202".to_string(),
+            resolved_summary: None,
+            collection: None,
+        }));
+        let message_id = tokio_timeout(
+            Duration::from_secs(2),
+            finish_job_progress(progress, progress_task),
+        )
+        .await
+        .expect("close flush should finish before the regular interval");
+        assert_eq!(message_id, Some(1_000));
+        assert_eq!(
+            queue.get(task_id).unwrap().unwrap().status_message_id,
+            message_id
+        );
+        edit_or_send(
+            &telegram,
+            chat_id,
+            message_id.unwrap(),
+            "Failed job #969".to_string(),
         )
         .await;
-        assert_eq!(delivery, ProgressDelivery::Edit(1_000));
-        deliver_progress_message(
-            context,
-            delivery,
-            "Planning episodes: 66/202".to_string(),
-            "Planning episodes: 66/202",
-        )
-        .await;
-        let later_updates = take_fake_telegram_requests(&mut requests);
-        assert_eq!(later_updates.len(), 2);
-        assert_eq!(later_updates[0].method, "sendMessage");
-        assert_eq!(later_updates[1].method, "editMessageText");
-        assert_eq!(later_updates[1].body["message_id"].as_i64(), Some(1_000));
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].method, "sendMessage");
+        assert_eq!(recorded[1].method, "editMessageText");
+        assert_eq!(recorded[1].body["message_id"].as_i64(), Some(1_000));
+        assert_eq!(recorded[1].body["text"].as_str(), Some("Failed job #969"));
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
@@ -11404,7 +11510,10 @@ mod tests {
         config.tools.yt_dlp = root.join("missing-yt-dlp");
         fs::create_dir_all(&config.downloads.video_dir).unwrap();
         fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
-        let queue = Arc::new(QueueManager::open(&config).unwrap());
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider;
+        let queue =
+            Arc::new(QueueManager::open_with_file_provider(&config, file_provider_trait).unwrap());
         let task_id = "planning-failure-progress";
         let chat_id = 123_456_789;
         let job = JobRequest::Youtube {
@@ -11485,6 +11594,150 @@ mod tests {
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn plan_confirmation_sends_when_progress_delivery_rejects_dead_message_e2e() {
+        let root = temp_main_test_dir("plan-confirmation-dead-progress-message-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider;
+        let queue =
+            Arc::new(QueueManager::open_with_file_provider(&config, file_provider_trait).unwrap());
+        let task_id = "plan-confirmation-dead-progress-message";
+        let chat_id = 123_456_789;
+        let job = JobRequest::Pdf {
+            url: "https://example.test/report.pdf".to_string(),
+        };
+        let mut record = TaskRecord::new(
+            task_id.to_string(),
+            966,
+            967,
+            chat_id,
+            Some(42),
+            0,
+            job.clone(),
+        );
+        record.plan = Some(PlanValidationSnapshot {
+            stable_media_ids: vec!["pdf:previous-report.pdf".to_string()],
+            ..PlanValidationSnapshot::default()
+        });
+        queue.create(record).unwrap();
+        queue.set_status(task_id, TaskStatus::Queued, None).unwrap();
+        queue.set_status_message_id(task_id, -404_405).unwrap();
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(967)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        tokio_timeout(
+            Duration::from_secs(5),
+            run_queued_job(
+                context,
+                Arc::new(Notify::new()),
+                chat_id,
+                966,
+                task_id.to_string(),
+                0,
+                Some(-404_405),
+                job,
+                JobRunMode::Direct,
+            ),
+        )
+        .await
+        .expect("plan confirmation should finish after progress delivery drains");
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert!(recorded.iter().any(|request| {
+            request.method == "editMessageText"
+                && request.body["message_id"].as_i64() == Some(-404_405)
+        }));
+        let confirmation = recorded
+            .iter()
+            .find(|request| {
+                request.method == "sendMessage"
+                    && request.body["text"].as_str().is_some_and(|text| {
+                        text.contains("paused because its download plan changed")
+                    })
+            })
+            .expect("confirmation should be sent when the prior message is no longer editable");
+        assert!(confirmation.body["reply_markup"].is_object());
+        assert_eq!(
+            queue.get(task_id).unwrap().unwrap().status,
+            TaskStatus::AwaitingConfirmation
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_status_message_sends_cancellation_report_e2e() {
+        let task_id = "cancel-without-status-message";
+        let job_id = 968;
+        let chat_id = 123_456_789;
+        let (queue_root, config, queue, _file_provider) = generation_guard_collection_queue(
+            "cancel-without-status-message-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        queue.set_status(task_id, TaskStatus::Queued, None).unwrap();
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(job_id + 1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        let cancel = Arc::new(Notify::new());
+        cancel.notify_one();
+        tokio_timeout(
+            Duration::from_secs(5),
+            run_queued_job(
+                context,
+                cancel,
+                chat_id,
+                job_id,
+                task_id.to_string(),
+                0,
+                None,
+                queue.get(task_id).unwrap().unwrap().job,
+                JobRunMode::Direct,
+            ),
+        )
+        .await
+        .expect("preflight cancellation should finish");
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].method, "sendMessage");
+        assert!(
+            recorded[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Canceled job #968"))
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
     }
 
     #[tokio::test]
@@ -12025,6 +12278,7 @@ mod tests {
             .await
             .expect("collection progress forwarding should finish within timeout")
             .expect("collection progress forwarding task should not panic")
+            .collection_delivery
             .expect("collection tracker should be returned");
         finalize_collection_messages(
             ProgressDeliveryContext {

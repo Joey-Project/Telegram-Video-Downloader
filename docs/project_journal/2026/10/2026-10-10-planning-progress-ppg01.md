@@ -34,12 +34,15 @@ distinguish the first planning pass from a stalled download.
   Reuse it through queueing and startup. Defer a replacement after an edit
   failure to a later progress update. Restart the periodic update deadline
   after API completion so slow responses cannot cause adjacent catch-up edits.
+- Carry replacement delivery state through ordinary-video plan confirmation,
+  cancellation, and terminal results. If the last edit failed before a deferred
+  replacement was sent, the subsequent result can create a new status message.
 
 ## Validation
 
-- Rust 1.95.0: all-target tests passed (598 passed, 15 ignored), strict
+- Rust 1.95.0: all-target tests passed (601 passed, 15 ignored), strict
   Clippy passed with warnings denied, and the isolated release build passed.
 - Formatting and whitespace checks passed. Tests cover message reuse, throttling,
   deferred replacement, cancellation, and terminal status ordering.
-- Runtime activation is deferred while the existing season download is active;
-  the live bot was not restarted for this change.
+- The release was built outside the live executable path, and the staged
+  binary satisfies the original trusted signing requirement.
