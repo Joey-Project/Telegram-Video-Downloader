@@ -3,7 +3,6 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -44,7 +43,7 @@ use crate::safe_fs::{
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 // Credential migration can block on the cross-process auth lock. Keep callers waiting
 // asynchronously so inbound Bilibili links cannot consume Tokio blocking workers.
-static BILIBILI_CREDENTIAL_SYNC_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+static BILIBILI_CREDENTIAL_SYNC_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 #[cfg(unix)]
 static BILIBILI_WORKER_PROCESS: AtomicBool = AtomicBool::new(false);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -496,6 +495,11 @@ pub struct VideoDuplicate {
 pub struct BilibiliSkipSummary {
     pub total_entries: usize,
     pub duplicate_entries: usize,
+}
+
+pub struct VideoDuplicateCheck {
+    pub duplicate: Option<VideoDuplicate>,
+    pub display_metadata: Option<PlanValidationSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1639,13 +1643,12 @@ fn bilibili_plan_validation_snapshot(
         if let Some(stream) = bilibili_selected_video(entry, &options.stream_selection) {
             let format_id = format!("{stable_id}:video:{}", stream.id);
             snapshot.selected_format_ids.push(format_id.clone());
-            if let Some(bytes) = stream.size {
-                snapshot.exact_sizes.push(PlanSize {
-                    subject: format_id.clone(),
-                    bytes,
-                    provenance: "Bilibili plan stream size".to_string(),
-                });
-            }
+            push_bilibili_snapshot_size(
+                &mut snapshot,
+                &format_id,
+                stream,
+                entry.streams.duration_seconds,
+            );
             snapshot.resolution_codecs.push(format!(
                 "{format_id}:{}x{}:{}",
                 stream.width.unwrap_or_default(),
@@ -1656,13 +1659,12 @@ fn bilibili_plan_validation_snapshot(
         if let Some(stream) = bilibili_selected_audio(entry, &options.stream_selection) {
             let format_id = format!("{stable_id}:audio:{}", stream.id);
             snapshot.selected_format_ids.push(format_id.clone());
-            if let Some(bytes) = stream.size {
-                snapshot.exact_sizes.push(PlanSize {
-                    subject: format_id.clone(),
-                    bytes,
-                    provenance: "Bilibili plan stream size".to_string(),
-                });
-            }
+            push_bilibili_snapshot_size(
+                &mut snapshot,
+                &format_id,
+                stream,
+                entry.streams.duration_seconds,
+            );
             snapshot.resolution_codecs.push(format!(
                 "{format_id}:{}",
                 stream.codecs.as_deref().unwrap_or("unknown")
@@ -1684,6 +1686,32 @@ fn validate_missing_plan_snapshot(
             "Bilibili missing-episode plan changed after queue confirmation ({}); retry the queued job to review the updated plan before downloading",
             differences.join(", ")
         )
+    }
+}
+
+fn push_bilibili_snapshot_size(
+    snapshot: &mut PlanValidationSnapshot,
+    format_id: &str,
+    stream: &bbdown_core::MediaStream,
+    duration_seconds: Option<u32>,
+) {
+    if let Some(bytes) = stream.size {
+        snapshot.exact_sizes.push(PlanSize {
+            subject: format_id.to_string(),
+            bytes,
+            provenance: "Bilibili plan stream size".to_string(),
+        });
+    } else if let Some(bits) = stream
+        .bandwidth
+        .filter(|value| *value > 0)
+        .zip(duration_seconds.filter(|value| *value > 0))
+        .and_then(|(bandwidth, duration)| bandwidth.checked_mul(u64::from(duration)))
+    {
+        snapshot.approximate_sizes.push(PlanSize {
+            subject: format_id.to_string(),
+            bytes: bits.div_ceil(8),
+            provenance: "Bilibili stream bandwidth and duration estimate".to_string(),
+        });
     }
 }
 
@@ -1759,7 +1787,7 @@ pub async fn run_video_job_staged_keep_both_with_plan(
 pub async fn find_video_duplicate_with_probe(
     config: &AppConfig,
     job: &JobRequest,
-) -> Result<Option<VideoDuplicate>> {
+) -> Result<VideoDuplicateCheck> {
     let index = scan_video_identity_index(config, job).await?;
     let mut identities = video_identity(job).into_iter().collect::<Vec<_>>();
     let direct_overwrite_identities = identities
@@ -1771,6 +1799,7 @@ pub async fn find_video_duplicate_with_probe(
         find_video_duplicate_in_index(&index, &identities, &direct_overwrite_identities);
     let mut overwrite_identities = Vec::new();
     let mut skip_summary = None;
+    let mut display_metadata = None;
 
     if let JobRequest::Bilibili { url, selection } = job {
         let probe_timeout = if direct_duplicate.is_some() {
@@ -1783,6 +1812,7 @@ pub async fn find_video_duplicate_with_probe(
                 let plan = probe.plan;
                 push_bilibili_plan_identities(&mut identities, &plan);
                 overwrite_identities = bilibili_plan_overwrite_identities(&plan);
+                display_metadata = Some(bilibili_metadata_display_snapshot(&plan));
                 if let (Some(total_entries), Ok(mode)) = (
                     probe.season_total,
                     bilibili_core::download_mode_from_config(config),
@@ -1825,7 +1855,10 @@ pub async fn find_video_duplicate_with_probe(
             }
         }
     } else {
-        return Ok(direct_duplicate);
+        return Ok(VideoDuplicateCheck {
+            duplicate: direct_duplicate,
+            display_metadata: None,
+        });
     }
 
     let mut duplicate = find_video_duplicate_in_index(&index, &identities, &overwrite_identities)
@@ -1833,7 +1866,60 @@ pub async fn find_video_duplicate_with_probe(
     if let Some(duplicate) = duplicate.as_mut() {
         duplicate.skip_summary = skip_summary;
     }
-    Ok(duplicate)
+    // Keep season/collection inventory metadata-only. A single duplicate can cheaply
+    // preview its selected streams, but a failed preview must not block the choice.
+    if duplicate.is_some()
+        && display_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.stable_media_ids.len() == 1)
+        && let Ok(Ok(plan)) = tokio_timeout(
+            BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT,
+            inspect_job_plan(config, job),
+        )
+        .await
+    {
+        display_metadata = Some(plan);
+    }
+    Ok(VideoDuplicateCheck {
+        duplicate,
+        display_metadata,
+    })
+}
+
+pub async fn inspect_job_display_metadata(
+    config: &AppConfig,
+    job: &JobRequest,
+) -> Result<Option<PlanValidationSnapshot>> {
+    let JobRequest::Bilibili { url, selection } = job else {
+        return Ok(None);
+    };
+    let metadata = probe_bilibili_duplicate_metadata(
+        config,
+        url,
+        *selection,
+        BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT,
+    )
+    .await?;
+    Ok(Some(bilibili_metadata_display_snapshot(&metadata.plan)))
+}
+
+fn bilibili_metadata_display_snapshot(plan: &BilibiliDownloadPlan) -> PlanValidationSnapshot {
+    PlanValidationSnapshot {
+        title: Some(plan.title.clone()),
+        stable_media_ids: plan
+            .entries
+            .iter()
+            .map(|entry| {
+                bilibili_plan_stable_media_id(
+                    entry.bvid.as_deref(),
+                    entry.aid,
+                    entry.cid,
+                    entry.epid,
+                )
+            })
+            .collect(),
+        ..PlanValidationSnapshot::default()
+    }
 }
 
 fn bilibili_plan_entry_has_exact_existing_metadata(
@@ -7199,34 +7285,37 @@ pub(crate) async fn sync_bilibili_rust_credentials(config: &AppConfig) -> Result
     let state_path = config.bilibili.auth.state_path.clone();
     let credential_file = config.bilibili.auth.credential_file.clone();
     let credential_profile = config.bilibili.auth.credential_profile.clone();
-    run_with_bilibili_credential_sync_limit(bilibili_credential_sync_semaphore(), async move {
-        tokio::task::spawn_blocking(move || {
-            bilibili_auth::sync_bbdown_rust_credentials_from_state(
-                &state_path,
-                &credential_file,
-                credential_profile.as_deref(),
-            )
-        })
-        .await
-        .context("BBDown credential migration task failed")??;
-        Ok(())
+    run_with_bilibili_credential_sync_limit(bilibili_credential_sync_semaphore(), move || {
+        bilibili_auth::sync_bbdown_rust_credentials_from_state(
+            &state_path,
+            &credential_file,
+            credential_profile.as_deref(),
+        )
     })
-    .await
+    .await??;
+    Ok(())
 }
 
-fn bilibili_credential_sync_semaphore() -> &'static Semaphore {
-    BILIBILI_CREDENTIAL_SYNC_SEMAPHORE.get_or_init(|| Semaphore::new(1))
+fn bilibili_credential_sync_semaphore() -> Arc<Semaphore> {
+    Arc::clone(BILIBILI_CREDENTIAL_SYNC_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(1))))
 }
 
-async fn run_with_bilibili_credential_sync_limit<T>(
-    semaphore: &Semaphore,
-    operation: impl Future<Output = T>,
-) -> T {
-    let _permit = semaphore
-        .acquire()
+async fn run_with_bilibili_credential_sync_limit<T: Send + 'static>(
+    semaphore: Arc<Semaphore>,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    let permit = semaphore
+        .acquire_owned()
         .await
         .expect("Bilibili credential sync semaphore should remain open");
-    operation.await
+    // Blocking work continues after its caller is cancelled. The worker must own
+    // the permit so a timeout cannot admit another credential migration early.
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .context("BBDown credential migration task failed")
 }
 
 pub fn bilibili_metadata_command_spec(config: &AppConfig, url: &str) -> Result<CommandSpec> {
@@ -15618,17 +15707,17 @@ mod tests {
             .await
             .expect("test semaphore should remain open");
         let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let waiting_semaphore = Arc::clone(&semaphore);
         let waiting_task = tokio::spawn(async move {
-            run_with_bilibili_credential_sync_limit(&waiting_semaphore, async move {
+            run_with_bilibili_credential_sync_limit(waiting_semaphore, move || {
                 started_tx
-                    .send(())
-                    .await
+                    .blocking_send(())
                     .expect("test receiver should remain open");
-                release_rx.await.expect("test sender should remain open");
+                release_rx.recv().expect("test sender should remain open");
             })
-            .await;
+            .await
+            .expect("credential sync worker should finish");
         });
 
         assert!(
@@ -15650,6 +15739,52 @@ mod tests {
             .await
             .expect("waiting credential sync task should finish")
             .expect("waiting credential sync task should not panic");
+    }
+
+    #[tokio::test]
+    async fn bilibili_credential_sync_limit_survives_caller_cancellation() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_semaphore = Arc::clone(&semaphore);
+        let first_task = tokio::spawn(async move {
+            run_with_bilibili_credential_sync_limit(first_semaphore, move || {
+                started_tx.blocking_send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+            .await
+            .unwrap();
+        });
+        tokio_timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        first_task.abort();
+        assert!(first_task.await.unwrap_err().is_cancelled());
+
+        let (next_started_tx, mut next_started_rx) = tokio::sync::mpsc::channel(1);
+        let second_task = tokio::spawn(async move {
+            run_with_bilibili_credential_sync_limit(semaphore, move || {
+                next_started_tx.blocking_send(()).unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        assert!(
+            tokio_timeout(Duration::from_millis(50), next_started_rx.recv())
+                .await
+                .is_err(),
+            "cancelling the caller must not release a running worker's permit"
+        );
+        release_tx.send(()).unwrap();
+        tokio_timeout(Duration::from_secs(1), next_started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio_timeout(Duration::from_secs(1), second_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     fn test_home() -> PathBuf {
@@ -16116,6 +16251,34 @@ mod tests {
             "entries": entries,
         }))
         .expect("test Bilibili plan should deserialize")
+    }
+
+    #[test]
+    fn queue_stream_sizes_prefer_exact_and_bound_bitrate_estimates() {
+        let plan = test_bilibili_plan(vec![test_bilibili_entry(1, None, None)]);
+        let mut stream = plan.entries[0].streams.videos[0].clone();
+        let mut snapshot = PlanValidationSnapshot::default();
+        push_bilibili_snapshot_size(&mut snapshot, "estimated", &stream, Some(60));
+        assert_eq!(snapshot.approximate_sizes[0].bytes, 30_000_000);
+        stream.size = Some(123);
+        push_bilibili_snapshot_size(&mut snapshot, "exact", &stream, Some(60));
+        assert_eq!(snapshot.exact_sizes[0].bytes, 123);
+        assert_eq!(snapshot.approximate_sizes.len(), 1);
+        stream.size = None;
+        for (bandwidth, duration) in [
+            (None, Some(60)),
+            (Some(0), Some(60)),
+            (Some(10), None),
+            (Some(10), Some(0)),
+            (Some(u64::MAX), Some(2)),
+        ] {
+            stream.bandwidth = bandwidth;
+            push_bilibili_snapshot_size(&mut snapshot, "unknown", &stream, duration);
+        }
+        assert_eq!(snapshot.approximate_sizes.len(), 1);
+        stream.bandwidth = Some(1);
+        push_bilibili_snapshot_size(&mut snapshot, "rounded", &stream, Some(1));
+        assert_eq!(snapshot.approximate_sizes[1].bytes, 1);
     }
 
     fn test_bilibili_entry(

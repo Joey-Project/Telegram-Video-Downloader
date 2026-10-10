@@ -36,6 +36,8 @@ superseded_by:
 - The worker compares its lock-protected filtered plan with the queued snapshot
   before downloading. A changed plan stops with retry/requeue guidance so the
   queue can validate the new plan.
+- The shared snapshot helper retains the current queue metadata preview and
+  bandwidth-based size estimates after integrating the updated target branch.
 - An entirely existing season returns existing media through the normal
   completed-output path. No existing media is overwritten or deleted.
 
@@ -48,7 +50,8 @@ superseded_by:
   the skipped episode receives zero playback requests, the missing episode
   receives one, and an all-existing season produces a valid empty plan.
 - `cargo test --all-targets --locked --offline --quiet -- --test-threads=4`:
-  569 passed, 13 ignored, zero failures. Coverage includes actual file
+  580 passed, 13 ignored, zero failures after target-branch integration.
+  Coverage includes actual file
   removal/replacement, changed and newly conflicting sidecars, benign
   directory-entry churn, and real video/audio stream fixtures. Snapshot mismatch
   rejection and worker IPC propagation are tested directly; a full subprocess
