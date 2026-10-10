@@ -28,6 +28,9 @@ superseded_by:
   exact existing entries before playback planning. Remaining episodes retain
   their original order and indices, with independent deadlines and concurrency
   of two. A coarse BV/AV match or filename alone cannot skip an episode.
+- Queue plan inspection and execution share the same filtering helper, including
+  audio-only media. Conflicting CID/EPID evidence across associated sidecars
+  prevents skipping the ambiguous file.
 - An entirely existing season returns existing media through the normal
   completed-output path. No existing media is overwritten or deleted.
 
@@ -36,9 +39,14 @@ superseded_by:
 - Regression coverage includes partial matches, conflicting identities, all
   existing entries, callback labels, serialized skip choices, persisted queue
   recovery, and stale duplicate callbacks.
-- `cargo test --all-targets --locked --offline --quiet`: 564 passed, 13 ignored,
-  zero failures. The final run includes actual file removal/replacement and
+- A localhost-only mock makes an existing episode's play URL fail if requested:
+  the skipped episode receives zero playback requests, the missing episode
+  receives one, and an all-existing season produces a valid empty plan.
+- `cargo test --all-targets --locked --offline --quiet -- --test-threads=4`:
+  566 passed, 13 ignored, zero failures. The final run includes actual file removal/replacement and
   benign directory-entry churn.
+- An initial parallel run hit an existing local Telegram progress timeout; the
+  exact test passed alone, and the complete four-thread run passed.
 - Strict Clippy and formatting passed with Cargo/rustc 1.95.0. Queue and HTTP
   tests ran outside the sandbox; compilation used an isolated temporary target.
 - The isolated release build passed. The staged executable was signed with the
