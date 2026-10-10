@@ -483,6 +483,11 @@ pub struct VideoDuplicate {
     pub(crate) overwrite_confirmation: Option<VideoOverwriteConfirmation>,
 }
 
+pub struct VideoDuplicateCheck {
+    pub duplicate: Option<VideoDuplicate>,
+    pub display_metadata: Option<PlanValidationSnapshot>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VideoOverwriteConfirmation {
     root_identity: EntryIdentity,
@@ -1587,13 +1592,12 @@ pub async fn inspect_job_plan(
                 if let Some(stream) = bilibili_selected_video(entry, &options.stream_selection) {
                     let format_id = format!("{stable_id}:video:{}", stream.id);
                     snapshot.selected_format_ids.push(format_id.clone());
-                    if let Some(bytes) = stream.size {
-                        snapshot.exact_sizes.push(PlanSize {
-                            subject: format_id.clone(),
-                            bytes,
-                            provenance: "Bilibili plan stream size".to_string(),
-                        });
-                    }
+                    push_bilibili_snapshot_size(
+                        &mut snapshot,
+                        &format_id,
+                        stream,
+                        entry.streams.duration_seconds,
+                    );
                     snapshot.resolution_codecs.push(format!(
                         "{format_id}:{}x{}:{}",
                         stream.width.unwrap_or_default(),
@@ -1604,13 +1608,12 @@ pub async fn inspect_job_plan(
                 if let Some(stream) = bilibili_selected_audio(entry, &options.stream_selection) {
                     let format_id = format!("{stable_id}:audio:{}", stream.id);
                     snapshot.selected_format_ids.push(format_id.clone());
-                    if let Some(bytes) = stream.size {
-                        snapshot.exact_sizes.push(PlanSize {
-                            subject: format_id.clone(),
-                            bytes,
-                            provenance: "Bilibili plan stream size".to_string(),
-                        });
-                    }
+                    push_bilibili_snapshot_size(
+                        &mut snapshot,
+                        &format_id,
+                        stream,
+                        entry.streams.duration_seconds,
+                    );
                     snapshot.resolution_codecs.push(format!(
                         "{format_id}:{}",
                         stream.codecs.as_deref().unwrap_or("unknown")
@@ -1619,6 +1622,32 @@ pub async fn inspect_job_plan(
             }
             Ok(snapshot)
         }
+    }
+}
+
+fn push_bilibili_snapshot_size(
+    snapshot: &mut PlanValidationSnapshot,
+    format_id: &str,
+    stream: &bbdown_core::MediaStream,
+    duration_seconds: Option<u32>,
+) {
+    if let Some(bytes) = stream.size {
+        snapshot.exact_sizes.push(PlanSize {
+            subject: format_id.to_string(),
+            bytes,
+            provenance: "Bilibili plan stream size".to_string(),
+        });
+    } else if let Some(bits) = stream
+        .bandwidth
+        .filter(|value| *value > 0)
+        .zip(duration_seconds.filter(|value| *value > 0))
+        .and_then(|(bandwidth, duration)| bandwidth.checked_mul(u64::from(duration)))
+    {
+        snapshot.approximate_sizes.push(PlanSize {
+            subject: format_id.to_string(),
+            bytes: bits.div_ceil(8),
+            provenance: "Bilibili stream bandwidth and duration estimate".to_string(),
+        });
     }
 }
 
@@ -1683,7 +1712,7 @@ pub async fn run_video_job_staged_keep_both(
 pub async fn find_video_duplicate_with_probe(
     config: &AppConfig,
     job: &JobRequest,
-) -> Result<Option<VideoDuplicate>> {
+) -> Result<VideoDuplicateCheck> {
     let index = scan_video_identity_index(config, job).await?;
     let mut identities = video_identity(job).into_iter().collect::<Vec<_>>();
     let direct_overwrite_identities = identities
@@ -1694,6 +1723,7 @@ pub async fn find_video_duplicate_with_probe(
     let direct_duplicate =
         find_video_duplicate_in_index(&index, &identities, &direct_overwrite_identities);
     let mut overwrite_identities = Vec::new();
+    let mut display_metadata = None;
 
     if let JobRequest::Bilibili { url, selection } = job {
         let probe_timeout = if direct_duplicate.is_some() {
@@ -1705,6 +1735,7 @@ pub async fn find_video_duplicate_with_probe(
             Ok(plan) => {
                 push_bilibili_plan_identities(&mut identities, &plan);
                 overwrite_identities = bilibili_plan_overwrite_identities(&plan);
+                display_metadata = Some(bilibili_metadata_display_snapshot(&plan));
             }
             Err(err) if should_propagate_bilibili_probe_error(*selection, &err) => {
                 return Err(err).with_context(|| {
@@ -1726,12 +1757,67 @@ pub async fn find_video_duplicate_with_probe(
             }
         }
     } else {
-        return Ok(direct_duplicate);
+        return Ok(VideoDuplicateCheck {
+            duplicate: direct_duplicate,
+            display_metadata: None,
+        });
     }
 
-    match find_video_duplicate_in_index(&index, &identities, &overwrite_identities) {
-        Some(duplicate) => Ok(Some(duplicate)),
-        None => Ok(direct_duplicate),
+    let duplicate = find_video_duplicate_in_index(&index, &identities, &overwrite_identities)
+        .or(direct_duplicate);
+    // Keep season/collection inventory metadata-only. A single duplicate can cheaply
+    // preview its selected streams, but a failed preview must not block the choice.
+    if duplicate.is_some()
+        && display_metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.stable_media_ids.len() == 1)
+        && let Ok(Ok(plan)) = tokio_timeout(
+            BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT,
+            inspect_job_plan(config, job),
+        )
+        .await
+    {
+        display_metadata = Some(plan);
+    }
+    Ok(VideoDuplicateCheck {
+        duplicate,
+        display_metadata,
+    })
+}
+
+pub async fn inspect_job_display_metadata(
+    config: &AppConfig,
+    job: &JobRequest,
+) -> Result<Option<PlanValidationSnapshot>> {
+    let JobRequest::Bilibili { url, selection } = job else {
+        return Ok(None);
+    };
+    let metadata = probe_bilibili_duplicate_metadata(
+        config,
+        url,
+        *selection,
+        BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT,
+    )
+    .await?;
+    Ok(Some(bilibili_metadata_display_snapshot(&metadata)))
+}
+
+fn bilibili_metadata_display_snapshot(plan: &BilibiliDownloadPlan) -> PlanValidationSnapshot {
+    PlanValidationSnapshot {
+        title: Some(plan.title.clone()),
+        stable_media_ids: plan
+            .entries
+            .iter()
+            .map(|entry| {
+                bilibili_plan_stable_media_id(
+                    entry.bvid.as_deref(),
+                    entry.aid,
+                    entry.cid,
+                    entry.epid,
+                )
+            })
+            .collect(),
+        ..PlanValidationSnapshot::default()
     }
 }
 
@@ -15526,6 +15612,34 @@ mod tests {
             "entries": entries,
         }))
         .expect("test Bilibili plan should deserialize")
+    }
+
+    #[test]
+    fn queue_stream_sizes_prefer_exact_and_bound_bitrate_estimates() {
+        let plan = test_bilibili_plan(vec![test_bilibili_entry(1, None, None)]);
+        let mut stream = plan.entries[0].streams.videos[0].clone();
+        let mut snapshot = PlanValidationSnapshot::default();
+        push_bilibili_snapshot_size(&mut snapshot, "estimated", &stream, Some(60));
+        assert_eq!(snapshot.approximate_sizes[0].bytes, 30_000_000);
+        stream.size = Some(123);
+        push_bilibili_snapshot_size(&mut snapshot, "exact", &stream, Some(60));
+        assert_eq!(snapshot.exact_sizes[0].bytes, 123);
+        assert_eq!(snapshot.approximate_sizes.len(), 1);
+        stream.size = None;
+        for (bandwidth, duration) in [
+            (None, Some(60)),
+            (Some(0), Some(60)),
+            (Some(10), None),
+            (Some(10), Some(0)),
+            (Some(u64::MAX), Some(2)),
+        ] {
+            stream.bandwidth = bandwidth;
+            push_bilibili_snapshot_size(&mut snapshot, "unknown", &stream, duration);
+        }
+        assert_eq!(snapshot.approximate_sizes.len(), 1);
+        stream.bandwidth = Some(1);
+        push_bilibili_snapshot_size(&mut snapshot, "rounded", &stream, Some(1));
+        assert_eq!(snapshot.approximate_sizes[1].bytes, 1);
     }
 
     fn test_bilibili_entry(
