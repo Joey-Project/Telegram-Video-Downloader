@@ -3716,6 +3716,23 @@ async fn inspect_and_preserve_job_plan(
     job: &JobRequest,
 ) -> Result<PlanValidationSnapshot> {
     let result = inspect_job_plan(config, job).await;
+    preserve_job_plan_result(
+        queue,
+        task_id,
+        generation,
+        result,
+        inspect_job_display_metadata(config, job),
+    )
+    .await
+}
+
+async fn preserve_job_plan_result(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    result: Result<PlanValidationSnapshot>,
+    metadata_probe: impl Future<Output = Result<Option<PlanValidationSnapshot>>>,
+) -> Result<PlanValidationSnapshot> {
     let needs_metadata = if result.is_err() {
         match queue.get_if_generation(task_id, generation) {
             Ok(task) => task.is_some_and(|task| task.display_metadata.is_none()),
@@ -3728,7 +3745,9 @@ async fn inspect_and_preserve_job_plan(
         false
     };
     if needs_metadata
-        && let Ok(Some(metadata)) = inspect_job_display_metadata(config, job).await
+        // Include credential synchronization and its semaphore wait in the budget.
+        && let Ok(Ok(Some(metadata))) =
+            tokio_timeout(Duration::from_secs(5), metadata_probe).await
         && let Err(err) = queue.set_display_metadata_if_generation(task_id, generation, metadata)
     {
         warn!(task_id, error = %err, "failed to persist details after plan probe failure");

@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-10
 updated: 2026-10-10
 branch: wip/queue-metadata
-pr: null
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/35
 supersedes: []
 superseded_by:
 ---
@@ -29,6 +29,8 @@ superseded_by:
   status checks reject stale writes; changing the request clears its preview.
   Execution still resolves and validates the current plan.
 - If planning fails without cached details, attempt a bounded title-only lookup.
+  Its five-second budget includes credential synchronization and semaphore waits,
+  so a blocked fallback cannot hide the original failure or keep the task running.
   Queue rows show the available title and a concise failure/interruption reason.
   API denial codes/messages remain redacted and bounded; HTTP/IO details stay
   generic.
@@ -41,11 +43,11 @@ superseded_by:
 
 ## Validation
 
-- Seven new regressions cover duplicate preview persistence through restart,
+- Eight new regressions cover duplicate preview persistence through restart,
   denied preview and failed plan title retention, stale writes and request changes,
   legacy records, long error pages, bitrate estimate boundaries, and per-episode
-  API denial reporting.
-- `cargo test --all-targets --locked --offline --quiet`: 567 passed, 13 ignored,
+  API denial reporting, and fallback timeout while credential synchronization waits.
+- `cargo test --all-targets --locked --offline --quiet`: 568 passed, 13 ignored,
   zero failures. Localhost and macOS File Provider fixtures ran outside the sandbox.
 - `cargo build --locked --offline`, strict Clippy, and format checks passed with
   Cargo/rustc 1.95.0. Build targets were isolated under a task-scoped temporary

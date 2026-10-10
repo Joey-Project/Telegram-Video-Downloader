@@ -168,6 +168,45 @@ mod queue_metadata_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn failed_plan_metadata_timeout_includes_credential_semaphore_wait() {
+        let (root, _, queue, job) = queue_fixture("queue-blocked-metadata");
+        let id = "blocked-preview";
+        let mut task = TaskRecord::new(id.to_string(), 1, 2, CHAT_ID, None, 0, job);
+        task.status = TaskStatus::Running;
+        queue.create(task).unwrap();
+        let credential_sync = Semaphore::new(1);
+        let blocked_permit = credential_sync.acquire().await.unwrap();
+        let metadata_probe = async {
+            let _permit = credential_sync.acquire().await.unwrap();
+            panic!("blocked credential work must not start");
+        };
+        let started = Instant::now();
+        let error = tokio_timeout(
+            Duration::from_secs(10),
+            preserve_job_plan_result(
+                &queue,
+                id,
+                0,
+                Err(anyhow::anyhow!("Original stream planning error")),
+                metadata_probe,
+            ),
+        )
+        .await
+        .expect("metadata fallback must finish within its own budget")
+        .expect_err("metadata timeout must preserve the original plan error");
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(error.to_string(), "Original stream planning error");
+        queue.fail_if_generation(id, 0, error.to_string()).unwrap();
+        let task = queue.get(id).unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.error.as_deref(), Some("Original stream planning error"));
+        assert!(task.display_metadata.is_none());
+        drop(blocked_permit);
+        drop(queue);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn preview_updates_reject_stale_generation_and_clear_on_selection_change() {
         let (root, config, queue, job) = queue_fixture("queue-metadata-generation");
