@@ -26,6 +26,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex, MutexGuard, Semaphore, watch};
+use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, sleep_until, timeout as tokio_timeout};
 use tracing::info;
 
@@ -41,12 +42,19 @@ use crate::safe_fs::{
 };
 
 static VIDEO_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static BILIBILI_MISSING_VALIDATION_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 // Credential migration can block on the cross-process auth lock. Keep callers waiting
 // asynchronously so inbound Bilibili links cannot consume Tokio blocking workers.
 static BILIBILI_CREDENTIAL_SYNC_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 #[cfg(unix)]
 static BILIBILI_WORKER_PROCESS: AtomicBool = AtomicBool::new(false);
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn bilibili_missing_validation_semaphore() -> Arc<Semaphore> {
+    BILIBILI_MISSING_VALIDATION_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(2)))
+        .clone()
+}
 static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
 const VIDEO_STAGING_INITIALIZING_DIR_PREFIX: &str = ".initializing-job-";
@@ -128,6 +136,7 @@ const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
 ];
 const OUTPUT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_ABORT_GRACE: Duration = Duration::from_secs(3);
+const MAX_FFPROBE_CAPTURE_BYTES: usize = 64 * 1024;
 const BILIBILI_METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -247,6 +256,62 @@ pub struct JobReport {
     pub details: String,
     #[serde(default)]
     pub primary_media_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) existing_bilibili_evidence: Option<ExistingBilibiliReportEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct MediaContentStamp {
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl MediaContentStamp {
+    fn from_bound_file(file: &BoundFile) -> Result<Self> {
+        let (size, modified_seconds, modified_nanoseconds, changed_seconds, changed_nanoseconds) =
+            file.content_stamp()?;
+        Ok(Self {
+            size,
+            modified_seconds,
+            modified_nanoseconds,
+            changed_seconds,
+            changed_nanoseconds,
+        })
+    }
+
+    fn same_timestamps(self, other: Self) -> bool {
+        self.modified_seconds == other.modified_seconds
+            && self.modified_nanoseconds == other.modified_nanoseconds
+            && self.changed_seconds == other.changed_seconds
+            && self.changed_nanoseconds == other.changed_nanoseconds
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ExistingBilibiliReportEvidence {
+    #[serde(default)]
+    skipped: Vec<ExistingBilibiliMediaEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ExistingBilibiliMediaEvidence {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    sidecars: Vec<ExistingBilibiliSidecarEvidence>,
+    cid: u64,
+    epid: u64,
+    content_stamp: MediaContentStamp,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ExistingBilibiliSidecarEvidence {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,6 +469,8 @@ struct BilibiliWorkerRequest {
     url: String,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<VideoIdentity>,
+    #[serde(default)]
+    expected_plan: Option<PlanValidationSnapshot>,
     logical_output_dir: PathBuf,
     output_root_device: u64,
     output_root_inode: u64,
@@ -411,6 +478,12 @@ struct BilibiliWorkerRequest {
     staging_inode: u64,
     output_lock_device: u64,
     output_lock_inode: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct BilibiliWorkerRequestExpectations {
+    overwrite_identity: Option<VideoIdentity>,
+    plan: Option<PlanValidationSnapshot>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -479,7 +552,14 @@ pub enum VideoDuplicateAction {
 pub struct VideoDuplicate {
     pub identity: VideoIdentity,
     pub existing_videos: Vec<PathBuf>,
+    pub skip_summary: Option<BilibiliSkipSummary>,
     pub(crate) overwrite_confirmation: Option<VideoOverwriteConfirmation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BilibiliSkipSummary {
+    pub total_entries: usize,
+    pub duplicate_entries: usize,
 }
 
 pub struct VideoDuplicateCheck {
@@ -518,14 +598,32 @@ impl VideoDuplicate {
         match (job, self.identity.provider) {
             (JobRequest::Youtube { .. }, VideoProvider::Youtube) => true,
             (JobRequest::Bilibili { selection, .. }, VideoProvider::Bilibili) => {
-                !matches!(selection, Some(BilibiliSelection::All))
-                    && is_bilibili_entry_identity(&self.identity.id)
+                !matches!(
+                    selection,
+                    Some(BilibiliSelection::All | BilibiliSelection::Missing)
+                ) && is_bilibili_entry_identity(&self.identity.id)
                     && self.existing_videos.first().is_some_and(|video| {
                         metadata_sidecars_match_identity(video, &self.identity)
                     })
             }
             _ => false,
         }
+    }
+
+    pub fn allows_skip_for(&self, job: &JobRequest) -> bool {
+        matches!(
+            (job, self.skip_summary),
+            (
+                JobRequest::Bilibili {
+                    selection: Some(BilibiliSelection::All),
+                    ..
+                },
+                Some(BilibiliSkipSummary {
+                    total_entries,
+                    duplicate_entries,
+                })
+            ) if total_entries > 0 && duplicate_entries > 0
+        )
     }
 
     fn overwrite_target(&self) -> Option<&PathBuf> {
@@ -1568,59 +1666,92 @@ pub async fn inspect_job_plan(
             sync_bilibili_rust_credentials(config).await?;
             let options = bilibili_core::download_options(config)?;
             let client = bilibili_core::client(config)?;
-            let plan = probe_bilibili_plan_with_mode(
-                &client,
-                url,
-                *selection,
-                options.mode,
-                BILIBILI_METADATA_PROBE_TIMEOUT,
-            )
-            .await?;
-            let mut snapshot = PlanValidationSnapshot {
-                title: Some(plan.title.clone()),
-                ..PlanValidationSnapshot::default()
+            let plan = if matches!(selection, Some(BilibiliSelection::Missing)) {
+                plan_bilibili_missing_season(
+                    config,
+                    &client,
+                    url,
+                    options.mode,
+                    &ffprobe_program(&config.tools.ffmpeg),
+                    &duplicate_scan_video_dir(config, job),
+                    BILIBILI_METADATA_PROBE_TIMEOUT,
+                    |_, _| {},
+                )
+                .await?
+                .plan
+            } else {
+                probe_bilibili_plan_with_mode(
+                    &client,
+                    url,
+                    *selection,
+                    options.mode,
+                    BILIBILI_METADATA_PROBE_TIMEOUT,
+                )
+                .await?
             };
-            for entry in &plan.entries {
-                let stable_id = bilibili_plan_stable_media_id(
-                    entry.bvid.as_deref(),
-                    entry.aid,
-                    entry.cid,
-                    entry.epid,
-                );
-                snapshot.stable_media_ids.push(stable_id.clone());
-                if let Some(stream) = bilibili_selected_video(entry, &options.stream_selection) {
-                    let format_id = format!("{stable_id}:video:{}", stream.id);
-                    snapshot.selected_format_ids.push(format_id.clone());
-                    push_bilibili_snapshot_size(
-                        &mut snapshot,
-                        &format_id,
-                        stream,
-                        entry.streams.duration_seconds,
-                    );
-                    snapshot.resolution_codecs.push(format!(
-                        "{format_id}:{}x{}:{}",
-                        stream.width.unwrap_or_default(),
-                        stream.height.unwrap_or_default(),
-                        stream.codecs.as_deref().unwrap_or("unknown")
-                    ));
-                }
-                if let Some(stream) = bilibili_selected_audio(entry, &options.stream_selection) {
-                    let format_id = format!("{stable_id}:audio:{}", stream.id);
-                    snapshot.selected_format_ids.push(format_id.clone());
-                    push_bilibili_snapshot_size(
-                        &mut snapshot,
-                        &format_id,
-                        stream,
-                        entry.streams.duration_seconds,
-                    );
-                    snapshot.resolution_codecs.push(format!(
-                        "{format_id}:{}",
-                        stream.codecs.as_deref().unwrap_or("unknown")
-                    ));
-                }
-            }
-            Ok(snapshot)
+            Ok(bilibili_plan_validation_snapshot(&plan, &options))
         }
+    }
+}
+
+fn bilibili_plan_validation_snapshot(
+    plan: &bbdown_core::DownloadPlan,
+    options: &bbdown_core::DownloadOptions,
+) -> PlanValidationSnapshot {
+    let mut snapshot = PlanValidationSnapshot {
+        title: Some(plan.title.clone()),
+        ..PlanValidationSnapshot::default()
+    };
+    for entry in &plan.entries {
+        let stable_id =
+            bilibili_plan_stable_media_id(entry.bvid.as_deref(), entry.aid, entry.cid, entry.epid);
+        snapshot.stable_media_ids.push(stable_id.clone());
+        if let Some(stream) = bilibili_selected_video(entry, &options.stream_selection) {
+            let format_id = format!("{stable_id}:video:{}", stream.id);
+            snapshot.selected_format_ids.push(format_id.clone());
+            push_bilibili_snapshot_size(
+                &mut snapshot,
+                &format_id,
+                stream,
+                entry.streams.duration_seconds,
+            );
+            snapshot.resolution_codecs.push(format!(
+                "{format_id}:{}x{}:{}",
+                stream.width.unwrap_or_default(),
+                stream.height.unwrap_or_default(),
+                stream.codecs.as_deref().unwrap_or("unknown")
+            ));
+        }
+        if let Some(stream) = bilibili_selected_audio(entry, &options.stream_selection) {
+            let format_id = format!("{stable_id}:audio:{}", stream.id);
+            snapshot.selected_format_ids.push(format_id.clone());
+            push_bilibili_snapshot_size(
+                &mut snapshot,
+                &format_id,
+                stream,
+                entry.streams.duration_seconds,
+            );
+            snapshot.resolution_codecs.push(format!(
+                "{format_id}:{}",
+                stream.codecs.as_deref().unwrap_or("unknown")
+            ));
+        }
+    }
+    snapshot
+}
+
+fn validate_missing_plan_snapshot(
+    expected: &PlanValidationSnapshot,
+    current: &PlanValidationSnapshot,
+) -> Result<()> {
+    let differences = expected.blocking_differences(current);
+    if differences.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "Bilibili missing-episode plan changed after queue confirmation ({}); retry the queued job to review the updated plan before downloading",
+            differences.join(", ")
+        )
     }
 }
 
@@ -1682,7 +1813,7 @@ pub async fn run_job_with_duplicate_action(
         bail!("overwrite requires one exact video or Bilibili entry match");
     }
 
-    run_staged_video_job(config, job, action, duplicate, progress).await
+    run_staged_video_job(config, job, action, duplicate, None, progress).await
 }
 
 pub async fn run_video_job_staged_keep_both(
@@ -1690,10 +1821,20 @@ pub async fn run_video_job_staged_keep_both(
     job: &JobRequest,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
+    run_video_job_staged_keep_both_with_plan(config, job, None, progress).await
+}
+
+pub async fn run_video_job_staged_keep_both_with_plan(
+    config: &AppConfig,
+    job: &JobRequest,
+    expected_plan: Option<PlanValidationSnapshot>,
+    progress: Option<JobProgressSender>,
+) -> Result<JobReport> {
     let Some(identity) = fallback_video_identity(job) else {
         return run_simple_job(config, job, progress).await;
     };
     let duplicate = VideoDuplicate {
+        skip_summary: None,
         overwrite_confirmation: None,
         identity,
         existing_videos: Vec::new(),
@@ -1703,6 +1844,7 @@ pub async fn run_video_job_staged_keep_both(
         job,
         VideoDuplicateAction::KeepBoth,
         &duplicate,
+        expected_plan,
         progress,
     )
     .await
@@ -1712,7 +1854,7 @@ pub async fn find_video_duplicate_with_probe(
     config: &AppConfig,
     job: &JobRequest,
 ) -> Result<VideoDuplicateCheck> {
-    let index = scan_video_identity_index(config, job).await?;
+    let index = Arc::new(scan_video_identity_index(config, job).await?);
     let mut identities = video_identity(job).into_iter().collect::<Vec<_>>();
     let direct_overwrite_identities = identities
         .iter()
@@ -1722,6 +1864,7 @@ pub async fn find_video_duplicate_with_probe(
     let direct_duplicate =
         find_video_duplicate_in_index(&index, &identities, &direct_overwrite_identities);
     let mut overwrite_identities = Vec::new();
+    let mut skip_summary = None;
     let mut display_metadata = None;
 
     if let JobRequest::Bilibili { url, selection } = job {
@@ -1731,10 +1874,48 @@ pub async fn find_video_duplicate_with_probe(
             BILIBILI_METADATA_PROBE_TIMEOUT
         };
         match probe_bilibili_duplicate_metadata(config, url, *selection, probe_timeout).await {
-            Ok(plan) => {
+            Ok(probe) => {
+                let plan = probe.plan;
                 push_bilibili_plan_identities(&mut identities, &plan);
                 overwrite_identities = bilibili_plan_overwrite_identities(&plan);
                 display_metadata = Some(bilibili_metadata_display_snapshot(&plan));
+                if let (Some(total_entries), Ok(mode)) = (
+                    probe.season_total,
+                    bilibili_core::download_mode_from_config(config),
+                ) && bilibili_missing_skip_mode_supported(mode)
+                {
+                    let ffprobe = ffprobe_program(&config.tools.ffmpeg);
+                    let probe_config = Arc::new(config.clone());
+                    let mut duplicate_entries = 0;
+                    for batch in plan.entries.chunks(2) {
+                        let mut probes = JoinSet::new();
+                        for entry in batch {
+                            let entry = entry.clone();
+                            let index = Arc::clone(&index);
+                            let config = Arc::clone(&probe_config);
+                            let ffprobe = ffprobe.clone();
+                            probes.spawn(async move {
+                                bilibili_plan_entry_has_compatible_existing_media(
+                                    &config,
+                                    Arc::clone(&index),
+                                    &entry,
+                                    mode,
+                                    &ffprobe,
+                                )
+                                .await
+                            });
+                        }
+                        while let Some(result) = probes.join_next().await {
+                            if matches!(result, Ok(true)) {
+                                duplicate_entries += 1;
+                            }
+                        }
+                    }
+                    skip_summary = (duplicate_entries > 0).then_some(BilibiliSkipSummary {
+                        total_entries,
+                        duplicate_entries,
+                    });
+                }
             }
             Err(err) if should_propagate_bilibili_probe_error(*selection, &err) => {
                 return Err(err).with_context(|| {
@@ -1762,8 +1943,11 @@ pub async fn find_video_duplicate_with_probe(
         });
     }
 
-    let duplicate = find_video_duplicate_in_index(&index, &identities, &overwrite_identities)
+    let mut duplicate = find_video_duplicate_in_index(&index, &identities, &overwrite_identities)
         .or(direct_duplicate);
+    if let Some(duplicate) = duplicate.as_mut() {
+        duplicate.skip_summary = skip_summary;
+    }
     // Keep season/collection inventory metadata-only. A single duplicate can cheaply
     // preview its selected streams, but a failed preview must not block the choice.
     if duplicate.is_some()
@@ -1798,7 +1982,7 @@ pub async fn inspect_job_display_metadata(
         BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT,
     )
     .await?;
-    Ok(Some(bilibili_metadata_display_snapshot(&metadata)))
+    Ok(Some(bilibili_metadata_display_snapshot(&metadata.plan)))
 }
 
 fn bilibili_metadata_display_snapshot(plan: &BilibiliDownloadPlan) -> PlanValidationSnapshot {
@@ -1818,6 +2002,877 @@ fn bilibili_metadata_display_snapshot(plan: &BilibiliDownloadPlan) -> PlanValida
             .collect(),
         ..PlanValidationSnapshot::default()
     }
+}
+
+fn bilibili_plan_entry_has_exact_existing_metadata(
+    index: &VideoIdentityIndex,
+    entry: &BilibiliDownloadEntry,
+) -> bool {
+    bilibili_exact_entry_metadata_paths(index, entry)
+        .iter()
+        .any(|video| bilibili_media_path_has_exact_existing_metadata(index, video, entry))
+}
+
+fn bilibili_media_path_has_exact_existing_metadata(
+    index: &VideoIdentityIndex,
+    video: &Path,
+    entry: &BilibiliDownloadEntry,
+) -> bool {
+    let Some(root) = index.root.as_ref() else {
+        return false;
+    };
+    index.metadata_video_is_current(video)
+        && current_bilibili_sidecars_match_entry(root, video, entry)
+        && index.metadata_video_is_current(video)
+}
+
+async fn bilibili_plan_entry_has_compatible_existing_media(
+    config: &AppConfig,
+    index: Arc<VideoIdentityIndex>,
+    entry: &BilibiliDownloadEntry,
+    mode: DownloadMode,
+    ffprobe: &Path,
+) -> bool {
+    bilibili_plan_entry_compatible_existing_media(config, index, entry, mode, ffprobe)
+        .await
+        .is_some()
+}
+
+async fn bilibili_plan_entry_compatible_existing_media(
+    config: &AppConfig,
+    index: Arc<VideoIdentityIndex>,
+    entry: &BilibiliDownloadEntry,
+    mode: DownloadMode,
+    ffprobe: &Path,
+) -> Option<ExistingEpisodeEvidence> {
+    let semaphore = bilibili_missing_validation_semaphore();
+    let permit = tokio_timeout(Duration::from_secs(6), semaphore.acquire_owned())
+        .await
+        .ok()?
+        .ok()?;
+    let config = config.clone();
+    let index = Arc::clone(&index);
+    let entry = entry.clone();
+    let ffprobe = ffprobe.to_path_buf();
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        bilibili_plan_entry_compatible_existing_media_blocking(
+            &config, &index, &entry, mode, &ffprobe,
+        )
+    });
+    match tokio_timeout(Duration::from_secs(6), task).await {
+        Ok(Ok(evidence)) => evidence,
+        Ok(Err(_)) => {
+            info!(
+                "existing Bilibili media validation worker failed; planning episode for download"
+            );
+            None
+        }
+        Err(_) => {
+            info!("existing Bilibili media validation timed out; planning episode for download");
+            None
+        }
+    }
+}
+
+fn bilibili_plan_entry_compatible_existing_media_blocking(
+    config: &AppConfig,
+    index: &VideoIdentityIndex,
+    entry: &BilibiliDownloadEntry,
+    mode: DownloadMode,
+    ffprobe: &Path,
+) -> Option<ExistingEpisodeEvidence> {
+    if !bilibili_missing_skip_mode_supported(mode)
+        || !bilibili_plan_entry_has_exact_existing_metadata(index, entry)
+    {
+        return None;
+    }
+    let root = index.root.as_ref()?;
+    for video in bilibili_exact_entry_metadata_paths(index, entry) {
+        let Some(sidecars) = current_bilibili_sidecars_for_entry(root, &video, entry) else {
+            continue;
+        };
+        let Some(bound_file) = root.open_bound_file(&video).ok().flatten() else {
+            continue;
+        };
+        if index.file_identities.get(&video) != Some(&bound_file.identity()) {
+            continue;
+        }
+        let Some(((has_video, has_audio), after)) =
+            probe_media_streams_stable_blocking(config, ffprobe, &bound_file, None)
+        else {
+            continue;
+        };
+        if bound_file.validate_identity().is_ok()
+            && index.file_identities.get(&video) == Some(&bound_file.identity())
+            && current_bilibili_sidecars_for_entry(root, &video, entry)
+                .is_some_and(|current| current == sidecars)
+            && media_satisfies_download_mode(mode, has_video, has_audio)
+        {
+            return Some(ExistingEpisodeEvidence {
+                path: video,
+                identity: bound_file.identity(),
+                sidecars,
+                content_stamp: after,
+            });
+        }
+    }
+    None
+}
+
+fn probe_media_streams_stable_blocking(
+    config: &AppConfig,
+    ffprobe: &Path,
+    media: &BoundFile,
+    expected_size: Option<u64>,
+) -> Option<((bool, bool), MediaContentStamp)> {
+    let runtime = tokio::runtime::Handle::current();
+    let mut before = MediaContentStamp::from_bound_file(media).ok()?;
+    if expected_size.is_some_and(|size| size != before.size) {
+        return None;
+    }
+    for attempt in 0..3 {
+        let streams = runtime.block_on(probe_media_streams(config, ffprobe, media))?;
+        let after = MediaContentStamp::from_bound_file(media).ok()?;
+        if before.size != after.size || expected_size.is_some_and(|size| size != after.size) {
+            return None;
+        }
+        if before.same_timestamps(after) {
+            return Some((streams, after));
+        }
+        if attempt == 2 {
+            return None;
+        }
+        before = after;
+    }
+    None
+}
+
+#[derive(Clone, Debug)]
+struct ExistingEpisodeEvidence {
+    path: PathBuf,
+    // Device/inode/type identity plus required-stream proof when the content stamp changes;
+    // this does not claim arbitrary byte-level immutability.
+    identity: EntryIdentity,
+    sidecars: Vec<ExistingSidecarEvidence>,
+    content_stamp: MediaContentStamp,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExistingSidecarEvidence {
+    path: PathBuf,
+    identity: EntryIdentity,
+}
+
+fn bilibili_report_evidence_from_skipped(
+    skipped: &[(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)],
+) -> ExistingBilibiliReportEvidence {
+    ExistingBilibiliReportEvidence {
+        skipped: skipped
+            .iter()
+            .map(|(episode, evidence)| ExistingBilibiliMediaEvidence {
+                path: evidence.path.clone(),
+                device: evidence.identity.device(),
+                inode: evidence.identity.inode(),
+                sidecars: evidence
+                    .sidecars
+                    .iter()
+                    .map(|sidecar| ExistingBilibiliSidecarEvidence {
+                        path: sidecar.path.clone(),
+                        device: sidecar.identity.device(),
+                        inode: sidecar.identity.inode(),
+                    })
+                    .collect(),
+                cid: episode.cid,
+                epid: episode.epid,
+                content_stamp: evidence.content_stamp,
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn normalize_existing_bilibili_report_evidence(
+    root: &RootedFs,
+    report: &mut JobReport,
+) -> Result<()> {
+    let Some(evidence) = report.existing_bilibili_evidence.as_mut() else {
+        return Ok(());
+    };
+    for skipped in &mut evidence.skipped {
+        skipped.path = logical_download_root_path(root, &skipped.path)?
+            .context("skipped Bilibili media evidence is outside configured output root")?;
+        for sidecar in &mut skipped.sidecars {
+            sidecar.path = logical_download_root_path(root, &sidecar.path)?
+                .context("skipped Bilibili sidecar evidence is outside configured output root")?;
+        }
+        skipped
+            .sidecars
+            .sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    evidence
+        .skipped
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(())
+}
+
+pub(crate) fn existing_bilibili_report_media_identities(
+    root: &RootedFs,
+    report: &JobReport,
+) -> Result<BTreeMap<PathBuf, EntryIdentity>> {
+    let Some(evidence) = report.existing_bilibili_evidence.as_ref() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut identities = BTreeMap::new();
+    for skipped in &evidence.skipped {
+        let identity = EntryIdentity::regular_file(skipped.device, skipped.inode);
+        let path = logical_download_root_path(root, &skipped.path)?
+            .context("skipped Bilibili media evidence is outside configured output root")?;
+        if identities.insert(path, identity).is_some() {
+            bail!("Bilibili report contains duplicate skipped-media evidence paths");
+        }
+    }
+    Ok(identities)
+}
+
+fn validate_existing_bilibili_report_evidence_identity(
+    root: &RootedFs,
+    report: &JobReport,
+) -> Result<()> {
+    let Some(evidence) = report.existing_bilibili_evidence.as_ref() else {
+        return Ok(());
+    };
+    let mut paths = BTreeSet::new();
+    for skipped in &evidence.skipped {
+        if !paths.insert(skipped.path.clone()) {
+            bail!("Bilibili report contains duplicate skipped-media evidence paths");
+        }
+        let media_identity = EntryIdentity::regular_file(skipped.device, skipped.inode);
+        let episode = BilibiliDownloadEntry {
+            cid: skipped.cid,
+            epid: Some(skipped.epid),
+            ..BilibiliDownloadEntry::default()
+        };
+        let media_path = logical_download_root_path(root, &skipped.path)?
+            .context("skipped Bilibili media evidence is outside configured output root")?;
+        let media = root.open_bound_file(&media_path).with_context(|| {
+            format!(
+                "failed to read skipped Bilibili media while validating report: {}",
+                skipped.path.display()
+            )
+        })?;
+        let Some(media) = media else {
+            bail!(
+                "skipped Bilibili media disappeared before report completion: {}",
+                skipped.path.display()
+            );
+        };
+        if media.identity() != media_identity || !media.identity().is_file() {
+            bail!(
+                "skipped Bilibili media identity changed before report completion: {}",
+                skipped.path.display()
+            );
+        }
+        let current_stamp = MediaContentStamp::from_bound_file(&media).with_context(|| {
+            format!(
+                "failed to inspect skipped Bilibili media while validating report: {}",
+                skipped.path.display()
+            )
+        })?;
+        if current_stamp.size != skipped.content_stamp.size {
+            bail!(
+                "skipped Bilibili media size changed before report completion: {}",
+                skipped.path.display()
+            );
+        }
+        let sidecars = match validate_current_bilibili_sidecars(root, &media_path, &episode)
+            .with_context(|| {
+                format!(
+                    "failed to read skipped Bilibili identity sidecars while validating report: {}",
+                    skipped.path.display()
+                )
+            })? {
+            CurrentBilibiliSidecarEvidence::Matches(sidecars) => sidecars,
+            CurrentBilibiliSidecarEvidence::Missing => bail!(
+                "skipped Bilibili identity sidecars disappeared before report completion: {}",
+                skipped.path.display()
+            ),
+            CurrentBilibiliSidecarEvidence::Mismatched => bail!(
+                "skipped Bilibili identity sidecar changed before report completion: {}",
+                skipped.path.display()
+            ),
+        };
+        let expected_sidecars = skipped
+            .sidecars
+            .iter()
+            .map(|sidecar| {
+                Ok(ExistingSidecarEvidence {
+                    path: logical_download_root_path(root, &sidecar.path)?.context(
+                        "skipped Bilibili sidecar evidence is outside configured output root",
+                    )?,
+                    identity: EntryIdentity::regular_file(sidecar.device, sidecar.inode),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut expected_sidecars = expected_sidecars;
+        expected_sidecars.sort_by(|left, right| left.path.cmp(&right.path));
+        if sidecars != expected_sidecars {
+            bail!(
+                "skipped Bilibili identity sidecar object changed before report completion: {}",
+                skipped.path.display()
+            );
+        }
+        let media_after_sidecars = root.open_bound_file(&media_path).with_context(|| {
+            format!(
+                "failed to recheck skipped Bilibili media after sidecar validation: {}",
+                skipped.path.display()
+            )
+        })?;
+        let Some(media_after_sidecars) = media_after_sidecars else {
+            bail!(
+                "skipped Bilibili media disappeared before report completion: {}",
+                skipped.path.display()
+            );
+        };
+        if media_after_sidecars.identity() != media_identity {
+            bail!(
+                "skipped Bilibili media identity changed before report completion: {}",
+                skipped.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn validate_existing_bilibili_report_for_completion(
+    config: &AppConfig,
+    report: &JobReport,
+) -> Result<()> {
+    let Some(evidence) = report.existing_bilibili_evidence.as_ref() else {
+        return Ok(());
+    };
+    let mode = bilibili_core::download_mode_from_config(config)?;
+    if !evidence.skipped.is_empty() && !bilibili_missing_skip_mode_supported(mode) {
+        bail!("skipped Bilibili evidence is unsupported for the configured download mode");
+    }
+    let semaphore = bilibili_missing_validation_semaphore();
+    let output_root = config.downloads.video_dir.clone();
+    let ffprobe = ffprobe_program(&config.tools.ffmpeg);
+    for skipped in &evidence.skipped {
+        let permit = tokio_timeout(Duration::from_secs(6), semaphore.clone().acquire_owned())
+            .await
+            .context("timed out waiting to validate skipped Bilibili media")??;
+        let mut single_report = report.clone();
+        single_report.existing_bilibili_evidence = Some(ExistingBilibiliReportEvidence {
+            skipped: vec![skipped.clone()],
+        });
+        let output_root = output_root.clone();
+        let config = config.clone();
+        let ffprobe = ffprobe.clone();
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let root = RootedFs::new(&output_root).with_context(|| {
+                format!("failed to bind download root {}", output_root.display())
+            })?;
+            validate_existing_bilibili_report_evidence_identity(&root, &single_report)?;
+            let skipped = single_report
+                .existing_bilibili_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.skipped.first())
+                .context("missing skipped Bilibili evidence in validation task")?;
+            let media_path = logical_download_root_path(&root, &skipped.path)?
+                .context("skipped Bilibili media evidence is outside configured output root")?;
+            let media = root
+                .open_bound_file(&media_path)
+                .with_context(|| {
+                    format!(
+                        "failed to reopen skipped Bilibili media: {}",
+                        media_path.display()
+                    )
+                })?
+                .context("skipped Bilibili media disappeared before completion")?;
+            let stamp = MediaContentStamp::from_bound_file(&media)
+                .context("failed to inspect skipped Bilibili media content stamp")?;
+            if stamp.size != skipped.content_stamp.size {
+                bail!("skipped Bilibili media size changed before completion");
+            }
+            if !stamp.same_timestamps(skipped.content_stamp) {
+                let (streams, _) = probe_media_streams_stable_blocking(
+                    &config,
+                    &ffprobe,
+                    &media,
+                    Some(skipped.content_stamp.size),
+                )
+                .context("ffprobe failed or timed out while rechecking changed Bilibili media")?;
+                if !media_satisfies_download_mode(mode, streams.0, streams.1) {
+                    bail!("skipped Bilibili media no longer has the required streams");
+                }
+                validate_existing_bilibili_report_evidence_identity(&root, &single_report)?;
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        tokio_timeout(Duration::from_secs(6), task)
+            .await
+            .context("timed out validating skipped Bilibili media before completion")?
+            .context("skipped Bilibili media validation task failed to join")??;
+    }
+    Ok(())
+}
+
+fn bilibili_missing_skip_mode_supported(mode: DownloadMode) -> bool {
+    matches!(
+        mode,
+        DownloadMode::All | DownloadMode::VideoOnly | DownloadMode::AudioOnly
+    )
+}
+
+fn media_satisfies_download_mode(mode: DownloadMode, has_video: bool, has_audio: bool) -> bool {
+    match mode {
+        DownloadMode::All => has_video && has_audio,
+        DownloadMode::VideoOnly => has_video,
+        DownloadMode::AudioOnly => has_audio,
+        DownloadMode::SubtitleOnly | DownloadMode::DanmakuOnly | DownloadMode::CoverOnly => false,
+        _ => false,
+    }
+}
+
+fn ffprobe_program(ffmpeg: &Path) -> PathBuf {
+    let sibling = ffmpeg
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let probe_name = if name.eq_ignore_ascii_case("ffmpeg.exe") {
+                "ffprobe.exe"
+            } else if name.eq_ignore_ascii_case("ffmpeg") {
+                "ffprobe"
+            } else {
+                return PathBuf::from("ffprobe");
+            };
+            ffmpeg.with_file_name(probe_name)
+        });
+    sibling
+        .filter(|path| path.components().count() > 1 && path.is_file())
+        .unwrap_or_else(|| PathBuf::from("ffprobe"))
+}
+
+async fn probe_media_streams(
+    config: &AppConfig,
+    ffprobe: &Path,
+    media: &BoundFile,
+) -> Option<(bool, bool)> {
+    #[cfg(unix)]
+    let (media_arg, inherited_fd_base) = {
+        let base = select_bilibili_mux_inherited_fd_base(1).ok()?;
+        (PathBuf::from(format!("/dev/fd/{base}")), Some(base))
+    };
+    #[cfg(not(unix))]
+    let (media_arg, inherited_fd_base) = return None;
+
+    let spec = CommandSpec {
+        program: ffprobe.to_path_buf(),
+        args: vec![
+            "-v".to_string(),
+            "error".to_string(),
+            "-show_entries".to_string(),
+            "stream=codec_type".to_string(),
+            "-of".to_string(),
+            "default=noprint_wrappers=1:nokey=1".to_string(),
+            media_arg.to_string_lossy().into_owned(),
+        ],
+        cwd: PathBuf::from("/"),
+        activity_dir: None,
+        cleanup_paths: Vec::new(),
+        inherited_fd_base,
+    };
+    media.validate_identity().ok()?;
+    let output = tokio_timeout(
+        Duration::from_secs(3),
+        run_command_with_inherited_files(config, &spec, std::slice::from_ref(media), None),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    media.validate_identity().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let streams = String::from_utf8_lossy(&output.stdout);
+    Some((
+        streams.lines().any(|stream| stream.trim() == "video"),
+        streams.lines().any(|stream| stream.trim() == "audio"),
+    ))
+}
+
+fn bilibili_exact_entry_metadata_paths(
+    index: &VideoIdentityIndex,
+    entry: &BilibiliDownloadEntry,
+) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    if entry.cid != 0 {
+        paths.extend(
+            index
+                .metadata_videos(&bilibili_collection_cid_identity(entry.cid))
+                .iter()
+                .cloned(),
+        );
+    }
+    if let Some(epid) = entry.epid.filter(|epid| *epid != 0) {
+        paths.extend(
+            index
+                .metadata_videos(&VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: format!("ep{epid}"),
+                })
+                .iter()
+                .cloned(),
+        );
+    }
+    paths.retain(|video| {
+        index.metadata_video_is_current(video)
+            && index
+                .metadata_sidecar_identities_by_video
+                .get(video)
+                .is_some_and(|sidecars| bilibili_sidecars_match_entry(sidecars, entry))
+    });
+    paths
+}
+
+fn bilibili_sidecars_match_entry(
+    sidecars: &[Vec<VideoIdentity>],
+    entry: &BilibiliDownloadEntry,
+) -> bool {
+    let identities = sidecars
+        .iter()
+        .flatten()
+        .filter(|identity| identity.provider == VideoProvider::Bilibili)
+        .collect::<Vec<_>>();
+    let cids = identities
+        .iter()
+        .map(|identity| identity.id.as_str())
+        .filter(|id| id.starts_with("cid"))
+        .collect::<Vec<_>>();
+    let epids = identities
+        .iter()
+        .map(|identity| identity.id.as_str())
+        .filter(|id| id.starts_with("ep"))
+        .collect::<Vec<_>>();
+    let expected_cid = format!("cid{}", entry.cid);
+    let expected_epid = entry.epid.map(|epid| format!("ep{epid}"));
+    let has_exact_identity = !cids.is_empty() || !epids.is_empty();
+    let cids_match =
+        cids.iter().all(|cid| *cid == expected_cid) && (cids.is_empty() || entry.cid != 0);
+    let epids_match = epids.iter().all(|epid| {
+        expected_epid
+            .as_deref()
+            .is_some_and(|expected| *epid == expected)
+    });
+    let expected_identity_matches = cids.contains(&expected_cid.as_str())
+        || expected_epid
+            .as_deref()
+            .is_some_and(|expected| epids.contains(&expected));
+
+    has_exact_identity && expected_identity_matches && cids_match && epids_match
+}
+
+const IDENTITY_METADATA_SIDECAR_READ_LIMIT: usize = 1024 * 1024;
+
+fn current_bilibili_sidecars_match_entry(
+    root: &RootedFs,
+    video: &Path,
+    entry: &BilibiliDownloadEntry,
+) -> bool {
+    current_bilibili_sidecars_for_entry(root, video, entry).is_some()
+}
+
+fn current_bilibili_sidecars_for_entry(
+    root: &RootedFs,
+    video: &Path,
+    entry: &BilibiliDownloadEntry,
+) -> Option<Vec<ExistingSidecarEvidence>> {
+    match validate_current_bilibili_sidecars(root, video, entry) {
+        Ok(CurrentBilibiliSidecarEvidence::Matches(sidecars)) => Some(sidecars),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CurrentBilibiliSidecarEvidence {
+    Matches(Vec<ExistingSidecarEvidence>),
+    Missing,
+    Mismatched,
+}
+
+fn validate_current_bilibili_sidecars(
+    root: &RootedFs,
+    video: &Path,
+    entry: &BilibiliDownloadEntry,
+) -> Result<CurrentBilibiliSidecarEvidence> {
+    let paths = existing_metadata_sidecar_paths(video)?;
+    if paths.is_empty() {
+        return Ok(CurrentBilibiliSidecarEvidence::Missing);
+    }
+    let mut sidecars = Vec::with_capacity(paths.len());
+    let mut sidecar_evidence = Vec::with_capacity(paths.len());
+    for path in paths {
+        let Some(file) = root.open_bound_file(&path).with_context(|| {
+            format!("failed to open current identity sidecar {}", path.display())
+        })?
+        else {
+            return Ok(CurrentBilibiliSidecarEvidence::Missing);
+        };
+        let identity = file.identity();
+        let contents = file
+            .read_limited(IDENTITY_METADATA_SIDECAR_READ_LIMIT)
+            .with_context(|| {
+                format!("failed to read current identity sidecar {}", path.display())
+            })?;
+        let contents = String::from_utf8(contents).with_context(|| {
+            format!("current identity sidecar is not UTF-8: {}", path.display())
+        })?;
+        let identities = metadata_sidecar_identities(&path, &contents).with_context(|| {
+            format!(
+                "failed to parse current identity sidecar {}",
+                path.display()
+            )
+        })?;
+        if !current_sidecar_path_matches_identity(root, &path, identity)? {
+            if root.open_bound_file(&path)?.is_none() {
+                return Ok(CurrentBilibiliSidecarEvidence::Missing);
+            }
+            return Ok(CurrentBilibiliSidecarEvidence::Mismatched);
+        }
+        sidecar_evidence.push(ExistingSidecarEvidence { path, identity });
+        sidecars.push(identities);
+    }
+    if bilibili_sidecars_match_entry(&sidecars, entry) {
+        Ok(CurrentBilibiliSidecarEvidence::Matches(sidecar_evidence))
+    } else {
+        Ok(CurrentBilibiliSidecarEvidence::Mismatched)
+    }
+}
+
+fn current_sidecar_path_matches_identity(
+    root: &RootedFs,
+    path: &Path,
+    expected: EntryIdentity,
+) -> Result<bool> {
+    let Some(current) = root.open_bound_file(path).with_context(|| {
+        format!(
+            "failed to recheck current identity sidecar {}",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(false);
+    };
+    Ok(current.identity() == expected)
+}
+
+struct BilibiliMissingSeasonPlan {
+    plan: bbdown_core::DownloadPlan,
+    resolved: ResolvedContent,
+    skipped: Vec<(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)>,
+    total_entries: usize,
+}
+
+fn bilibili_entry_from_episode_metadata(
+    episode: &bbdown_core::EpisodeMetadata,
+) -> BilibiliDownloadEntry {
+    BilibiliDownloadEntry {
+        index: episode.index,
+        aid: episode.aid,
+        bvid: None,
+        cid: episode.cid,
+        epid: Some(episode.epid),
+        title: episode.title.clone(),
+        uploader: None,
+        publish_date: None,
+    }
+}
+
+fn revalidate_missing_season_evidence_for_report(
+    root: &RootedFs,
+    skipped: &[(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)],
+) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    for (episode, evidence) in skipped {
+        revalidate_missing_episode_evidence(root, episode, evidence, "final report")?;
+        paths.insert(evidence.path.clone());
+    }
+    Ok(paths.into_iter().collect())
+}
+
+async fn revalidate_missing_season_evidence_bounded(
+    root: &RootedFs,
+    skipped: &[(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)],
+    phase: &'static str,
+) -> Result<Vec<PathBuf>> {
+    let permit = tokio_timeout(
+        Duration::from_secs(6),
+        bilibili_missing_validation_semaphore().acquire_owned(),
+    )
+    .await
+    .context("timed out waiting to validate skipped Bilibili media")??;
+    let root = root.clone();
+    let skipped = skipped.to_vec();
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .with_context(|| format!("failed to revalidate skipped Bilibili media during {phase}"))
+    });
+    tokio_timeout(Duration::from_secs(6), task)
+        .await
+        .context("timed out validating skipped Bilibili media")?
+        .context("skipped Bilibili media validation task failed to join")?
+}
+
+fn revalidate_missing_episode_evidence(
+    root: &RootedFs,
+    episode: &bbdown_core::EpisodeMetadata,
+    evidence: &ExistingEpisodeEvidence,
+    phase: &str,
+) -> Result<()> {
+    let current = root.open_bound_file(&evidence.path).with_context(|| {
+        format!(
+            "failed to read existing Bilibili media during {phase} validation: {}",
+            evidence.path.display()
+        )
+    })?;
+    let Some(current) = current else {
+        bail!(
+            "existing Bilibili media disappeared during {phase} validation: {}",
+            evidence.path.display()
+        );
+    };
+    if current.identity() != evidence.identity || !current.identity().is_file() {
+        bail!(
+            "existing Bilibili media identity changed during {phase} validation: {}",
+            evidence.path.display()
+        );
+    }
+    match validate_current_bilibili_sidecars(
+        root,
+        &evidence.path,
+        &bilibili_entry_from_episode_metadata(episode),
+    )
+    .with_context(|| {
+        format!(
+            "failed to read current Bilibili identity sidecar during {phase} validation for {}",
+            evidence.path.display()
+        )
+    })? {
+        CurrentBilibiliSidecarEvidence::Matches(sidecars) if sidecars == evidence.sidecars => {}
+        CurrentBilibiliSidecarEvidence::Matches(_) => bail!(
+            "Bilibili identity sidecar object changed during {phase} validation: {}",
+            evidence.path.display()
+        ),
+        CurrentBilibiliSidecarEvidence::Missing => bail!(
+            "Bilibili identity sidecar disappeared during {phase} validation: {}",
+            evidence.path.display()
+        ),
+        CurrentBilibiliSidecarEvidence::Mismatched => bail!(
+            "Bilibili identity sidecar changed during {phase} validation: {}",
+            evidence.path.display()
+        ),
+    };
+    let current_after_sidecars = root.open_bound_file(&evidence.path).with_context(|| {
+        format!(
+            "failed to recheck existing Bilibili media after sidecar validation during {phase}: {}",
+            evidence.path.display()
+        )
+    })?;
+    let Some(current_after_sidecars) = current_after_sidecars else {
+        bail!(
+            "existing Bilibili media disappeared during {phase} validation: {}",
+            evidence.path.display()
+        );
+    };
+    if current_after_sidecars.identity() != evidence.identity {
+        bail!(
+            "existing Bilibili media identity changed during {phase} validation: {}",
+            evidence.path.display()
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn plan_bilibili_missing_season(
+    config: &AppConfig,
+    client: &bbdown_core::BiliClient,
+    url: &str,
+    mode: DownloadMode,
+    ffprobe: &Path,
+    output_root: &Path,
+    timeout: Duration,
+    progress: impl Fn(usize, usize),
+) -> Result<BilibiliMissingSeasonPlan> {
+    if !bilibili_missing_skip_mode_supported(mode) {
+        bail!(
+            "persisted missing-episode selection is unsupported for the configured download mode; retry the season with a supported media mode"
+        );
+    }
+    let ffprobe = ffprobe.to_path_buf();
+    let probe_config = Arc::new(config.clone());
+    let output_root = output_root.to_path_buf();
+    let primary_media_kind = bilibili_primary_media_kind(mode);
+    let scan_permit = tokio_timeout(
+        Duration::from_secs(6),
+        bilibili_missing_validation_semaphore().acquire_owned(),
+    )
+    .await
+    .context("timed out waiting to scan existing Bilibili season media")??;
+    let scan_task = tokio::task::spawn_blocking(move || {
+        let _permit = scan_permit;
+        build_video_identity_index_in_dir(
+            &output_root,
+            primary_media_kind,
+            IdentityIndexReadPolicy::BestEffort,
+        )
+    });
+    let index = tokio_timeout(Duration::from_secs(6), scan_task)
+        .await
+        .context("timed out scanning existing Bilibili season media")?
+        .context("Bilibili existing season media scan task failed")??;
+    let index = Arc::new(index);
+    let filter_index = Arc::clone(&index);
+    let (plan, resolved, skipped) = bilibili_planning::plan_download_filtered(
+        client,
+        url,
+        Some(Selection::All),
+        mode,
+        timeout,
+        progress,
+        move |episode| {
+            let entry = bilibili_entry_from_episode_metadata(&episode);
+            let ffprobe = ffprobe.clone();
+            let index = Arc::clone(&filter_index);
+            let config = Arc::clone(&probe_config);
+            async move {
+                bilibili_plan_entry_compatible_existing_media(
+                    &config, index, &entry, mode, &ffprobe,
+                )
+                .await
+            }
+        },
+    )
+    .await?;
+    let ResolvedContent::Season(season) = &resolved else {
+        bail!("missing Bilibili episode download requires a season URL");
+    };
+    let total_entries = season.selected_episodes.len();
+    let root = index
+        .root
+        .as_ref()
+        .context("Bilibili output root became unavailable while validating skipped episodes")?;
+    revalidate_missing_season_evidence_bounded(root, &skipped, "planning")
+        .await
+        .context("retry the season so the updated plan can be reviewed")?;
+    Ok(BilibiliMissingSeasonPlan {
+        plan,
+        resolved,
+        skipped,
+        total_entries,
+    })
 }
 
 async fn scan_video_identity_index(
@@ -1849,6 +2904,7 @@ struct VideoIdentityIndex {
     videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
     overwrite_videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
     metadata_videos_by_identity: BTreeMap<VideoIdentity, Vec<PathBuf>>,
+    metadata_sidecar_identities_by_video: BTreeMap<PathBuf, Vec<Vec<VideoIdentity>>>,
     root: Option<RootedFs>,
     file_identities: BTreeMap<PathBuf, EntryIdentity>,
 }
@@ -1874,6 +2930,13 @@ impl VideoIdentityIndex {
         insert_identity_path(&mut self.metadata_videos_by_identity, identity, video);
     }
 
+    fn insert_metadata_sidecar_evidence(&mut self, video: &Path, identities: Vec<VideoIdentity>) {
+        self.metadata_sidecar_identities_by_video
+            .entry(video.to_path_buf())
+            .or_default()
+            .push(identities);
+    }
+
     fn videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
         identity_paths(&self.videos_by_identity, identity)
     }
@@ -1884,6 +2947,29 @@ impl VideoIdentityIndex {
 
     fn metadata_videos(&self, identity: &VideoIdentity) -> &[PathBuf] {
         identity_paths(&self.metadata_videos_by_identity, identity)
+    }
+
+    fn metadata_video_is_current(&self, video: &Path) -> bool {
+        let Some(root) = self.root.as_ref() else {
+            return false;
+        };
+        let Some(expected) = self.file_identities.get(video) else {
+            return false;
+        };
+        // Protect media object identity (device/inode/type), rather than
+        // timestamps changed by ordinary File Provider materialization.
+        match root.open_bound_file(video) {
+            Ok(Some(file)) => file.identity() == *expected && file.identity().is_file(),
+            Ok(None) => false,
+            Err(error) => {
+                info!(
+                    path = %video.display(),
+                    error = %redact_sensitive_text(&format!("{error:#}")),
+                    "existing episode revalidation failed; planning it instead of skipping"
+                );
+                false
+            }
+        }
     }
 
     fn overwrite_confirmation(&self, video: &Path) -> Option<VideoOverwriteConfirmation> {
@@ -1983,6 +3069,7 @@ fn find_video_duplicate_in_index(
             overwrite_confirmation,
             identity,
             existing_videos,
+            skip_summary: None,
         });
     }
 
@@ -2009,6 +3096,7 @@ fn find_video_duplicate_in_index(
             overwrite_confirmation,
             identity,
             existing_videos,
+            skip_summary: None,
         }
     })
 }
@@ -2044,6 +3132,7 @@ async fn run_simple_job(
         saved_location,
         details: tail_lines(&stderr, 6),
         primary_media_paths: vec![primary_media_path],
+        existing_bilibili_evidence: None,
     })
 }
 
@@ -2053,6 +3142,7 @@ async fn run_staged_bilibili_worker(
     url: &str,
     selection: Option<BilibiliSelection>,
     expected_overwrite_identity: Option<&VideoIdentity>,
+    expected_plan: Option<&PlanValidationSnapshot>,
     progress: Option<JobProgressSender>,
 ) -> Result<BilibiliWorkerOutcome> {
     let request = build_bilibili_worker_request(
@@ -2060,7 +3150,10 @@ async fn run_staged_bilibili_worker(
         roots.final_output_root.root_path(),
         url,
         selection,
-        expected_overwrite_identity,
+        BilibiliWorkerRequestExpectations {
+            overwrite_identity: expected_overwrite_identity.cloned(),
+            plan: expected_plan.cloned(),
+        },
         roots.staging,
         roots.output_lock,
     );
@@ -2109,7 +3202,19 @@ async fn run_staged_bilibili_worker(
         );
     }
     let response = last_nonempty_line(&stdout).context("Bilibili worker returned no report")?;
-    parse_bilibili_worker_response(response)
+    let outcome = parse_bilibili_worker_response(response)?;
+    if matches!(selection, Some(BilibiliSelection::Missing)) {
+        let report = match &outcome {
+            BilibiliWorkerOutcome::Completed(report)
+            | BilibiliWorkerOutcome::AlreadyComplete(report) => report,
+        };
+        if report.existing_bilibili_evidence.is_none() {
+            bail!(
+                "Bilibili worker response omitted required missing-season evidence; retry the queued job"
+            );
+        }
+    }
+    Ok(outcome)
 }
 
 fn parse_bilibili_worker_response(response: &str) -> Result<BilibiliWorkerOutcome> {
@@ -2186,7 +3291,7 @@ fn build_bilibili_worker_request(
     final_video_dir: &Path,
     url: &str,
     selection: Option<BilibiliSelection>,
-    expected_overwrite_identity: Option<&VideoIdentity>,
+    expectations: BilibiliWorkerRequestExpectations,
     staging: &BoundStagingDir,
     output_lock: &BoundFile,
 ) -> BilibiliWorkerRequest {
@@ -2202,7 +3307,8 @@ fn build_bilibili_worker_request(
         final_video_dir: final_video_dir.to_path_buf(),
         url: url.to_string(),
         selection,
-        expected_overwrite_identity: expected_overwrite_identity.cloned(),
+        expected_overwrite_identity: expectations.overwrite_identity,
+        expected_plan: expectations.plan,
         logical_output_dir: staging.path().to_path_buf(),
         output_root_device: staging.root.root_identity().device(),
         output_root_inode: staging.root.root_identity().inode(),
@@ -2538,6 +3644,7 @@ impl BilibiliUgcCollectionDownload {
                 self.title, self.total_entries, self.skipped_entries
             ),
             primary_media_paths: self.existing_media_paths.clone(),
+            existing_bilibili_evidence: None,
         }
     }
 }
@@ -3002,6 +4109,14 @@ async fn run_bilibili_job_locked(
         .map(BilibiliUgcCollectionDownload::missing_selection)
         .transpose()?
         .or_else(|| bilibili_core::selection(selection));
+    let missing_selection = matches!(selection, Some(BilibiliSelection::Missing));
+    if missing_selection && worker_context.request.expected_plan.is_none() {
+        bail!(
+            "missing-episode job has no persisted plan snapshot; retry the queued job to generate and review a plan before downloading"
+        );
+    }
+    let mut missing_season_skip_evidence = Vec::new();
+    let mut missing_season_summary = None;
     let (core_plan, resolved_metadata): (
         bbdown_core::DownloadPlan,
         Result<Option<ResolvedContent>>,
@@ -3018,6 +4133,72 @@ async fn run_bilibili_job_locked(
             .write_nfo
             .then(|| ResolvedContent::Collection(collection.resolution.clone()));
         (core_plan, Ok(metadata))
+    } else if missing_selection {
+        send_progress(
+            progress.as_ref(),
+            "BBDown-rust: re-resolving selected season for missing episodes".to_string(),
+        );
+        let missing = plan_bilibili_missing_season(
+            config,
+            &client,
+            url,
+            options.mode,
+            &ffprobe_program(&config.tools.ffmpeg),
+            worker_context.final_output_root.logical_root_path(),
+            BILIBILI_METADATA_PROBE_TIMEOUT,
+            |done, total| {
+                send_progress(
+                    progress.as_ref(),
+                    format!(
+                        "BBDown-rust: planned missing episodes {done}/{total} (up to 2 at a time)"
+                    ),
+                );
+            },
+        )
+        .await?;
+        if let Some(expected) = worker_context.request.expected_plan.as_ref() {
+            let current = bilibili_plan_validation_snapshot(&missing.plan, &options);
+            validate_missing_plan_snapshot(expected, &current)?;
+        }
+        let total_entries = missing.total_entries;
+        let skipped_entries = missing.skipped.len();
+        missing_season_summary = Some((total_entries, skipped_entries));
+        send_progress(
+            progress.as_ref(),
+            format!(
+                "Season sync: {total_entries} total; {skipped_entries} already present; {} queued",
+                total_entries.saturating_sub(skipped_entries)
+            ),
+        );
+        if missing.plan.entries.is_empty() {
+            let existing_media_paths = revalidate_missing_season_evidence_bounded(
+                worker_context.final_output_root,
+                &missing.skipped,
+                "all-existing completion",
+            )
+            .await?;
+            let ResolvedContent::Season(season) = &missing.resolved else {
+                bail!("missing Bilibili episode download requires a season URL");
+            };
+            return Ok(BilibiliJobOutcome::AlreadyComplete(JobReport {
+                saved_location: if existing_media_paths.len() == 1 {
+                    existing_media_paths[0].display().to_string()
+                } else {
+                    join_paths(&existing_media_paths)
+                },
+                details: format!(
+                    "Bilibili season already complete: {} ({total_entries} total, {skipped_entries} already present)",
+                    season.season.title
+                ),
+                primary_media_paths: existing_media_paths,
+                existing_bilibili_evidence: Some(bilibili_report_evidence_from_skipped(
+                    &missing.skipped,
+                )),
+            }));
+        }
+        missing_season_skip_evidence = missing.skipped;
+        let metadata = config.video.write_nfo.then_some(missing.resolved);
+        (missing.plan, Ok(metadata))
     } else {
         send_progress(
             progress.as_ref(),
@@ -3139,6 +4320,12 @@ async fn run_bilibili_job_locked(
     if let Some(collection) = collection_download.as_ref() {
         details.push(collection.details_summary(report.entries.len()));
     }
+    if let Some((total_entries, skipped_entries)) = missing_season_summary {
+        details.push(format!(
+            "Season sync: {total_entries} total; {skipped_entries} already present; {} downloaded",
+            report.entries.len()
+        ));
+    }
     if !report.title.trim().is_empty() {
         details.push(format!("Title: {}", report.title));
     }
@@ -3170,6 +4357,17 @@ async fn run_bilibili_job_locked(
                 .map(|path| rebase_download_path(path, &output_dir, reported_output_dir)),
         );
     }
+    let missing_existing_media_paths = revalidate_missing_season_evidence_bounded(
+        worker_context.final_output_root,
+        &missing_season_skip_evidence,
+        "download completion",
+    )
+    .await?;
+    reported_primary_videos.extend(
+        missing_existing_media_paths
+            .iter()
+            .map(|path| rebase_download_path(path, &output_dir, reported_output_dir)),
+    );
     let reported_primary_videos = reported_primary_videos.into_iter().collect::<Vec<_>>();
     let fallback_output = rebase_download_path(
         &resolve_command_output_path(&output_dir, &report.output_dir),
@@ -3187,6 +4385,8 @@ async fn run_bilibili_job_locked(
         },
         details: nonempty_join(details),
         primary_media_paths: reported_primary_videos,
+        existing_bilibili_evidence: missing_selection
+            .then(|| bilibili_report_evidence_from_skipped(&missing_season_skip_evidence)),
     }))
 }
 
@@ -6174,6 +7374,7 @@ async fn run_youtube_job_locked(
         saved_location,
         details: nonempty_join(vec![subtitle_plan.describe(), tail_lines(&stderr, 6)]),
         primary_media_paths: vec![primary_media_path],
+        existing_bilibili_evidence: None,
     })
 }
 
@@ -6182,6 +7383,7 @@ async fn run_staged_video_job(
     job: &JobRequest,
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
+    expected_plan: Option<PlanValidationSnapshot>,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let guard = video_output_lock(
@@ -6233,6 +7435,7 @@ async fn run_staged_video_job(
                 url,
                 *selection,
                 expected_identity,
+                expected_plan.as_ref(),
                 progress.clone(),
             )
             .await
@@ -6276,6 +7479,19 @@ async fn run_staged_video_job(
                             );
                         }
                     };
+                    if matches!(
+                        job,
+                        JobRequest::Bilibili {
+                            selection: Some(BilibiliSelection::Missing),
+                            ..
+                        }
+                    ) {
+                        normalize_existing_bilibili_report_evidence(&root, &mut report)
+                            .context("failed to normalize skipped Bilibili output paths")?;
+                        validate_existing_bilibili_report_for_completion(config, &report)
+                            .await
+                            .context("skipped Bilibili media changed during parent publication")?;
+                    }
                     if let Err(err) = staging.discard_incomplete() {
                         return Err(err.context(
                             "Bilibili collection was already complete but its empty staging directory could not be discarded",
@@ -6458,6 +7674,19 @@ async fn run_staged_video_job(
         &report.primary_media_paths,
         primary_media_kind,
     )?;
+    if matches!(
+        job,
+        JobRequest::Bilibili {
+            selection: Some(BilibiliSelection::Missing),
+            ..
+        }
+    ) {
+        normalize_existing_bilibili_report_evidence(&root, &mut report)
+            .context("failed to normalize skipped Bilibili output paths")?;
+        validate_existing_bilibili_report_for_completion(config, &report)
+            .await
+            .context("skipped Bilibili media changed during parent publication")?;
+    }
 
     let saved_location = if moved_files.len() == 1 {
         moved_files[0].display().to_string()
@@ -6479,6 +7708,7 @@ async fn run_staged_video_job(
         saved_location,
         details,
         primary_media_paths,
+        existing_bilibili_evidence: report.existing_bilibili_evidence,
     };
     staging
         .finish()
@@ -6690,10 +7920,18 @@ fn staged_primary_media_kind(
     job: &JobRequest,
 ) -> Result<StagedPrimaryMediaKind> {
     match job {
-        JobRequest::Bilibili { .. } if bilibili_downloads_audio_only(config)? => {
-            Ok(StagedPrimaryMediaKind::VideoOrAudio)
-        }
+        JobRequest::Bilibili { .. } => Ok(bilibili_primary_media_kind(
+            bilibili_core::download_mode_from_config(config)?,
+        )),
         _ => Ok(StagedPrimaryMediaKind::Video),
+    }
+}
+
+fn bilibili_primary_media_kind(mode: DownloadMode) -> StagedPrimaryMediaKind {
+    if matches!(mode, DownloadMode::AudioOnly) {
+        StagedPrimaryMediaKind::VideoOrAudio
+    } else {
+        StagedPrimaryMediaKind::Video
     }
 }
 
@@ -7262,11 +8500,23 @@ async fn probe_bilibili_duplicate_metadata(
     url: &str,
     selection: Option<BilibiliSelection>,
     timeout: Duration,
-) -> Result<BilibiliDownloadPlan> {
+) -> Result<BilibiliDuplicateMetadataProbe> {
     sync_bilibili_rust_credentials(config).await?;
     let client = bilibili_core::client(config)?;
     let metadata = probe_bilibili_resolved_content(&client, url, selection, timeout).await?;
-    Ok(bilibili_metadata_identity_plan(&metadata))
+    let season_total = match &metadata {
+        ResolvedContent::Season(season) => Some(season.selected_episodes.len()),
+        _ => None,
+    };
+    Ok(BilibiliDuplicateMetadataProbe {
+        plan: bilibili_metadata_identity_plan(&metadata),
+        season_total,
+    })
+}
+
+struct BilibiliDuplicateMetadataProbe {
+    plan: BilibiliDownloadPlan,
+    season_total: Option<usize>,
 }
 
 fn bilibili_metadata_identity_plan(metadata: &ResolvedContent) -> BilibiliDownloadPlan {
@@ -8608,12 +9858,23 @@ async fn run_command_with_execution_context_and_additional_fds(
         .ok_or_else(|| anyhow!("failed to capture {} stderr", spec.program.display()))?;
 
     let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+    let capture_limit = spec
+        .args
+        .iter()
+        .any(|arg| arg == "stream=codec_type")
+        .then_some(MAX_FFPROBE_CAPTURE_BYTES);
     let stdout_handle = tokio::spawn(read_command_stream(
         stdout,
         CommandStream::Stdout,
         chunk_tx.clone(),
+        capture_limit,
     ));
-    let stderr_handle = tokio::spawn(read_command_stream(stderr, CommandStream::Stderr, chunk_tx));
+    let stderr_handle = tokio::spawn(read_command_stream(
+        stderr,
+        CommandStream::Stderr,
+        chunk_tx,
+        capture_limit,
+    ));
 
     let total_timeout = Duration::from_secs(config.bot.command_timeout_seconds);
     let idle_timeout = Duration::from_secs(config.bot.command_idle_timeout_seconds);
@@ -9256,22 +10517,39 @@ async fn read_command_stream<R>(
     mut reader: R,
     stream: CommandStream,
     progress: mpsc::UnboundedSender<CommandChunk>,
+    capture_limit: Option<usize>,
 ) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
     let mut output = Vec::new();
     let mut buffer = [0_u8; 8192];
+    let mut exceeded_limit = false;
     loop {
         let size = reader.read(&mut buffer).await?;
         if size == 0 {
             break;
         }
         let bytes = buffer[..size].to_vec();
-        output.extend_from_slice(&bytes);
+        if let Some(limit) = capture_limit {
+            if output.len().saturating_add(size) > limit {
+                exceeded_limit = true;
+            } else if !exceeded_limit {
+                output.extend_from_slice(&bytes);
+            }
+        } else {
+            output.extend_from_slice(&bytes);
+        }
         let _ = progress.send(CommandChunk { stream, bytes });
     }
-    Ok(output)
+    if exceeded_limit {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "command output exceeded the bounded capture limit",
+        ))
+    } else {
+        Ok(output)
+    }
 }
 
 async fn collect_stream_outputs(
@@ -10325,6 +11603,7 @@ fn index_metadata_sidecar(
             });
         }
     };
+    index.insert_metadata_sidecar_evidence(video, identities.clone());
     for identity in identities {
         index.insert_metadata_evidence(identity, video);
     }
@@ -10397,9 +11676,6 @@ fn identity_metadata_kind(path: &Path) -> Option<IdentityMetadataKind> {
 }
 
 fn info_json_identities(metadata: &serde_json::Value) -> Vec<VideoIdentity> {
-    let Some(id) = json_string_field(metadata, "id").filter(|id| !id.trim().is_empty()) else {
-        return Vec::new();
-    };
     let mut providers = BTreeSet::new();
     for value in ["extractor", "extractor_key", "ie_key"]
         .into_iter()
@@ -10415,13 +11691,46 @@ fn info_json_identities(metadata: &serde_json::Value) -> Vec<VideoIdentity> {
     if let Some(provider) = json_string_field(metadata, "webpage_url").and_then(provider_from_url) {
         providers.insert(provider);
     }
-    providers
+    let mut identities = json_string_field(metadata, "webpage_url")
+        .and_then(provider_from_url)
+        .filter(|provider| *provider == VideoProvider::Bilibili)
         .into_iter()
-        .map(|provider| VideoIdentity {
-            provider,
-            id: id.to_string(),
+        .chain(providers.iter().copied())
+        .map(|provider| {
+            let id = json_string_field(metadata, "id")
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_default();
+            VideoIdentity {
+                provider,
+                id: id.to_string(),
+            }
         })
-        .collect()
+        .filter(|identity| !identity.id.is_empty())
+        .collect::<Vec<_>>();
+    let bilibili = providers.contains(&VideoProvider::Bilibili)
+        || json_string_field(metadata, "webpage_url").and_then(provider_from_url)
+            == Some(VideoProvider::Bilibili);
+    if bilibili {
+        for (field, prefix) in [("cid", "cid"), ("epid", "ep")] {
+            if let Some(value) = json_u64_field(metadata, field).filter(|value| *value != 0) {
+                push_unique_video_identity(
+                    &mut identities,
+                    VideoIdentity {
+                        provider: VideoProvider::Bilibili,
+                        id: format!("{prefix}{value}"),
+                    },
+                );
+            }
+        }
+    }
+    identities
+}
+
+fn json_u64_field(metadata: &serde_json::Value, key: &str) -> Option<u64> {
+    metadata
+        .get(key)?
+        .as_u64()
+        .or_else(|| metadata.get(key)?.as_str()?.trim().parse::<u64>().ok())
 }
 
 fn json_string_field<'a>(metadata: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -10545,7 +11854,7 @@ fn existing_metadata_sidecar_paths(video: &Path) -> Result<Vec<PathBuf>> {
     }
 
     let prefix = format!("{stem}.");
-    Ok(entries
+    let mut sidecars = entries
         .into_iter()
         .filter(|path| {
             identity_metadata_kind(path).is_some()
@@ -10555,7 +11864,9 @@ fn existing_metadata_sidecar_paths(video: &Path) -> Result<Vec<PathBuf>> {
                     .is_some_and(|name| name.starts_with(&prefix))
                 && best_primary_stem_for_sidecar(path, &primary_stems).as_deref() == Some(stem)
         })
-        .collect())
+        .collect::<Vec<_>>();
+    sidecars.sort();
+    Ok(sidecars)
 }
 
 #[derive(Debug, Default)]
@@ -15520,6 +16831,7 @@ mod tests {
         write_bilibili_identity_nfo(&existing, "cid123");
         let root = RootedFs::new(&final_dir).expect("output root should bind");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -16247,6 +17559,1237 @@ mod tests {
     }
 
     #[test]
+    fn season_skip_matches_exact_episode_metadata_and_rejects_conflicts() {
+        let video_dir = temp_test_dir("bilibili-season-skip-exact-metadata");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        let video = video_dir.join("episode.mkv");
+        fs::write(&video, "video").expect("video should write");
+        let sidecar = video.with_extension("nfo");
+        fs::write(
+            &sidecar,
+            r#"<movie><uniqueid type="bilibili-cid">cid403</uniqueid><uniqueid type="bilibili-epid">ep503</uniqueid></movie>"#,
+        )
+        .expect("exact identity sidecar should write");
+        let expected = BilibiliDownloadEntry {
+            index: 203,
+            aid: 999,
+            cid: 403,
+            epid: Some(503),
+            title: "Episode 203".to_string(),
+            ..Default::default()
+        };
+        let index = build_video_identity_index_in_dir(
+            &video_dir,
+            StagedPrimaryMediaKind::Video,
+            IdentityIndexReadPolicy::BestEffort,
+        )
+        .expect("media identity index should build");
+        assert!(bilibili_plan_entry_has_exact_existing_metadata(
+            &index, &expected
+        ));
+        let duplicate_entries = (1..=203)
+            .filter(|episode_index| {
+                bilibili_plan_entry_has_exact_existing_metadata(
+                    &index,
+                    &BilibiliDownloadEntry {
+                        index: *episode_index,
+                        aid: u64::from(*episode_index) + 100,
+                        cid: u64::from(*episode_index) + 200,
+                        epid: Some(u64::from(*episode_index) + 300),
+                        title: format!("Episode {episode_index}"),
+                        ..Default::default()
+                    },
+                )
+            })
+            .count();
+        assert_eq!(duplicate_entries, 1);
+
+        let other_cid = BilibiliDownloadEntry {
+            cid: 404,
+            ..expected.clone()
+        };
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index, &other_cid
+        ));
+        let coarse_bv = BilibiliDownloadEntry {
+            cid: 0,
+            epid: None,
+            ..expected
+        };
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index, &coarse_bv
+        ));
+        // The index caches candidate paths, but a changed sidecar's current contents control
+        // the skip decision.
+        let replacement_sidecar = video_dir.join("replacement.nfo");
+        fs::write(
+            &replacement_sidecar,
+            r#"<movie><uniqueid type="bilibili-cid">cid404</uniqueid><uniqueid type="bilibili-epid">ep503</uniqueid></movie>"#,
+        )
+        .expect("conflicting replacement sidecar should write");
+        fs::rename(&replacement_sidecar, &sidecar)
+            .expect("conflicting sidecar should replace its original path");
+        let conflicting_expected = BilibiliDownloadEntry {
+            cid: 403,
+            epid: Some(503),
+            ..coarse_bv
+        };
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index,
+            &conflicting_expected
+        ));
+        // Directory entry churn does not replace the selected media object or its identity proof.
+        fs::write(
+            &sidecar,
+            r#"<movie><uniqueid type="bilibili-cid">cid403</uniqueid><uniqueid type="bilibili-epid">ep503</uniqueid></movie>"#,
+        )
+        .expect("matching sidecar should restore");
+        fs::write(
+            video.with_extension("info.json"),
+            serde_json::json!({"extractor": "bilibili", "cid": 404, "epid": 503}).to_string(),
+        )
+        .expect("new contradictory sidecar should write");
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index,
+            &conflicting_expected
+        ));
+        fs::write(
+            video.with_extension("info.json"),
+            serde_json::json!({"extractor": "bilibili", "id": "BV123"}).to_string(),
+        )
+        .expect("coarse sidecar should write");
+        fs::create_dir(video_dir.join("unrelated-entry")).unwrap();
+        assert!(bilibili_plan_entry_has_exact_existing_metadata(
+            &index,
+            &conflicting_expected
+        ));
+        // Preserve the old inode while replacing its path with a new object.
+        fs::rename(&video, video_dir.join("retained-original")).unwrap();
+        fs::write(&video, b"replacement").unwrap();
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index,
+            &conflicting_expected
+        ));
+        fs::remove_file(&video).unwrap();
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index,
+            &conflicting_expected
+        ));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn season_skip_checks_all_sidecars_for_conflicting_episode_ids() {
+        let video_dir = temp_test_dir("bilibili-season-skip-sidecar-consistency");
+        fs::create_dir_all(&video_dir).expect("video dir should create");
+        let video = video_dir.join("episode.mkv");
+        fs::write(&video, "video").expect("video should write");
+        let nfo = r#"<movie>
+            <uniqueid type="bilibili-cid">cid403</uniqueid>
+            <uniqueid type="bilibili-epid">ep503</uniqueid>
+        </movie>"#;
+        fs::write(video.with_extension("nfo"), nfo).expect("nfo should write");
+        let entry = BilibiliDownloadEntry {
+            index: 203,
+            aid: 999,
+            cid: 403,
+            epid: Some(503),
+            title: "Episode 203".to_string(),
+            ..Default::default()
+        };
+        let index = || {
+            build_video_identity_index_in_dir(
+                &video_dir,
+                StagedPrimaryMediaKind::Video,
+                IdentityIndexReadPolicy::BestEffort,
+            )
+            .expect("media identity index should build")
+        };
+
+        fs::write(
+            video.with_extension("info.json"),
+            serde_json::json!({
+                "id": "BV123",
+                "extractor": "bilibili",
+                "webpage_url": "https://www.bilibili.com/video/BV123",
+                "cid": 403,
+                "epid": 503,
+            })
+            .to_string(),
+        )
+        .expect("consistent info json should write");
+        assert!(bilibili_plan_entry_has_exact_existing_metadata(
+            &index(),
+            &entry
+        ));
+
+        fs::write(
+            video.with_extension("info.json"),
+            serde_json::json!({
+                "id": "BV123",
+                "extractor": "bilibili",
+                "webpage_url": "https://www.bilibili.com/video/BV123",
+                "cid": 404,
+                "epid": 503,
+            })
+            .to_string(),
+        )
+        .expect("conflicting info json should write");
+        assert!(!bilibili_plan_entry_has_exact_existing_metadata(
+            &index(),
+            &entry
+        ));
+
+        fs::write(
+            video.with_extension("info.json"),
+            serde_json::json!({
+                "id": "BV123",
+                "extractor": "bilibili",
+                "webpage_url": "https://www.bilibili.com/video/BV123",
+            })
+            .to_string(),
+        )
+        .expect("coarse info json should write");
+        assert!(bilibili_plan_entry_has_exact_existing_metadata(
+            &index(),
+            &entry
+        ));
+        let _ = fs::remove_dir_all(video_dir);
+    }
+
+    #[test]
+    fn missing_season_mode_requires_proven_stream_completeness() {
+        assert!(media_satisfies_download_mode(DownloadMode::All, true, true));
+        assert!(!media_satisfies_download_mode(
+            DownloadMode::All,
+            true,
+            false
+        ));
+        assert!(!media_satisfies_download_mode(
+            DownloadMode::All,
+            false,
+            true
+        ));
+        assert!(media_satisfies_download_mode(
+            DownloadMode::VideoOnly,
+            true,
+            false
+        ));
+        assert!(!media_satisfies_download_mode(
+            DownloadMode::VideoOnly,
+            false,
+            true
+        ));
+        assert!(media_satisfies_download_mode(
+            DownloadMode::AudioOnly,
+            false,
+            true
+        ));
+        assert!(!media_satisfies_download_mode(
+            DownloadMode::AudioOnly,
+            true,
+            false
+        ));
+        for mode in [
+            DownloadMode::SubtitleOnly,
+            DownloadMode::DanmakuOnly,
+            DownloadMode::CoverOnly,
+        ] {
+            assert!(!bilibili_missing_skip_mode_supported(mode));
+            assert!(!media_satisfies_download_mode(mode, true, true));
+        }
+    }
+
+    #[test]
+    fn missing_season_final_report_revalidates_media_sidecars_and_allows_directory_churn() {
+        let output = temp_test_dir("missing-season-final-evidence");
+        fs::create_dir_all(&output).expect("output directory should create");
+        let root = RootedFs::new(&output).expect("output root should bind");
+        let media_path = output.join("Episode.mp4");
+        let sidecar_path = media_path.with_extension("nfo");
+        fs::write(&media_path, b"existing media").expect("media should write");
+        let matching_sidecar = r#"<movie><uniqueid type="bilibili-cid">cid123</uniqueid><uniqueid type="bilibili-epid">ep456</uniqueid></movie>"#;
+        fs::write(&sidecar_path, matching_sidecar).expect("sidecar should write");
+        let media = root
+            .open_bound_file(&media_path)
+            .unwrap()
+            .expect("media should bind");
+        let sidecar = root
+            .open_bound_file(&sidecar_path)
+            .unwrap()
+            .expect("sidecar should bind");
+        let episode = bbdown_core::EpisodeMetadata {
+            index: 1,
+            aid: 789,
+            bvid: None,
+            cid: 123,
+            epid: 456,
+            title: "Episode one".to_string(),
+            long_title: None,
+            pub_time: None,
+        };
+        let skipped = vec![(
+            episode,
+            ExistingEpisodeEvidence {
+                path: media_path.clone(),
+                identity: media.identity(),
+                sidecars: vec![ExistingSidecarEvidence {
+                    path: sidecar_path.clone(),
+                    identity: sidecar.identity(),
+                }],
+                content_stamp: MediaContentStamp::from_bound_file(&media)
+                    .expect("media content stamp should read"),
+            },
+        )];
+
+        assert_eq!(
+            revalidate_missing_season_evidence_for_report(&root, &skipped)
+                .expect("unchanged media should remain reportable"),
+            vec![media_path.clone()]
+        );
+        fs::write(output.join("unrelated-directory-churn.txt"), b"new sibling")
+            .expect("benign directory churn should write");
+        assert!(revalidate_missing_season_evidence_for_report(&root, &skipped).is_ok());
+
+        fs::remove_file(&sidecar_path).expect("sidecar should remove");
+        let missing_sidecar = revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .expect_err("a missing identity sidecar must invalidate the report");
+        assert!(format!("{missing_sidecar:#}").contains("sidecar disappeared"));
+        fs::create_dir(&sidecar_path).expect("invalid sidecar object should create");
+        let unreadable_sidecar = revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .expect_err("an unreadable identity sidecar must remain distinct from missing");
+        assert!(
+            format!("{unreadable_sidecar:#}")
+                .contains("failed to read current Bilibili identity sidecar")
+        );
+        fs::remove_dir(&sidecar_path).expect("invalid sidecar object should remove");
+        fs::write(&sidecar_path, matching_sidecar.replace("cid123", "cid999"))
+            .expect("conflicting sidecar should write");
+        let changed_sidecar = revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .expect_err("a changed identity sidecar must invalidate the report");
+        assert!(format!("{changed_sidecar:#}").contains("sidecar changed"));
+
+        let moved_original = output.join("Episode.original.mp4");
+        fs::rename(&media_path, &moved_original).expect("original media should remain allocated");
+        fs::write(&media_path, b"replacement media").expect("replacement media should write");
+        let replaced_media = revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .expect_err("a replacement media object must invalidate the report");
+        assert!(format!("{replaced_media:#}").contains("media identity changed"));
+
+        fs::remove_file(&media_path).expect("replacement should remove");
+        let missing_media = revalidate_missing_season_evidence_for_report(&root, &skipped)
+            .expect_err("a missing media object must remain distinct from replacement");
+        assert!(format!("{missing_media:#}").contains("media disappeared"));
+
+        let _ = fs::remove_dir_all(output);
+    }
+
+    #[test]
+    fn bilibili_sidecar_revalidation_rejects_path_replacement_after_open() {
+        let output = temp_test_dir("bilibili-sidecar-path-replacement");
+        fs::create_dir_all(&output).expect("output root should create");
+        let root = RootedFs::new(&output).expect("output root should bind");
+        let sidecar = output.join("Episode.nfo");
+        fs::write(&sidecar, b"original sidecar").expect("original sidecar should write");
+        let media_path = output.join("Episode.mp4");
+        fs::write(&media_path, b"existing media").expect("media should write");
+        let media = root
+            .open_bound_file(&media_path)
+            .expect("media should open")
+            .expect("media should exist");
+        fs::write(
+            &sidecar,
+            r#"<movie><uniqueid type="bilibili-cid">cid123</uniqueid><uniqueid type="bilibili-epid">ep456</uniqueid></movie>"#,
+        )
+        .expect("valid Bilibili sidecar should write");
+        let original = root
+            .open_bound_file(&sidecar)
+            .expect("valid sidecar should open")
+            .expect("valid sidecar should exist");
+        let report = JobReport {
+            saved_location: media_path.display().to_string(),
+            details: String::new(),
+            primary_media_paths: vec![media_path.clone()],
+            existing_bilibili_evidence: Some(ExistingBilibiliReportEvidence {
+                skipped: vec![ExistingBilibiliMediaEvidence {
+                    path: media_path.clone(),
+                    device: media.identity().device(),
+                    inode: media.identity().inode(),
+                    sidecars: vec![ExistingBilibiliSidecarEvidence {
+                        path: sidecar.clone(),
+                        device: original.identity().device(),
+                        inode: original.identity().inode(),
+                    }],
+                    cid: 123,
+                    epid: 456,
+                    content_stamp: MediaContentStamp::from_bound_file(&media)
+                        .expect("media content stamp should read"),
+                }],
+            }),
+        };
+        validate_existing_bilibili_report_evidence_identity(&root, &report)
+            .expect("unchanged report evidence should validate");
+        let moved = output.join("Episode.original.nfo");
+        fs::rename(&sidecar, &moved).expect("original sidecar should remain allocated");
+        fs::write(
+            &sidecar,
+            r#"<movie><uniqueid type="bilibili-cid">cid123</uniqueid><uniqueid type="bilibili-epid">ep456</uniqueid></movie>"#,
+        )
+        .expect("replacement should write");
+
+        assert!(
+            !current_sidecar_path_matches_identity(&root, &sidecar, original.identity())
+                .expect("path identity revalidation should succeed"),
+            "pathname should no longer resolve to the descriptor read earlier"
+        );
+        fs::write(output.join("unrelated.txt"), b"benign directory churn")
+            .expect("directory entry churn should be harmless");
+        assert!(
+            !current_sidecar_path_matches_identity(&root, &sidecar, original.identity())
+                .expect("directory churn should not alter the selected sidecar identity")
+        );
+        let report_error = validate_existing_bilibili_report_evidence_identity(&root, &report)
+            .expect_err("report validation must reject a replaced matching sidecar");
+        assert!(format!("{report_error:#}").contains("sidecar object changed"));
+        let _ = fs::remove_dir_all(output);
+    }
+
+    #[test]
+    fn bilibili_missing_evidence_survives_worker_ipc_and_rejects_parent_replacements() {
+        let output = temp_test_dir("bilibili-missing-ipc-evidence");
+        fs::create_dir_all(&output).expect("output root should create");
+        let root = RootedFs::new(&output).expect("output root should bind");
+        let media = output.join("Episode.mp4");
+        let sidecar = output.join("Episode.nfo");
+        fs::write(&media, b"existing media").expect("media should write");
+        let sidecar_contents = r#"<movie><uniqueid type="bilibili-cid">cid123</uniqueid><uniqueid type="bilibili-epid">ep456</uniqueid></movie>"#;
+        fs::write(&sidecar, sidecar_contents).expect("sidecar should write");
+        let bound_media = root
+            .open_bound_file(&media)
+            .expect("media should open")
+            .expect("media should exist");
+        let bound_sidecar = root
+            .open_bound_file(&sidecar)
+            .expect("sidecar should open")
+            .expect("sidecar should exist");
+        let episode = bbdown_core::EpisodeMetadata {
+            index: 1,
+            aid: 789,
+            bvid: None,
+            cid: 123,
+            epid: 456,
+            title: "Episode one".to_string(),
+            long_title: None,
+            pub_time: None,
+        };
+        let report = JobReport {
+            saved_location: media.display().to_string(),
+            details: "one episode skipped".to_string(),
+            primary_media_paths: vec![media.clone()],
+            existing_bilibili_evidence: Some(bilibili_report_evidence_from_skipped(&[(
+                episode,
+                ExistingEpisodeEvidence {
+                    path: media.clone(),
+                    identity: bound_media.identity(),
+                    sidecars: vec![ExistingSidecarEvidence {
+                        path: sidecar.clone(),
+                        identity: bound_sidecar.identity(),
+                    }],
+                    content_stamp: MediaContentStamp::from_bound_file(&bound_media)
+                        .expect("media content stamp should read"),
+                },
+            )])),
+        };
+        let response = BilibiliWorkerResponse::Completed {
+            report: report.clone(),
+        };
+        let encoded = serde_json::to_string(&response).expect("worker response should encode");
+        let parsed = parse_bilibili_worker_response(&encoded)
+            .expect("worker response evidence should round-trip");
+        let BilibiliWorkerOutcome::Completed(report) = parsed else {
+            unreachable!("worker response should remain completed");
+        };
+        validate_existing_bilibili_report_evidence_identity(&root, &report)
+            .expect("unchanged publication should preserve skip evidence");
+
+        let moved_media = output.join("Episode.original.mp4");
+        fs::rename(&media, &moved_media).expect("original media should remain allocated");
+        fs::write(&media, b"replacement media").expect("replacement media should write");
+        let replaced_media = validate_existing_bilibili_report_evidence_identity(&root, &report)
+            .expect_err("parent publication must reject a replacement media object");
+        assert!(format!("{replaced_media:#}").contains("media identity changed"));
+
+        fs::remove_file(&media).expect("replacement media should remove");
+        fs::rename(&moved_media, &media).expect("original media should restore");
+        validate_existing_bilibili_report_evidence_identity(&root, &report)
+            .expect("restoring the evidenced media object should validate");
+        let moved_sidecar = output.join("Episode.original.nfo");
+        fs::rename(&sidecar, &moved_sidecar).expect("original sidecar should remain allocated");
+        fs::write(&sidecar, sidecar_contents).expect("replacement sidecar should write");
+        let replaced_sidecar = validate_existing_bilibili_report_evidence_identity(&root, &report)
+            .expect_err("parent publication must reject a replacement sidecar object");
+        assert!(format!("{replaced_sidecar:#}").contains("sidecar object changed"));
+        let _ = fs::remove_dir_all(output);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ffprobe_reads_the_bound_media_object_after_path_replacement() {
+        let root = temp_test_dir("bilibili-bound-ffprobe-aba");
+        fs::create_dir_all(&root).expect("fixture root should create");
+        let media_path = root.join("episode.mp4");
+        fs::write(&media_path, "original-media").expect("media should write");
+        let rooted = RootedFs::new(&root).expect("fixture root should bind");
+        let bound_file = rooted
+            .open_bound_file(&media_path)
+            .unwrap()
+            .expect("media should bind");
+        let original_identity = bound_file.identity();
+        let ffprobe = root.join("ffprobe-fixture");
+        fs::write(
+            &ffprobe,
+            format!(
+                "#!/bin/sh\nset -eu\nmv '{}' '{}.old'\nprintf replacement > '{}'\ntest \"$(cat \"$7\")\" = original-media\nprintf 'video\\naudio\\n'\n",
+                media_path.display(),
+                media_path.display(),
+                media_path.display(),
+            ),
+        )
+        .expect("controlled probe should write");
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755))
+            .expect("probe should be executable");
+
+        let streams = probe_media_streams(&test_config(), &ffprobe, &bound_file)
+            .await
+            .expect("bound descriptor should remain readable after path replacement");
+        assert_eq!(streams, (true, true));
+        bound_file
+            .validate_identity()
+            .expect("the selected open object should remain the original inode");
+        let replacement = rooted
+            .open_bound_file(&media_path)
+            .unwrap()
+            .expect("replacement path should be present");
+        assert_ne!(replacement.identity(), original_identity);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_report_evidence_normalizes_symlink_paths_and_sidecar_order() {
+        use std::os::unix::fs::symlink;
+
+        let parent = temp_test_dir("bilibili-report-evidence-normalize");
+        let physical = parent.join("physical");
+        let logical = parent.join("configured");
+        fs::create_dir_all(&physical).expect("physical output root should create");
+        symlink(&physical, &logical).expect("configured output symlink should create");
+        let canonical_physical = fs::canonicalize(&physical).expect("physical root canonicalizes");
+        let media = canonical_physical.join("episode.mp4");
+        let nfo = canonical_physical.join("episode.nfo");
+        let info = canonical_physical.join("episode.info.json");
+        fs::write(&media, b"media").expect("media should write");
+        fs::write(&nfo, b"nfo").expect("NFO should write");
+        fs::write(&info, b"{}").expect("info sidecar should write");
+        let root = RootedFs::new(&logical).expect("configured root should bind");
+        let logical_media = logical.join("episode.mp4");
+        let logical_nfo = logical.join("episode.nfo");
+        let logical_info = logical.join("episode.info.json");
+        let bound_media = root
+            .open_bound_file(&logical_media)
+            .unwrap()
+            .expect("media should bind");
+        let bound_nfo = root
+            .open_bound_file(&logical_nfo)
+            .unwrap()
+            .expect("NFO should bind");
+        let bound_info = root
+            .open_bound_file(&logical_info)
+            .unwrap()
+            .expect("info sidecar should bind");
+        let media_identity = bound_media.identity();
+        let nfo_identity = bound_nfo.identity();
+        let info_identity = bound_info.identity();
+        let evidence = ExistingBilibiliMediaEvidence {
+            path: media.clone(),
+            device: media_identity.device(),
+            inode: media_identity.inode(),
+            sidecars: vec![
+                ExistingBilibiliSidecarEvidence {
+                    path: info.clone(),
+                    device: info_identity.device(),
+                    inode: info_identity.inode(),
+                },
+                ExistingBilibiliSidecarEvidence {
+                    path: nfo.clone(),
+                    device: nfo_identity.device(),
+                    inode: nfo_identity.inode(),
+                },
+            ],
+            cid: 12,
+            epid: 34,
+            content_stamp: MediaContentStamp::from_bound_file(&bound_media)
+                .expect("media stamp should read"),
+        };
+        let mut report = JobReport {
+            saved_location: "episode.mp4".into(),
+            details: String::new(),
+            primary_media_paths: vec![logical.join("episode.mp4")],
+            existing_bilibili_evidence: Some(ExistingBilibiliReportEvidence {
+                skipped: vec![evidence],
+            }),
+        };
+
+        normalize_existing_bilibili_report_evidence(&root, &mut report)
+            .expect("evidence should normalize to configured root");
+
+        let evidence = report
+            .existing_bilibili_evidence
+            .as_ref()
+            .unwrap()
+            .skipped
+            .first()
+            .unwrap();
+        assert_eq!(evidence.path, logical.join("episode.mp4"));
+        assert_eq!(
+            evidence
+                .sidecars
+                .iter()
+                .map(|sidecar| sidecar.path.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                logical.join("episode.info.json"),
+                logical.join("episode.nfo")
+            ]
+        );
+        assert_eq!(
+            existing_bilibili_report_media_identities(&root, &report)
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![logical.join("episode.mp4")]
+        );
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn completion_revalidation_reprobes_timestamp_changes_and_rejects_stream_or_size_changes()
+    {
+        let root = temp_test_dir("bilibili-report-content-revalidation");
+        fs::create_dir_all(&root).expect("validation root should create");
+        let media_path = root.join("episode.mp4");
+        let sidecar_path = root.join("episode.nfo");
+        fs::write(&media_path, b"original media").expect("media should write");
+        fs::write(
+            &sidecar_path,
+            r#"<movie><uniqueid type="bilibili-cid">cid12</uniqueid><uniqueid type="bilibili-epid">ep34</uniqueid></movie>"#,
+        )
+        .expect("sidecar should write");
+        let ffmpeg = root.join("ffmpeg");
+        let ffprobe = root.join("ffprobe");
+        fs::write(&ffmpeg, "").expect("ffmpeg placeholder should write");
+        let config = AppConfig::for_test();
+        let mut config = config;
+        config.downloads.video_dir = root.clone();
+        config.tools.ffmpeg = ffmpeg;
+        write_mock_ffprobe(&ffprobe, "video\naudio\n");
+        let rooted = RootedFs::new(&root).expect("validation root should bind");
+        let media = rooted
+            .open_bound_file(&media_path)
+            .unwrap()
+            .expect("media should bind");
+        let sidecar = rooted
+            .open_bound_file(&sidecar_path)
+            .unwrap()
+            .expect("sidecar should bind");
+        let stamp = MediaContentStamp::from_bound_file(&media).expect("stamp should read");
+        let report = JobReport {
+            saved_location: media_path.display().to_string(),
+            details: String::new(),
+            primary_media_paths: vec![media_path.clone()],
+            existing_bilibili_evidence: Some(ExistingBilibiliReportEvidence {
+                skipped: vec![ExistingBilibiliMediaEvidence {
+                    path: media_path.clone(),
+                    device: media.identity().device(),
+                    inode: media.identity().inode(),
+                    sidecars: vec![ExistingBilibiliSidecarEvidence {
+                        path: sidecar_path.clone(),
+                        device: sidecar.identity().device(),
+                        inode: sidecar.identity().inode(),
+                    }],
+                    cid: 12,
+                    epid: 34,
+                    content_stamp: stamp,
+                }],
+            }),
+        };
+
+        // A timestamp-only transition triggers a real stream check and remains acceptable.
+        fs::set_permissions(&media_path, fs::Permissions::from_mode(0o600))
+            .expect("metadata-only transition should succeed");
+        validate_existing_bilibili_report_for_completion(&config, &report)
+            .await
+            .expect("timestamp-only changes with required streams should remain valid");
+
+        // Same-size content changes must be re-probed; an incompatible stream set is rejected.
+        fs::write(&media_path, b"changed media!").expect("same-size media rewrite should succeed");
+        write_mock_ffprobe(&ffprobe, "video\n");
+        let changed_streams = validate_existing_bilibili_report_for_completion(&config, &report)
+            .await
+            .expect_err("a same-size rewrite missing audio must fail All-mode validation");
+        assert!(
+            format!("{changed_streams:#}").contains("required streams"),
+            "stream failure should explain the invalid selected property: {changed_streams:#}"
+        );
+
+        // Size is a direct content-change signal and fails without trusting a stale probe result.
+        fs::write(&media_path, b"short").expect("truncated media should write");
+        let changed_size = validate_existing_bilibili_report_for_completion(&config, &report)
+            .await
+            .expect_err("size changes must fail closed");
+        assert!(
+            format!("{changed_size:#}").contains("size changed"),
+            "size change should be reported distinctly: {changed_size:#}"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    fn write_mock_ffprobe(path: &Path, streams: &str) {
+        let script = format!(
+            "#!/bin/sh\nprintf '{}\\n'",
+            streams.trim_end().replace('\n', "\\n")
+        );
+        fs::write(path, script).expect("mock ffprobe should write");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .expect("mock ffprobe should be executable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_season_evidence_releases_descriptors_under_low_limit() {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("test binary should resolve"),
+        );
+        command
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("downloader::tests::missing_season_many_existing_entries_low_limit_child")
+            .arg("--nocapture")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        unsafe {
+            command.pre_exec(|| {
+                let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let mut limits = limits.assume_init();
+                limits.rlim_cur = limits.rlim_cur.min(64 as libc::rlim_t);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limits) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for descriptor in (libc::STDERR_FILENO + 1)..64 {
+                    libc::close(descriptor);
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().expect("low-limit helper should run");
+        assert!(
+            output.status.success(),
+            "low-limit helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "spawned by missing_season_evidence_releases_descriptors_under_low_limit"]
+    async fn missing_season_many_existing_entries_low_limit_child() {
+        let root = temp_test_dir("missing-season-many-existing-low-fd");
+        fs::create_dir_all(&root).expect("fixture root should create");
+        let mut limits = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limits.as_mut_ptr()) },
+            0
+        );
+        assert!(unsafe { limits.assume_init() }.rlim_cur <= 64 as libc::rlim_t);
+
+        let ffprobe = root.join("ffprobe-fixture");
+        fs::write(&ffprobe, "#!/bin/sh\nprintf 'video\\naudio\\n'\n")
+            .expect("controlled probe should write");
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755))
+            .expect("probe should be executable");
+        for index in 0..200_u64 {
+            let video = root.join(format!("Episode {index:03}.mp4"));
+            fs::write(&video, b"synthetic media").expect("media should write");
+            fs::write(
+                video.with_extension("nfo"),
+                format!(
+                    "<movie><uniqueid type=\"bilibili-cid\">cid{}</uniqueid><uniqueid type=\"bilibili-epid\">ep{}</uniqueid></movie>",
+                    index + 1000,
+                    index + 2000
+                ),
+            )
+            .expect("identity sidecar should write");
+        }
+        let index = Arc::new(
+            build_video_identity_index_in_dir(
+                &root,
+                StagedPrimaryMediaKind::Video,
+                IdentityIndexReadPolicy::BestEffort,
+            )
+            .expect("existing media should index"),
+        );
+        let config = test_config();
+        let mut evidence = Vec::with_capacity(200);
+        for ordinal in 0..200_u64 {
+            let entry = BilibiliDownloadEntry {
+                cid: ordinal + 1000,
+                epid: Some(ordinal + 2000),
+                ..Default::default()
+            };
+            evidence.push(
+                bilibili_plan_entry_compatible_existing_media(
+                    &config,
+                    Arc::clone(&index),
+                    &entry,
+                    DownloadMode::All,
+                    &ffprobe,
+                )
+                .await
+                .expect("matching episode should retain lightweight evidence"),
+            );
+        }
+        assert_eq!(evidence.len(), 200);
+        assert!(
+            evidence
+                .iter()
+                .all(|item| item.identity.is_file() && item.path.is_file())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires installed ffmpeg and ffprobe; run explicitly for real media validation"]
+    async fn missing_season_probe_uses_actual_video_and_audio_streams() {
+        let root = temp_test_dir("bilibili-missing-mode-probe");
+        fs::create_dir_all(&root).expect("fixture root should create");
+        let config = test_config();
+        let ffmpeg = config.tools.ffmpeg.clone();
+        let ffprobe = ffprobe_program(&ffmpeg);
+        async fn generate(ffmpeg: &Path, output: &Path, args: &[&str]) {
+            let result = Command::new(ffmpeg)
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=size=16x16:rate=1:duration=1",
+                ])
+                .args(args)
+                .arg("-y")
+                .arg(output)
+                .output()
+                .await
+                .expect("ffmpeg fixture generator should launch");
+            assert!(
+                result.status.success(),
+                "ffmpeg fixture should generate: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+        }
+
+        let video_only = root.join("video-only.mp4");
+        generate(&ffmpeg, &video_only, &["-an", "-c:v", "mpeg4"]).await;
+        let audio_only = root.join("audio-only.m4a");
+        let audio_result = Command::new(&ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:duration=1",
+                "-vn",
+                "-c:a",
+                "aac",
+                "-y",
+            ])
+            .arg(&audio_only)
+            .output()
+            .await
+            .expect("ffmpeg audio fixture generator should launch");
+        assert!(
+            audio_result.status.success(),
+            "ffmpeg audio fixture should generate: {}",
+            String::from_utf8_lossy(&audio_result.stderr)
+        );
+        let audiovisual = root.join("audiovisual.mp4");
+        let av_result = Command::new(&ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=size=16x16:rate=1:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=1000:duration=1",
+                "-shortest",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "aac",
+                "-y",
+            ])
+            .arg(&audiovisual)
+            .output()
+            .await
+            .expect("ffmpeg audiovisual fixture generator should launch");
+        assert!(
+            av_result.status.success(),
+            "ffmpeg audiovisual fixture should generate: {}",
+            String::from_utf8_lossy(&av_result.stderr)
+        );
+
+        let rooted = RootedFs::new(&root).expect("fixture root should bind");
+        let video_file = rooted.open_bound_file(&video_only).unwrap().unwrap();
+        let audio_file = rooted.open_bound_file(&audio_only).unwrap().unwrap();
+        let av_file = rooted.open_bound_file(&audiovisual).unwrap().unwrap();
+        let video_streams = probe_media_streams(&config, &ffprobe, &video_file)
+            .await
+            .expect("video stream probe should complete");
+        let audio_streams = probe_media_streams(&config, &ffprobe, &audio_file)
+            .await
+            .expect("audio stream probe should complete");
+        let av_streams = probe_media_streams(&config, &ffprobe, &av_file)
+            .await
+            .expect("AV stream probe should complete");
+        assert_eq!(video_streams, (true, false));
+        assert_eq!(audio_streams, (false, true));
+        assert_eq!(av_streams, (true, true));
+        assert!(!media_satisfies_download_mode(
+            DownloadMode::All,
+            video_streams.0,
+            video_streams.1
+        ));
+        assert!(media_satisfies_download_mode(
+            DownloadMode::All,
+            av_streams.0,
+            av_streams.1
+        ));
+        assert!(media_satisfies_download_mode(
+            DownloadMode::AudioOnly,
+            audio_streams.0,
+            audio_streams.1
+        ));
+        let matching_nfo = r#"<movie><uniqueid type="bilibili-cid">cid403</uniqueid><uniqueid type="bilibili-epid">ep503</uniqueid></movie>"#;
+        for media in [&video_only, &audiovisual] {
+            fs::write(media.with_extension("nfo"), matching_nfo).unwrap();
+        }
+        let entry = BilibiliDownloadEntry {
+            cid: 403,
+            epid: Some(503),
+            ..Default::default()
+        };
+        let index = Arc::new(
+            build_video_identity_index_in_dir(
+                &root,
+                StagedPrimaryMediaKind::Video,
+                IdentityIndexReadPolicy::BestEffort,
+            )
+            .unwrap(),
+        );
+        fs::write(
+            audiovisual.with_extension("nfo"),
+            matching_nfo.replace("cid403", "cid404"),
+        )
+        .unwrap();
+        // The identity-valid file lacks audio; the complete file now belongs to
+        // another episode. Evidence from different files cannot justify a skip.
+        assert!(bilibili_plan_entry_has_exact_existing_metadata(
+            &index, &entry
+        ));
+        assert!(
+            bilibili_plan_entry_compatible_existing_media(
+                &config,
+                Arc::clone(&index),
+                &entry,
+                DownloadMode::All,
+                &ffprobe,
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(
+            bilibili_plan_entry_compatible_existing_media(
+                &config,
+                Arc::clone(&index),
+                &entry,
+                DownloadMode::VideoOnly,
+                &ffprobe,
+            )
+            .await
+            .map(|evidence| evidence.path),
+            Some(video_only.clone())
+        );
+        fs::write(audiovisual.with_extension("nfo"), matching_nfo).unwrap();
+        assert_eq!(
+            bilibili_plan_entry_compatible_existing_media(
+                &config,
+                Arc::clone(&index),
+                &entry,
+                DownloadMode::All,
+                &ffprobe,
+            )
+            .await
+            .map(|evidence| evidence.path),
+            Some(audiovisual)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_plan_snapshot_rejects_inventory_changed_under_output_lock() {
+        let expected = PlanValidationSnapshot {
+            stable_media_ids: vec!["aid:11:cid:101:epid:1001".to_string()],
+            selected_format_ids: vec!["aid:11:cid:101:epid:1001:video:64".to_string()],
+            ..PlanValidationSnapshot::default()
+        };
+        assert!(validate_missing_plan_snapshot(&expected, &expected).is_ok());
+        let changed = PlanValidationSnapshot {
+            stable_media_ids: vec!["aid:12:cid:102:epid:1002".to_string()],
+            selected_format_ids: vec!["aid:12:cid:102:epid:1002:video:64".to_string()],
+            ..PlanValidationSnapshot::default()
+        };
+        let error = validate_missing_plan_snapshot(&expected, &changed)
+            .expect_err("changed filtered inventory must require review before download");
+        assert!(error.to_string().contains("retry the queued job"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_season_preflight_does_not_request_skipped_episode_playback() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock API listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("mock API address should read")
+        );
+        let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0_u8; 8192];
+                let Ok(read) = stream.read(&mut request).await else {
+                    break;
+                };
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let request_line = request.lines().next().unwrap_or_default().to_string();
+                server_requests
+                    .lock()
+                    .expect("request log should lock")
+                    .push(request_line.clone());
+                let body = if request_line.contains("/pgc/view/web/season") {
+                    if request_line.contains("season_id=123") {
+                        serde_json::json!({
+                            "code": 0,
+                            "result": {
+                                "season_id": 123,
+                                "title": "Test season",
+                                "episodes": [
+                                    {"aid": 10, "bvid": "BV1aa", "cid": 100, "id": 9000, "ep_id": 1000, "title": "1"},
+                                    {"aid": 11, "bvid": "BV1bb", "cid": 101, "id": 9001, "ep_id": 1001, "title": "2"}
+                                ]
+                            }
+                        })
+                    } else if request_line.contains("ep_id=1001") {
+                        serde_json::json!({
+                            "code": 0,
+                            "result": {
+                                "season_id": 123,
+                                "title": "Test season",
+                                "episodes": [
+                                    {"aid": 11, "bvid": "BV1bb", "cid": 101, "id": 9001, "ep_id": 1001, "title": "2"}
+                                ]
+                            }
+                        })
+                    } else {
+                        serde_json::json!({"code": -404, "message": "skipped episode must not resolve"})
+                    }
+                } else if request_line.contains("/pgc/player/web/v2/playurl") {
+                    if request_line.contains("ep_id=1001") {
+                        serde_json::json!({
+                            "code": 0,
+                            "result": {
+                                "video_info": {
+                                    "dash": {
+                                        "duration": 1,
+                                        "video": [{
+                                            "id": 64,
+                                            "baseUrl": "https://media.example/video.m4s",
+                                            "base_url": "https://media.example/video.m4s",
+                                            "codecs": "hev1",
+                                            "bandwidth": 900,
+                                            "mimeType": "video/mp4",
+                                            "mime_type": "video/mp4"
+                                        }],
+                                        "audio": []
+                                    }
+                                }
+                            }
+                        })
+                    } else {
+                        serde_json::json!({"code": -404, "message": "skipped playback must not be requested"})
+                    }
+                } else {
+                    serde_json::json!({"code": 0, "data": {"subtitle": {"subtitles": []}}})
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut endpoints = bbdown_core::EndpointConfig::default();
+        endpoints.pgc_base = base_url;
+        let client = bbdown_core::BiliClient::new(
+            bbdown_core::ClientConfig::default()
+                .with_endpoints(endpoints)
+                .with_playurl_mode(bbdown_core::PlayurlMode::Web)
+                .with_request_timeout(Duration::from_secs(2)),
+        );
+        let output_dir = temp_test_dir("missing-season-preflight-output");
+        fs::create_dir_all(&output_dir).expect("output dir should create");
+        let existing = output_dir.join("Episode one.mp4");
+        fs::write(
+            &existing,
+            b"synthetic media; streams supplied by the controlled probe",
+        )
+        .unwrap();
+        let ffprobe = output_dir.join("ffprobe-fixture");
+        let probe_count = output_dir.join("probe-count");
+        fs::write(
+            &ffprobe,
+            format!(
+                "#!/bin/sh\nset -eu\nprintf x >> '{}'\nprintf 'video\\naudio\\n'\n",
+                probe_count.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            existing.with_extension("nfo"),
+            r#"<movie>
+                <uniqueid type="bilibili-cid">cid100</uniqueid>
+                <uniqueid type="bilibili-epid">ep1000</uniqueid>
+            </movie>"#,
+        )
+        .expect("existing identity metadata should write");
+
+        let plan = tokio_timeout(
+            Duration::from_secs(5),
+            plan_bilibili_missing_season(
+                &test_config(),
+                &client,
+                "https://www.bilibili.com/bangumi/play/ss123",
+                DownloadMode::VideoOnly,
+                &ffprobe,
+                &output_dir,
+                Duration::from_secs(2),
+                |_, _| {},
+            ),
+        )
+        .await
+        .expect("mock planning should finish")
+        .expect("missing season plan should succeed");
+
+        let complete_output_dir = temp_test_dir("missing-season-preflight-complete-output");
+        fs::create_dir_all(&complete_output_dir).expect("complete output dir should create");
+        let complete_fixture = complete_output_dir.join("fixture.mp4");
+        fs::copy(&existing, &complete_fixture).expect("fixture media should copy");
+        for (name, cid, epid) in [("Episode one", 100, 1000), ("Episode two", 101, 1001)] {
+            let video = complete_output_dir.join(format!("{name}.mp4"));
+            fs::copy(&complete_fixture, &video).expect("fixture media should copy");
+            fs::write(
+                video.with_extension("nfo"),
+                format!(
+                    "<movie><uniqueid type=\"bilibili-cid\">cid{cid}</uniqueid><uniqueid type=\"bilibili-epid\">ep{epid}</uniqueid></movie>"
+                ),
+            )
+            .expect("existing identity metadata should write");
+        }
+        let complete_plan = plan_bilibili_missing_season(
+            &test_config(),
+            &client,
+            "https://www.bilibili.com/bangumi/play/ss123",
+            DownloadMode::VideoOnly,
+            &ffprobe,
+            &complete_output_dir,
+            Duration::from_secs(2),
+            |_, _| {},
+        )
+        .await
+        .expect("fully existing season should still produce a plan snapshot");
+        server.abort();
+
+        assert_eq!(plan.total_entries, 2);
+        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.plan.entries.len(), 1);
+        assert_eq!(plan.plan.entries[0].epid, Some(1001));
+        assert!(complete_plan.plan.entries.is_empty());
+        assert_eq!(complete_plan.plan.title, "Test season");
+        let requests = requests.lock().expect("request log should lock");
+        assert_eq!(
+            fs::read(&probe_count)
+                .expect("probe calls should be counted")
+                .len(),
+            3,
+            "one probe per exact existing episode; final path collection must reuse evidence"
+        );
+        let skipped_playback_requests = requests
+            .iter()
+            .filter(|request| {
+                request.contains("/pgc/player/web/v2/playurl") && request.contains("ep_id=1000")
+            })
+            .count();
+        assert_eq!(skipped_playback_requests, 0);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.contains("/pgc/player/web/v2/playurl") && request.contains("ep_id=1001")
+                })
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(output_dir);
+        let _ = fs::remove_dir_all(complete_output_dir);
+    }
+
+    #[test]
     fn metadata_duplicate_inventory_never_uses_unknown_zero_ids() {
         let plan = BilibiliDownloadPlan {
             title: "Inventory".to_string(),
@@ -16540,6 +19083,11 @@ mod tests {
         assert_eq!(exact_duplicate.identity.id, "cid222");
         assert_eq!(exact_duplicate.existing_videos, vec![second_entry.clone()]);
         assert!(exact_duplicate.allows_overwrite_for(&job));
+        let missing_job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV123?p=2".to_string(),
+            selection: Some(BilibiliSelection::Missing),
+        };
+        assert!(!exact_duplicate.allows_overwrite_for(&missing_job));
 
         let conflicting_entry = video_dir.join("Conflicting episode identity.mp4");
         fs::write(&conflicting_entry, "conflict").expect("conflicting entry should write");
@@ -16590,6 +19138,7 @@ mod tests {
             .overwrite_confirmation(&video)
             .expect("indexed video should retain an overwrite handle");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: Some(overwrite_confirmation),
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -16641,6 +19190,7 @@ mod tests {
     #[test]
     fn duplicate_without_a_retained_target_handle_never_allows_overwrite() {
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -16854,6 +19404,19 @@ mod tests {
         config.bilibili.extra_args = vec!["--audio-only".to_string()];
         let audio_path = video_dir.join("Example [BV12TRrBcEP8].m4a");
         fs::write(&audio_path, "audio").expect("audio file should write");
+        write_bilibili_identity_nfo(&audio_path, "cid403");
+
+        let index = build_video_identity_index_in_dir(
+            &video_dir,
+            bilibili_primary_media_kind(DownloadMode::AudioOnly),
+            IdentityIndexReadPolicy::BestEffort,
+        )
+        .expect("audio-only final output index should build");
+        assert!(
+            index
+                .metadata_videos(&bilibili_collection_cid_identity(403))
+                .contains(&audio_path)
+        );
 
         let duplicate = find_video_duplicate_without_probe(
             &config,
@@ -17254,6 +19817,7 @@ mod tests {
         fs::write(&existing_video, "already-published").expect("existing video should write");
 
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -17563,7 +20127,7 @@ mod tests {
             &final_dir,
             "https://www.bilibili.com/video/BV123",
             None,
-            None,
+            BilibiliWorkerRequestExpectations::default(),
             &staging,
             &output_lock,
         );
@@ -17777,6 +20341,7 @@ mod tests {
         write_bilibili_identity_nfo(&existing, "cid123");
         let root = RootedFs::new(&final_dir).expect("output root should bind");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -17864,6 +20429,7 @@ mod tests {
         write_bilibili_identity_nfo(&existing, "cid123");
         let root = RootedFs::new(&final_dir).expect("output root should bind");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -17969,6 +20535,7 @@ mod tests {
         write_bilibili_identity_nfo(&existing, "cid123");
         let root = RootedFs::new(&final_dir).expect("output root should bind");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18130,6 +20697,7 @@ mod tests {
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
         fs::write(staged.with_extension("info.json"), "new-json").expect("new json should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18182,6 +20750,7 @@ mod tests {
         fs::write(&staged, "new-video").expect("staged video should write");
         fs::write(staged.with_extension("xml"), "new-xml").expect("staged xml should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18226,6 +20795,7 @@ mod tests {
         fs::write(staged.with_extension("info.json"), "new-json")
             .expect("staged info json should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18280,6 +20850,7 @@ mod tests {
         fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
             .expect("part2 nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18326,6 +20897,7 @@ mod tests {
         fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
             .expect("part2 nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18390,6 +20962,7 @@ mod tests {
         fs::write(&staged_b, "new-b").expect("movie b should write");
         fs::write(staged_b.with_extension("nfo"), "new-b-nfo").expect("movie b nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18434,6 +21007,7 @@ mod tests {
         fs::write(&staged_audio, "new-audio").expect("audio should write");
         fs::write(staged_audio.with_extension("nfo"), "new-nfo").expect("nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18477,6 +21051,7 @@ mod tests {
         fs::write(staging_dir.join("Episode.cover.jpg"), "cover").expect("cover should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18534,6 +21109,7 @@ mod tests {
             .expect("cover should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18606,6 +21182,7 @@ mod tests {
         fs::write(staging_dir.join("New.Title.xml"), "new-xml").expect("new xml should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18644,6 +21221,7 @@ mod tests {
         fs::write(&staged_xml, "new-xml").expect("staged xml should write");
         let staged_files = collect_regular_files(&staging_dir).expect("staged files should scan");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18690,6 +21268,7 @@ mod tests {
         let staged_flv = staging_dir.join("Episode Part 2.flv");
         fs::write(&staged_flv, "new-flv").expect("flv segment should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18750,6 +21329,7 @@ mod tests {
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
         fs::write(staged.with_extension("xml"), "new-xml").expect("new xml should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18811,6 +21391,7 @@ mod tests {
         fs::write(&staged, "new-video").expect("staged video should write");
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("new nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -18857,6 +21438,7 @@ mod tests {
         fs::write(staging_dir.join("danmaku.xml"), "new-danmaku")
             .expect("new bare danmaku should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18913,6 +21495,7 @@ mod tests {
         fs::write(staging_dir.join("subtitle-zh-01-new.ass"), "new-subtitle")
             .expect("new unbound subtitle should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -18965,6 +21548,7 @@ mod tests {
         fs::write(staging_dir.join("cover-image-new.jpg"), "new-cover")
             .expect("new unbound cover should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19616,6 +22200,7 @@ mod tests {
         let staged = staging_dir.join("New [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -19668,6 +22253,7 @@ mod tests {
         fs::write(&first_staged, "new-first").expect("first staged video should write");
         fs::write(&second_staged, "new-second").expect("second staged video should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19717,6 +22303,7 @@ mod tests {
         fs::write(&staged, "new-video").expect("staged video should write");
         fs::write(staged.with_extension("nfo"), "new-nfo").expect("staged NFO should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19761,6 +22348,7 @@ mod tests {
         fs::write(staged.with_extension("info.json"), r#"{"id":"cid123"}"#)
             .expect("staged info JSON should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19799,6 +22387,7 @@ mod tests {
         let staged = staging_dir.join("New [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -19838,6 +22427,7 @@ mod tests {
         let staged = staging_dir.join("New [PHH1wTDF-1M].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -19880,6 +22470,7 @@ mod tests {
         let staged = staging_dir.join("New [BV123].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19926,6 +22517,7 @@ mod tests {
         let staged = staging_dir.join("New [BV123].mkv");
         fs::write(&staged, "new-video").expect("staged file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -19972,6 +22564,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20024,6 +22617,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20069,6 +22663,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20106,6 +22701,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20251,6 +22847,7 @@ mod tests {
         write_bilibili_identity_nfo(&existing, "cid123");
         let root = RootedFs::new(&final_dir).expect("output root should bind");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20373,6 +22970,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20416,6 +23014,7 @@ mod tests {
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20480,6 +23079,7 @@ mod tests {
         let existing = final_dir.join("Episode.mkv");
         fs::write(&existing, "original-video").expect("existing file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20554,6 +23154,7 @@ mod tests {
         let existing = final_dir.join("Episode.mkv");
         fs::write(&existing, "original-video").expect("existing file should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,
@@ -20644,6 +23245,7 @@ mod tests {
         fs::write(staged_part2.with_extension("nfo"), "new-part2-nfo")
             .expect("staged part2 nfo should write");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Youtube,
@@ -21425,7 +24027,10 @@ mod tests {
             &video_dir,
             "https://www.bilibili.com/video/BV123",
             Some(BilibiliSelection::Latest),
-            Some(&expected_identity),
+            BilibiliWorkerRequestExpectations {
+                overwrite_identity: Some(expected_identity.clone()),
+                ..BilibiliWorkerRequestExpectations::default()
+            },
             &staging,
             &output_lock,
         );
@@ -21552,12 +24157,19 @@ mod tests {
             provider: VideoProvider::Bilibili,
             id: "cid123".to_string(),
         };
+        let expected_plan = PlanValidationSnapshot {
+            stable_media_ids: vec!["aid:11:cid:101:epid:1001".to_string()],
+            ..PlanValidationSnapshot::default()
+        };
         let request = build_bilibili_worker_request(
             &config,
             &video_dir,
             "https://www.bilibili.com/video/BV123",
             Some(BilibiliSelection::Latest),
-            Some(&expected_identity),
+            BilibiliWorkerRequestExpectations {
+                overwrite_identity: Some(expected_identity.clone()),
+                plan: Some(expected_plan.clone()),
+            },
             &staging,
             &output_lock,
         );
@@ -21577,6 +24189,7 @@ mod tests {
             parsed.expected_overwrite_identity,
             request.expected_overwrite_identity
         );
+        assert_eq!(parsed.expected_plan, Some(expected_plan));
         assert!(
             !staging
                 .path()
@@ -21603,7 +24216,7 @@ mod tests {
             &video_dir,
             "https://www.bilibili.com/video/BV123",
             None,
-            None,
+            BilibiliWorkerRequestExpectations::default(),
             &staging,
             &output_lock,
         );
@@ -21670,7 +24283,7 @@ mod tests {
             &video_dir,
             "https://www.bilibili.com/video/BV123",
             None,
-            None,
+            BilibiliWorkerRequestExpectations::default(),
             &staging,
             &output_lock,
         );
@@ -21736,27 +24349,62 @@ mod tests {
 
     #[test]
     fn bilibili_worker_response_preserves_marker_failure_state() {
+        let output = temp_test_dir("bilibili-worker-report-evidence");
+        fs::create_dir_all(&output).expect("output root should create");
+        let root = RootedFs::new(&output).expect("output root should bind");
+        let media = output.join("existing.mp4");
         let completed = BilibiliWorkerResponse::Completed {
             report: JobReport {
                 saved_location: "Episode.mp4".to_string(),
                 details: "complete".to_string(),
-                primary_media_paths: Vec::new(),
+                primary_media_paths: vec![media.clone()],
+                existing_bilibili_evidence: Some(ExistingBilibiliReportEvidence {
+                    skipped: vec![ExistingBilibiliMediaEvidence {
+                        path: media.clone(),
+                        device: 11,
+                        inode: 22,
+                        sidecars: Vec::new(),
+                        cid: 33,
+                        epid: 44,
+                        content_stamp: MediaContentStamp {
+                            size: 3,
+                            modified_seconds: 0,
+                            modified_nanoseconds: 0,
+                            changed_seconds: 0,
+                            changed_nanoseconds: 0,
+                        },
+                    }],
+                }),
             },
         };
         let encoded = serde_json::to_string(&completed).expect("response should encode");
         let outcome = parse_bilibili_worker_response(&encoded)
             .expect("completed worker response should parse");
         assert!(matches!(
-            outcome,
+            &outcome,
             BilibiliWorkerOutcome::Completed(JobReport { saved_location, .. })
                 if saved_location == "Episode.mp4"
         ));
+        let BilibiliWorkerOutcome::Completed(report) = outcome else {
+            unreachable!("completed response should remain completed");
+        };
+        let identities = existing_bilibili_report_media_identities(&root, &report)
+            .expect("IPC report should expose expected media identities");
+        assert_eq!(identities.len(), 1);
+        let identity = identities
+            .get(&media)
+            .expect("skipped media identity should survive IPC");
+        assert!(identity.is_file());
+        assert_eq!((identity.device(), identity.inode()), (11, 22));
 
         let already_complete = BilibiliWorkerResponse::AlreadyComplete {
             report: JobReport {
                 saved_location: "Collection".to_string(),
                 details: "already complete".to_string(),
                 primary_media_paths: Vec::new(),
+                existing_bilibili_evidence: Some(ExistingBilibiliReportEvidence {
+                    skipped: Vec::new(),
+                }),
             },
         };
         let encoded = serde_json::to_string(&already_complete)
@@ -21777,6 +24425,7 @@ mod tests {
                 .downcast_ref::<BilibiliCoreCompletionMarkerFailure>()
                 .is_some()
         );
+        let _ = fs::remove_dir_all(output);
     }
 
     #[test]
@@ -21826,7 +24475,7 @@ mod tests {
             &video_dir,
             "https://www.bilibili.com/video/BV123",
             None,
-            None,
+            BilibiliWorkerRequestExpectations::default(),
             &staging,
             &output_lock,
         );
@@ -23555,6 +26204,7 @@ mv video.original video.m4s || exit 46
         fs::write(&existing, "original-video").expect("existing file should write");
         write_bilibili_identity_nfo(&existing, "cid123");
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: VideoIdentity {
                 provider: VideoProvider::Bilibili,

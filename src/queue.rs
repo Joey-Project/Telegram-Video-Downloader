@@ -1543,10 +1543,22 @@ impl QueueManager {
     }
 }
 
+#[cfg(test)]
 pub fn hash_primary_media(
     root_path: &Path,
     media_paths: &[PathBuf],
 ) -> Result<BTreeMap<String, String>> {
+    hash_primary_media_with_expected_identities(root_path, media_paths, &BTreeMap::new())
+}
+
+pub(crate) fn hash_primary_media_with_expected_identities(
+    root_path: &Path,
+    media_paths: &[PathBuf],
+    expected: &BTreeMap<PathBuf, EntryIdentity>,
+) -> Result<BTreeMap<String, String>> {
+    if expected.keys().any(|path| !media_paths.contains(path)) {
+        bail!("expected media identity is not included in the published report");
+    }
     let root = RootedFs::new(root_path)
         .with_context(|| format!("failed to bind download root {}", root_path.display()))?;
     root.validate_configured_root()?;
@@ -1568,6 +1580,17 @@ pub fn hash_primary_media(
             )
         })?;
         let identity = file.identity();
+        // Protect object identity (device, inode, and type) on the same descriptor
+        // used for hashing. Directory churn does not change this property.
+        if expected
+            .get(path)
+            .is_some_and(|expected| *expected != identity)
+        {
+            bail!(
+                "published media identity changed before hashing: {}",
+                path.display()
+            );
+        }
         let file = file.duplicate_std_file()?;
         hashes.insert(
             path.display().to_string(),
@@ -2937,6 +2960,163 @@ mod tests {
 
     fn test_task(id: &str, job: JobRequest) -> TaskRecord {
         TaskRecord::new(id.to_string(), 1, 2, 123_456_789, Some(3), 0, job)
+    }
+
+    #[test]
+    fn hashing_expected_media_accepts_directory_churn_and_rejects_replacement() {
+        let directory = temp_queue_root("hash-expected-replacement");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("episode.mp4");
+        fs::write(&path, b"original episode").unwrap();
+        let root = RootedFs::new(&directory).unwrap();
+        let original = root.open_bound_file(&path).unwrap().unwrap();
+        let expected = BTreeMap::from([(path.clone(), original.identity())]);
+        fs::write(directory.join("unrelated.nfo"), b"directory churn").unwrap();
+        let paths = vec![path.clone()];
+        let hashes =
+            hash_primary_media_with_expected_identities(&directory, &paths, &expected).unwrap();
+        assert_eq!(hashes, hash_primary_media(&directory, &paths).unwrap());
+
+        fs::rename(&path, directory.join("original.mp4")).unwrap();
+        fs::write(&path, b"replacement episode").unwrap();
+        let error =
+            hash_primary_media_with_expected_identities(&directory, &paths, &expected).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("identity changed before hashing")
+        );
+        fs::remove_file(&path).unwrap();
+        let error =
+            hash_primary_media_with_expected_identities(&directory, &paths, &expected).unwrap_err();
+        assert!(error.to_string().contains("disappeared before hashing"));
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn hashing_expected_media_rejects_unreported_evidence() {
+        let directory = temp_queue_root("hash-unreported-evidence");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("episode.mp4");
+        fs::write(&path, b"episode").unwrap();
+        let root = RootedFs::new(&directory).unwrap();
+        let media = root.open_bound_file(&path).unwrap().unwrap();
+        let expected = BTreeMap::from([(path, media.identity())]);
+        let error =
+            hash_primary_media_with_expected_identities(&directory, &[], &expected).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not included in the published report")
+        );
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn hashing_skipped_worker_media_under_a_symlink_configured_root() {
+        let directory = temp_queue_root("hash-worker-root-alias");
+        let physical = directory.join("physical");
+        let logical = directory.join("configured");
+        fs::create_dir_all(&physical).unwrap();
+        symlink(&physical, &logical).unwrap();
+        let path = logical.join("episode.mp4");
+        fs::write(&path, b"existing episode").unwrap();
+        let root = RootedFs::new(&logical).unwrap();
+        let identity = root.open_bound_file(&path).unwrap().unwrap().identity();
+        let report: crate::downloader::JobReport = serde_json::from_value(serde_json::json!({
+            "saved_location": path,
+            "details": "existing season entry",
+            "primary_media_paths": [path],
+            "existing_bilibili_evidence": {
+                "skipped": [{
+                    "path": root.root_path().join("episode.mp4"),
+                    "device": identity.device(),
+                    "inode": identity.inode(),
+                    "sidecars": [],
+                    "cid": 203,
+                    "epid": 247472,
+                    "content_stamp": {
+                        "size": 16,
+                        "modified_seconds": 0,
+                        "modified_nanoseconds": 0,
+                        "changed_seconds": 0,
+                        "changed_nanoseconds": 0
+                    }
+                }]
+            }
+        }))
+        .unwrap();
+        let expected =
+            crate::downloader::existing_bilibili_report_media_identities(&root, &report).unwrap();
+        assert_eq!(expected.get(&path), Some(&identity));
+        let hashes = hash_primary_media_with_expected_identities(
+            &logical,
+            &report.primary_media_paths,
+            &expected,
+        )
+        .unwrap();
+        assert_eq!(hashes, hash_primary_media(&logical, &[path]).unwrap());
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn missing_season_selection_survives_queue_reopen_and_stale_choice() {
+        use crate::router::BilibiliSelection;
+
+        let temp_root = temp_queue_root("missing-season-choice");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = temp_root.join("videos");
+        config.downloads.pdf_dir = temp_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "missing-season",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".to_string(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::AwaitingDuplicateChoice;
+        queue.create(task.clone()).unwrap();
+        let JobRequest::Bilibili { url, .. } = &task.job else {
+            unreachable!()
+        };
+        let missing_job = JobRequest::Bilibili {
+            url: url.clone(),
+            selection: Some(BilibiliSelection::Missing),
+        };
+        let saved = queue
+            .update_job_if_generation(
+                &task.id,
+                task.generation,
+                &[TaskStatus::AwaitingDuplicateChoice],
+                missing_job.clone(),
+                TaskStatus::Queued,
+            )
+            .unwrap()
+            .expect("current skip decision should persist atomically");
+        assert_eq!(saved.job, missing_job);
+        assert!(
+            queue
+                .update_job_if_generation(
+                    &task.id,
+                    task.generation,
+                    &[TaskStatus::AwaitingDuplicateChoice],
+                    task.job,
+                    TaskStatus::Queued,
+                )
+                .unwrap()
+                .is_none(),
+            "repeated choice must not reset skipping"
+        );
+        drop(queue);
+        let reopened = QueueManager::open(&config).unwrap();
+        let restored = reopened.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.job, missing_job);
+        assert!(!restored.cancel_requested);
+        drop(reopened);
+        fs::remove_dir_all(temp_root).unwrap();
     }
 
     #[test]

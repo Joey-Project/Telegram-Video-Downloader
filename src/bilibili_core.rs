@@ -260,6 +260,7 @@ pub fn selection(selection: Option<BilibiliSelection>) -> Option<Selection> {
         BilibiliSelection::Current => Selection::Current,
         BilibiliSelection::Latest => Selection::Latest,
         BilibiliSelection::All => Selection::All,
+        BilibiliSelection::Missing => Selection::All,
         BilibiliSelection::Page(page) => Selection::Page(page),
         BilibiliSelection::CurrentPage(page) => Selection::Page(page),
     })
@@ -1161,6 +1162,10 @@ mod tests {
         );
         assert_eq!(
             selection(Some(BilibiliSelection::All)),
+            Some(Selection::All)
+        );
+        assert_eq!(
+            selection(Some(BilibiliSelection::Missing)),
             Some(Selection::All)
         );
         assert_eq!(

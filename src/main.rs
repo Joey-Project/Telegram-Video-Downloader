@@ -35,15 +35,19 @@ use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
     BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
     JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, VideoDuplicate,
-    VideoDuplicateAction, VideoDuplicateCheck, find_video_duplicate_with_probe, human_bytes,
-    inspect_job_display_metadata, inspect_job_plan, job_progress_channel,
-    recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
-    run_job_with_duplicate_action, run_video_job_staged_keep_both, sync_bilibili_rust_credentials,
+    VideoDuplicateAction, VideoDuplicateCheck, existing_bilibili_report_media_identities,
+    find_video_duplicate_with_probe, human_bytes, inspect_job_display_metadata, inspect_job_plan,
+    job_progress_channel, recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
+    run_job_with_duplicate_action, run_video_job_staged_keep_both,
+    run_video_job_staged_keep_both_with_plan, sync_bilibili_rust_credentials,
+    validate_existing_bilibili_report_for_completion,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
+#[cfg(test)]
+use crate::queue::hash_primary_media;
 use crate::queue::{
     PlanValidationSnapshot, QueueManager, RestartSummary, TaskRecord, TaskStatus,
-    hash_primary_media, sanitize_job_for_storage,
+    hash_primary_media_with_expected_identities, sanitize_job_for_storage,
 };
 use crate::redaction::redact_sensitive_text;
 use crate::router::{
@@ -3537,7 +3541,15 @@ async fn process_job_after_duplicate_check(
         return;
     }
 
-    if is_confirmed_bilibili_ugc_collection_job(&job) {
+    if is_confirmed_bilibili_ugc_collection_job(&job)
+        || matches!(
+            &job,
+            JobRequest::Bilibili {
+                selection: Some(BilibiliSelection::Missing),
+                ..
+            }
+        )
+    {
         queue_job(
             context,
             chat_id,
@@ -3782,6 +3794,7 @@ async fn prompt_duplicate_choice(
     let token = next_duplicate_callback_token(job_id);
     let prompt = duplicate_choice_message(job_id, job.label(), &duplicate);
     let allow_overwrite = job_allows_duplicate_overwrite(&job, &duplicate);
+    let allow_skip = duplicate.allows_skip_for(&job);
     let generation = match queue.update_job_if_generation(
         &task_id,
         generation,
@@ -3818,7 +3831,7 @@ async fn prompt_duplicate_choice(
         .send_message_with_inline_keyboard(
             chat_id,
             truncate(&prompt),
-            duplicate_choice_keyboard(token, allow_overwrite),
+            duplicate_choice_keyboard(token, allow_overwrite, allow_skip),
         )
         .await
     {
@@ -4279,6 +4292,32 @@ async fn handle_callback_query(context: BotContext, callback_query: CallbackQuer
             )
             .await;
         }
+        DuplicateCallbackAction::Skip => {
+            let Some(job) = job_skipping_duplicates(&pending.job, &pending.duplicate) else {
+                pending_duplicate_jobs()
+                    .lock()
+                    .await
+                    .insert(callback.token, pending);
+                answer_callback_or_log(
+                    &telegram,
+                    callback_id,
+                    "Skipping duplicates is not available for this job.".to_string(),
+                )
+                .await;
+                return;
+            };
+            let pending = PendingDuplicateJob { job, ..pending };
+            queue_duplicate_choice(
+                context,
+                callback_id,
+                chat_id,
+                message.message_id,
+                pending,
+                JobRunMode::StagedKeepBoth,
+                "skip duplicates",
+            )
+            .await;
+        }
         DuplicateCallbackAction::Run(action) => {
             if matches!(action, VideoDuplicateAction::Overwrite)
                 && !job_allows_duplicate_overwrite(&pending.job, &pending.duplicate)
@@ -4328,83 +4367,108 @@ async fn handle_callback_query(context: BotContext, callback_query: CallbackQuer
                 VideoDuplicateAction::Overwrite => "overwrite",
                 VideoDuplicateAction::KeepBoth => "keep both",
             };
-            let queued_generation = match queue.set_status_if_generation(
-                &pending.task_id,
-                pending.generation,
-                &[TaskStatus::AwaitingDuplicateChoice],
-                TaskStatus::Queued,
-            ) {
-                Ok(Some(task)) => task.generation,
-                Ok(None) => {
-                    answer_callback_or_log(
-                        &telegram,
-                        callback_id,
-                        "This choice has expired.".to_string(),
-                    )
-                    .await;
-                    return;
-                }
-                Err(err) => {
-                    warn!(task_id = %pending.task_id, error = %err, "failed to queue duplicate-choice task");
-                    answer_callback_or_log(
-                        &telegram,
-                        callback_id,
-                        "Could not save this choice; try again from /queue.".to_string(),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            match set_status_message_id_if_generation_and_status_with_retry_delay(
-                &queue,
-                &pending.task_id,
-                queued_generation,
-                &[TaskStatus::Queued],
-                message.message_id,
-                context.queue_start_retry_delay,
-            )
-            .await
-            {
-                Ok(Some(_)) => {}
-                Ok(None) => warn!(
-                    task_id = %pending.task_id,
-                    generation = queued_generation,
-                    "duplicate choice advanced before its prompt message was associated"
-                ),
-                Err(err) => warn!(
-                    task_id = %pending.task_id,
-                    generation = queued_generation,
-                    error = %err,
-                    "failed to retain duplicate choice message as queued status"
-                ),
-            }
-            answer_callback_or_log(&telegram, callback_id, "Queued.".to_string()).await;
-            edit_without_keyboard_or_send(
-                &telegram,
-                chat_id,
-                message.message_id,
-                format!(
-                    "Selected {action_label} for job #{}: {}",
-                    pending.job_id,
-                    pending.job.label()
-                ),
-            )
-            .await;
-            queue_queued_task(
+            let run_mode = JobRunMode::Duplicate(DuplicateRun {
+                action,
+                duplicate: pending.duplicate.clone(),
+            });
+            queue_duplicate_choice(
                 context,
+                callback_id,
                 chat_id,
-                pending.job_id,
-                pending.task_id,
-                pending.job,
-                JobRunMode::Duplicate(DuplicateRun {
-                    action,
-                    duplicate: pending.duplicate,
-                }),
-                Some(queued_generation),
+                message.message_id,
+                pending,
+                run_mode,
+                action_label,
             )
             .await;
         }
     }
+}
+
+async fn queue_duplicate_choice(
+    context: BotContext,
+    callback_id: String,
+    chat_id: i64,
+    message_id: i64,
+    pending: PendingDuplicateJob,
+    run_mode: JobRunMode,
+    action_label: &str,
+) {
+    let telegram = context.telegram.clone();
+    let queue = Arc::clone(&context.queue);
+    let queued_generation = match queue.update_job_if_generation(
+        &pending.task_id,
+        pending.generation,
+        &[TaskStatus::AwaitingDuplicateChoice],
+        pending.job.clone(),
+        TaskStatus::Queued,
+    ) {
+        Ok(Some(task)) => task.generation,
+        Ok(None) => {
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                "This choice has expired.".to_string(),
+            )
+            .await;
+            return;
+        }
+        Err(err) => {
+            warn!(task_id = %pending.task_id, error = %err, "failed to queue duplicate-choice task");
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                "Could not save this choice; try again from /queue.".to_string(),
+            )
+            .await;
+            return;
+        }
+    };
+    match set_status_message_id_if_generation_and_status_with_retry_delay(
+        &queue,
+        &pending.task_id,
+        queued_generation,
+        &[TaskStatus::Queued],
+        message_id,
+        context.queue_start_retry_delay,
+    )
+    .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => warn!(
+            task_id = %pending.task_id,
+            generation = queued_generation,
+            "duplicate choice advanced before its prompt message was associated"
+        ),
+        Err(err) => warn!(
+            task_id = %pending.task_id,
+            generation = queued_generation,
+            error = %err,
+            "failed to retain duplicate choice message as queued status"
+        ),
+    }
+    answer_callback_or_log(&telegram, callback_id, "Queued.".to_string()).await;
+    edit_without_keyboard_or_send(
+        &telegram,
+        chat_id,
+        message_id,
+        format!(
+            "Selected {action_label} for job #{}: {}",
+            pending.job_id,
+            pending.job.label()
+        ),
+    )
+    .await;
+    queue_queued_task(
+        context,
+        chat_id,
+        pending.job_id,
+        pending.task_id,
+        pending.job,
+        run_mode,
+        Some(queued_generation),
+    )
+    .await;
 }
 
 async fn handle_bilibili_selection_callback(
@@ -5154,6 +5218,7 @@ struct DuplicateCallback {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DuplicateCallbackAction {
     Run(VideoDuplicateAction),
+    Skip,
     Cancel,
 }
 
@@ -5168,6 +5233,7 @@ fn parse_duplicate_callback_data(data: &str) -> Option<DuplicateCallback> {
     let action = match action {
         "overwrite" => DuplicateCallbackAction::Run(VideoDuplicateAction::Overwrite),
         "keep" => DuplicateCallbackAction::Run(VideoDuplicateAction::KeepBoth),
+        "skip" => DuplicateCallbackAction::Skip,
         "cancel" => DuplicateCallbackAction::Cancel,
         _ => return None,
     };
@@ -5187,8 +5253,18 @@ fn duplicate_callback_data(token: u64, action: &str) -> String {
     format!("dup:{token:016x}:{action}")
 }
 
-fn duplicate_choice_keyboard(token: u64, allow_overwrite: bool) -> InlineKeyboardMarkup {
+fn duplicate_choice_keyboard(
+    token: u64,
+    allow_overwrite: bool,
+    allow_skip: bool,
+) -> InlineKeyboardMarkup {
     let mut first_row = Vec::new();
+    if allow_skip {
+        first_row.push(InlineKeyboardButton {
+            text: "Skip duplicates".to_string(),
+            callback_data: duplicate_callback_data(token, "skip"),
+        });
+    }
     if allow_overwrite {
         first_row.push(InlineKeyboardButton {
             text: "Overwrite".to_string(),
@@ -5203,7 +5279,7 @@ fn duplicate_choice_keyboard(token: u64, allow_overwrite: bool) -> InlineKeyboar
         inline_keyboard: vec![
             first_row,
             vec![InlineKeyboardButton {
-                text: "Cancel".to_string(),
+                text: "Cancel entire job".to_string(),
                 callback_data: duplicate_callback_data(token, "cancel"),
             }],
         ],
@@ -5211,12 +5287,33 @@ fn duplicate_choice_keyboard(token: u64, allow_overwrite: bool) -> InlineKeyboar
 }
 
 fn duplicate_choice_message(job_id: u64, job_label: &str, duplicate: &VideoDuplicate) -> String {
+    let skip_summary = duplicate.skip_summary.as_ref().map_or(String::new(), |summary| {
+        format!(
+            "\nAlready downloaded: {}/{} episodes. Skip duplicates to download the remaining {} episodes.",
+            summary.duplicate_entries,
+            summary.total_entries,
+            summary.total_entries.saturating_sub(summary.duplicate_entries)
+        )
+    });
     format!(
-        "Existing video found for job #{job_id}: {job_label}\nIdentity: {} {}\n\nChoose how to handle it:\n{}",
+        "Existing video found for job #{job_id}: {job_label}\nIdentity: {} {}{skip_summary}\n\nChoose how to handle it:\n{}",
         duplicate.identity.provider.as_str(),
         duplicate.identity.id,
         duplicate.describe_existing_videos(5)
     )
+}
+
+fn job_skipping_duplicates(job: &JobRequest, duplicate: &VideoDuplicate) -> Option<JobRequest> {
+    if !duplicate.allows_skip_for(job) {
+        return None;
+    }
+    let JobRequest::Bilibili { url, .. } = job else {
+        return None;
+    };
+    Some(JobRequest::Bilibili {
+        url: url.clone(),
+        selection: Some(BilibiliSelection::Missing),
+    })
 }
 
 async fn answer_callback_or_log(
@@ -5636,7 +5733,13 @@ async fn run_queued_job(
                     .await
                 }
                 JobRunMode::StagedKeepBoth => {
-                    run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
+                    run_video_job_staged_keep_both_with_plan(
+                        &config,
+                        &job,
+                        updated_task.plan.clone(),
+                        Some(progress_tx),
+                    )
+                    .await
                 }
                 JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
             }
@@ -5721,11 +5824,22 @@ async fn run_queued_job(
                     config.downloads.video_dir.clone()
                 };
                 let media_paths = report.primary_media_paths.clone();
+                validate_existing_bilibili_report_for_completion(&config, &report).await?;
+                let verification_report = report.clone();
                 let hashes = tokio::task::spawn_blocking(move || {
-                    hash_primary_media(&media_root, &media_paths)
+                    let root = crate::safe_fs::RootedFs::new(&media_root)?;
+                    let expected =
+                        existing_bilibili_report_media_identities(&root, &verification_report)?;
+                    let hashes = hash_primary_media_with_expected_identities(
+                        &media_root,
+                        &media_paths,
+                        &expected,
+                    )?;
+                    Ok::<_, anyhow::Error>(hashes)
                 })
                 .await
                 .context("published media hash task failed to join")??;
+                validate_existing_bilibili_report_for_completion(&config, &report).await?;
                 complete_published_task_with_retry(
                     &telegram,
                     &queue,
@@ -11688,6 +11802,13 @@ mod tests {
                 action: DuplicateCallbackAction::Cancel
             })
         );
+        assert_eq!(
+            parse_duplicate_callback_data("dup:000000000000002a:skip"),
+            Some(DuplicateCallback {
+                token: 42,
+                action: DuplicateCallbackAction::Skip
+            })
+        );
         assert_eq!(parse_duplicate_callback_data("dup:nothex:keep"), None);
         assert_eq!(parse_duplicate_callback_data("other:42:keep"), None);
         assert_eq!(parse_duplicate_callback_data("dup:42:unknown"), None);
@@ -12043,7 +12164,7 @@ mod tests {
 
     #[test]
     fn builds_duplicate_choice_keyboard() {
-        let keyboard = duplicate_choice_keyboard(42, true);
+        let keyboard = duplicate_choice_keyboard(42, true, false);
         let data = keyboard
             .inline_keyboard
             .iter()
@@ -12073,7 +12194,7 @@ mod tests {
             "<movie><uniqueid type=\"bilibili-cid\">cid456</uniqueid></movie>",
         )
         .expect("test NFO should write");
-        let keyboard = duplicate_choice_keyboard(42, false);
+        let keyboard = duplicate_choice_keyboard(42, false, false);
         let data = keyboard
             .inline_keyboard
             .iter()
@@ -12086,6 +12207,7 @@ mod tests {
             vec!["dup:000000000000002a:keep", "dup:000000000000002a:cancel"]
         );
         let exact_duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: crate::downloader::VideoIdentity {
                 provider: crate::downloader::VideoProvider::Bilibili,
@@ -12108,6 +12230,7 @@ mod tests {
             &exact_duplicate,
         ));
         let broad_duplicate = VideoDuplicate {
+            skip_summary: None,
             overwrite_confirmation: None,
             identity: crate::downloader::VideoIdentity {
                 provider: crate::downloader::VideoProvider::Bilibili,
@@ -12125,6 +12248,58 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn season_duplicate_choice_preserves_missing_selection() {
+        let job = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/bangumi/media/md1376".to_string(),
+            selection: Some(BilibiliSelection::All),
+        };
+        let mut duplicate = VideoDuplicate {
+            skip_summary: Some(crate::downloader::BilibiliSkipSummary {
+                total_entries: 203,
+                duplicate_entries: 1,
+            }),
+            overwrite_confirmation: None,
+            identity: crate::downloader::VideoIdentity {
+                provider: crate::downloader::VideoProvider::Bilibili,
+                id: "cid33083494166".to_string(),
+            },
+            existing_videos: vec![PathBuf::from("episode203.mp4")],
+        };
+        let keyboard = duplicate_choice_keyboard(42, false, duplicate.allows_skip_for(&job));
+        let buttons = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        assert_eq!(buttons[0].text, "Skip duplicates");
+        assert_eq!(buttons[0].callback_data, "dup:000000000000002a:skip");
+        assert_eq!(buttons.last().unwrap().text, "Cancel entire job");
+        let prompt = duplicate_choice_message(1, job.label(), &duplicate);
+        assert!(prompt.contains("1/203 episodes"));
+        assert!(prompt.contains("remaining 202 episodes"));
+        let missing =
+            job_skipping_duplicates(&job, &duplicate).expect("exact duplicates allow skipping");
+        let serialized = serde_json::to_string(&missing).expect("selection should persist");
+        let restored: JobRequest =
+            serde_json::from_str(&serialized).expect("selection should restore");
+        assert_eq!(missing, restored);
+        assert!(matches!(
+            restored,
+            JobRequest::Bilibili {
+                selection: Some(BilibiliSelection::Missing),
+                ..
+            }
+        ));
+        let latest = JobRequest::Bilibili {
+            url: "https://www.bilibili.com/bangumi/media/md1376".to_string(),
+            selection: Some(BilibiliSelection::Latest),
+        };
+        assert!(job_skipping_duplicates(&latest, &duplicate).is_none());
+        duplicate.skip_summary = None;
+        assert!(job_skipping_duplicates(&job, &duplicate).is_none());
+    }
+
     fn pending_duplicate_job(job_id: u64, created_at: Instant) -> PendingDuplicateJob {
         PendingDuplicateJob {
             chat_id: 1,
@@ -12135,6 +12310,7 @@ mod tests {
                 url: format!("https://youtu.be/{job_id}"),
             },
             duplicate: VideoDuplicate {
+                skip_summary: None,
                 overwrite_confirmation: None,
                 identity: crate::downloader::VideoIdentity {
                     provider: crate::downloader::VideoProvider::Youtube,

@@ -33,6 +33,14 @@ pub(crate) struct EntryIdentity {
 }
 
 impl EntryIdentity {
+    pub(crate) fn regular_file(device: u64, inode: u64) -> Self {
+        Self {
+            device,
+            inode,
+            file_type: FileType::RegularFile,
+        }
+    }
+
     pub(crate) fn is_file(self) -> bool {
         self.file_type == FileType::RegularFile
     }
@@ -213,6 +221,25 @@ impl BoundFile {
             bail!("bound file descriptor identity changed");
         }
         Ok(())
+    }
+
+    pub(crate) fn content_stamp(&self) -> Result<(u64, i64, i64, i64, i64)> {
+        use std::os::unix::fs::MetadataExt;
+
+        self.validate_identity()?;
+        let file = self.duplicate_std_file()?;
+        let metadata = file
+            .metadata()
+            .context("failed to read bound file metadata")?;
+        let stamp = (
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        );
+        self.validate_identity()?;
+        Ok(stamp)
     }
 
     pub(crate) fn validate_private_single_link(&self, mode: u16) -> Result<()> {

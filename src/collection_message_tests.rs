@@ -2449,6 +2449,7 @@ mod collection_message_tests {
             selection: Some(BilibiliSelection::All),
         };
         let duplicate = VideoDuplicate {
+            skip_summary: None,
             identity: crate::downloader::VideoIdentity {
                 provider: crate::downloader::VideoProvider::Bilibili,
                 id: "cid-generation-fixture".to_string(),

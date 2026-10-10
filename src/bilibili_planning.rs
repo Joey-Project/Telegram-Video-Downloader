@@ -9,6 +9,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 const MAX_EPISODE_PLANNING_CONCURRENCY: usize = 2;
+const EXISTING_MEDIA_CHECK_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Resolves a Bilibili input and plans its selected download entries.
 ///
@@ -23,6 +24,65 @@ pub async fn plan_download(
     per_entry_timeout: Duration,
     progress: impl Fn(usize, usize),
 ) -> Result<(DownloadPlan, ResolvedContent)> {
+    let (plan, resolved, _) = plan_download_with_filter::<
+        fn(EpisodeMetadata) -> std::future::Ready<Option<()>>,
+        std::future::Ready<Option<()>>,
+        (),
+    >(
+        client,
+        url,
+        selection,
+        mode,
+        per_entry_timeout,
+        progress,
+        None,
+    )
+    .await?;
+    Ok((plan, resolved))
+}
+
+/// Resolves and plans a season while excluding entries selected by `is_existing`.
+/// Excluded entries are removed before any per-episode play URL is requested.
+pub async fn plan_download_filtered<F, Fut, E>(
+    client: &BiliClient,
+    url: &str,
+    selection: Option<Selection>,
+    mode: DownloadMode,
+    per_entry_timeout: Duration,
+    progress: impl Fn(usize, usize),
+    is_existing: F,
+) -> Result<(DownloadPlan, ResolvedContent, Vec<(EpisodeMetadata, E)>)>
+where
+    F: Fn(EpisodeMetadata) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<E>> + Send + 'static,
+    E: Send + 'static,
+{
+    plan_download_with_filter(
+        client,
+        url,
+        selection,
+        mode,
+        per_entry_timeout,
+        progress,
+        Some(is_existing),
+    )
+    .await
+}
+
+async fn plan_download_with_filter<F, Fut, E>(
+    client: &BiliClient,
+    url: &str,
+    selection: Option<Selection>,
+    mode: DownloadMode,
+    per_entry_timeout: Duration,
+    progress: impl Fn(usize, usize),
+    is_existing: Option<F>,
+) -> Result<(DownloadPlan, ResolvedContent, Vec<(EpisodeMetadata, E)>)>
+where
+    F: Fn(EpisodeMetadata) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<E>> + Send + 'static,
+    E: Send + 'static,
+{
     let (input, resolved) = timeout(per_entry_timeout, async {
         let input = client.parse_input(url).await?;
         let resolved = client.resolve(input.clone(), selection.clone()).await?;
@@ -38,6 +98,11 @@ pub async fn plan_download(
     })?;
 
     let ResolvedContent::Season(season) = &resolved else {
+        if is_existing.is_some() {
+            return Err(anyhow!(
+                "missing Bilibili episode download requires a season URL"
+            ));
+        }
         let plan = timeout(
             per_entry_timeout,
             client.plan_with_download_mode(input, selection, mode),
@@ -51,15 +116,36 @@ pub async fn plan_download(
             )
         })?;
         progress(plan.entries.len(), plan.entries.len());
-        return Ok((plan, resolved));
+        return Ok((plan, resolved, Vec::new()));
     };
 
     let season_title = season.season.title.clone();
-    let episodes = season.selected_episodes.clone();
-    let total = episodes.len();
+    let selected_episodes = season.selected_episodes.clone();
+    let total = selected_episodes.len();
+    let evidence = if let Some(predicate) = is_existing {
+        probe_existing_episodes(
+            selected_episodes.clone(),
+            per_entry_timeout.min(EXISTING_MEDIA_CHECK_TIMEOUT),
+            predicate,
+        )
+        .await?
+    } else {
+        (0..total).map(|_| None).collect()
+    };
+    let (episodes, skipped) = partition_existing_episodes(selected_episodes, evidence);
     progress(0, total);
     if episodes.is_empty() {
-        return Err(anyhow!("season selection resolved to no episodes"));
+        if skipped.is_empty() {
+            return Err(anyhow!("season selection resolved to no episodes"));
+        }
+        return Ok((
+            DownloadPlan {
+                title: season_title,
+                entries: Vec::new(),
+            },
+            resolved,
+            skipped,
+        ));
     }
     let input_kind = episode_input_kind(&input);
     let work = episodes
@@ -97,7 +183,52 @@ pub async fn plan_download(
             entries,
         },
         resolved,
+        skipped,
     ))
+}
+
+async fn probe_existing_episodes<F, Fut, E>(
+    episodes: Vec<EpisodeMetadata>,
+    probe_timeout: Duration,
+    predicate: F,
+) -> Result<Vec<Option<E>>>
+where
+    F: Fn(EpisodeMetadata) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Option<E>> + Send + 'static,
+    E: Send + 'static,
+{
+    schedule_bounded(
+        episodes
+            .into_iter()
+            .map(|episode| (episode.index, episode))
+            .collect(),
+        probe_timeout + Duration::from_secs(1),
+        move |episode| {
+            let future = predicate(episode);
+            async move {
+                // Unreadable or slow existing media is uncertain evidence: plan it.
+                Ok(timeout(probe_timeout, future).await.unwrap_or(None))
+            }
+        },
+        |_, _| {},
+    )
+    .await
+}
+
+fn partition_existing_episodes<E>(
+    selected_episodes: Vec<EpisodeMetadata>,
+    evidence: Vec<Option<E>>,
+) -> (Vec<EpisodeMetadata>, Vec<(EpisodeMetadata, E)>) {
+    let mut planned = Vec::new();
+    let mut skipped = Vec::new();
+    assert_eq!(selected_episodes.len(), evidence.len());
+    for (episode, evidence) in selected_episodes.into_iter().zip(evidence) {
+        match evidence {
+            Some(evidence) => skipped.push((episode, evidence)),
+            None => planned.push(episode),
+        }
+    }
+    (planned, skipped)
 }
 
 #[derive(Clone, Copy)]
@@ -278,7 +409,8 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        EpisodeInputKind, TaskFailure, episode_input_kind, safe_planning_failure, schedule_bounded,
+        EpisodeInputKind, TaskFailure, episode_input_kind, partition_existing_episodes,
+        probe_existing_episodes, safe_planning_failure, schedule_bounded,
         validate_and_preserve_episode,
     };
     use bbdown_core::{DownloadPlan, EpisodeMetadata};
@@ -565,6 +697,104 @@ mod tests {
             validate_and_preserve_episode(&mut multiple, &expected),
             Err(TaskFailure::UnexpectedEntryCount)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn existing_episodes_are_removed_from_planning_work_before_requests() {
+        let episode = |index| EpisodeMetadata {
+            index,
+            aid: u64::from(index) + 100,
+            bvid: Some(format!("BV{index}")),
+            cid: u64::from(index) + 200,
+            epid: u64::from(index) + 300,
+            title: format!("Episode {index}"),
+            long_title: None,
+            pub_time: None,
+        };
+        let (planned, skipped) = partition_existing_episodes(
+            vec![episode(1), episode(203), episode(7)],
+            vec![None, Some("verified path"), None],
+        );
+
+        assert_eq!(
+            planned
+                .iter()
+                .map(|episode| episode.index)
+                .collect::<Vec<_>>(),
+            vec![1, 7]
+        );
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|(episode, _)| episode.index)
+                .collect::<Vec<_>>(),
+            vec![203]
+        );
+        let (planned, skipped) = partition_existing_episodes(
+            vec![episode(1), episode(203)],
+            vec![Some("first path"), Some("last path")],
+        );
+        assert!(
+            planned.is_empty(),
+            "all existing entries produce no planning work"
+        );
+        assert_eq!(skipped.len(), 2);
+        let (planned, skipped) =
+            partition_existing_episodes(vec![episode(1), episode(203)], vec![None::<()>, None]);
+        assert_eq!(planned.len(), 2);
+        assert!(skipped.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn existing_probes_are_bounded_ordered_and_timeout_conservatively() -> Result<()> {
+        struct ActiveProbe(Arc<AtomicUsize>);
+        impl Drop for ActiveProbe {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let predicate_active = Arc::clone(&active);
+        let predicate_peak = Arc::clone(&peak);
+        let predicate_calls = Arc::clone(&calls);
+        let episodes = (1..=4)
+            .map(|index| EpisodeMetadata {
+                index,
+                aid: u64::from(index) + 100,
+                bvid: None,
+                cid: u64::from(index) + 200,
+                epid: u64::from(index) + 300,
+                title: format!("Episode {index}"),
+                long_title: None,
+                pub_time: None,
+            })
+            .collect();
+        let evidence = probe_existing_episodes(episodes, Duration::from_secs(5), move |episode| {
+            let active = Arc::clone(&predicate_active);
+            let peak = Arc::clone(&predicate_peak);
+            let calls = Arc::clone(&predicate_calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                let _guard = ActiveProbe(active);
+                let delay = match episode.index {
+                    1 => 8,
+                    2 => 3,
+                    _ => 1,
+                };
+                sleep(Duration::from_secs(delay)).await;
+                Some(episode.index)
+            }
+        })
+        .await?;
+        assert_eq!(evidence, vec![None, Some(2), Some(3), Some(4)]);
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
         Ok(())
     }
 
