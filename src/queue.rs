@@ -145,6 +145,9 @@ pub struct TaskRecord {
     pub cancel_requested: bool,
     pub plan: Option<PlanValidationSnapshot>,
     pub proposed_plan: Option<PlanValidationSnapshot>,
+    // Display-only details never authorize a download or replace plan revalidation.
+    #[serde(default)]
+    pub display_metadata: Option<PlanValidationSnapshot>,
     pub saved_location: Option<String>,
     #[serde(default)]
     pub primary_media_hashes: BTreeMap<String, String>,
@@ -267,6 +270,7 @@ impl TaskRecord {
             cancel_requested: false,
             plan: None,
             proposed_plan: None,
+            display_metadata: None,
             saved_location: None,
             primary_media_hashes: BTreeMap::new(),
             primary_media_hash_manifest: None,
@@ -537,6 +541,9 @@ impl QueueManager {
             }
             record.original_url = job_url(&job).to_string();
             record.url_was_sanitized |= url_was_sanitized;
+            if record.job != job {
+                record.display_metadata = None;
+            }
             record.job = job;
             record.status = status;
             record.cancel_requested = false;
@@ -565,6 +572,9 @@ impl QueueManager {
                 }
                 record.original_url = job_url(&job).to_string();
                 record.url_was_sanitized |= url_was_sanitized;
+                if record.job != job {
+                    record.display_metadata = None;
+                }
                 record.job = job;
                 record.status = status;
                 record.cancel_requested = false;
@@ -720,6 +730,24 @@ impl QueueManager {
         record.status = TaskStatus::Verifying;
         record.cancel_requested = false;
         store.save_mutated_record(record, entry, true).map(Some)
+    }
+
+    pub fn set_display_metadata_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        metadata: PlanValidationSnapshot,
+    ) -> Result<Option<TaskRecord>> {
+        self.update_if_generation_and_status(
+            id,
+            expected_generation,
+            &[TaskStatus::Preparing, TaskStatus::Running],
+            false,
+            |record| {
+                record.display_metadata = Some(metadata);
+                Ok(())
+            },
+        )
     }
 
     pub fn set_plan_if_generation(

@@ -30,7 +30,12 @@ pub async fn plan_download(
     })
     .await
     .map_err(|_| anyhow!("Bilibili input resolution timed out"))?
-    .map_err(|_| anyhow!("failed to parse or resolve Bilibili input"))?;
+    .map_err(|error| {
+        anyhow!(
+            "failed to parse or resolve Bilibili input: {}",
+            safe_planning_failure(&error)
+        )
+    })?;
 
     let ResolvedContent::Season(season) = &resolved else {
         let plan = timeout(
@@ -39,7 +44,12 @@ pub async fn plan_download(
         )
         .await
         .map_err(|_| anyhow!("Bilibili download planning timed out"))?
-        .map_err(|_| anyhow!("failed to plan Bilibili download"))?;
+        .map_err(|error| {
+            anyhow!(
+                "failed to plan Bilibili download: {}",
+                safe_planning_failure(&error)
+            )
+        })?;
         progress(plan.entries.len(), plan.entries.len());
         return Ok((plan, resolved));
     };
@@ -71,7 +81,7 @@ pub async fn plan_download(
                 let mut plan = client
                     .plan_with_download_mode(input, Some(Selection::Episode(episode.epid)), mode)
                     .await
-                    .map_err(|_| TaskFailure::Upstream)?;
+                    .map_err(|error| TaskFailure::Upstream(safe_planning_failure(&error)))?;
                 validate_and_preserve_episode(&mut plan, &episode)?;
                 Ok(plan.entries)
             }
@@ -201,23 +211,37 @@ where
     Ok(ordered.into_iter().flatten().collect())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum TaskFailure {
     Timeout,
-    Upstream,
+    Upstream(String),
     UnexpectedEntryCount,
     IdentityChanged,
 }
 
 impl TaskFailure {
-    const fn message(self) -> &'static str {
+    fn message(&self) -> String {
         match self {
-            Self::Timeout => "planning timed out",
-            Self::Upstream => "planning failed",
-            Self::UnexpectedEntryCount => "planner returned an unexpected entry count",
-            Self::IdentityChanged => "episode identity changed during planning",
+            Self::Timeout => "planning timed out".to_string(),
+            Self::Upstream(reason) => format!("planning failed: {reason}"),
+            Self::UnexpectedEntryCount => "planner returned an unexpected entry count".to_string(),
+            Self::IdentityChanged => "episode identity changed during planning".to_string(),
         }
     }
+}
+
+fn safe_planning_failure(error: &bbdown_core::Error) -> String {
+    // API denial messages explain missing stream details. Keep HTTP/IO errors generic
+    // because they can include credential-bearing URLs or local configuration paths.
+    let reason = match error {
+        bbdown_core::Error::Api { code, message } => format!("API returned code {code}: {message}"),
+        bbdown_core::Error::AccessRestricted(message) => format!("access restricted: {message}"),
+        _ => "upstream request failed".to_string(),
+    };
+    crate::redaction::redact_sensitive_text(&reason)
+        .chars()
+        .take(256)
+        .collect()
 }
 
 fn spawn_episode_task<T, O, F, Fut>(
@@ -254,10 +278,32 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::{
-        EpisodeInputKind, TaskFailure, episode_input_kind, schedule_bounded,
+        EpisodeInputKind, TaskFailure, episode_input_kind, safe_planning_failure, schedule_bounded,
         validate_and_preserve_episode,
     };
     use bbdown_core::{DownloadPlan, EpisodeMetadata};
+
+    #[tokio::test]
+    async fn episode_failure_preserves_api_denial_reason() {
+        let error = schedule_bounded(
+            vec![(203, ())],
+            Duration::from_secs(1),
+            |_| async {
+                Err::<(), _>(TaskFailure::Upstream(safe_planning_failure(
+                    &bbdown_core::Error::Api {
+                        code: -10403,
+                        message: "This video is not available in your region".to_string(),
+                    },
+                )))
+            },
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("episode index 203"));
+        assert!(error.to_string().contains("API returned code -10403"));
+        assert!(error.to_string().contains("not available in your region"));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn independent_timeouts_allow_total_duration_over_timeout() -> Result<()> {
@@ -368,7 +414,9 @@ mod tests {
                             while started.load(Ordering::SeqCst) < 2 {
                                 tokio::task::yield_now().await;
                             }
-                            Err(TaskFailure::Upstream)
+                            Err(TaskFailure::Upstream(
+                                "fixture upstream failure".to_string(),
+                            ))
                         } else {
                             let _drop_flag = DropFlag(cancelled);
                             std::future::pending::<()>().await;

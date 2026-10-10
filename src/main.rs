@@ -35,8 +35,9 @@ use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
     BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
     JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, VideoDuplicate,
-    VideoDuplicateAction, find_video_duplicate_with_probe, human_bytes, inspect_job_plan,
-    job_progress_channel, recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
+    VideoDuplicateAction, VideoDuplicateCheck, find_video_duplicate_with_probe, human_bytes,
+    inspect_job_display_metadata, inspect_job_plan, job_progress_channel,
+    recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both, sync_bilibili_rust_credentials,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
@@ -1313,6 +1314,7 @@ fn render_queue_page(
         "Size is the expected total for selected streams; final files may differ.".to_string(),
     );
     let mut rows = Vec::new();
+    let mut detail_notices = Vec::new();
     for (page_index, record) in records.into_iter().enumerate() {
         let task_number = command
             .page
@@ -1348,6 +1350,10 @@ fn render_queue_page(
                 QUEUE_URL_PREVIEW_UNITS,
             ),
         ));
+        if let Some(reason) = queue_task_detail_notice(&record) {
+            detail_notices.push((lines.len(), reason));
+            lines.push(String::new());
+        }
         if command.history {
             continue;
         }
@@ -1376,6 +1382,18 @@ fn render_queue_page(
             },
         ]);
     }
+    if !detail_notices.is_empty() {
+        let base_units = lines.join("\n").encode_utf16().count();
+        let notice_units = (QUEUE_PAGE_MAX_TEXT_UNITS.saturating_sub(base_units)
+            / detail_notices.len())
+        .saturating_sub("Details: ".len())
+        .min(QUEUE_TASK_DETAIL_NOTICE_UNITS);
+        if notice_units > 0 {
+            for (line, reason) in detail_notices {
+                lines[line] = format!("Details: {}", truncate_utf16_units(&reason, notice_units));
+            }
+        }
+    }
     let rendered = lines.join("\n");
     let over_limit = rendered.encode_utf16().count() > QUEUE_PAGE_MAX_TEXT_UNITS;
     let text = truncate_utf16_units(&rendered, QUEUE_PAGE_MAX_TEXT_UNITS);
@@ -1392,6 +1410,7 @@ const QUEUE_TASK_TITLE_UNITS: usize = 64;
 const QUEUE_TASK_QUALITY_UNITS: usize = 22;
 const QUEUE_TASK_SIZE_UNITS: usize = 20;
 const QUEUE_TASK_ID_PREVIEW_UNITS: usize = 24;
+const QUEUE_TASK_DETAIL_NOTICE_UNITS: usize = 96;
 const QUEUE_COUNT_PREVIEW_UNITS: usize = 12;
 const QUEUE_BUTTON_LABEL_MAX_UNITS: usize = 64;
 const QUEUE_BUTTON_QUALITY_UNITS: usize = 12;
@@ -1417,6 +1436,8 @@ fn queue_task_display(record: &TaskRecord) -> QueueTaskDisplay {
         (Some(plan), None)
     } else if let Some(plan) = record.proposed_plan.as_ref() {
         (Some(plan), Some("Proposed plan"))
+    } else if let Some(metadata) = record.display_metadata.as_ref() {
+        (Some(metadata), Some("Preview"))
     } else {
         (None, None)
     };
@@ -1425,6 +1446,14 @@ fn queue_task_display(record: &TaskRecord) -> QueueTaskDisplay {
         .and_then(|plan| plan.title.as_deref())
         .map(sanitize_queue_display_text)
         .filter(|title| !title.is_empty())
+        .or_else(|| {
+            record
+                .display_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.title.as_deref())
+                .map(sanitize_queue_display_text)
+                .filter(|title| !title.is_empty())
+        })
         .unwrap_or_else(|| record.job.label().to_string());
     let quality = plan
         .map(queue_plan_quality)
@@ -1448,6 +1477,39 @@ fn queue_task_display(record: &TaskRecord) -> QueueTaskDisplay {
     }
 }
 
+fn queue_task_detail_notice(record: &TaskRecord) -> Option<String> {
+    if matches!(record.status, TaskStatus::Failed | TaskStatus::Interrupted)
+        && let Some(error) = record.error.as_deref()
+    {
+        let error = sanitize_queue_display_text(&redact_sensitive_text(error));
+        let error = error
+            .find("API returned code ")
+            .map_or(error.as_str(), |index| {
+                let start = error[..index].rfind("episode index ").unwrap_or(index);
+                &error[start..]
+            });
+        if !error.is_empty() {
+            return Some(truncate_utf16_units(error, QUEUE_TASK_DETAIL_NOTICE_UNITS));
+        }
+    }
+    if record.plan.is_none()
+        && record.proposed_plan.is_none()
+        && record
+            .display_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.selected_format_ids.is_empty())
+    {
+        return Some(if matches!(record.job, JobRequest::Pdf { .. }) {
+            "Document information is not available yet.".to_string()
+        } else if record.display_metadata.is_some() {
+            "Stream information is not available yet.".to_string()
+        } else {
+            "Video information is not available yet.".to_string()
+        });
+    }
+    None
+}
+
 fn queue_task_collection_label(record: &TaskRecord) -> Option<String> {
     if !is_bilibili_ugc_collection_job(&record.job) {
         return None;
@@ -1456,7 +1518,8 @@ fn queue_task_collection_label(record: &TaskRecord) -> Option<String> {
         record.proposed_plan.as_ref().or(record.plan.as_ref())
     } else {
         record.plan.as_ref().or(record.proposed_plan.as_ref())
-    };
+    }
+    .or(record.display_metadata.as_ref());
     let count = if record.media_entries_total > 1 {
         Some(record.media_entries_total)
     } else {
@@ -3521,6 +3584,21 @@ async fn process_job_after_duplicate_check(
     };
     let duplicate_scan_result = find_video_duplicate_async(Arc::clone(&config), job.clone()).await;
     drop(duplicate_scan_permit);
+    let duplicate_scan_result = match duplicate_scan_result {
+        Ok(check) => {
+            if let Some(metadata) = check.display_metadata {
+                match queue.set_display_metadata_if_generation(&task_id, generation, metadata) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return,
+                    Err(err) => {
+                        warn!(task_id, error = %err, "failed to persist duplicate-check details")
+                    }
+                }
+            }
+            Ok(check.duplicate)
+        }
+        Err(err) => Err(err),
+    };
 
     match duplicate_scan_result {
         Ok(Some(duplicate)) => {
@@ -3635,10 +3713,57 @@ fn is_bilibili_selection_required_error(error: &anyhow::Error) -> bool {
     })
 }
 
+async fn inspect_and_preserve_job_plan(
+    config: &AppConfig,
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    job: &JobRequest,
+) -> Result<PlanValidationSnapshot> {
+    let result = inspect_job_plan(config, job).await;
+    preserve_job_plan_result(
+        queue,
+        task_id,
+        generation,
+        result,
+        inspect_job_display_metadata(config, job),
+    )
+    .await
+}
+
+async fn preserve_job_plan_result(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    result: Result<PlanValidationSnapshot>,
+    metadata_probe: impl Future<Output = Result<Option<PlanValidationSnapshot>>>,
+) -> Result<PlanValidationSnapshot> {
+    let needs_metadata = if result.is_err() {
+        match queue.get_if_generation(task_id, generation) {
+            Ok(task) => task.is_some_and(|task| task.display_metadata.is_none()),
+            Err(err) => {
+                warn!(task_id, error = %err, "failed to read details after plan probe failure");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if needs_metadata
+        // Include credential synchronization and its semaphore wait in the budget.
+        && let Ok(Ok(Some(metadata))) =
+            tokio_timeout(Duration::from_secs(5), metadata_probe).await
+        && let Err(err) = queue.set_display_metadata_if_generation(task_id, generation, metadata)
+    {
+        warn!(task_id, error = %err, "failed to persist details after plan probe failure");
+    }
+    result
+}
+
 async fn find_video_duplicate_async(
     config: Arc<AppConfig>,
     job: JobRequest,
-) -> Result<Option<VideoDuplicate>> {
+) -> Result<VideoDuplicateCheck> {
     find_video_duplicate_with_probe(&config, &job).await
 }
 
@@ -5309,7 +5434,7 @@ async fn run_queued_job(
     let current_plan = tokio::select! {
         biased;
         _ = cancel.notified() => None,
-        result = inspect_job_plan(&config, &job) => Some(result),
+        result = inspect_and_preserve_job_plan(&config, &queue, &task_id, generation, &job) => Some(result),
     };
     let Some(current_plan) = current_plan else {
         if let Err(err) = queue.finish_cancellation_if_generation(&task_id, generation) {
@@ -12367,4 +12492,5 @@ mod tests {
     }
 
     include!("collection_message_tests.rs");
+    include!("queue_metadata_tests.rs");
 }
