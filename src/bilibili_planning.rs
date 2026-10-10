@@ -23,14 +23,17 @@ pub async fn plan_download(
     per_entry_timeout: Duration,
     progress: impl Fn(usize, usize),
 ) -> Result<(DownloadPlan, ResolvedContent)> {
-    let (plan, resolved, _) = plan_download_with_filter(
+    let (plan, resolved, _) = plan_download_with_filter::<
+        fn(&EpisodeMetadata) -> std::future::Ready<bool>,
+        std::future::Ready<bool>,
+    >(
         client,
         url,
         selection,
         mode,
         per_entry_timeout,
         progress,
-        None::<fn(&EpisodeMetadata) -> bool>,
+        None,
     )
     .await?;
     Ok((plan, resolved))
@@ -38,15 +41,19 @@ pub async fn plan_download(
 
 /// Resolves and plans a season while excluding entries selected by `is_existing`.
 /// Excluded entries are removed before any per-episode play URL is requested.
-pub async fn plan_download_filtered(
+pub async fn plan_download_filtered<F, Fut>(
     client: &BiliClient,
     url: &str,
     selection: Option<Selection>,
     mode: DownloadMode,
     per_entry_timeout: Duration,
     progress: impl Fn(usize, usize),
-    is_existing: impl Fn(&EpisodeMetadata) -> bool,
-) -> Result<(DownloadPlan, ResolvedContent, Vec<EpisodeMetadata>)> {
+    is_existing: F,
+) -> Result<(DownloadPlan, ResolvedContent, Vec<EpisodeMetadata>)>
+where
+    F: Fn(&EpisodeMetadata) -> Fut,
+    Fut: Future<Output = bool>,
+{
     plan_download_with_filter(
         client,
         url,
@@ -59,15 +66,19 @@ pub async fn plan_download_filtered(
     .await
 }
 
-async fn plan_download_with_filter(
+async fn plan_download_with_filter<F, Fut>(
     client: &BiliClient,
     url: &str,
     selection: Option<Selection>,
     mode: DownloadMode,
     per_entry_timeout: Duration,
     progress: impl Fn(usize, usize),
-    is_existing: Option<impl Fn(&EpisodeMetadata) -> bool>,
-) -> Result<(DownloadPlan, ResolvedContent, Vec<EpisodeMetadata>)> {
+    is_existing: Option<F>,
+) -> Result<(DownloadPlan, ResolvedContent, Vec<EpisodeMetadata>)>
+where
+    F: Fn(&EpisodeMetadata) -> Fut,
+    Fut: Future<Output = bool>,
+{
     let (input, resolved) = timeout(per_entry_timeout, async {
         let input = client.parse_input(url).await?;
         let resolved = client.resolve(input.clone(), selection.clone()).await?;
@@ -97,11 +108,15 @@ async fn plan_download_with_filter(
     let season_title = season.season.title.clone();
     let selected_episodes = season.selected_episodes.clone();
     let total = selected_episodes.len();
-    let (episodes, skipped) = partition_existing_episodes(selected_episodes, |episode| {
-        is_existing
-            .as_ref()
-            .is_some_and(|predicate| predicate(episode))
-    });
+    let mut existing_indices = std::collections::BTreeSet::new();
+    if let Some(predicate) = &is_existing {
+        for episode in &selected_episodes {
+            if predicate(episode).await {
+                existing_indices.insert(episode.index);
+            }
+        }
+    }
+    let (episodes, skipped) = partition_existing_episodes(selected_episodes, &existing_indices);
     progress(0, total);
     if episodes.is_empty() {
         if skipped.is_empty() {
@@ -158,12 +173,12 @@ async fn plan_download_with_filter(
 
 fn partition_existing_episodes(
     selected_episodes: Vec<EpisodeMetadata>,
-    is_existing: impl Fn(&EpisodeMetadata) -> bool,
+    existing_indices: &std::collections::BTreeSet<u32>,
 ) -> (Vec<EpisodeMetadata>, Vec<EpisodeMetadata>) {
     let mut planned = Vec::new();
     let mut skipped = Vec::new();
     for episode in selected_episodes {
-        if is_existing(&episode) {
+        if existing_indices.contains(&episode.index) {
             skipped.push(episode);
         } else {
             planned.push(episode);
@@ -614,10 +629,10 @@ mod tests {
             long_title: None,
             pub_time: None,
         };
-        let (planned, skipped) =
-            partition_existing_episodes(vec![episode(1), episode(203), episode(7)], |candidate| {
-                candidate.epid == 503
-            });
+        let (planned, skipped) = partition_existing_episodes(
+            vec![episode(1), episode(203), episode(7)],
+            &std::collections::BTreeSet::from([203]),
+        );
 
         assert_eq!(
             planned
@@ -633,15 +648,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![203]
         );
-        let (planned, skipped) =
-            partition_existing_episodes(vec![episode(1), episode(203)], |_| true);
+        let (planned, skipped) = partition_existing_episodes(
+            vec![episode(1), episode(203)],
+            &std::collections::BTreeSet::from([1, 203]),
+        );
         assert!(
             planned.is_empty(),
             "all existing entries produce no planning work"
         );
         assert_eq!(skipped.len(), 2);
-        let (planned, skipped) =
-            partition_existing_episodes(vec![episode(1), episode(203)], |_| false);
+        let (planned, skipped) = partition_existing_episodes(
+            vec![episode(1), episode(203)],
+            &std::collections::BTreeSet::new(),
+        );
         assert_eq!(planned.len(), 2);
         assert!(skipped.is_empty());
     }

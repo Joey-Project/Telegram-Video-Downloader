@@ -37,7 +37,8 @@ use crate::downloader::{
     JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, VideoDuplicate,
     VideoDuplicateAction, find_video_duplicate_with_probe, human_bytes, inspect_job_plan,
     job_progress_channel, recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
-    run_job_with_duplicate_action, run_video_job_staged_keep_both, sync_bilibili_rust_credentials,
+    run_job_with_duplicate_action, run_video_job_staged_keep_both,
+    run_video_job_staged_keep_both_with_plan, sync_bilibili_rust_credentials,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 use crate::queue::{
@@ -5604,7 +5605,13 @@ async fn run_queued_job(
                     .await
                 }
                 JobRunMode::StagedKeepBoth => {
-                    run_video_job_staged_keep_both(&config, &job, Some(progress_tx)).await
+                    run_video_job_staged_keep_both_with_plan(
+                        &config,
+                        &job,
+                        updated_task.plan.clone(),
+                        Some(progress_tx),
+                    )
+                    .await
                 }
                 JobRunMode::Direct => run_job(&config, &job, Some(progress_tx)).await,
             }

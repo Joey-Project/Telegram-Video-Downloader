@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-10
 updated: 2026-10-10
 branch: codex/skip-season-duplicates
-pr: null
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/34
 supersedes: []
 superseded_by:
 ---
@@ -31,6 +31,11 @@ superseded_by:
 - Queue plan inspection and execution share the same filtering helper, including
   audio-only media. Conflicting CID/EPID evidence across associated sidecars
   prevents skipping the ambiguous file.
+- Filtering rereads current sidecars and uses bounded stream probes for the
+  requested audio/video mode. Artifact-only modes cannot skip from video evidence.
+- The worker compares its lock-protected filtered plan with the queued snapshot
+  before downloading. A changed plan stops with retry/requeue guidance so the
+  queue can validate the new plan.
 - An entirely existing season returns existing media through the normal
   completed-output path. No existing media is overwritten or deleted.
 
@@ -43,8 +48,11 @@ superseded_by:
   the skipped episode receives zero playback requests, the missing episode
   receives one, and an all-existing season produces a valid empty plan.
 - `cargo test --all-targets --locked --offline --quiet -- --test-threads=4`:
-  566 passed, 13 ignored, zero failures. The final run includes actual file removal/replacement and
-  benign directory-entry churn.
+  569 passed, 13 ignored, zero failures. Coverage includes actual file
+  removal/replacement, changed and newly conflicting sidecars, benign
+  directory-entry churn, and real video/audio stream fixtures. Snapshot mismatch
+  rejection and worker IPC propagation are tested directly; a full subprocess
+  download race was not exercised.
 - An initial parallel run hit an existing local Telegram progress timeout; the
   exact test passed alone, and the complete four-thread run passed.
 - Strict Clippy and formatting passed with Cargo/rustc 1.95.0. Queue and HTTP
