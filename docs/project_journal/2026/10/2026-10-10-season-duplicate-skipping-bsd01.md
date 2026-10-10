@@ -51,19 +51,25 @@ superseded_by:
 - Regression coverage includes partial matches, conflicting identities, all
   existing entries, callback labels, serialized skip choices, persisted queue
   recovery, and stale duplicate callbacks.
-- A localhost-only mock makes an existing episode's play URL fail if requested:
+- A localhost-only mock with controlled stream-probe output makes an existing
+  episode's play URL fail if requested:
   the skipped episode receives zero playback requests, the missing episode
   receives one, and an all-existing season produces a valid empty plan.
 - `cargo test --all-targets --locked --offline --quiet -- --test-threads=4`:
-  580 passed, 13 ignored, zero failures after target-branch integration.
+  579 passed, 14 ignored, zero failures after target-branch integration.
   Coverage includes actual file
   removal/replacement, changed and newly conflicting sidecars, benign
-  directory-entry churn, and real video/audio stream fixtures, including mixed
-  identity/completeness evidence from separate files. Snapshot mismatch
+  directory-entry churn. The separate real video/audio stream fixture test is
+  explicitly run with `--ignored`, including mixed identity/completeness
+  evidence from separate files. Snapshot mismatch
   rejection and worker IPC propagation are tested directly; a full subprocess
   download race was not exercised.
 - An initial parallel run hit an existing local Telegram progress timeout; the
   exact test passed alone, and the complete four-thread run passed.
+- Hosted macOS CI lacked FFmpeg. The planning mock now uses a controlled probe;
+  real media validation follows the repository's opt-in external-tool convention.
+- The explicit real-media test passed separately (one test); the controlled
+  probe script passed `bash -n` and ShellCheck.
 - Strict Clippy and formatting passed with Cargo/rustc 1.95.0. Queue and HTTP
   tests ran outside the sandbox; compilation used an isolated temporary target.
 - The isolated release build passed. The staged executable was signed with the

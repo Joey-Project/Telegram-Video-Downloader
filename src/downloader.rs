@@ -17098,6 +17098,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires installed ffmpeg and ffprobe; run explicitly for real media validation"]
     async fn missing_season_probe_uses_actual_video_and_audio_streams() {
         let root = temp_test_dir("bilibili-missing-mode-probe");
         fs::create_dir_all(&root).expect("fixture root should create");
@@ -17285,6 +17286,7 @@ mod tests {
         assert!(error.to_string().contains("retry the queued job"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn missing_season_preflight_does_not_request_skipped_episode_playback() {
         use tokio::io::AsyncWriteExt;
@@ -17391,36 +17393,19 @@ mod tests {
         );
         let output_dir = temp_test_dir("missing-season-preflight-output");
         fs::create_dir_all(&output_dir).expect("output dir should create");
-        let ffmpeg = PathBuf::from("ffmpeg");
         let existing = output_dir.join("Episode one.mp4");
-        let generated = Command::new(&ffmpeg)
-            .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=size=16x16:rate=1:duration=1",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=1000:duration=1",
-                "-shortest",
-                "-c:v",
-                "mpeg4",
-                "-c:a",
-                "aac",
-                "-y",
-            ])
-            .arg(&existing)
-            .output()
-            .await
-            .expect("ffmpeg fixture generator should launch");
-        assert!(
-            generated.status.success(),
-            "ffmpeg fixture should generate: {}",
-            String::from_utf8_lossy(&generated.stderr)
-        );
+        fs::write(
+            &existing,
+            b"synthetic media; streams supplied by the controlled probe",
+        )
+        .unwrap();
+        let ffprobe = output_dir.join("ffprobe-fixture");
+        fs::write(
+            &ffprobe,
+            "#!/bin/sh\nset -eu\ncase \"$4\" in\n  v:0) printf 'video\\n';;\n  a:0) printf 'audio\\n';;\n  *) exit 1;;\nesac\n",
+        )
+        .unwrap();
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(
             existing.with_extension("nfo"),
             r#"<movie>
@@ -17436,7 +17421,7 @@ mod tests {
                 &client,
                 "https://www.bilibili.com/bangumi/play/ss123",
                 DownloadMode::VideoOnly,
-                Path::new("ffprobe"),
+                &ffprobe,
                 &output_dir,
                 Duration::from_secs(2),
                 |_, _| {},
@@ -17465,7 +17450,7 @@ mod tests {
             &client,
             "https://www.bilibili.com/bangumi/play/ss123",
             DownloadMode::VideoOnly,
-            Path::new("ffprobe"),
+            &ffprobe,
             &complete_output_dir,
             Duration::from_secs(2),
             |_, _| {},

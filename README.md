@@ -147,4 +147,5 @@ uv run python -m unittest discover -s tests
 
 ```sh
 cargo test bilibili_fd_mux_preserves_streams_and_decodes_with_real_ffmpeg -- --ignored
+cargo test missing_season_probe_uses_actual_video_and_audio_streams -- --ignored
 ```
