@@ -33,6 +33,14 @@ pub(crate) struct EntryIdentity {
 }
 
 impl EntryIdentity {
+    pub(crate) fn regular_file(device: u64, inode: u64) -> Self {
+        Self {
+            device,
+            inode,
+            file_type: FileType::RegularFile,
+        }
+    }
+
     pub(crate) fn is_file(self) -> bool {
         self.file_type == FileType::RegularFile
     }

@@ -47,6 +47,11 @@ superseded_by:
 - The final report repeats skipped-file identity and sidecar validation after
   downloading the remaining episodes, preventing a changed skipped file from
   being reported complete using stale planning evidence.
+- The worker carries typed media and sidecar identities through IPC. The parent
+  validates them after publication and around descriptor-bound hashing; hashing
+  compares the expected media identity on the same descriptor it reads. Sidecar
+  validation binds the current pathname after reading, rejecting atomic
+  replacements even if the original descriptor remains readable.
 - The worker compares its lock-protected filtered plan with the queued snapshot
   before downloading. A changed plan stops with retry/requeue guidance so the
   queue can validate the new plan.
@@ -65,7 +70,7 @@ superseded_by:
   the skipped episode receives zero playback requests, the missing episode
   receives one, and an all-existing season produces a valid empty plan.
 - `cargo test --all-targets --locked --offline --quiet -- --test-threads=4`:
-  583 passed, 15 ignored, zero failures after target-branch integration.
+  587 passed, 15 ignored, zero failures after target-branch integration.
   Coverage includes actual file
   removal/replacement, changed and newly conflicting sidecars, benign
   directory-entry churn. The separate real video/audio stream fixture test is
@@ -88,6 +93,9 @@ superseded_by:
 - Final-report regression coverage accepts unchanged evidence and directory
   churn while rejecting missing/replaced media and missing, unreadable, or
   conflicting sidecars with distinct errors.
+- Publication and hashing regression coverage preserves typed IPC evidence and
+  rejects replaced media, replaced sidecars, and evidence outside the reported
+  outputs while accepting harmless directory churn.
 - The explicit real-media test passed separately (one test); both controlled
   probe scripts passed `bash -n` and ShellCheck.
 - Strict Clippy and formatting passed with Cargo/rustc 1.95.0. Queue and HTTP

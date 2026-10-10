@@ -249,6 +249,31 @@ pub struct JobReport {
     pub details: String,
     #[serde(default)]
     pub primary_media_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) existing_bilibili_evidence: Option<ExistingBilibiliReportEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ExistingBilibiliReportEvidence {
+    #[serde(default)]
+    skipped: Vec<ExistingBilibiliMediaEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ExistingBilibiliMediaEvidence {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    sidecars: Vec<ExistingBilibiliSidecarEvidence>,
+    cid: u64,
+    epid: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ExistingBilibiliSidecarEvidence {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1985,10 +2010,10 @@ async fn bilibili_plan_entry_compatible_existing_media(
         return None;
     }
     for video in bilibili_exact_entry_metadata_paths(index, entry) {
-        if !bilibili_media_path_has_exact_existing_metadata(index, &video, entry) {
-            continue;
-        }
         let root = index.root.as_ref()?;
+        let Some(sidecars) = current_bilibili_sidecars_for_entry(root, &video, entry) else {
+            continue;
+        };
         let Some(bound_file) = root.open_bound_file(&video).ok().flatten() else {
             continue;
         };
@@ -2001,12 +2026,14 @@ async fn bilibili_plan_entry_compatible_existing_media(
         };
         if bound_file.validate_identity().is_ok()
             && index.file_identities.get(&video) == Some(&bound_file.identity())
-            && bilibili_media_path_has_exact_existing_metadata(index, &video, entry)
+            && current_bilibili_sidecars_for_entry(root, &video, entry)
+                .is_some_and(|current| current == sidecars)
             && media_satisfies_download_mode(mode, has_video, has_audio)
         {
             return Some(ExistingEpisodeEvidence {
                 path: video,
                 identity: bound_file.identity(),
+                sidecars,
             });
         }
     }
@@ -2018,6 +2045,144 @@ struct ExistingEpisodeEvidence {
     path: PathBuf,
     // Device/inode/type identity observed on the bound descriptor; no content-stability claim.
     identity: EntryIdentity,
+    sidecars: Vec<ExistingSidecarEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExistingSidecarEvidence {
+    path: PathBuf,
+    identity: EntryIdentity,
+}
+
+fn bilibili_report_evidence_from_skipped(
+    skipped: &[(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)],
+) -> ExistingBilibiliReportEvidence {
+    ExistingBilibiliReportEvidence {
+        skipped: skipped
+            .iter()
+            .map(|(episode, evidence)| ExistingBilibiliMediaEvidence {
+                path: evidence.path.clone(),
+                device: evidence.identity.device(),
+                inode: evidence.identity.inode(),
+                sidecars: evidence
+                    .sidecars
+                    .iter()
+                    .map(|sidecar| ExistingBilibiliSidecarEvidence {
+                        path: sidecar.path.clone(),
+                        device: sidecar.identity.device(),
+                        inode: sidecar.identity.inode(),
+                    })
+                    .collect(),
+                cid: episode.cid,
+                epid: episode.epid,
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn existing_bilibili_report_media_identities(
+    report: &JobReport,
+) -> Result<BTreeMap<PathBuf, EntryIdentity>> {
+    let Some(evidence) = report.existing_bilibili_evidence.as_ref() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut identities = BTreeMap::new();
+    for skipped in &evidence.skipped {
+        let identity = EntryIdentity::regular_file(skipped.device, skipped.inode);
+        if identities.insert(skipped.path.clone(), identity).is_some() {
+            bail!("Bilibili report contains duplicate skipped-media evidence paths");
+        }
+    }
+    Ok(identities)
+}
+
+pub(crate) fn validate_existing_bilibili_report_evidence(
+    root: &RootedFs,
+    report: &JobReport,
+) -> Result<()> {
+    let Some(evidence) = report.existing_bilibili_evidence.as_ref() else {
+        return Ok(());
+    };
+    let mut paths = BTreeSet::new();
+    for skipped in &evidence.skipped {
+        if !paths.insert(skipped.path.clone()) {
+            bail!("Bilibili report contains duplicate skipped-media evidence paths");
+        }
+        let media_identity = EntryIdentity::regular_file(skipped.device, skipped.inode);
+        let episode = BilibiliDownloadEntry {
+            cid: skipped.cid,
+            epid: Some(skipped.epid),
+            ..BilibiliDownloadEntry::default()
+        };
+        let media = root.open_bound_file(&skipped.path).with_context(|| {
+            format!(
+                "failed to read skipped Bilibili media while validating report: {}",
+                skipped.path.display()
+            )
+        })?;
+        let Some(media) = media else {
+            bail!(
+                "skipped Bilibili media disappeared before report completion: {}",
+                skipped.path.display()
+            );
+        };
+        if media.identity() != media_identity || !media.identity().is_file() {
+            bail!(
+                "skipped Bilibili media identity changed before report completion: {}",
+                skipped.path.display()
+            );
+        }
+        let sidecars = match validate_current_bilibili_sidecars(root, &skipped.path, &episode)
+            .with_context(|| {
+                format!(
+                    "failed to read skipped Bilibili identity sidecars while validating report: {}",
+                    skipped.path.display()
+                )
+            })? {
+            CurrentBilibiliSidecarEvidence::Matches(sidecars) => sidecars,
+            CurrentBilibiliSidecarEvidence::Missing => bail!(
+                "skipped Bilibili identity sidecars disappeared before report completion: {}",
+                skipped.path.display()
+            ),
+            CurrentBilibiliSidecarEvidence::Mismatched => bail!(
+                "skipped Bilibili identity sidecar changed before report completion: {}",
+                skipped.path.display()
+            ),
+        };
+        let expected_sidecars = skipped
+            .sidecars
+            .iter()
+            .map(|sidecar| ExistingSidecarEvidence {
+                path: sidecar.path.clone(),
+                identity: EntryIdentity::regular_file(sidecar.device, sidecar.inode),
+            })
+            .collect::<Vec<_>>();
+        if sidecars != expected_sidecars {
+            bail!(
+                "skipped Bilibili identity sidecar object changed before report completion: {}",
+                skipped.path.display()
+            );
+        }
+        let media_after_sidecars = root.open_bound_file(&skipped.path).with_context(|| {
+            format!(
+                "failed to recheck skipped Bilibili media after sidecar validation: {}",
+                skipped.path.display()
+            )
+        })?;
+        let Some(media_after_sidecars) = media_after_sidecars else {
+            bail!(
+                "skipped Bilibili media disappeared before report completion: {}",
+                skipped.path.display()
+            );
+        };
+        if media_after_sidecars.identity() != media_identity {
+            bail!(
+                "skipped Bilibili media identity changed before report completion: {}",
+                skipped.path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn bilibili_missing_skip_mode_supported(mode: DownloadMode) -> bool {
@@ -2182,15 +2347,23 @@ fn current_bilibili_sidecars_match_entry(
     video: &Path,
     entry: &BilibiliDownloadEntry,
 ) -> bool {
-    matches!(
-        validate_current_bilibili_sidecars(root, video, entry),
-        Ok(CurrentBilibiliSidecarEvidence::Matches)
-    )
+    current_bilibili_sidecars_for_entry(root, video, entry).is_some()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+fn current_bilibili_sidecars_for_entry(
+    root: &RootedFs,
+    video: &Path,
+    entry: &BilibiliDownloadEntry,
+) -> Option<Vec<ExistingSidecarEvidence>> {
+    match validate_current_bilibili_sidecars(root, video, entry) {
+        Ok(CurrentBilibiliSidecarEvidence::Matches(sidecars)) => Some(sidecars),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CurrentBilibiliSidecarEvidence {
-    Matches,
+    Matches(Vec<ExistingSidecarEvidence>),
     Missing,
     Mismatched,
 }
@@ -2205,6 +2378,7 @@ fn validate_current_bilibili_sidecars(
         return Ok(CurrentBilibiliSidecarEvidence::Missing);
     }
     let mut sidecars = Vec::with_capacity(paths.len());
+    let mut sidecar_evidence = Vec::with_capacity(paths.len());
     for path in paths {
         let Some(file) = root.open_bound_file(&path).with_context(|| {
             format!("failed to open current identity sidecar {}", path.display())
@@ -2212,6 +2386,7 @@ fn validate_current_bilibili_sidecars(
         else {
             return Ok(CurrentBilibiliSidecarEvidence::Missing);
         };
+        let identity = file.identity();
         let contents = file
             .read_limited(IDENTITY_METADATA_SIDECAR_READ_LIMIT)
             .with_context(|| {
@@ -2226,13 +2401,37 @@ fn validate_current_bilibili_sidecars(
                 path.display()
             )
         })?;
+        if !current_sidecar_path_matches_identity(root, &path, identity)? {
+            if root.open_bound_file(&path)?.is_none() {
+                return Ok(CurrentBilibiliSidecarEvidence::Missing);
+            }
+            return Ok(CurrentBilibiliSidecarEvidence::Mismatched);
+        }
+        sidecar_evidence.push(ExistingSidecarEvidence { path, identity });
         sidecars.push(identities);
     }
     if bilibili_sidecars_match_entry(&sidecars, entry) {
-        Ok(CurrentBilibiliSidecarEvidence::Matches)
+        Ok(CurrentBilibiliSidecarEvidence::Matches(sidecar_evidence))
     } else {
         Ok(CurrentBilibiliSidecarEvidence::Mismatched)
     }
+}
+
+fn current_sidecar_path_matches_identity(
+    root: &RootedFs,
+    path: &Path,
+    expected: EntryIdentity,
+) -> Result<bool> {
+    let Some(current) = root.open_bound_file(path).with_context(|| {
+        format!(
+            "failed to recheck current identity sidecar {}",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(false);
+    };
+    Ok(current.identity() == expected)
 }
 
 struct BilibiliMissingSeasonPlan {
@@ -2304,7 +2503,11 @@ fn revalidate_missing_episode_evidence(
             evidence.path.display()
         )
     })? {
-        CurrentBilibiliSidecarEvidence::Matches => {}
+        CurrentBilibiliSidecarEvidence::Matches(sidecars) if sidecars == evidence.sidecars => {}
+        CurrentBilibiliSidecarEvidence::Matches(_) => bail!(
+            "Bilibili identity sidecar object changed during {phase} validation: {}",
+            evidence.path.display()
+        ),
         CurrentBilibiliSidecarEvidence::Missing => bail!(
             "Bilibili identity sidecar disappeared during {phase} validation: {}",
             evidence.path.display()
@@ -2663,6 +2866,7 @@ async fn run_simple_job(
         saved_location,
         details: tail_lines(&stderr, 6),
         primary_media_paths: vec![primary_media_path],
+        existing_bilibili_evidence: None,
     })
 }
 
@@ -2732,7 +2936,19 @@ async fn run_staged_bilibili_worker(
         );
     }
     let response = last_nonempty_line(&stdout).context("Bilibili worker returned no report")?;
-    parse_bilibili_worker_response(response)
+    let outcome = parse_bilibili_worker_response(response)?;
+    if matches!(selection, Some(BilibiliSelection::Missing)) {
+        let report = match &outcome {
+            BilibiliWorkerOutcome::Completed(report)
+            | BilibiliWorkerOutcome::AlreadyComplete(report) => report,
+        };
+        if report.existing_bilibili_evidence.is_none() {
+            bail!(
+                "Bilibili worker response omitted required missing-season evidence; retry the queued job"
+            );
+        }
+    }
+    Ok(outcome)
 }
 
 fn parse_bilibili_worker_response(response: &str) -> Result<BilibiliWorkerOutcome> {
@@ -3162,6 +3378,7 @@ impl BilibiliUgcCollectionDownload {
                 self.title, self.total_entries, self.skipped_entries
             ),
             primary_media_paths: self.existing_media_paths.clone(),
+            existing_bilibili_evidence: None,
         }
     }
 }
@@ -3706,6 +3923,9 @@ async fn run_bilibili_job_locked(
                     season.season.title
                 ),
                 primary_media_paths: existing_media_paths,
+                existing_bilibili_evidence: Some(bilibili_report_evidence_from_skipped(
+                    &missing.skipped,
+                )),
             }));
         }
         missing_season_skip_evidence = missing.skipped;
@@ -3895,6 +4115,8 @@ async fn run_bilibili_job_locked(
         },
         details: nonempty_join(details),
         primary_media_paths: reported_primary_videos,
+        existing_bilibili_evidence: missing_selection
+            .then(|| bilibili_report_evidence_from_skipped(&missing_season_skip_evidence)),
     }))
 }
 
@@ -6882,6 +7104,7 @@ async fn run_youtube_job_locked(
         saved_location,
         details: nonempty_join(vec![subtitle_plan.describe(), tail_lines(&stderr, 6)]),
         primary_media_paths: vec![primary_media_path],
+        existing_bilibili_evidence: None,
     })
 }
 
@@ -6986,6 +7209,16 @@ async fn run_staged_video_job(
                             );
                         }
                     };
+                    if matches!(
+                        job,
+                        JobRequest::Bilibili {
+                            selection: Some(BilibiliSelection::Missing),
+                            ..
+                        }
+                    ) {
+                        validate_existing_bilibili_report_evidence(&root, &report)
+                            .context("skipped Bilibili media changed during parent publication")?;
+                    }
                     if let Err(err) = staging.discard_incomplete() {
                         return Err(err.context(
                             "Bilibili collection was already complete but its empty staging directory could not be discarded",
@@ -7168,6 +7401,16 @@ async fn run_staged_video_job(
         &report.primary_media_paths,
         primary_media_kind,
     )?;
+    if matches!(
+        job,
+        JobRequest::Bilibili {
+            selection: Some(BilibiliSelection::Missing),
+            ..
+        }
+    ) {
+        validate_existing_bilibili_report_evidence(&root, &report)
+            .context("skipped Bilibili media changed during parent publication")?;
+    }
 
     let saved_location = if moved_files.len() == 1 {
         moved_files[0].display().to_string()
@@ -7189,6 +7432,7 @@ async fn run_staged_video_job(
         saved_location,
         details,
         primary_media_paths,
+        existing_bilibili_evidence: report.existing_bilibili_evidence,
     };
     staging
         .finish()
@@ -17292,6 +17536,10 @@ mod tests {
             .open_bound_file(&media_path)
             .unwrap()
             .expect("media should bind");
+        let sidecar = root
+            .open_bound_file(&sidecar_path)
+            .unwrap()
+            .expect("sidecar should bind");
         let episode = bbdown_core::EpisodeMetadata {
             index: 1,
             aid: 789,
@@ -17307,6 +17555,10 @@ mod tests {
             ExistingEpisodeEvidence {
                 path: media_path.clone(),
                 identity: media.identity(),
+                sidecars: vec![ExistingSidecarEvidence {
+                    path: sidecar_path.clone(),
+                    identity: sidecar.identity(),
+                }],
             },
         )];
 
@@ -17337,7 +17589,6 @@ mod tests {
             .expect_err("a changed identity sidecar must invalidate the report");
         assert!(format!("{changed_sidecar:#}").contains("sidecar changed"));
 
-        fs::write(&sidecar_path, matching_sidecar).expect("matching sidecar should restore");
         let moved_original = output.join("Episode.original.mp4");
         fs::rename(&media_path, &moved_original).expect("original media should remain allocated");
         fs::write(&media_path, b"replacement media").expect("replacement media should write");
@@ -17349,6 +17600,151 @@ mod tests {
         let missing_media = revalidate_missing_season_evidence_for_report(&root, &skipped)
             .expect_err("a missing media object must remain distinct from replacement");
         assert!(format!("{missing_media:#}").contains("media disappeared"));
+
+        let _ = fs::remove_dir_all(output);
+    }
+
+    #[test]
+    fn bilibili_sidecar_revalidation_rejects_path_replacement_after_open() {
+        let output = temp_test_dir("bilibili-sidecar-path-replacement");
+        fs::create_dir_all(&output).expect("output root should create");
+        let root = RootedFs::new(&output).expect("output root should bind");
+        let sidecar = output.join("Episode.nfo");
+        fs::write(&sidecar, b"original sidecar").expect("original sidecar should write");
+        let media_path = output.join("Episode.mp4");
+        fs::write(&media_path, b"existing media").expect("media should write");
+        let media = root
+            .open_bound_file(&media_path)
+            .expect("media should open")
+            .expect("media should exist");
+        fs::write(
+            &sidecar,
+            r#"<movie><uniqueid type="bilibili-cid">cid123</uniqueid><uniqueid type="bilibili-epid">ep456</uniqueid></movie>"#,
+        )
+        .expect("valid Bilibili sidecar should write");
+        let original = root
+            .open_bound_file(&sidecar)
+            .expect("valid sidecar should open")
+            .expect("valid sidecar should exist");
+        let report = JobReport {
+            saved_location: media_path.display().to_string(),
+            details: String::new(),
+            primary_media_paths: vec![media_path.clone()],
+            existing_bilibili_evidence: Some(ExistingBilibiliReportEvidence {
+                skipped: vec![ExistingBilibiliMediaEvidence {
+                    path: media_path.clone(),
+                    device: media.identity().device(),
+                    inode: media.identity().inode(),
+                    sidecars: vec![ExistingBilibiliSidecarEvidence {
+                        path: sidecar.clone(),
+                        device: original.identity().device(),
+                        inode: original.identity().inode(),
+                    }],
+                    cid: 123,
+                    epid: 456,
+                }],
+            }),
+        };
+        validate_existing_bilibili_report_evidence(&root, &report)
+            .expect("unchanged report evidence should validate");
+        let moved = output.join("Episode.original.nfo");
+        fs::rename(&sidecar, &moved).expect("original sidecar should remain allocated");
+        fs::write(
+            &sidecar,
+            r#"<movie><uniqueid type="bilibili-cid">cid123</uniqueid><uniqueid type="bilibili-epid">ep456</uniqueid></movie>"#,
+        )
+        .expect("replacement should write");
+
+        assert!(
+            !current_sidecar_path_matches_identity(&root, &sidecar, original.identity())
+                .expect("path identity revalidation should succeed"),
+            "pathname should no longer resolve to the descriptor read earlier"
+        );
+        fs::write(output.join("unrelated.txt"), b"benign directory churn")
+            .expect("directory entry churn should be harmless");
+        assert!(
+            !current_sidecar_path_matches_identity(&root, &sidecar, original.identity())
+                .expect("directory churn should not alter the selected sidecar identity")
+        );
+        let report_error = validate_existing_bilibili_report_evidence(&root, &report)
+            .expect_err("report validation must reject a replaced matching sidecar");
+        assert!(format!("{report_error:#}").contains("sidecar object changed"));
+        let _ = fs::remove_dir_all(output);
+    }
+
+    #[test]
+    fn bilibili_missing_evidence_survives_worker_ipc_and_rejects_parent_replacements() {
+        let output = temp_test_dir("bilibili-missing-ipc-evidence");
+        fs::create_dir_all(&output).expect("output root should create");
+        let root = RootedFs::new(&output).expect("output root should bind");
+        let media = output.join("Episode.mp4");
+        let sidecar = output.join("Episode.nfo");
+        fs::write(&media, b"existing media").expect("media should write");
+        let sidecar_contents = r#"<movie><uniqueid type="bilibili-cid">cid123</uniqueid><uniqueid type="bilibili-epid">ep456</uniqueid></movie>"#;
+        fs::write(&sidecar, sidecar_contents).expect("sidecar should write");
+        let bound_media = root
+            .open_bound_file(&media)
+            .expect("media should open")
+            .expect("media should exist");
+        let bound_sidecar = root
+            .open_bound_file(&sidecar)
+            .expect("sidecar should open")
+            .expect("sidecar should exist");
+        let episode = bbdown_core::EpisodeMetadata {
+            index: 1,
+            aid: 789,
+            bvid: None,
+            cid: 123,
+            epid: 456,
+            title: "Episode one".to_string(),
+            long_title: None,
+            pub_time: None,
+        };
+        let report = JobReport {
+            saved_location: media.display().to_string(),
+            details: "one episode skipped".to_string(),
+            primary_media_paths: vec![media.clone()],
+            existing_bilibili_evidence: Some(bilibili_report_evidence_from_skipped(&[(
+                episode,
+                ExistingEpisodeEvidence {
+                    path: media.clone(),
+                    identity: bound_media.identity(),
+                    sidecars: vec![ExistingSidecarEvidence {
+                        path: sidecar.clone(),
+                        identity: bound_sidecar.identity(),
+                    }],
+                },
+            )])),
+        };
+        let response = BilibiliWorkerResponse::Completed {
+            report: report.clone(),
+        };
+        let encoded = serde_json::to_string(&response).expect("worker response should encode");
+        let parsed = parse_bilibili_worker_response(&encoded)
+            .expect("worker response evidence should round-trip");
+        let BilibiliWorkerOutcome::Completed(report) = parsed else {
+            unreachable!("worker response should remain completed");
+        };
+        validate_existing_bilibili_report_evidence(&root, &report)
+            .expect("unchanged publication should preserve skip evidence");
+
+        let moved_media = output.join("Episode.original.mp4");
+        fs::rename(&media, &moved_media).expect("original media should remain allocated");
+        fs::write(&media, b"replacement media").expect("replacement media should write");
+        let replaced_media = validate_existing_bilibili_report_evidence(&root, &report)
+            .expect_err("parent publication must reject a replacement media object");
+        assert!(format!("{replaced_media:#}").contains("media identity changed"));
+
+        fs::remove_file(&media).expect("replacement media should remove");
+        fs::rename(&moved_media, &media).expect("original media should restore");
+        validate_existing_bilibili_report_evidence(&root, &report)
+            .expect("restoring the evidenced media object should validate");
+        let moved_sidecar = output.join("Episode.original.nfo");
+        fs::rename(&sidecar, &moved_sidecar).expect("original sidecar should remain allocated");
+        fs::write(&sidecar, sidecar_contents).expect("replacement sidecar should write");
+        let replaced_sidecar = validate_existing_bilibili_report_evidence(&root, &report)
+            .expect_err("parent publication must reject a replacement sidecar object");
+        assert!(format!("{replaced_sidecar:#}").contains("sidecar object changed"));
         let _ = fs::remove_dir_all(output);
     }
 
@@ -23476,23 +23872,47 @@ mod tests {
             report: JobReport {
                 saved_location: "Episode.mp4".to_string(),
                 details: "complete".to_string(),
-                primary_media_paths: Vec::new(),
+                primary_media_paths: vec![PathBuf::from("/downloads/existing.mp4")],
+                existing_bilibili_evidence: Some(ExistingBilibiliReportEvidence {
+                    skipped: vec![ExistingBilibiliMediaEvidence {
+                        path: PathBuf::from("/downloads/existing.mp4"),
+                        device: 11,
+                        inode: 22,
+                        sidecars: Vec::new(),
+                        cid: 33,
+                        epid: 44,
+                    }],
+                }),
             },
         };
         let encoded = serde_json::to_string(&completed).expect("response should encode");
         let outcome = parse_bilibili_worker_response(&encoded)
             .expect("completed worker response should parse");
         assert!(matches!(
-            outcome,
+            &outcome,
             BilibiliWorkerOutcome::Completed(JobReport { saved_location, .. })
                 if saved_location == "Episode.mp4"
         ));
+        let BilibiliWorkerOutcome::Completed(report) = outcome else {
+            unreachable!("completed response should remain completed");
+        };
+        let identities = existing_bilibili_report_media_identities(&report)
+            .expect("IPC report should expose expected media identities");
+        assert_eq!(identities.len(), 1);
+        let identity = identities
+            .get(Path::new("/downloads/existing.mp4"))
+            .expect("skipped media identity should survive IPC");
+        assert!(identity.is_file());
+        assert_eq!((identity.device(), identity.inode()), (11, 22));
 
         let already_complete = BilibiliWorkerResponse::AlreadyComplete {
             report: JobReport {
                 saved_location: "Collection".to_string(),
                 details: "already complete".to_string(),
                 primary_media_paths: Vec::new(),
+                existing_bilibili_evidence: Some(ExistingBilibiliReportEvidence {
+                    skipped: Vec::new(),
+                }),
             },
         };
         let encoded = serde_json::to_string(&already_complete)

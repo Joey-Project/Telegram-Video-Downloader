@@ -1543,10 +1543,22 @@ impl QueueManager {
     }
 }
 
+#[cfg(test)]
 pub fn hash_primary_media(
     root_path: &Path,
     media_paths: &[PathBuf],
 ) -> Result<BTreeMap<String, String>> {
+    hash_primary_media_with_expected_identities(root_path, media_paths, &BTreeMap::new())
+}
+
+pub(crate) fn hash_primary_media_with_expected_identities(
+    root_path: &Path,
+    media_paths: &[PathBuf],
+    expected: &BTreeMap<PathBuf, EntryIdentity>,
+) -> Result<BTreeMap<String, String>> {
+    if expected.keys().any(|path| !media_paths.contains(path)) {
+        bail!("expected media identity is not included in the published report");
+    }
     let root = RootedFs::new(root_path)
         .with_context(|| format!("failed to bind download root {}", root_path.display()))?;
     root.validate_configured_root()?;
@@ -1568,6 +1580,17 @@ pub fn hash_primary_media(
             )
         })?;
         let identity = file.identity();
+        // Protect object identity (device, inode, and type) on the same descriptor
+        // used for hashing. Directory churn does not change this property.
+        if expected
+            .get(path)
+            .is_some_and(|expected| *expected != identity)
+        {
+            bail!(
+                "published media identity changed before hashing: {}",
+                path.display()
+            );
+        }
         let file = file.duplicate_std_file()?;
         hashes.insert(
             path.display().to_string(),
@@ -2937,6 +2960,56 @@ mod tests {
 
     fn test_task(id: &str, job: JobRequest) -> TaskRecord {
         TaskRecord::new(id.to_string(), 1, 2, 123_456_789, Some(3), 0, job)
+    }
+
+    #[test]
+    fn hashing_expected_media_accepts_directory_churn_and_rejects_replacement() {
+        let directory = temp_queue_root("hash-expected-replacement");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("episode.mp4");
+        fs::write(&path, b"original episode").unwrap();
+        let root = RootedFs::new(&directory).unwrap();
+        let original = root.open_bound_file(&path).unwrap().unwrap();
+        let expected = BTreeMap::from([(path.clone(), original.identity())]);
+        fs::write(directory.join("unrelated.nfo"), b"directory churn").unwrap();
+        let paths = vec![path.clone()];
+        let hashes =
+            hash_primary_media_with_expected_identities(&directory, &paths, &expected).unwrap();
+        assert_eq!(hashes, hash_primary_media(&directory, &paths).unwrap());
+
+        fs::rename(&path, directory.join("original.mp4")).unwrap();
+        fs::write(&path, b"replacement episode").unwrap();
+        let error =
+            hash_primary_media_with_expected_identities(&directory, &paths, &expected).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("identity changed before hashing")
+        );
+        fs::remove_file(&path).unwrap();
+        let error =
+            hash_primary_media_with_expected_identities(&directory, &paths, &expected).unwrap_err();
+        assert!(error.to_string().contains("disappeared before hashing"));
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn hashing_expected_media_rejects_unreported_evidence() {
+        let directory = temp_queue_root("hash-unreported-evidence");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("episode.mp4");
+        fs::write(&path, b"episode").unwrap();
+        let root = RootedFs::new(&directory).unwrap();
+        let media = root.open_bound_file(&path).unwrap().unwrap();
+        let expected = BTreeMap::from([(path, media.identity())]);
+        let error =
+            hash_primary_media_with_expected_identities(&directory, &[], &expected).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not included in the published report")
+        );
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

@@ -35,16 +35,19 @@ use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
     BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
     JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, VideoDuplicate,
-    VideoDuplicateAction, VideoDuplicateCheck, find_video_duplicate_with_probe, human_bytes,
-    inspect_job_display_metadata, inspect_job_plan, job_progress_channel,
-    recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
+    VideoDuplicateAction, VideoDuplicateCheck, existing_bilibili_report_media_identities,
+    find_video_duplicate_with_probe, human_bytes, inspect_job_display_metadata, inspect_job_plan,
+    job_progress_channel, recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both,
     run_video_job_staged_keep_both_with_plan, sync_bilibili_rust_credentials,
+    validate_existing_bilibili_report_evidence,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
+#[cfg(test)]
+use crate::queue::hash_primary_media;
 use crate::queue::{
     PlanValidationSnapshot, QueueManager, RestartSummary, TaskRecord, TaskStatus,
-    hash_primary_media, sanitize_job_for_storage,
+    hash_primary_media_with_expected_identities, sanitize_job_for_storage,
 };
 use crate::redaction::redact_sensitive_text;
 use crate::router::{
@@ -5821,8 +5824,18 @@ async fn run_queued_job(
                     config.downloads.video_dir.clone()
                 };
                 let media_paths = report.primary_media_paths.clone();
+                let verification_report = report.clone();
                 let hashes = tokio::task::spawn_blocking(move || {
-                    hash_primary_media(&media_root, &media_paths)
+                    let root = crate::safe_fs::RootedFs::new(&media_root)?;
+                    validate_existing_bilibili_report_evidence(&root, &verification_report)?;
+                    let expected = existing_bilibili_report_media_identities(&verification_report)?;
+                    let hashes = hash_primary_media_with_expected_identities(
+                        &media_root,
+                        &media_paths,
+                        &expected,
+                    )?;
+                    validate_existing_bilibili_report_evidence(&root, &verification_report)?;
+                    Ok::<_, anyhow::Error>(hashes)
                 })
                 .await
                 .context("published media hash task failed to join")??;
