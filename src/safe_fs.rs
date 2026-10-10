@@ -223,6 +223,25 @@ impl BoundFile {
         Ok(())
     }
 
+    pub(crate) fn content_stamp(&self) -> Result<(u64, i64, i64, i64, i64)> {
+        use std::os::unix::fs::MetadataExt;
+
+        self.validate_identity()?;
+        let file = self.duplicate_std_file()?;
+        let metadata = file
+            .metadata()
+            .context("failed to read bound file metadata")?;
+        let stamp = (
+            metadata.len(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        );
+        self.validate_identity()?;
+        Ok(stamp)
+    }
+
     pub(crate) fn validate_private_single_link(&self, mode: u16) -> Result<()> {
         self.validate_private_link_count(mode, 1)
     }

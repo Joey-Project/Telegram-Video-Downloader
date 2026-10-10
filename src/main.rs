@@ -40,7 +40,7 @@ use crate::downloader::{
     job_progress_channel, recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
     run_job_with_duplicate_action, run_video_job_staged_keep_both,
     run_video_job_staged_keep_both_with_plan, sync_bilibili_rust_credentials,
-    validate_existing_bilibili_report_evidence,
+    validate_existing_bilibili_report_for_completion,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 #[cfg(test)]
@@ -5824,21 +5824,22 @@ async fn run_queued_job(
                     config.downloads.video_dir.clone()
                 };
                 let media_paths = report.primary_media_paths.clone();
+                validate_existing_bilibili_report_for_completion(&config, &report).await?;
                 let verification_report = report.clone();
                 let hashes = tokio::task::spawn_blocking(move || {
                     let root = crate::safe_fs::RootedFs::new(&media_root)?;
-                    validate_existing_bilibili_report_evidence(&root, &verification_report)?;
-                    let expected = existing_bilibili_report_media_identities(&verification_report)?;
+                    let expected =
+                        existing_bilibili_report_media_identities(&root, &verification_report)?;
                     let hashes = hash_primary_media_with_expected_identities(
                         &media_root,
                         &media_paths,
                         &expected,
                     )?;
-                    validate_existing_bilibili_report_evidence(&root, &verification_report)?;
                     Ok::<_, anyhow::Error>(hashes)
                 })
                 .await
                 .context("published media hash task failed to join")??;
+                validate_existing_bilibili_report_for_completion(&config, &report).await?;
                 complete_published_task_with_retry(
                     &telegram,
                     &queue,

@@ -3013,6 +3013,53 @@ mod tests {
     }
 
     #[test]
+    fn hashing_skipped_worker_media_under_a_symlink_configured_root() {
+        let directory = temp_queue_root("hash-worker-root-alias");
+        let physical = directory.join("physical");
+        let logical = directory.join("configured");
+        fs::create_dir_all(&physical).unwrap();
+        symlink(&physical, &logical).unwrap();
+        let path = logical.join("episode.mp4");
+        fs::write(&path, b"existing episode").unwrap();
+        let root = RootedFs::new(&logical).unwrap();
+        let identity = root.open_bound_file(&path).unwrap().unwrap().identity();
+        let report: crate::downloader::JobReport = serde_json::from_value(serde_json::json!({
+            "saved_location": path,
+            "details": "existing season entry",
+            "primary_media_paths": [path],
+            "existing_bilibili_evidence": {
+                "skipped": [{
+                    "path": root.root_path().join("episode.mp4"),
+                    "device": identity.device(),
+                    "inode": identity.inode(),
+                    "sidecars": [],
+                    "cid": 203,
+                    "epid": 247472,
+                    "content_stamp": {
+                        "size": 16,
+                        "modified_seconds": 0,
+                        "modified_nanoseconds": 0,
+                        "changed_seconds": 0,
+                        "changed_nanoseconds": 0
+                    }
+                }]
+            }
+        }))
+        .unwrap();
+        let expected =
+            crate::downloader::existing_bilibili_report_media_identities(&root, &report).unwrap();
+        assert_eq!(expected.get(&path), Some(&identity));
+        let hashes = hash_primary_media_with_expected_identities(
+            &logical,
+            &report.primary_media_paths,
+            &expected,
+        )
+        .unwrap();
+        assert_eq!(hashes, hash_primary_media(&logical, &[path]).unwrap());
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
     fn missing_season_selection_survives_queue_reopen_and_stale_choice() {
         use crate::router::BilibiliSelection;
 

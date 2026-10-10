@@ -36,8 +36,11 @@ superseded_by:
 - Identity and stream evidence must belong to the same current media object;
   only that verified path is returned as an existing output. Sidecars are checked
   again after probing. The guard protects device/inode/type identity and current
-  episode metadata, without claiming content stability or rejecting harmless
-  File Provider timestamp changes.
+  episode metadata and required audio/video streams. A changed media size is
+  rejected; changed modification/change timestamps trigger bounded stream
+  revalidation. Harmless File Provider timestamp changes remain acceptable
+  when the required streams are still complete. This does not claim arbitrary
+  byte-for-byte content immutability.
 - Stream probing reads an inherited descriptor for the held media object rather
   than reopening its pathname, selecting its number within the process limit.
   Existing-entry checks use at most two concurrent probes, close the held files
@@ -52,6 +55,12 @@ superseded_by:
   compares the expected media identity on the same descriptor it reads. Sidecar
   validation binds the current pathname after reading, rejecting atomic
   replacements even if the original descriptor remains readable.
+- Canonical worker evidence paths are translated to the configured root before
+  parent validation and hashing, including symlink-configured download roots.
+  Sidecar evidence uses sorted paths so filesystem enumeration order is immaterial.
+- Blocking media and sidecar checks run off the async runtime under a shared
+  two-permit limit. Timeouts do not wait for blocked filesystem calls, and those
+  calls keep their permits until they finish, bounding abandoned blocking work.
 - The worker compares its lock-protected filtered plan with the queued snapshot
   before downloading. A changed plan stops with retry/requeue guidance so the
   queue can validate the new plan.
@@ -70,7 +79,7 @@ superseded_by:
   the skipped episode receives zero playback requests, the missing episode
   receives one, and an all-existing season produces a valid empty plan.
 - `cargo test --all-targets --locked --offline --quiet -- --test-threads=4`:
-  587 passed, 15 ignored, zero failures after target-branch integration.
+  590 passed, 15 ignored, zero failures after target-branch integration.
   Coverage includes actual file
   removal/replacement, changed and newly conflicting sidecars, benign
   directory-entry churn. The separate real video/audio stream fixture test is
@@ -96,6 +105,11 @@ superseded_by:
 - Publication and hashing regression coverage preserves typed IPC evidence and
   rejects replaced media, replaced sidecars, and evidence outside the reported
   outputs while accepting harmless directory churn.
+- Symlink-root coverage verifies canonical worker evidence becomes logical
+  published/hash paths; reordered sidecars remain equivalent. Controlled probe
+  coverage accepts metadata-only timestamp changes and rejects same-size media
+  changes missing required streams and file-size changes. Deliberately stalled
+  filesystem calls were not fault-injected.
 - The explicit real-media test passed separately (one test); both controlled
   probe scripts passed `bash -n` and ShellCheck.
 - Strict Clippy and formatting passed with Cargo/rustc 1.95.0. Queue and HTTP
