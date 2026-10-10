@@ -32,6 +32,7 @@ use tracing::info;
 
 use crate::bilibili_auth;
 use crate::bilibili_core;
+use crate::bilibili_planning;
 use crate::config::AppConfig;
 use crate::queue::{PlanSize, PlanValidationSnapshot, sanitize_job_for_storage};
 use crate::redaction::redact_sensitive_text;
@@ -1700,19 +1701,19 @@ pub async fn find_video_duplicate_with_probe(
         } else {
             BILIBILI_METADATA_PROBE_TIMEOUT
         };
-        match probe_bilibili_plan(config, url, *selection, probe_timeout).await {
+        match probe_bilibili_duplicate_metadata(config, url, *selection, probe_timeout).await {
             Ok(plan) => {
                 push_bilibili_plan_identities(&mut identities, &plan);
                 overwrite_identities = bilibili_plan_overwrite_identities(&plan);
             }
             Err(err) if should_propagate_bilibili_probe_error(*selection, &err) => {
                 return Err(err).with_context(|| {
-                    format!("failed to probe Bilibili plan for duplicate check: {url}")
+                    format!("failed to resolve Bilibili metadata for duplicate check: {url}")
                 });
             }
             Err(err) if identities.is_empty() && direct_duplicate.is_none() => {
                 return Err(err).with_context(|| {
-                    format!("failed to probe Bilibili plan for duplicate check: {url}")
+                    format!("failed to resolve Bilibili metadata for duplicate check: {url}")
                 });
             }
             Err(err) => {
@@ -1720,7 +1721,7 @@ pub async fn find_video_duplicate_with_probe(
                 info!(
                     url = %url,
                     error = %error,
-                    "Bilibili plan probe skipped during duplicate check"
+                    "Bilibili metadata probe skipped during duplicate check"
                 );
             }
         }
@@ -2916,7 +2917,10 @@ async fn run_bilibili_job_locked(
         .map(BilibiliUgcCollectionDownload::missing_selection)
         .transpose()?
         .or_else(|| bilibili_core::selection(selection));
-    let (core_plan, resolved_metadata) = if let Some(collection) = collection_download.as_ref() {
+    let (core_plan, resolved_metadata): (
+        bbdown_core::DownloadPlan,
+        Result<Option<ResolvedContent>>,
+    ) = if let Some(collection) = collection_download.as_ref() {
         let core_plan = tokio_timeout(
             BILIBILI_METADATA_PROBE_TIMEOUT,
             client.plan_download_with_mode(url, core_selection.clone(), options.mode),
@@ -2929,44 +2933,26 @@ async fn run_bilibili_job_locked(
             .write_nfo
             .then(|| ResolvedContent::Collection(collection.resolution.clone()));
         (core_plan, Ok(metadata))
-    } else if config.video.write_nfo {
-        let plan_probe = probe_bilibili_plan_with_mode(
+    } else {
+        send_progress(
+            progress.as_ref(),
+            "BBDown-rust: resolving media inventory".to_string(),
+        );
+        let (plan, metadata) = bilibili_planning::plan_download(
             &client,
             url,
-            selection,
+            core_selection,
             options.mode,
             BILIBILI_METADATA_PROBE_TIMEOUT,
-        );
-        let metadata_probe = probe_bilibili_resolved_content(
-            &client,
-            url,
-            selection,
-            BILIBILI_METADATA_PROBE_TIMEOUT,
-        );
-        tokio::pin!(plan_probe);
-        tokio::pin!(metadata_probe);
-        tokio::select! {
-            core_plan = &mut plan_probe => {
-                let core_plan = core_plan?;
-                (core_plan, metadata_probe.await.map(Some))
-            }
-            metadata = &mut metadata_probe => {
-                let core_plan = plan_probe.await?;
-                (core_plan, metadata.map(Some))
-            }
-        }
-    } else {
-        (
-            probe_bilibili_plan_with_mode(
-                &client,
-                url,
-                selection,
-                options.mode,
-                BILIBILI_METADATA_PROBE_TIMEOUT,
-            )
-            .await?,
-            Ok(None),
+            |done, total| {
+                send_progress(
+                    progress.as_ref(),
+                    format!("BBDown-rust: planned episodes {done}/{total} (up to 2 at a time)"),
+                );
+            },
         )
+        .await?;
+        (plan, Ok(config.video.write_nfo.then_some(metadata)))
     };
     let (resolved_metadata, metadata_warning) = match resolved_metadata {
         Ok(metadata) => (metadata, None),
@@ -7164,19 +7150,6 @@ async fn fetch_youtube_metadata(
     serde_json::from_str(json).context("failed to parse yt-dlp metadata JSON")
 }
 
-async fn probe_bilibili_plan(
-    config: &AppConfig,
-    url: &str,
-    selection: Option<BilibiliSelection>,
-    timeout: Duration,
-) -> Result<BilibiliDownloadPlan> {
-    sync_bilibili_rust_credentials(config).await?;
-    let client = bilibili_core::client(config)?;
-    let mode = bilibili_core::download_mode_from_config(config)?;
-    let plan = probe_bilibili_plan_with_mode(&client, url, selection, mode, timeout).await?;
-    Ok(BilibiliDownloadPlan::from(&plan))
-}
-
 async fn probe_bilibili_plan_with_mode(
     client: &bbdown_core::BiliClient,
     url: &str,
@@ -7184,13 +7157,81 @@ async fn probe_bilibili_plan_with_mode(
     mode: DownloadMode,
     timeout: Duration,
 ) -> Result<bbdown_core::DownloadPlan> {
-    tokio_timeout(
+    bilibili_planning::plan_download(
+        client,
+        url,
+        bilibili_core::selection(selection),
+        mode,
         timeout,
-        client.plan_download_with_mode(url, bilibili_core::selection(selection), mode),
+        |_, _| {},
     )
     .await
-    .context("Bilibili plan probe timed out")?
-    .context("failed to probe Bilibili plan with bbdown-core")
+    .map(|(plan, _)| plan)
+}
+
+async fn probe_bilibili_duplicate_metadata(
+    config: &AppConfig,
+    url: &str,
+    selection: Option<BilibiliSelection>,
+    timeout: Duration,
+) -> Result<BilibiliDownloadPlan> {
+    sync_bilibili_rust_credentials(config).await?;
+    let client = bilibili_core::client(config)?;
+    let metadata = probe_bilibili_resolved_content(&client, url, selection, timeout).await?;
+    Ok(bilibili_metadata_identity_plan(&metadata))
+}
+
+fn bilibili_metadata_identity_plan(metadata: &ResolvedContent) -> BilibiliDownloadPlan {
+    let (title, entries) = match metadata {
+        ResolvedContent::Video(video) => (
+            video.title.clone(),
+            video
+                .pages
+                .iter()
+                .map(|page| BilibiliDownloadEntry {
+                    index: page.index,
+                    aid: page.aid,
+                    bvid: video.bvid.clone(),
+                    cid: page.cid,
+                    epid: page.epid,
+                    title: page.title.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        ResolvedContent::Season(resolution) => (
+            resolution.season.title.clone(),
+            resolution
+                .selected_episodes
+                .iter()
+                .map(|episode| BilibiliDownloadEntry {
+                    index: episode.index,
+                    aid: episode.aid,
+                    bvid: episode.bvid.clone(),
+                    cid: episode.cid,
+                    epid: Some(episode.epid),
+                    title: episode.title.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        ResolvedContent::Collection(resolution) => (
+            resolution.collection.title.clone(),
+            resolution
+                .selected_items
+                .iter()
+                .map(|item| BilibiliDownloadEntry {
+                    index: item.index,
+                    aid: item.aid,
+                    bvid: item.bvid.clone(),
+                    cid: item.cid,
+                    title: item.title.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+    };
+    BilibiliDownloadPlan { title, entries }
 }
 
 async fn probe_bilibili_resolved_content(
@@ -9946,16 +9987,19 @@ fn push_bilibili_plan_identities(identities: &mut Vec<VideoIdentity>, plan: &Bil
                 },
             );
         }
-        for id in [format!("av{}", entry.aid), format!("cid{}", entry.cid)] {
+        for (value, prefix) in [(entry.aid, "av"), (entry.cid, "cid")] {
+            if value == 0 {
+                continue;
+            }
             push_unique_video_identity(
                 identities,
                 VideoIdentity {
                     provider: VideoProvider::Bilibili,
-                    id,
+                    id: format!("{prefix}{value}"),
                 },
             );
         }
-        if let Some(epid) = entry.epid {
+        if let Some(epid) = entry.epid.filter(|epid| *epid != 0) {
             push_unique_video_identity(
                 identities,
                 VideoIdentity {
@@ -9978,7 +10022,7 @@ fn bilibili_plan_overwrite_identities(plan: &BilibiliDownloadPlan) -> Vec<VideoI
             id: format!("cid{}", entry.cid),
         });
     }
-    if let Some(epid) = entry.epid {
+    if let Some(epid) = entry.epid.filter(|epid| *epid != 0) {
         identities.push(VideoIdentity {
             provider: VideoProvider::Bilibili,
             id: format!("ep{epid}"),
@@ -15990,6 +16034,71 @@ mod tests {
             None,
             &anyhow!("ordinary probe failure")
         ));
+    }
+
+    #[test]
+    fn metadata_duplicate_inventory_uses_only_selected_episode_ids() {
+        let episode = |index| bbdown_core::EpisodeMetadata {
+            index,
+            aid: u64::from(index) + 100,
+            bvid: Some(format!("BV{index}")),
+            cid: u64::from(index) + 200,
+            epid: u64::from(index) + 300,
+            title: format!("Episode {index}"),
+            long_title: None,
+            pub_time: None,
+        };
+        let first = episode(1);
+        let latest = episode(203);
+        let season = bbdown_core::SeasonMetadata {
+            season_id: Some(10),
+            media_id: Some(20),
+            title: "Season".to_string(),
+            description: String::new(),
+            cover_url: None,
+            main_episode_count: 203,
+            areas: Vec::new(),
+            tags: Vec::new(),
+            episodes: vec![first.clone(), latest.clone()],
+        };
+        let metadata = ResolvedContent::Season(bbdown_core::SeasonResolution {
+            season: season.clone(),
+            selected_episodes: vec![latest.clone()],
+        });
+        let plan = bilibili_metadata_identity_plan(&metadata);
+        let mut ids = Vec::new();
+        push_bilibili_plan_identities(&mut ids, &plan);
+        assert_eq!(plan.entries[0].index, 203);
+        for id in ["BV203", "av303", "cid403", "ep503"] {
+            assert!(ids.iter().any(|identity| identity.id == id));
+        }
+        assert!(!ids.iter().any(|identity| identity.id == "cid201"));
+        assert_eq!(bilibili_plan_overwrite_identities(&plan).len(), 2);
+
+        let all = bilibili_metadata_identity_plan(&ResolvedContent::Season(
+            bbdown_core::SeasonResolution {
+                season,
+                selected_episodes: vec![first, latest],
+            },
+        ));
+        assert!(bilibili_plan_overwrite_identities(&all).is_empty());
+    }
+
+    #[test]
+    fn metadata_duplicate_inventory_never_uses_unknown_zero_ids() {
+        let plan = BilibiliDownloadPlan {
+            title: "Inventory".to_string(),
+            entries: vec![BilibiliDownloadEntry {
+                bvid: Some("BV123".to_string()),
+                epid: Some(0),
+                ..Default::default()
+            }],
+        };
+        let mut ids = Vec::new();
+        push_bilibili_plan_identities(&mut ids, &plan);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].id, "BV123");
+        assert!(bilibili_plan_overwrite_identities(&plan).is_empty());
     }
 
     #[test]

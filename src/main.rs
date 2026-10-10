@@ -1,6 +1,7 @@
 mod bilibili_access_key;
 mod bilibili_auth;
 mod bilibili_core;
+mod bilibili_planning;
 mod config;
 mod downloader;
 mod file_provider;
