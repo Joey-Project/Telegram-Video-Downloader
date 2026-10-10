@@ -6,6 +6,7 @@
 
 - 普通消息中的 Bilibili 链接通过 `BBDown-rust` 的 `bbdown-core` crate 解析和下载，保存到视频下载目录，并默认保留 XML/ASS 弹幕 sidecar。
 - Bilibili 番剧和 intl 链接走内嵌 plan/download API；`ss/md` 系列入口会先提示选择最新一集或全集。
+- 番剧按所选剧集分别规划播放地址，最多同时解析 2 集，每集有独立的 60 秒期限；全集不再共用一分钟总期限。规划进度显示已完成集数，单集失败或超时会报告具体集号并终止其他在途规划，结果仍按原剧集顺序下载。
 - 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
@@ -39,7 +40,7 @@ cp config.example.toml config.toml
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
-重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 能由 NFO 或 info JSON sidecar 证明并唯一匹配一个现有文件时才允许覆盖，文件名里的 cid/epid 只用于重复提示。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。实际下载使用的 plan 还必须保留确认时的精确 cid/epid，否则任务中止。覆盖时，bot 会先把旧媒体及明确属于同 basename 的 sidecar 移入本次事务独占的隐藏备份目录，再从已取得的文件重建严格身份索引；无法明确归属的裸 `danmaku.*`、`subtitle-*` 或 `cover-*` 文件不会被旧文件清理误删。目标缺失、metadata 不可读、身份变化、路径被重新占用或新增歧义都会拒绝覆盖并尝试恢复原文件。如果单个已完成任务意外产出多个主媒体文件，bot 会保留旧文件并把全部新产物按“两者并存”提交，避免清理 staging 时丢失下载结果。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
+重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` metadata API 解析所选条目的 bvid、aid、cid 和 epid，不请求播放地址，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 能由 NFO 或 info JSON sidecar 证明并唯一匹配一个现有文件时才允许覆盖，文件名里的 cid/epid 只用于重复提示。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。实际下载使用的 plan 还必须保留确认时的精确 cid/epid，否则任务中止。覆盖时，bot 会先把旧媒体及明确属于同 basename 的 sidecar 移入本次事务独占的隐藏备份目录，再从已取得的文件重建严格身份索引；无法明确归属的裸 `danmaku.*`、`subtitle-*` 或 `cover-*` 文件不会被旧文件清理误删。目标缺失、metadata 不可读、身份变化、路径被重新占用或新增歧义都会拒绝覆盖并尝试恢复原文件。如果单个已完成任务意外产出多个主媒体文件，bot 会保留旧文件并把全部新产物按“两者并存”提交，避免清理 staging 时丢失下载结果。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
 覆盖按钮生成时会以 `O_NOFOLLOW` 打开并持有现有媒体文件，直到任务完成，避免确认后删除并复用 inode 的同路径文件继承覆盖授权。旧媒体备份保留原文件名；完整视频覆盖会先提交主媒体，再提交 sidecar，对每个已提交输出执行 `fsync`，然后为其在事务目录创建同 inode 的硬链接锚点，并以“完整写入临时文件后原子交换”的方式把 recovery manifest 从 `acquired` 切换为 `committed`。只有这些输出内容和 committed recovery state 都持久化后才会删除旧备份。旧备份全部安全清理前锚点始终存在，因此输出路径即使被删除也不能把已记录 inode 转让给无关替换文件。最后一次输出验证后，包含 manifest 和全部锚点的事务目录会整体原子移入受控删除隔离区；崩溃恢复不会看到只删除了一部分锚点的 committed 事务。bot 每次启动都会扫描这些受控事务；正常任务还会在持有跨进程输出锁时，把 `.telegram-video-downloader-control` 私有目录里的恢复状态通过原子文件替换写为 dirty，只有任务和恢复都干净结束后才写回 clean。控制目录由绑定根目录和控制目录 inode 的 owner 记录认证，状态文件要求私有权限且硬链接数为 1；升级时旧根目录 marker 只读检测并触发一次恢复扫描，不会被修改。后续任务只在标记不干净时再次递归恢复，避免每次下载前后都完整扫描媒体库。`acquired` 事务只在目标路径仍为空时回滚，路径被占用时保留全部对象供人工处理；v3 `committed` 事务只有在当前输出仍与持久锚点相同、且 manifest 身份一致时才完成清理；没有锚点的旧 v2 committed 事务会 fail closed 并保留备份。视频目录里的持久锁文件会跨 bot、`--replay-message` 和启动恢复进程串行化输出事务。无法识别的旧版备份目录、结构异常的事务和无关的不可读子目录会分别保留或跳过并写入日志，不会误删文件或阻止其他事务恢复。
 
