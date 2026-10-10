@@ -26,6 +26,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex, MutexGuard, Semaphore, watch};
+use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, sleep_until, timeout as tokio_timeout};
 use tracing::info;
 
@@ -128,6 +129,7 @@ const VIDEO_SIDECAR_EXTENSIONS: &[&str] = &[
 ];
 const OUTPUT_CLOSE_GRACE: Duration = Duration::from_secs(2);
 const OUTPUT_ABORT_GRACE: Duration = Duration::from_secs(3);
+const MAX_FFPROBE_CAPTURE_BYTES: usize = 64 * 1024;
 const BILIBILI_METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1603,6 +1605,7 @@ pub async fn inspect_job_plan(
             let client = bilibili_core::client(config)?;
             let plan = if matches!(selection, Some(BilibiliSelection::Missing)) {
                 plan_bilibili_missing_season(
+                    config,
                     &client,
                     url,
                     options.mode,
@@ -1788,7 +1791,7 @@ pub async fn find_video_duplicate_with_probe(
     config: &AppConfig,
     job: &JobRequest,
 ) -> Result<VideoDuplicateCheck> {
-    let index = scan_video_identity_index(config, job).await?;
+    let index = Arc::new(scan_video_identity_index(config, job).await?);
     let mut identities = video_identity(job).into_iter().collect::<Vec<_>>();
     let direct_overwrite_identities = identities
         .iter()
@@ -1819,14 +1822,26 @@ pub async fn find_video_duplicate_with_probe(
                 ) && bilibili_missing_skip_mode_supported(mode)
                 {
                     let ffprobe = ffprobe_program(&config.tools.ffmpeg);
+                    let probe_config = Arc::new(config.clone());
                     let mut duplicate_entries = 0;
-                    for entry in &plan.entries {
-                        if bilibili_plan_entry_has_compatible_existing_media(
-                            &index, entry, mode, &ffprobe,
-                        )
-                        .await
-                        {
-                            duplicate_entries += 1;
+                    for batch in plan.entries.chunks(2) {
+                        let mut probes = JoinSet::new();
+                        for entry in batch {
+                            let entry = entry.clone();
+                            let index = Arc::clone(&index);
+                            let config = Arc::clone(&probe_config);
+                            let ffprobe = ffprobe.clone();
+                            probes.spawn(async move {
+                                bilibili_plan_entry_has_compatible_existing_media(
+                                    &config, &index, &entry, mode, &ffprobe,
+                                )
+                                .await
+                            });
+                        }
+                        while let Some(result) = probes.join_next().await {
+                            if matches!(result, Ok(true)) {
+                                duplicate_entries += 1;
+                            }
                         }
                     }
                     skip_summary = (duplicate_entries > 0).then_some(BilibiliSkipSummary {
@@ -1945,22 +1960,24 @@ fn bilibili_media_path_has_exact_existing_metadata(
 }
 
 async fn bilibili_plan_entry_has_compatible_existing_media(
+    config: &AppConfig,
     index: &VideoIdentityIndex,
     entry: &BilibiliDownloadEntry,
     mode: DownloadMode,
     ffprobe: &Path,
 ) -> bool {
-    bilibili_plan_entry_compatible_existing_media(index, entry, mode, ffprobe)
+    bilibili_plan_entry_compatible_existing_media(config, index, entry, mode, ffprobe)
         .await
         .is_some()
 }
 
 async fn bilibili_plan_entry_compatible_existing_media(
+    config: &AppConfig,
     index: &VideoIdentityIndex,
     entry: &BilibiliDownloadEntry,
     mode: DownloadMode,
     ffprobe: &Path,
-) -> Option<PathBuf> {
+) -> Option<ExistingEpisodeEvidence> {
     if !bilibili_missing_skip_mode_supported(mode) {
         return None;
     }
@@ -1971,19 +1988,36 @@ async fn bilibili_plan_entry_compatible_existing_media(
         if !bilibili_media_path_has_exact_existing_metadata(index, &video, entry) {
             continue;
         }
-        let Some((has_video, has_audio)) = probe_media_streams(ffprobe, &video).await else {
+        let root = index.root.as_ref()?;
+        let Some(bound_file) = root.open_bound_file(&video).ok().flatten() else {
+            continue;
+        };
+        let Some((has_video, has_audio)) = probe_media_streams(config, ffprobe, &bound_file).await
+        else {
             info!(
                 "existing Bilibili media stream probe failed or timed out; planning the episode for download"
             );
             continue;
         };
-        if bilibili_media_path_has_exact_existing_metadata(index, &video, entry)
+        if bound_file.validate_identity().is_ok()
+            && bilibili_media_path_has_exact_existing_metadata(index, &video, entry)
             && media_satisfies_download_mode(mode, has_video, has_audio)
         {
-            return Some(video);
+            return Some(ExistingEpisodeEvidence {
+                path: video,
+                bound_file,
+            });
         }
     }
     None
+}
+
+#[derive(Debug)]
+struct ExistingEpisodeEvidence {
+    path: PathBuf,
+    // Pins and revalidates the selected filesystem object across ffprobe and final planning.
+    // This protects object identity, not against in-place media content mutation.
+    bound_file: BoundFile,
 }
 
 fn bilibili_missing_skip_mode_supported(mode: DownloadMode) -> bool {
@@ -2022,42 +2056,52 @@ fn ffprobe_program(ffmpeg: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("ffprobe"))
 }
 
-async fn probe_media_streams(ffprobe: &Path, media: &Path) -> Option<(bool, bool)> {
-    async fn has_stream(
-        ffprobe: &Path,
-        media: &Path,
-        selector: &str,
-        expected: &str,
-    ) -> Option<bool> {
-        let output = tokio_timeout(
-            Duration::from_secs(3),
-            Command::new(ffprobe)
-                .args([
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    selector,
-                    "-show_entries",
-                    "stream=codec_type",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=1",
-                ])
-                .arg(media)
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok)?;
-        if !output.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&output.stdout).trim() == expected)
-    }
+async fn probe_media_streams(
+    config: &AppConfig,
+    ffprobe: &Path,
+    media: &BoundFile,
+) -> Option<(bool, bool)> {
+    #[cfg(unix)]
+    let (media_arg, inherited_fd_base) = {
+        let base = 64;
+        (PathBuf::from(format!("/dev/fd/{base}")), Some(base))
+    };
+    #[cfg(not(unix))]
+    let (media_arg, inherited_fd_base) = return None;
 
-    let has_video = has_stream(ffprobe, media, "v:0", "video").await?;
-    let has_audio = has_stream(ffprobe, media, "a:0", "audio").await?;
-    Some((has_video, has_audio))
+    let spec = CommandSpec {
+        program: ffprobe.to_path_buf(),
+        args: vec![
+            "-v".to_string(),
+            "error".to_string(),
+            "-show_entries".to_string(),
+            "stream=codec_type".to_string(),
+            "-of".to_string(),
+            "default=noprint_wrappers=1:nokey=1".to_string(),
+            media_arg.to_string_lossy().into_owned(),
+        ],
+        cwd: PathBuf::from("/"),
+        activity_dir: None,
+        cleanup_paths: Vec::new(),
+        inherited_fd_base,
+    };
+    media.validate_identity().ok()?;
+    let output = tokio_timeout(
+        Duration::from_secs(3),
+        run_command_with_inherited_files(config, &spec, std::slice::from_ref(media), None),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    media.validate_identity().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let streams = String::from_utf8_lossy(&output.stdout);
+    Some((
+        streams.lines().any(|stream| stream.trim() == "video"),
+        streams.lines().any(|stream| stream.trim() == "audio"),
+    ))
 }
 
 fn bilibili_exact_entry_metadata_paths(
@@ -2165,12 +2209,14 @@ fn current_bilibili_sidecars_match_entry(
 struct BilibiliMissingSeasonPlan {
     plan: bbdown_core::DownloadPlan,
     resolved: ResolvedContent,
-    skipped: Vec<bbdown_core::EpisodeMetadata>,
+    skipped: Vec<(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)>,
     existing_media_paths: BTreeSet<PathBuf>,
     total_entries: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn plan_bilibili_missing_season(
+    config: &AppConfig,
     client: &bbdown_core::BiliClient,
     url: &str,
     mode: DownloadMode,
@@ -2185,6 +2231,7 @@ async fn plan_bilibili_missing_season(
         );
     }
     let ffprobe = ffprobe.to_path_buf();
+    let probe_config = Arc::new(config.clone());
     let output_root = output_root.to_path_buf();
     let primary_media_kind = bilibili_primary_media_kind(mode);
     let index = tokio::task::spawn_blocking(move || {
@@ -2197,6 +2244,7 @@ async fn plan_bilibili_missing_season(
     .await
     .context("Bilibili existing season media scan task failed")??;
     let index = Arc::new(index);
+    let filter_index = Arc::clone(&index);
     let (plan, resolved, skipped) = bilibili_planning::plan_download_filtered(
         client,
         url,
@@ -2204,7 +2252,7 @@ async fn plan_bilibili_missing_season(
         mode,
         timeout,
         progress,
-        |episode| {
+        move |episode| {
             let entry = BilibiliDownloadEntry {
                 index: episode.index,
                 aid: episode.aid,
@@ -2216,10 +2264,13 @@ async fn plan_bilibili_missing_season(
                 publish_date: None,
             };
             let ffprobe = ffprobe.clone();
-            let index = Arc::clone(&index);
+            let index = Arc::clone(&filter_index);
+            let config = Arc::clone(&probe_config);
             async move {
-                bilibili_plan_entry_has_compatible_existing_media(&index, &entry, mode, &ffprobe)
-                    .await
+                bilibili_plan_entry_compatible_existing_media(
+                    &config, &index, &entry, mode, &ffprobe,
+                )
+                .await
             }
         },
     )
@@ -2229,7 +2280,7 @@ async fn plan_bilibili_missing_season(
     };
     let total_entries = season.selected_episodes.len();
     let mut existing_media_paths = BTreeSet::new();
-    for episode in &skipped {
+    for (episode, evidence) in &skipped {
         let entry = BilibiliDownloadEntry {
             index: episode.index,
             aid: episode.aid,
@@ -2240,14 +2291,14 @@ async fn plan_bilibili_missing_season(
             uploader: None,
             publish_date: None,
         };
-        let Some(video) =
-            bilibili_plan_entry_compatible_existing_media(&index, &entry, mode, &ffprobe).await
-        else {
+        if !bilibili_media_path_has_exact_existing_metadata(&index, &evidence.path, &entry)
+            || evidence.bound_file.validate_identity().is_err()
+        {
             bail!(
                 "Bilibili episode identity or media evidence changed while planning; retry the season so the updated plan can be reviewed"
             );
-        };
-        existing_media_paths.insert(video);
+        }
+        existing_media_paths.insert(evidence.path.clone());
     }
     Ok(BilibiliMissingSeasonPlan {
         plan,
@@ -3508,6 +3559,7 @@ async fn run_bilibili_job_locked(
             "BBDown-rust: re-resolving selected season for missing episodes".to_string(),
         );
         let missing = plan_bilibili_missing_season(
+            config,
             &client,
             url,
             options.mode,
@@ -9185,12 +9237,23 @@ async fn run_command_with_execution_context_and_additional_fds(
         .ok_or_else(|| anyhow!("failed to capture {} stderr", spec.program.display()))?;
 
     let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
+    let capture_limit = spec
+        .args
+        .iter()
+        .any(|arg| arg == "stream=codec_type")
+        .then_some(MAX_FFPROBE_CAPTURE_BYTES);
     let stdout_handle = tokio::spawn(read_command_stream(
         stdout,
         CommandStream::Stdout,
         chunk_tx.clone(),
+        capture_limit,
     ));
-    let stderr_handle = tokio::spawn(read_command_stream(stderr, CommandStream::Stderr, chunk_tx));
+    let stderr_handle = tokio::spawn(read_command_stream(
+        stderr,
+        CommandStream::Stderr,
+        chunk_tx,
+        capture_limit,
+    ));
 
     let total_timeout = Duration::from_secs(config.bot.command_timeout_seconds);
     let idle_timeout = Duration::from_secs(config.bot.command_idle_timeout_seconds);
@@ -9833,22 +9896,39 @@ async fn read_command_stream<R>(
     mut reader: R,
     stream: CommandStream,
     progress: mpsc::UnboundedSender<CommandChunk>,
+    capture_limit: Option<usize>,
 ) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
     let mut output = Vec::new();
     let mut buffer = [0_u8; 8192];
+    let mut exceeded_limit = false;
     loop {
         let size = reader.read(&mut buffer).await?;
         if size == 0 {
             break;
         }
         let bytes = buffer[..size].to_vec();
-        output.extend_from_slice(&bytes);
+        if let Some(limit) = capture_limit {
+            if output.len().saturating_add(size) > limit {
+                exceeded_limit = true;
+            } else if !exceeded_limit {
+                output.extend_from_slice(&bytes);
+            }
+        } else {
+            output.extend_from_slice(&bytes);
+        }
         let _ = progress.send(CommandChunk { stream, bytes });
     }
-    Ok(output)
+    if exceeded_limit {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "command output exceeded the bounded capture limit",
+        ))
+    } else {
+        Ok(output)
+    }
 }
 
 async fn collect_stream_outputs(
@@ -17097,12 +17177,55 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ffprobe_reads_the_bound_media_object_after_path_replacement() {
+        let root = temp_test_dir("bilibili-bound-ffprobe-aba");
+        fs::create_dir_all(&root).expect("fixture root should create");
+        let media_path = root.join("episode.mp4");
+        fs::write(&media_path, "original-media").expect("media should write");
+        let rooted = RootedFs::new(&root).expect("fixture root should bind");
+        let bound_file = rooted
+            .open_bound_file(&media_path)
+            .unwrap()
+            .expect("media should bind");
+        let original_identity = bound_file.identity();
+        let ffprobe = root.join("ffprobe-fixture");
+        fs::write(
+            &ffprobe,
+            format!(
+                "#!/bin/sh\nset -eu\nmv '{}' '{}.old'\nprintf replacement > '{}'\ntest \"$(cat \"$7\")\" = original-media\nprintf 'video\\naudio\\n'\n",
+                media_path.display(),
+                media_path.display(),
+                media_path.display(),
+            ),
+        )
+        .expect("controlled probe should write");
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755))
+            .expect("probe should be executable");
+
+        let streams = probe_media_streams(&test_config(), &ffprobe, &bound_file)
+            .await
+            .expect("bound descriptor should remain readable after path replacement");
+        assert_eq!(streams, (true, true));
+        bound_file
+            .validate_identity()
+            .expect("the selected open object should remain the original inode");
+        let replacement = rooted
+            .open_bound_file(&media_path)
+            .unwrap()
+            .expect("replacement path should be present");
+        assert_ne!(replacement.identity(), original_identity);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     #[ignore = "requires installed ffmpeg and ffprobe; run explicitly for real media validation"]
     async fn missing_season_probe_uses_actual_video_and_audio_streams() {
         let root = temp_test_dir("bilibili-missing-mode-probe");
         fs::create_dir_all(&root).expect("fixture root should create");
-        let ffmpeg = test_config().tools.ffmpeg;
+        let config = test_config();
+        let ffmpeg = config.tools.ffmpeg.clone();
         let ffprobe = ffprobe_program(&ffmpeg);
         async fn generate(ffmpeg: &Path, output: &Path, args: &[&str]) {
             let result = Command::new(ffmpeg)
@@ -17182,13 +17305,17 @@ mod tests {
             String::from_utf8_lossy(&av_result.stderr)
         );
 
-        let video_streams = probe_media_streams(&ffprobe, &video_only)
+        let rooted = RootedFs::new(&root).expect("fixture root should bind");
+        let video_file = rooted.open_bound_file(&video_only).unwrap().unwrap();
+        let audio_file = rooted.open_bound_file(&audio_only).unwrap().unwrap();
+        let av_file = rooted.open_bound_file(&audiovisual).unwrap().unwrap();
+        let video_streams = probe_media_streams(&config, &ffprobe, &video_file)
             .await
             .expect("video stream probe should complete");
-        let audio_streams = probe_media_streams(&ffprobe, &audio_only)
+        let audio_streams = probe_media_streams(&config, &ffprobe, &audio_file)
             .await
             .expect("audio stream probe should complete");
-        let av_streams = probe_media_streams(&ffprobe, &audiovisual)
+        let av_streams = probe_media_streams(&config, &ffprobe, &av_file)
             .await
             .expect("AV stream probe should complete");
         assert_eq!(video_streams, (true, false));
@@ -17236,6 +17363,7 @@ mod tests {
         ));
         assert!(
             bilibili_plan_entry_compatible_existing_media(
+                &config,
                 &index,
                 &entry,
                 DownloadMode::All,
@@ -17246,23 +17374,27 @@ mod tests {
         );
         assert_eq!(
             bilibili_plan_entry_compatible_existing_media(
+                &config,
                 &index,
                 &entry,
                 DownloadMode::VideoOnly,
                 &ffprobe,
             )
-            .await,
-            Some(video_only)
+            .await
+            .map(|evidence| evidence.path),
+            Some(video_only.clone())
         );
         fs::write(audiovisual.with_extension("nfo"), matching_nfo).unwrap();
         assert_eq!(
             bilibili_plan_entry_compatible_existing_media(
+                &config,
                 &index,
                 &entry,
                 DownloadMode::All,
                 &ffprobe,
             )
-            .await,
+            .await
+            .map(|evidence| evidence.path),
             Some(audiovisual)
         );
         let _ = fs::remove_dir_all(root);
@@ -17400,9 +17532,13 @@ mod tests {
         )
         .unwrap();
         let ffprobe = output_dir.join("ffprobe-fixture");
+        let probe_count = output_dir.join("probe-count");
         fs::write(
             &ffprobe,
-            "#!/bin/sh\nset -eu\ncase \"$4\" in\n  v:0) printf 'video\\n';;\n  a:0) printf 'audio\\n';;\n  *) exit 1;;\nesac\n",
+            format!(
+                "#!/bin/sh\nset -eu\nprintf x >> '{}'\nprintf 'video\\naudio\\n'\n",
+                probe_count.display()
+            ),
         )
         .unwrap();
         fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755)).unwrap();
@@ -17418,6 +17554,7 @@ mod tests {
         let plan = tokio_timeout(
             Duration::from_secs(5),
             plan_bilibili_missing_season(
+                &test_config(),
                 &client,
                 "https://www.bilibili.com/bangumi/play/ss123",
                 DownloadMode::VideoOnly,
@@ -17447,6 +17584,7 @@ mod tests {
             .expect("existing identity metadata should write");
         }
         let complete_plan = plan_bilibili_missing_season(
+            &test_config(),
             &client,
             "https://www.bilibili.com/bangumi/play/ss123",
             DownloadMode::VideoOnly,
@@ -17466,6 +17604,13 @@ mod tests {
         assert!(complete_plan.plan.entries.is_empty());
         assert_eq!(complete_plan.plan.title, "Test season");
         let requests = requests.lock().expect("request log should lock");
+        assert_eq!(
+            fs::read(&probe_count)
+                .expect("probe calls should be counted")
+                .len(),
+            3,
+            "one probe per exact existing episode; final path collection must reuse evidence"
+        );
         let skipped_playback_requests = requests
             .iter()
             .filter(|request| {
