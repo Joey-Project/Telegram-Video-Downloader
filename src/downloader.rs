@@ -42,7 +42,8 @@ use crate::bilibili_planning;
 use crate::config::AppConfig;
 use crate::episode_retry::{EpisodeFailureDisposition, classify_episode_failure};
 use crate::queue::{
-    BilibiliGroupEntryIdentity, PlanSize, PlanValidationSnapshot, sanitize_job_for_storage,
+    BilibiliCollectionDirectorySnapshot, BilibiliGroupEntryIdentity, PlanSize,
+    PlanValidationSnapshot, sanitize_job_for_storage,
 };
 use crate::redaction::redact_sensitive_text;
 use crate::router::{BilibiliSelection, JobRequest, is_bilibili_ugc_collection_url};
@@ -1920,8 +1921,25 @@ impl BilibiliEpisodeGroupInventory {
                     stable_media_id: entry.stable_media_id.clone(),
                 })
                 .collect(),
+            bilibili_collection_directory: self.collection_directory_snapshot(),
             title: Some(self.title.clone()),
             ..PlanValidationSnapshot::default()
+        }
+    }
+
+    fn collection_directory_snapshot(&self) -> BilibiliCollectionDirectorySnapshot {
+        let (BilibiliGroupSource::Collection, Some(path)) = (self.source, &self.output_folder)
+        else {
+            return BilibiliCollectionDirectorySnapshot::Untracked;
+        };
+        match self.output_folder_identity {
+            Some(identity) => BilibiliCollectionDirectorySnapshot::Existing {
+                path: path.clone(),
+                device: identity.device(),
+                inode: identity.inode(),
+                is_directory: identity.is_dir(),
+            },
+            None => BilibiliCollectionDirectorySnapshot::Missing { path: path.clone() },
         }
     }
 }
@@ -2914,6 +2932,21 @@ fn validate_group_inventory_snapshot(
     previous: Option<&BilibiliAttemptSnapshot>,
     current_media_profile: &str,
 ) -> Result<()> {
+    let current_collection_directory = inventory.collection_directory_snapshot();
+    if let Some(expected) = expected_plan
+        && expected.bilibili_collection_directory != current_collection_directory
+    {
+        if expected.bilibili_collection_directory == BilibiliCollectionDirectorySnapshot::Untracked
+            && inventory.source == BilibiliGroupSource::Collection
+        {
+            bail!(
+                "saved Bilibili collection output directory identity mismatch: the plan is untracked; inspect the group again"
+            );
+        }
+        bail!(
+            "Bilibili collection output directory identity changed since the reviewed plan; inspect the group again"
+        );
+    }
     let stable_ids = inventory
         .entries
         .iter()
@@ -19837,6 +19870,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collection_group_driver_pauses_when_reviewed_directory_object_is_replaced() {
+        let (config, output_root) =
+            test_group_config("episode-group-reviewed-collection-replacement");
+        let folder_name = "selected-collection";
+        let folder = output_root.join(folder_name);
+        fs::create_dir(&folder).expect("selected collection directory should be created");
+        let rooted_output = RootedFs::new(&output_root).expect("output root should bind");
+        let selected_identity = rooted_output
+            .entry_identity(&folder)
+            .expect("selected directory should be inspectable")
+            .expect("selected directory should exist");
+        let reviewed_inventory =
+            test_collection_group_inventory(folder_name, Some(selected_identity));
+        let reviewed_plan = test_group_validation_snapshot(&reviewed_inventory, &config);
+
+        let encoded_plan = serde_json::to_vec(&reviewed_plan)
+            .expect("reviewed plan should serialize for queue persistence");
+        let restored_plan: PlanValidationSnapshot =
+            serde_json::from_slice(&encoded_plan).expect("reviewed plan should reload");
+        assert_eq!(restored_plan, reviewed_plan);
+
+        let mut legacy_value = serde_json::to_value(&reviewed_plan)
+            .expect("reviewed plan should convert to legacy fixture");
+        legacy_value
+            .as_object_mut()
+            .expect("plan JSON should be an object")
+            .remove("bilibili_collection_directory");
+        let legacy_plan: PlanValidationSnapshot =
+            serde_json::from_value(legacy_value).expect("legacy plan should retain compatibility");
+        assert_eq!(
+            legacy_plan.bilibili_collection_directory,
+            BilibiliCollectionDirectorySnapshot::Untracked
+        );
+
+        let renamed_original = output_root.join("selected-collection-original");
+        fs::rename(&folder, &renamed_original)
+            .expect("original selected directory should be moved aside");
+        fs::create_dir(&folder).expect("replacement directory should be created");
+        let replacement_identity = rooted_output
+            .entry_identity(&folder)
+            .expect("replacement directory should be inspectable")
+            .expect("replacement directory should exist");
+        assert_ne!(selected_identity, replacement_identity);
+        let current_inventory =
+            test_collection_group_inventory(folder_name, Some(replacement_identity));
+        let current_plan = test_group_validation_snapshot(&current_inventory, &config);
+        assert_eq!(
+            restored_plan.blocking_differences(&current_plan),
+            vec!["collection output directory"]
+        );
+
+        let execute_count = Arc::new(StdMutex::new(0usize));
+        let executor_count = Arc::clone(&execute_count);
+        let execute_entry: BilibiliGroupEntryExecutor = Arc::new(move |_| {
+            let count = Arc::clone(&executor_count);
+            Box::pin(async move {
+                *count
+                    .lock()
+                    .expect("executor count lock should remain healthy") += 1;
+                bail!("directory replacement must pause before an episode starts")
+            })
+        });
+        let scanner: BilibiliGroupExistingMediaScanner = Arc::new(|_| Box::pin(async { Ok(None) }));
+        let error = run_bilibili_episode_group_with_inventory(
+            &config,
+            &test_group_job(BilibiliSelection::All),
+            current_inventory.clone(),
+            None,
+            Some(restored_plan.clone()),
+            None,
+            test_group_hooks(execute_entry, scanner),
+        )
+        .await
+        .expect_err("replacement after review must pause the group");
+        assert!(format!("{error:#}").contains("identity changed"));
+        assert_eq!(
+            classify_episode_failure(&error, 0),
+            EpisodeFailureDisposition::PauseGroup,
+            "directory identity mismatch is a shared safety failure"
+        );
+        assert_eq!(
+            *execute_count
+                .lock()
+                .expect("executor count lock should remain healthy"),
+            0,
+            "no episode may start under an unreviewed replacement directory"
+        );
+
+        let current_options =
+            bilibili_core::download_options(&config).expect("test Bilibili options should parse");
+        let legacy_error = validate_group_inventory_snapshot(
+            &current_inventory,
+            Some(&legacy_plan),
+            None,
+            &bilibili_group_media_profile(&current_options, &config),
+        )
+        .expect_err("legacy collection plan without identity must be reconfirmed");
+        assert_eq!(
+            classify_episode_failure(&legacy_error, 0),
+            EpisodeFailureDisposition::PauseGroup
+        );
+
+        fs::remove_dir_all(output_root).expect("test output root should be removed");
+    }
+
+    #[tokio::test]
+    async fn missing_collection_directory_reconfirmation_preserves_verified_media() {
+        let (config, output_root) =
+            test_group_config("episode-group-missing-directory-reconfirmation");
+        let folder_name = "selected-collection";
+        let folder = output_root.join(folder_name);
+        let missing_inventory = test_collection_group_inventory(folder_name, None);
+        let missing_plan = test_group_validation_snapshot(&missing_inventory, &config);
+        assert_eq!(
+            missing_plan.bilibili_collection_directory,
+            BilibiliCollectionDirectorySnapshot::Missing {
+                path: folder_name.to_string(),
+            }
+        );
+
+        let first_execute_count = Arc::new(StdMutex::new(0usize));
+        let first_executor_count = Arc::clone(&first_execute_count);
+        let first_folder = folder.clone();
+        let first_executor: BilibiliGroupEntryExecutor = Arc::new(move |entry| {
+            let count = Arc::clone(&first_executor_count);
+            let folder = first_folder.clone();
+            Box::pin(async move {
+                *count
+                    .lock()
+                    .expect("executor count lock should remain healthy") += 1;
+                fs::create_dir_all(&folder)
+                    .expect("the selected output directory should be created by execution");
+                let path = folder.join(format!("Episode {}.mp4", entry.download.index));
+                fs::write(&path, b"verified episode media")
+                    .expect("episode media should be published");
+                Ok(report_for_group_test_media(path))
+            })
+        });
+        let scanner: BilibiliGroupExistingMediaScanner = Arc::new(|_| Box::pin(async { Ok(None) }));
+        let (first_progress, _first_receiver) = job_progress_channel();
+        let first_report = run_bilibili_episode_group_with_inventory(
+            &config,
+            &test_group_job(BilibiliSelection::All),
+            missing_inventory.clone(),
+            None,
+            Some(missing_plan.clone()),
+            Some(first_progress.clone()),
+            test_group_hooks(first_executor, Arc::clone(&scanner)),
+        )
+        .await
+        .expect("the initial plan should download into its missing collection directory");
+        assert_eq!(*first_execute_count.lock().unwrap(), 1);
+        assert_eq!(first_report.primary_media_paths.len(), 1);
+
+        let mut previous = first_progress
+            .bilibili_attempt_snapshot()
+            .expect("completed group should retain its entry receipts");
+        assert_eq!(previous.verified_entries(), 1);
+        previous.prepare_resume(false);
+        let previous: BilibiliAttemptSnapshot = serde_json::from_slice(
+            &serde_json::to_vec(&previous).expect("verified attempt should serialize"),
+        )
+        .expect("verified attempt should survive a queue reload");
+        assert_eq!(previous.verified_entries(), 1);
+        assert_eq!(
+            previous.entries[0].published_media_paths,
+            first_report.primary_media_paths
+        );
+
+        let rooted_output = RootedFs::new(&output_root).expect("output root should bind");
+        let existing_identity = rooted_output
+            .entry_identity(&folder)
+            .expect("created collection directory should be inspectable")
+            .expect("execution should have created the collection directory");
+        let existing_inventory =
+            test_collection_group_inventory(folder_name, Some(existing_identity));
+        let accepted_plan = test_group_validation_snapshot(&existing_inventory, &config);
+        assert_eq!(
+            missing_plan.blocking_differences(&accepted_plan),
+            vec!["collection output directory"],
+            "the Missing-to-Existing transition requires a fresh plan confirmation"
+        );
+
+        let should_not_execute: BilibiliGroupEntryExecutor =
+            Arc::new(|_| Box::pin(async { bail!("verified output should be reused") }));
+        let stale_plan_error = run_bilibili_episode_group_with_inventory(
+            &config,
+            &test_group_job(BilibiliSelection::All),
+            existing_inventory.clone(),
+            Some(previous.clone()),
+            Some(missing_plan),
+            None,
+            test_group_hooks(Arc::clone(&should_not_execute), Arc::clone(&scanner)),
+        )
+        .await
+        .expect_err("the stale Missing plan must not trust the new directory object");
+        assert_eq!(
+            classify_episode_failure(&stale_plan_error, 0),
+            EpisodeFailureDisposition::PauseGroup
+        );
+
+        let (resume_progress, _resume_receiver) = job_progress_channel();
+        let resumed = run_bilibili_episode_group_with_inventory(
+            &config,
+            &test_group_job(BilibiliSelection::All),
+            existing_inventory.clone(),
+            Some(previous),
+            Some(accepted_plan),
+            Some(resume_progress.clone()),
+            test_group_hooks(should_not_execute, scanner),
+        )
+        .await
+        .expect("reconfirmed directory plan should preserve verified media");
+        assert_eq!(
+            resumed.primary_media_paths,
+            first_report.primary_media_paths
+        );
+        assert_eq!(*first_execute_count.lock().unwrap(), 1);
+        assert_eq!(
+            resume_progress
+                .bilibili_attempt_snapshot()
+                .expect("resumed group should retain its snapshot")
+                .verified_entries(),
+            1
+        );
+
+        fs::remove_dir_all(output_root).expect("test output root should be removed");
+    }
+
+    #[tokio::test]
     async fn collection_group_inventory_allows_child_entry_churn() {
         let (config, output_root) = test_group_config("episode-group-collection-child-churn");
         let folder_name = "selected-collection";
@@ -19848,20 +20111,37 @@ mod tests {
             .expect("selected directory should be inspectable")
             .expect("selected directory should exist");
         let inventory = test_collection_group_inventory(folder_name, Some(selected_identity));
+        let reviewed_plan = test_group_validation_snapshot(&inventory, &config);
 
         fs::write(folder.join("late-child.txt"), "benign directory churn")
             .expect("child entry should be added after inventory selection");
-        assert_eq!(
-            rooted_output
-                .entry_identity(&folder)
-                .expect("selected directory should remain inspectable"),
-            Some(selected_identity),
-            "child-entry churn must not change the selected directory object"
+        let refreshed_identity = rooted_output
+            .entry_identity(&folder)
+            .expect("selected directory should remain inspectable")
+            .expect("selected directory should remain present");
+        assert_eq!(refreshed_identity, selected_identity);
+        let refreshed_inventory =
+            test_collection_group_inventory(folder_name, Some(refreshed_identity));
+        let refreshed_plan = test_group_validation_snapshot(&refreshed_inventory, &config);
+        assert!(
+            reviewed_plan
+                .blocking_differences(&refreshed_plan)
+                .is_empty(),
+            "child churn must not invalidate the reviewed directory object"
         );
+        let options = bilibili_core::download_options(&config).expect("test options should parse");
+        validate_group_inventory_snapshot(
+            &refreshed_inventory,
+            Some(&reviewed_plan),
+            None,
+            &bilibili_group_media_profile(&options, &config),
+        )
+        .expect("a refreshed plan should retain the same directory object after child churn");
 
-        let index = build_bilibili_group_identity_index(&config, &inventory, DownloadMode::All)
-            .await
-            .expect("child churn should remain eligible for inventory scanning");
+        let index =
+            build_bilibili_group_identity_index(&config, &refreshed_inventory, DownloadMode::All)
+                .await
+                .expect("child churn should remain eligible for inventory scanning");
         let index = index.lock().await;
         assert_eq!(
             index.root.as_ref().map(RootedFs::root_identity),

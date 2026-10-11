@@ -540,10 +540,22 @@ impl BilibiliAttemptSnapshot {
 
     pub fn finish(&mut self, mut outcome: BilibiliAttemptOutcome) {
         if self.outcome.is_some() {
-            if self.outcome == Some(BilibiliAttemptOutcome::Interrupted)
-                && outcome == BilibiliAttemptOutcome::Cancelled
-            {
-                // An explicit parent cancellation is authoritative over a guard's Drop snapshot.
+            let may_replace = matches!(
+                (self.outcome, outcome),
+                (
+                    Some(BilibiliAttemptOutcome::Verified),
+                    BilibiliAttemptOutcome::Failed
+                        | BilibiliAttemptOutcome::PartiallyCompleted
+                        | BilibiliAttemptOutcome::Cancelled
+                        | BilibiliAttemptOutcome::Interrupted
+                ) | (
+                    Some(BilibiliAttemptOutcome::Interrupted),
+                    BilibiliAttemptOutcome::Cancelled
+                )
+            );
+            if may_replace {
+                // Per-episode verification precedes parent task finalization; the parent outcome
+                // remains authoritative until the queue records task completion.
                 self.outcome = None;
             } else {
                 return;
@@ -1213,7 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_cancel_replaces_interrupted_but_preserves_real_terminal_outcomes() {
+    fn parent_outcomes_replace_verified_and_preserve_real_failures() {
         let mut interrupted = BilibiliAttemptSnapshot::new_independent(
             "Season".to_string(),
             [(1, "Episode 1".to_string(), None)],
@@ -1226,6 +1238,58 @@ mod tests {
         assert_eq!(
             interrupted.entries[0].state,
             BilibiliAttemptEntryState::Interrupted
+        );
+
+        let mut verified = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [(1, "Episode 1".to_string(), None)],
+            0,
+        );
+        verified.entry_verified(1);
+        verified.finish(BilibiliAttemptOutcome::Verified);
+        verified.finish(BilibiliAttemptOutcome::PartiallyCompleted);
+        assert_eq!(
+            verified.outcome,
+            Some(BilibiliAttemptOutcome::PartiallyCompleted)
+        );
+
+        let mut verified_before_restart = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [(1, "Episode 1".to_string(), None)],
+            0,
+        );
+        verified_before_restart.entry_verified(1);
+        verified_before_restart.finish(BilibiliAttemptOutcome::Verified);
+        verified_before_restart.finish(BilibiliAttemptOutcome::Interrupted);
+        assert_eq!(
+            verified_before_restart.outcome,
+            Some(BilibiliAttemptOutcome::Interrupted)
+        );
+
+        let mut verified_before_cancel = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [(1, "Episode 1".to_string(), None)],
+            0,
+        );
+        verified_before_cancel.entry_verified(1);
+        verified_before_cancel.finish(BilibiliAttemptOutcome::Verified);
+        verified_before_cancel.finish(BilibiliAttemptOutcome::Cancelled);
+        assert_eq!(
+            verified_before_cancel.outcome,
+            Some(BilibiliAttemptOutcome::Cancelled)
+        );
+
+        let mut verified_before_failure = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [(1, "Episode 1".to_string(), None)],
+            0,
+        );
+        verified_before_failure.entry_verified(1);
+        verified_before_failure.finish(BilibiliAttemptOutcome::Verified);
+        verified_before_failure.finish(BilibiliAttemptOutcome::Failed);
+        assert_eq!(
+            verified_before_failure.outcome,
+            Some(BilibiliAttemptOutcome::PartiallyCompleted)
         );
 
         let mut partial = BilibiliAttemptSnapshot::new_independent(
@@ -1245,15 +1309,15 @@ mod tests {
             Some(BilibiliAttemptOutcome::PartiallyCompleted)
         );
 
-        let mut verified = BilibiliAttemptSnapshot::new_independent(
+        let mut failed = BilibiliAttemptSnapshot::new_independent(
             "Season".to_string(),
             [(1, "Episode 1".to_string(), None)],
             0,
         );
-        verified.entry_verified(1);
-        verified.finish(BilibiliAttemptOutcome::Verified);
-        verified.finish(BilibiliAttemptOutcome::Cancelled);
-        assert_eq!(verified.outcome, Some(BilibiliAttemptOutcome::Verified));
+        failed.entry_failed(1);
+        failed.finish(BilibiliAttemptOutcome::Failed);
+        failed.finish(BilibiliAttemptOutcome::Cancelled);
+        assert_eq!(failed.outcome, Some(BilibiliAttemptOutcome::Failed));
     }
 
     #[test]

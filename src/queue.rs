@@ -110,6 +110,28 @@ pub struct BilibiliGroupEntryIdentity {
     pub stable_media_id: String,
 }
 
+/// The reviewed collection output directory state. Existing directories are bound by their
+/// root-relative path, device, inode, and directory type: these signals protect the selected
+/// directory object and its access path across confirmation/restart. Child contents and mutable
+/// metadata such as modification time are intentionally excluded so child churn and normal
+/// File Provider materialization do not invalidate the reviewed object. `Untracked` is also the
+/// serde default for legacy plans that did not persist this identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BilibiliCollectionDirectorySnapshot {
+    #[default]
+    Untracked,
+    Missing {
+        path: String,
+    },
+    Existing {
+        path: String,
+        device: u64,
+        inode: u64,
+        is_directory: bool,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanValidationSnapshot {
     pub stable_media_ids: Vec<String>,
@@ -122,6 +144,8 @@ pub struct PlanValidationSnapshot {
     pub media_profile: Option<String>,
     #[serde(default)]
     pub bilibili_group_entries: Vec<BilibiliGroupEntryIdentity>,
+    #[serde(default)]
+    pub bilibili_collection_directory: BilibiliCollectionDirectorySnapshot,
 }
 
 impl PlanValidationSnapshot {
@@ -154,6 +178,9 @@ impl PlanValidationSnapshot {
         }
         if self.media_profile != current.media_profile {
             differences.push("download requirements");
+        }
+        if self.bilibili_collection_directory != current.bilibili_collection_directory {
+            differences.push("collection output directory");
         }
         differences
     }
@@ -4831,6 +4858,115 @@ mod tests {
         }
         assert!(attempt.summary().contains("Outcome: cancelled"));
         assert!(!attempt.summary().contains("Outcome: interrupted"));
+
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn parent_partial_finalization_replaces_group_verified_outcome_and_reloads() {
+        use crate::router::BilibiliSelection;
+        let directory = temp_queue_root("episode-group-finalization-partial");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = directory.join("videos");
+        config.downloads.pdf_dir = directory.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "episode-group-finalization-partial",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        let mut snapshot = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [(16, "Episode 16".into(), Some("ep-16".into()))],
+            0,
+        );
+        snapshot.entry_verified(16);
+        snapshot.finish(BilibiliAttemptOutcome::Verified);
+        task.bilibili_attempt = Some(snapshot);
+        queue.create(task.clone()).unwrap();
+
+        let partial = queue
+            .fail_with_bilibili_attempt_if_generation(
+                &task.id,
+                0,
+                "final hash validation failed".into(),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial.status, TaskStatus::PartiallyCompleted);
+        assert_eq!(
+            partial.bilibili_attempt.as_ref().unwrap().outcome,
+            Some(BilibiliAttemptOutcome::PartiallyCompleted)
+        );
+        assert!(
+            partial
+                .bilibili_attempt
+                .as_ref()
+                .unwrap()
+                .summary()
+                .contains("Outcome: partially completed")
+        );
+
+        drop(queue);
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.status, TaskStatus::PartiallyCompleted);
+        let attempt = restored.bilibili_attempt.unwrap();
+        assert_eq!(
+            attempt.outcome,
+            Some(BilibiliAttemptOutcome::PartiallyCompleted)
+        );
+        assert_eq!(attempt.verified_entries(), 1);
+        assert!(attempt.summary().contains("Outcome: partially completed"));
+
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn restart_replaces_group_verified_outcome_with_interrupted_summary() {
+        use crate::router::BilibiliSelection;
+        let directory = temp_queue_root("episode-group-finalization-restart");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = directory.join("videos");
+        config.downloads.pdf_dir = directory.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "episode-group-finalization-restart",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        let mut snapshot = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [(16, "Episode 16".into(), Some("ep-16".into()))],
+            0,
+        );
+        snapshot.entry_verified(16);
+        snapshot.finish(BilibiliAttemptOutcome::Verified);
+        task.bilibili_attempt = Some(snapshot);
+        queue.create(task.clone()).unwrap();
+        drop(queue);
+
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.status, TaskStatus::Interrupted);
+        let attempt = restored.bilibili_attempt.unwrap();
+        assert_eq!(attempt.outcome, Some(BilibiliAttemptOutcome::Interrupted));
+        assert_eq!(attempt.verified_entries(), 1);
+        assert!(attempt.summary().contains("Outcome: interrupted"));
+        assert!(!attempt.summary().contains("Outcome: verified"));
 
         drop(queue);
         fs::remove_dir_all(directory).unwrap();

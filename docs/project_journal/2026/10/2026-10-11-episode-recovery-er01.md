@@ -52,10 +52,15 @@ offer a way to select failed episodes.
 - Offer a claimable normal resume after scoped retry preparation fails before
   execution. Keep explicit cancellation authoritative over interrupted cleanup
   snapshots, and pause collection groups when refreshed page identities change.
+- Carry reviewed collection-directory object identities across plan confirmation
+  and execution. Media verification remains provisional until the parent queue
+  completes final hashing and persistence, with matching failure/restart outcomes.
+  Legacy collection plans and Missing-to-Existing directory transitions use the
+  existing plan confirmation flow while retaining valid episode receipts.
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed with 701 passed and 15 existing
+- Rust 1.95.0: all-target offline tests passed with 705 passed and 15 existing
   opt-in tests ignored. Offline build, all-target Clippy with warnings denied,
   formatting, diff checks, and project journal validation passed.
 - Regression tests exercise the actual episode driver through injected child
@@ -79,6 +84,9 @@ offer a way to select failed episodes.
   failure and execute the rendered resume callback. Cancellation tests cover
   interrupted cleanup snapshots and reload; refreshed collection CID changes
   stop the driver before a later episode starts.
+- Finalization regressions preserve verified episode files while replacing the
+  provisional group outcome after parent failure or restart. Collection plan
+  regressions retain reviewed directory identity across delayed execution.
 - State and mock Telegram tests cover independent completion counts, restart,
   error retention, progress-channel closure, paginated episode views, message
   reuse, stale generation callbacks, and cross-chat action rejection.
