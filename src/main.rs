@@ -15,7 +15,7 @@ mod telegram;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::{
     Arc,
@@ -40,14 +40,14 @@ use crate::config::AppConfig;
 use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
     BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
-    JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, VideoDuplicate,
+    JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, JobReport, VideoDuplicate,
     VideoDuplicateAction, VideoDuplicateCheck, existing_bilibili_report_media_identities,
     find_video_duplicate_with_probe_and_progress, human_bytes, inspect_job_display_metadata,
     inspect_job_plan_with_progress, is_bilibili_episode_group, job_progress_channel,
     recover_pending_overwrite_transactions, run_bilibili_episode_group, run_bilibili_worker,
     run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
     run_video_job_staged_keep_both_with_plan, sync_bilibili_rust_credentials,
-    validate_existing_bilibili_report_for_completion,
+    validate_bilibili_report_media_hashes, validate_existing_bilibili_report_for_completion,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 #[cfg(test)]
@@ -5887,6 +5887,24 @@ struct PublishedTaskCompletion<'a> {
     collection_status_message_id: Option<i64>,
 }
 
+async fn hash_and_validate_published_media(
+    media_root: &Path,
+    report: &JobReport,
+) -> Result<BTreeMap<String, String>> {
+    let root_path = media_root.to_path_buf();
+    let media_paths = report.primary_media_paths.clone();
+    let verification_report = report.clone();
+    let hashes = tokio::task::spawn_blocking(move || {
+        let root = crate::safe_fs::RootedFs::new(&root_path)?;
+        let expected = existing_bilibili_report_media_identities(&root, &verification_report)?;
+        hash_primary_media_with_expected_identities(&root_path, &media_paths, &expected)
+    })
+    .await
+    .context("published media hash task failed to join")??;
+    validate_bilibili_report_media_hashes(report, &hashes)?;
+    Ok(hashes)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_queued_job(
     context: BotContext,
@@ -6386,22 +6404,8 @@ async fn run_queued_job(
                 } else {
                     config.downloads.video_dir.clone()
                 };
-                let media_paths = report.primary_media_paths.clone();
                 validate_existing_bilibili_report_for_completion(&config, &report).await?;
-                let verification_report = report.clone();
-                let hashes = tokio::task::spawn_blocking(move || {
-                    let root = crate::safe_fs::RootedFs::new(&media_root)?;
-                    let expected =
-                        existing_bilibili_report_media_identities(&root, &verification_report)?;
-                    let hashes = hash_primary_media_with_expected_identities(
-                        &media_root,
-                        &media_paths,
-                        &expected,
-                    )?;
-                    Ok::<_, anyhow::Error>(hashes)
-                })
-                .await
-                .context("published media hash task failed to join")??;
+                let hashes = hash_and_validate_published_media(&media_root, &report).await?;
                 validate_existing_bilibili_report_for_completion(&config, &report).await?;
                 complete_published_task_with_retry(
                     &telegram,
@@ -11961,6 +11965,56 @@ mod tests {
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn group_receipt_hashes_are_checked_by_published_completion_hash_path() {
+        let root = temp_main_test_dir("group-receipt-final-hash");
+        fs::create_dir_all(&root).expect("output root should create");
+        let media = root.join("episode.mp4");
+        fs::write(&media, b"verified episode bytes").expect("episode should write");
+        let media_paths = vec![media.clone()];
+        let expected =
+            hash_primary_media(&root, &media_paths).expect("verified output should hash");
+        let report: JobReport = serde_json::from_value(serde_json::json!({
+            "saved_location": "Episode group",
+            "details": "",
+            "primary_media_paths": media_paths,
+            "existing_bilibili_evidence": {
+                "expected_media_hashes": expected,
+            },
+        }))
+        .expect("group report receipt should deserialize");
+
+        let actual = hash_and_validate_published_media(&root, &report)
+            .await
+            .expect("unchanged published content should match its receipt");
+        assert_eq!(
+            actual,
+            report
+                .existing_bilibili_evidence
+                .as_ref()
+                .unwrap()
+                .expected_media_hashes
+                .clone()
+        );
+
+        let replacement = root.join("replacement.mp4");
+        fs::write(&replacement, b"verified episode bytes")
+            .expect("same-content replacement should write");
+        fs::remove_file(&media).expect("old output should remove for rematerialization");
+        fs::rename(&replacement, &media).expect("same-content output should rematerialize");
+        hash_and_validate_published_media(&root, &report)
+            .await
+            .expect("same bytes should remain valid after object rematerialization");
+
+        fs::write(&media, b"changed episode bytes").expect("changed output should write");
+        let error = hash_and_validate_published_media(&root, &report)
+            .await
+            .expect_err("changed published content must not replace its receipt");
+        assert!(format!("{error:#}").contains("changed after episode verification"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

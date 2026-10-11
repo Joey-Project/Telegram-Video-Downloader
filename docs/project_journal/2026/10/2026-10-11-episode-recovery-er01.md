@@ -45,10 +45,14 @@ offer a way to select failed episodes.
   publication receipt per stable media identity and output root. Recovery does
   not depend on optional NFO or sidecars; content hashes and bound path checks
   distinguish invalid output from unreadable recovery state.
+- Recover published outputs even when the episode-start event was not saved,
+  preserve explicit fresh All keep-both behavior, and compare original receipt
+  hashes at group completion and final queue hashing. Retain selected collection
+  directory identities and release shared index locks before timed media probes.
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed with 688 passed and 15 existing
+- Rust 1.95.0: all-target offline tests passed with 697 passed and 15 existing
   opt-in tests ignored. Offline build, all-target Clippy with warnings denied,
   formatting, diff checks, and project journal validation passed.
 - Regression tests exercise the actual episode driver through injected child
@@ -63,6 +67,11 @@ offer a way to select failed episodes.
   mutation, and unreadable receipt state. UI and state regressions preserve
   retry scopes across inventory changes and expose finalization resume while
   distinguishing settled partial results from restart interruptions.
+- Completion regressions reject later content mutations and preserve original
+  hashes through the actual parent queue finalization path; same-content file
+  replacement and normal directory child-entry churn remain accepted. Controlled
+  timeout tests prove background probes release the publication-index lock and
+  publication-index updates fail within a bounded wait.
 - State and mock Telegram tests cover independent completion counts, restart,
   error retention, progress-channel closure, paginated episode views, message
   reuse, stale generation callbacks, and cross-chat action rejection.
