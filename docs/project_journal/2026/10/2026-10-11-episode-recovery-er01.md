@@ -72,10 +72,16 @@ offer a way to select failed episodes.
 - Bind durable publication requirements to confirmed episode stream fingerprints
   so accepting new formats cannot reuse an old-format receipt after queue receipt
   persistence was interrupted.
+- Revalidate copied and durable publication receipts before launching an automatic
+  retry. Verified outputs survive retryable post-publication cleanup errors;
+  changed outputs still require a fresh child execution.
+- Carry the confirmed collection directory object into each child publication.
+  Bind destination parents to that object before moving files. Missing directories
+  use atomic owned creation, retaining the resulting identity for later episodes.
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed with 716 passed and 15 existing
+- Rust 1.95.0: all-target offline tests passed with 720 passed and 15 existing
   opt-in tests ignored. Offline build, all-target Clippy with warnings denied,
   formatting, diff checks, and project journal validation passed.
 - Regression tests exercise the actual episode driver through injected child
@@ -112,6 +118,11 @@ offer a way to select failed episodes.
 - Task isolation and restart regressions reject another All task's publication
   evidence, preserve task namespaces, retain cancellation over failed summaries,
   and pause on output-root disappearance while keeping single-file misses local.
+- Publication regressions replace the collection directory in the actual mover
+  and reject path rebinding, while allowing normal child churn and consecutive
+  publications into an atomically created directory. Concurrent foreign creation
+  is rejected. Automatic retry tests recover event-only and durable-only receipts
+  after cleanup timeout, and redownload changed media instead of reusing it.
 - State and mock Telegram tests cover independent completion counts, restart,
   error retention, progress-channel closure, paginated episode views, message
   reuse, stale generation callbacks, and cross-chat action rejection.

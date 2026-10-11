@@ -553,6 +553,8 @@ struct BilibiliWorkerExpectedEntry {
     #[serde(default)]
     collection_output_folder: Option<String>,
     #[serde(default)]
+    collection_directory: BilibiliCollectionDirectorySnapshot,
+    #[serde(default)]
     confirmed_streams: Option<BilibiliGroupConfirmedStreams>,
 }
 
@@ -2021,6 +2023,91 @@ impl BilibiliEpisodeGroupInventory {
     }
 }
 
+fn establish_bilibili_group_collection_directory(
+    root: &RootedFs,
+    inventory: &mut BilibiliEpisodeGroupInventory,
+) -> Result<()> {
+    if inventory.source != BilibiliGroupSource::Collection {
+        return Ok(());
+    }
+    let folder = inventory
+        .output_folder
+        .as_deref()
+        .context("Bilibili collection inventory omitted its selected output directory")?;
+    let path = bilibili_group_collection_output_folder_path(root, folder)?;
+    let identity = match inventory.collection_directory_snapshot() {
+        BilibiliCollectionDirectorySnapshot::Existing {
+            path: reviewed_path,
+            device,
+            inode,
+            is_directory,
+        } => {
+            if reviewed_path != folder || !is_directory {
+                bail!(
+                    "Bilibili collection output directory identity mismatch: invalid reviewed directory binding"
+                );
+            }
+            let entry = root.bind_entry(&path, false)?;
+            let current = root.bound_entry_identity(&entry)?.with_context(|| {
+                format!(
+                    "Bilibili collection output directory identity changed: {} is missing",
+                    path.display()
+                )
+            })?;
+            if !current.is_dir() || current.device() != device || current.inode() != inode {
+                bail!(
+                    "Bilibili collection output directory identity changed: {}",
+                    path.display()
+                );
+            }
+            current
+        }
+        BilibiliCollectionDirectorySnapshot::Missing {
+            path: reviewed_path,
+        } => {
+            if reviewed_path != folder {
+                bail!(
+                    "Bilibili collection output directory identity mismatch: reviewed path changed"
+                );
+            }
+            // Only accept this directory when this locked invocation created it. A concurrent
+            // appearance belongs to another actor and requires a fresh reviewed plan.
+            let created = root.create_dir(&path, 0o755)?.with_context(|| {
+                format!(
+                    "Bilibili collection output directory identity changed: {} appeared before creation",
+                    path.display()
+                )
+            })?;
+            let entry = root.bind_entry(&path, false)?;
+            let current = root.bound_entry_identity(&entry)?.with_context(|| {
+                format!(
+                    "Bilibili collection output directory identity changed: {} disappeared after creation",
+                    path.display()
+                )
+            })?;
+            if !created.is_dir()
+                || !current.is_dir()
+                || current.device() != created.device()
+                || current.inode() != created.inode()
+            {
+                bail!(
+                    "Bilibili collection output directory identity changed during creation: {}",
+                    path.display()
+                );
+            }
+            current
+        }
+        BilibiliCollectionDirectorySnapshot::Untracked => {
+            bail!(
+                "Bilibili collection output directory identity binding missing; inspect the group again"
+            );
+        }
+    };
+    root.validate_configured_root()?;
+    inventory.output_folder_identity = Some(identity);
+    Ok(())
+}
+
 fn bilibili_group_media_profile(
     options: &bbdown_core::DownloadOptions,
     config: &AppConfig,
@@ -2430,7 +2517,7 @@ pub async fn run_bilibili_episode_group(
     config: &AppConfig,
     job: &JobRequest,
     previous: Option<BilibiliAttemptSnapshot>,
-    expected_plan: Option<PlanValidationSnapshot>,
+    mut expected_plan: Option<PlanValidationSnapshot>,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let JobRequest::Bilibili { url, .. } = job else {
@@ -2469,19 +2556,54 @@ pub async fn run_bilibili_episode_group(
     let inventory = match resolve_bilibili_episode_group_inventory(config, url).await {
         Ok(inventory) => inventory,
         Err(error) => {
-            if let Some(mut snapshot) = previous.clone()
-                && snapshot.independent_entries
-            {
-                snapshot.finish(BilibiliAttemptOutcome::Interrupted);
-                send_group_attempt_snapshot(progress.as_ref(), &snapshot);
-            }
+            interrupt_previous_bilibili_group(&previous, progress.as_ref());
             return Err(error);
         }
     };
 
+    let options = match bilibili_core::download_options(config) {
+        Ok(options) => options,
+        Err(error) => {
+            interrupt_previous_bilibili_group(&previous, progress.as_ref());
+            return Err(error);
+        }
+    };
+    let media_profile = bilibili_group_media_profile(&options, config);
+    if let Err(error) = validate_group_inventory_snapshot(
+        &inventory,
+        expected_plan.as_ref(),
+        previous.as_ref(),
+        &media_profile,
+    ) {
+        interrupt_previous_bilibili_group(&previous, progress.as_ref());
+        return Err(error);
+    }
+    let mut inventory = inventory;
+    if inventory.source == BilibiliGroupSource::Collection {
+        let establish_result = async {
+            let guard = video_output_lock(
+                &config.downloads.video_dir,
+                "Bilibili collection directory validation",
+                progress.as_ref(),
+            )
+            .await?;
+            establish_bilibili_group_collection_directory(guard.root(), &mut inventory)
+        }
+        .await;
+        if let Err(error) = establish_result {
+            interrupt_previous_bilibili_group(&previous, progress.as_ref());
+            return Err(error);
+        }
+        if let Some(plan) = expected_plan.as_mut() {
+            // The selected folder was either already reviewed as this object or was created by
+            // this invocation from a reviewed Missing state. Keep the updated witness in the
+            // in-memory child plan; the durable plan remains Missing so the next run reconfirms.
+            plan.bilibili_collection_directory = inventory.collection_directory_snapshot();
+        }
+    }
+
     let shared_config = Arc::new(config.clone());
     let shared_inventory = Arc::new(inventory.clone());
-    let options = bilibili_core::download_options(config)?;
     let scan_config = Arc::clone(&shared_config);
     let scan_inventory = Arc::clone(&shared_inventory);
     let scan_mode = options.mode;
@@ -3178,13 +3300,6 @@ async fn run_bilibili_episode_group_with_inventory(
                         } => {
                             retries_used = retries_used.saturating_add(1);
                             let next_attempt = saved_attempts.saturating_add(attempts_made + 1);
-                            attempt.update(
-                                entry.download.index,
-                                BilibiliAttemptUpdate::Retrying {
-                                    attempt: next_attempt,
-                                    error: safe_error.clone(),
-                                },
-                            );
                             (hooks.wait_before_retry)(
                                 delay,
                                 entry.clone(),
@@ -3193,6 +3308,79 @@ async fn run_bilibili_episode_group_with_inventory(
                                 next_attempt,
                             )
                             .await;
+                            let confirmed_streams = expected_plan.as_ref().and_then(|plan| {
+                                bilibili_group_confirmed_streams_for(plan, &entry.stable_media_id)
+                            });
+                            let entry_profile = bilibili_group_entry_media_profile(
+                                &media_profile,
+                                confirmed_streams.as_ref(),
+                            );
+                            let saved = attempt
+                                .snapshot()
+                                .entries
+                                .iter()
+                                .find(|saved| saved.index == entry.download.index)
+                                .expect("retrying entry should remain in its group");
+                            let recovered = match recover_bilibili_group_publication_before_retry(
+                                &output_root_path,
+                                entry,
+                                saved,
+                                &entry_profile,
+                                publication_namespace.as_deref(),
+                                collection_output_folder,
+                            )
+                            .await
+                            {
+                                Ok(recovered) => recovered,
+                                Err(error) => {
+                                    return pause_bilibili_episode_group(
+                                        &mut attempt,
+                                        &inventory.title,
+                                        error,
+                                    );
+                                }
+                            };
+                            if let Some(verified) = recovered {
+                                attempt.update(
+                                    entry.download.index,
+                                    BilibiliAttemptUpdate::Verified {
+                                        media_paths: verified.paths.clone(),
+                                        hashes: verified.hashes.clone(),
+                                    },
+                                );
+                                if let Err(error) = (hooks.record_published_evidence)(
+                                    verified
+                                        .evidence
+                                        .iter()
+                                        .cloned()
+                                        .map(|evidence| (entry.download.clone(), evidence))
+                                        .collect(),
+                                )
+                                .await
+                                {
+                                    return pause_bilibili_episode_group(
+                                        &mut attempt,
+                                        &inventory.title,
+                                        error,
+                                    );
+                                }
+                                report_paths.extend(verified.paths);
+                                report_evidence.extend(
+                                    verified
+                                        .evidence
+                                        .into_iter()
+                                        .map(|evidence| (entry.download.clone(), evidence)),
+                                );
+                                break;
+                            }
+                            // Clear old evidence only when the next child really needs to run.
+                            attempt.update(
+                                entry.download.index,
+                                BilibiliAttemptUpdate::Retrying {
+                                    attempt: next_attempt,
+                                    error: safe_error.clone(),
+                                },
+                            );
                         }
                         EpisodeFailureDisposition::FailEntry => {
                             attempt.update(
@@ -3433,6 +3621,18 @@ fn send_group_attempt_snapshot(
     }
 }
 
+fn interrupt_previous_bilibili_group(
+    previous: &Option<BilibiliAttemptSnapshot>,
+    progress: Option<&JobProgressSender>,
+) {
+    if let Some(mut snapshot) = previous.clone()
+        && snapshot.independent_entries
+    {
+        snapshot.finish(BilibiliAttemptOutcome::Interrupted);
+        send_group_attempt_snapshot(progress, &snapshot);
+    }
+}
+
 fn send_group_entry_update(
     snapshot: &mut BilibiliAttemptSnapshot,
     progress: Option<&JobProgressSender>,
@@ -3457,6 +3657,55 @@ fn pause_bilibili_episode_group<T>(
         verified_entries
     ));
     Err(anyhow!(error))
+}
+
+async fn recover_bilibili_group_publication_before_retry(
+    output_root: &Path,
+    entry: &BilibiliGroupEntry,
+    saved: &crate::bilibili_attempt::BilibiliAttemptEntry,
+    media_profile: &str,
+    publication_namespace: Option<&str>,
+    collection_output_folder: Option<&str>,
+) -> Result<Option<BilibiliGroupOutputVerification>> {
+    if !saved.published_media_paths.is_empty()
+        && !saved.published_media_hashes.is_empty()
+        && saved.stable_media_id == entry.stable_media_id
+        && let Some(verified) = revalidate_group_snapshot_entry(
+            output_root,
+            &entry.download,
+            saved,
+            collection_output_folder,
+        )
+        .await?
+    {
+        return Ok(Some(verified));
+    }
+    let Some(namespace) = publication_namespace else {
+        return Ok(None);
+    };
+    match load_bilibili_group_publication_receipt(
+        output_root.to_path_buf(),
+        entry.stable_media_id.clone(),
+        media_profile.to_string(),
+        Some(namespace.to_string()),
+        collection_output_folder.map(str::to_string),
+    )
+    .await?
+    {
+        BilibiliGroupReceiptLookup::Found(receipt) => {
+            verify_bilibili_group_publication_receipt(
+                output_root,
+                &entry.download,
+                &receipt,
+                Some(namespace),
+                collection_output_folder,
+            )
+            .await
+        }
+        BilibiliGroupReceiptLookup::Missing | BilibiliGroupReceiptLookup::ProfileMismatch => {
+            Ok(None)
+        }
+    }
 }
 
 fn mark_bilibili_group_entry_requires_redownload(
@@ -3575,6 +3824,7 @@ async fn execute_bilibili_group_entry(
             } else {
                 None
             },
+            collection_directory: inventory.collection_directory_snapshot(),
         };
     let child_media_profile = bilibili_group_entry_media_profile(
         &bilibili_group_media_profile(&bilibili_core::download_options(config)?, config),
@@ -18380,10 +18630,107 @@ where
         };
         prepare_staged_publication(root, staging, &mut plan, overwrite)?;
     }
+    let bound_destinations = if let Some(receipt_context) = context.bilibili_group_receipt {
+        bind_bilibili_group_destination_parents(root, &plan, receipt_context.expected_entry)?
+    } else {
+        None
+    };
     before_first_move(root, bilibili_group_receipt.as_ref())?;
-    let mut result = execute_move_plan(root, plan, primary_media_kind)?;
+    let mut result = execute_move_plan_with_bound_destinations(
+        root,
+        plan,
+        primary_media_kind,
+        bound_destinations,
+        &mut |_| Ok(()),
+    )?;
     result.bilibili_group_receipt = bilibili_group_receipt;
     Ok(result)
+}
+
+fn bind_bilibili_group_destination_parents(
+    root: &RootedFs,
+    plan: &[MoveStep],
+    expected_entry: &BilibiliWorkerExpectedEntry,
+) -> Result<Option<BTreeMap<PathBuf, BoundEntry>>> {
+    let Some(folder) = expected_entry.collection_output_folder.as_deref() else {
+        if expected_entry.collection_directory != BilibiliCollectionDirectorySnapshot::Untracked {
+            bail!(
+                "Bilibili collection output directory identity mismatch: worker has an unexpected directory binding"
+            );
+        }
+        return Ok(None);
+    };
+    let (reviewed_path, device, inode, is_directory) = match &expected_entry.collection_directory {
+        BilibiliCollectionDirectorySnapshot::Existing {
+            path,
+            device,
+            inode,
+            is_directory,
+        } => (path, *device, *inode, *is_directory),
+        BilibiliCollectionDirectorySnapshot::Missing { .. }
+        | BilibiliCollectionDirectorySnapshot::Untracked => {
+            bail!(
+                "Bilibili collection output directory identity mismatch: worker lacks an Existing directory binding"
+            );
+        }
+    };
+    if reviewed_path != folder || !is_directory {
+        bail!(
+            "Bilibili collection output directory identity mismatch: worker directory binding does not match the selected folder"
+        );
+    }
+
+    let folder_path = bilibili_group_collection_output_folder_path(root, folder)?;
+    let folder_entry = root.bind_entry(&folder_path, false)?;
+    let current = root.bound_entry_identity(&folder_entry)?.with_context(|| {
+        format!(
+            "Bilibili collection output directory identity changed: {} is missing before publication",
+            folder_path.display()
+        )
+    })?;
+    if !current.is_dir() || current.device() != device || current.inode() != inode {
+        bail!(
+            "Bilibili collection output directory identity changed before publication: {}",
+            folder_path.display()
+        );
+    }
+
+    let mut destinations = BTreeMap::new();
+    for step in plan {
+        let logical = logical_download_root_path(root, &step.destination)?.with_context(|| {
+            format!(
+                "Bilibili collection destination is outside the configured output root: {}",
+                step.destination.display()
+            )
+        })?;
+        if logical.parent() != Some(folder_path.as_path()) {
+            bail!(
+                "Bilibili collection destination is outside the selected directory: {}",
+                step.destination.display()
+            );
+        }
+        let name = logical.file_name().with_context(|| {
+            format!(
+                "Bilibili collection destination has no file name: {}",
+                step.destination.display()
+            )
+        })?;
+        let destination = root
+            .bind_direct_child_of_bound_directory(&folder_entry, current, name)
+            .with_context(|| {
+                format!(
+                    "failed to bind Bilibili collection destination parent for {}",
+                    step.destination.display()
+                )
+            })?;
+        if destinations
+            .insert(step.destination.clone(), destination)
+            .is_some()
+        {
+            bail!("Bilibili group move plan contains a duplicate destination path");
+        }
+    }
+    Ok(Some(destinations))
 }
 
 #[cfg(test)]
@@ -18840,10 +19187,44 @@ fn execute_move_plan_with_hook<F>(
 where
     F: FnMut(&MovedFile) -> Result<()>,
 {
+    execute_move_plan_with_bound_destinations(root, plan, primary_media_kind, None, hook)
+}
+
+fn execute_move_plan_with_bound_destinations<F>(
+    root: &RootedFs,
+    plan: Vec<MoveStep>,
+    primary_media_kind: StagedPrimaryMediaKind,
+    mut bound_destinations: Option<BTreeMap<PathBuf, BoundEntry>>,
+    hook: &mut F,
+) -> Result<MovePlanResult>
+where
+    F: FnMut(&MovedFile) -> Result<()>,
+{
+    if bound_destinations.as_ref().is_some_and(|destinations| {
+        destinations.len() != plan.len()
+            || plan
+                .iter()
+                .any(|step| !destinations.contains_key(&step.destination))
+    }) {
+        bail!("Bilibili group destination bindings do not match the publication plan");
+    }
     let mut moved = Vec::new();
     let mut moved_videos = Vec::new();
     for step in plan {
-        match move_step_with_bound_parents(root, step.clone()) {
+        let destination_entry = match bound_destinations.as_mut() {
+            Some(destinations) => match destinations.remove(&step.destination) {
+                Some(entry) => Some(entry),
+                None => {
+                    let error = anyhow!(
+                        "Bilibili group destination binding is missing for {}",
+                        step.destination.display()
+                    );
+                    return Err(with_move_rollback_error(root, error, &moved));
+                }
+            },
+            None => None,
+        };
+        match move_step_with_bound_parents_and_destination(root, step.clone(), destination_entry) {
             Ok(moved_file) => {
                 let is_primary = is_primary_media_file(&moved_file.destination, primary_media_kind);
                 moved.push(moved_file);
@@ -18882,8 +19263,21 @@ where
 }
 
 fn move_step_with_bound_parents(root: &RootedFs, step: MoveStep) -> Result<MovedFile> {
+    move_step_with_bound_parents_and_destination(root, step, None)
+}
+
+fn move_step_with_bound_parents_and_destination(
+    root: &RootedFs,
+    step: MoveStep,
+    destination_entry: Option<BoundEntry>,
+) -> Result<MovedFile> {
     let source_entry = root.bind_entry(&step.source, false)?;
-    let destination_entry = root.bind_entry(&step.destination, true)?;
+    let uses_reviewed_collection_directory = destination_entry.is_some();
+    let destination_entry = match destination_entry {
+        Some(entry) if entry.path() == step.destination => entry,
+        Some(_) => bail!("bound move destination path does not match its publication plan"),
+        None => root.bind_entry(&step.destination, true)?,
+    };
     let identity = root
         .bound_entry_identity(&source_entry)?
         .with_context(|| format!("move source is missing: {}", step.source.display()))?;
@@ -18918,15 +19312,44 @@ fn move_step_with_bound_parents(root: &RootedFs, step: MoveStep) -> Result<Moved
     if let Err(err) =
         require_entry_identity(root, &moved.destination, identity, "moved destination")
     {
+        let err = if uses_reviewed_collection_directory {
+            err.context("Bilibili collection output directory identity changed during publication")
+        } else {
+            err
+        };
         return Err(with_move_rollback_error(
             root,
             err.context("failed to validate moved destination through the configured output root"),
             std::slice::from_ref(&moved),
         ));
     }
-    let destination = root
-        .open_bound_file(&moved.destination)?
-        .context("moved destination disappeared before durability validation")?;
+    let destination = match root.open_bound_file(&moved.destination) {
+        Ok(Some(destination)) => destination,
+        Ok(None) if uses_reviewed_collection_directory => {
+            return Err(with_move_rollback_error(
+                root,
+                anyhow!(
+                    "Bilibili collection output directory identity changed during publication: moved destination disappeared before durability validation: {}",
+                    moved.destination.display()
+                ),
+                std::slice::from_ref(&moved),
+            ));
+        }
+        Ok(None) => {
+            return Err(with_move_rollback_error(
+                root,
+                anyhow!("moved destination disappeared before durability validation"),
+                std::slice::from_ref(&moved),
+            ));
+        }
+        Err(error) => {
+            return Err(with_move_rollback_error(
+                root,
+                error.context("failed to reopen moved destination before durability validation"),
+                std::slice::from_ref(&moved),
+            ));
+        }
+    };
     if destination.identity() != identity {
         return Err(with_move_rollback_error(
             root,
@@ -20416,6 +20839,7 @@ mod tests {
             bilibili_publication_namespace: Some(TEST_GROUP_PUBLICATION_NAMESPACE.to_string()),
             output_template: None,
             collection_output_folder: None,
+            collection_directory: BilibiliCollectionDirectorySnapshot::Untracked,
             confirmed_streams: bilibili_group_confirmed_streams_for(&reviewed, id),
         };
         let mut current = reviewed.clone();
@@ -21444,6 +21868,10 @@ mod tests {
         let selected_folder = "selected-collection";
         let collection_dir = output_root.join(selected_folder);
         fs::create_dir(&collection_dir).expect("selected collection directory should exist");
+        let collection_identity = root
+            .entry_identity(&collection_dir)
+            .expect("selected collection directory identity should read")
+            .expect("selected collection directory should exist");
         let staging =
             create_video_staging_dir(&root).expect("production staging directory should create");
         let staging_dir = staging.path().to_path_buf();
@@ -21462,6 +21890,12 @@ mod tests {
             bilibili_publication_namespace: Some(TEST_GROUP_PUBLICATION_NAMESPACE.to_string()),
             output_template: None,
             collection_output_folder: Some(selected_folder.to_string()),
+            collection_directory: BilibiliCollectionDirectorySnapshot::Existing {
+                path: selected_folder.to_string(),
+                device: collection_identity.device(),
+                inode: collection_identity.inode(),
+                is_directory: collection_identity.is_dir(),
+            },
             confirmed_streams: None,
         };
         let media_profile = "test-group-publication-profile-v2";
@@ -21552,6 +21986,11 @@ mod tests {
                         bail!("group mover persisted a receipt for another media profile")
                     }
                 }
+                fs::write(
+                    collection_dir.join("unrelated-child.txt"),
+                    b"benign child churn",
+                )
+                .expect("benign collection child churn should succeed after directory binding");
                 observed_pre_move = true;
                 Ok(())
             },
@@ -21565,6 +22004,7 @@ mod tests {
         assert_eq!(publication.primary_destinations.len(), 1);
         assert!(!staged_media.exists());
         assert!(publication.primary_destinations[0].is_file());
+        assert!(collection_dir.join("unrelated-child.txt").is_file());
         let receipt = publication
             .bilibili_group_receipt
             .as_ref()
@@ -21580,6 +22020,201 @@ mod tests {
         staging
             .finish()
             .expect("published staging directory should be removed");
+        fs::remove_dir_all(output_root).expect("test output root should be removed");
+    }
+
+    #[test]
+    fn missing_collection_directory_creation_witness_allows_later_episode_publications() {
+        let output_root = temp_test_dir("episode-group-missing-directory-witness");
+        let root = RootedFs::new(&output_root).expect("output root should bind");
+        let selected_folder = "selected-collection";
+        let collection_dir = output_root.join(selected_folder);
+        let mut inventory = test_collection_group_inventory(selected_folder, None);
+        inventory.entries.push(test_group_entry(2));
+        assert!(matches!(
+            inventory.collection_directory_snapshot(),
+            BilibiliCollectionDirectorySnapshot::Missing { .. }
+        ));
+
+        establish_bilibili_group_collection_directory(&root, &mut inventory)
+            .expect("group should retain the identity of its own created directory");
+        let witness = inventory.collection_directory_snapshot();
+        assert!(matches!(
+            &witness,
+            BilibiliCollectionDirectorySnapshot::Existing {
+                path,
+                is_directory: true,
+                ..
+            } if path == selected_folder
+        ));
+
+        for entry in &inventory.entries {
+            let staging = create_video_staging_dir(&root)
+                .expect("production staging directory should create");
+            let staging_dir = staging.path().to_path_buf();
+            let staged_media = staging_dir.join(format!("Episode {}.mkv", entry.download.index));
+            fs::write(&staged_media, format!("episode {}", entry.download.index))
+                .expect("staged episode should write");
+            let expected_entry = BilibiliWorkerExpectedEntry {
+                index: entry.download.index,
+                title: entry.download.title.clone(),
+                stable_media_id: entry.stable_media_id.clone(),
+                bilibili_publication_namespace: Some(TEST_GROUP_PUBLICATION_NAMESPACE.to_string()),
+                output_template: inventory.output_template.clone(),
+                collection_output_folder: Some(selected_folder.to_string()),
+                collection_directory: witness.clone(),
+                confirmed_streams: None,
+            };
+            let duplicate = VideoDuplicate {
+                skip_summary: None,
+                overwrite_confirmation: None,
+                identity: VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: entry.stable_media_id.clone(),
+                },
+                existing_videos: Vec::new(),
+            };
+            let publication = move_staged_video_files_with_root_and_sources(
+                MoveExecutionContext {
+                    root: &root,
+                    staging: Some(&staging),
+                    bilibili_group_receipt: Some(BilibiliGroupReceiptWriteContext {
+                        expected_entry: &expected_entry,
+                        media_profile: "test-group-publication-profile-v2",
+                        progress: None,
+                    }),
+                },
+                &staging_dir,
+                &collection_dir,
+                std::slice::from_ref(&staged_media),
+                VideoDuplicateAction::KeepBoth,
+                &duplicate,
+                StagedPrimaryMediaKind::Video,
+            )
+            .expect("later child should publish through the created directory witness");
+            assert_eq!(publication.primary_destinations.len(), 1);
+            assert!(publication.primary_destinations[0].starts_with(&collection_dir));
+            staging
+                .finish()
+                .expect("published child staging should finish");
+        }
+
+        fs::remove_dir_all(output_root).expect("test output root should be removed");
+    }
+
+    #[test]
+    fn missing_collection_directory_does_not_adopt_a_concurrent_creation() {
+        let output_root = temp_test_dir("episode-group-missing-directory-race");
+        let root = RootedFs::new(&output_root).expect("output root should bind");
+        let selected_folder = "selected-collection";
+        let mut inventory = test_collection_group_inventory(selected_folder, None);
+        let collection_dir = output_root.join(selected_folder);
+        fs::create_dir(&collection_dir).expect("foreign collection directory should appear");
+
+        let error = establish_bilibili_group_collection_directory(&root, &mut inventory)
+            .expect_err("a directory that appeared after Missing review must not be adopted");
+        assert!(format!("{error:#}").contains("identity changed"));
+        assert!(inventory.output_folder_identity.is_none());
+
+        fs::remove_dir_all(output_root).expect("test output root should be removed");
+    }
+
+    #[test]
+    fn group_publication_does_not_follow_replaced_collection_directory_path() {
+        let output_root = temp_test_dir("episode-group-replaced-directory-before-move");
+        let root = RootedFs::new(&output_root).expect("output root should bind");
+        let selected_folder = "selected-collection";
+        let collection_dir = output_root.join(selected_folder);
+        fs::create_dir(&collection_dir).expect("selected collection directory should exist");
+        let identity = root
+            .entry_identity(&collection_dir)
+            .expect("selected collection identity should read")
+            .expect("selected collection should exist");
+        let staging =
+            create_video_staging_dir(&root).expect("production staging directory should create");
+        let staging_dir = staging.path().to_path_buf();
+        let staged_media = staging_dir.join("Episode 1.mkv");
+        fs::write(&staged_media, b"selected directory publication")
+            .expect("staged media should write");
+        let entry = test_group_entry(1);
+        let expected_entry = BilibiliWorkerExpectedEntry {
+            index: entry.download.index,
+            title: entry.download.title.clone(),
+            stable_media_id: entry.stable_media_id.clone(),
+            bilibili_publication_namespace: Some(TEST_GROUP_PUBLICATION_NAMESPACE.to_string()),
+            output_template: None,
+            collection_output_folder: Some(selected_folder.to_string()),
+            collection_directory: BilibiliCollectionDirectorySnapshot::Existing {
+                path: selected_folder.to_string(),
+                device: identity.device(),
+                inode: identity.inode(),
+                is_directory: identity.is_dir(),
+            },
+            confirmed_streams: None,
+        };
+        let duplicate = VideoDuplicate {
+            skip_summary: None,
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: expected_entry.stable_media_id.clone(),
+            },
+            existing_videos: Vec::new(),
+        };
+        let retired_dir = output_root.join("selected-collection-retired");
+        let replacement_media = collection_dir.join("Episode 1.mkv");
+        let result = move_staged_video_files_with_root_and_sources_observed(
+            MoveExecutionContext {
+                root: &root,
+                staging: Some(&staging),
+                bilibili_group_receipt: Some(BilibiliGroupReceiptWriteContext {
+                    expected_entry: &expected_entry,
+                    media_profile: "test-group-publication-profile-v2",
+                    progress: None,
+                }),
+            },
+            &staging_dir,
+            &collection_dir,
+            std::slice::from_ref(&staged_media),
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+            &mut |_, _| {
+                fs::rename(&collection_dir, &retired_dir)
+                    .context("failed to replace selected collection directory")?;
+                fs::create_dir(&collection_dir)
+                    .context("failed to create replacement collection directory")?;
+                fs::write(collection_dir.join("foreign-marker.txt"), b"replacement")
+                    .context("failed to mark replacement collection directory")?;
+                Ok(())
+            },
+        );
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("replacement after binding must stop publication"),
+        };
+        assert!(format!("{error:#}").contains("identity changed"));
+        assert_eq!(
+            classify_episode_failure(&error, 0),
+            EpisodeFailureDisposition::PauseGroup,
+            "directory replacement is a group safety failure, not an episode failure"
+        );
+        assert!(
+            !replacement_media.exists(),
+            "replacement collection directory must not receive the episode"
+        );
+        assert!(
+            !retired_dir.join("Episode 1.mkv").exists(),
+            "rollback must remove the episode from the detached reviewed directory"
+        );
+        assert!(
+            staged_media.exists(),
+            "failed publication should restore the staged episode"
+        );
+        assert!(collection_dir.join("foreign-marker.txt").is_file());
+
+        drop(staging);
         fs::remove_dir_all(output_root).expect("test output root should be removed");
     }
 
@@ -22510,6 +23145,114 @@ mod tests {
             .is_err(),
             "episode index changes must invalidate the reviewed plan"
         );
+    }
+
+    #[tokio::test]
+    async fn retryable_cleanup_failure_reuses_only_verified_publication_before_retrying() {
+        for (durable_only, mutate_published) in [(false, false), (true, false), (true, true)] {
+            let (mut config, root) = test_group_config("episode-group-cleanup-retry-recovery");
+            config.video.write_nfo = false;
+            let inventory = test_group_inventory(2);
+            let plan = test_group_validation_snapshot(&inventory, &config);
+            let profile = plan.media_profile.clone().unwrap();
+            let (progress, _receiver) = job_progress_channel();
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let executor_calls = Arc::clone(&calls);
+            let executor_root = root.clone();
+            let executor_progress = progress.clone();
+            let execute: BilibiliGroupEntryExecutor = Arc::new(move |entry| {
+                let root = executor_root.clone();
+                let progress = executor_progress.clone();
+                let calls = Arc::clone(&executor_calls);
+                let profile = profile.clone();
+                Box::pin(async move {
+                    let entry_call = {
+                        let mut calls = calls.lock().unwrap();
+                        calls.push(entry.download.index);
+                        calls
+                            .iter()
+                            .filter(|index| **index == entry.download.index)
+                            .count()
+                    };
+                    if entry.download.index == 1 && entry_call > 1 {
+                        let path = root.join("retry-1.mp4");
+                        fs::write(&path, b"fresh replacement after corruption")?;
+                        return Ok(report_for_group_test_media(path));
+                    }
+                    if entry.download.index != 1 {
+                        let snapshot = progress.bilibili_attempt_snapshot().unwrap();
+                        assert_eq!(
+                            snapshot.entries[0].state,
+                            BilibiliAttemptEntryState::Verified
+                        );
+                        return Ok(report_for_group_test_media(write_group_test_media(
+                            &root,
+                            entry.download.index,
+                        )));
+                    }
+                    if durable_only {
+                        let (_, path) = publish_test_group_receipt(
+                            &root,
+                            &entry,
+                            &profile,
+                            b"published before cleanup",
+                        );
+                        if mutate_published {
+                            fs::write(path, b"modified after publication")?;
+                        }
+                    } else {
+                        let path = write_group_test_media(&root, entry.download.index);
+                        let verified = verify_group_output_paths(
+                            root,
+                            entry.download.clone(),
+                            vec![path],
+                            None,
+                        )
+                        .await?;
+                        let mut snapshot = progress.bilibili_attempt_snapshot().unwrap();
+                        snapshot.entries[0].published_media_paths = verified.paths;
+                        snapshot.entries[0].published_media_hashes = verified.hashes;
+                        progress.send_lifecycle(JobProgressLifecycleEvent::BilibiliAttempt {
+                            snapshot,
+                        });
+                    }
+                    Err(anyhow!(
+                        "operation timed out after publication while finishing staging"
+                    ))
+                })
+            });
+            let scanner: BilibiliGroupExistingMediaScanner =
+                Arc::new(|_| Box::pin(async { bail!("All must not scan the shared index") }));
+            let report = run_bilibili_episode_group_with_inventory(
+                &config,
+                &test_group_job(BilibiliSelection::All),
+                inventory,
+                None,
+                Some(plan),
+                Some(progress.clone()),
+                test_group_hooks(execute, scanner),
+            )
+            .await
+            .expect("a verified publication should survive retryable cleanup failure");
+            let expected_calls = if mutate_published {
+                vec![1, 1, 2]
+            } else {
+                vec![1, 2]
+            };
+            assert_eq!(
+                *calls.lock().unwrap(),
+                expected_calls,
+                "durable_only={durable_only}"
+            );
+            assert_eq!(report.primary_media_paths.len(), 2);
+            let snapshot = progress.bilibili_attempt_snapshot().unwrap();
+            assert_eq!(
+                snapshot.entries[0].attempts,
+                if mutate_published { 2 } else { 1 }
+            );
+            assert_eq!(snapshot.outcome, Some(BilibiliAttemptOutcome::Verified));
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]
