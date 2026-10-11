@@ -142,6 +142,12 @@ pub struct PlanValidationSnapshot {
     pub title: Option<String>,
     #[serde(default)]
     pub media_profile: Option<String>,
+    /// Internal task-lifetime identity for durable Bilibili publication receipts.
+    #[serde(default)]
+    pub bilibili_publication_namespace: Option<String>,
+    /// Entries whose stream availability probe completed, including entries with no streams.
+    #[serde(default)]
+    pub bilibili_resolved_stream_ids: Vec<String>,
     #[serde(default)]
     pub bilibili_group_entries: Vec<BilibiliGroupEntryIdentity>,
     #[serde(default)]
@@ -153,6 +159,19 @@ impl PlanValidationSnapshot {
         let mut differences = Vec::new();
         if self.stable_media_ids != current.stable_media_ids {
             differences.push("media identity");
+        }
+        let previous_resolved_stream_ids = self
+            .bilibili_resolved_stream_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let current_resolved_stream_ids = current
+            .bilibili_resolved_stream_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if previous_resolved_stream_ids != current_resolved_stream_ids {
+            differences.push("resolved stream availability");
         }
         let previous_episode_numbers = self
             .bilibili_group_entries
@@ -186,7 +205,14 @@ impl PlanValidationSnapshot {
     }
 
     fn media_requirements_match_for(&self, current: &Self, stable_media_id: &str) -> bool {
-        self.media_profile == current.media_profile
+        self.bilibili_resolved_stream_ids
+            .iter()
+            .any(|id| id == stable_media_id)
+            == current
+                .bilibili_resolved_stream_ids
+                .iter()
+                .any(|id| id == stable_media_id)
+            && self.media_profile == current.media_profile
             && self
                 .selected_format_ids
                 .iter()
@@ -336,6 +362,18 @@ struct CancellationRegistration {
 }
 
 impl TaskRecord {
+    /// Stable, private namespace for durable publication receipts owned by this logical task.
+    /// It survives resume generations and changes for separately queued tasks.
+    pub fn bilibili_publication_namespace(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"bilibili-publication-namespace-v1\0");
+        digest.update((self.id.len() as u64).to_be_bytes());
+        digest.update(self.id.as_bytes());
+        digest.update(self.chat_id.to_be_bytes());
+        digest.update(self.created_at.to_be_bytes());
+        format!("bpn1-{:x}", digest.finalize())
+    }
+
     pub fn new(
         id: String,
         update_id: i64,
@@ -436,6 +474,12 @@ fn reconcile_accepted_bilibili_attempt(
         record.media_entries_failed = 0;
         return;
     }
+    attempt.bilibili_publication_namespace = Some(
+        accepted_plan
+            .bilibili_publication_namespace
+            .clone()
+            .unwrap_or_else(|| record.bilibili_publication_namespace()),
+    );
 
     let old_profile_matches_attempt =
         previous_plan.is_some_and(|plan| plan.media_profile == attempt.media_profile);
@@ -526,6 +570,21 @@ fn finish_bilibili_attempt(record: &mut TaskRecord, outcome: BilibiliAttemptOutc
     if let Some(snapshot) = record.bilibili_attempt.as_mut() {
         snapshot.finish(outcome);
         refresh_bilibili_attempt_counts(record);
+    }
+}
+
+fn stamp_bilibili_publication_namespace(
+    record: &TaskRecord,
+    snapshot: &mut BilibiliAttemptSnapshot,
+) {
+    if snapshot.independent_entries {
+        snapshot.bilibili_publication_namespace = Some(
+            record
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.bilibili_publication_namespace.clone())
+                .unwrap_or_else(|| record.bilibili_publication_namespace()),
+        );
     }
 }
 
@@ -1119,7 +1178,7 @@ impl QueueManager {
         &self,
         id: &str,
         expected_generation: Option<u64>,
-        current: PlanValidationSnapshot,
+        mut current: PlanValidationSnapshot,
     ) -> Result<Option<(TaskRecord, Vec<&'static str>)>> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
@@ -1136,6 +1195,9 @@ impl QueueManager {
                 return Ok(None);
             }
             bail!("task {id} changed state before plan validation completed");
+        }
+        if !current.bilibili_group_entries.is_empty() {
+            current.bilibili_publication_namespace = Some(record.bilibili_publication_namespace());
         }
         let mut differences = Vec::new();
         {
@@ -1181,9 +1243,12 @@ impl QueueManager {
         {
             return Ok(None);
         }
-        let Some(plan) = record.proposed_plan.take() else {
+        let Some(mut plan) = record.proposed_plan.take() else {
             return Ok(None);
         };
+        if !plan.bilibili_group_entries.is_empty() {
+            plan.bilibili_publication_namespace = Some(record.bilibili_publication_namespace());
+        }
         let generation = record.generation;
         let previous_plan = record.plan.clone();
         reconcile_accepted_bilibili_attempt(&mut record, previous_plan.as_ref(), &plan);
@@ -1254,6 +1319,7 @@ impl QueueManager {
                 return Ok(());
             }
             snapshot.sanitize_errors();
+            stamp_bilibili_publication_namespace(record, &mut snapshot);
             if let Some(outcome) = terminal_bilibili_attempt_outcome(record.status) {
                 snapshot.finish(outcome);
             }
@@ -1626,6 +1692,7 @@ impl QueueManager {
             }
             if let Some(mut snapshot) = snapshot {
                 snapshot.sanitize_errors();
+                stamp_bilibili_publication_namespace(record, &mut snapshot);
                 record.bilibili_attempt = Some(snapshot);
             }
             let has_verified_entries = record.bilibili_attempt.as_ref().is_some_and(|snapshot| {
@@ -1668,6 +1735,7 @@ impl QueueManager {
             }
             if let Some(mut snapshot) = snapshot {
                 snapshot.sanitize_errors();
+                stamp_bilibili_publication_namespace(record, &mut snapshot);
                 record.bilibili_attempt = Some(snapshot);
             }
             record.status = TaskStatus::Interrupted;
@@ -1845,7 +1913,8 @@ impl QueueManager {
         {
             return Ok(None);
         }
-        if let Some(snapshot) = snapshot {
+        if let Some(mut snapshot) = snapshot {
+            stamp_bilibili_publication_namespace(&record, &mut snapshot);
             record.bilibili_attempt = Some(snapshot);
         }
         record.status = TaskStatus::Cancelled;
@@ -3906,6 +3975,8 @@ mod tests {
         });
         let snapshot: PlanValidationSnapshot = serde_json::from_value(legacy).unwrap();
         assert_eq!(snapshot.media_profile, None);
+        assert_eq!(snapshot.bilibili_publication_namespace, None);
+        assert!(snapshot.bilibili_resolved_stream_ids.is_empty());
         assert!(snapshot.bilibili_group_entries.is_empty());
     }
 
@@ -3922,6 +3993,31 @@ mod tests {
             &[(16, "Updated A", "media-a"), (17, "Updated B", "media-b")],
         );
         assert!(original.blocking_differences(&title_changed).is_empty());
+        let mut namespaced = original.clone();
+        namespaced.bilibili_publication_namespace = Some("internal-task-scope".into());
+        assert!(original.blocking_differences(&namespaced).is_empty());
+
+        let mut resolved = original.clone();
+        resolved.bilibili_resolved_stream_ids = vec!["media-a".into(), "media-b".into()];
+        let mut reordered_resolved = resolved.clone();
+        reordered_resolved.bilibili_resolved_stream_ids = vec!["media-b".into(), "media-a".into()];
+        assert!(
+            resolved
+                .blocking_differences(&reordered_resolved)
+                .is_empty()
+        );
+        assert!(resolved.media_requirements_match_for(&reordered_resolved, "media-a"));
+
+        let mut no_resolved_probe = resolved.clone();
+        no_resolved_probe.bilibili_resolved_stream_ids.clear();
+        assert_eq!(
+            resolved.blocking_differences(&no_resolved_probe),
+            vec!["resolved stream availability"]
+        );
+        assert!(!resolved.media_requirements_match_for(&no_resolved_probe, "media-a"));
+        assert!(
+            resolved.media_requirements_match_for(&no_resolved_probe, "media-not-in-either-plan")
+        );
 
         let renumbered = grouped_plan(
             "Original title",
@@ -3932,6 +4028,151 @@ mod tests {
             original.blocking_differences(&renumbered),
             vec!["episode numbering"]
         );
+    }
+
+    #[test]
+    fn group_publication_namespace_is_task_scoped_and_survives_acceptance_and_reload() {
+        let directory = temp_queue_root("group-publication-namespace");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = bilibili_task("group-publication-namespace");
+        task.status = TaskStatus::Running;
+        let namespace = task.bilibili_publication_namespace();
+        assert_ne!(
+            namespace,
+            bilibili_task("another-publication-task").bilibili_publication_namespace()
+        );
+        queue.create(task.clone()).unwrap();
+
+        let media_profile = "mode=all;quality=high";
+        let old_plan = grouped_plan(
+            "Season",
+            Some(media_profile),
+            &[(16, "Episode A", "media-a")],
+        );
+        let planned = queue
+            .set_plan_if_generation(&task.id, 0, old_plan)
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(
+            planned
+                .plan
+                .as_ref()
+                .unwrap()
+                .bilibili_publication_namespace
+                .as_deref(),
+            Some(namespace.as_str())
+        );
+
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [(16, "Episode A".into(), Some("media-a".into()))],
+            0,
+        );
+        attempt.media_profile = Some(media_profile.into());
+        let saved = queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, attempt)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved
+                .bilibili_attempt
+                .as_ref()
+                .unwrap()
+                .bilibili_publication_namespace
+                .as_deref(),
+            Some(namespace.as_str())
+        );
+
+        let proposed = grouped_plan(
+            "Season",
+            Some(media_profile),
+            &[(101, "Episode A", "media-a")],
+        );
+        let proposed_record = queue
+            .set_plan_if_generation(&task.id, 0, proposed)
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(proposed_record.status, TaskStatus::AwaitingConfirmation);
+        assert_eq!(
+            proposed_record
+                .proposed_plan
+                .as_ref()
+                .unwrap()
+                .bilibili_publication_namespace
+                .as_deref(),
+            Some(namespace.as_str())
+        );
+
+        let accepted = queue
+            .accept_proposed_plan_for_chat_if_generation(&task.id, 0, task.chat_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            accepted
+                .plan
+                .as_ref()
+                .unwrap()
+                .bilibili_publication_namespace
+                .as_deref(),
+            Some(namespace.as_str())
+        );
+        assert_eq!(
+            accepted
+                .bilibili_attempt
+                .as_ref()
+                .unwrap()
+                .bilibili_publication_namespace
+                .as_deref(),
+            Some(namespace.as_str())
+        );
+        drop(queue);
+
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(
+            restored
+                .plan
+                .as_ref()
+                .unwrap()
+                .bilibili_publication_namespace
+                .as_deref(),
+            Some(namespace.as_str())
+        );
+        assert_eq!(
+            restored
+                .bilibili_attempt
+                .as_ref()
+                .unwrap()
+                .bilibili_publication_namespace
+                .as_deref(),
+            Some(namespace.as_str())
+        );
+        let resumed = queue.claim_resume(&task.id, false).unwrap().unwrap();
+        assert_eq!(resumed.generation, 1);
+        assert_eq!(
+            resumed
+                .plan
+                .as_ref()
+                .unwrap()
+                .bilibili_publication_namespace
+                .as_deref(),
+            Some(namespace.as_str())
+        );
+        assert_eq!(
+            resumed
+                .bilibili_attempt
+                .as_ref()
+                .unwrap()
+                .bilibili_publication_namespace
+                .as_deref(),
+            Some(namespace.as_str())
+        );
+
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4858,6 +5099,116 @@ mod tests {
         }
         assert!(attempt.summary().contains("Outcome: cancelled"));
         assert!(!attempt.summary().contains("Outcome: interrupted"));
+
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn parent_cancel_overrides_failed_group_summaries_and_survives_late_snapshot_and_reload() {
+        use crate::router::BilibiliSelection;
+
+        let directory = temp_queue_root("episode-group-cancel-after-failure");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).unwrap();
+        let cases = [
+            ("episode-group-cancel-partial", true),
+            ("episode-group-cancel-failed", false),
+        ];
+
+        for (task_id, partially_completed) in cases {
+            let mut task = test_task(
+                task_id,
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                    selection: Some(BilibiliSelection::All),
+                },
+            );
+            task.status = TaskStatus::Running;
+            queue.create(task.clone()).unwrap();
+
+            let mut snapshot = BilibiliAttemptSnapshot::new_independent(
+                "Season".into(),
+                if partially_completed {
+                    vec![
+                        (16, "Episode 16".into(), Some("ep-16".into())),
+                        (17, "Episode 17".into(), Some("ep-17".into())),
+                    ]
+                } else {
+                    vec![(17, "Episode 17".into(), Some("ep-17".into()))]
+                },
+                0,
+            );
+            if partially_completed {
+                snapshot.entry_verified(16);
+            }
+            snapshot.entry_failed_with_error(17, 2, "episode download failed".into());
+            snapshot.finish(if partially_completed {
+                BilibiliAttemptOutcome::PartiallyCompleted
+            } else {
+                BilibiliAttemptOutcome::Failed
+            });
+            queue
+                .set_bilibili_attempt_if_generation(&task.id, 0, snapshot.clone())
+                .unwrap()
+                .unwrap();
+
+            let requested = queue
+                .cancel_if_generation(&task.id, 0, task.chat_id)
+                .unwrap()
+                .unwrap();
+            assert!(requested.cancel_requested);
+
+            let cancelled = queue
+                .finish_cancellation_with_bilibili_attempt_if_generation(
+                    &task.id,
+                    0,
+                    Some(snapshot.clone()),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(cancelled.status, TaskStatus::Cancelled);
+            assert_eq!(
+                cancelled.bilibili_attempt.as_ref().unwrap().outcome,
+                Some(BilibiliAttemptOutcome::Cancelled)
+            );
+            assert!(
+                cancelled
+                    .bilibili_attempt
+                    .as_ref()
+                    .unwrap()
+                    .summary()
+                    .contains("Outcome: cancelled")
+            );
+
+            // A late pre-cancel failure snapshot cannot make the summary disagree with queue state.
+            let delayed = queue
+                .set_bilibili_attempt_if_generation(&task.id, 0, snapshot)
+                .unwrap()
+                .unwrap();
+            assert_eq!(delayed.status, TaskStatus::Cancelled);
+            assert_eq!(
+                delayed.bilibili_attempt.as_ref().unwrap().outcome,
+                Some(BilibiliAttemptOutcome::Cancelled)
+            );
+        }
+
+        drop(queue);
+        let queue = QueueManager::open(&config).unwrap();
+        for (task_id, partially_completed) in cases {
+            let restored = queue.get(task_id).unwrap().unwrap();
+            assert_eq!(restored.status, TaskStatus::Cancelled);
+            let attempt = restored.bilibili_attempt.unwrap();
+            assert_eq!(attempt.outcome, Some(BilibiliAttemptOutcome::Cancelled));
+            assert_eq!(attempt.failed_entries(), 1);
+            assert_eq!(
+                attempt.verified_entries(),
+                if partially_completed { 1 } else { 0 }
+            );
+            assert!(attempt.summary().contains("Outcome: cancelled"));
+            assert!(!attempt.summary().contains("Outcome: failed"));
+            assert!(!attempt.summary().contains("Outcome: partially completed"));
+        }
 
         drop(queue);
         fs::remove_dir_all(directory).unwrap();

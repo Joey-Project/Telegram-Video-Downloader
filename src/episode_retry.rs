@@ -135,6 +135,15 @@ fn is_group_authentication_failure(chain: &str) -> bool {
 }
 
 fn is_shared_storage_failure(error: &Error, chain: &str) -> bool {
+    let missing_output_root = chain.contains("output root")
+        && (error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::NotFound)
+        }) || contains_any(chain, &["no such file or directory", "(os error 2)"]));
+    if missing_output_root {
+        return true;
+    }
     if contains_any(
         chain,
         &[
@@ -529,6 +538,43 @@ mod tests {
                 delay: Duration::from_secs(5),
                 refresh_plan: true,
             }
+        );
+    }
+
+    #[test]
+    fn missing_output_root_pauses_but_a_missing_episode_file_does_not() {
+        let missing_root = std::env::temp_dir().join(format!(
+            "episode-retry-missing-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock should be after the epoch")
+                .as_nanos()
+        ));
+        let error = match crate::safe_fs::RootedFs::new(&missing_root) {
+            Ok(_) => panic!("unique output root should be absent"),
+            Err(error) => error,
+        };
+        for retries_used in [0, MAX_ADDITIONAL_EPISODE_RETRIES] {
+            assert_eq!(
+                classify_episode_failure(&error, retries_used),
+                EpisodeFailureDisposition::PauseGroup
+            );
+            // Worker IPC retains the error chain text but not the typed I/O cause.
+            assert_eq!(
+                classify_episode_failure(&anyhow!("{error:#}"), retries_used),
+                EpisodeFailureDisposition::PauseGroup
+            );
+        }
+        let missing_file = Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("failed to open one episode sidecar");
+        assert_eq!(
+            classify_episode_failure(&missing_file, 0),
+            EpisodeFailureDisposition::FailEntry
+        );
+        assert_eq!(
+            classify("HTTP 404 Not Found", 0),
+            EpisodeFailureDisposition::FailEntry
         );
     }
 

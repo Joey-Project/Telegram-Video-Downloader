@@ -22,8 +22,10 @@ offer a way to select failed episodes.
 
 - Retain one group in the queue, with persistent per-episode execution state,
   sparse original indices, stable media identities, and verified output receipts.
-- Resolve group inventory before execution; obtain a fresh play plan per episode
-  rather than requiring every play URL before the first download.
+- Resolve group inventory and inspect selected episode streams with at most two
+  concurrent probes and independent timeouts. Individual unavailable streams do
+  not abort inspection; fresh execution plans must match confirmed per-episode
+  formats, resolutions, and codecs before downloading.
 - Publish verified episodes individually. Retry transient episode failures at
   most twice beyond the initial episode attempt, then continue later episodes.
   Shared authentication, storage, permission, and identity failures interrupt
@@ -42,10 +44,10 @@ offer a way to select failed episodes.
   inventory changes. Distinguish settled partial results from restart
   interruptions, and offer finalization resume when all outputs are verified.
 - Bind artifact requirements to output receipts and persist one latest private
-  publication receipt per stable media identity, output root, and selected
-  collection directory. Recovery does not depend on optional NFO or sidecars;
-  content hashes and bound path checks
-  distinguish invalid output from unreadable recovery state.
+  publication receipt per logical queue task, stable media identity, output root,
+  and selected collection directory. Recovery does not depend on optional NFO or
+  sidecars; content hashes and bound path checks distinguish invalid output from
+  unreadable recovery state.
 - Recover published outputs even when the episode-start event was not saved,
   preserve explicit fresh All keep-both behavior, and compare original receipt
   hashes at group completion and final queue hashing. Retain selected collection
@@ -62,10 +64,18 @@ offer a way to select failed episodes.
   and validate that durable and queue-snapshot media paths remain in that scope.
   Shared media identities in separate collections retain independent recovery;
   legacy unscoped receipts cannot silently supply collection recovery evidence.
+- Persist a logical task namespace before child execution. All/keep-both recovery
+  uses only that task's publication evidence and does not trust the shared media
+  index as proof of a newly requested copy. Missing selections retain skip-existing.
+- Let explicit parent cancellation replace failed or partial episode outcomes,
+  and pause once when the shared configured output root disappears.
+- Bind durable publication requirements to confirmed episode stream fingerprints
+  so accepting new formats cannot reuse an old-format receipt after queue receipt
+  persistence was interrupted.
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed with 707 passed and 15 existing
+- Rust 1.95.0: all-target offline tests passed with 716 passed and 15 existing
   opt-in tests ignored. Offline build, all-target Clippy with warnings denied,
   formatting, diff checks, and project journal validation passed.
 - Regression tests exercise the actual episode driver through injected child
@@ -95,6 +105,13 @@ offer a way to select failed episodes.
 - Cross-collection recovery regressions retain independent receipts for the same
   media identity in two directories; foreign queue paths cannot count
   as successful outputs in the selected collection.
+- Stream planning regressions cover bounded parallelism, continuation after one
+  unavailable episode, resolved-empty versus unresolved streams, and execution
+  checks against the confirmed per-entry fingerprint. Durable recovery rejects
+  an old-format receipt without saved queue paths after new streams are accepted.
+- Task isolation and restart regressions reject another All task's publication
+  evidence, preserve task namespaces, retain cancellation over failed summaries,
+  and pause on output-root disappearance while keeping single-file misses local.
 - State and mock Telegram tests cover independent completion counts, restart,
   error retention, progress-channel closure, paginated episode views, message
   reuse, stale generation callbacks, and cross-chat action rejection.

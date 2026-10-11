@@ -120,6 +120,9 @@ pub struct BilibiliAttemptSnapshot {
     /// Normalized media requirements used to create the episode receipts.
     #[serde(default)]
     pub media_profile: Option<String>,
+    /// Durable queue-task namespace used to bind publication receipts to this task lifetime.
+    #[serde(default)]
+    pub bilibili_publication_namespace: Option<String>,
 }
 
 const SUMMARY_MAX_BYTES: usize = 1_800;
@@ -155,6 +158,7 @@ impl BilibiliAttemptSnapshot {
             independent_entries: false,
             retry_indices: None,
             media_profile: None,
+            bilibili_publication_namespace: None,
         }
     }
 
@@ -550,6 +554,11 @@ impl BilibiliAttemptSnapshot {
                         | BilibiliAttemptOutcome::Interrupted
                 ) | (
                     Some(BilibiliAttemptOutcome::Interrupted),
+                    BilibiliAttemptOutcome::Cancelled
+                ) | (
+                    Some(
+                        BilibiliAttemptOutcome::Failed | BilibiliAttemptOutcome::PartiallyCompleted
+                    ),
                     BilibiliAttemptOutcome::Cancelled
                 )
             );
@@ -1225,7 +1234,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_outcomes_replace_verified_and_preserve_real_failures() {
+    fn parent_outcomes_replace_verified_and_cancel_overrides_failure_summaries() {
         let mut interrupted = BilibiliAttemptSnapshot::new_independent(
             "Season".to_string(),
             [(1, "Episode 1".to_string(), None)],
@@ -1304,10 +1313,10 @@ mod tests {
         partial.entry_failed(2);
         partial.finish(BilibiliAttemptOutcome::PartiallyCompleted);
         partial.finish(BilibiliAttemptOutcome::Cancelled);
-        assert_eq!(
-            partial.outcome,
-            Some(BilibiliAttemptOutcome::PartiallyCompleted)
-        );
+        assert_eq!(partial.outcome, Some(BilibiliAttemptOutcome::Cancelled));
+        assert_eq!(partial.verified_entries(), 1);
+        assert_eq!(partial.failed_entries(), 1);
+        assert!(partial.summary().contains("Outcome: cancelled"));
 
         let mut failed = BilibiliAttemptSnapshot::new_independent(
             "Season".to_string(),
@@ -1317,7 +1326,39 @@ mod tests {
         failed.entry_failed(1);
         failed.finish(BilibiliAttemptOutcome::Failed);
         failed.finish(BilibiliAttemptOutcome::Cancelled);
-        assert_eq!(failed.outcome, Some(BilibiliAttemptOutcome::Failed));
+        assert_eq!(failed.outcome, Some(BilibiliAttemptOutcome::Cancelled));
+        assert_eq!(failed.failed_entries(), 1);
+        assert!(failed.summary().contains("Outcome: cancelled"));
+
+        let mut partial_protection = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [
+                (1, "Episode 1".to_string(), None),
+                (2, "Episode 2".to_string(), None),
+            ],
+            0,
+        );
+        partial_protection.entry_verified(1);
+        partial_protection.entry_failed(2);
+        partial_protection.finish(BilibiliAttemptOutcome::PartiallyCompleted);
+        partial_protection.finish(BilibiliAttemptOutcome::Interrupted);
+        assert_eq!(
+            partial_protection.outcome,
+            Some(BilibiliAttemptOutcome::PartiallyCompleted)
+        );
+
+        let mut failed_protection = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [(1, "Episode 1".to_string(), None)],
+            0,
+        );
+        failed_protection.entry_failed(1);
+        failed_protection.finish(BilibiliAttemptOutcome::Failed);
+        failed_protection.finish(BilibiliAttemptOutcome::Interrupted);
+        assert_eq!(
+            failed_protection.outcome,
+            Some(BilibiliAttemptOutcome::Failed)
+        );
     }
 
     #[test]
@@ -1471,8 +1512,13 @@ mod tests {
         let mut value = serde_json::to_value(attempt).unwrap();
         value.as_object_mut().unwrap().remove("retry_indices");
         value.as_object_mut().unwrap().remove("media_profile");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("bilibili_publication_namespace");
         let mut legacy: BilibiliAttemptSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(legacy.retry_indices, None);
+        assert_eq!(legacy.bilibili_publication_namespace, None);
 
         legacy.reconcile_independent_inventory(
             "Season revised".into(),
