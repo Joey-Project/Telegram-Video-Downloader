@@ -1,9 +1,14 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use crate::redaction::redact_sensitive_text;
 use serde::{Deserialize, Serialize};
 
 /// The terminal result of a Bilibili download attempt.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BilibiliAttemptOutcome {
     Failed,
+    PartiallyCompleted,
     Cancelled,
     Interrupted,
     Verified,
@@ -13,9 +18,27 @@ pub enum BilibiliAttemptOutcome {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum BilibiliAttemptUpdate {
     Started,
-    Stage { stage: String },
+    Stage {
+        stage: String,
+    },
     Completed,
     Failed,
+    Retrying {
+        attempt: usize,
+        error: String,
+    },
+    Failure {
+        error: String,
+        attempts: usize,
+    },
+    AlreadyPresent {
+        media_paths: Vec<PathBuf>,
+        hashes: BTreeMap<String, String>,
+    },
+    Verified {
+        media_paths: Vec<PathBuf>,
+        hashes: BTreeMap<String, String>,
+    },
 }
 
 impl BilibiliAttemptUpdate {
@@ -25,6 +48,24 @@ impl BilibiliAttemptUpdate {
             Self::Stage { stage } => snapshot.stage_started(index, stage.clone()),
             Self::Completed => snapshot.entry_completed(index),
             Self::Failed => snapshot.entry_failed(index),
+            Self::Retrying { attempt, error } => {
+                snapshot.entry_retrying(index, *attempt, error.clone())
+            }
+            Self::Failure { error, attempts } => {
+                snapshot.entry_failed_with_error(index, *attempts, error.clone())
+            }
+            Self::AlreadyPresent {
+                media_paths,
+                hashes,
+            } => snapshot.entry_already_present_with_outputs(
+                index,
+                media_paths.clone(),
+                hashes.clone(),
+            ),
+            Self::Verified {
+                media_paths,
+                hashes,
+            } => snapshot.entry_verified_with_outputs(index, media_paths.clone(), hashes.clone()),
         }
     }
 }
@@ -37,6 +78,20 @@ pub struct BilibiliAttemptEntry {
     pub state: BilibiliAttemptEntryState,
     /// The most recently reported operation, such as `audio` or `danmaku`.
     pub stage: String,
+    #[serde(default)]
+    pub already_present: bool,
+    #[serde(default)]
+    pub requires_redownload: bool,
+    #[serde(default)]
+    pub attempts: usize,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub stable_media_id: String,
+    #[serde(default)]
+    pub published_media_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub published_media_hashes: BTreeMap<String, String>,
 }
 
 /// State of one entry in the current attempt.
@@ -58,6 +113,10 @@ pub struct BilibiliAttemptSnapshot {
     /// Entries that were already present and therefore excluded from this attempt.
     pub skipped_entries: usize,
     pub outcome: Option<BilibiliAttemptOutcome>,
+    #[serde(default)]
+    pub independent_entries: bool,
+    #[serde(default)]
+    pub retry_indices: Option<Vec<u32>>,
 }
 
 const SUMMARY_MAX_BYTES: usize = 1_800;
@@ -79,11 +138,41 @@ impl BilibiliAttemptSnapshot {
                     title,
                     state: BilibiliAttemptEntryState::Pending,
                     stage: String::new(),
+                    already_present: false,
+                    requires_redownload: false,
+                    attempts: 0,
+                    error: None,
+                    stable_media_id: String::new(),
+                    published_media_paths: Vec::new(),
+                    published_media_hashes: BTreeMap::new(),
                 })
                 .collect(),
             skipped_entries,
             outcome: None,
+            independent_entries: false,
+            retry_indices: None,
         }
+    }
+
+    /// Create a grouped attempt whose selected entries can be published independently.
+    pub fn new_independent(
+        title: String,
+        entries: impl IntoIterator<Item = (u32, String, Option<String>)>,
+        skipped_entries: usize,
+    ) -> Self {
+        let entries: Vec<_> = entries.into_iter().collect();
+        let mut snapshot = Self::new(
+            title,
+            entries
+                .iter()
+                .map(|(index, title, _)| (*index, title.clone())),
+            skipped_entries,
+        );
+        snapshot.independent_entries = true;
+        for (entry, (_, _, stable_media_id)) in snapshot.entries.iter_mut().zip(entries) {
+            entry.stable_media_id = stable_media_id.unwrap_or_default();
+        }
+        snapshot
     }
 
     pub fn entry_started(&mut self, index: u32) {
@@ -100,8 +189,13 @@ impl BilibiliAttemptSnapshot {
             ) {
                 entry.state = BilibiliAttemptEntryState::Downloading;
                 entry.stage.clear();
+                entry.already_present = false;
+                entry.attempts = entry.attempts.max(1);
+                entry.published_media_paths.clear();
+                entry.published_media_hashes.clear();
             }
         }
+        self.refresh_independent_skipped_entries();
     }
 
     pub fn stage_started(&mut self, index: u32, stage: String) {
@@ -109,12 +203,15 @@ impl BilibiliAttemptSnapshot {
             return;
         }
         for entry in self.entries.iter_mut().filter(|entry| entry.index == index) {
-            if matches!(
-                entry.state,
-                BilibiliAttemptEntryState::Pending | BilibiliAttemptEntryState::Downloading
-            ) {
-                entry.state = BilibiliAttemptEntryState::Downloading;
-                entry.stage = stage.clone();
+            match entry.state {
+                BilibiliAttemptEntryState::Pending | BilibiliAttemptEntryState::Downloading => {
+                    entry.state = BilibiliAttemptEntryState::Downloading;
+                    entry.stage = stage.clone();
+                }
+                BilibiliAttemptEntryState::Downloaded if self.independent_entries => {
+                    entry.stage = stage.clone();
+                }
+                _ => {}
             }
         }
     }
@@ -130,8 +227,11 @@ impl BilibiliAttemptSnapshot {
             ) {
                 entry.state = BilibiliAttemptEntryState::Downloaded;
                 entry.stage.clear();
+                entry.already_present = false;
+                entry.error = None;
             }
         }
+        self.refresh_independent_skipped_entries();
     }
 
     pub fn entry_failed(&mut self, index: u32) {
@@ -144,17 +244,236 @@ impl BilibiliAttemptSnapshot {
                 BilibiliAttemptEntryState::Downloaded | BilibiliAttemptEntryState::Verified
             ) {
                 entry.state = BilibiliAttemptEntryState::Failed;
+                entry.already_present = false;
+                entry.attempts = entry.attempts.max(1);
+            }
+        }
+        self.refresh_independent_skipped_entries();
+    }
+
+    pub fn entry_retrying(&mut self, index: u32, attempt: usize, error: String) {
+        if self.outcome.is_some() {
+            return;
+        }
+        let error = sanitize_entry_error(&error);
+        for entry in self.entries.iter_mut().filter(|entry| entry.index == index) {
+            if entry.state != BilibiliAttemptEntryState::Verified {
+                entry.state = BilibiliAttemptEntryState::Downloading;
+                entry.stage.clear();
+                entry.already_present = false;
+                entry.attempts = entry.attempts.max(attempt);
+                entry.error = Some(error.clone());
+                entry.published_media_paths.clear();
+                entry.published_media_hashes.clear();
+            }
+        }
+        self.refresh_independent_skipped_entries();
+    }
+
+    pub fn entry_failed_with_error(&mut self, index: u32, attempts: usize, error: String) {
+        if self.outcome.is_some() {
+            return;
+        }
+        let error = sanitize_entry_error(&error);
+        for entry in self.entries.iter_mut().filter(|entry| entry.index == index) {
+            if entry.state != BilibiliAttemptEntryState::Verified {
+                entry.state = BilibiliAttemptEntryState::Failed;
+                entry.already_present = false;
+                if !self.independent_entries {
+                    entry.stage.clear();
+                }
+                entry.attempts = entry.attempts.max(attempts);
+                entry.error = Some(error.clone());
+                entry.published_media_paths.clear();
+                entry.published_media_hashes.clear();
+            }
+        }
+        self.refresh_independent_skipped_entries();
+    }
+
+    pub fn entry_verified(&mut self, index: u32) {
+        if self.outcome.is_some() {
+            return;
+        }
+        for entry in self.entries.iter_mut().filter(|entry| entry.index == index) {
+            entry.state = BilibiliAttemptEntryState::Verified;
+            entry.stage.clear();
+            if self.independent_entries {
+                entry.already_present = false;
+                entry.requires_redownload = false;
+            }
+            entry.error = None;
+            entry.attempts = entry.attempts.max(1);
+        }
+        self.refresh_independent_skipped_entries();
+    }
+
+    pub fn entry_verified_with_outputs(
+        &mut self,
+        index: u32,
+        media_paths: Vec<PathBuf>,
+        hashes: BTreeMap<String, String>,
+    ) {
+        self.entry_verified(index);
+        if self.outcome.is_some() {
+            return;
+        }
+        for entry in self.entries.iter_mut().filter(|entry| entry.index == index) {
+            entry.published_media_paths = media_paths.clone();
+            entry.published_media_hashes = hashes.clone();
+        }
+    }
+
+    pub fn entry_already_present_with_outputs(
+        &mut self,
+        index: u32,
+        media_paths: Vec<PathBuf>,
+        hashes: BTreeMap<String, String>,
+    ) {
+        if !self.independent_entries {
+            return;
+        }
+        let previous_attempts: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.index == index)
+            .map(|entry| (entry.attempts, entry.requires_redownload))
+            .collect();
+        self.entry_verified_with_outputs(index, media_paths, hashes);
+        if self.outcome.is_some() {
+            return;
+        }
+        for (entry, attempts) in self
+            .entries
+            .iter_mut()
+            .filter(|entry| entry.index == index)
+            .zip(previous_attempts)
+        {
+            entry.already_present = true;
+            entry.attempts = attempts.0;
+            entry.requires_redownload = attempts.1;
+        }
+        self.refresh_independent_skipped_entries();
+    }
+
+    fn refresh_independent_skipped_entries(&mut self) {
+        if self.independent_entries {
+            self.skipped_entries = self
+                .entries
+                .iter()
+                .filter(|entry| entry.already_present)
+                .count();
+        }
+    }
+
+    /// Prepare grouped entries for a resume or failed-entry retry.
+    pub fn prepare_resume(&mut self, retry_failed: bool) {
+        if !self.independent_entries {
+            return;
+        }
+        self.outcome = None;
+        self.retry_indices = if retry_failed {
+            Some(
+                self.entries
+                    .iter()
+                    .filter(|entry| entry.state == BilibiliAttemptEntryState::Failed)
+                    .map(|entry| entry.index)
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        for entry in &mut self.entries {
+            let reset = if retry_failed {
+                entry.state == BilibiliAttemptEntryState::Failed
+            } else {
+                matches!(
+                    entry.state,
+                    BilibiliAttemptEntryState::Pending
+                        | BilibiliAttemptEntryState::Failed
+                        | BilibiliAttemptEntryState::Interrupted
+                        | BilibiliAttemptEntryState::Downloading
+                )
+            };
+            if reset {
+                entry.state = BilibiliAttemptEntryState::Pending;
+                entry.stage.clear();
+                entry.already_present = false;
+                entry.published_media_paths.clear();
+                entry.published_media_hashes.clear();
+            }
+        }
+        self.refresh_independent_skipped_entries();
+    }
+
+    /// Prepare one eligible grouped entry for a scoped retry while retaining other outcomes.
+    pub fn prepare_episode_retry(&mut self, index: u32) -> bool {
+        if !self.independent_entries {
+            return false;
+        }
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.index == index) else {
+            return false;
+        };
+        if !matches!(
+            entry.state,
+            BilibiliAttemptEntryState::Pending
+                | BilibiliAttemptEntryState::Failed
+                | BilibiliAttemptEntryState::Interrupted
+        ) {
+            return false;
+        }
+        self.outcome = None;
+        self.retry_indices = Some(vec![index]);
+        entry.state = BilibiliAttemptEntryState::Pending;
+        entry.stage.clear();
+        entry.already_present = false;
+        entry.error = None;
+        entry.published_media_paths.clear();
+        entry.published_media_hashes.clear();
+        self.refresh_independent_skipped_entries();
+        true
+    }
+
+    pub fn verified_entries(&self) -> usize {
+        self.count(BilibiliAttemptEntryState::Verified)
+    }
+
+    pub fn sanitize_errors(&mut self) {
+        for entry in &mut self.entries {
+            if let Some(error) = entry.error.as_deref() {
+                let sanitized = sanitize_entry_error(error);
+                entry.error = Some(sanitized);
             }
         }
     }
 
-    pub fn finish(&mut self, outcome: BilibiliAttemptOutcome) {
+    pub fn finish(&mut self, mut outcome: BilibiliAttemptOutcome) {
         if self.outcome.is_some() {
             return;
         }
 
+        if self.independent_entries
+            && outcome == BilibiliAttemptOutcome::Verified
+            && self
+                .entries
+                .iter()
+                .any(|entry| entry.state != BilibiliAttemptEntryState::Verified)
+        {
+            outcome = if self.verified_entries() > 0 {
+                BilibiliAttemptOutcome::PartiallyCompleted
+            } else {
+                BilibiliAttemptOutcome::Failed
+            };
+        }
+        if self.independent_entries
+            && outcome == BilibiliAttemptOutcome::Failed
+            && self.verified_entries() > 0
+        {
+            outcome = BilibiliAttemptOutcome::PartiallyCompleted;
+        }
+
         match outcome {
-            BilibiliAttemptOutcome::Failed => {
+            BilibiliAttemptOutcome::Failed | BilibiliAttemptOutcome::PartiallyCompleted => {
                 for entry in &mut self.entries {
                     if entry.state == BilibiliAttemptEntryState::Downloading {
                         entry.state = BilibiliAttemptEntryState::Failed;
@@ -169,9 +488,11 @@ impl BilibiliAttemptSnapshot {
                 }
             }
             BilibiliAttemptOutcome::Verified => {
-                for entry in &mut self.entries {
-                    entry.state = BilibiliAttemptEntryState::Verified;
-                    entry.stage.clear();
+                if !self.independent_entries {
+                    for entry in &mut self.entries {
+                        entry.state = BilibiliAttemptEntryState::Verified;
+                        entry.stage.clear();
+                    }
                 }
             }
         }
@@ -209,6 +530,7 @@ impl BilibiliAttemptSnapshot {
         if let Some(outcome) = self.outcome {
             let label = match outcome {
                 BilibiliAttemptOutcome::Failed => "failed",
+                BilibiliAttemptOutcome::PartiallyCompleted => "partially completed",
                 BilibiliAttemptOutcome::Cancelled => "cancelled",
                 BilibiliAttemptOutcome::Interrupted => "interrupted",
                 BilibiliAttemptOutcome::Verified => "verified",
@@ -250,7 +572,7 @@ impl BilibiliAttemptSnapshot {
 
             for entry in entries.into_iter().take(MAX_DETAIL_ENTRIES) {
                 let title = single_line(&entry.title);
-                let detail = if entry.stage.is_empty() {
+                let mut detail = if entry.stage.is_empty() {
                     format!("\nEpisode {}: {}", entry.index, title)
                 } else {
                     format!(
@@ -260,6 +582,15 @@ impl BilibiliAttemptSnapshot {
                         single_line(&entry.stage)
                     )
                 };
+                if entry.attempts > 0 {
+                    detail.push_str(&format!(" (attempts: {})", entry.attempts));
+                }
+                if let Some(error) = &entry.error {
+                    detail.push_str(&format!(
+                        " (last error: {})",
+                        single_line(&sanitize_entry_error(error))
+                    ));
+                }
                 append_bounded(&mut output, &detail);
             }
         }
@@ -273,6 +604,19 @@ impl BilibiliAttemptSnapshot {
             .filter(|entry| entry.state == state)
             .count()
     }
+}
+
+fn sanitize_entry_error(error: &str) -> String {
+    let redacted = redact_sensitive_text(error);
+    const MAX_ERROR_BYTES: usize = 1_000;
+    if redacted.len() <= MAX_ERROR_BYTES {
+        return redacted;
+    }
+    let mut end = MAX_ERROR_BYTES.saturating_sub(3);
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &redacted[..end])
 }
 
 fn compact_ranges(indices: impl IntoIterator<Item = u32>) -> Vec<String> {
@@ -466,6 +810,182 @@ mod tests {
     }
 
     #[test]
+    fn independent_failure_keeps_the_last_reported_stage() {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [(17, "Episode 17".into(), Some("ep-17".into()))],
+            0,
+        );
+        BilibiliAttemptUpdate::Started.apply(&mut attempt, 17);
+        BilibiliAttemptUpdate::Stage {
+            stage: "audio".into(),
+        }
+        .apply(&mut attempt, 17);
+        BilibiliAttemptUpdate::Failure {
+            error: "audio request failed".into(),
+            attempts: 1,
+        }
+        .apply(&mut attempt, 17);
+
+        assert_eq!(attempt.entries[0].state, BilibiliAttemptEntryState::Failed);
+        assert_eq!(attempt.entries[0].stage, "audio");
+        assert!(
+            attempt
+                .summary()
+                .contains("Episode 17: Episode 17 (last reported stage: audio)")
+        );
+    }
+
+    #[test]
+    fn independent_downloaded_entry_accepts_mux_stage_and_failure_keeps_it() {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [(17, "Episode 17".into(), Some("ep-17".into()))],
+            0,
+        );
+        BilibiliAttemptUpdate::Started.apply(&mut attempt, 17);
+        BilibiliAttemptUpdate::Completed.apply(&mut attempt, 17);
+        assert_eq!(
+            attempt.entries[0].state,
+            BilibiliAttemptEntryState::Downloaded
+        );
+
+        BilibiliAttemptUpdate::Stage {
+            stage: "mux".into(),
+        }
+        .apply(&mut attempt, 17);
+        assert_eq!(
+            attempt.entries[0].state,
+            BilibiliAttemptEntryState::Downloaded
+        );
+        assert_eq!(attempt.entries[0].stage, "mux");
+
+        BilibiliAttemptUpdate::Failure {
+            error: "mux failed".into(),
+            attempts: 1,
+        }
+        .apply(&mut attempt, 17);
+        assert_eq!(attempt.entries[0].state, BilibiliAttemptEntryState::Failed);
+        assert_eq!(attempt.entries[0].stage, "mux");
+    }
+
+    #[test]
+    fn already_present_event_tracks_skip_subset_and_verified_clears_it() {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [(17, "Episode 17".into(), Some("ep-17".into()))],
+            0,
+        );
+        let first_path = PathBuf::from("/downloads/episode-17.mp4");
+        let first_hash = "a".repeat(64);
+        let already_present = BilibiliAttemptUpdate::AlreadyPresent {
+            media_paths: vec![first_path.clone()],
+            hashes: BTreeMap::from([(first_path.display().to_string(), first_hash)]),
+        };
+        already_present.apply(&mut attempt, 17);
+        already_present.apply(&mut attempt, 17);
+
+        assert_eq!(
+            attempt.entries[0].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert!(attempt.entries[0].already_present);
+        assert!(!attempt.entries[0].requires_redownload);
+        assert_eq!(attempt.entries[0].attempts, 0);
+        assert_eq!(attempt.skipped_entries, 1);
+
+        let current_path = PathBuf::from("/downloads/episode-17-remuxed.mp4");
+        BilibiliAttemptUpdate::Verified {
+            media_paths: vec![current_path.clone()],
+            hashes: BTreeMap::from([(current_path.display().to_string(), "b".repeat(64))]),
+        }
+        .apply(&mut attempt, 17);
+
+        assert_eq!(
+            attempt.entries[0].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert!(!attempt.entries[0].already_present);
+        assert_eq!(attempt.skipped_entries, 0);
+        assert_eq!(attempt.entries[0].published_media_paths, vec![current_path]);
+    }
+
+    #[test]
+    fn requires_redownload_survives_retry_failure_and_resume_until_verified() {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [(17, "Episode 17".into(), Some("ep-17".into()))],
+            0,
+        );
+        attempt.entries[0].requires_redownload = true;
+
+        BilibiliAttemptUpdate::Started.apply(&mut attempt, 17);
+        assert!(attempt.entries[0].requires_redownload);
+        BilibiliAttemptUpdate::Retrying {
+            attempt: 2,
+            error: "retrying".into(),
+        }
+        .apply(&mut attempt, 17);
+        assert!(attempt.entries[0].requires_redownload);
+        BilibiliAttemptUpdate::Failure {
+            error: "failed".into(),
+            attempts: 2,
+        }
+        .apply(&mut attempt, 17);
+        assert!(attempt.entries[0].requires_redownload);
+
+        attempt.finish(BilibiliAttemptOutcome::Failed);
+        attempt.prepare_resume(false);
+        assert_eq!(attempt.entries[0].state, BilibiliAttemptEntryState::Pending);
+        assert!(attempt.entries[0].requires_redownload);
+        let serialized = serde_json::to_vec(&attempt).unwrap();
+        attempt = serde_json::from_slice(&serialized).unwrap();
+        assert!(attempt.entries[0].requires_redownload);
+
+        BilibiliAttemptUpdate::AlreadyPresent {
+            media_paths: vec![PathBuf::from("/downloads/episode-17.mp4")],
+            hashes: BTreeMap::from([("/downloads/episode-17.mp4".into(), "a".repeat(64))]),
+        }
+        .apply(&mut attempt, 17);
+        assert!(
+            attempt.entries[0].requires_redownload,
+            "an already-present event must not clear an invalid receipt marker"
+        );
+
+        BilibiliAttemptUpdate::Verified {
+            media_paths: vec![PathBuf::from("/downloads/episode-17.mp4")],
+            hashes: BTreeMap::from([("/downloads/episode-17.mp4".into(), "b".repeat(64))]),
+        }
+        .apply(&mut attempt, 17);
+        assert!(!attempt.entries[0].requires_redownload);
+    }
+
+    #[test]
+    fn legacy_downloaded_entry_keeps_ignoring_late_stage_updates() {
+        let mut attempt = snapshot([17]);
+        BilibiliAttemptUpdate::Started.apply(&mut attempt, 17);
+        BilibiliAttemptUpdate::Completed.apply(&mut attempt, 17);
+
+        BilibiliAttemptUpdate::Stage {
+            stage: "mux".into(),
+        }
+        .apply(&mut attempt, 17);
+        assert_eq!(
+            attempt.entries[0].state,
+            BilibiliAttemptEntryState::Downloaded
+        );
+        assert!(attempt.entries[0].stage.is_empty());
+
+        BilibiliAttemptUpdate::Failure {
+            error: "mux failed".into(),
+            attempts: 1,
+        }
+        .apply(&mut attempt, 17);
+        assert_eq!(attempt.entries[0].state, BilibiliAttemptEntryState::Failed);
+        assert!(attempt.entries[0].stage.is_empty());
+    }
+
+    #[test]
     fn finalization_failure_keeps_downloaded_entries_unverified() {
         let mut attempt = snapshot([1, 2]);
         attempt.entry_started(1);
@@ -517,5 +1037,145 @@ mod tests {
         assert_eq!(attempt.count(BilibiliAttemptEntryState::Verified), 2);
         assert!(attempt.summary().contains("verified: 2"));
         assert!(attempt.summary().contains("Outcome: verified"));
+    }
+
+    #[test]
+    fn grouped_resume_and_failed_retry_preserve_verified_entries_and_error_history() {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [
+                (1, "Episode 1".to_string(), Some("ep-1".to_string())),
+                (2, "Episode 2".to_string(), Some("ep-2".to_string())),
+                (3, "Episode 3".to_string(), Some("ep-3".to_string())),
+            ],
+            0,
+        );
+        attempt.entry_verified_with_outputs(
+            1,
+            vec![PathBuf::from("/downloads/episode-1.mp4")],
+            BTreeMap::from([("/downloads/episode-1.mp4".to_string(), "a".repeat(64))]),
+        );
+        attempt.entry_failed_with_error(2, 2, "first failure".to_string());
+        attempt.finish(BilibiliAttemptOutcome::Failed);
+
+        assert_eq!(
+            attempt.outcome,
+            Some(BilibiliAttemptOutcome::PartiallyCompleted)
+        );
+        let summary = attempt.summary();
+        assert!(summary.contains("Outcome: partially completed"));
+        assert!(summary.contains("Failed episodes: 2"));
+        assert!(summary.contains("attempts: 2"));
+        attempt.prepare_resume(true);
+        assert_eq!(
+            attempt.entries[0].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert_eq!(attempt.entries[1].state, BilibiliAttemptEntryState::Pending);
+        assert_eq!(attempt.entries[1].attempts, 2);
+        assert_eq!(attempt.entries[1].error.as_deref(), Some("first failure"));
+        assert_eq!(attempt.entries[2].state, BilibiliAttemptEntryState::Pending);
+        assert_eq!(attempt.retry_indices, Some(vec![2]));
+        assert_eq!(attempt.outcome, None);
+
+        attempt.entries[2].state = BilibiliAttemptEntryState::Downloading;
+        attempt.prepare_resume(false);
+        assert_eq!(
+            attempt.entries[0].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert_eq!(attempt.entries[1].state, BilibiliAttemptEntryState::Pending);
+        assert_eq!(attempt.outcome, None);
+        assert_eq!(attempt.retry_indices, None);
+        assert_eq!(attempt.entries[2].state, BilibiliAttemptEntryState::Pending);
+    }
+
+    #[test]
+    fn grouped_verified_terminal_does_not_promote_unverified_entries() {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [
+                (1, "Episode 1".to_string(), Some("ep-1".to_string())),
+                (2, "Episode 2".to_string(), Some("ep-2".to_string())),
+            ],
+            0,
+        );
+        attempt.entry_verified(1);
+        attempt.finish(BilibiliAttemptOutcome::Verified);
+
+        assert_eq!(
+            attempt.entries[0].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert_eq!(attempt.entries[1].state, BilibiliAttemptEntryState::Pending);
+        assert_eq!(
+            attempt.outcome,
+            Some(BilibiliAttemptOutcome::PartiallyCompleted)
+        );
+    }
+
+    #[test]
+    fn grouped_failed_retry_scope_excludes_pending_and_interrupted_entries() {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [
+                (1, "Episode 1".to_string(), Some("ep-1".to_string())),
+                (2, "Episode 2".to_string(), Some("ep-2".to_string())),
+                (3, "Episode 3".to_string(), Some("ep-3".to_string())),
+                (4, "Episode 4".to_string(), Some("ep-4".to_string())),
+            ],
+            0,
+        );
+        attempt.entry_verified(1);
+        attempt.entry_failed_with_error(2, 2, "failed".into());
+        attempt.entries[3].state = BilibiliAttemptEntryState::Interrupted;
+        attempt.finish(BilibiliAttemptOutcome::PartiallyCompleted);
+
+        attempt.prepare_resume(true);
+        assert_eq!(attempt.retry_indices, Some(vec![2]));
+        assert_eq!(
+            attempt.entries[0].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert_eq!(attempt.entries[1].state, BilibiliAttemptEntryState::Pending);
+        assert_eq!(attempt.entries[2].state, BilibiliAttemptEntryState::Pending);
+        assert_eq!(
+            attempt.entries[3].state,
+            BilibiliAttemptEntryState::Interrupted
+        );
+
+        attempt.prepare_resume(false);
+        assert_eq!(attempt.retry_indices, None);
+        assert_eq!(
+            attempt.entries[0].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert_eq!(attempt.entries[3].state, BilibiliAttemptEntryState::Pending);
+    }
+
+    #[test]
+    fn legacy_snapshot_defaults_group_fields_and_entry_receipts() {
+        let value = serde_json::json!({
+            "title": "Season",
+            "entries": [{
+                "index": 1,
+                "title": "Episode 1",
+                "state": "Pending",
+                "stage": ""
+            }],
+            "skipped_entries": 0,
+            "outcome": null
+        });
+        let attempt: BilibiliAttemptSnapshot = serde_json::from_value(value).unwrap();
+
+        assert!(!attempt.independent_entries);
+        assert_eq!(attempt.retry_indices, None);
+        assert!(!attempt.entries[0].already_present);
+        assert!(!attempt.entries[0].requires_redownload);
+        assert_eq!(attempt.entries[0].attempts, 0);
+        assert_eq!(attempt.entries[0].error, None);
+        assert!(attempt.entries[0].stable_media_id.is_empty());
+        assert!(attempt.entries[0].published_media_paths.is_empty());
+        assert!(attempt.entries[0].published_media_hashes.is_empty());
     }
 }

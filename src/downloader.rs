@@ -3,12 +3,14 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -30,11 +32,15 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, sleep_until, timeout as tokio_timeout};
 use tracing::info;
 
-use crate::bilibili_attempt::{BilibiliAttemptSnapshot, BilibiliAttemptUpdate};
+use crate::bilibili_attempt::{
+    BilibiliAttemptEntryState, BilibiliAttemptOutcome, BilibiliAttemptSnapshot,
+    BilibiliAttemptUpdate,
+};
 use crate::bilibili_auth;
 use crate::bilibili_core;
 use crate::bilibili_planning;
 use crate::config::AppConfig;
+use crate::episode_retry::{EpisodeFailureDisposition, classify_episode_failure};
 use crate::queue::{PlanSize, PlanValidationSnapshot, sanitize_job_for_storage};
 use crate::redaction::redact_sensitive_text;
 use crate::router::{BilibiliSelection, JobRequest, is_bilibili_ugc_collection_url};
@@ -72,7 +78,7 @@ const VIDEO_STAGING_RETENTION_LIMIT: usize = 4096;
 const VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON: &str =
     "download completed; automatic publication has not finished";
 const BILIBILI_WORKER_REQUEST_FILE_NAME: &str = ".bilibili-worker.json";
-const BILIBILI_WORKER_REQUEST_VERSION: u32 = 4;
+const BILIBILI_WORKER_REQUEST_VERSION: u32 = 5;
 const BILIBILI_WORKER_REQUEST_LIMIT: usize = 1024 * 1024;
 const BILIBILI_RESOLVED_PROGRESS_WIRE_PREFIX: &str = "TVD_BILIBILI_RESOLVED:";
 const BILIBILI_PROGRESS_EVENT_WIRE_PREFIX: &str = "TVD_BILIBILI_PROGRESS_EVENT:";
@@ -303,7 +309,13 @@ struct ExistingBilibiliMediaEvidence {
     device: u64,
     inode: u64,
     sidecars: Vec<ExistingBilibiliSidecarEvidence>,
+    #[serde(default)]
+    aid: u64,
+    #[serde(default)]
+    bvid: Option<String>,
     cid: u64,
+    /// Zero is used for older reports and UGC collection entries without an `epid`.
+    #[serde(default)]
     epid: u64,
     content_stamp: MediaContentStamp,
 }
@@ -506,6 +518,8 @@ struct BilibiliWorkerRequest {
     expected_overwrite_identity: Option<VideoIdentity>,
     #[serde(default)]
     expected_plan: Option<PlanValidationSnapshot>,
+    #[serde(default)]
+    expected_entry: Option<BilibiliWorkerExpectedEntry>,
     logical_output_dir: PathBuf,
     output_root_device: u64,
     output_root_inode: u64,
@@ -515,10 +529,21 @@ struct BilibiliWorkerRequest {
     output_lock_inode: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BilibiliWorkerExpectedEntry {
+    index: u32,
+    title: String,
+    stable_media_id: String,
+    #[serde(default)]
+    output_template: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct BilibiliWorkerRequestExpectations {
     overwrite_identity: Option<VideoIdentity>,
     plan: Option<PlanValidationSnapshot>,
+    expected_entry: Option<BilibiliWorkerExpectedEntry>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1616,6 +1641,1211 @@ pub async fn run_job(
     }
 }
 
+/// Return whether a Bilibili request explicitly asks for an inventory-wide execution.
+pub fn is_bilibili_episode_group(job: &JobRequest) -> bool {
+    matches!(
+        job,
+        JobRequest::Bilibili {
+            selection: Some(BilibiliSelection::All | BilibiliSelection::Missing),
+            ..
+        }
+    )
+}
+
+fn should_use_independent_bilibili_episode_group(
+    config: &AppConfig,
+    job: &JobRequest,
+) -> Result<bool> {
+    if !is_bilibili_episode_group(job) {
+        return Ok(false);
+    }
+    let is_all = matches!(
+        job,
+        JobRequest::Bilibili {
+            selection: Some(BilibiliSelection::All),
+            ..
+        }
+    );
+    Ok(!(is_all && bilibili_downloads_artifacts_only(config, job)?))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BilibiliGroupSource {
+    Video,
+    Season,
+    Collection,
+}
+
+#[derive(Clone, Debug)]
+struct BilibiliGroupEntry {
+    download: BilibiliDownloadEntry,
+    stable_media_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct BilibiliEpisodeGroupInventory {
+    title: String,
+    source: BilibiliGroupSource,
+    entries: Vec<BilibiliGroupEntry>,
+    output_template: Option<String>,
+    output_folder: Option<String>,
+}
+
+type BilibiliGroupEntryFuture = Pin<Box<dyn Future<Output = Result<JobReport>> + Send>>;
+type BilibiliGroupExistingMediaFuture =
+    Pin<Box<dyn Future<Output = Result<Option<ExistingEpisodeEvidence>>> + Send>>;
+type BilibiliGroupRetryWaitFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+type BilibiliGroupEntryExecutor =
+    Arc<dyn Fn(BilibiliGroupEntry) -> BilibiliGroupEntryFuture + Send + Sync>;
+type BilibiliGroupExistingMediaScanner =
+    Arc<dyn Fn(BilibiliGroupEntry) -> BilibiliGroupExistingMediaFuture + Send + Sync>;
+type BilibiliGroupRetryWaiter = Arc<
+    dyn Fn(Duration, BilibiliGroupEntry, usize, usize, usize) -> BilibiliGroupRetryWaitFuture
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
+struct BilibiliGroupExecutionHooks {
+    execute_entry: BilibiliGroupEntryExecutor,
+    find_existing_media: BilibiliGroupExistingMediaScanner,
+    wait_before_retry: BilibiliGroupRetryWaiter,
+}
+
+struct BilibiliGroupAttemptGuard {
+    snapshot: BilibiliAttemptSnapshot,
+    progress: Option<JobProgressSender>,
+    terminal: bool,
+}
+
+impl BilibiliGroupAttemptGuard {
+    fn new(snapshot: BilibiliAttemptSnapshot, progress: Option<JobProgressSender>) -> Self {
+        Self {
+            snapshot,
+            progress,
+            terminal: false,
+        }
+    }
+
+    fn snapshot(&self) -> &BilibiliAttemptSnapshot {
+        &self.snapshot
+    }
+
+    fn snapshot_mut(&mut self) -> &mut BilibiliAttemptSnapshot {
+        &mut self.snapshot
+    }
+
+    fn send_snapshot(&self) {
+        send_group_attempt_snapshot(self.progress.as_ref(), &self.snapshot);
+    }
+
+    fn update(&mut self, index: u32, update: BilibiliAttemptUpdate) {
+        send_group_entry_update(&mut self.snapshot, self.progress.as_ref(), index, update);
+    }
+
+    fn copy_stage_from_progress(&mut self, index: u32) {
+        let stage = self
+            .progress
+            .as_ref()
+            .and_then(JobProgressSender::bilibili_attempt_snapshot)
+            .and_then(|snapshot| {
+                snapshot
+                    .entries
+                    .into_iter()
+                    .find(|entry| entry.index == index)
+                    .map(|entry| entry.stage)
+            })
+            .filter(|stage| !stage.is_empty());
+        if let Some(stage) = stage {
+            self.snapshot.stage_started(index, stage);
+        }
+    }
+
+    fn finish(&mut self, outcome: BilibiliAttemptOutcome) {
+        self.snapshot.finish(outcome);
+        self.send_snapshot();
+        self.terminal = true;
+    }
+}
+
+impl Drop for BilibiliGroupAttemptGuard {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.snapshot.finish(BilibiliAttemptOutcome::Interrupted);
+            self.send_snapshot();
+            self.terminal = true;
+        }
+    }
+}
+
+impl BilibiliEpisodeGroupInventory {
+    fn validation_snapshot(&self) -> PlanValidationSnapshot {
+        PlanValidationSnapshot {
+            stable_media_ids: self
+                .entries
+                .iter()
+                .map(|entry| entry.stable_media_id.clone())
+                .collect(),
+            title: Some(self.title.clone()),
+            ..PlanValidationSnapshot::default()
+        }
+    }
+}
+
+async fn resolve_bilibili_episode_group_inventory(
+    config: &AppConfig,
+    url: &str,
+) -> Result<BilibiliEpisodeGroupInventory> {
+    let client = bilibili_core::client(config)?;
+    let resolved = tokio_timeout(
+        BILIBILI_METADATA_PROBE_TIMEOUT,
+        client.resolve_input(url, Some(Selection::All)),
+    )
+    .await
+    .context("Bilibili group inventory resolution timed out")?
+    .context("failed to resolve Bilibili group inventory")?;
+
+    let mut output_template = None;
+    let mut output_folder = None;
+    let (title, source, entries) = match resolved {
+        ResolvedContent::Video(video) => {
+            let bvid = video.bvid.clone();
+            let entries: Vec<BilibiliDownloadEntry> = video
+                .pages
+                .into_iter()
+                .map(|page| BilibiliDownloadEntry {
+                    index: page.index,
+                    aid: page.aid,
+                    bvid: bvid.clone(),
+                    cid: page.cid,
+                    epid: page.epid,
+                    title: page.title,
+                    ..BilibiliDownloadEntry::default()
+                })
+                .collect();
+            (video.title, BilibiliGroupSource::Video, entries)
+        }
+        ResolvedContent::Season(season) => {
+            let entries: Vec<BilibiliDownloadEntry> = season
+                .selected_episodes
+                .into_iter()
+                .map(|episode| BilibiliDownloadEntry {
+                    index: episode.index,
+                    aid: episode.aid,
+                    bvid: episode.bvid,
+                    cid: episode.cid,
+                    epid: Some(episode.epid),
+                    title: episode.title,
+                    ..BilibiliDownloadEntry::default()
+                })
+                .collect();
+            (season.season.title, BilibiliGroupSource::Season, entries)
+        }
+        ResolvedContent::Collection(resolution) => {
+            let input = bilibili_ugc_collection_input(url);
+            if let Some(input) = input {
+                if resolution.collection.id.is_some_and(|id| id != input.id)
+                    || !input.kind.matches(&resolution.collection.kind)
+                {
+                    bail!("Bilibili UGC group resolution returned a different collection");
+                }
+                let root = RootedFs::new(&config.downloads.video_dir)
+                    .context("failed to bind configured output root for Bilibili collection")?;
+                let output_directory = select_bilibili_ugc_collection_output_directory(
+                    &root,
+                    &resolution.collection,
+                    input,
+                )?;
+                output_template = Some(bilibili_ugc_collection_output_template(
+                    &output_directory.folder,
+                )?);
+                output_folder = Some(output_directory.folder);
+            }
+            let items = if resolution.selected_items.is_empty() {
+                resolution.collection.items
+            } else {
+                resolution.selected_items
+            };
+            let entries: Vec<BilibiliDownloadEntry> = items
+                .into_iter()
+                .map(|item| BilibiliDownloadEntry {
+                    index: item.index,
+                    aid: item.aid,
+                    bvid: item.bvid,
+                    cid: item.cid,
+                    title: item.title,
+                    ..BilibiliDownloadEntry::default()
+                })
+                .collect();
+            (
+                resolution.collection.title,
+                BilibiliGroupSource::Collection,
+                entries,
+            )
+        }
+    };
+
+    let mut seen_indices = BTreeSet::new();
+    let mut entries = entries
+        .into_iter()
+        .map(|download| {
+            if download.index == 0 || !seen_indices.insert(download.index) {
+                bail!("Bilibili group inventory contains an invalid or duplicate entry index");
+            }
+            if download.aid == 0 || download.cid == 0 {
+                bail!("Bilibili group inventory contains an incomplete media identity");
+            }
+            let stable_media_id = bilibili_plan_stable_media_id(
+                download.bvid.as_deref(),
+                download.aid,
+                download.cid,
+                download.epid,
+            );
+            Ok(BilibiliGroupEntry {
+                download,
+                stable_media_id,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by_key(|entry| entry.download.index);
+    if entries.is_empty() {
+        bail!("Bilibili group inventory contains no selected entries");
+    }
+    Ok(BilibiliEpisodeGroupInventory {
+        title: nonempty_collection_title(&title),
+        source,
+        entries,
+        output_template,
+        output_folder,
+    })
+}
+
+#[derive(Debug)]
+struct BilibiliGroupOutputVerification {
+    paths: Vec<PathBuf>,
+    hashes: BTreeMap<String, String>,
+    evidence: Vec<ExistingEpisodeEvidence>,
+}
+
+pub async fn run_bilibili_episode_group(
+    config: &AppConfig,
+    job: &JobRequest,
+    previous: Option<BilibiliAttemptSnapshot>,
+    expected_plan: Option<PlanValidationSnapshot>,
+    progress: Option<JobProgressSender>,
+) -> Result<JobReport> {
+    let JobRequest::Bilibili { url, .. } = job else {
+        bail!("grouped Bilibili execution requires a Bilibili job");
+    };
+    if !is_bilibili_episode_group(job) {
+        bail!("grouped Bilibili execution requires All or Missing selection");
+    }
+    if !should_use_independent_bilibili_episode_group(config, job)? {
+        return run_video_job_staged_keep_both_with_plan(config, job, expected_plan, progress)
+            .await;
+    }
+    if let Err(error) = sync_bilibili_rust_credentials(config).await {
+        if let Some(mut snapshot) = previous.clone()
+            && snapshot.independent_entries
+        {
+            snapshot.finish(BilibiliAttemptOutcome::Interrupted);
+            send_group_attempt_snapshot(progress.as_ref(), &snapshot);
+        }
+        return Err(error);
+    }
+
+    send_progress(
+        progress.as_ref(),
+        "Resolving Bilibili group inventory (metadata only)".to_string(),
+    );
+    let inventory = match resolve_bilibili_episode_group_inventory(config, url).await {
+        Ok(inventory) => inventory,
+        Err(error) => {
+            if let Some(mut snapshot) = previous.clone()
+                && snapshot.independent_entries
+            {
+                snapshot.finish(BilibiliAttemptOutcome::Interrupted);
+                send_group_attempt_snapshot(progress.as_ref(), &snapshot);
+            }
+            return Err(error);
+        }
+    };
+
+    let shared_config = Arc::new(config.clone());
+    let shared_url = Arc::<str>::from(url.as_str());
+    let shared_inventory = Arc::new(inventory.clone());
+    let scan_config = Arc::clone(&shared_config);
+    let scan_inventory = Arc::clone(&shared_inventory);
+    let execute_progress = progress.clone();
+    let execute_entry: BilibiliGroupEntryExecutor = Arc::new(move |entry| {
+        let config = Arc::clone(&shared_config);
+        let url = Arc::clone(&shared_url);
+        let inventory = Arc::clone(&shared_inventory);
+        let progress = execute_progress.clone();
+        Box::pin(async move {
+            execute_bilibili_group_entry(&config, &url, &inventory, &entry, progress.as_ref()).await
+        })
+    });
+    let find_existing_media: BilibiliGroupExistingMediaScanner = Arc::new(move |entry| {
+        let config = Arc::clone(&scan_config);
+        let inventory = Arc::clone(&scan_inventory);
+        Box::pin(async move {
+            let options = bilibili_core::download_options(&config)?;
+            find_compatible_group_media(&config, &inventory, &entry, options.mode).await
+        })
+    });
+    let progress_interval = config.bot.progress_update_seconds;
+    let retry_progress = progress.clone();
+    let wait_before_retry: BilibiliGroupRetryWaiter =
+        Arc::new(move |delay, entry, ordinal, total, attempt| {
+            let progress = retry_progress.clone();
+            Box::pin(wait_for_episode_retry_progress(
+                delay,
+                progress_interval,
+                progress,
+                entry,
+                ordinal,
+                total,
+                attempt,
+            ))
+        });
+    run_bilibili_episode_group_with_inventory(
+        config,
+        job,
+        inventory,
+        previous,
+        expected_plan,
+        progress,
+        BilibiliGroupExecutionHooks {
+            execute_entry,
+            find_existing_media,
+            wait_before_retry,
+        },
+    )
+    .await
+}
+
+async fn run_bilibili_episode_group_with_inventory(
+    config: &AppConfig,
+    job: &JobRequest,
+    inventory: BilibiliEpisodeGroupInventory,
+    previous: Option<BilibiliAttemptSnapshot>,
+    expected_plan: Option<PlanValidationSnapshot>,
+    progress: Option<JobProgressSender>,
+    hooks: BilibiliGroupExecutionHooks,
+) -> Result<JobReport> {
+    let JobRequest::Bilibili { selection, .. } = job else {
+        bail!("grouped Bilibili execution requires a Bilibili job");
+    };
+    validate_group_inventory_snapshot(&inventory, expected_plan.as_ref(), previous.as_ref())?;
+
+    let missing_selection = matches!(selection, Some(BilibiliSelection::Missing));
+    let options = bilibili_core::download_options(config)?;
+    if missing_selection && !bilibili_missing_skip_mode_supported(options.mode) {
+        bail!("Missing selection is unsupported for the configured Bilibili download mode");
+    }
+
+    let mut snapshot = previous.unwrap_or_else(|| {
+        BilibiliAttemptSnapshot::new_independent(
+            inventory.title.clone(),
+            inventory.entries.iter().map(|entry| {
+                (
+                    entry.download.index,
+                    entry.download.title.clone(),
+                    Some(entry.stable_media_id.clone()),
+                )
+            }),
+            0,
+        )
+    });
+    if !snapshot.independent_entries {
+        bail!("saved Bilibili attempt does not support independent episode recovery");
+    }
+    snapshot.outcome = None;
+    validate_group_inventory_snapshot(&inventory, None, Some(&snapshot))?;
+    let retry_indices = snapshot.retry_indices.clone();
+    let retry_scope = retry_indices
+        .as_ref()
+        .map(|indices| indices.iter().copied().collect::<BTreeSet<_>>());
+    if retry_scope.as_ref().is_some_and(|indices| {
+        indices
+            .iter()
+            .any(|index| !snapshot.entries.iter().any(|entry| entry.index == *index))
+    }) {
+        bail!("saved Bilibili retry scope does not match the reviewed group inventory");
+    }
+
+    let output_root_path = config.downloads.video_dir.clone();
+    let mut report_paths = BTreeSet::new();
+    let mut report_evidence = Vec::<(BilibiliDownloadEntry, ExistingEpisodeEvidence)>::new();
+    let mut attempt = BilibiliGroupAttemptGuard::new(snapshot, progress.clone());
+    attempt.send_snapshot();
+
+    let total_entries = inventory.entries.len();
+    for (ordinal, entry) in inventory.entries.iter().enumerate() {
+        let ordinal = ordinal + 1;
+        let state = attempt
+            .snapshot()
+            .entries
+            .iter()
+            .find(|saved| saved.index == entry.download.index)
+            .map(|saved| saved.state)
+            .context("saved Bilibili group entry disappeared during execution")?;
+        let selected = retry_scope
+            .as_ref()
+            .is_none_or(|scope| scope.contains(&entry.download.index));
+        let mut must_redownload = attempt
+            .snapshot()
+            .entries
+            .iter()
+            .find(|saved| saved.index == entry.download.index)
+            .is_some_and(|saved| saved.requires_redownload);
+
+        if state == BilibiliAttemptEntryState::Verified {
+            match revalidate_group_snapshot_entry(
+                &output_root_path,
+                &entry.download,
+                attempt
+                    .snapshot()
+                    .entries
+                    .iter()
+                    .find(|saved| saved.index == entry.download.index)
+                    .expect("entry was just looked up"),
+            )
+            .await
+            {
+                Ok(Some(verified)) => {
+                    report_paths.extend(verified.paths);
+                    report_evidence.extend(
+                        verified
+                            .evidence
+                            .into_iter()
+                            .map(|evidence| (entry.download.clone(), evidence)),
+                    );
+                    continue;
+                }
+                Ok(None) => {
+                    let saved = attempt
+                        .snapshot_mut()
+                        .entries
+                        .iter_mut()
+                        .find(|saved| saved.index == entry.download.index)
+                        .expect("entry was just looked up");
+                    saved.state = BilibiliAttemptEntryState::Pending;
+                    saved.stage.clear();
+                    saved.error = None;
+                    saved.published_media_paths.clear();
+                    saved.published_media_hashes.clear();
+                    saved.already_present = false;
+                    saved.requires_redownload = true;
+                    must_redownload = true;
+                    let snapshot = attempt.snapshot_mut();
+                    snapshot.skipped_entries = snapshot
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.already_present)
+                        .count();
+                    attempt.send_snapshot();
+                }
+                Err(error) => {
+                    return pause_bilibili_episode_group(&mut attempt, &inventory.title, error);
+                }
+            }
+        }
+
+        if !selected {
+            continue;
+        }
+
+        if missing_selection
+            && !must_redownload
+            && attempt
+                .snapshot()
+                .entries
+                .iter()
+                .find(|saved| saved.index == entry.download.index)
+                .is_some_and(|saved| saved.state != BilibiliAttemptEntryState::Verified)
+        {
+            let existing = match (hooks.find_existing_media)(entry.clone()).await {
+                Ok(existing) => existing,
+                Err(error) => {
+                    return pause_bilibili_episode_group(&mut attempt, &inventory.title, error);
+                }
+            };
+            if let Some(existing) = existing {
+                let verified = match verify_group_output_paths(
+                    output_root_path.clone(),
+                    entry.download.clone(),
+                    vec![existing.path.clone()],
+                    Some(vec![existing]),
+                )
+                .await
+                {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        return pause_bilibili_episode_group(&mut attempt, &inventory.title, error);
+                    }
+                };
+                attempt.update(
+                    entry.download.index,
+                    BilibiliAttemptUpdate::AlreadyPresent {
+                        media_paths: verified.paths.clone(),
+                        hashes: verified.hashes.clone(),
+                    },
+                );
+                report_paths.extend(verified.paths);
+                report_evidence.extend(
+                    verified
+                        .evidence
+                        .into_iter()
+                        .map(|evidence| (entry.download.clone(), evidence)),
+                );
+                continue;
+            }
+        }
+
+        let saved_attempts = attempt
+            .snapshot()
+            .entries
+            .iter()
+            .find(|saved| saved.index == entry.download.index)
+            .map(|saved| saved.attempts)
+            .unwrap_or_default();
+        if saved_attempts == 0 {
+            attempt.update(entry.download.index, BilibiliAttemptUpdate::Started);
+        } else {
+            attempt.update(
+                entry.download.index,
+                BilibiliAttemptUpdate::Retrying {
+                    attempt: saved_attempts.saturating_add(1),
+                    error: "resuming this episode".to_string(),
+                },
+            );
+        }
+        let mut retries_used = 0usize;
+        let mut attempts_made = 0usize;
+        loop {
+            attempts_made = attempts_made.saturating_add(1);
+            send_progress(
+                progress.as_ref(),
+                format!(
+                    "Episode {} · {ordinal}/{total_entries}: {} (attempt {})",
+                    entry.download.index,
+                    entry.download.title,
+                    saved_attempts.saturating_add(attempts_made)
+                ),
+            );
+            attempt.update(
+                entry.download.index,
+                BilibiliAttemptUpdate::Stage {
+                    stage: "refresh plan".to_string(),
+                },
+            );
+            let execution = (hooks.execute_entry)(entry.clone()).await;
+            attempt.copy_stage_from_progress(entry.download.index);
+            match execution {
+                Ok(report) => {
+                    attempt.update(
+                        entry.download.index,
+                        BilibiliAttemptUpdate::Stage {
+                            stage: "verify publication".to_string(),
+                        },
+                    );
+                    let verified = match verify_group_output_paths(
+                        output_root_path.clone(),
+                        entry.download.clone(),
+                        report.primary_media_paths.clone(),
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(verified) => verified,
+                        Err(error) => {
+                            return pause_bilibili_episode_group(
+                                &mut attempt,
+                                &inventory.title,
+                                error.context("unsafe publication verification failed"),
+                            );
+                        }
+                    };
+                    attempt.update(
+                        entry.download.index,
+                        BilibiliAttemptUpdate::Verified {
+                            media_paths: verified.paths.clone(),
+                            hashes: verified.hashes.clone(),
+                        },
+                    );
+                    report_paths.extend(verified.paths);
+                    report_evidence.extend(
+                        verified
+                            .evidence
+                            .into_iter()
+                            .map(|evidence| (entry.download.clone(), evidence)),
+                    );
+                    break;
+                }
+                Err(error) => {
+                    let safe_error = redact_sensitive_text(&format!("{error:#}"));
+                    match classify_episode_failure(&error, retries_used) {
+                        EpisodeFailureDisposition::Retry {
+                            delay,
+                            refresh_plan: _,
+                        } => {
+                            retries_used = retries_used.saturating_add(1);
+                            let next_attempt = saved_attempts.saturating_add(attempts_made + 1);
+                            attempt.update(
+                                entry.download.index,
+                                BilibiliAttemptUpdate::Retrying {
+                                    attempt: next_attempt,
+                                    error: safe_error.clone(),
+                                },
+                            );
+                            (hooks.wait_before_retry)(
+                                delay,
+                                entry.clone(),
+                                ordinal,
+                                total_entries,
+                                next_attempt,
+                            )
+                            .await;
+                        }
+                        EpisodeFailureDisposition::FailEntry => {
+                            attempt.update(
+                                entry.download.index,
+                                BilibiliAttemptUpdate::Failure {
+                                    error: safe_error,
+                                    attempts: saved_attempts.saturating_add(attempts_made),
+                                },
+                            );
+                            break;
+                        }
+                        EpisodeFailureDisposition::PauseGroup => {
+                            return pause_bilibili_episode_group(
+                                &mut attempt,
+                                &inventory.title,
+                                anyhow!(safe_error),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let all_verified = attempt
+        .snapshot()
+        .entries
+        .iter()
+        .all(|entry| entry.state == BilibiliAttemptEntryState::Verified);
+    if !all_verified {
+        attempt.finish(BilibiliAttemptOutcome::PartiallyCompleted);
+        let failed = attempt
+            .snapshot()
+            .entries
+            .iter()
+            .filter(|entry| entry.state != BilibiliAttemptEntryState::Verified)
+            .count();
+        let error = redact_sensitive_text(&format!(
+            "Bilibili group {} has {} verified and {} unfinished entries; resume or retry failed episodes",
+            inventory.title,
+            attempt.snapshot().verified_entries(),
+            failed
+        ));
+        return Err(anyhow!(error));
+    }
+
+    let root = RootedFs::new(&output_root_path)
+        .context("failed to bind output root while building Bilibili group report")?;
+    let media_paths = report_paths.into_iter().collect::<Vec<_>>();
+    let saved_location = inventory
+        .output_folder
+        .as_ref()
+        .map(|folder| root.logical_root_path().join(folder))
+        .unwrap_or_else(|| root.logical_root_path().to_path_buf())
+        .display()
+        .to_string();
+    let mut report = JobReport {
+        saved_location,
+        details: format!(
+            "Bilibili group completed: {} ({} entries; {} already present)",
+            inventory.title,
+            attempt.snapshot().entries.len(),
+            attempt.snapshot().skipped_entries
+        ),
+        primary_media_paths: media_paths,
+        existing_bilibili_evidence: (!report_evidence.is_empty())
+            .then(|| bilibili_report_evidence_from_entries(&report_evidence)),
+    };
+    normalize_existing_bilibili_report_evidence(&root, &mut report)?;
+    attempt.finish(BilibiliAttemptOutcome::Verified);
+    Ok(report)
+}
+
+fn validate_group_inventory_snapshot(
+    inventory: &BilibiliEpisodeGroupInventory,
+    expected_plan: Option<&PlanValidationSnapshot>,
+    previous: Option<&BilibiliAttemptSnapshot>,
+) -> Result<()> {
+    let stable_ids = inventory
+        .entries
+        .iter()
+        .map(|entry| entry.stable_media_id.as_str())
+        .collect::<Vec<_>>();
+    if let Some(expected) = expected_plan
+        && expected
+            .stable_media_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            != stable_ids
+    {
+        bail!("Bilibili group inventory changed since the reviewed plan; inspect the group again");
+    }
+    if let Some(previous) = previous {
+        if !previous.independent_entries || previous.entries.len() != inventory.entries.len() {
+            bail!("saved Bilibili group inventory no longer matches the current selection");
+        }
+        for entry in &inventory.entries {
+            let saved = previous
+                .entries
+                .iter()
+                .find(|saved| saved.index == entry.download.index)
+                .with_context(|| {
+                    format!(
+                        "Bilibili group entry {} is missing from its saved inventory",
+                        entry.download.index
+                    )
+                })?;
+            if saved.stable_media_id != entry.stable_media_id {
+                bail!(
+                    "Bilibili group entry {} changed identity since it was saved; inspect the group again",
+                    entry.download.index
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn send_group_attempt_snapshot(
+    progress: Option<&JobProgressSender>,
+    snapshot: &BilibiliAttemptSnapshot,
+) {
+    if let Some(progress) = progress {
+        progress.send_lifecycle(JobProgressLifecycleEvent::BilibiliAttempt {
+            snapshot: snapshot.clone(),
+        });
+    }
+}
+
+fn send_group_entry_update(
+    snapshot: &mut BilibiliAttemptSnapshot,
+    progress: Option<&JobProgressSender>,
+    index: u32,
+    update: BilibiliAttemptUpdate,
+) {
+    update.apply(snapshot, index);
+    if let Some(progress) = progress {
+        progress.send_lifecycle(JobProgressLifecycleEvent::BilibiliEntry { index, update });
+    }
+}
+
+fn pause_bilibili_episode_group<T>(
+    attempt: &mut BilibiliGroupAttemptGuard,
+    title: &str,
+    error: anyhow::Error,
+) -> Result<T> {
+    let verified_entries = attempt.snapshot().verified_entries();
+    attempt.finish(BilibiliAttemptOutcome::Interrupted);
+    let error = redact_sensitive_text(&format!(
+        "Bilibili group {title} was interrupted after {} verified entries: {error:#}",
+        verified_entries
+    ));
+    Err(anyhow!(error))
+}
+
+async fn find_compatible_group_media(
+    config: &AppConfig,
+    inventory: &BilibiliEpisodeGroupInventory,
+    entry: &BilibiliGroupEntry,
+    mode: DownloadMode,
+) -> Result<Option<ExistingEpisodeEvidence>> {
+    let root_path = config.downloads.video_dir.clone();
+    let folder = inventory.output_folder.clone();
+    let identity_index = tokio::task::spawn_blocking(move || -> Result<VideoIdentityIndex> {
+        let root = RootedFs::new(&root_path)?;
+        if let Some(folder) = folder {
+            let target = root.logical_root_path().join(&folder);
+            let expected = root.entry_identity(&target)?;
+            build_bilibili_ugc_collection_identity_index(
+                &root,
+                &folder,
+                expected,
+                bilibili_primary_media_kind(mode),
+            )
+        } else {
+            build_video_identity_index_in_dir(
+                &root_path,
+                bilibili_primary_media_kind(mode),
+                IdentityIndexReadPolicy::BestEffort,
+            )
+        }
+    })
+    .await
+    .context("Bilibili existing-media scan task failed to join")??;
+    Ok(bilibili_plan_entry_compatible_existing_media(
+        config,
+        Arc::new(identity_index),
+        &entry.download,
+        mode,
+        &ffprobe_program(&config.tools.ffmpeg),
+    )
+    .await)
+}
+
+async fn execute_bilibili_group_entry(
+    config: &AppConfig,
+    group_url: &str,
+    inventory: &BilibiliEpisodeGroupInventory,
+    entry: &BilibiliGroupEntry,
+    progress: Option<&JobProgressSender>,
+) -> Result<JobReport> {
+    let fresh = resolve_bilibili_episode_group_inventory(config, group_url).await?;
+    if fresh.source != inventory.source
+        || fresh.output_folder != inventory.output_folder
+        || fresh.output_template != inventory.output_template
+    {
+        bail!("Bilibili group output identity changed while refreshing an episode");
+    }
+    let refreshed = fresh
+        .entries
+        .iter()
+        .find(|candidate| candidate.download.index == entry.download.index)
+        .with_context(|| {
+            format!(
+                "Bilibili group entry {} disappeared while refreshing its download URL",
+                entry.download.index
+            )
+        })?;
+    if refreshed.stable_media_id != entry.stable_media_id {
+        bail!(
+            "Bilibili group entry {} changed identity while refreshing its download URL",
+            entry.download.index
+        );
+    }
+    let (url, selection) = match inventory.source {
+        BilibiliGroupSource::Season => {
+            let epid = refreshed
+                .download
+                .epid
+                .context("refreshed season entry omitted its epid")?;
+            (
+                format!("https://www.bilibili.com/bangumi/play/ep{epid}"),
+                Some(BilibiliSelection::Current),
+            )
+        }
+        BilibiliGroupSource::Video => {
+            let bvid = refreshed
+                .download
+                .bvid
+                .clone()
+                .unwrap_or_else(|| format!("av{}", refreshed.download.aid));
+            (
+                format!("https://www.bilibili.com/video/{bvid}"),
+                Some(BilibiliSelection::CurrentPage(refreshed.download.index)),
+            )
+        }
+        BilibiliGroupSource::Collection => {
+            let bvid = refreshed
+                .download
+                .bvid
+                .clone()
+                .unwrap_or_else(|| format!("av{}", refreshed.download.aid));
+            let client = bilibili_core::client(config)?;
+            let resolved = tokio_timeout(
+                BILIBILI_METADATA_PROBE_TIMEOUT,
+                client.resolve_input(&bvid, Some(Selection::Current)),
+            )
+            .await
+            .context("Bilibili collection item URL refresh timed out")?
+            .context("failed to refresh Bilibili collection item URL")?;
+            let ResolvedContent::Video(video) = resolved else {
+                bail!("Bilibili collection item did not resolve to a video");
+            };
+            let page = video
+                .pages
+                .iter()
+                .find(|page| page.cid == refreshed.download.cid)
+                .with_context(|| {
+                    format!(
+                        "Bilibili collection item {} changed its CID while refreshing",
+                        entry.download.index
+                    )
+                })?;
+            let video_id = video.bvid.unwrap_or_else(|| format!("av{}", video.aid));
+            (
+                format!("https://www.bilibili.com/video/{video_id}"),
+                Some(BilibiliSelection::CurrentPage(page.index)),
+            )
+        }
+    };
+    let child_job = JobRequest::Bilibili { url, selection };
+    let expected_entry = BilibiliWorkerExpectedEntry {
+        index: entry.download.index,
+        title: entry.download.title.clone(),
+        stable_media_id: entry.stable_media_id.clone(),
+        output_template: inventory.output_template.clone(),
+    };
+    let (child_progress, child_receiver) = job_progress_channel();
+    let bridge = tokio::spawn(bridge_bilibili_group_child_progress(
+        child_receiver,
+        progress.cloned(),
+        entry.download.index,
+        entry.download.title.clone(),
+    ));
+    let result = run_video_job_staged_keep_both_for_bilibili_entry(
+        config,
+        &child_job,
+        expected_entry,
+        Some(child_progress.clone()),
+    )
+    .await;
+    drop(child_progress);
+    let _ = bridge.await;
+    result
+}
+
+async fn bridge_bilibili_group_child_progress(
+    receiver: JobProgressReceiver,
+    parent: Option<JobProgressSender>,
+    index: u32,
+    title: String,
+) {
+    let Some(parent) = parent else {
+        return;
+    };
+    let (mut latest, mut lifecycle) = receiver.into_parts();
+    let mut latest_open = true;
+    let mut lifecycle_open = true;
+    while latest_open || lifecycle_open {
+        tokio::select! {
+            changed = latest.changed(), if latest_open => {
+                if changed.is_err() {
+                    latest_open = false;
+                    continue;
+                }
+                if let Some(child) = latest.borrow_and_update().as_ref() {
+                    let message = redact_sensitive_text(&format!(
+                        "Episode {index}: {title}\n{}",
+                        child.message
+                    ));
+                    parent.send_replace(Some(JobProgress {
+                        message,
+                        resolved_summary: child
+                            .resolved_summary
+                            .as_deref()
+                            .map(redact_sensitive_text),
+                        collection: None,
+                    }));
+                }
+            }
+            event = lifecycle.recv(), if lifecycle_open => {
+                match event {
+                    Some(JobProgressLifecycleEvent::StagingAttempt { path }) => {
+                        parent.send_lifecycle(JobProgressLifecycleEvent::StagingAttempt { path });
+                    }
+                    Some(JobProgressLifecycleEvent::BilibiliEntry {
+                        update: BilibiliAttemptUpdate::Stage { stage },
+                        ..
+                    }) => {
+                        parent.send_lifecycle(JobProgressLifecycleEvent::BilibiliEntry {
+                            index,
+                            update: BilibiliAttemptUpdate::Stage { stage },
+                        });
+                    }
+                    Some(_) => {
+                        // Child attempt, terminal, and collection events belong to the group.
+                    }
+                    None => lifecycle_open = false,
+                }
+            }
+        }
+    }
+}
+
+async fn wait_for_episode_retry_progress(
+    delay: Duration,
+    progress_interval_seconds: u64,
+    progress: Option<JobProgressSender>,
+    entry: BilibiliGroupEntry,
+    ordinal: usize,
+    total: usize,
+    attempt: usize,
+) {
+    let deadline = Instant::now() + delay;
+    let interval = Duration::from_secs(progress_interval_seconds.max(1));
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let next = (now + interval).min(deadline);
+        sleep_until(next).await;
+        if Instant::now() < deadline {
+            send_progress(
+                progress.as_ref(),
+                format!(
+                    "Episode {} · {ordinal}/{total}: retry {attempt} for {} in {}s",
+                    entry.download.index,
+                    entry.download.title,
+                    deadline.saturating_duration_since(Instant::now()).as_secs()
+                ),
+            );
+        }
+    }
+}
+
+async fn verify_group_output_paths(
+    output_root: PathBuf,
+    entry: BilibiliDownloadEntry,
+    paths: Vec<PathBuf>,
+    expected: Option<Vec<ExistingEpisodeEvidence>>,
+) -> Result<BilibiliGroupOutputVerification> {
+    tokio::task::spawn_blocking(move || {
+        verify_group_output_paths_blocking(&output_root, &entry, &paths, expected.as_deref())
+    })
+    .await
+    .context("Bilibili group publication verification task failed to join")?
+}
+
+fn verify_group_output_paths_blocking(
+    output_root: &Path,
+    entry: &BilibiliDownloadEntry,
+    paths: &[PathBuf],
+    expected: Option<&[ExistingEpisodeEvidence]>,
+) -> Result<BilibiliGroupOutputVerification> {
+    if paths.is_empty() {
+        bail!("unsafe publication: Bilibili entry reported no primary media paths");
+    }
+    let root = RootedFs::new(output_root)
+        .context("failed to bind output root while verifying Bilibili group media")?;
+    let mut logical_paths = Vec::with_capacity(paths.len());
+    let mut expected_identities = BTreeMap::new();
+    let mut captured = Vec::new();
+    let mut seen = BTreeSet::new();
+    for path in paths {
+        let logical = logical_download_root_path(&root, path)?
+            .context("unsafe publication: Bilibili media path is outside the output root")?;
+        if !seen.insert(logical.clone()) {
+            continue;
+        }
+        let media = root
+            .open_bound_file(&logical)
+            .with_context(|| {
+                format!(
+                    "failed to open published Bilibili media {}",
+                    logical.display()
+                )
+            })?
+            .ok_or_else(|| anyhow!("published Bilibili media is missing: {}", logical.display()))?;
+        if !media.identity().is_file() {
+            bail!("unsafe publication: published Bilibili media is not a regular file");
+        }
+        if let Some(expected) = expected
+            && let Some(expected) = expected.iter().find(|saved| saved.path == logical)
+            && expected.identity != media.identity()
+        {
+            bail!(
+                "published Bilibili media identity changed: {}",
+                logical.display()
+            );
+        }
+        let sidecars = match validate_current_bilibili_sidecars(&root, &logical, entry)? {
+            CurrentBilibiliSidecarEvidence::Matches(sidecars) => sidecars,
+            CurrentBilibiliSidecarEvidence::Missing => Vec::new(),
+            CurrentBilibiliSidecarEvidence::Mismatched => {
+                bail!(
+                    "published Bilibili identity sidecar changed: {}",
+                    logical.display()
+                );
+            }
+        };
+        if let Some(expected) = expected
+            && let Some(expected) = expected.iter().find(|saved| saved.path == logical)
+            && expected.sidecars != sidecars
+        {
+            bail!(
+                "published Bilibili identity sidecar object changed: {}",
+                logical.display()
+            );
+        }
+        let content_stamp = MediaContentStamp::from_bound_file(&media)?;
+        expected_identities.insert(logical.clone(), media.identity());
+        if !sidecars.is_empty() {
+            captured.push(ExistingEpisodeEvidence {
+                path: logical.clone(),
+                identity: media.identity(),
+                sidecars,
+                content_stamp,
+            });
+        }
+        logical_paths.push(logical);
+    }
+    let hashes = crate::queue::hash_primary_media_with_expected_identities(
+        output_root,
+        &logical_paths,
+        &expected_identities,
+    )?;
+    for evidence in &captured {
+        revalidate_bilibili_entry_evidence(&root, entry, evidence, "group completion")?;
+    }
+    Ok(BilibiliGroupOutputVerification {
+        paths: logical_paths,
+        hashes,
+        evidence: captured,
+    })
+}
+
+async fn revalidate_group_snapshot_entry(
+    output_root: &Path,
+    entry: &BilibiliDownloadEntry,
+    saved: &crate::bilibili_attempt::BilibiliAttemptEntry,
+) -> Result<Option<BilibiliGroupOutputVerification>> {
+    if saved.published_media_paths.is_empty() || saved.published_media_hashes.is_empty() {
+        return Ok(None);
+    }
+    let result = verify_group_output_paths(
+        output_root.to_path_buf(),
+        entry.clone(),
+        saved.published_media_paths.clone(),
+        None,
+    )
+    .await;
+    let verified = match result {
+        Ok(verified) => verified,
+        Err(error) if is_stored_group_output_invalid(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if verified.hashes != saved.published_media_hashes {
+        return Ok(None);
+    }
+    Ok(Some(verified))
+}
+
+fn is_stored_group_output_invalid(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_ascii_lowercase();
+    [
+        "published bilibili media is missing",
+        "published bilibili media identity changed",
+        "published bilibili identity sidecar changed",
+        "published bilibili identity sidecar object changed",
+        "published media disappeared before hashing",
+        "published media identity changed before hashing",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
 pub async fn inspect_job_plan_with_progress(
     config: &AppConfig,
     job: &JobRequest,
@@ -1781,6 +3011,10 @@ async fn inspect_job_plan_inner(
                 },
             );
             sync_bilibili_rust_credentials(config).await?;
+            if should_use_independent_bilibili_episode_group(config, job)? {
+                let inventory = resolve_bilibili_episode_group_inventory(config, url).await?;
+                return Ok(inventory.validation_snapshot());
+            }
             let options = bilibili_core::download_options(config)?;
             let client = bilibili_core::client(config)?;
             let plan = if matches!(selection, Some(BilibiliSelection::Missing)) {
@@ -1934,7 +3168,7 @@ pub async fn run_job_with_duplicate_action(
         bail!("overwrite requires one exact video or Bilibili entry match");
     }
 
-    run_staged_video_job(config, job, action, duplicate, None, progress).await
+    run_staged_video_job(config, job, action, duplicate, None, None, progress).await
 }
 
 pub async fn run_video_job_staged_keep_both(
@@ -1966,6 +3200,34 @@ pub async fn run_video_job_staged_keep_both_with_plan(
         VideoDuplicateAction::KeepBoth,
         &duplicate,
         expected_plan,
+        None,
+        progress,
+    )
+    .await
+}
+
+async fn run_video_job_staged_keep_both_for_bilibili_entry(
+    config: &AppConfig,
+    job: &JobRequest,
+    expected_entry: BilibiliWorkerExpectedEntry,
+    progress: Option<JobProgressSender>,
+) -> Result<JobReport> {
+    let Some(identity) = fallback_video_identity(job) else {
+        bail!("grouped Bilibili entry did not produce a video identity");
+    };
+    let duplicate = VideoDuplicate {
+        skip_summary: None,
+        overwrite_confirmation: None,
+        identity,
+        existing_videos: Vec::new(),
+    };
+    run_staged_video_job(
+        config,
+        job,
+        VideoDuplicateAction::KeepBoth,
+        &duplicate,
+        None,
+        Some(expected_entry),
         progress,
     )
     .await
@@ -2351,10 +3613,27 @@ struct ExistingSidecarEvidence {
 fn bilibili_report_evidence_from_skipped(
     skipped: &[(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)],
 ) -> ExistingBilibiliReportEvidence {
+    let entries = skipped
+        .iter()
+        .map(|(episode, evidence)| {
+            (
+                bilibili_entry_from_episode_metadata(episode),
+                evidence.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    bilibili_report_evidence_from_entries(&entries)
+}
+
+fn bilibili_report_evidence_from_entries(
+    entries: &[(BilibiliDownloadEntry, ExistingEpisodeEvidence)],
+) -> ExistingBilibiliReportEvidence {
+    let mut seen_paths = BTreeSet::new();
     ExistingBilibiliReportEvidence {
-        skipped: skipped
+        skipped: entries
             .iter()
-            .map(|(episode, evidence)| ExistingBilibiliMediaEvidence {
+            .filter(|(_, evidence)| seen_paths.insert(evidence.path.clone()))
+            .map(|(entry, evidence)| ExistingBilibiliMediaEvidence {
                 path: evidence.path.clone(),
                 device: evidence.identity.device(),
                 inode: evidence.identity.inode(),
@@ -2367,8 +3646,10 @@ fn bilibili_report_evidence_from_skipped(
                         inode: sidecar.identity.inode(),
                     })
                     .collect(),
-                cid: episode.cid,
-                epid: episode.epid,
+                aid: entry.aid,
+                bvid: entry.bvid.clone(),
+                cid: entry.cid,
+                epid: entry.epid.unwrap_or_default(),
                 content_stamp: evidence.content_stamp,
             })
             .collect(),
@@ -2432,8 +3713,10 @@ fn validate_existing_bilibili_report_evidence_identity(
         }
         let media_identity = EntryIdentity::regular_file(skipped.device, skipped.inode);
         let episode = BilibiliDownloadEntry {
+            aid: skipped.aid,
+            bvid: skipped.bvid.clone(),
             cid: skipped.cid,
-            epid: Some(skipped.epid),
+            epid: (skipped.epid != 0).then_some(skipped.epid),
             ..BilibiliDownloadEntry::default()
         };
         let media_path = logical_download_root_path(root, &skipped.path)?
@@ -2915,6 +4198,20 @@ fn revalidate_missing_episode_evidence(
     evidence: &ExistingEpisodeEvidence,
     phase: &str,
 ) -> Result<()> {
+    revalidate_bilibili_entry_evidence(
+        root,
+        &bilibili_entry_from_episode_metadata(episode),
+        evidence,
+        phase,
+    )
+}
+
+fn revalidate_bilibili_entry_evidence(
+    root: &RootedFs,
+    entry: &BilibiliDownloadEntry,
+    evidence: &ExistingEpisodeEvidence,
+    phase: &str,
+) -> Result<()> {
     let current = root.open_bound_file(&evidence.path).with_context(|| {
         format!(
             "failed to read existing Bilibili media during {phase} validation: {}",
@@ -2933,12 +4230,7 @@ fn revalidate_missing_episode_evidence(
             evidence.path.display()
         );
     }
-    match validate_current_bilibili_sidecars(
-        root,
-        &evidence.path,
-        &bilibili_entry_from_episode_metadata(episode),
-    )
-    .with_context(|| {
+    match validate_current_bilibili_sidecars(root, &evidence.path, entry).with_context(|| {
         format!(
             "failed to read current Bilibili identity sidecar during {phase} validation for {}",
             evidence.path.display()
@@ -3332,8 +4624,7 @@ async fn run_staged_bilibili_worker(
     roots: BilibiliWorkerRoots<'_>,
     url: &str,
     selection: Option<BilibiliSelection>,
-    expected_overwrite_identity: Option<&VideoIdentity>,
-    expected_plan: Option<&PlanValidationSnapshot>,
+    expectations: BilibiliWorkerRequestExpectations,
     progress: Option<JobProgressSender>,
 ) -> Result<BilibiliWorkerOutcome> {
     let request = build_bilibili_worker_request(
@@ -3341,10 +4632,7 @@ async fn run_staged_bilibili_worker(
         roots.final_output_root.root_path(),
         url,
         selection,
-        BilibiliWorkerRequestExpectations {
-            overwrite_identity: expected_overwrite_identity.cloned(),
-            plan: expected_plan.cloned(),
-        },
+        expectations,
         roots.staging,
         roots.output_lock,
     );
@@ -3500,6 +4788,7 @@ fn build_bilibili_worker_request(
         selection,
         expected_overwrite_identity: expectations.overwrite_identity,
         expected_plan: expectations.plan,
+        expected_entry: expectations.expected_entry,
         logical_output_dir: staging.path().to_path_buf(),
         output_root_device: staging.root.root_identity().device(),
         output_root_inode: staging.root.root_identity().inode(),
@@ -4253,6 +5542,22 @@ fn bilibili_collection_cid_identity(cid: u64) -> VideoIdentity {
     }
 }
 
+fn send_bilibili_worker_entry_stage(
+    progress: Option<&JobProgressSender>,
+    expected_entry: Option<&BilibiliWorkerExpectedEntry>,
+    stage: &str,
+) {
+    let (Some(progress), Some(expected_entry)) = (progress, expected_entry) else {
+        return;
+    };
+    progress.send_lifecycle(JobProgressLifecycleEvent::BilibiliEntry {
+        index: expected_entry.index,
+        update: BilibiliAttemptUpdate::Stage {
+            stage: stage.to_string(),
+        },
+    });
+}
+
 async fn run_bilibili_job_locked(
     config: &AppConfig,
     root: &RootedFs,
@@ -4268,6 +5573,14 @@ async fn run_bilibili_job_locked(
         && matches!(options.mux, bbdown_core::MuxOptions::Ffmpeg { .. });
     if mux_locally {
         options = options.with_mux(bbdown_core::MuxOptions::Disabled);
+    }
+    if let Some(output_template) = worker_context
+        .request
+        .expected_entry
+        .as_ref()
+        .and_then(|entry| entry.output_template.as_ref())
+    {
+        options = options.with_output_template(output_template.clone());
     }
     let client = bilibili_core::client(config)?;
     let collection_download = if matches!(selection, Some(BilibiliSelection::All))
@@ -4308,7 +5621,7 @@ async fn run_bilibili_job_locked(
     }
     let mut missing_season_skip_evidence = Vec::new();
     let mut missing_season_summary = None;
-    let (core_plan, resolved_metadata): (
+    let (mut core_plan, resolved_metadata): (
         bbdown_core::DownloadPlan,
         Result<Option<ResolvedContent>>,
     ) = if let Some(collection) = collection_download.as_ref() {
@@ -4415,6 +5728,26 @@ async fn run_bilibili_job_locked(
         .await?;
         (plan, Ok(config.video.write_nfo.then_some(metadata)))
     };
+    if let Some(expected) = worker_context.request.expected_entry.as_ref() {
+        if core_plan.entries.len() != 1 {
+            bail!(
+                "refreshed Bilibili entry plan returned {} entries instead of one",
+                core_plan.entries.len()
+            );
+        }
+        let entry = &mut core_plan.entries[0];
+        let refreshed_id =
+            bilibili_plan_stable_media_id(entry.bvid.as_deref(), entry.aid, entry.cid, entry.epid);
+        if refreshed_id != expected.stable_media_id {
+            bail!(
+                "refreshed Bilibili entry identity changed (expected {}, received {})",
+                expected.stable_media_id,
+                refreshed_id
+            );
+        }
+        entry.index = expected.index;
+        entry.title.clone_from(&expected.title);
+    }
     let (resolved_metadata, metadata_warning) = match resolved_metadata {
         Ok(metadata) => (metadata, None),
         Err(err) => (
@@ -4491,6 +5824,11 @@ async fn run_bilibili_job_locked(
     mark_bilibili_core_download_completed(root, Some(worker_context.request))?;
     let output_dir = bilibili_core::output_dir(config);
     if mux_locally {
+        send_bilibili_worker_entry_stage(
+            progress.as_ref(),
+            worker_context.request.expected_entry.as_ref(),
+            "mux",
+        );
         mux_bilibili_report_media(
             config,
             root,
@@ -4500,7 +5838,17 @@ async fn run_bilibili_job_locked(
             progress.clone(),
         )
         .await?;
+        send_bilibili_worker_entry_stage(
+            progress.as_ref(),
+            worker_context.request.expected_entry.as_ref(),
+            "verify",
+        );
     } else {
+        send_bilibili_worker_entry_stage(
+            progress.as_ref(),
+            worker_context.request.expected_entry.as_ref(),
+            "verify",
+        );
         for entry in &report.entries {
             for input in bilibili_entry_media_inputs(&output_dir, entry) {
                 verify_downloaded_media_path(
@@ -7632,6 +8980,7 @@ async fn run_staged_video_job(
     action: VideoDuplicateAction,
     duplicate: &VideoDuplicate,
     expected_plan: Option<PlanValidationSnapshot>,
+    expected_bilibili_entry: Option<BilibiliWorkerExpectedEntry>,
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let guard = video_output_lock(
@@ -7682,8 +9031,11 @@ async fn run_staged_video_job(
                 },
                 url,
                 *selection,
-                expected_identity,
-                expected_plan.as_ref(),
+                BilibiliWorkerRequestExpectations {
+                    overwrite_identity: expected_identity.cloned(),
+                    plan: expected_plan.clone(),
+                    expected_entry: expected_bilibili_entry.clone(),
+                },
                 progress.clone(),
             )
             .await
@@ -7880,6 +9232,11 @@ async fn run_staged_video_job(
         root: &root,
         staging: Some(&staging),
     };
+    send_bilibili_worker_entry_stage(
+        progress.as_ref(),
+        expected_bilibili_entry.as_ref(),
+        "publication",
+    );
     let (moved_files, moved_source_destinations) = if staged_media.is_empty() && artifact_only {
         (
             move_staged_artifact_files_with_root(
@@ -7914,6 +9271,11 @@ async fn run_staged_video_job(
     send_progress(
         progress.as_ref(),
         format!("staging: moved {} file(s)", moved_files.len()),
+    );
+    send_bilibili_worker_entry_stage(
+        progress.as_ref(),
+        expected_bilibili_entry.as_ref(),
+        "verify publication",
     );
     let primary_media_paths = reconstruct_published_primary_media_paths(
         &root,
@@ -16700,6 +18062,683 @@ mod tests {
         config
     }
 
+    fn test_group_config(label: &str) -> (AppConfig, PathBuf) {
+        let mut config = test_config();
+        let root = temp_test_dir(label);
+        config.downloads.video_dir = root.clone();
+        (config, root)
+    }
+
+    fn test_group_entry(index: u32) -> BilibiliGroupEntry {
+        let download = BilibiliDownloadEntry {
+            index,
+            aid: 1000 + u64::from(index),
+            bvid: Some(format!("BV{index}")),
+            cid: 2000 + u64::from(index),
+            epid: None,
+            title: format!("Episode {index}"),
+            ..BilibiliDownloadEntry::default()
+        };
+        let stable_media_id = bilibili_plan_stable_media_id(
+            download.bvid.as_deref(),
+            download.aid,
+            download.cid,
+            download.epid,
+        );
+        BilibiliGroupEntry {
+            download,
+            stable_media_id,
+        }
+    }
+
+    fn test_group_inventory(count: u32) -> BilibiliEpisodeGroupInventory {
+        BilibiliEpisodeGroupInventory {
+            title: "Test group".to_string(),
+            source: BilibiliGroupSource::Video,
+            entries: (1..=count).map(test_group_entry).collect(),
+            output_template: None,
+            output_folder: None,
+        }
+    }
+
+    fn test_group_job(selection: BilibiliSelection) -> JobRequest {
+        JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV-test".to_string(),
+            selection: Some(selection),
+        }
+    }
+
+    fn write_group_test_media(root: &Path, index: u32) -> PathBuf {
+        let path = root.join(format!("episode-{index}.mp4"));
+        fs::write(&path, format!("test video contents for {index}"))
+            .expect("test media should write");
+        path
+    }
+
+    fn report_for_group_test_media(path: PathBuf) -> JobReport {
+        JobReport {
+            saved_location: path.display().to_string(),
+            details: "test publication".to_string(),
+            primary_media_paths: vec![path],
+            existing_bilibili_evidence: None,
+        }
+    }
+
+    fn test_group_hooks(
+        execute_entry: BilibiliGroupEntryExecutor,
+        find_existing_media: BilibiliGroupExistingMediaScanner,
+    ) -> BilibiliGroupExecutionHooks {
+        BilibiliGroupExecutionHooks {
+            execute_entry,
+            find_existing_media,
+            wait_before_retry: Arc::new(|_, _, _, _, _| Box::pin(async {})),
+        }
+    }
+
+    #[test]
+    fn artifact_only_all_keeps_the_legacy_single_job_route() {
+        let mut config = test_config();
+        config.bilibili.extra_args = vec!["--only".to_string(), "subtitle".to_string()];
+        let all = test_group_job(BilibiliSelection::All);
+        let missing = test_group_job(BilibiliSelection::Missing);
+
+        assert!(
+            bilibili_downloads_artifacts_only(&config, &all)
+                .expect("subtitle-only mode should parse")
+        );
+        assert!(
+            !should_use_independent_bilibili_episode_group(&config, &all)
+                .expect("All artifact routing should be determined")
+        );
+        assert!(
+            should_use_independent_bilibili_episode_group(&config, &missing)
+                .expect("Missing artifact selection remains on the grouped validation path")
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_group_driver_retries_an_episode_then_continues_after_publishing() {
+        let (config, root) = test_group_config("episode-group-retry-continue");
+        let inventory = test_group_inventory(3);
+        let job = test_group_job(BilibiliSelection::All);
+        let (progress, _receiver) = job_progress_channel();
+        let calls = Arc::new(StdMutex::new(Vec::<u32>::new()));
+        let episode_two_calls = Arc::new(StdMutex::new(0usize));
+        let executor_progress = progress.clone();
+        let executor_calls = Arc::clone(&calls);
+        let executor_episode_two_calls = Arc::clone(&episode_two_calls);
+        let executor_root = root.clone();
+        let execute_entry: BilibiliGroupEntryExecutor = Arc::new(move |entry| {
+            let calls = Arc::clone(&executor_calls);
+            let episode_two_calls = Arc::clone(&executor_episode_two_calls);
+            let progress = executor_progress.clone();
+            let root = executor_root.clone();
+            Box::pin(async move {
+                let index = entry.download.index;
+                calls
+                    .lock()
+                    .expect("test calls lock should remain healthy")
+                    .push(index);
+                if index == 2 {
+                    let snapshot = progress
+                        .bilibili_attempt_snapshot()
+                        .expect("group snapshot should be available during child execution");
+                    assert_eq!(
+                        snapshot.entries[0].state,
+                        BilibiliAttemptEntryState::Verified,
+                        "entry 1 must pass the publication gate before entry 2 starts"
+                    );
+                    let mut count = episode_two_calls
+                        .lock()
+                        .expect("episode retry counter should remain healthy");
+                    *count += 1;
+                    if *count < 3 {
+                        return Err(anyhow!("HTTP 403 Forbidden"));
+                    }
+                }
+                let path = write_group_test_media(&root, index);
+                Ok(report_for_group_test_media(path))
+            })
+        });
+        let scanner: BilibiliGroupExistingMediaScanner = Arc::new(|_| Box::pin(async { Ok(None) }));
+
+        let report = run_bilibili_episode_group_with_inventory(
+            &config,
+            &job,
+            inventory.clone(),
+            None,
+            Some(inventory.validation_snapshot()),
+            Some(progress.clone()),
+            test_group_hooks(execute_entry, scanner),
+        )
+        .await
+        .expect("per-entry retry should let later episodes continue");
+
+        assert_eq!(
+            *calls.lock().expect("test calls lock should remain healthy"),
+            vec![1, 2, 2, 2, 3]
+        );
+        assert_eq!(report.primary_media_paths.len(), 3);
+        let snapshot = progress
+            .bilibili_attempt_snapshot()
+            .expect("completed group snapshot should remain available");
+        assert_eq!(snapshot.outcome, Some(BilibiliAttemptOutcome::Verified));
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| entry.state == BilibiliAttemptEntryState::Verified)
+        );
+
+        fs::remove_dir_all(root).expect("test output root should be removed");
+    }
+
+    #[tokio::test]
+    async fn independent_group_driver_scopes_manual_retry_to_failed_entry() {
+        let (config, root) = test_group_config("episode-group-manual-retry-scope");
+        let inventory = test_group_inventory(3);
+        let job = test_group_job(BilibiliSelection::All);
+        let mut previous = BilibiliAttemptSnapshot::new_independent(
+            inventory.title.clone(),
+            inventory.entries.iter().map(|entry| {
+                (
+                    entry.download.index,
+                    entry.download.title.clone(),
+                    Some(entry.stable_media_id.clone()),
+                )
+            }),
+            0,
+        );
+        for index in [1, 3] {
+            let entry = inventory
+                .entries
+                .iter()
+                .find(|entry| entry.download.index == index)
+                .expect("test entry should exist");
+            let path = write_group_test_media(&root, index);
+            let verified =
+                verify_group_output_paths(root.clone(), entry.download.clone(), vec![path], None)
+                    .await
+                    .expect("prior verified media should validate");
+            BilibiliAttemptUpdate::Verified {
+                media_paths: verified.paths,
+                hashes: verified.hashes,
+            }
+            .apply(&mut previous, index);
+        }
+        BilibiliAttemptUpdate::Failure {
+            error: "HTTP 404 Not Found".to_string(),
+            attempts: 1,
+        }
+        .apply(&mut previous, 2);
+        previous.retry_indices = Some(vec![2]);
+
+        let calls = Arc::new(StdMutex::new(Vec::<u32>::new()));
+        let executor_calls = Arc::clone(&calls);
+        let executor_root = root.clone();
+        let execute_entry: BilibiliGroupEntryExecutor = Arc::new(move |entry| {
+            let calls = Arc::clone(&executor_calls);
+            let root = executor_root.clone();
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("test calls lock should remain healthy")
+                    .push(entry.download.index);
+                let path = write_group_test_media(&root, entry.download.index);
+                Ok(report_for_group_test_media(path))
+            })
+        });
+        let scanner: BilibiliGroupExistingMediaScanner = Arc::new(|_| Box::pin(async { Ok(None) }));
+
+        run_bilibili_episode_group_with_inventory(
+            &config,
+            &job,
+            inventory.clone(),
+            Some(previous),
+            Some(inventory.validation_snapshot()),
+            None,
+            test_group_hooks(execute_entry, scanner),
+        )
+        .await
+        .expect("scoped retry should preserve previously verified entries");
+
+        assert_eq!(
+            *calls.lock().expect("test calls lock should remain healthy"),
+            vec![2],
+            "manual retry must execute only its selected failed entry"
+        );
+        fs::remove_dir_all(root).expect("test output root should be removed");
+    }
+
+    #[tokio::test]
+    async fn changed_verified_missing_receipt_forces_redownload_instead_of_reskip() {
+        let (config, root) = test_group_config("episode-group-missing-receipt-change");
+        let inventory = test_group_inventory(1);
+        let entry = inventory.entries[0].clone();
+        let original_path = write_group_test_media(&root, 1);
+        write_bilibili_identity_nfo(&original_path, "cid2001");
+        let original = verify_group_output_paths(
+            root.clone(),
+            entry.download.clone(),
+            vec![original_path.clone()],
+            None,
+        )
+        .await
+        .expect("original verified output should validate");
+        let mut previous = BilibiliAttemptSnapshot::new_independent(
+            inventory.title.clone(),
+            [(
+                entry.download.index,
+                entry.download.title.clone(),
+                Some(entry.stable_media_id.clone()),
+            )],
+            0,
+        );
+        BilibiliAttemptUpdate::AlreadyPresent {
+            media_paths: original.paths,
+            hashes: original.hashes,
+        }
+        .apply(&mut previous, entry.download.index);
+
+        fs::write(&original_path, b"replaced contents").expect("prior media should mutate");
+        let changed_existing = verify_group_output_paths(
+            root.clone(),
+            entry.download.clone(),
+            vec![original_path],
+            None,
+        )
+        .await
+        .expect("changed current media should remain readable for this skip-path fixture");
+        let scan_calls = Arc::new(StdMutex::new(0usize));
+        let scanner_calls = Arc::clone(&scan_calls);
+        let changed_evidence = changed_existing
+            .evidence
+            .into_iter()
+            .next()
+            .expect("matching identity NFO should create current evidence");
+        let scanner: BilibiliGroupExistingMediaScanner = Arc::new(move |_| {
+            let calls = Arc::clone(&scanner_calls);
+            let evidence = changed_evidence.clone();
+            Box::pin(async move {
+                *calls
+                    .lock()
+                    .expect("test scan counter should remain healthy") += 1;
+                Ok(Some(evidence))
+            })
+        });
+        let execute_calls = Arc::new(StdMutex::new(0usize));
+        let executor_calls = Arc::clone(&execute_calls);
+        let executor_root = root.clone();
+        let execute_entry: BilibiliGroupEntryExecutor = Arc::new(move |_entry| {
+            let calls = Arc::clone(&executor_calls);
+            let root = executor_root.clone();
+            Box::pin(async move {
+                *calls
+                    .lock()
+                    .expect("test execution counter should remain healthy") += 1;
+                let path = root.join("replacement-episode-1.mp4");
+                fs::write(&path, b"fresh published contents")
+                    .expect("replacement media should write");
+                Ok(report_for_group_test_media(path))
+            })
+        });
+        let job = test_group_job(BilibiliSelection::Missing);
+
+        let report = run_bilibili_episode_group_with_inventory(
+            &config,
+            &job,
+            inventory.clone(),
+            Some(previous),
+            Some(inventory.validation_snapshot()),
+            None,
+            test_group_hooks(execute_entry, scanner),
+        )
+        .await
+        .expect("changed Missing receipt should trigger a fresh download");
+
+        assert_eq!(
+            *execute_calls
+                .lock()
+                .expect("test execution counter should remain healthy"),
+            1
+        );
+        assert_eq!(
+            *scan_calls
+                .lock()
+                .expect("test scan counter should remain healthy"),
+            0,
+            "a changed verified receipt must bypass the Missing skip scan"
+        );
+        assert!(
+            report
+                .primary_media_paths
+                .iter()
+                .any(|path| path.ends_with("replacement-episode-1.mp4"))
+        );
+        fs::remove_dir_all(root).expect("test output root should be removed");
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_invalid_missing_receipt_stays_forced_redownload_after_resume() {
+        let (config, root) = test_group_config("episode-group-missing-resume-redownload");
+        let inventory = test_group_inventory(2);
+        let entry_one = inventory.entries[0].clone();
+        let original_path = write_group_test_media(&root, 1);
+        write_bilibili_identity_nfo(&original_path, "cid2001");
+        let original = verify_group_output_paths(
+            root.clone(),
+            entry_one.download.clone(),
+            vec![original_path.clone()],
+            None,
+        )
+        .await
+        .expect("original verified output should validate");
+        let mut previous = BilibiliAttemptSnapshot::new_independent(
+            inventory.title.clone(),
+            inventory.entries.iter().map(|entry| {
+                (
+                    entry.download.index,
+                    entry.download.title.clone(),
+                    Some(entry.stable_media_id.clone()),
+                )
+            }),
+            0,
+        );
+        BilibiliAttemptUpdate::AlreadyPresent {
+            media_paths: original.paths,
+            hashes: original.hashes,
+        }
+        .apply(&mut previous, 1);
+        BilibiliAttemptUpdate::Failure {
+            error: "HTTP 404 Not Found".to_string(),
+            attempts: 1,
+        }
+        .apply(&mut previous, 2);
+        previous.retry_indices = Some(vec![2]);
+
+        fs::write(&original_path, b"changed but still readable")
+            .expect("prior media should mutate");
+        let changed_existing = verify_group_output_paths(
+            root.clone(),
+            entry_one.download.clone(),
+            vec![original_path],
+            None,
+        )
+        .await
+        .expect("changed current media should validate for the injected scan fixture");
+        let changed_evidence = changed_existing
+            .evidence
+            .into_iter()
+            .next()
+            .expect("matching identity NFO should create current evidence");
+        let scan_indices = Arc::new(StdMutex::new(Vec::<u32>::new()));
+        let scanner_indices = Arc::clone(&scan_indices);
+        let scanner: BilibiliGroupExistingMediaScanner = Arc::new(move |entry| {
+            let indices = Arc::clone(&scanner_indices);
+            let existing = changed_evidence.clone();
+            Box::pin(async move {
+                indices
+                    .lock()
+                    .expect("scan indices lock should remain healthy")
+                    .push(entry.download.index);
+                Ok((entry.download.index == 1).then_some(existing))
+            })
+        });
+        let execute_indices = Arc::new(StdMutex::new(Vec::<u32>::new()));
+        let first_execution_indices = Arc::clone(&execute_indices);
+        let first_executor_root = root.clone();
+        let first_executor: BilibiliGroupEntryExecutor = Arc::new(move |entry| {
+            let indices = Arc::clone(&first_execution_indices);
+            let root = first_executor_root.clone();
+            Box::pin(async move {
+                indices
+                    .lock()
+                    .expect("execution indices lock should remain healthy")
+                    .push(entry.download.index);
+                let path = write_group_test_media(&root, entry.download.index);
+                Ok(report_for_group_test_media(path))
+            })
+        });
+        let job = test_group_job(BilibiliSelection::Missing);
+        let (progress, _receiver) = job_progress_channel();
+
+        let first_result = run_bilibili_episode_group_with_inventory(
+            &config,
+            &job,
+            inventory.clone(),
+            Some(previous),
+            Some(inventory.validation_snapshot()),
+            Some(progress.clone()),
+            test_group_hooks(first_executor, scanner.clone()),
+        )
+        .await;
+        assert!(
+            first_result.is_err(),
+            "out-of-scope pending entry remains partial"
+        );
+        let mut after_scoped_retry = progress
+            .bilibili_attempt_snapshot()
+            .expect("partial snapshot should persist after scoped retry");
+        assert_eq!(
+            after_scoped_retry.entries[0].state,
+            BilibiliAttemptEntryState::Pending
+        );
+        assert!(after_scoped_retry.entries[0].requires_redownload);
+        assert_eq!(
+            *execute_indices
+                .lock()
+                .expect("execution indices lock should remain healthy"),
+            vec![2]
+        );
+
+        after_scoped_retry.prepare_resume(false);
+        let second_execution_indices = Arc::clone(&execute_indices);
+        let second_executor_root = root.clone();
+        let second_executor: BilibiliGroupEntryExecutor = Arc::new(move |entry| {
+            let indices = Arc::clone(&second_execution_indices);
+            let root = second_executor_root.clone();
+            Box::pin(async move {
+                indices
+                    .lock()
+                    .expect("execution indices lock should remain healthy")
+                    .push(entry.download.index);
+                let path = root.join("replacement-episode-1.mp4");
+                fs::write(&path, b"freshly published after resume")
+                    .expect("replacement media should write");
+                Ok(report_for_group_test_media(path))
+            })
+        });
+        run_bilibili_episode_group_with_inventory(
+            &config,
+            &job,
+            inventory.clone(),
+            Some(after_scoped_retry),
+            Some(inventory.validation_snapshot()),
+            None,
+            test_group_hooks(second_executor, scanner),
+        )
+        .await
+        .expect("normal resume should honor the durable redownload marker");
+
+        assert_eq!(
+            *scan_indices
+                .lock()
+                .expect("scan indices lock should remain healthy"),
+            vec![2],
+            "entry 1 must bypass the existing-media scan after resume"
+        );
+        assert_eq!(
+            *execute_indices
+                .lock()
+                .expect("execution indices lock should remain healthy"),
+            vec![2, 1]
+        );
+        fs::remove_dir_all(root).expect("test output root should be removed");
+    }
+
+    #[tokio::test]
+    async fn cancelled_group_preserves_published_entries_and_stops_later_work() {
+        let (config, root) = test_group_config("episode-group-cancel");
+        let inventory = test_group_inventory(3);
+        let job = test_group_job(BilibiliSelection::All);
+        let (progress, _receiver) = job_progress_channel();
+        let calls = Arc::new(StdMutex::new(Vec::<u32>::new()));
+        let started_second = Arc::new(tokio::sync::Notify::new());
+        let executor_calls = Arc::clone(&calls);
+        let executor_started = Arc::clone(&started_second);
+        let executor_root = root.clone();
+        let execute_entry: BilibiliGroupEntryExecutor = Arc::new(move |entry| {
+            let calls = Arc::clone(&executor_calls);
+            let started = Arc::clone(&executor_started);
+            let root = executor_root.clone();
+            Box::pin(async move {
+                let index = entry.download.index;
+                calls
+                    .lock()
+                    .expect("test calls lock should remain healthy")
+                    .push(index);
+                if index == 2 {
+                    started.notify_one();
+                    return std::future::pending::<Result<JobReport>>().await;
+                }
+                let path = write_group_test_media(&root, index);
+                Ok(report_for_group_test_media(path))
+            })
+        });
+        let scanner: BilibiliGroupExistingMediaScanner = Arc::new(|_| Box::pin(async { Ok(None) }));
+        let hooks = test_group_hooks(execute_entry, scanner);
+        let task_config = config.clone();
+        let task_job = job.clone();
+        let task_progress = progress.clone();
+        let task_inventory = inventory.clone();
+        let task = tokio::spawn(async move {
+            run_bilibili_episode_group_with_inventory(
+                &task_config,
+                &task_job,
+                task_inventory.clone(),
+                None,
+                Some(task_inventory.validation_snapshot()),
+                Some(task_progress),
+                hooks,
+            )
+            .await
+        });
+
+        started_second.notified().await;
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("cancelled task should abort")
+                .is_cancelled()
+        );
+
+        assert_eq!(
+            *calls.lock().expect("test calls lock should remain healthy"),
+            vec![1, 2]
+        );
+        let snapshot = progress
+            .bilibili_attempt_snapshot()
+            .expect("drop guard should persist the interrupted group snapshot");
+        assert_eq!(snapshot.outcome, Some(BilibiliAttemptOutcome::Interrupted));
+        assert_eq!(
+            snapshot.entries[0].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert_eq!(
+            snapshot.entries[1].state,
+            BilibiliAttemptEntryState::Interrupted
+        );
+        assert_eq!(
+            snapshot.entries[2].state,
+            BilibiliAttemptEntryState::Pending
+        );
+        assert!(!snapshot.entries[0].published_media_paths.is_empty());
+
+        fs::remove_dir_all(root).expect("test output root should be removed");
+    }
+
+    #[tokio::test]
+    async fn grouped_child_bridge_maps_stage_and_suppresses_child_terminal_events() {
+        let (parent, _parent_receiver) = job_progress_channel();
+        let mut parent_snapshot = BilibiliAttemptSnapshot::new_independent(
+            "Parent group".to_string(),
+            [(
+                10,
+                "Episode 10".to_string(),
+                Some("bvid:BV10:cid:2010:epid:none".to_string()),
+            )],
+            0,
+        );
+        parent_snapshot.entry_started(10);
+        parent.send_lifecycle(JobProgressLifecycleEvent::BilibiliAttempt {
+            snapshot: parent_snapshot,
+        });
+
+        let (child, child_receiver) = job_progress_channel();
+        let bridge = tokio::spawn(bridge_bilibili_group_child_progress(
+            child_receiver,
+            Some(parent.clone()),
+            10,
+            "Episode 10".to_string(),
+        ));
+        let child_snapshot = BilibiliAttemptSnapshot::new(
+            "Child entry".to_string(),
+            [(1, "Child page".to_string())],
+            0,
+        );
+        child.send_lifecycle(JobProgressLifecycleEvent::BilibiliAttempt {
+            snapshot: child_snapshot,
+        });
+        child.send_lifecycle(JobProgressLifecycleEvent::BilibiliEntry {
+            index: 1,
+            update: BilibiliAttemptUpdate::Stage {
+                stage: "audio".to_string(),
+            },
+        });
+        child.send_lifecycle(JobProgressLifecycleEvent::BilibiliEntry {
+            index: 1,
+            update: BilibiliAttemptUpdate::Completed,
+        });
+        child.send_lifecycle(JobProgressLifecycleEvent::Completed {
+            snapshot: BilibiliCollectionProgressSnapshot {
+                title: "child collection".to_string(),
+                total_entries: 1,
+                skipped_entries: 0,
+                planned_entries: 1,
+                completed_entries: 1,
+                current_entry: None,
+            },
+        });
+        child.send_replace(Some(JobProgress {
+            message: "downloaded".to_string(),
+            resolved_summary: Some("resolved".to_string()),
+            collection: Some(BilibiliCollectionProgressSnapshot {
+                title: "child collection".to_string(),
+                total_entries: 1,
+                skipped_entries: 0,
+                planned_entries: 1,
+                completed_entries: 1,
+                current_entry: None,
+            }),
+        }));
+        drop(child);
+        bridge.await.expect("progress bridge should finish");
+
+        let snapshot = parent
+            .bilibili_attempt_snapshot()
+            .expect("group snapshot should remain available");
+        assert_eq!(snapshot.entries[0].index, 10);
+        assert_eq!(
+            snapshot.entries[0].state,
+            BilibiliAttemptEntryState::Downloading
+        );
+        assert_eq!(snapshot.entries[0].stage, "audio");
+        let latest = parent.borrow();
+        let latest = latest.as_ref().expect("child progress should be bridged");
+        assert!(latest.message.starts_with("Episode 10: Episode 10"));
+        assert_eq!(latest.collection, None);
+    }
+
     #[test]
     fn bilibili_plan_identity_includes_cid_and_episode_id_with_bvid() {
         let original = bilibili_plan_stable_media_id(Some("BV123"), 123, 456, Some(789));
@@ -18328,6 +20367,8 @@ mod tests {
                     path: media_path.clone(),
                     device: media.identity().device(),
                     inode: media.identity().inode(),
+                    aid: 0,
+                    bvid: None,
                     sidecars: vec![ExistingBilibiliSidecarEvidence {
                         path: sidecar.clone(),
                         device: original.identity().device(),
@@ -18527,6 +20568,8 @@ mod tests {
             path: media.clone(),
             device: media_identity.device(),
             inode: media_identity.inode(),
+            aid: 0,
+            bvid: None,
             sidecars: vec![
                 ExistingBilibiliSidecarEvidence {
                     path: info.clone(),
@@ -18627,6 +20670,8 @@ mod tests {
                     path: media_path.clone(),
                     device: media.identity().device(),
                     inode: media.identity().inode(),
+                    aid: 0,
+                    bvid: None,
                     sidecars: vec![ExistingBilibiliSidecarEvidence {
                         path: sidecar_path.clone(),
                         device: sidecar.identity().device(),
@@ -24602,6 +26647,7 @@ mod tests {
             BilibiliWorkerRequestExpectations {
                 overwrite_identity: Some(expected_identity.clone()),
                 plan: Some(expected_plan.clone()),
+                expected_entry: None,
             },
             &staging,
             &output_lock,
@@ -24623,6 +26669,7 @@ mod tests {
             request.expected_overwrite_identity
         );
         assert_eq!(parsed.expected_plan, Some(expected_plan));
+        assert!(parsed.expected_entry.is_none());
         assert!(
             !staging
                 .path()
@@ -24796,6 +26843,8 @@ mod tests {
                         path: media.clone(),
                         device: 11,
                         inode: 22,
+                        aid: 0,
+                        bvid: None,
                         sidecars: Vec::new(),
                         cid: 33,
                         epid: 44,

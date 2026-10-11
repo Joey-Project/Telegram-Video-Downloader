@@ -63,6 +63,10 @@ Video preparation and plan inspection also report metadata resolution, existing-
 
 Per-entry Bilibili attempt state is saved in batches at that same configured interval, with forced saves at attempt snapshots and progress-channel closure. Queue completion counts include already-present entries and verified outputs; raw downloaded streams remain pending finalization. Optional queue summaries and error details share the remaining page text budget so task actions and history navigation remain available.
 
+Bilibili all-episode and missing-episode jobs keep one queue item and execute episodes independently. Each successful episode is muxed, verified, and published before the next episode starts. Temporary episode errors receive at most two additional attempts; HTTP 403 retries resolve a fresh play plan using the configured resolver. Retry progress edits the existing message at the configured interval. Exhausted episode errors record the episode number, stage, error, and attempt count, then allow later episodes to proceed. Authentication, local storage, permission, and filesystem identity failures pause the group instead.
+
+The final summary distinguishes completed, failed, skipped, and unstarted episodes. Partially completed groups remain in the active queue with **Retry failed episodes**, **Episodes**, and **Failure details** actions. Episode pages also support retrying a single unfinished episode. Resume and retry preserve successful episodes only after checking their media identity and published content hashes; a changed or missing output is downloaded again. Older saved attempts retain their original restart behavior.
+
 Bilibili 合集每轮执行只发送一条入队主消息和每个所选视频的一条状态消息；合集详情、进度、处理和最终结果编辑已有消息，下载完成后还会等待已发布文件校验。已存在且通过核验的视频显示跳过下载状态；取消时不为尚未开始的视频补发消息。通过 `/queue` 恢复或手动重试会开启新一轮，保留旧轮消息并创建新轮消息；网络和文件提供器的内部重试不会另开一轮。
 
 Bilibili 的文件描述符输出保留 MP4 索引（`moov`）在文件末尾，不启用 `faststart`。FFmpeg 的 `faststart` 第二遍搬移会重新打开输出；`fd:` 重新打开后共享文件偏移，可导致媒体数据被覆盖，即使命令返回成功。完整下载后的文件可正常本地播放。此前因此损坏的文件不会自动恢复；若原始音视频流已清理，需要重新下载，完成记录中的 SHA-256 一致只能证明文件未变化，不能证明内容可解码。
