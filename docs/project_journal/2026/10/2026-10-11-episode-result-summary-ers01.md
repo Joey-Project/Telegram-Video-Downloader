@@ -40,13 +40,16 @@ the episode that failed, and entries that had never started.
   pending updates at terminal snapshots or progress-channel closure. Once an
   attempt is tracked, derive queue counters from its states rather than legacy
   collection events; downloaded streams do not count as verified completion.
+- Save the latest attempt snapshot and failure/cancellation outcome in the same
+  task mutation. Late snapshots preserve the task's terminal outcome. All-present
+  UGC collections initialize an empty attempt with their already-present count.
 - Keep the current stop-on-terminal-error behavior and existing staging
   recovery policy. Counts describe reported stages, not a guarantee that
   partial files remain available or are playable.
 
 ## Validation
 
-- Rust 1.95.0 all-target tests passed: 619 passed, 15 ignored. The offline
+- Rust 1.95.0 all-target tests passed: 620 passed, 15 ignored. The offline
   build, strict Clippy with warnings denied, formatting, and journal validation
   passed with an isolated Cargo target.
 - Regression coverage includes fragmented season progress records, sparse

@@ -5835,8 +5835,13 @@ async fn run_queued_job(
         }),
     )
     .await;
+    let mut bilibili_attempt = completion_progress.bilibili_attempt_snapshot();
     if (result.is_none() || result.as_ref().is_some_and(Result::is_err))
-        && let Err(err) = queue.finish_cancellation_if_generation(&task_id, generation)
+        && let Err(err) = queue.finish_cancellation_with_bilibili_attempt_if_generation(
+            &task_id,
+            generation,
+            bilibili_attempt.clone(),
+        )
     {
         warn!(task_id, error = %err, "failed to persist task cancellation");
     }
@@ -5860,7 +5865,6 @@ async fn run_queued_job(
             ),
         }
     }
-    let mut bilibili_attempt = completion_progress.bilibili_attempt_snapshot();
     drop(completion_progress);
     let progress_result = match progress_task.await {
         Ok(result) => result,
@@ -6003,10 +6007,11 @@ async fn run_queued_job(
                             message
                         }
                         Ok(Some(_)) => {
-                            match queue.fail_if_generation(
+                            match queue.fail_with_bilibili_attempt_if_generation(
                                 &task_id,
                                 generation,
                                 truncate(&error_chain),
+                                bilibili_attempt.clone(),
                             ) {
                                 Ok(Some(_)) => {}
                                 Ok(None) => deliver_final_message = false,
@@ -6047,7 +6052,12 @@ async fn run_queued_job(
                     format!("Canceled job #{job_id}: {}", job.label())
                 }
                 Ok(Some(_)) => {
-                    match queue.fail_if_generation(&task_id, generation, truncate(&error_chain)) {
+                    match queue.fail_with_bilibili_attempt_if_generation(
+                        &task_id,
+                        generation,
+                        truncate(&error_chain),
+                        bilibili_attempt.clone(),
+                    ) {
                         Ok(Some(_)) => {}
                         Ok(None) => deliver_final_message = false,
                         Err(fail_error) => warn!(

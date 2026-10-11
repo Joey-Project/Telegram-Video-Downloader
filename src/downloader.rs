@@ -4631,6 +4631,14 @@ fn bilibili_collection_already_complete_outcome(
         "BBDown-rust: resolved media".to_string(),
         manifest.overview_summary(),
     );
+    send_bilibili_attempt(
+        progress,
+        BilibiliAttemptSnapshot::new(
+            redact_sensitive_text(&collection.title),
+            std::iter::empty(),
+            collection.skipped_entries,
+        ),
+    );
 
     Some(BilibiliJobOutcome::AlreadyComplete(
         collection.already_complete_report(output_root),
@@ -17519,6 +17527,21 @@ mod tests {
         assert_eq!(snapshot.skipped_entries, 2);
         assert_eq!(snapshot.planned_entries, 0);
         assert_eq!(snapshot.completed_entries, 0);
+        let JobProgressLifecycleEvent::BilibiliAttempt { snapshot: attempt } = lifecycle
+            .try_recv()
+            .expect("all-present collection should initialize skipped attempt results")
+        else {
+            panic!("second event should initialize attempt results");
+        };
+        assert_eq!(attempt.title, "Collection");
+        assert!(attempt.entries.is_empty());
+        assert_eq!(attempt.skipped_entries, 2);
+        assert_eq!(attempt.outcome, None);
+        assert!(
+            attempt
+                .summary()
+                .contains("Selected: 0; skipped/already present: 2")
+        );
         assert!(
             lifecycle.try_recv().is_err(),
             "all-present fast path should await the normal outer hash verification without claiming download completion"
