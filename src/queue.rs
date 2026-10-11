@@ -14,6 +14,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
+use crate::bilibili_attempt::{
+    BilibiliAttemptEntryState, BilibiliAttemptOutcome, BilibiliAttemptSnapshot,
+    BilibiliAttemptUpdate,
+};
 use crate::config::AppConfig;
 use crate::file_provider::{
     QueueFileProvider, classify_deadlock_error, is_deadlock_error, is_file_provider_access_error,
@@ -157,6 +161,8 @@ pub struct TaskRecord {
     pub media_entries_total: usize,
     pub media_entries_completed: usize,
     pub media_entries_failed: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bilibili_attempt: Option<BilibiliAttemptSnapshot>,
     pub error: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
@@ -278,6 +284,7 @@ impl TaskRecord {
             media_entries_total: 1,
             media_entries_completed: 0,
             media_entries_failed: 0,
+            bilibili_attempt: None,
             error: None,
             created_at: now,
             updated_at: now,
@@ -286,6 +293,42 @@ impl TaskRecord {
             activity_revision: 0,
             user_actions: 0,
         }
+    }
+}
+
+fn refresh_bilibili_attempt_counts(record: &mut TaskRecord) {
+    let Some(snapshot) = record.bilibili_attempt.as_ref() else {
+        return;
+    };
+    let total = snapshot
+        .total_entries()
+        .saturating_add(snapshot.skipped_entries)
+        .max(1);
+    let verified = snapshot
+        .entries
+        .iter()
+        .filter(|entry| entry.state == BilibiliAttemptEntryState::Verified)
+        .count();
+    record.media_entries_total = total;
+    // Already-present entries remain complete; downloaded entries count only after verification.
+    record.media_entries_completed = snapshot.skipped_entries.saturating_add(verified).min(total);
+    record.media_entries_failed = snapshot.failed_entries().min(total);
+}
+
+fn terminal_bilibili_attempt_outcome(status: TaskStatus) -> Option<BilibiliAttemptOutcome> {
+    match status {
+        TaskStatus::Failed => Some(BilibiliAttemptOutcome::Failed),
+        TaskStatus::Cancelled => Some(BilibiliAttemptOutcome::Cancelled),
+        TaskStatus::Completed => Some(BilibiliAttemptOutcome::Verified),
+        TaskStatus::Interrupted => Some(BilibiliAttemptOutcome::Interrupted),
+        _ => None,
+    }
+}
+
+fn finish_bilibili_attempt(record: &mut TaskRecord, outcome: BilibiliAttemptOutcome) {
+    if let Some(snapshot) = record.bilibili_attempt.as_mut() {
+        snapshot.finish(outcome);
+        refresh_bilibili_attempt_counts(record);
     }
 }
 
@@ -522,6 +565,10 @@ impl QueueManager {
         record.cancel_requested = false;
         record.error = None;
         record.status_message_id = None;
+        if record.bilibili_attempt.take().is_some() {
+            record.media_entries_completed = 0;
+            record.media_entries_failed = 0;
+        }
         record.user_actions = record.user_actions.saturating_add(1);
         store.save_mutated_record(record, entry, true).map(Some)
     }
@@ -868,12 +915,81 @@ impl QueueManager {
         completed: usize,
         failed: usize,
     ) -> Result<Option<TaskRecord>> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
+            return Ok(None);
+        };
+        if record.generation != expected_generation {
+            return Ok(None);
+        }
+        if record.bilibili_attempt.is_some() {
+            // Episode attempt state owns these counters once it is available.
+            return Ok(Some(record));
+        }
+        record.media_entries_total = total.max(1);
+        record.media_entries_completed = completed.min(record.media_entries_total);
+        record.media_entries_failed = failed.min(record.media_entries_total);
+        store.save_mutated_record(record, entry, true).map(Some)
+    }
+
+    pub fn set_bilibili_attempt_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        mut snapshot: BilibiliAttemptSnapshot,
+    ) -> Result<Option<TaskRecord>> {
         self.update_if_generation(id, expected_generation, true, |record| {
-            record.media_entries_total = total.max(1);
-            record.media_entries_completed = completed.min(record.media_entries_total);
-            record.media_entries_failed = failed.min(record.media_entries_total);
+            if let Some(outcome) = terminal_bilibili_attempt_outcome(record.status) {
+                snapshot.finish(outcome);
+            }
+            record.bilibili_attempt = Some(snapshot);
+            refresh_bilibili_attempt_counts(record);
             Ok(())
         })
+    }
+
+    #[cfg(test)]
+    pub fn update_bilibili_attempt_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        index: u32,
+        update: &BilibiliAttemptUpdate,
+    ) -> Result<Option<TaskRecord>> {
+        self.update_bilibili_attempt_batch_if_generation(
+            id,
+            expected_generation,
+            &[(index, update.clone())],
+        )
+    }
+
+    pub fn update_bilibili_attempt_batch_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        updates: &[(u32, BilibiliAttemptUpdate)],
+    ) -> Result<Option<TaskRecord>> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
+            return Ok(None);
+        };
+        if record.generation != expected_generation {
+            return Ok(None);
+        }
+        if updates.is_empty() {
+            return Ok(Some(record));
+        }
+        let Some(snapshot) = record.bilibili_attempt.as_mut() else {
+            return Ok(Some(record));
+        };
+        if snapshot.outcome.is_some() {
+            return Ok(Some(record));
+        }
+        for (index, update) in updates {
+            update.apply(snapshot, *index);
+        }
+        refresh_bilibili_attempt_counts(&mut record);
+        store.save_mutated_record(record, entry, true).map(Some)
     }
 
     pub fn record_staging_path_if_generation(
@@ -1071,11 +1187,17 @@ impl QueueManager {
             bail!("task {id} changed state before output verification completed");
         }
         record.status = TaskStatus::Completed;
+        let has_bilibili_attempt = record.bilibili_attempt.is_some();
+        if let Some(snapshot) = record.bilibili_attempt.as_mut() {
+            snapshot.finish(BilibiliAttemptOutcome::Verified);
+        }
         record.error = None;
         record.saved_location = Some(saved_location);
         record.primary_media_hashes = persisted_hashes;
         record.primary_media_hash_manifest = hash_manifest;
-        if record.media_entries_total <= 1 {
+        if has_bilibili_attempt {
+            refresh_bilibili_attempt_counts(&mut record);
+        } else if record.media_entries_total <= 1 {
             record.media_entries_total = 1;
             record.media_entries_completed = 1;
         } else {
@@ -1164,14 +1286,32 @@ impl QueueManager {
         expected_generation: u64,
         message: String,
     ) -> Result<Option<TaskRecord>> {
+        self.fail_with_bilibili_attempt_if_generation(id, expected_generation, message, None)
+    }
+
+    pub fn fail_with_bilibili_attempt_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        message: String,
+        snapshot: Option<BilibiliAttemptSnapshot>,
+    ) -> Result<Option<TaskRecord>> {
         self.update_if_generation(id, expected_generation, true, |record| {
             if matches!(record.status, TaskStatus::Cancelled | TaskStatus::Completed) {
                 bail!("task {id} is already terminal");
             }
+            if let Some(snapshot) = snapshot {
+                record.bilibili_attempt = Some(snapshot);
+            }
             record.status = TaskStatus::Failed;
             record.cancel_requested = false;
             record.error = Some(message);
-            if record.media_entries_total <= 1 && record.media_entries_completed == 0 {
+            let has_bilibili_attempt = record.bilibili_attempt.is_some();
+            finish_bilibili_attempt(record, BilibiliAttemptOutcome::Failed);
+            if !has_bilibili_attempt
+                && record.media_entries_total <= 1
+                && record.media_entries_completed == 0
+            {
                 record.media_entries_failed = 1;
             }
             Ok(())
@@ -1291,6 +1431,7 @@ impl QueueManager {
         record.cancel_requested = false;
         record.error = None;
         record.user_actions = record.user_actions.saturating_add(1);
+        finish_bilibili_attempt(&mut record, BilibiliAttemptOutcome::Cancelled);
         let result = store.save_mutated_record(record, entry, true)?;
         drop(_guard);
         Ok(Some((result, cancellation_target)))
@@ -1313,6 +1454,7 @@ impl QueueManager {
         record.status = TaskStatus::Cancelled;
         record.cancel_requested = false;
         record.error = None;
+        finish_bilibili_attempt(&mut record, BilibiliAttemptOutcome::Cancelled);
         store.save_mutated_record(record, entry, true).map(Some)
     }
 
@@ -1320,6 +1462,15 @@ impl QueueManager {
         &self,
         id: &str,
         expected_generation: u64,
+    ) -> Result<Option<TaskRecord>> {
+        self.finish_cancellation_with_bilibili_attempt_if_generation(id, expected_generation, None)
+    }
+
+    pub fn finish_cancellation_with_bilibili_attempt_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        snapshot: Option<BilibiliAttemptSnapshot>,
     ) -> Result<Option<TaskRecord>> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
@@ -1334,9 +1485,13 @@ impl QueueManager {
         {
             return Ok(None);
         }
+        if let Some(snapshot) = snapshot {
+            record.bilibili_attempt = Some(snapshot);
+        }
         record.status = TaskStatus::Cancelled;
         record.cancel_requested = false;
         record.error = None;
+        finish_bilibili_attempt(&mut record, BilibiliAttemptOutcome::Cancelled);
         store.save_mutated_record(record, entry, true).map(Some)
     }
 
@@ -1535,6 +1690,12 @@ impl QueueManager {
                         record.cancel_requested = false;
                         record.error = Some("Task was interrupted by process restart.".to_string());
                     }
+                    let outcome = if record.status == TaskStatus::Cancelled {
+                        BilibiliAttemptOutcome::Cancelled
+                    } else {
+                        BilibiliAttemptOutcome::Interrupted
+                    };
+                    finish_bilibili_attempt(&mut record, outcome);
                     store.save_mutated_record(record, entry, true)?;
                 }
             }
@@ -2960,6 +3121,365 @@ mod tests {
 
     fn test_task(id: &str, job: JobRequest) -> TaskRecord {
         TaskRecord::new(id.to_string(), 1, 2, 123_456_789, Some(3), 0, job)
+    }
+
+    #[test]
+    fn bilibili_attempt_persists_partial_results_and_retry_resets_only_current_generation() {
+        use crate::router::BilibiliSelection;
+        let directory = temp_queue_root("episode-results");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = directory.join("videos");
+        config.downloads.pdf_dir = directory.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "episode-results",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        task.media_entries_completed = 2;
+        queue.create(task.clone()).unwrap();
+        let snapshot = BilibiliAttemptSnapshot::new(
+            "Season".into(),
+            [
+                (16, "Episode 16".into()),
+                (17, "Episode 17".into()),
+                (18, "Episode 18".into()),
+            ],
+            200,
+        );
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, snapshot.clone())
+            .unwrap()
+            .unwrap();
+        let initial = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(initial.media_entries_completed, 200);
+        queue
+            .update_bilibili_attempt_if_generation(
+                &task.id,
+                0,
+                16,
+                &BilibiliAttemptUpdate::Completed,
+            )
+            .unwrap()
+            .unwrap();
+        queue
+            .update_bilibili_attempt_if_generation(&task.id, 0, 17, &BilibiliAttemptUpdate::Started)
+            .unwrap()
+            .unwrap();
+        queue
+            .update_bilibili_attempt_if_generation(
+                &task.id,
+                0,
+                17,
+                &BilibiliAttemptUpdate::Stage {
+                    stage: "danmaku".into(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let before_legacy_collection_event = queue.get(&task.id).unwrap().unwrap();
+        let interleaved = queue
+            .set_collection_progress_if_generation(&task.id, 0, 203, 203, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            interleaved.revision,
+            before_legacy_collection_event.revision
+        );
+        assert_eq!(interleaved.media_entries_total, 203);
+        assert_eq!(interleaved.media_entries_completed, 200);
+        assert!(
+            queue
+                .set_bilibili_attempt_if_generation(&task.id, 1, snapshot)
+                .unwrap()
+                .is_none()
+        );
+        let failed_record = queue
+            .fail_if_generation(&task.id, 0, "HTTP 403".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_record.status, TaskStatus::Failed);
+        let failed = failed_record.bilibili_attempt.clone().unwrap();
+        assert_eq!(failed.outcome, Some(BilibiliAttemptOutcome::Failed));
+        assert_eq!(failed_record.media_entries_completed, 200);
+        assert_eq!(failed_record.media_entries_failed, 1);
+        drop(queue);
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.bilibili_attempt, Some(failed));
+        assert_eq!(restored.media_entries_total, 203);
+        assert_eq!(
+            restored.media_entries_completed, 200,
+            "downloaded streams are not verified published videos"
+        );
+        assert_eq!(restored.media_entries_failed, 1);
+        let retry = queue.claim_resume(&task.id, true).unwrap().unwrap();
+        assert_eq!(retry.generation, 1);
+        assert!(retry.bilibili_attempt.is_none());
+        assert_eq!(retry.media_entries_failed, 0);
+        assert!(
+            queue
+                .update_bilibili_attempt_if_generation(
+                    &task.id,
+                    0,
+                    18,
+                    &BilibiliAttemptUpdate::Failed
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            queue
+                .update_bilibili_attempt_batch_if_generation(
+                    &task.id,
+                    0,
+                    &[(18, BilibiliAttemptUpdate::Failed)],
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bilibili_attempt_failure_persists_latest_snapshot_atomically() {
+        use crate::router::BilibiliSelection;
+        let directory = temp_queue_root("episode-results-atomic-failure");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = directory.join("videos");
+        config.downloads.pdf_dir = directory.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "episode-atomic-failure",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        queue.create(task.clone()).unwrap();
+
+        // This is the latest in-memory progress state; the event forwarder may not have saved it yet.
+        let mut snapshot = BilibiliAttemptSnapshot::new(
+            "Season".into(),
+            [(16, "Episode 16".into()), (17, "Episode 17".into())],
+            2,
+        );
+        snapshot.entry_completed(16);
+        snapshot.entry_started(17);
+        let failed = queue
+            .fail_with_bilibili_attempt_if_generation(
+                &task.id,
+                0,
+                "HTTP 403".into(),
+                Some(snapshot),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert_eq!(failed.media_entries_total, 4);
+        assert_eq!(failed.media_entries_completed, 2);
+        assert_eq!(failed.media_entries_failed, 1);
+        let attempt = failed.bilibili_attempt.unwrap();
+        assert_eq!(attempt.outcome, Some(BilibiliAttemptOutcome::Failed));
+        assert_eq!(attempt.downloaded_entries(), 1);
+        assert_eq!(attempt.failed_entries(), 1);
+
+        assert!(
+            queue
+                .fail_with_bilibili_attempt_if_generation(&task.id, 1, "stale".into(), None)
+                .unwrap()
+                .is_none()
+        );
+        drop(queue);
+
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.status, TaskStatus::Failed);
+        assert_eq!(
+            restored.bilibili_attempt.unwrap().outcome,
+            Some(BilibiliAttemptOutcome::Failed)
+        );
+        assert_eq!(restored.media_entries_completed, 2);
+        assert_eq!(restored.media_entries_failed, 1);
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bilibili_attempt_cancel_restart_keeps_downloaded_entries_out_of_completed_count() {
+        use crate::router::BilibiliSelection;
+        let directory = temp_queue_root("episode-results-cancel-restart");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = directory.join("videos");
+        config.downloads.pdf_dir = directory.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "episode-cancel-restart",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        queue.create(task.clone()).unwrap();
+        let snapshot = BilibiliAttemptSnapshot::new(
+            "Season".into(),
+            [
+                (16, "Episode 16".into()),
+                (17, "Episode 17".into()),
+                (18, "Episode 18".into()),
+            ],
+            1,
+        );
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, snapshot)
+            .unwrap()
+            .unwrap();
+        queue
+            .update_bilibili_attempt_batch_if_generation(
+                &task.id,
+                0,
+                &[
+                    (16, BilibiliAttemptUpdate::Completed),
+                    (17, BilibiliAttemptUpdate::Started),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let before_legacy_event = queue.get(&task.id).unwrap().unwrap();
+        let after_legacy_event = queue
+            .set_collection_progress_if_generation(&task.id, 0, 4, 4, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_legacy_event.revision, before_legacy_event.revision);
+        assert_eq!(after_legacy_event.media_entries_total, 4);
+        assert_eq!(after_legacy_event.media_entries_completed, 1);
+        let cancellation_requested = queue
+            .cancel_if_generation(&task.id, 0, task.chat_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancellation_requested.status, TaskStatus::Running);
+        assert!(cancellation_requested.cancel_requested);
+        let mut fresh_snapshot = BilibiliAttemptSnapshot::new(
+            "Season".into(),
+            [
+                (16, "Episode 16".into()),
+                (17, "Episode 17".into()),
+                (18, "Episode 18".into()),
+            ],
+            1,
+        );
+        fresh_snapshot.entry_completed(16);
+        fresh_snapshot.entry_started(17);
+        assert!(
+            queue
+                .finish_cancellation_with_bilibili_attempt_if_generation(
+                    &task.id,
+                    1,
+                    Some(fresh_snapshot.clone()),
+                )
+                .unwrap()
+                .is_none()
+        );
+        let cancelled = queue
+            .finish_cancellation_with_bilibili_attempt_if_generation(
+                &task.id,
+                0,
+                Some(fresh_snapshot.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert_eq!(
+            cancelled.bilibili_attempt.as_ref().unwrap().outcome,
+            Some(BilibiliAttemptOutcome::Cancelled)
+        );
+        assert_eq!(cancelled.media_entries_completed, 1);
+        assert_eq!(cancelled.media_entries_failed, 0);
+        // A lifecycle snapshot already in flight after cancellation must retain the terminal outcome.
+        let delayed_snapshot = queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, fresh_snapshot)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delayed_snapshot.status, TaskStatus::Cancelled);
+        assert_eq!(
+            delayed_snapshot.bilibili_attempt.as_ref().unwrap().outcome,
+            Some(BilibiliAttemptOutcome::Cancelled)
+        );
+        drop(queue);
+
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        let attempt = restored.bilibili_attempt.unwrap();
+        assert_eq!(restored.status, TaskStatus::Cancelled);
+        assert_eq!(attempt.outcome, Some(BilibiliAttemptOutcome::Cancelled));
+        assert_eq!(attempt.downloaded_entries(), 1);
+        assert_eq!(attempt.failed_entries(), 0);
+        assert_eq!(restored.media_entries_total, 4);
+        assert_eq!(restored.media_entries_completed, 1);
+        assert_eq!(restored.media_entries_failed, 0);
+
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bilibili_attempt_restart_preserves_downloaded_entries_without_reporting_them_verified() {
+        let directory = temp_queue_root("episode-results-restart");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = directory.join("videos");
+        config.downloads.pdf_dir = directory.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "episode-restart",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(crate::router::BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        let mut snapshot = BilibiliAttemptSnapshot::new(
+            "Season".into(),
+            [(16, "Episode 16".into()), (17, "Episode 17".into())],
+            0,
+        );
+        snapshot.entry_completed(16);
+        snapshot.entry_started(17);
+        task.bilibili_attempt = Some(snapshot);
+        queue.create(task.clone()).unwrap();
+        drop(queue);
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.status, TaskStatus::Interrupted);
+        let snapshot = restored.bilibili_attempt.unwrap();
+        assert_eq!(snapshot.outcome, Some(BilibiliAttemptOutcome::Interrupted));
+        assert_eq!(snapshot.downloaded_entries(), 1);
+        assert_eq!(snapshot.failed_entries(), 0);
+        assert!(snapshot.summary().contains("interrupted: 1"));
+        assert!(snapshot.summary().contains("verified: 0"));
+        let mut value = serde_json::to_value(task).unwrap();
+        value.as_object_mut().unwrap().remove("bilibili_attempt");
+        assert!(
+            serde_json::from_value::<TaskRecord>(value)
+                .unwrap()
+                .bilibili_attempt
+                .is_none()
+        );
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
