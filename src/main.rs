@@ -31,7 +31,9 @@ use tokio::sync::{Mutex, Notify, Semaphore, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
 
-use crate::bilibili_attempt::{BilibiliAttemptOutcome, BilibiliAttemptSnapshot};
+use crate::bilibili_attempt::{
+    BilibiliAttemptOutcome, BilibiliAttemptSnapshot, BilibiliAttemptUpdate,
+};
 use crate::config::AppConfig;
 use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
@@ -1320,7 +1322,7 @@ fn render_queue_page(
         "Size is the expected total for selected streams; final files may differ.".to_string(),
     );
     let mut rows = Vec::new();
-    let mut detail_notices = Vec::new();
+    let mut optional_details = Vec::new();
     for (page_index, record) in records.into_iter().enumerate() {
         let task_number = command
             .page
@@ -1357,14 +1359,16 @@ fn render_queue_page(
             ),
         ));
         if let Some(reason) = queue_task_detail_notice(&record) {
-            detail_notices.push((lines.len(), reason));
+            optional_details.push((
+                lines.len(),
+                format!("Details: {reason}"),
+                QUEUE_TASK_DETAIL_NOTICE_UNITS + "Details: ".len(),
+            ));
             lines.push(String::new());
         }
         if let Some(snapshot) = record.bilibili_attempt.as_ref() {
-            lines.push(truncate_utf16_units(
-                &redact_sensitive_text(&snapshot.summary()),
-                700,
-            ));
+            optional_details.push((lines.len(), redact_sensitive_text(&snapshot.summary()), 700));
+            lines.push(String::new());
         }
         if command.history {
             continue;
@@ -1394,18 +1398,20 @@ fn render_queue_page(
             },
         ]);
     }
-    if !detail_notices.is_empty() {
+    if !optional_details.is_empty() {
         let base_units = lines.join("\n").encode_utf16().count();
-        let notice_units = (QUEUE_PAGE_MAX_TEXT_UNITS.saturating_sub(base_units)
-            / detail_notices.len())
-        .saturating_sub("Details: ".len())
-        .min(QUEUE_TASK_DETAIL_NOTICE_UNITS);
-        if notice_units > 0 {
-            for (line, reason) in detail_notices {
-                lines[line] = format!("Details: {}", truncate_utf16_units(&reason, notice_units));
+        // Reserve the complete task/action context first. Optional summaries
+        // share the remaining page budget and cannot suppress the keyboard.
+        let per_detail_units =
+            QUEUE_PAGE_MAX_TEXT_UNITS.saturating_sub(base_units) / optional_details.len();
+        if per_detail_units > 0 {
+            for (line, detail, limit) in optional_details {
+                lines[line] = truncate_utf16_units(&detail, per_detail_units.min(limit));
             }
         }
     }
+    // Unused optional slots must not consume even their newline budget.
+    lines.retain(|line| !line.is_empty());
     let rendered = lines.join("\n");
     let over_limit = rendered.encode_utf16().count() > QUEUE_PAGE_MAX_TEXT_UNITS;
     let text = truncate_utf16_units(&rendered, QUEUE_PAGE_MAX_TEXT_UNITS);
@@ -6286,6 +6292,7 @@ async fn forward_progress_with_close_policy(
     let mut ticker = interval(update_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
+    let mut bilibili_attempt_persistence = BilibiliAttemptPersistence::new(update_interval);
     let mut pending = None;
     let mut latest_open = true;
     let mut lifecycle_open = true;
@@ -6301,6 +6308,15 @@ async fn forward_progress_with_close_policy(
             break;
         }
         if !latest_open && !lifecycle_open {
+            if let Err(err) = bilibili_attempt_persistence.flush(
+                &queue,
+                &task_id,
+                generation,
+                true,
+                Instant::now(),
+            ) {
+                warn!(task_id, error = %err, "failed to flush episode result updates after progress closed");
+            }
             if flush_on_close && let Some(progress) = pending.take() {
                 status_delivery = deliver_pending_progress(
                     delivery_context,
@@ -6333,7 +6349,28 @@ async fn forward_progress_with_close_policy(
                                 Err(err) => warn!(task_id, error = %err, "failed to persist staging attempt path"),
                             }
                         } else {
-                            match persist_collection_progress(&queue, &task_id, generation, &event) {
+                            let persistence_result = match &event {
+                                JobProgressLifecycleEvent::BilibiliAttempt { snapshot } => {
+                                    bilibili_attempt_persistence.persist_snapshot(
+                                        &queue,
+                                        &task_id,
+                                        generation,
+                                        snapshot.clone(),
+                                        Instant::now(),
+                                    )
+                                }
+                                JobProgressLifecycleEvent::BilibiliEntry { index, update } => {
+                                    bilibili_attempt_persistence.observe_update(*index, update);
+                                    Ok(true)
+                                }
+                                _ => persist_collection_progress(
+                                    &queue,
+                                    &task_id,
+                                    generation,
+                                    &event,
+                                ),
+                            };
+                            match persistence_result {
                                 Ok(true) => {}
                                 Ok(false) => continue,
                                 Err(err) => warn!(task_id, error = %err, "failed to persist collection progress"),
@@ -6367,16 +6404,26 @@ async fn forward_progress_with_close_policy(
                         }
                     }
             }
-            _ = ticker.tick(), if pending.is_some() => {
-                let progress = pending.take().expect("guarded by is_some");
-                status_delivery = deliver_pending_progress(
-                    delivery_context,
-                    status_delivery,
-                    &mut collection_delivery,
-                    progress,
-                ).await;
-                // Slow API calls must not turn missed ticks into nearby edits.
-                ticker.reset();
+            _ = ticker.tick(), if pending.is_some() || bilibili_attempt_persistence.has_pending() => {
+                if let Some(progress) = pending.take() {
+                    status_delivery = deliver_pending_progress(
+                        delivery_context,
+                        status_delivery,
+                        &mut collection_delivery,
+                        progress,
+                    ).await;
+                    // Slow API calls must not turn missed ticks into nearby edits.
+                    ticker.reset();
+                }
+                if let Err(err) = bilibili_attempt_persistence.flush(
+                    &queue,
+                    &task_id,
+                    generation,
+                    false,
+                    Instant::now(),
+                ) {
+                    warn!(task_id, error = %err, "failed to persist episode result updates");
+                }
             }
         }
     }
@@ -6393,16 +6440,9 @@ fn persist_collection_progress(
     event: &JobProgressLifecycleEvent,
 ) -> Result<bool> {
     let (total, completed, failed) = match event {
-        JobProgressLifecycleEvent::BilibiliAttempt { snapshot } => {
-            return Ok(queue
-                .set_bilibili_attempt_if_generation(task_id, generation, snapshot.clone())?
-                .is_some());
-        }
-        JobProgressLifecycleEvent::BilibiliEntry { index, update } => {
-            return Ok(queue
-                .update_bilibili_attempt_if_generation(task_id, generation, *index, update)?
-                .is_some());
-        }
+        // Attempt events are routed through BilibiliAttemptPersistence in the forwarder.
+        JobProgressLifecycleEvent::BilibiliAttempt { .. }
+        | JobProgressLifecycleEvent::BilibiliEntry { .. } => return Ok(true),
         JobProgressLifecycleEvent::StagingAttempt { .. } => return Ok(true),
         JobProgressLifecycleEvent::Resolved { manifest, .. } => {
             (manifest.total_entries, manifest.skipped_entries, 0)
@@ -7523,6 +7563,109 @@ struct ProgressForwardResult {
     collection_delivery: Option<CollectionProgressDelivery>,
 }
 
+#[derive(Debug)]
+struct BilibiliAttemptPersistence {
+    interval: Duration,
+    has_attempt: bool,
+    pending_snapshot: Option<BilibiliAttemptSnapshot>,
+    pending_updates: Vec<(u32, BilibiliAttemptUpdate)>,
+    last_persisted_at: Option<Instant>,
+}
+
+impl BilibiliAttemptPersistence {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            has_attempt: false,
+            pending_snapshot: None,
+            pending_updates: Vec::new(),
+            last_persisted_at: None,
+        }
+    }
+
+    fn is_due(&self, now: Instant) -> bool {
+        self.has_pending()
+            && self
+                .last_persisted_at
+                .is_none_or(|last| now.saturating_duration_since(last) >= self.interval)
+    }
+
+    fn has_pending(&self) -> bool {
+        self.pending_snapshot.is_some() || !self.pending_updates.is_empty()
+    }
+
+    fn observe_update(&mut self, index: u32, update: &BilibiliAttemptUpdate) {
+        if self.has_attempt {
+            self.pending_updates.push((index, update.clone()));
+        }
+    }
+
+    fn persist_snapshot(
+        &mut self,
+        queue: &QueueManager,
+        task_id: &str,
+        generation: u64,
+        snapshot: BilibiliAttemptSnapshot,
+        now: Instant,
+    ) -> Result<bool> {
+        if self.has_pending() {
+            match self.flush(queue, task_id, generation, true, now) {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(err) => {
+                    warn!(task_id, error = %err, "failed to persist pending episode results before replacing snapshot");
+                    self.pending_snapshot = None;
+                    self.pending_updates.clear();
+                }
+            }
+        }
+        self.has_attempt = true;
+        self.pending_snapshot = Some(snapshot);
+        self.pending_updates.clear();
+        self.flush(queue, task_id, generation, true, now)
+    }
+
+    fn flush(
+        &mut self,
+        queue: &QueueManager,
+        task_id: &str,
+        generation: u64,
+        force: bool,
+        now: Instant,
+    ) -> Result<bool> {
+        if !force && !self.is_due(now) {
+            return Ok(true);
+        }
+        if let Some(snapshot) = self.pending_snapshot.as_ref() {
+            let Some(_) =
+                queue.set_bilibili_attempt_if_generation(task_id, generation, snapshot.clone())?
+            else {
+                return Ok(false);
+            };
+            self.pending_snapshot = None;
+            self.last_persisted_at = Some(now);
+        }
+        if !self.pending_updates.is_empty()
+            && (force
+                || self
+                    .last_persisted_at
+                    .is_none_or(|last| now.saturating_duration_since(last) >= self.interval))
+        {
+            let Some(_) = queue.update_bilibili_attempt_batch_if_generation(
+                task_id,
+                generation,
+                &self.pending_updates,
+            )?
+            else {
+                return Ok(false);
+            };
+            self.pending_updates.clear();
+            self.last_persisted_at = Some(now);
+        }
+        Ok(true)
+    }
+}
+
 impl Default for ProgressForwardResult {
     fn default() -> Self {
         Self {
@@ -7773,6 +7916,236 @@ mod tests {
         assert!(message.contains("Failed episodes: 17"));
         assert!(message.contains("last reported stage: danmaku"));
         assert!(message.find("Failed episodes: 17").unwrap() < message.find("HTTP 403").unwrap());
+    }
+
+    #[test]
+    fn bilibili_attempt_persistence_coalesces_deltas_and_flushes_on_close() {
+        let directory = temp_main_test_dir("episode-result-persistence");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = directory.join("videos");
+        config.downloads.pdf_dir = directory.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let task_id = "episode-result-persistence";
+        let mut task = TaskRecord::new(
+            task_id.to_string(),
+            1,
+            2,
+            123_456_789,
+            Some(3),
+            0,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        assert!(queue.create(task).unwrap());
+
+        let start = Instant::now();
+        let mut persistence = BilibiliAttemptPersistence::new(Duration::from_secs(3));
+        let snapshot = BilibiliAttemptSnapshot::new(
+            "Season".into(),
+            [(16, "Episode 16".into()), (17, "Episode 17".into())],
+            1,
+        );
+        assert!(
+            persistence
+                .persist_snapshot(&queue, task_id, 0, snapshot, start)
+                .unwrap()
+        );
+        let initial = queue.get(task_id).unwrap().unwrap();
+        assert_eq!(initial.media_entries_total, 3);
+        assert_eq!(initial.media_entries_completed, 1);
+
+        persistence.observe_update(16, &BilibiliAttemptUpdate::Started);
+        persistence.observe_update(
+            16,
+            &BilibiliAttemptUpdate::Stage {
+                stage: "video".into(),
+            },
+        );
+        persistence.observe_update(17, &BilibiliAttemptUpdate::Started);
+        let interleaved = queue
+            .set_collection_progress_if_generation(task_id, 0, 3, 3, 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(interleaved.revision, initial.revision);
+        assert_eq!(interleaved.media_entries_completed, 1);
+
+        assert!(!persistence.is_due(start + Duration::from_secs(2)));
+        assert!(
+            persistence
+                .flush(&queue, task_id, 0, false, start + Duration::from_secs(2),)
+                .unwrap()
+        );
+        assert_eq!(
+            queue.get(task_id).unwrap().unwrap().revision,
+            initial.revision
+        );
+
+        let interval_flush_time = start + Duration::from_secs(3);
+        assert!(persistence.is_due(interval_flush_time));
+        assert!(
+            persistence
+                .flush(&queue, task_id, 0, false, interval_flush_time)
+                .unwrap()
+        );
+        let after_interval = queue.get(task_id).unwrap().unwrap();
+        assert_eq!(after_interval.revision, initial.revision + 1);
+        let attempt = after_interval.bilibili_attempt.unwrap();
+        assert_eq!(
+            attempt.entries[0].state,
+            crate::bilibili_attempt::BilibiliAttemptEntryState::Downloading
+        );
+        assert_eq!(attempt.entries[0].stage, "video");
+        assert_eq!(
+            attempt.entries[1].state,
+            crate::bilibili_attempt::BilibiliAttemptEntryState::Downloading
+        );
+
+        persistence.observe_update(16, &BilibiliAttemptUpdate::Completed);
+        assert!(
+            persistence
+                .flush(
+                    &queue,
+                    task_id,
+                    0,
+                    true,
+                    interval_flush_time + Duration::from_millis(10),
+                )
+                .unwrap()
+        );
+        let after_close_flush = queue.get(task_id).unwrap().unwrap();
+        assert_eq!(after_close_flush.revision, after_interval.revision + 1);
+        assert_eq!(after_close_flush.media_entries_completed, 1);
+        assert_eq!(
+            after_close_flush
+                .bilibili_attempt
+                .unwrap()
+                .downloaded_entries(),
+            1
+        );
+
+        queue
+            .fail_if_generation(task_id, 0, "retry me".to_string())
+            .unwrap()
+            .unwrap();
+        queue.claim_resume(task_id, true).unwrap().unwrap();
+        let resumed = queue.get(task_id).unwrap().unwrap();
+        persistence.observe_update(17, &BilibiliAttemptUpdate::Failed);
+        assert!(
+            !persistence
+                .flush(
+                    &queue,
+                    task_id,
+                    0,
+                    true,
+                    interval_flush_time + Duration::from_secs(1),
+                )
+                .unwrap()
+        );
+        let current = queue.get(task_id).unwrap().unwrap();
+        assert_eq!(current.revision, resumed.revision);
+        assert_eq!(current.generation, 1);
+        assert!(current.bilibili_attempt.is_none());
+
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarder_flushes_attempt_deltas_after_a_quiet_interval() {
+        let task_id = "episode-result-quiet-interval";
+        let (queue_root, _config, queue, file_provider) = generation_guard_collection_queue(
+            "episode-result-quiet-interval",
+            task_id,
+            902,
+            123_456_789,
+        );
+        queue
+            .set_status(task_id, TaskStatus::Running, None)
+            .expect("attempt task should be running");
+        let (progress, progress_rx) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress_with_close_policy(
+            TelegramClient::new("test-token".into()),
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id: 123_456_789,
+                job_id: 902,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: false,
+                status_message_id: None,
+                update_interval: Duration::from_secs(5),
+            },
+            progress_rx,
+            Duration::ZERO,
+            false,
+        ));
+
+        progress.send_lifecycle(JobProgressLifecycleEvent::BilibiliAttempt {
+            snapshot: BilibiliAttemptSnapshot::new("Season".into(), [(16, "Episode 16".into())], 0),
+        });
+        for _ in 0..20 {
+            if queue
+                .get(task_id)
+                .unwrap()
+                .unwrap()
+                .bilibili_attempt
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let initial = queue.get(task_id).unwrap().unwrap();
+        assert!(initial.bilibili_attempt.is_some());
+        let reads_before_delta = file_provider.read_paths().len();
+
+        progress.send_lifecycle(JobProgressLifecycleEvent::BilibiliEntry {
+            index: 16,
+            update: BilibiliAttemptUpdate::Started,
+        });
+        for _ in 0..20 {
+            if file_provider.read_paths().len() >= reads_before_delta + 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            file_provider.read_paths().len() >= reads_before_delta + 4,
+            "forwarder should consume the lifecycle delta before the persistence interval"
+        );
+        assert_eq!(
+            queue.get(task_id).unwrap().unwrap().revision,
+            initial.revision
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..20 {
+            let current = queue.get(task_id).unwrap().unwrap();
+            if current.bilibili_attempt.as_ref().is_some_and(|snapshot| {
+                snapshot.entries[0].state
+                    == crate::bilibili_attempt::BilibiliAttemptEntryState::Downloading
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let flushed = queue.get(task_id).unwrap().unwrap();
+        assert_eq!(flushed.revision, initial.revision + 1);
+        assert_eq!(
+            flushed.bilibili_attempt.unwrap().entries[0].state,
+            crate::bilibili_attempt::BilibiliAttemptEntryState::Downloading
+        );
+
+        drop(progress);
+        progress_task.await.unwrap();
+        drop(queue);
+        fs::remove_dir_all(queue_root).unwrap();
     }
 
     #[test]
@@ -9250,6 +9623,91 @@ mod tests {
 
         drop(queue);
         let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[test]
+    fn queue_attempt_summaries_preserve_task_actions_and_history_pagination() {
+        for history in [false, true] {
+            let queue_root = temp_main_test_dir("queue-attempt-summary-budget");
+            let mut config = AppConfig::for_test();
+            config.downloads.video_dir = queue_root.join("videos");
+            config.downloads.pdf_dir = queue_root.join("pdfs");
+            fs::create_dir_all(&config.downloads.video_dir).unwrap();
+            fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+            let queue = QueueManager::open(&config).unwrap();
+            let chat_id = 123_456_789;
+            for ordinal in 0..11 {
+                let mut record = TaskRecord::new(
+                    format!("summary-budget-{ordinal}"),
+                    ordinal,
+                    ordinal,
+                    chat_id,
+                    None,
+                    ordinal as usize,
+                    JobRequest::Bilibili {
+                        url: format!(
+                            "https://www.bilibili.com/bangumi/media/md1376?{}",
+                            "😀".repeat(2_000)
+                        ),
+                        selection: Some(BilibiliSelection::All),
+                    },
+                );
+                record.status = if history {
+                    TaskStatus::Cancelled
+                } else if ordinal % 2 == 0 {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Interrupted
+                };
+                record.error = Some("Long failure detail ".repeat(100));
+                record.plan = Some(PlanValidationSnapshot {
+                    title: Some(format!("Season {ordinal} {}", "👨‍👩‍👧‍👦".repeat(100))),
+                    ..PlanValidationSnapshot::default()
+                });
+                let mut snapshot = BilibiliAttemptSnapshot::new(
+                    "Long summary title 😀".repeat(100),
+                    (1..=100).map(|index| (index, "Episode 😀".repeat(100))),
+                    3,
+                );
+                for index in (1..=100).step_by(2) {
+                    snapshot.entry_started(index);
+                    snapshot.stage_started(index, "audio".to_string());
+                    snapshot.entry_failed(index);
+                }
+                snapshot.finish(BilibiliAttemptOutcome::Failed);
+                assert!(snapshot.summary().encode_utf16().count() > 700);
+                record.bilibili_attempt = Some(snapshot);
+                assert!(queue.create(record).unwrap());
+            }
+            let (text, keyboard) =
+                render_queue_page(&queue, chat_id, QueueCommand { history, page: 0 }).unwrap();
+            assert!(text.encode_utf16().count() <= QUEUE_PAGE_MAX_TEXT_UNITS);
+            assert_eq!(text.matches("Title: Season").count(), 10);
+            let rows = keyboard
+                .expect("summaries must not remove actions")
+                .inline_keyboard;
+            if history {
+                assert_eq!(rows.len(), 1);
+            } else {
+                assert_eq!(rows.len(), 11);
+                assert!(rows[..10].iter().all(|row| {
+                    row.iter().any(|button| {
+                        button.text.starts_with("Retry") || button.text.starts_with("Resume")
+                    })
+                }));
+                assert!(
+                    rows[..10]
+                        .iter()
+                        .any(|row| row.iter().any(|button| button.text.starts_with("Cancel")))
+                );
+            }
+            let navigation = rows.last().unwrap();
+            assert_eq!(navigation[0].text, "Previous");
+            assert_eq!(navigation[1].text, "Next");
+            assert!(navigation[1].callback_data.ends_with(":1"));
+            drop(queue);
+            let _ = fs::remove_dir_all(queue_root);
+        }
     }
 
     #[test]
