@@ -5,6 +5,7 @@ mod bilibili_core;
 mod bilibili_planning;
 mod config;
 mod downloader;
+mod episode_retry;
 mod file_provider;
 mod queue;
 mod redaction;
@@ -14,7 +15,7 @@ mod telegram;
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::{
     Arc,
@@ -32,19 +33,21 @@ use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio
 use tracing::{error, info, warn};
 
 use crate::bilibili_attempt::{
-    BilibiliAttemptOutcome, BilibiliAttemptSnapshot, BilibiliAttemptUpdate,
+    BilibiliAttemptEntryState, BilibiliAttemptOutcome, BilibiliAttemptSnapshot,
+    BilibiliAttemptUpdate,
 };
 use crate::config::AppConfig;
 use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
     BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
-    JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, VideoDuplicate,
+    JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, JobReport, VideoDuplicate,
     VideoDuplicateAction, VideoDuplicateCheck, existing_bilibili_report_media_identities,
     find_video_duplicate_with_probe_and_progress, human_bytes, inspect_job_display_metadata,
-    inspect_job_plan_with_progress, job_progress_channel, recover_pending_overwrite_transactions,
-    run_bilibili_worker, run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
+    inspect_job_plan_with_progress, is_bilibili_episode_group, job_progress_channel,
+    recover_pending_overwrite_transactions, run_bilibili_episode_group, run_bilibili_worker,
+    run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
     run_video_job_staged_keep_both_with_plan, sync_bilibili_rust_credentials,
-    validate_existing_bilibili_report_for_completion,
+    validate_bilibili_report_media_hashes, validate_existing_bilibili_report_for_completion,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 #[cfg(test)]
@@ -883,10 +886,33 @@ struct QueueCommand {
 
 #[derive(Debug, Clone)]
 enum QueueCallbackAction {
-    Resume { id: String, generation: u64 },
-    Retry { id: String, generation: u64 },
-    Cancel { id: String, generation: u64 },
-    Confirm { id: String, generation: u64 },
+    Resume {
+        id: String,
+        generation: u64,
+    },
+    Retry {
+        id: String,
+        generation: u64,
+    },
+    Cancel {
+        id: String,
+        generation: u64,
+    },
+    Confirm {
+        id: String,
+        generation: u64,
+    },
+    Episodes {
+        id: String,
+        generation: u64,
+        page: usize,
+        failures_only: bool,
+    },
+    RetryEpisode {
+        id: String,
+        generation: u64,
+        index: u32,
+    },
     StaleTaskAction,
     ActivePage(usize),
     HistoryPage(usize),
@@ -918,6 +944,33 @@ fn parse_queue_callback_data(data: &str) -> Option<QueueCallbackAction> {
     let action = parts.next()?;
     let value = parts.next()?;
     match action {
+        "e" | "x" => {
+            let generation = u64::from_str_radix(parts.next()?, 16).ok()?;
+            let page_or_index = parts.next()?;
+            let parsed = if action == "e" {
+                let failures_only = match parts.next()? {
+                    "a" => false,
+                    "f" => true,
+                    _ => return None,
+                };
+                QueueCallbackAction::Episodes {
+                    id: value.to_string(),
+                    generation,
+                    page: page_or_index.parse().ok()?,
+                    failures_only,
+                }
+            } else {
+                QueueCallbackAction::RetryEpisode {
+                    id: value.to_string(),
+                    generation,
+                    index: page_or_index.parse().ok()?,
+                }
+            };
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(parsed)
+        }
         "r" | "t" | "c" | "f" => {
             let generation = u64::from_str_radix(parts.next()?, 16).ok()?;
             if parts.next().is_some() {
@@ -972,6 +1025,184 @@ fn queue_callback_data(action: &str, id: &str, generation: u64) -> String {
         "queue callback data exceeds Telegram's 64-byte limit"
     );
     data
+}
+
+fn episode_page_callback(record: &TaskRecord, page: usize, failures_only: bool) -> String {
+    let data = format!(
+        "q:e:{}:{:x}:{page}:{}",
+        record.id,
+        record.generation,
+        if failures_only { "f" } else { "a" }
+    );
+    debug_assert!(data.len() <= 64);
+    data
+}
+
+fn episode_state_label(state: BilibiliAttemptEntryState) -> &'static str {
+    match state {
+        BilibiliAttemptEntryState::Pending => "queued",
+        BilibiliAttemptEntryState::Downloading => "running",
+        BilibiliAttemptEntryState::Downloaded => "awaiting verification",
+        BilibiliAttemptEntryState::Failed => "failed",
+        BilibiliAttemptEntryState::Interrupted => "interrupted",
+        BilibiliAttemptEntryState::Verified => "saved and verified",
+    }
+}
+
+fn render_episode_page(
+    record: &TaskRecord,
+    page: usize,
+    failures_only: bool,
+) -> Option<(String, InlineKeyboardMarkup)> {
+    const PER_PAGE: usize = 5;
+    let attempt = record
+        .bilibili_attempt
+        .as_ref()
+        .filter(|attempt| attempt.independent_entries)?;
+    let entries: Vec<_> = attempt
+        .entries
+        .iter()
+        .filter(|entry| !failures_only || entry.state == BilibiliAttemptEntryState::Failed)
+        .collect();
+    let pages = entries.len().div_ceil(PER_PAGE).max(1);
+    let page = page.min(pages - 1);
+    let mut text = format!(
+        "{}\n{} (page {}/{pages})\nVerified: {}; failed: {}; already present: {}",
+        truncate_utf16_units(&sanitize_queue_display_text(&attempt.title), 200),
+        if failures_only {
+            "Failed episodes"
+        } else {
+            "Episodes"
+        },
+        page + 1,
+        attempt
+            .entries
+            .iter()
+            .filter(|entry| entry.state == BilibiliAttemptEntryState::Verified)
+            .count(),
+        attempt.failed_entries(),
+        attempt.skipped_entries
+    );
+    let mut rows = Vec::new();
+    let actionable = matches!(
+        record.status,
+        TaskStatus::Failed | TaskStatus::PartiallyCompleted | TaskStatus::Interrupted
+    );
+    for entry in entries.iter().skip(page * PER_PAGE).take(PER_PAGE) {
+        text.push_str(&format!(
+            "\n\nEpisode {}: {}\n{} · {} attempt(s)",
+            entry.index,
+            truncate_utf16_units(&sanitize_queue_display_text(&entry.title), 120),
+            episode_state_label(entry.state),
+            entry.attempts
+        ));
+        if !entry.stage.is_empty() {
+            text.push_str(&format!(
+                "\nStage: {}",
+                truncate_utf16_units(
+                    &sanitize_queue_display_text(&redact_sensitive_text(&entry.stage)),
+                    80
+                )
+            ));
+        }
+        if let Some(error) = &entry.error {
+            text.push_str(&format!("\nError: {}", episode_error_preview(error)));
+        }
+        if actionable
+            && matches!(
+                entry.state,
+                BilibiliAttemptEntryState::Failed
+                    | BilibiliAttemptEntryState::Interrupted
+                    | BilibiliAttemptEntryState::Pending
+            )
+        {
+            let callback_data =
+                format!("q:x:{}:{:x}:{}", record.id, record.generation, entry.index);
+            debug_assert!(callback_data.len() <= 64);
+            rows.push(vec![InlineKeyboardButton {
+                text: format!("Retry episode {}", entry.index),
+                callback_data,
+            }]);
+        }
+    }
+    if entries.is_empty() {
+        text.push_str("\n\nNo episodes in this view.");
+    }
+    if pages > 1 {
+        rows.push(vec![
+            InlineKeyboardButton {
+                text: "Previous".into(),
+                callback_data: episode_page_callback(record, page.saturating_sub(1), failures_only),
+            },
+            InlineKeyboardButton {
+                text: "Next".into(),
+                callback_data: episode_page_callback(
+                    record,
+                    (page + 1).min(pages - 1),
+                    failures_only,
+                ),
+            },
+        ]);
+    }
+    if matches!(
+        record.status,
+        TaskStatus::Failed | TaskStatus::PartiallyCompleted
+    ) && attempt.failed_entries() > 0
+    {
+        rows.push(vec![InlineKeyboardButton {
+            text: "Retry failed episodes".into(),
+            callback_data: queue_callback_data("retry", &record.id, record.generation),
+        }]);
+    }
+    if actionable && group_has_remaining_entries(attempt) {
+        rows.push(vec![InlineKeyboardButton {
+            text: "Resume remaining episodes".into(),
+            callback_data: queue_callback_data("resume", &record.id, record.generation),
+        }]);
+    }
+    rows.push(vec![
+        InlineKeyboardButton {
+            text: if failures_only {
+                "All episodes"
+            } else {
+                "Failed episodes"
+            }
+            .into(),
+            callback_data: episode_page_callback(record, 0, !failures_only),
+        },
+        InlineKeyboardButton {
+            text: "Back to queue".into(),
+            callback_data: format!(
+                "q:{}:0",
+                if record.status.is_history() {
+                    "history"
+                } else {
+                    "active"
+                }
+            ),
+        },
+    ]);
+    Some((
+        truncate_utf16_units(&text, QUEUE_PAGE_MAX_TEXT_UNITS),
+        InlineKeyboardMarkup {
+            inline_keyboard: rows,
+        },
+    ))
+}
+
+fn episode_error_preview(error: &str) -> String {
+    let redacted = redact_sensitive_text(error);
+    let detail = redacted
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Error: "))
+        .or_else(|| {
+            redacted.split_once("stderr:\n").and_then(|(_, stderr)| {
+                let detail = stderr.split("\nstdout:").next()?.trim();
+                (!detail.is_empty()).then_some(detail)
+            })
+        })
+        .unwrap_or(&redacted);
+    truncate_utf16_units(&sanitize_queue_display_text(detail), 180)
 }
 
 fn task_action_keyboard(buttons: &[(String, String)]) -> InlineKeyboardMarkup {
@@ -1054,6 +1285,116 @@ async fn handle_queue_callback(
     let queue = Arc::clone(&context.queue);
     let next_job_id = Arc::clone(&context.next_job_id);
     match action {
+        QueueCallbackAction::Episodes {
+            id,
+            generation,
+            page,
+            failures_only,
+        } => {
+            let record = match queue.get_if_generation(&id, generation) {
+                Ok(Some(record)) if record.chat_id == chat_id => record,
+                Ok(_) => {
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Task changed; refresh /queue.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                Err(err) => {
+                    if !report_queue_file_provider_callback_error(
+                        &telegram,
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "load episode list",
+                        &err,
+                    )
+                    .await
+                    {
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not load episodes.".to_string(),
+                        )
+                        .await;
+                    }
+                    return;
+                }
+            };
+            let Some((text, keyboard)) = render_episode_page(&record, page, failures_only) else {
+                answer_callback_or_log(
+                    &telegram,
+                    callback_id,
+                    "No episode results available yet.".to_string(),
+                )
+                .await;
+                return;
+            };
+            if let Err(err) = telegram
+                .edit_message_text_with_inline_keyboard(chat_id, message_id, text, keyboard)
+                .await
+            {
+                warn!(task_id = %id, error = %err, "failed to edit episode list");
+            }
+            answer_callback_or_log(&telegram, callback_id, "Episodes updated.".to_string()).await;
+        }
+        QueueCallbackAction::RetryEpisode {
+            id,
+            generation,
+            index,
+        } => {
+            let claimed = match queue
+                .claim_episode_retry_for_chat_if_generation(&id, generation, chat_id, index)
+            {
+                Ok(Some(record)) => record,
+                Ok(None) => {
+                    answer_callback_or_log(
+                        &telegram,
+                        callback_id,
+                        "Episode or task changed; refresh /queue.".to_string(),
+                    )
+                    .await;
+                    return;
+                }
+                Err(err) => {
+                    if !report_queue_file_provider_callback_error(
+                        &telegram,
+                        &callback_id,
+                        chat_id,
+                        Some(&id),
+                        "retry episode",
+                        &err,
+                    )
+                    .await
+                    {
+                        answer_callback_or_log(
+                            &telegram,
+                            callback_id,
+                            "Could not restart this episode.".to_string(),
+                        )
+                        .await;
+                    }
+                    return;
+                }
+            };
+            answer_callback_or_log(
+                &telegram,
+                callback_id,
+                format!("Rechecking episode {index}. Other episode results are retained."),
+            )
+            .await;
+            let job_id = next_job_id.fetch_add(1, Ordering::Relaxed);
+            queue_or_prompt_job(
+                context,
+                chat_id,
+                job_id,
+                claimed.id,
+                claimed.generation,
+                claimed.job,
+            );
+        }
         action @ QueueCallbackAction::Resume { .. }
         | action @ QueueCallbackAction::Retry { .. } => {
             let (id, generation, retry) = match action {
@@ -1371,6 +1712,16 @@ fn render_queue_page(
             lines.push(String::new());
         }
         if command.history {
+            if record
+                .bilibili_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.independent_entries)
+            {
+                rows.push(vec![InlineKeyboardButton {
+                    text: format!("Episodes · #{task_number}"),
+                    callback_data: episode_page_callback(&record, 0, false),
+                }]);
+            }
             continue;
         }
         let buttons = queue_task_buttons(&record, task_number, &display);
@@ -1496,8 +1847,10 @@ fn queue_task_display(record: &TaskRecord) -> QueueTaskDisplay {
 }
 
 fn queue_task_detail_notice(record: &TaskRecord) -> Option<String> {
-    if matches!(record.status, TaskStatus::Failed | TaskStatus::Interrupted)
-        && let Some(error) = record.error.as_deref()
+    if matches!(
+        record.status,
+        TaskStatus::Failed | TaskStatus::PartiallyCompleted | TaskStatus::Interrupted
+    ) && let Some(error) = record.error.as_deref()
     {
         let error = sanitize_queue_display_text(&redact_sensitive_text(error));
         let error = error
@@ -1558,7 +1911,36 @@ fn queue_task_buttons(
 ) -> Vec<InlineKeyboardButton> {
     let mut buttons = Vec::new();
     let task_action = match record.status {
-        TaskStatus::Failed => Some(("Retry", "retry")),
+        TaskStatus::Failed
+            if record.bilibili_attempt.as_ref().is_some_and(|attempt| {
+                attempt.independent_entries
+                    && attempt.failed_entries() == 0
+                    && attempt.verified_entries() == 0
+                    && group_has_remaining_entries(attempt)
+            }) =>
+        {
+            Some((episode_group_resume_label(record), "resume"))
+        }
+        TaskStatus::PartiallyCompleted
+            if record
+                .bilibili_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.failed_entries() == 0) =>
+        {
+            Some((episode_group_resume_label(record), "resume"))
+        }
+        TaskStatus::Failed | TaskStatus::PartiallyCompleted => Some((
+            if record
+                .bilibili_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.independent_entries)
+            {
+                "Retry failed episodes"
+            } else {
+                "Retry"
+            },
+            "retry",
+        )),
         TaskStatus::Received
         | TaskStatus::AwaitingSelection
         | TaskStatus::Interrupted
@@ -1580,6 +1962,22 @@ fn queue_task_buttons(
             callback_action,
         ));
     }
+    if matches!(
+        record.status,
+        TaskStatus::Failed | TaskStatus::PartiallyCompleted
+    ) && record
+        .bilibili_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.failed_entries() > 0 && group_has_remaining_entries(attempt))
+    {
+        buttons.push(queue_task_action_button(
+            record,
+            task_number,
+            display,
+            "Resume remaining episodes",
+            "resume",
+        ));
+    }
     if record.status.is_unfinished() && record.status != TaskStatus::Verifying {
         buttons.push(queue_task_action_button(
             record,
@@ -1588,6 +1986,16 @@ fn queue_task_buttons(
             "Cancel",
             "cancel",
         ));
+    }
+    if record
+        .bilibili_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.independent_entries)
+    {
+        buttons.push(InlineKeyboardButton {
+            text: format!("Episodes · #{task_number}"),
+            callback_data: episode_page_callback(record, 0, false),
+        });
     }
     buttons
 }
@@ -1846,6 +2254,7 @@ fn task_status_label(status: TaskStatus) -> &'static str {
         TaskStatus::Verifying => "verifying published files",
         TaskStatus::Interrupted => "interrupted",
         TaskStatus::Failed => "failed",
+        TaskStatus::PartiallyCompleted => "partially completed",
         TaskStatus::Cancelled => "cancelled",
         TaskStatus::Completed => "completed",
     }
@@ -1853,8 +2262,9 @@ fn task_status_label(status: TaskStatus) -> &'static str {
 
 fn render_restart_summary(summary: &RestartSummary) -> String {
     format!(
-        "Some tasks were interrupted by restart.\nJobs: {} interrupted, {} recently completed, {} recently failed.\nMedia entries: {} completed, {} remaining, {} failed.\nUse /queue to review and resume tasks.",
+        "Task queue after restart.\nJobs: {} interrupted, {} partially completed, {} recently completed, {} recently failed.\nMedia entries: {} completed, {} remaining, {} failed.\nUse /queue to review and resume tasks.",
         summary.interrupted_jobs,
+        summary.partially_completed_jobs,
         summary.recently_completed_jobs,
         summary.recently_failed_jobs,
         summary.completed_entries,
@@ -3253,6 +3663,45 @@ async fn queue_or_prompt_normalized_job(
             }
         }
     };
+    let resumed_group = if is_bilibili_episode_group(&job) {
+        match task_if_generation_with_retry_delay(
+            &context.queue,
+            &task_id,
+            generation,
+            context.queue_start_retry_delay,
+        )
+        .await
+        {
+            Ok(Some(task)) => task
+                .bilibili_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.independent_entries),
+            Ok(None) => return,
+            Err(err) => {
+                warn!(task_id, error = %err, "could not load grouped recovery scope");
+                return;
+            }
+        }
+    } else {
+        false
+    };
+    if resumed_group {
+        // Resumed groups retain their explicit episode scope; do not ask a new
+        // season/duplicate question or replace it with a fresh selection.
+        let run_mode = default_run_mode(&job);
+        queue_job(
+            context,
+            chat_id,
+            job_id,
+            task_id,
+            job,
+            run_mode,
+            TaskStatus::Preparing,
+            generation,
+        )
+        .await;
+        return;
+    }
     if job.requires_bilibili_selection() {
         prompt_bilibili_selection(
             &context,
@@ -5448,6 +5897,24 @@ struct PublishedTaskCompletion<'a> {
     collection_status_message_id: Option<i64>,
 }
 
+async fn hash_and_validate_published_media(
+    media_root: &Path,
+    report: &JobReport,
+) -> Result<BTreeMap<String, String>> {
+    let root_path = media_root.to_path_buf();
+    let media_paths = report.primary_media_paths.clone();
+    let verification_report = report.clone();
+    let hashes = tokio::task::spawn_blocking(move || {
+        let root = crate::safe_fs::RootedFs::new(&root_path)?;
+        let expected = existing_bilibili_report_media_identities(&root, &verification_report)?;
+        hash_primary_media_with_expected_identities(&root_path, &media_paths, &expected)
+    })
+    .await
+    .context("published media hash task failed to join")??;
+    validate_bilibili_report_media_hashes(report, &hashes)?;
+    Ok(hashes)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_queued_job(
     context: BotContext,
@@ -5653,11 +6120,33 @@ async fn run_queued_job(
         Ok(plan) => plan,
         Err(err) => {
             let message = redact_sensitive_text(&format!("{err:#}"));
-            let _ = queue.fail_if_generation(&task_id, generation, truncate(&message));
+            let paused = is_bilibili_episode_group(&job)
+                && matches!(
+                    episode_retry::classify_episode_failure(&err, 0),
+                    episode_retry::EpisodeFailureDisposition::PauseGroup
+                );
+            if paused {
+                let _ = queue.interrupt_with_bilibili_attempt_if_generation(
+                    &task_id,
+                    generation,
+                    truncate(&message),
+                    None,
+                );
+            } else {
+                let _ = queue.fail_if_generation(&task_id, generation, truncate(&message));
+            }
             drop(permit);
             let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
             status_message_id = finish_job_progress(progress_tx, progress_task).await;
-            let final_message = failed_job_message(job_id, job.label(), &message);
+            let final_message = if paused {
+                format!(
+                    "Paused job #{job_id}: {}\n{}",
+                    job.label(),
+                    truncate(&message)
+                )
+            } else {
+                failed_job_message(job_id, job.label(), &message)
+            };
             if is_collection {
                 if let Some(message_id) = status_message_id {
                     edit_task_message_if_current(
@@ -5745,11 +6234,7 @@ async fn run_queued_job(
                 queue_callback_data("cancel", &task_id, generation),
             ),
         ]);
-        let text = format!(
-            "Task {} paused because its download plan changed ({}). Review and confirm the updated plan before downloading.",
-            task_id,
-            differences.join(", ")
-        );
+        let text = plan_confirmation_text(&updated_task, &differences);
         if let Some(message_id) = status_message_id {
             if is_collection {
                 edit_task_message_with_keyboard_if_current(
@@ -5810,6 +6295,16 @@ async fn run_queued_job(
     let result = release_download_permit_after(
         permit,
         select_worker_result_or_cancel(&cancel, async {
+            if is_bilibili_episode_group(&job) {
+                return run_bilibili_episode_group(
+                    &config,
+                    &job,
+                    updated_task.bilibili_attempt.clone(),
+                    updated_task.plan.clone(),
+                    Some(progress_tx),
+                )
+                .await;
+            }
             match run_mode {
                 JobRunMode::Duplicate(duplicate_run) => {
                     run_job_with_duplicate_action(
@@ -5919,22 +6414,8 @@ async fn run_queued_job(
                 } else {
                     config.downloads.video_dir.clone()
                 };
-                let media_paths = report.primary_media_paths.clone();
                 validate_existing_bilibili_report_for_completion(&config, &report).await?;
-                let verification_report = report.clone();
-                let hashes = tokio::task::spawn_blocking(move || {
-                    let root = crate::safe_fs::RootedFs::new(&media_root)?;
-                    let expected =
-                        existing_bilibili_report_media_identities(&root, &verification_report)?;
-                    let hashes = hash_primary_media_with_expected_identities(
-                        &media_root,
-                        &media_paths,
-                        &expected,
-                    )?;
-                    Ok::<_, anyhow::Error>(hashes)
-                })
-                .await
-                .context("published media hash task failed to join")??;
+                let hashes = hash_and_validate_published_media(&media_root, &report).await?;
                 validate_existing_bilibili_report_for_completion(&config, &report).await?;
                 complete_published_task_with_retry(
                     &telegram,
@@ -6007,13 +6488,15 @@ async fn run_queued_job(
                             message
                         }
                         Ok(Some(_)) => {
-                            match queue.fail_with_bilibili_attempt_if_generation(
+                            match persist_bilibili_terminal_failure(
+                                &queue,
                                 &task_id,
                                 generation,
                                 truncate(&error_chain),
                                 bilibili_attempt.clone(),
+                                is_bilibili_episode_group(&job),
                             ) {
-                                Ok(Some(_)) => {}
+                                Ok(Some(record)) => bilibili_attempt = record.bilibili_attempt,
                                 Ok(None) => deliver_final_message = false,
                                 Err(fail_error) => warn!(
                                     task_id,
@@ -6021,7 +6504,13 @@ async fn run_queued_job(
                                     "failed to persist task failure state"
                                 ),
                             }
-                            failed_job_message(job_id, job.label(), &error_chain)
+                            episode_group_failure_message(
+                                job_id,
+                                job.label(),
+                                &error_chain,
+                                bilibili_attempt.as_ref(),
+                                is_bilibili_episode_group(&job),
+                            )
                         }
                         Ok(None) => {
                             deliver_final_message = false;
@@ -6052,13 +6541,15 @@ async fn run_queued_job(
                     format!("Canceled job #{job_id}: {}", job.label())
                 }
                 Ok(Some(_)) => {
-                    match queue.fail_with_bilibili_attempt_if_generation(
+                    match persist_bilibili_terminal_failure(
+                        &queue,
                         &task_id,
                         generation,
                         truncate(&error_chain),
                         bilibili_attempt.clone(),
+                        is_bilibili_episode_group(&job),
                     ) {
-                        Ok(Some(_)) => {}
+                        Ok(Some(record)) => bilibili_attempt = record.bilibili_attempt,
                         Ok(None) => deliver_final_message = false,
                         Err(fail_error) => warn!(
                             task_id,
@@ -6066,7 +6557,13 @@ async fn run_queued_job(
                             "failed to persist task failure state"
                         ),
                     }
-                    failed_job_message(job_id, job.label(), &error_chain)
+                    episode_group_failure_message(
+                        job_id,
+                        job.label(),
+                        &error_chain,
+                        bilibili_attempt.as_ref(),
+                        is_bilibili_episode_group(&job),
+                    )
                 }
                 Ok(None) => {
                     deliver_final_message = false;
@@ -6119,7 +6616,47 @@ async fn run_queued_job(
         message = with_bilibili_attempt_summary(&message, snapshot);
     }
 
-    if is_collection {
+    if is_bilibili_episode_group(&job)
+        && bilibili_attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.independent_entries)
+    {
+        let Ok(Some(record)) = queue.get_if_generation(&task_id, generation) else {
+            return;
+        };
+        let keyboard = episode_group_terminal_keyboard(&record);
+        let edited = if let Some(message_id) = status_message_id {
+            edit_task_message_with_keyboard_if_current(
+                &queue,
+                &task_id,
+                generation,
+                &telegram,
+                chat_id,
+                message_id,
+                message.clone(),
+                keyboard.clone(),
+            )
+            .await
+        } else {
+            false
+        };
+        if !edited {
+            send_task_message_with_keyboard_id_if_current(
+                ProgressDeliveryContext {
+                    telegram: &telegram,
+                    queue: &queue,
+                    task_id: &task_id,
+                    generation,
+                    chat_id,
+                    job_id,
+                    job_label: job.label(),
+                },
+                message,
+                keyboard,
+            )
+            .await;
+        }
+    } else if is_collection {
         let mut delivery = progress_result.collection_delivery.unwrap_or_default();
         if let Some(message_id) = delivery.main_delivery.message_id().or(status_message_id) {
             delivery.main_delivery = ProgressDelivery::Edit(message_id);
@@ -6171,11 +6708,34 @@ where
 }
 
 fn plan_confirmation_text(task: &TaskRecord, differences: &[&str]) -> String {
-    format!(
+    let mut text = format!(
         "Task {} paused because its download plan changed ({}). Review and confirm the updated plan before downloading.",
         task.id,
         differences.join(", ")
-    )
+    );
+    if is_bilibili_episode_group(&task.job)
+        && let Some(updated) = task.proposed_plan.as_ref()
+    {
+        let previous_count = task
+            .plan
+            .as_ref()
+            .map(|plan| plan.stable_media_ids.len())
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "\nEpisodes: {previous_count} → {}. Compatible completed episodes will be retained; changed or missing outputs will be downloaded again.",
+            updated.stable_media_ids.len()
+        ));
+        if task
+            .plan
+            .as_ref()
+            .is_some_and(|previous| previous.media_profile != updated.media_profile)
+        {
+            text.push_str(
+                "\nDownload requirements changed. Previously completed episodes must be downloaded again to meet the updated requirements.",
+            );
+        }
+    }
+    text
 }
 
 fn send_collection_failure_lifecycle(progress: &JobProgressSender) {
@@ -6189,6 +6749,354 @@ fn failed_job_message(job_id: u64, job_label: &str, error_chain: &str) -> String
         "Failed job #{job_id}: {job_label}\n{}",
         truncate(&redact_sensitive_text(error_chain))
     )
+}
+
+fn persist_bilibili_terminal_failure(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    error: String,
+    mut snapshot: Option<BilibiliAttemptSnapshot>,
+    grouped: bool,
+) -> Result<Option<TaskRecord>> {
+    if snapshot.as_ref().is_some_and(|attempt| {
+        attempt.independent_entries && attempt.outcome == Some(BilibiliAttemptOutcome::Interrupted)
+    }) || (grouped && group_error_requires_pause(&error))
+    {
+        if let Some(attempt) = snapshot.as_mut() {
+            attempt.outcome = None;
+            attempt.finish(BilibiliAttemptOutcome::Interrupted);
+        }
+        queue.interrupt_with_bilibili_attempt_if_generation(task_id, generation, error, snapshot)
+    } else {
+        queue.fail_with_bilibili_attempt_if_generation(task_id, generation, error, snapshot)
+    }
+}
+
+fn episode_group_failure_message(
+    job_id: u64,
+    job_label: &str,
+    error: &str,
+    snapshot: Option<&BilibiliAttemptSnapshot>,
+    grouped: bool,
+) -> String {
+    let Some(attempt) = snapshot.filter(|attempt| attempt.independent_entries) else {
+        if grouped && group_error_requires_pause(error) {
+            return format!("Paused job #{job_id}: {job_label}\n{}", truncate(error));
+        }
+        return failed_job_message(job_id, job_label, error);
+    };
+    let status = if attempt.outcome == Some(BilibiliAttemptOutcome::Interrupted) {
+        "Paused"
+    } else if attempt
+        .entries
+        .iter()
+        .any(|entry| entry.state == BilibiliAttemptEntryState::Verified)
+    {
+        "Partially completed"
+    } else {
+        "Failed"
+    };
+    format!(
+        "{status} job #{job_id}: {job_label}\n{}",
+        truncate(&redact_sensitive_text(error))
+    )
+}
+
+fn group_error_requires_pause(error: &str) -> bool {
+    matches!(
+        episode_retry::classify_episode_failure(&anyhow::anyhow!("{error}"), 0),
+        episode_retry::EpisodeFailureDisposition::PauseGroup
+    )
+}
+
+fn episode_group_terminal_keyboard(record: &TaskRecord) -> InlineKeyboardMarkup {
+    let mut rows = Vec::new();
+    let attempt = record.bilibili_attempt.as_ref();
+    if matches!(
+        record.status,
+        TaskStatus::Failed | TaskStatus::PartiallyCompleted
+    ) && attempt.is_some_and(|attempt| attempt.failed_entries() > 0)
+    {
+        rows.push(vec![InlineKeyboardButton {
+            text: "Retry failed episodes".into(),
+            callback_data: queue_callback_data("retry", &record.id, record.generation),
+        }]);
+    }
+    if record.status == TaskStatus::Interrupted
+        || (matches!(
+            record.status,
+            TaskStatus::Failed | TaskStatus::PartiallyCompleted
+        ) && attempt.is_some_and(|attempt| {
+            group_has_remaining_entries(attempt)
+                || (record.status == TaskStatus::PartiallyCompleted
+                    && attempt.independent_entries
+                    && attempt.failed_entries() == 0)
+        }))
+    {
+        rows.push(vec![InlineKeyboardButton {
+            text: episode_group_resume_label(record).into(),
+            callback_data: queue_callback_data("resume", &record.id, record.generation),
+        }]);
+    }
+    let mut details = vec![InlineKeyboardButton {
+        text: "Episodes".into(),
+        callback_data: episode_page_callback(record, 0, false),
+    }];
+    if attempt.is_some_and(|attempt| attempt.failed_entries() > 0) {
+        details.push(InlineKeyboardButton {
+            text: "Failure details".into(),
+            callback_data: episode_page_callback(record, 0, true),
+        });
+    }
+    rows.push(details);
+    InlineKeyboardMarkup {
+        inline_keyboard: rows,
+    }
+}
+
+fn episode_group_resume_label(record: &TaskRecord) -> &'static str {
+    if record.status == TaskStatus::PartiallyCompleted
+        && record.bilibili_attempt.as_ref().is_some_and(|attempt| {
+            attempt.independent_entries
+                && !attempt.entries.is_empty()
+                && attempt
+                    .entries
+                    .iter()
+                    .all(|entry| entry.state == BilibiliAttemptEntryState::Verified)
+        })
+    {
+        "Resume finalization"
+    } else {
+        "Resume remaining episodes"
+    }
+}
+
+fn group_has_remaining_entries(attempt: &BilibiliAttemptSnapshot) -> bool {
+    attempt.independent_entries
+        && attempt.entries.iter().any(|entry| {
+            matches!(
+                entry.state,
+                BilibiliAttemptEntryState::Pending
+                    | BilibiliAttemptEntryState::Interrupted
+                    | BilibiliAttemptEntryState::Downloaded
+            )
+        })
+}
+
+#[cfg(test)]
+mod episode_group_ui_tests {
+    use super::*;
+
+    fn record() -> TaskRecord {
+        let mut record = TaskRecord::new(
+            "u9223372036854775807-0".into(),
+            1,
+            1,
+            42,
+            None,
+            0,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        record.generation = u64::MAX;
+        record.status = TaskStatus::PartiallyCompleted;
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [1, 4, 17, 23, 89, 120, 203].map(|index| {
+                (
+                    index,
+                    format!("Episode {index}"),
+                    Some(format!("episode:{index}")),
+                )
+            }),
+            2,
+        );
+        attempt.entry_verified(1);
+        attempt.stage_started(17, "audio".into());
+        attempt.entry_failed_with_error(17, 3, "audio: HTTP 403 Forbidden".into());
+        attempt.entry_failed_with_error(
+            89,
+            2,
+            format!("video: HTTP 503 {}", "中文错误😀".repeat(300)),
+        );
+        record.bilibili_attempt = Some(attempt);
+        record
+    }
+
+    #[test]
+    fn episode_pages_keep_sparse_indices_and_targeted_actions() {
+        let record = record();
+        let (text, keyboard) = render_episode_page(&record, 0, true).unwrap();
+        assert!(text.contains("Episode 17:"));
+        assert!(text.contains("Episode 89:"));
+        assert!(!text.contains("Episode 1:"));
+        assert!(text.contains("audio: HTTP 403"));
+        assert!(text.contains("Stage: audio"));
+        assert!(text.encode_utf16().count() <= QUEUE_PAGE_MAX_TEXT_UNITS);
+        let buttons: Vec<_> = keyboard.inline_keyboard.into_iter().flatten().collect();
+        assert!(buttons.iter().any(|button| matches!(
+            parse_queue_callback_data(&button.callback_data),
+            Some(QueueCallbackAction::RetryEpisode {
+                index: 17,
+                generation: u64::MAX,
+                ..
+            })
+        )));
+        assert!(buttons.iter().all(|button| button.callback_data.len() <= 64
+            && parse_queue_callback_data(&button.callback_data).is_some()));
+    }
+
+    #[test]
+    fn episode_error_preview_keeps_worker_cause_ahead_of_recovery_wrapper() {
+        let error = format!(
+            "{}\nstderr:\nError: HTTP status client error (403 Forbidden)\nCaused by:\nHTTP 403\nstdout:\nmedia progress",
+            "Retained output recovery context. ".repeat(20)
+        );
+        assert_eq!(
+            episode_error_preview(&error),
+            "HTTP status client error (403 Forbidden)"
+        );
+        assert_eq!(
+            episode_error_preview("episode unavailable"),
+            "episode unavailable"
+        );
+    }
+
+    #[test]
+    fn partial_groups_expose_failed_retry_and_remaining_resume_separately() {
+        let record = record();
+        let keyboard = episode_group_terminal_keyboard(&record);
+        let actions: Vec<_> = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .filter_map(|button| parse_queue_callback_data(&button.callback_data))
+            .collect();
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, QueueCallbackAction::Retry { .. }))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, QueueCallbackAction::Resume { .. }))
+        );
+        let mut pending_only = record;
+        for entry in &mut pending_only.bilibili_attempt.as_mut().unwrap().entries {
+            if entry.state == BilibiliAttemptEntryState::Failed {
+                entry.state = BilibiliAttemptEntryState::Pending;
+            }
+        }
+        let display = queue_task_display(&pending_only);
+        let actions = queue_task_buttons(&pending_only, 1, &display);
+        assert!(actions.iter().any(|button| matches!(
+            parse_queue_callback_data(&button.callback_data),
+            Some(QueueCallbackAction::Resume { .. })
+        )));
+        assert!(!actions.iter().any(|button| matches!(
+            parse_queue_callback_data(&button.callback_data),
+            Some(QueueCallbackAction::Retry { .. })
+        )));
+    }
+
+    #[test]
+    fn restart_summary_distinguishes_settled_partial_results() {
+        let text = render_restart_summary(&RestartSummary {
+            chat_id: 42,
+            interrupted_jobs: 0,
+            partially_completed_jobs: 1,
+            recently_completed_jobs: 0,
+            recently_failed_jobs: 0,
+            completed_entries: 16,
+            remaining_entries: 0,
+            failed_entries: 1,
+        });
+        assert!(text.contains("0 interrupted, 1 partially completed"));
+        assert!(text.contains("16 completed, 0 remaining, 1 failed"));
+        assert!(!text.contains("interrupted by restart"));
+    }
+
+    #[test]
+    fn verified_partial_groups_offer_finalization_resume_on_both_messages() {
+        let mut record = record();
+        for entry in &mut record.bilibili_attempt.as_mut().unwrap().entries {
+            entry.state = BilibiliAttemptEntryState::Verified;
+        }
+        let terminal = episode_group_terminal_keyboard(&record);
+        let queue_buttons = queue_task_buttons(&record, 1, &queue_task_display(&record));
+        let terminal_buttons: Vec<_> = terminal.inline_keyboard.into_iter().flatten().collect();
+        for buttons in [&terminal_buttons, &queue_buttons] {
+            assert!(buttons.iter().any(|button| {
+                button.text.split(" · ").next() == Some("Resume finalization")
+                    && matches!(
+                        parse_queue_callback_data(&button.callback_data),
+                        Some(QueueCallbackAction::Resume {
+                            generation: u64::MAX,
+                            ..
+                        })
+                    )
+            }));
+            assert!(!buttons.iter().any(|button| matches!(
+                parse_queue_callback_data(&button.callback_data),
+                Some(QueueCallbackAction::Retry { .. })
+            )));
+        }
+    }
+
+    #[test]
+    fn episode_pages_clamp_page_and_never_retry_verified_outputs() {
+        let record = record();
+        let (text, _) = render_episode_page(&record, usize::MAX, false).unwrap();
+        assert!(text.contains("page 2/2"));
+        assert!(text.contains("Episode 203:"));
+        let (_, keyboard) = render_episode_page(&record, 0, false).unwrap();
+        assert!(
+            !keyboard
+                .inline_keyboard
+                .iter()
+                .flatten()
+                .any(|button| matches!(
+                    parse_queue_callback_data(&button.callback_data),
+                    Some(QueueCallbackAction::RetryEpisode { index: 1, .. })
+                ))
+        );
+    }
+
+    #[test]
+    fn group_terminal_message_distinguishes_partial_and_paused() {
+        let mut record = record();
+        let attempt = record.bilibili_attempt.as_mut().unwrap();
+        assert!(
+            episode_group_failure_message(1, "Bilibili download", "HTTP403", Some(attempt), true)
+                .starts_with("Partially completed job #1")
+        );
+        attempt.finish(BilibiliAttemptOutcome::Interrupted);
+        assert!(
+            episode_group_failure_message(1, "Bilibili download", "Disk full", Some(attempt), true)
+                .starts_with("Paused job #1")
+        );
+        record.status = TaskStatus::Interrupted;
+        let keyboard = episode_group_terminal_keyboard(&record);
+        assert!(
+            keyboard
+                .inline_keyboard
+                .iter()
+                .flatten()
+                .any(|button| button.text == "Resume remaining episodes")
+        );
+    }
+
+    #[test]
+    fn episode_callbacks_reject_trailing_data_and_invalid_views() {
+        assert!(parse_queue_callback_data("q:e:task:0:0:bad").is_none());
+        assert!(parse_queue_callback_data("q:e:task:0:0:f:extra").is_none());
+        assert!(parse_queue_callback_data("q:x:task:0:not-an-index").is_none());
+        assert!(parse_queue_callback_data("q:x:task:0:17:extra").is_none());
+    }
 }
 
 fn with_bilibili_attempt_summary(message: &str, snapshot: &BilibiliAttemptSnapshot) -> String {
@@ -9878,6 +10786,42 @@ mod tests {
     }
 
     #[test]
+    fn episode_plan_confirmation_explains_inventory_and_receipt_invalidation() {
+        let mut record = TaskRecord::new(
+            "episode-plan-confirmation".to_string(),
+            1,
+            2,
+            123_456_789,
+            None,
+            0,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".to_string(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        record.plan = Some(PlanValidationSnapshot {
+            stable_media_ids: vec!["episode-a".to_string(), "episode-b".to_string()],
+            media_profile: Some("mode=AudioOnly".to_string()),
+            ..PlanValidationSnapshot::default()
+        });
+        record.proposed_plan = Some(PlanValidationSnapshot {
+            stable_media_ids: vec!["episode-a".to_string()],
+            media_profile: Some("mode=AudioOnly".to_string()),
+            ..PlanValidationSnapshot::default()
+        });
+        let inventory_only = plan_confirmation_text(&record, &["media identity"]);
+        assert!(inventory_only.contains("Episodes: 2 → 1"));
+        assert!(inventory_only.contains("Compatible completed episodes will be retained"));
+        assert!(!inventory_only.contains("Download requirements changed"));
+
+        record.proposed_plan.as_mut().unwrap().media_profile = Some("mode=All".to_string());
+        let changed_requirements = plan_confirmation_text(&record, &["media requirements"]);
+        assert!(changed_requirements.contains("Download requirements changed"));
+        assert!(changed_requirements.contains("must be downloaded again"));
+        assert!(!changed_requirements.contains("mode="));
+    }
+
+    #[test]
     fn queue_display_prefers_the_plan_that_matches_the_task_state() {
         let mut record = TaskRecord::new(
             "plan-precedence".to_string(),
@@ -10010,6 +10954,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn failed_group_planning_after_scoped_retry_offers_a_working_resume() {
+        let task_id = "failed-group-retry-planning-resume";
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, _file_provider) =
+            generation_guard_collection_queue(task_id, task_id, 968, chat_id);
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [16, 17].map(|index| {
+                (
+                    index,
+                    format!("Episode {index}"),
+                    Some(format!("episode:{index}")),
+                )
+            }),
+            0,
+        );
+        for index in [16, 17] {
+            attempt.entry_failed_with_error(index, 3, "HTTP 403 Forbidden".into());
+        }
+        attempt.finish(BilibiliAttemptOutcome::Failed);
+        queue
+            .fail_with_bilibili_attempt_if_generation(
+                task_id,
+                0,
+                "episode attempts exhausted".into(),
+                Some(attempt),
+            )
+            .unwrap()
+            .unwrap();
+        let retry = queue.claim_resume(task_id, true).unwrap().unwrap();
+        assert_eq!(retry.generation, 1);
+        assert_eq!(retry.bilibili_attempt.as_ref().unwrap().failed_entries(), 0);
+        let failed = queue
+            .fail_if_generation(task_id, 1, "plan inspection failed before execution".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert!(queue.claim_resume(task_id, true).unwrap().is_none());
+
+        let buttons = queue_task_buttons(&failed, 1, &queue_task_display(&failed));
+        let resume_button = buttons
+            .iter()
+            .find(|button| {
+                matches!(
+                    parse_queue_callback_data(&button.callback_data),
+                    Some(QueueCallbackAction::Resume { .. })
+                )
+            })
+            .expect("failed planning must offer normal resume");
+        assert!(resume_button.text.starts_with("Resume remaining episodes"));
+        assert!(!buttons.iter().any(|button| matches!(
+            parse_queue_callback_data(&button.callback_data),
+            Some(QueueCallbackAction::Retry { .. })
+        )));
+        assert!(
+            episode_group_terminal_keyboard(&failed)
+                .inline_keyboard
+                .iter()
+                .flatten()
+                .any(|button| button.callback_data == resume_button.callback_data)
+        );
+        let Some(QueueCallbackAction::Resume { id, generation }) =
+            parse_queue_callback_data(&resume_button.callback_data)
+        else {
+            panic!("expected a resume callback");
+        };
+        let resumed = queue
+            .claim_resume_for_chat_if_generation(&id, generation, chat_id, false)
+            .unwrap()
+            .expect("the rendered resume action must be claimable");
+        assert_eq!(resumed.status, TaskStatus::Preparing);
+        assert_eq!(resumed.generation, 2);
+        drop(queue);
+        fs::remove_dir_all(queue_root).unwrap();
     }
 
     #[test]
@@ -11031,6 +12052,56 @@ mod tests {
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn group_receipt_hashes_are_checked_by_published_completion_hash_path() {
+        let root = temp_main_test_dir("group-receipt-final-hash");
+        fs::create_dir_all(&root).expect("output root should create");
+        let media = root.join("episode.mp4");
+        fs::write(&media, b"verified episode bytes").expect("episode should write");
+        let media_paths = vec![media.clone()];
+        let expected =
+            hash_primary_media(&root, &media_paths).expect("verified output should hash");
+        let report: JobReport = serde_json::from_value(serde_json::json!({
+            "saved_location": "Episode group",
+            "details": "",
+            "primary_media_paths": media_paths,
+            "existing_bilibili_evidence": {
+                "expected_media_hashes": expected,
+            },
+        }))
+        .expect("group report receipt should deserialize");
+
+        let actual = hash_and_validate_published_media(&root, &report)
+            .await
+            .expect("unchanged published content should match its receipt");
+        assert_eq!(
+            actual,
+            report
+                .existing_bilibili_evidence
+                .as_ref()
+                .unwrap()
+                .expected_media_hashes
+                .clone()
+        );
+
+        let replacement = root.join("replacement.mp4");
+        fs::write(&replacement, b"verified episode bytes")
+            .expect("same-content replacement should write");
+        fs::remove_file(&media).expect("old output should remove for rematerialization");
+        fs::rename(&replacement, &media).expect("same-content output should rematerialize");
+        hash_and_validate_published_media(&root, &report)
+            .await
+            .expect("same bytes should remain valid after object rematerialization");
+
+        fs::write(&media, b"changed episode bytes").expect("changed output should write");
+        let error = hash_and_validate_published_media(&root, &report)
+            .await
+            .expect_err("changed published content must not replace its receipt");
+        assert!(format!("{error:#}").contains("changed after episode verification"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -12738,6 +13809,147 @@ mod tests {
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn episode_callbacks_reuse_message_and_reject_stale_or_other_chat_actions() {
+        let root = temp_main_test_dir("episode-callbacks");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = Arc::new(QueueManager::open(&config).unwrap());
+        let mut record = TaskRecord::new(
+            "episode-callback-task".into(),
+            1,
+            1,
+            42,
+            Some(71),
+            0,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        record.status = TaskStatus::PartiallyCompleted;
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [
+                (1, "First".into(), None),
+                (17, "Failed episode".into(), None),
+            ],
+            0,
+        );
+        attempt.entry_verified(1);
+        attempt.stage_started(17, "audio".into());
+        attempt.entry_failed_with_error(17, 3, "HTTP 403 Forbidden".into());
+        record.bilibili_attempt = Some(attempt);
+        queue.create(record.clone()).unwrap();
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        handle_queue_callback(
+            context.clone(),
+            "view-episodes".into(),
+            42,
+            71,
+            QueueCallbackAction::Episodes {
+                id: record.id.clone(),
+                generation: 0,
+                page: 0,
+                failures_only: true,
+            },
+        )
+        .await;
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].method, "editMessageText");
+        assert_eq!(recorded[0].body["message_id"], 71);
+        assert!(
+            recorded[0].body["text"]
+                .as_str()
+                .unwrap()
+                .contains("Episode 17:")
+        );
+        assert_eq!(recorded[1].method, "answerCallbackQuery");
+        for (chat_id, generation) in [(43, 0), (42, 1)] {
+            handle_queue_callback(
+                context.clone(),
+                "invalid-episode-retry".into(),
+                chat_id,
+                71,
+                QueueCallbackAction::RetryEpisode {
+                    id: record.id.clone(),
+                    generation,
+                    index: 17,
+                },
+            )
+            .await;
+            let recorded = take_fake_telegram_requests(&mut requests);
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0].method, "answerCallbackQuery");
+        }
+        let current = queue.get(&record.id).unwrap().unwrap();
+        assert_eq!(current.generation, 0);
+        assert_eq!(current.status, TaskStatus::PartiallyCompleted);
+        assert_eq!(current.bilibili_attempt, record.bilibili_attempt);
+        drop(context);
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shared_group_failure_before_inventory_remains_resumable() {
+        let root = temp_main_test_dir("group-initial-auth-failure");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = TaskRecord::new(
+            "initial-group".into(),
+            1,
+            1,
+            42,
+            None,
+            0,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        queue.create(task.clone()).unwrap();
+        let error = "HTTP 401 Unauthorized";
+        let paused =
+            persist_bilibili_terminal_failure(&queue, &task.id, 0, error.into(), None, true)
+                .unwrap()
+                .unwrap();
+        assert_eq!(paused.status, TaskStatus::Interrupted);
+        assert!(
+            episode_group_failure_message(1, "Bilibili download", error, None, true)
+                .starts_with("Paused job")
+        );
+        assert!(
+            queue
+                .claim_resume_for_chat_if_generation(&task.id, 0, 42, false)
+                .unwrap()
+                .is_some()
+        );
+        drop(queue);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
