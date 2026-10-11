@@ -8,6 +8,7 @@
 - Bilibili 番剧和 intl 链接走内嵌 plan/download API；`ss/md` 系列入口会先提示选择最新一集或全集。
 - 番剧按所选剧集分别规划播放地址，最多同时解析 2 集，每集有独立的 60 秒期限；全集不再共用一分钟总期限。规划进度显示已完成集数，单集失败或超时会报告具体集号并终止其他在途规划，结果仍按原剧集顺序下载。
 - 番剧全集命中已下载剧集时，可以选择 `Skip duplicates`，仅跳过当前 sidecar 精确匹配 CID/EPID、且音视频流满足下载模式的剧集，并继续下载其余集数；`Cancel entire job` 才会取消整个任务。跳过选择保存在队列中，恢复时会重新核对现有文件；若等待目录锁期间计划发生变化，任务会停止并提示重试，由队列重新验证计划。字幕、弹幕或封面单独下载模式不提供这个跳过选项。
+- 番剧下载进度和最终结果会区分下载阶段完成、已验证保存、失败、未开始、被中断和已有跳过的集数，并列出失败集号与最后报告的阶段。失败摘要位于长日志之前，队列会保存当前尝试的逐集状态；重试清空本轮计数。下载阶段完成不代表可播放文件已经合并、验证并发布；某集的终态错误仍会停止本轮下载，后续未开始的集不计为失败。
 - 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
@@ -59,6 +60,8 @@ staging 下载成功后会先持久化身份绑定的 `.retained.json`；Bilibil
 `bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。进度通道只保留最新状态，Telegram 按该间隔合并刷新，不会因全集任务的高频事件积压消息。视频计划解析得到的媒体摘要会作为进度上下文保留，后续速度、文件增长、下载和 mux 阶段更新不会覆盖它。YouTube/PDF 外部命令会刷新文件增长快照；Bilibili 会转发 `bbdown-core` 的关键 plan、download 和 mux 阶段。`bot.command_timeout_seconds` 是单个外部命令的总超时；direct Bilibili 下载不受这个总时限约束，而是把 `bot.command_idle_timeout_seconds` 作为媒体读取 idle timeout 传给 `bbdown-core`。Bilibili API 请求仍受独立的 request timeout 约束，bot 调用的 ffmpeg 等外部命令仍受总超时和 idle timeout 约束。
 
 Video preparation and plan inspection also report metadata resolution, existing-media checks, and planned episode counts before media transfer begins. Slow duplicate checks show progress at the configured interval; checks that finish sooner add no progress notice. Queueing, planning, and downloading reuse the status message. Queue plan inspection and download share one coalescing progress channel and the same `bot.progress_update_seconds` timer. Slow planning updates include elapsed time. If no status message is available, the first successful progress send becomes the message reused by later edits; an edit failure defers replacement to a later progress update. Replacement messages are also reused for plan confirmation, cancellation, and the final result. Slow Telegram responses cannot trigger nearby catch-up edits.
+
+Per-entry Bilibili attempt state is saved in batches at that same configured interval, with forced saves at attempt snapshots and progress-channel closure. Queue completion counts include already-present entries and verified outputs; raw downloaded streams remain pending finalization. Optional queue summaries and error details share the remaining page text budget so task actions and history navigation remain available.
 
 Bilibili 合集每轮执行只发送一条入队主消息和每个所选视频的一条状态消息；合集详情、进度、处理和最终结果编辑已有消息，下载完成后还会等待已发布文件校验。已存在且通过核验的视频显示跳过下载状态；取消时不为尚未开始的视频补发消息。通过 `/queue` 恢复或手动重试会开启新一轮，保留旧轮消息并创建新轮消息；网络和文件提供器的内部重试不会另开一轮。
 
