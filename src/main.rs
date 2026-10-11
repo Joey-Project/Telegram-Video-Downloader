@@ -1,4 +1,5 @@
 mod bilibili_access_key;
+mod bilibili_attempt;
 mod bilibili_auth;
 mod bilibili_core;
 mod bilibili_planning;
@@ -30,6 +31,7 @@ use tokio::sync::{Mutex, Notify, Semaphore, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
 use tracing::{error, info, warn};
 
+use crate::bilibili_attempt::{BilibiliAttemptOutcome, BilibiliAttemptSnapshot};
 use crate::config::AppConfig;
 use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
@@ -1357,6 +1359,12 @@ fn render_queue_page(
         if let Some(reason) = queue_task_detail_notice(&record) {
             detail_notices.push((lines.len(), reason));
             lines.push(String::new());
+        }
+        if let Some(snapshot) = record.bilibili_attempt.as_ref() {
+            lines.push(truncate_utf16_units(
+                &redact_sensitive_text(&snapshot.summary()),
+                700,
+            ));
         }
         if command.history {
             continue;
@@ -5846,6 +5854,7 @@ async fn run_queued_job(
             ),
         }
     }
+    let mut bilibili_attempt = completion_progress.bilibili_attempt_snapshot();
     drop(completion_progress);
     let progress_result = match progress_task.await {
         Ok(result) => result,
@@ -5863,7 +5872,7 @@ async fn run_queued_job(
 
     let mut final_outcome = CollectionFinalOutcome::Failed;
     let mut deliver_final_message = true;
-    let message = match result {
+    let mut message = match result {
         Some(Ok(report)) => {
             let details = if report.details.is_empty() {
                 String::new()
@@ -6080,6 +6089,20 @@ async fn run_queued_job(
         return;
     }
 
+    if let Some(snapshot) = bilibili_attempt.as_mut() {
+        snapshot.finish(match final_outcome {
+            CollectionFinalOutcome::Verified => BilibiliAttemptOutcome::Verified,
+            CollectionFinalOutcome::Failed => BilibiliAttemptOutcome::Failed,
+            CollectionFinalOutcome::Cancelled => BilibiliAttemptOutcome::Cancelled,
+        });
+        match queue.set_bilibili_attempt_if_generation(&task_id, generation, snapshot.clone()) {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(err) => warn!(task_id, error = %err, "failed to persist episode result summary"),
+        }
+        message = with_bilibili_attempt_summary(&message, snapshot);
+    }
+
     if is_collection {
         let mut delivery = progress_result.collection_delivery.unwrap_or_default();
         if let Some(message_id) = delivery.main_delivery.message_id().or(status_message_id) {
@@ -6149,6 +6172,15 @@ fn failed_job_message(job_id: u64, job_label: &str, error_chain: &str) -> String
     format!(
         "Failed job #{job_id}: {job_label}\n{}",
         truncate(&redact_sensitive_text(error_chain))
+    )
+}
+
+fn with_bilibili_attempt_summary(message: &str, snapshot: &BilibiliAttemptSnapshot) -> String {
+    let (headline, details) = message.split_once('\n').unwrap_or((message, ""));
+    // Keep episode results ahead of verbose logs so Telegram truncation cannot hide them.
+    format!(
+        "{headline}\n{}\n\n{details}",
+        redact_sensitive_text(&snapshot.summary())
     )
 }
 
@@ -6361,6 +6393,16 @@ fn persist_collection_progress(
     event: &JobProgressLifecycleEvent,
 ) -> Result<bool> {
     let (total, completed, failed) = match event {
+        JobProgressLifecycleEvent::BilibiliAttempt { snapshot } => {
+            return Ok(queue
+                .set_bilibili_attempt_if_generation(task_id, generation, snapshot.clone())?
+                .is_some());
+        }
+        JobProgressLifecycleEvent::BilibiliEntry { index, update } => {
+            return Ok(queue
+                .update_bilibili_attempt_if_generation(task_id, generation, *index, update)?
+                .is_some());
+        }
         JobProgressLifecycleEvent::StagingAttempt { .. } => return Ok(true),
         JobProgressLifecycleEvent::Resolved { manifest, .. } => {
             (manifest.total_entries, manifest.skipped_entries, 0)
@@ -6431,6 +6473,8 @@ async fn deliver_collection_lifecycle(
         return status_delivery;
     };
     match event {
+        JobProgressLifecycleEvent::BilibiliAttempt { .. }
+        | JobProgressLifecycleEvent::BilibiliEntry { .. } => {}
         JobProgressLifecycleEvent::StagingAttempt { .. } => {}
         JobProgressLifecycleEvent::Resolved { manifest, snapshot } => {
             if delivery.manifest.is_none() {
@@ -7701,6 +7745,35 @@ mod tests {
     use super::*;
 
     static TEST_AUTH_GENERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn episode_failure_results_precede_verbose_worker_logs_and_survive_truncation() {
+        let mut snapshot = BilibiliAttemptSnapshot::new(
+            "Season".into(),
+            (1..=203).map(|index| (index, format!("Episode {index}"))),
+            0,
+        );
+        for index in 1..=16 {
+            snapshot.entry_completed(index);
+        }
+        snapshot.entry_started(17);
+        snapshot.stage_started(17, "danmaku".into());
+        snapshot.finish(BilibiliAttemptOutcome::Failed);
+        let verbose = failed_job_message(
+            2,
+            "Bilibili download",
+            &format!("HTTP 403\n{}", "worker output\n".repeat(500)),
+        );
+        let message = truncate(&with_bilibili_attempt_summary(&verbose, &snapshot));
+        assert!(message.starts_with("Failed job #2: Bilibili download\nSeason"));
+        assert!(
+            message.contains("Downloaded pending mux/publication/verification: 16; verified: 0")
+        );
+        assert!(message.contains("Failed: 1; not started: 186"));
+        assert!(message.contains("Failed episodes: 17"));
+        assert!(message.contains("last reported stage: danmaku"));
+        assert!(message.find("Failed episodes: 17").unwrap() < message.find("HTTP 403").unwrap());
+    }
 
     #[test]
     fn queue_task_callbacks_carry_generation_within_telegram_limit() {

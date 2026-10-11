@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
+use crate::bilibili_attempt::{
+    BilibiliAttemptOutcome, BilibiliAttemptSnapshot, BilibiliAttemptUpdate,
+};
 use crate::config::AppConfig;
 use crate::file_provider::{
     QueueFileProvider, classify_deadlock_error, is_deadlock_error, is_file_provider_access_error,
@@ -157,6 +160,8 @@ pub struct TaskRecord {
     pub media_entries_total: usize,
     pub media_entries_completed: usize,
     pub media_entries_failed: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bilibili_attempt: Option<BilibiliAttemptSnapshot>,
     pub error: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
@@ -278,6 +283,7 @@ impl TaskRecord {
             media_entries_total: 1,
             media_entries_completed: 0,
             media_entries_failed: 0,
+            bilibili_attempt: None,
             error: None,
             created_at: now,
             updated_at: now,
@@ -522,6 +528,10 @@ impl QueueManager {
         record.cancel_requested = false;
         record.error = None;
         record.status_message_id = None;
+        if record.bilibili_attempt.take().is_some() {
+            record.media_entries_completed = 0;
+            record.media_entries_failed = 0;
+        }
         record.user_actions = record.user_actions.saturating_add(1);
         store.save_mutated_record(record, entry, true).map(Some)
     }
@@ -876,6 +886,43 @@ impl QueueManager {
         })
     }
 
+    pub fn set_bilibili_attempt_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        snapshot: BilibiliAttemptSnapshot,
+    ) -> Result<Option<TaskRecord>> {
+        self.update_if_generation(id, expected_generation, true, |record| {
+            if record.bilibili_attempt.is_none() && snapshot.outcome.is_none() {
+                record.media_entries_completed = 0;
+            }
+            record.media_entries_total = snapshot
+                .total_entries()
+                .saturating_add(snapshot.skipped_entries)
+                .max(1);
+            // Downloaded streams are not published, verified primary media.
+            record.media_entries_failed = snapshot.failed_entries();
+            record.bilibili_attempt = Some(snapshot);
+            Ok(())
+        })
+    }
+
+    pub fn update_bilibili_attempt_if_generation(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        index: u32,
+        update: &BilibiliAttemptUpdate,
+    ) -> Result<Option<TaskRecord>> {
+        self.update_if_generation(id, expected_generation, true, |record| {
+            if let Some(snapshot) = record.bilibili_attempt.as_mut() {
+                update.apply(snapshot, index);
+                record.media_entries_failed = snapshot.failed_entries();
+            }
+            Ok(())
+        })
+    }
+
     pub fn record_staging_path_if_generation(
         &self,
         id: &str,
@@ -1071,6 +1118,9 @@ impl QueueManager {
             bail!("task {id} changed state before output verification completed");
         }
         record.status = TaskStatus::Completed;
+        if let Some(snapshot) = record.bilibili_attempt.as_mut() {
+            snapshot.finish(BilibiliAttemptOutcome::Verified);
+        }
         record.error = None;
         record.saved_location = Some(saved_location);
         record.primary_media_hashes = persisted_hashes;
@@ -1534,6 +1584,13 @@ impl QueueManager {
                         record.status = TaskStatus::Interrupted;
                         record.cancel_requested = false;
                         record.error = Some("Task was interrupted by process restart.".to_string());
+                    }
+                    if let Some(snapshot) = record.bilibili_attempt.as_mut() {
+                        snapshot.finish(if record.status == TaskStatus::Cancelled {
+                            BilibiliAttemptOutcome::Cancelled
+                        } else {
+                            BilibiliAttemptOutcome::Interrupted
+                        });
                     }
                     store.save_mutated_record(record, entry, true)?;
                 }
@@ -2960,6 +3017,161 @@ mod tests {
 
     fn test_task(id: &str, job: JobRequest) -> TaskRecord {
         TaskRecord::new(id.to_string(), 1, 2, 123_456_789, Some(3), 0, job)
+    }
+
+    #[test]
+    fn bilibili_attempt_persists_partial_results_and_retry_resets_only_current_generation() {
+        use crate::router::BilibiliSelection;
+        let directory = temp_queue_root("episode-results");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = directory.join("videos");
+        config.downloads.pdf_dir = directory.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "episode-results",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        task.media_entries_completed = 2;
+        queue.create(task.clone()).unwrap();
+        let snapshot = BilibiliAttemptSnapshot::new(
+            "Season".into(),
+            [
+                (16, "Episode 16".into()),
+                (17, "Episode 17".into()),
+                (18, "Episode 18".into()),
+            ],
+            200,
+        );
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, snapshot.clone())
+            .unwrap()
+            .unwrap();
+        queue
+            .update_bilibili_attempt_if_generation(
+                &task.id,
+                0,
+                16,
+                &BilibiliAttemptUpdate::Completed,
+            )
+            .unwrap()
+            .unwrap();
+        queue
+            .update_bilibili_attempt_if_generation(&task.id, 0, 17, &BilibiliAttemptUpdate::Started)
+            .unwrap()
+            .unwrap();
+        queue
+            .update_bilibili_attempt_if_generation(
+                &task.id,
+                0,
+                17,
+                &BilibiliAttemptUpdate::Stage {
+                    stage: "danmaku".into(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let mut failed = queue
+            .get(&task.id)
+            .unwrap()
+            .unwrap()
+            .bilibili_attempt
+            .unwrap();
+        failed.finish(BilibiliAttemptOutcome::Failed);
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, failed.clone())
+            .unwrap()
+            .unwrap();
+        assert!(
+            queue
+                .set_bilibili_attempt_if_generation(&task.id, 1, snapshot)
+                .unwrap()
+                .is_none()
+        );
+        queue
+            .fail_if_generation(&task.id, 0, "HTTP 403".into())
+            .unwrap()
+            .unwrap();
+        drop(queue);
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.bilibili_attempt, Some(failed));
+        assert_eq!(restored.media_entries_total, 203);
+        assert_eq!(
+            restored.media_entries_completed, 0,
+            "downloaded streams are not verified published videos"
+        );
+        assert_eq!(restored.media_entries_failed, 1);
+        let retry = queue.claim_resume(&task.id, true).unwrap().unwrap();
+        assert_eq!(retry.generation, 1);
+        assert!(retry.bilibili_attempt.is_none());
+        assert_eq!(retry.media_entries_failed, 0);
+        assert!(
+            queue
+                .update_bilibili_attempt_if_generation(
+                    &task.id,
+                    0,
+                    18,
+                    &BilibiliAttemptUpdate::Failed
+                )
+                .unwrap()
+                .is_none()
+        );
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn bilibili_attempt_restart_preserves_downloaded_entries_without_reporting_them_verified() {
+        let directory = temp_queue_root("episode-results-restart");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = directory.join("videos");
+        config.downloads.pdf_dir = directory.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "episode-restart",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(crate::router::BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        let mut snapshot = BilibiliAttemptSnapshot::new(
+            "Season".into(),
+            [(16, "Episode 16".into()), (17, "Episode 17".into())],
+            0,
+        );
+        snapshot.entry_completed(16);
+        snapshot.entry_started(17);
+        task.bilibili_attempt = Some(snapshot);
+        queue.create(task.clone()).unwrap();
+        drop(queue);
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.status, TaskStatus::Interrupted);
+        let snapshot = restored.bilibili_attempt.unwrap();
+        assert_eq!(snapshot.outcome, Some(BilibiliAttemptOutcome::Interrupted));
+        assert_eq!(snapshot.downloaded_entries(), 1);
+        assert_eq!(snapshot.failed_entries(), 0);
+        assert!(snapshot.summary().contains("interrupted: 1"));
+        assert!(snapshot.summary().contains("verified: 0"));
+        let mut value = serde_json::to_value(task).unwrap();
+        value.as_object_mut().unwrap().remove("bilibili_attempt");
+        assert!(
+            serde_json::from_value::<TaskRecord>(value)
+                .unwrap()
+                .bilibili_attempt
+                .is_none()
+        );
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

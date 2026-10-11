@@ -30,6 +30,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, sleep_until, timeout as tokio_timeout};
 use tracing::info;
 
+use crate::bilibili_attempt::{BilibiliAttemptSnapshot, BilibiliAttemptUpdate};
 use crate::bilibili_auth;
 use crate::bilibili_core;
 use crate::bilibili_planning;
@@ -373,6 +374,13 @@ pub struct BilibiliCollectionProgressSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobProgressLifecycleEvent {
+    BilibiliAttempt {
+        snapshot: BilibiliAttemptSnapshot,
+    },
+    BilibiliEntry {
+        index: u32,
+        update: BilibiliAttemptUpdate,
+    },
     StagingAttempt {
         path: PathBuf,
     },
@@ -401,6 +409,7 @@ pub enum JobProgressLifecycleEvent {
 pub struct JobProgressSender {
     latest: watch::Sender<Option<JobProgress>>,
     lifecycle: mpsc::UnboundedSender<JobProgressLifecycleEvent>,
+    attempt: Arc<StdMutex<Option<BilibiliAttemptSnapshot>>>,
 }
 
 #[derive(Debug)]
@@ -433,7 +442,33 @@ impl JobProgressSender {
     }
 
     pub fn send_lifecycle(&self, event: JobProgressLifecycleEvent) {
+        match &event {
+            JobProgressLifecycleEvent::BilibiliAttempt { snapshot } => {
+                *self
+                    .attempt
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot.clone());
+            }
+            JobProgressLifecycleEvent::BilibiliEntry { index, update } => {
+                if let Some(snapshot) = self
+                    .attempt
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_mut()
+                {
+                    update.apply(snapshot, *index);
+                }
+            }
+            _ => {}
+        }
         let _ = self.lifecycle.send(event);
+    }
+
+    pub fn bilibili_attempt_snapshot(&self) -> Option<BilibiliAttemptSnapshot> {
+        self.attempt
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -534,7 +569,11 @@ pub fn job_progress_channel() -> (JobProgressSender, JobProgressReceiver) {
     let (latest, receiver) = watch::channel(None);
     let (lifecycle, lifecycle_receiver) = mpsc::unbounded_channel();
     (
-        JobProgressSender { latest, lifecycle },
+        JobProgressSender {
+            latest,
+            lifecycle,
+            attempt: Arc::new(StdMutex::new(None)),
+        },
         JobProgressReceiver {
             latest: receiver,
             lifecycle: lifecycle_receiver,
@@ -4328,6 +4367,14 @@ async fn run_bilibili_job_locked(
             let ResolvedContent::Season(season) = &missing.resolved else {
                 bail!("missing Bilibili episode download requires a season URL");
             };
+            send_bilibili_attempt(
+                progress.as_ref(),
+                BilibiliAttemptSnapshot::new(
+                    redact_sensitive_text(&season.season.title),
+                    std::iter::empty(),
+                    skipped_entries,
+                ),
+            );
             return Ok(BilibiliJobOutcome::AlreadyComplete(JobReport {
                 saved_location: if existing_media_paths.len() == 1 {
                     existing_media_paths[0].display().to_string()
@@ -4419,6 +4466,21 @@ async fn run_bilibili_job_locked(
                 .unwrap_or_default(),
             media_summary,
         ]),
+    );
+    let skipped_entries = collection_manifest.as_ref().map_or_else(
+        || missing_season_summary.map_or(0, |(_, skipped)| skipped),
+        |manifest| manifest.skipped_entries,
+    );
+    send_bilibili_attempt(
+        progress.as_ref(),
+        BilibiliAttemptSnapshot::new(
+            redact_sensitive_text(&core_plan.title),
+            core_plan
+                .entries
+                .iter()
+                .map(|entry| (entry.index, redact_sensitive_text(&entry.title))),
+            skipped_entries,
+        ),
     );
     let progress_reporter = BilibiliCoreProgress::new(progress.clone(), collection_progress);
     let command_started_at = SystemTime::now();
@@ -4732,6 +4794,36 @@ impl BilibiliCollectionProgress {
 
 impl DownloadProgressSink for BilibiliCoreProgress {
     fn on_download_progress(&self, event: &DownloadProgressEvent) {
+        if let Some(progress) = self.progress.as_ref() {
+            let update = match event {
+                DownloadProgressEvent::EntryStarted { index, .. } => {
+                    Some((*index, BilibiliAttemptUpdate::Started))
+                }
+                DownloadProgressEvent::FileStarted {
+                    entry_index, kind, ..
+                }
+                | DownloadProgressEvent::FileFailed {
+                    entry_index, kind, ..
+                } => Some((
+                    *entry_index,
+                    BilibiliAttemptUpdate::Stage {
+                        stage: bilibili_file_kind(kind).to_string(),
+                    },
+                )),
+                DownloadProgressEvent::EntryCompleted { index, .. } => {
+                    Some((*index, BilibiliAttemptUpdate::Completed))
+                }
+                DownloadProgressEvent::EntryFailed { index, .. } => {
+                    Some((*index, BilibiliAttemptUpdate::Failed))
+                }
+                _ => None,
+            };
+            if let Some((index, update)) = update
+                && progress.bilibili_attempt_snapshot().is_some()
+            {
+                progress.send_lifecycle(JobProgressLifecycleEvent::BilibiliEntry { index, update });
+            }
+        }
         let message = match event {
             DownloadProgressEvent::PlanStarted {
                 title, entry_count, ..
@@ -9532,6 +9624,12 @@ fn warn_recovered_overwrite(recovery: &str) {
     );
 }
 
+fn send_bilibili_attempt(progress: Option<&JobProgressSender>, snapshot: BilibiliAttemptSnapshot) {
+    if let Some(progress) = progress {
+        progress.send_lifecycle(JobProgressLifecycleEvent::BilibiliAttempt { snapshot });
+    }
+}
+
 fn send_progress(progress: Option<&JobProgressSender>, message: String) {
     if let Some(progress) = progress {
         let message = redact_sensitive_text(&message);
@@ -9634,7 +9732,9 @@ fn bilibili_collection_snapshot_from_event(
     event: &JobProgressLifecycleEvent,
 ) -> Option<BilibiliCollectionProgressSnapshot> {
     match event {
-        JobProgressLifecycleEvent::StagingAttempt { .. } => None,
+        JobProgressLifecycleEvent::StagingAttempt { .. }
+        | JobProgressLifecycleEvent::BilibiliAttempt { .. }
+        | JobProgressLifecycleEvent::BilibiliEntry { .. } => None,
         JobProgressLifecycleEvent::Resolved { snapshot, .. }
         | JobProgressLifecycleEvent::EntryStarted { snapshot, .. }
         | JobProgressLifecycleEvent::EntryCompleted { snapshot, .. }
@@ -11312,6 +11412,14 @@ impl ProgressTracker {
 
         if let Some(output) = &self.last_output {
             lines.push(format!("Last output: {output}"));
+        }
+
+        if let Some(snapshot) = self
+            .progress
+            .as_ref()
+            .and_then(JobProgressSender::bilibili_attempt_snapshot)
+        {
+            lines.insert(0, snapshot.summary());
         }
 
         lines.join("\n")
@@ -17544,6 +17652,108 @@ mod tests {
         assert_eq!(
             update.resolved_summary.as_deref(),
             Some("Estimated media: 4.0 MiB")
+        );
+    }
+
+    #[tokio::test]
+    async fn bilibili_attempt_wire_preserves_partial_counts_across_fragmented_delta_events() {
+        let (progress, mut receiver) = job_progress_channel();
+        let mut tracker = ProgressTracker::new(
+            "BBDown-rust".into(),
+            Duration::from_secs(30),
+            Some(progress.clone()),
+        );
+        let initial = JobProgressLifecycleEvent::BilibiliAttempt {
+            snapshot: BilibiliAttemptSnapshot::new(
+                "Season".into(),
+                (1..=203).map(|index| (index, format!("Episode {index}"))),
+                0,
+            ),
+        };
+        let mut events = vec![initial];
+        for index in 1..=16 {
+            events.push(JobProgressLifecycleEvent::BilibiliEntry {
+                index,
+                update: BilibiliAttemptUpdate::Started,
+            });
+            events.push(JobProgressLifecycleEvent::BilibiliEntry {
+                index,
+                update: BilibiliAttemptUpdate::Completed,
+            });
+        }
+        events.push(JobProgressLifecycleEvent::BilibiliEntry {
+            index: 17,
+            update: BilibiliAttemptUpdate::Started,
+        });
+        events.push(JobProgressLifecycleEvent::BilibiliEntry {
+            index: 17,
+            update: BilibiliAttemptUpdate::Stage {
+                stage: "danmaku".into(),
+            },
+        });
+        events.push(JobProgressLifecycleEvent::BilibiliEntry {
+            index: 17,
+            update: BilibiliAttemptUpdate::Failed,
+        });
+        for event in events {
+            let wire = format!("{}\n", bilibili_progress_event_wire(&event));
+            for fragment in wire.as_bytes().chunks(17) {
+                tracker.observe(CommandStream::Stdout, fragment);
+            }
+        }
+        let snapshot = progress.bilibili_attempt_snapshot().unwrap();
+        assert_eq!(snapshot.downloaded_entries(), 16);
+        assert_eq!(snapshot.failed_entries(), 1);
+        let summary = snapshot.summary();
+        assert!(summary.contains("not started: 186"));
+        assert!(summary.contains("Failed episodes: 17"));
+        assert!(summary.contains("last reported stage: danmaku"));
+        let latest = take_latest_progress(&mut receiver);
+        assert!(latest.message.contains(&summary));
+        assert!(latest.collection.is_none());
+    }
+
+    #[test]
+    fn bilibili_core_file_retry_does_not_mark_episode_failed() {
+        let (progress, _) = job_progress_channel();
+        send_bilibili_attempt(
+            Some(&progress),
+            BilibiliAttemptSnapshot::new("Season".into(), [(17, "Episode 17".into())], 0),
+        );
+        let sink = BilibiliCoreProgress::new(Some(progress.clone()), None);
+        sink.on_download_progress(&DownloadProgressEvent::EntryStarted {
+            index: 17,
+            title: "Episode 17".into(),
+            directory: PathBuf::from("episode17"),
+        });
+        sink.on_download_progress(&DownloadProgressEvent::FileFailed {
+            entry_index: 17,
+            entry_title: "Episode 17".into(),
+            kind: DownloadFileKind::Danmaku,
+            path: PathBuf::from("episode17/danmaku.xml"),
+            attempt: 1,
+            max_attempts: 3,
+            error: "HTTP 403".into(),
+        });
+        assert_eq!(
+            progress
+                .bilibili_attempt_snapshot()
+                .unwrap()
+                .failed_entries(),
+            0
+        );
+        sink.on_download_progress(&DownloadProgressEvent::EntryFailed {
+            index: 17,
+            title: "Episode 17".into(),
+            directory: PathBuf::from("episode17"),
+            error: "HTTP 403".into(),
+        });
+        assert_eq!(
+            progress
+                .bilibili_attempt_snapshot()
+                .unwrap()
+                .failed_entries(),
+            1
         );
     }
 
