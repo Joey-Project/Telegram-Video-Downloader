@@ -90,6 +90,7 @@ fn retry_or_fail(
 
 fn is_shared_output_recovery_failure(chain: &str) -> bool {
     chain.contains("video output recovery scan is incomplete")
+        || chain.contains("shared output recovery failure: bilibili group publication receipt")
 }
 
 fn is_group_authentication_failure(chain: &str) -> bool {
@@ -386,6 +387,30 @@ mod tests {
                 delay: Duration::from_secs(20),
                 refresh_plan: false,
             }
+        );
+    }
+
+    #[test]
+    fn publication_receipt_failures_pause_even_with_an_http_error_in_the_chain() {
+        for reason in [
+            "identity mismatch",
+            "schema invalid",
+            "access denied",
+            "atomic persistence failed",
+        ] {
+            let error = anyhow!("HTTP 403 Forbidden").context(format!(
+                "shared output recovery failure: Bilibili group publication receipt {reason}"
+            ));
+            for retries_used in [0, MAX_ADDITIONAL_EPISODE_RETRIES] {
+                assert_eq!(
+                    classify_episode_failure(&error, retries_used),
+                    EpisodeFailureDisposition::PauseGroup
+                );
+            }
+        }
+        assert_eq!(
+            classify("HTTP 404 Not Found", 0),
+            EpisodeFailureDisposition::FailEntry
         );
     }
 

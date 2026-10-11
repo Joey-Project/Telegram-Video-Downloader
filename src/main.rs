@@ -1917,7 +1917,7 @@ fn queue_task_buttons(
                 .as_ref()
                 .is_some_and(|attempt| attempt.failed_entries() == 0) =>
         {
-            Some(("Resume remaining episodes", "resume"))
+            Some((episode_group_resume_label(record), "resume"))
         }
         TaskStatus::Failed | TaskStatus::PartiallyCompleted => Some((
             if record
@@ -2252,8 +2252,9 @@ fn task_status_label(status: TaskStatus) -> &'static str {
 
 fn render_restart_summary(summary: &RestartSummary) -> String {
     format!(
-        "Some tasks were interrupted by restart.\nJobs: {} interrupted, {} recently completed, {} recently failed.\nMedia entries: {} completed, {} remaining, {} failed.\nUse /queue to review and resume tasks.",
+        "Task queue after restart.\nJobs: {} interrupted, {} partially completed, {} recently completed, {} recently failed.\nMedia entries: {} completed, {} remaining, {} failed.\nUse /queue to review and resume tasks.",
         summary.interrupted_jobs,
+        summary.partially_completed_jobs,
         summary.recently_completed_jobs,
         summary.recently_failed_jobs,
         summary.completed_entries,
@@ -6812,10 +6813,15 @@ fn episode_group_terminal_keyboard(record: &TaskRecord) -> InlineKeyboardMarkup 
         || (matches!(
             record.status,
             TaskStatus::Failed | TaskStatus::PartiallyCompleted
-        ) && attempt.is_some_and(group_has_remaining_entries))
+        ) && attempt.is_some_and(|attempt| {
+            group_has_remaining_entries(attempt)
+                || (record.status == TaskStatus::PartiallyCompleted
+                    && attempt.independent_entries
+                    && attempt.failed_entries() == 0)
+        }))
     {
         rows.push(vec![InlineKeyboardButton {
-            text: "Resume remaining episodes".into(),
+            text: episode_group_resume_label(record).into(),
             callback_data: queue_callback_data("resume", &record.id, record.generation),
         }]);
     }
@@ -6832,6 +6838,23 @@ fn episode_group_terminal_keyboard(record: &TaskRecord) -> InlineKeyboardMarkup 
     rows.push(details);
     InlineKeyboardMarkup {
         inline_keyboard: rows,
+    }
+}
+
+fn episode_group_resume_label(record: &TaskRecord) -> &'static str {
+    if record.status == TaskStatus::PartiallyCompleted
+        && record.bilibili_attempt.as_ref().is_some_and(|attempt| {
+            attempt.independent_entries
+                && !attempt.entries.is_empty()
+                && attempt
+                    .entries
+                    .iter()
+                    .all(|entry| entry.state == BilibiliAttemptEntryState::Verified)
+        })
+    {
+        "Resume finalization"
+    } else {
+        "Resume remaining episodes"
     }
 }
 
@@ -6964,6 +6987,50 @@ mod episode_group_ui_tests {
             parse_queue_callback_data(&button.callback_data),
             Some(QueueCallbackAction::Retry { .. })
         )));
+    }
+
+    #[test]
+    fn restart_summary_distinguishes_settled_partial_results() {
+        let text = render_restart_summary(&RestartSummary {
+            chat_id: 42,
+            interrupted_jobs: 0,
+            partially_completed_jobs: 1,
+            recently_completed_jobs: 0,
+            recently_failed_jobs: 0,
+            completed_entries: 16,
+            remaining_entries: 0,
+            failed_entries: 1,
+        });
+        assert!(text.contains("0 interrupted, 1 partially completed"));
+        assert!(text.contains("16 completed, 0 remaining, 1 failed"));
+        assert!(!text.contains("interrupted by restart"));
+    }
+
+    #[test]
+    fn verified_partial_groups_offer_finalization_resume_on_both_messages() {
+        let mut record = record();
+        for entry in &mut record.bilibili_attempt.as_mut().unwrap().entries {
+            entry.state = BilibiliAttemptEntryState::Verified;
+        }
+        let terminal = episode_group_terminal_keyboard(&record);
+        let queue_buttons = queue_task_buttons(&record, 1, &queue_task_display(&record));
+        let terminal_buttons: Vec<_> = terminal.inline_keyboard.into_iter().flatten().collect();
+        for buttons in [&terminal_buttons, &queue_buttons] {
+            assert!(buttons.iter().any(|button| {
+                button.text.split(" · ").next() == Some("Resume finalization")
+                    && matches!(
+                        parse_queue_callback_data(&button.callback_data),
+                        Some(QueueCallbackAction::Resume {
+                            generation: u64::MAX,
+                            ..
+                        })
+                    )
+            }));
+            assert!(!buttons.iter().any(|button| matches!(
+                parse_queue_callback_data(&button.callback_data),
+                Some(QueueCallbackAction::Retry { .. })
+            )));
+        }
     }
 
     #[test]

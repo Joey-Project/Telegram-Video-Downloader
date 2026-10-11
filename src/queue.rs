@@ -240,6 +240,7 @@ pub struct TaskRecord {
 pub struct RestartSummary {
     pub chat_id: i64,
     pub interrupted_jobs: usize,
+    pub partially_completed_jobs: usize,
     pub recently_completed_jobs: usize,
     pub recently_failed_jobs: usize,
     pub completed_entries: usize,
@@ -1860,6 +1861,7 @@ impl QueueManager {
                 let summary = summaries.entry(chat_id).or_insert(RestartSummary {
                     chat_id,
                     interrupted_jobs: 0,
+                    partially_completed_jobs: 0,
                     recently_completed_jobs: 0,
                     recently_failed_jobs: 0,
                     completed_entries: 0,
@@ -1867,7 +1869,15 @@ impl QueueManager {
                     failed_entries: 0,
                 });
                 for record in chat_records {
-                    if record.status.is_unfinished() {
+                    if record.status == TaskStatus::PartiallyCompleted {
+                        summary.partially_completed_jobs += 1;
+                        summary.completed_entries += record.media_entries_completed;
+                        summary.failed_entries += record.media_entries_failed;
+                        summary.remaining_entries += record
+                            .media_entries_total
+                            .saturating_sub(record.media_entries_completed)
+                            .saturating_sub(record.media_entries_failed);
+                    } else if record.status.is_unfinished() {
                         summary.interrupted_jobs += 1;
                         summary.completed_entries += record.media_entries_completed;
                         summary.failed_entries += record.media_entries_failed;
@@ -3639,6 +3649,63 @@ mod tests {
     }
 
     #[test]
+    fn stable_partial_attempt_is_not_reported_as_interrupted_after_restart() {
+        let directory = temp_queue_root("partial-restart-summary");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = bilibili_task("partial-restart-summary");
+        task.status = TaskStatus::Running;
+        queue.create(task.clone()).unwrap();
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, grouped_attempt())
+            .unwrap()
+            .unwrap();
+        queue
+            .update_bilibili_attempt_batch_if_generation(
+                &task.id,
+                0,
+                &[
+                    (
+                        16,
+                        BilibiliAttemptUpdate::Verified {
+                            media_paths: vec![config.downloads.video_dir.join("episode-16.mp4")],
+                            hashes: BTreeMap::new(),
+                        },
+                    ),
+                    (
+                        17,
+                        BilibiliAttemptUpdate::Failure {
+                            error: "episode failed".into(),
+                            attempts: 1,
+                        },
+                    ),
+                ],
+            )
+            .unwrap()
+            .unwrap();
+        let partial = queue
+            .fail_if_generation(&task.id, 0, "episode failed".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(partial.status, TaskStatus::PartiallyCompleted);
+        drop(queue);
+
+        let queue = QueueManager::open(&config).unwrap();
+        let recovered = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(recovered.status, TaskStatus::PartiallyCompleted);
+        assert!(recovered.status.is_unfinished());
+        let summaries = queue.startup_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].interrupted_jobs, 0);
+        assert_eq!(summaries[0].partially_completed_jobs, 1);
+        assert_eq!(summaries[0].completed_entries, 1);
+        assert_eq!(summaries[0].failed_entries, 1);
+        assert_eq!(summaries[0].remaining_entries, 1);
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn accepted_group_inventory_rebuilds_entries_by_stable_media_id() {
         let directory = temp_queue_root("grouped-inventory-reconcile");
         let config = test_video_config(&directory);
@@ -3907,6 +3974,123 @@ mod tests {
         );
         assert_eq!(snapshot.entries[1].index, 102);
         assert_eq!(snapshot.entries[1].stable_media_id, "media-b");
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn accepted_plan_and_reload_preserve_scoped_retry_and_redownload_markers() {
+        let directory = temp_queue_root("grouped-scoped-retry-reconcile");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = bilibili_task("grouped-scoped-retry-reconcile");
+        task.status = TaskStatus::Running;
+        queue.create(task.clone()).unwrap();
+
+        let old_profile = "mode=all;quality=high";
+        let old_plan = grouped_plan(
+            "Season",
+            Some(old_profile),
+            &[(1, "Episode A", "media-a"), (2, "Episode B", "media-b")],
+        );
+        queue
+            .set_plan_if_generation(&task.id, 0, old_plan)
+            .unwrap()
+            .unwrap();
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [
+                (1, "Episode A".into(), Some("media-a".into())),
+                (2, "Episode B".into(), Some("media-b".into())),
+            ],
+            0,
+        );
+        attempt.media_profile = Some(old_profile.into());
+        attempt.entry_failed_with_error(1, 2, "retry target failed".into());
+        attempt.entry_verified_with_outputs(
+            2,
+            vec![config.downloads.video_dir.join("episode-b.mp4")],
+            BTreeMap::from([("episode-b".into(), "d".repeat(64))]),
+        );
+        attempt.prepare_resume(true);
+        assert_eq!(attempt.retry_indices, Some(vec![1]));
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, attempt)
+            .unwrap()
+            .unwrap();
+
+        let new_profile = "mode=audio-only;quality=preferred";
+        let proposed = grouped_plan(
+            "Season revised",
+            Some(new_profile),
+            &[
+                (20, "Episode B", "media-b"),
+                (10, "Episode A", "media-a"),
+                (30, "Episode C", "media-c"),
+            ],
+        );
+        let differences = queue
+            .set_plan_if_generation(&task.id, 0, proposed)
+            .unwrap()
+            .unwrap()
+            .1;
+        assert!(differences.contains(&"episode numbering"));
+        assert!(differences.contains(&"download requirements"));
+
+        let accepted = queue
+            .accept_proposed_plan_for_chat_if_generation(&task.id, 0, task.chat_id)
+            .unwrap()
+            .unwrap();
+        let accepted_snapshot = accepted.bilibili_attempt.unwrap();
+        assert_eq!(accepted_snapshot.retry_indices, Some(vec![10]));
+        assert_eq!(accepted_snapshot.entries[0].index, 20);
+        assert_eq!(accepted_snapshot.entries[0].stable_media_id, "media-b");
+        assert_eq!(
+            accepted_snapshot.entries[0].state,
+            BilibiliAttemptEntryState::Pending
+        );
+        assert!(accepted_snapshot.entries[0].requires_redownload);
+        assert!(
+            accepted_snapshot.entries[0]
+                .published_media_paths
+                .is_empty()
+        );
+        assert_eq!(accepted_snapshot.entries[1].index, 10);
+        assert_eq!(accepted_snapshot.entries[1].stable_media_id, "media-a");
+        assert_eq!(
+            accepted_snapshot.entries[1].state,
+            BilibiliAttemptEntryState::Pending
+        );
+        assert_eq!(accepted_snapshot.entries[2].index, 30);
+        assert_eq!(accepted_snapshot.entries[2].stable_media_id, "media-c");
+        assert!(!accepted_snapshot.entries[2].requires_redownload);
+        drop(queue);
+
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.status, TaskStatus::Interrupted);
+        let restored_snapshot = restored.bilibili_attempt.unwrap();
+        assert_eq!(restored_snapshot.retry_indices, Some(vec![10]));
+        assert_eq!(
+            restored_snapshot.entries[0].state,
+            BilibiliAttemptEntryState::Pending
+        );
+        assert!(restored_snapshot.entries[0].requires_redownload);
+        assert!(
+            restored_snapshot.entries[0]
+                .published_media_paths
+                .is_empty()
+        );
+        assert_eq!(
+            restored_snapshot.entries[1].state,
+            BilibiliAttemptEntryState::Pending
+        );
+        assert!(restored_snapshot.entries[1].requires_redownload);
+        assert_eq!(
+            restored_snapshot.entries[2].state,
+            BilibiliAttemptEntryState::Pending
+        );
+        assert!(!restored_snapshot.entries[2].requires_redownload);
         drop(queue);
         fs::remove_dir_all(directory).unwrap();
     }

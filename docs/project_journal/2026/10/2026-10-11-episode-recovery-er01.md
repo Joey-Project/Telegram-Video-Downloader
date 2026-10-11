@@ -38,10 +38,17 @@ offer a way to select failed episodes.
 - Reconcile approved inventory changes with saved episode state, invalidate
   receipts when media requirements change, and recover published outputs after
   interrupted completion bookkeeping. Reuse one existing-media index per run.
+- Preserve limited retry scopes by stable media identity across approved
+  inventory changes. Distinguish settled partial results from restart
+  interruptions, and offer finalization resume when all outputs are verified.
+- Bind artifact requirements to output receipts and persist one latest private
+  publication receipt per stable media identity and output root. Recovery does
+  not depend on optional NFO or sidecars; content hashes and bound path checks
+  distinguish invalid output from unreadable recovery state.
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed with 673 passed and 15 existing
+- Rust 1.95.0: all-target offline tests passed with 688 passed and 15 existing
   opt-in tests ignored. Offline build, all-target Clippy with warnings denied,
   formatting, diff checks, and project journal validation passed.
 - Regression tests exercise the actual episode driver through injected child
@@ -51,6 +58,11 @@ offer a way to select failed episodes.
 - Recovery regressions cover one shared index with new publication evidence,
   approved inventory growth and renumbering, media requirement changes,
   interrupted All publications, single-entry URLs, and zero-success failures.
+- Durable recovery regressions cover receipt persistence before the production
+  mover, NFO-disabled outputs, unchanged-content rematerialization, content
+  mutation, and unreadable receipt state. UI and state regressions preserve
+  retry scopes across inventory changes and expose finalization resume while
+  distinguishing settled partial results from restart interruptions.
 - State and mock Telegram tests cover independent completion counts, restart,
   error retention, progress-channel closure, paginated episode views, message
   reuse, stale generation callbacks, and cross-chat action rejection.

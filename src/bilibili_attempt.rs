@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 
 use crate::redaction::redact_sensitive_text;
@@ -450,6 +450,14 @@ impl BilibiliAttemptSnapshot {
         preserved_verified_ids: &std::collections::BTreeSet<String>,
         requires_redownload_ids: &std::collections::BTreeSet<String>,
     ) {
+        let scoped_media_ids = self.retry_indices.as_ref().map(|indices| {
+            self.entries
+                .iter()
+                .filter(|entry| indices.contains(&entry.index))
+                .map(|entry| entry.stable_media_id.clone())
+                .filter(|stable_media_id| !stable_media_id.is_empty())
+                .collect::<BTreeSet<_>>()
+        });
         let mut previous_by_id = BTreeMap::<String, VecDeque<_>>::new();
         for entry in std::mem::take(&mut self.entries) {
             if entry.stable_media_id.is_empty() {
@@ -506,7 +514,13 @@ impl BilibiliAttemptSnapshot {
             .filter(|entry| entry.already_present)
             .count();
         self.outcome = None;
-        self.retry_indices = None;
+        self.retry_indices = scoped_media_ids.map(|stable_media_ids| {
+            self.entries
+                .iter()
+                .filter(|entry| stable_media_ids.contains(&entry.stable_media_id))
+                .map(|entry| entry.index)
+                .collect()
+        });
         self.independent_entries = true;
         self.media_profile = media_profile;
     }
@@ -1228,6 +1242,134 @@ mod tests {
             BilibiliAttemptEntryState::Verified
         );
         assert_eq!(attempt.entries[3].state, BilibiliAttemptEntryState::Pending);
+    }
+
+    #[test]
+    fn reconcile_maps_failed_retry_scope_by_identity_after_reorder_and_addition() {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [
+                (1, "Episode A".into(), Some("media-a".into())),
+                (2, "Episode B".into(), Some("media-b".into())),
+                (3, "Episode C".into(), Some("media-c".into())),
+            ],
+            0,
+        );
+        attempt.entry_verified(1);
+        attempt.entry_failed_with_error(2, 2, "failed".into());
+        attempt.finish(BilibiliAttemptOutcome::PartiallyCompleted);
+        attempt.prepare_resume(true);
+        assert_eq!(attempt.retry_indices, Some(vec![2]));
+
+        attempt.reconcile_independent_inventory(
+            "Season revised".into(),
+            Some("profile-v1".into()),
+            [
+                (30, "Episode C".into(), "media-c".into()),
+                (20, "Episode B".into(), "media-b".into()),
+                (10, "Episode A".into(), "media-a".into()),
+                (40, "Episode D".into(), "media-d".into()),
+            ],
+            &BTreeSet::from(["media-a".to_string()]),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(attempt.retry_indices, Some(vec![20]));
+        assert_eq!(attempt.entries[0].state, BilibiliAttemptEntryState::Pending);
+        assert_eq!(attempt.entries[1].index, 20);
+        assert_eq!(attempt.entries[1].stable_media_id, "media-b");
+        assert_eq!(attempt.entries[1].state, BilibiliAttemptEntryState::Pending);
+        assert_eq!(attempt.entries[1].attempts, 2);
+        assert_eq!(
+            attempt.entries[2].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert_eq!(attempt.entries[2].stable_media_id, "media-a");
+        assert_eq!(attempt.entries[3].stable_media_id, "media-d");
+        assert_eq!(attempt.entries[3].state, BilibiliAttemptEntryState::Pending);
+    }
+
+    #[test]
+    fn reconcile_maps_single_episode_retry_scope_to_new_index() {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [
+                (17, "Episode A".into(), Some("media-a".into())),
+                (18, "Episode B".into(), Some("media-b".into())),
+            ],
+            0,
+        );
+        attempt.entry_failed_with_error(18, 1, "failed".into());
+        assert!(attempt.prepare_episode_retry(18));
+
+        attempt.reconcile_independent_inventory(
+            "Season revised".into(),
+            Some("profile-v1".into()),
+            [
+                (98, "Episode B".into(), "media-b".into()),
+                (97, "Episode A".into(), "media-a".into()),
+                (99, "Episode C".into(), "media-c".into()),
+            ],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(attempt.retry_indices, Some(vec![98]));
+        assert_eq!(attempt.entries[0].state, BilibiliAttemptEntryState::Pending);
+        assert_eq!(attempt.entries[1].state, BilibiliAttemptEntryState::Pending);
+        assert_eq!(attempt.entries[2].state, BilibiliAttemptEntryState::Pending);
+    }
+
+    #[test]
+    fn reconcile_keeps_empty_retry_scope_when_selected_episode_was_removed() {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [
+                (1, "Episode A".into(), Some("media-a".into())),
+                (2, "Episode B".into(), Some("media-b".into())),
+            ],
+            0,
+        );
+        attempt.entry_failed_with_error(2, 1, "failed".into());
+        attempt.prepare_resume(true);
+
+        attempt.reconcile_independent_inventory(
+            "Season reduced".into(),
+            Some("profile-v1".into()),
+            [(11, "Episode A".into(), "media-a".into())],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+
+        assert_eq!(attempt.retry_indices, Some(Vec::new()));
+        assert_eq!(attempt.entries.len(), 1);
+        assert_eq!(attempt.entries[0].state, BilibiliAttemptEntryState::Pending);
+    }
+
+    #[test]
+    fn reconcile_preserves_unrestricted_scope_for_legacy_snapshot_format() {
+        let attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [(1, "Episode A".into(), Some("media-a".into()))],
+            0,
+        );
+        let mut value = serde_json::to_value(attempt).unwrap();
+        value.as_object_mut().unwrap().remove("retry_indices");
+        value.as_object_mut().unwrap().remove("media_profile");
+        let mut legacy: BilibiliAttemptSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.retry_indices, None);
+
+        legacy.reconcile_independent_inventory(
+            "Season revised".into(),
+            Some("profile-v1".into()),
+            [
+                (1, "Episode A".into(), "media-a".into()),
+                (2, "Episode B".into(), "media-b".into()),
+            ],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(legacy.retry_indices, None);
     }
 
     #[test]
