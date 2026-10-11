@@ -6,10 +6,13 @@
 
 - 普通消息中的 Bilibili 链接通过 `BBDown-rust` 的 `bbdown-core` crate 解析和下载，保存到视频下载目录，并默认保留 XML/ASS 弹幕 sidecar。
 - Bilibili 番剧和 intl 链接走内嵌 plan/download API；`ss/md` 系列入口会先提示选择最新一集或全集。
+- 番剧按所选剧集分别规划播放地址，最多同时解析 2 集，每集有独立的 60 秒期限；全集不再共用一分钟总期限。规划进度显示已完成集数，单集失败或超时会报告具体集号并终止其他在途规划，结果仍按原剧集顺序下载。
+- 番剧全集命中已下载剧集时，可以选择 `Skip duplicates`，仅跳过当前 sidecar 精确匹配 CID/EPID、且音视频流满足下载模式的剧集，并继续下载其余集数；`Cancel entire job` 才会取消整个任务。跳过选择保存在队列中，恢复时会重新核对现有文件；若等待目录锁期间计划发生变化，任务会停止并提示重试，由队列重新验证计划。字幕、弹幕或封面单独下载模式不提供这个跳过选项。
 - 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
 - `/queue` 查看可操作的持久任务；可以恢复中断任务、重试失败任务或取消任务，`/queue history` 查看已完成和已取消记录。重启后需要重新选择的任务会重新显示选择项；下载计划或媒体规格变化时，bot 会暂停并要求确认。
+  队列会保留重复检查取得的标题；单条视频重复确认时会尝试补齐所选流的画质和预估体积，并标为 Preview。缺少精确流大小时，可以根据码率和时长显示标为 about 的估算值；失败或中断任务会显示原因，流信息不可获取时仍保留已取得的标题。预览不代替执行前的计划核验；旧记录没有保存详情时，需要 Resume/Retry 才能刷新。
 - macOS 上队列索引和记录通过 File Provider 协调读写，云端占位内容可在读取时按需物化。若系统无法协调访问，bot 会提示检查 Finder 中隐藏队列目录的下载状态并重试；读取失败不会清理队列或 staging 数据。
 - 普通消息中的 YouTube 链接调用 `yt-dlp`，保存到视频下载目录，并尽量写入 metadata、封面、字幕和媒体库 sidecar。
 - 普通消息会从整段文本里扫描 HTTP(S) URL；标题、说明和 URL 外层标点会被忽略。
@@ -39,7 +42,7 @@ cp config.example.toml config.toml
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
-重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 能由 NFO 或 info JSON sidecar 证明并唯一匹配一个现有文件时才允许覆盖，文件名里的 cid/epid 只用于重复提示。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。实际下载使用的 plan 还必须保留确认时的精确 cid/epid，否则任务中止。覆盖时，bot 会先把旧媒体及明确属于同 basename 的 sidecar 移入本次事务独占的隐藏备份目录，再从已取得的文件重建严格身份索引；无法明确归属的裸 `danmaku.*`、`subtitle-*` 或 `cover-*` 文件不会被旧文件清理误删。目标缺失、metadata 不可读、身份变化、路径被重新占用或新增歧义都会拒绝覆盖并尝试恢复原文件。如果单个已完成任务意外产出多个主媒体文件，bot 会保留旧文件并把全部新产物按“两者并存”提交，避免清理 staging 时丢失下载结果。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
+重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` metadata API 解析所选条目的 bvid、aid、cid 和 epid，不请求播放地址，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 能由 NFO 或 info JSON sidecar 证明并唯一匹配一个现有文件时才允许覆盖，文件名里的 cid/epid 只用于重复提示。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。实际下载使用的 plan 还必须保留确认时的精确 cid/epid，否则任务中止。覆盖时，bot 会先把旧媒体及明确属于同 basename 的 sidecar 移入本次事务独占的隐藏备份目录，再从已取得的文件重建严格身份索引；无法明确归属的裸 `danmaku.*`、`subtitle-*` 或 `cover-*` 文件不会被旧文件清理误删。目标缺失、metadata 不可读、身份变化、路径被重新占用或新增歧义都会拒绝覆盖并尝试恢复原文件。如果单个已完成任务意外产出多个主媒体文件，bot 会保留旧文件并把全部新产物按“两者并存”提交，避免清理 staging 时丢失下载结果。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
 覆盖按钮生成时会以 `O_NOFOLLOW` 打开并持有现有媒体文件，直到任务完成，避免确认后删除并复用 inode 的同路径文件继承覆盖授权。旧媒体备份保留原文件名；完整视频覆盖会先提交主媒体，再提交 sidecar，对每个已提交输出执行 `fsync`，然后为其在事务目录创建同 inode 的硬链接锚点，并以“完整写入临时文件后原子交换”的方式把 recovery manifest 从 `acquired` 切换为 `committed`。只有这些输出内容和 committed recovery state 都持久化后才会删除旧备份。旧备份全部安全清理前锚点始终存在，因此输出路径即使被删除也不能把已记录 inode 转让给无关替换文件。最后一次输出验证后，包含 manifest 和全部锚点的事务目录会整体原子移入受控删除隔离区；崩溃恢复不会看到只删除了一部分锚点的 committed 事务。bot 每次启动都会扫描这些受控事务；正常任务还会在持有跨进程输出锁时，把 `.telegram-video-downloader-control` 私有目录里的恢复状态通过原子文件替换写为 dirty，只有任务和恢复都干净结束后才写回 clean。控制目录由绑定根目录和控制目录 inode 的 owner 记录认证，状态文件要求私有权限且硬链接数为 1；升级时旧根目录 marker 只读检测并触发一次恢复扫描，不会被修改。后续任务只在标记不干净时再次递归恢复，避免每次下载前后都完整扫描媒体库。`acquired` 事务只在目标路径仍为空时回滚，路径被占用时保留全部对象供人工处理；v3 `committed` 事务只有在当前输出仍与持久锚点相同、且 manifest 身份一致时才完成清理；没有锚点的旧 v2 committed 事务会 fail closed 并保留备份。视频目录里的持久锁文件会跨 bot、`--replay-message` 和启动恢复进程串行化输出事务。无法识别的旧版备份目录、结构异常的事务和无关的不可读子目录会分别保留或跳过并写入日志，不会误删文件或阻止其他事务恢复。
 
@@ -54,6 +57,8 @@ staging 下载成功后会先持久化身份绑定的 `.retained.json`；Bilibil
 `bilibili.auth.credential_file` 是 `bbdown-core` credential 文件，默认写到 `~/.local/state/telegram-video-downloader/bbdown-credentials.json`；可选的 `credential_profile` 会选择同一文件里的 profile。`credential_file` 的直接父目录不能是符号链接；需要使用链接目录时，请配置其解析后的真实目录。`/bbdown login` 默认等同 `/bbdown login web`，会直接创建并轮询 Web QR；`/bbdown login tv` 会保存 TV 专用 `tv_access_key`；`/bbdown login access-key` 通过 BiliPlus 获取 Bilibili 授权 QR 和链接，用户使用 Bilibili app 扫码并确认后，bot 自动轮询并保存通用 `access_key`，不再要求复制 callback URL 或凭据消息。BiliPlus 会参与该授权流程；登录请求不携带现有 cookie 或 access key，二维码和授权结果不会写入普通日志。此流程受 `login_timeout_seconds` 限制，过期、失败和 `/bbdown logout` 会终止轮询；通用 access key 与 TV 专用 key 分开保存。`/bbdown status` 通过 crate API 检查 cookie、`access_key` 和 `tv_access_key`；`/bbdown logout` 清理当前 credential/profile，并兼容删除旧版 bot Web cookie state。legacy cookie migration、fresh login 和 logout 使用同一个常驻、`O_NOFOLLOW` 打开的跨进程锁文件。该文件通过两个交替写入、`fsync` 的固定大小槽位保存认证 epoch，并能从旧版有界 append log 自动迁移：登录开始时冻结当前 epoch，写入凭据前必须仍匹配；status、登录成功和 logout 的最终 Telegram 回复会在持有同一跨进程锁时重新核对 epoch。这样并行进程既不能在 logout 后用等待中的登录重新创建凭据，也不能在凭据变化后发送过期的“有效/成功”回复。
 
 `bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。进度通道只保留最新状态，Telegram 按该间隔合并刷新，不会因全集任务的高频事件积压消息。视频计划解析得到的媒体摘要会作为进度上下文保留，后续速度、文件增长、下载和 mux 阶段更新不会覆盖它。YouTube/PDF 外部命令会刷新文件增长快照；Bilibili 会转发 `bbdown-core` 的关键 plan、download 和 mux 阶段。`bot.command_timeout_seconds` 是单个外部命令的总超时；direct Bilibili 下载不受这个总时限约束，而是把 `bot.command_idle_timeout_seconds` 作为媒体读取 idle timeout 传给 `bbdown-core`。Bilibili API 请求仍受独立的 request timeout 约束，bot 调用的 ffmpeg 等外部命令仍受总超时和 idle timeout 约束。
+
+Video preparation and plan inspection also report metadata resolution, existing-media checks, and planned episode counts before media transfer begins. Slow duplicate checks show progress at the configured interval; checks that finish sooner add no progress notice. Queueing, planning, and downloading reuse the status message. Queue plan inspection and download share one coalescing progress channel and the same `bot.progress_update_seconds` timer. Slow planning updates include elapsed time. If no status message is available, the first successful progress send becomes the message reused by later edits; an edit failure defers replacement to a later progress update. Replacement messages are also reused for plan confirmation, cancellation, and the final result. Slow Telegram responses cannot trigger nearby catch-up edits.
 
 Bilibili 合集每轮执行只发送一条入队主消息和每个所选视频的一条状态消息；合集详情、进度、处理和最终结果编辑已有消息，下载完成后还会等待已发布文件校验。已存在且通过核验的视频显示跳过下载状态；取消时不为尚未开始的视频补发消息。通过 `/queue` 恢复或手动重试会开启新一轮，保留旧轮消息并创建新轮消息；网络和文件提供器的内部重试不会另开一轮。
 
@@ -144,4 +149,5 @@ uv run python -m unittest discover -s tests
 
 ```sh
 cargo test bilibili_fd_mux_preserves_streams_and_decodes_with_real_ffmpeg -- --ignored
+cargo test missing_season_probe_uses_actual_video_and_audio_streams -- --ignored
 ```

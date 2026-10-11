@@ -22,6 +22,8 @@ pub enum BilibiliSelection {
     Current,
     Latest,
     All,
+    /// Download all season episodes without exact existing media matches.
+    Missing,
     Page(u32),
     CurrentPage(u32),
 }
