@@ -11,6 +11,14 @@ use tokio::time::timeout;
 const MAX_EPISODE_PLANNING_CONCURRENCY: usize = 2;
 const EXISTING_MEDIA_CHECK_TIMEOUT: Duration = Duration::from_secs(6);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanningStage {
+    ResolvingMetadata,
+    ScanningExistingMedia,
+    PlanningEpisodes,
+    PlanComplete,
+}
+
 /// Resolves a Bilibili input and plans its selected download entries.
 ///
 /// Season episodes are planned independently with a per-entry timeout and a
@@ -24,6 +32,27 @@ pub async fn plan_download(
     per_entry_timeout: Duration,
     progress: impl Fn(usize, usize),
 ) -> Result<(DownloadPlan, ResolvedContent)> {
+    plan_download_with_progress(
+        client,
+        url,
+        selection,
+        mode,
+        per_entry_timeout,
+        progress,
+        |_, _, _| {},
+    )
+    .await
+}
+
+pub async fn plan_download_with_progress(
+    client: &BiliClient,
+    url: &str,
+    selection: Option<Selection>,
+    mode: DownloadMode,
+    per_entry_timeout: Duration,
+    progress: impl Fn(usize, usize),
+    stage_progress: impl Fn(PlanningStage, usize, usize),
+) -> Result<(DownloadPlan, ResolvedContent)> {
     let (plan, resolved, _) = plan_download_with_filter::<
         fn(EpisodeMetadata) -> std::future::Ready<Option<()>>,
         std::future::Ready<Option<()>>,
@@ -36,6 +65,7 @@ pub async fn plan_download(
         per_entry_timeout,
         progress,
         None,
+        stage_progress,
     )
     .await?;
     Ok((plan, resolved))
@@ -43,13 +73,15 @@ pub async fn plan_download(
 
 /// Resolves and plans a season while excluding entries selected by `is_existing`.
 /// Excluded entries are removed before any per-episode play URL is requested.
-pub async fn plan_download_filtered<F, Fut, E>(
+#[allow(clippy::too_many_arguments)]
+pub async fn plan_download_filtered_with_progress<F, Fut, E>(
     client: &BiliClient,
     url: &str,
     selection: Option<Selection>,
     mode: DownloadMode,
     per_entry_timeout: Duration,
     progress: impl Fn(usize, usize),
+    stage_progress: impl Fn(PlanningStage, usize, usize),
     is_existing: F,
 ) -> Result<(DownloadPlan, ResolvedContent, Vec<(EpisodeMetadata, E)>)>
 where
@@ -65,10 +97,12 @@ where
         per_entry_timeout,
         progress,
         Some(is_existing),
+        stage_progress,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn plan_download_with_filter<F, Fut, E>(
     client: &BiliClient,
     url: &str,
@@ -77,12 +111,14 @@ async fn plan_download_with_filter<F, Fut, E>(
     per_entry_timeout: Duration,
     progress: impl Fn(usize, usize),
     is_existing: Option<F>,
+    stage_progress: impl Fn(PlanningStage, usize, usize),
 ) -> Result<(DownloadPlan, ResolvedContent, Vec<(EpisodeMetadata, E)>)>
 where
     F: Fn(EpisodeMetadata) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Option<E>> + Send + 'static,
     E: Send + 'static,
 {
+    stage_progress(PlanningStage::ResolvingMetadata, 0, 0);
     let (input, resolved) = timeout(per_entry_timeout, async {
         let input = client.parse_input(url).await?;
         let resolved = client.resolve(input.clone(), selection.clone()).await?;
@@ -116,6 +152,16 @@ where
             )
         })?;
         progress(plan.entries.len(), plan.entries.len());
+        stage_progress(
+            PlanningStage::PlanningEpisodes,
+            plan.entries.len(),
+            plan.entries.len(),
+        );
+        stage_progress(
+            PlanningStage::PlanComplete,
+            plan.entries.len(),
+            plan.entries.len(),
+        );
         return Ok((plan, resolved, Vec::new()));
     };
 
@@ -123,6 +169,7 @@ where
     let selected_episodes = season.selected_episodes.clone();
     let total = selected_episodes.len();
     let evidence = if let Some(predicate) = is_existing {
+        stage_progress(PlanningStage::ScanningExistingMedia, 0, total);
         probe_existing_episodes(
             selected_episodes.clone(),
             per_entry_timeout.min(EXISTING_MEDIA_CHECK_TIMEOUT),
@@ -133,11 +180,14 @@ where
         (0..total).map(|_| None).collect()
     };
     let (episodes, skipped) = partition_existing_episodes(selected_episodes, evidence);
-    progress(0, total);
+    let planned_total = episodes.len();
+    stage_progress(PlanningStage::PlanningEpisodes, 0, planned_total);
+    progress(0, planned_total);
     if episodes.is_empty() {
         if skipped.is_empty() {
             return Err(anyhow!("season selection resolved to no episodes"));
         }
+        stage_progress(PlanningStage::PlanComplete, 0, planned_total);
         return Ok((
             DownloadPlan {
                 title: season_title,
@@ -172,11 +222,15 @@ where
                 Ok(plan.entries)
             }
         },
-        progress,
+        |done, task_total| {
+            progress(done, task_total);
+            stage_progress(PlanningStage::PlanningEpisodes, done, task_total);
+        },
     )
     .await?;
 
     let entries = plans.into_iter().flatten().collect();
+    stage_progress(PlanningStage::PlanComplete, planned_total, planned_total);
     Ok((
         DownloadPlan {
             title: season_title,

@@ -36,9 +36,9 @@ use crate::downloader::{
     BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
     JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, VideoDuplicate,
     VideoDuplicateAction, VideoDuplicateCheck, existing_bilibili_report_media_identities,
-    find_video_duplicate_with_probe, human_bytes, inspect_job_display_metadata, inspect_job_plan,
-    job_progress_channel, recover_pending_overwrite_transactions, run_bilibili_worker, run_job,
-    run_job_with_duplicate_action, run_video_job_staged_keep_both,
+    find_video_duplicate_with_probe_and_progress, human_bytes, inspect_job_display_metadata,
+    inspect_job_plan_with_progress, job_progress_channel, recover_pending_overwrite_transactions,
+    run_bilibili_worker, run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
     run_video_job_staged_keep_both_with_plan, sync_bilibili_rust_credentials,
     validate_existing_bilibili_report_for_completion,
 };
@@ -3564,12 +3564,49 @@ async fn process_job_after_duplicate_check(
         return;
     }
 
+    let preparing_message_id = match task_if_generation_with_retry_delay(
+        &queue,
+        &task_id,
+        generation,
+        context.queue_start_retry_delay,
+    )
+    .await
+    {
+        Ok(Some(task)) if task.status == TaskStatus::Preparing => task.status_message_id,
+        Ok(_) => return,
+        Err(err) => {
+            warn!(task_id, error = %err, "failed to read preparing progress message");
+            None
+        }
+    };
+    let (progress_tx, progress_rx) = job_progress_channel();
+    let progress_task = tokio::spawn(forward_preparation_progress(
+        telegram.clone(),
+        Arc::clone(&queue),
+        JobProgressContext {
+            chat_id,
+            job_id,
+            task_id: task_id.clone(),
+            generation,
+            job_label: job.label(),
+            is_collection: false,
+            status_message_id: preparing_message_id,
+            update_interval: Duration::from_secs(config.bot.progress_update_seconds),
+        },
+        progress_rx,
+    ));
+    progress_tx.send_replace(Some(JobProgress {
+        message: "Preparing video: waiting to check existing media".to_string(),
+        resolved_summary: None,
+        collection: None,
+    }));
     let duplicate_scan_permit = match Arc::clone(&context.job_dispatch.duplicate_scan_semaphore)
         .acquire_owned()
         .await
     {
         Ok(permit) => permit,
         Err(err) => {
+            finish_job_progress(progress_tx, progress_task).await;
             send_or_log(
                 &telegram,
                 chat_id,
@@ -3594,8 +3631,11 @@ async fn process_job_after_duplicate_check(
             return;
         }
     };
-    let duplicate_scan_result = find_video_duplicate_async(Arc::clone(&config), job.clone()).await;
+    let duplicate_scan_result =
+        find_video_duplicate_async(Arc::clone(&config), job.clone(), Some(progress_tx.clone()))
+            .await;
     drop(duplicate_scan_permit);
+    finish_job_progress(progress_tx, progress_task).await;
     let duplicate_scan_result = match duplicate_scan_result {
         Ok(check) => {
             if let Some(metadata) = check.display_metadata {
@@ -3731,8 +3771,9 @@ async fn inspect_and_preserve_job_plan(
     task_id: &str,
     generation: u64,
     job: &JobRequest,
+    progress: Option<JobProgressSender>,
 ) -> Result<PlanValidationSnapshot> {
-    let result = inspect_job_plan(config, job).await;
+    let result = inspect_job_plan_with_progress(config, job, progress).await;
     preserve_job_plan_result(
         queue,
         task_id,
@@ -3775,8 +3816,9 @@ async fn preserve_job_plan_result(
 async fn find_video_duplicate_async(
     config: Arc<AppConfig>,
     job: JobRequest,
+    progress: Option<JobProgressSender>,
 ) -> Result<VideoDuplicateCheck> {
-    find_video_duplicate_with_probe(&config, &job).await
+    find_video_duplicate_with_probe_and_progress(&config, &job, progress).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4111,7 +4153,7 @@ async fn queue_queued_task(
         }
     };
     let queued_text = format!("Queued job #{job_id}: {}", job.label());
-    let queued_message_id = if is_collection {
+    let queued_message_id = if is_collection || previous_status_message_id.is_some() {
         if let Some(message_id) = previous_status_message_id {
             edit_task_message_without_keyboard_if_current(
                 &context.queue,
@@ -5426,6 +5468,8 @@ async fn run_queued_job(
                         message,
                     )
                     .await;
+                } else {
+                    send_or_log(&telegram, chat_id, message).await;
                 }
             } else {
                 send_or_log(&telegram, chat_id, message).await;
@@ -5481,6 +5525,13 @@ async fn run_queued_job(
                                 format!("Canceled job #{job_id}: {}", job.label()),
                             )
                             .await;
+                        } else {
+                            send_or_log(
+                                &telegram,
+                                chat_id,
+                                format!("Canceled job #{job_id}: {}", job.label()),
+                            )
+                            .await;
                         }
                     }
                     Ok(_) => {}
@@ -5503,8 +5554,20 @@ async fn run_queued_job(
         }
     }
 
-    let status_message_id = if is_collection {
+    let mut status_message_id = if is_collection {
         queued_message_id
+    } else if let Some(message_id) = queued_message_id {
+        edit_task_message_if_current(
+            &queue,
+            &task_id,
+            generation,
+            &telegram,
+            chat_id,
+            message_id,
+            job_status_message(job_id, job.label(), "Started", None),
+        )
+        .await;
+        Some(message_id)
     } else {
         let message_id = send_or_log_message_id(
             &telegram,
@@ -5528,10 +5591,27 @@ async fn run_queued_job(
         message_id
     };
 
+    // Keep one progress channel, message, and ticker across planning and download.
+    let (progress_tx, progress_rx) = job_progress_channel();
+    let progress_task = tokio::spawn(forward_progress(
+        telegram.clone(),
+        Arc::clone(&queue),
+        JobProgressContext {
+            chat_id,
+            job_id,
+            task_id: task_id.clone(),
+            generation,
+            job_label: job.label(),
+            is_collection,
+            status_message_id,
+            update_interval: Duration::from_secs(config.bot.progress_update_seconds),
+        },
+        progress_rx,
+    ));
     let current_plan = tokio::select! {
         biased;
         _ = cancel.notified() => None,
-        result = inspect_and_preserve_job_plan(&config, &queue, &task_id, generation, &job) => Some(result),
+        result = inspect_and_preserve_job_plan(&config, &queue, &task_id, generation, &job, Some(progress_tx.clone())) => Some(result),
     };
     let Some(current_plan) = current_plan else {
         if let Err(err) = queue.finish_cancellation_if_generation(&task_id, generation) {
@@ -5539,8 +5619,9 @@ async fn run_queued_job(
         }
         drop(permit);
         let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+        status_message_id = finish_job_progress(progress_tx, progress_task).await;
+        let message = format!("Canceled job #{job_id}: {}", job.label());
         if let Some(message_id) = status_message_id {
-            let message = format!("Canceled job #{job_id}: {}", job.label());
             if is_collection {
                 edit_task_message_if_current(
                     &queue, &task_id, generation, &telegram, chat_id, message_id, message,
@@ -5549,6 +5630,8 @@ async fn run_queued_job(
             } else {
                 edit_or_send(&telegram, chat_id, message_id, message).await;
             }
+        } else {
+            send_or_log(&telegram, chat_id, message).await;
         }
         return;
     };
@@ -5559,6 +5642,7 @@ async fn run_queued_job(
             let _ = queue.fail_if_generation(&task_id, generation, truncate(&message));
             drop(permit);
             let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+            status_message_id = finish_job_progress(progress_tx, progress_task).await;
             let final_message = failed_job_message(job_id, job.label(), &message);
             if is_collection {
                 if let Some(message_id) = status_message_id {
@@ -5573,6 +5657,8 @@ async fn run_queued_job(
                     )
                     .await;
                 }
+            } else if let Some(message_id) = status_message_id {
+                edit_or_send(&telegram, chat_id, message_id, final_message).await;
             } else {
                 send_or_log(&telegram, chat_id, final_message).await;
             }
@@ -5585,12 +5671,14 @@ async fn run_queued_job(
             Ok(None) => {
                 drop(permit);
                 let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+                finish_job_progress(progress_tx, progress_task).await;
                 return;
             }
             Err(err) => {
                 let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
                 drop(permit);
                 warn!(task_id, error = %err, "task plan validation could not be persisted");
+                finish_job_progress(progress_tx, progress_task).await;
                 return;
             }
         };
@@ -5608,12 +5696,14 @@ async fn run_queued_job(
             warn!(task_id, error = %err, "failed to resolve task cancellation state");
             drop(permit);
             let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+            finish_job_progress(progress_tx, progress_task).await;
             return;
         }
     };
     if cancellation_finished {
         drop(permit);
         let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+        status_message_id = finish_job_progress(progress_tx, progress_task).await;
         let message = format!("Canceled job #{job_id}: {}", job.label());
         if let Some(message_id) = status_message_id {
             if is_collection {
@@ -5630,6 +5720,7 @@ async fn run_queued_job(
         return;
     }
     if !differences.is_empty() {
+        status_message_id = finish_job_progress(progress_tx, progress_task).await;
         let keyboard = task_action_keyboard(&[
             (
                 "Use updated plan".to_string(),
@@ -5701,22 +5792,6 @@ async fn run_queued_job(
         return;
     }
 
-    let (progress_tx, progress_rx) = job_progress_channel();
-    let progress_task = tokio::spawn(forward_progress(
-        telegram.clone(),
-        Arc::clone(&queue),
-        JobProgressContext {
-            chat_id,
-            job_id,
-            task_id: task_id.clone(),
-            generation,
-            job_label: job.label(),
-            is_collection,
-            status_message_id,
-            update_interval: Duration::from_secs(config.bot.progress_update_seconds),
-        },
-        progress_rx,
-    ));
     let completion_progress = progress_tx.clone();
     let result = release_download_permit_after(
         permit,
@@ -5772,14 +5847,16 @@ async fn run_queued_job(
         }
     }
     drop(completion_progress);
-    let collection_delivery = match progress_task.await {
-        Ok(delivery) => delivery,
+    let progress_result = match progress_task.await {
+        Ok(result) => result,
         Err(err) => {
             warn!(task_id, error = %err, "collection progress delivery task failed to join");
-            None
+            ProgressForwardResult::default()
         }
     };
-    let collection_status_message_id = collection_delivery
+    status_message_id = progress_result.main_delivery.message_id();
+    let collection_status_message_id = progress_result
+        .collection_delivery
         .as_ref()
         .and_then(|delivery| delivery.main_delivery.message_id())
         .or(status_message_id);
@@ -6004,7 +6081,7 @@ async fn run_queued_job(
     }
 
     if is_collection {
-        let mut delivery = collection_delivery.unwrap_or_default();
+        let mut delivery = progress_result.collection_delivery.unwrap_or_default();
         if let Some(message_id) = delivery.main_delivery.message_id().or(status_message_id) {
             delivery.main_delivery = ProgressDelivery::Edit(message_id);
         }
@@ -6075,12 +6152,27 @@ fn failed_job_message(job_id: u64, job_label: &str, error_chain: &str) -> String
     )
 }
 
+async fn finish_job_progress(
+    progress: JobProgressSender,
+    task: tokio::task::JoinHandle<ProgressForwardResult>,
+) -> Option<i64> {
+    // Drain pending edits before publishing a terminal state or confirmation.
+    drop(progress);
+    match task.await {
+        Ok(result) => result.main_delivery.message_id(),
+        Err(err) => {
+            warn!(error = %err, "planning progress delivery task failed to join");
+            None
+        }
+    }
+}
+
 async fn forward_progress(
     telegram: TelegramClient,
     queue: Arc<QueueManager>,
     context: JobProgressContext,
     progress_rx: JobProgressReceiver,
-) -> Option<CollectionProgressDelivery> {
+) -> ProgressForwardResult {
     forward_progress_with_retry_delay(
         telegram,
         queue,
@@ -6097,7 +6189,43 @@ async fn forward_progress_with_retry_delay(
     context: JobProgressContext,
     progress_rx: JobProgressReceiver,
     generation_retry_delay: Duration,
-) -> Option<CollectionProgressDelivery> {
+) -> ProgressForwardResult {
+    forward_progress_with_close_policy(
+        telegram,
+        queue,
+        context,
+        progress_rx,
+        generation_retry_delay,
+        true,
+    )
+    .await
+}
+
+async fn forward_preparation_progress(
+    telegram: TelegramClient,
+    queue: Arc<QueueManager>,
+    context: JobProgressContext,
+    progress_rx: JobProgressReceiver,
+) -> ProgressForwardResult {
+    forward_progress_with_close_policy(
+        telegram,
+        queue,
+        context,
+        progress_rx,
+        QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
+        false,
+    )
+    .await
+}
+
+async fn forward_progress_with_close_policy(
+    telegram: TelegramClient,
+    queue: Arc<QueueManager>,
+    context: JobProgressContext,
+    progress_rx: JobProgressReceiver,
+    generation_retry_delay: Duration,
+    flush_on_close: bool,
+) -> ProgressForwardResult {
     let JobProgressContext {
         chat_id,
         job_id,
@@ -6141,8 +6269,8 @@ async fn forward_progress_with_retry_delay(
             break;
         }
         if !latest_open && !lifecycle_open {
-            if let Some(progress) = pending.take() {
-                let _ = deliver_pending_progress(
+            if flush_on_close && let Some(progress) = pending.take() {
+                status_delivery = deliver_pending_progress(
                     delivery_context,
                     status_delivery,
                     &mut collection_delivery,
@@ -6215,10 +6343,15 @@ async fn forward_progress_with_retry_delay(
                     &mut collection_delivery,
                     progress,
                 ).await;
+                // Slow API calls must not turn missed ticks into nearby edits.
+                ticker.reset();
             }
         }
     }
-    collection_delivery
+    ProgressForwardResult {
+        main_delivery: status_delivery,
+        collection_delivery,
+    }
 }
 
 fn persist_collection_progress(
@@ -7054,24 +7187,26 @@ async fn deliver_progress_message(
             if edit_or_log(context.telegram, context.chat_id, message_id, message).await {
                 return delivery;
             }
-            delivery = delivery.after_edit_result(false);
-            if !generation_is_current(context.queue, context.task_id, context.generation).await {
-                return delivery;
-            }
-            send_or_log(
-                context.telegram,
-                context.chat_id,
-                progress_fallback_message(context.job_id, fallback_progress),
-            )
-            .await;
+            // A replacement message must wait for the next progress interval.
+            return delivery.after_edit_result(false);
         }
         ProgressDelivery::Send => {
-            send_or_log(
+            if let Some(message_id) = send_or_log_message_id(
                 context.telegram,
                 context.chat_id,
                 progress_fallback_message(context.job_id, fallback_progress),
             )
-            .await;
+            .await
+            {
+                delivery = ProgressDelivery::Edit(message_id);
+                if let Err(err) = context.queue.set_status_message_id_if_generation(
+                    context.task_id,
+                    context.generation,
+                    message_id,
+                ) {
+                    warn!(task_id = context.task_id, error = %err, "failed to persist progress message association");
+                }
+            }
         }
     }
     delivery
@@ -7337,6 +7472,20 @@ struct CollectionProgressDelivery {
     details_token: Option<u64>,
     details_page: usize,
     overview: String,
+}
+
+struct ProgressForwardResult {
+    main_delivery: ProgressDelivery,
+    collection_delivery: Option<CollectionProgressDelivery>,
+}
+
+impl Default for ProgressForwardResult {
+    fn default() -> Self {
+        Self {
+            main_delivery: ProgressDelivery::Send,
+            collection_delivery: None,
+        }
+    }
 }
 
 impl Default for CollectionProgressDelivery {
@@ -7709,6 +7858,18 @@ mod tests {
         next_message_id: &mut i64,
         updates: Vec<serde_json::Value>,
     ) -> String {
+        if request.method == "editMessageText"
+            && request.body["message_id"].as_i64() == Some(-404_405)
+        {
+            let payload = serde_json::json!({
+                "ok": false, "error_code": 400, "description": "message to edit not found"
+            })
+            .to_string();
+            return format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+        }
         if request.method == "sendMessage" && request.body["chat_id"].as_i64() == Some(-404_404) {
             let payload = serde_json::json!({
                 "ok": false,
@@ -10929,6 +11090,7 @@ mod tests {
             .await
             .expect("progress forwarding should resume after the transient lookup error")
             .expect("progress forwarding task should not panic")
+            .collection_delivery
             .expect("resolved collection should retain its message tracker");
         assert_eq!(delivery.entries.len(), 1);
         assert_eq!(delivery.entries[&1].message_id, Some(1_000));
@@ -11030,9 +11192,548 @@ mod tests {
             .await
             .expect("stale progress forwarding should stop after retry")
             .expect("progress forwarding task should not panic")
+            .collection_delivery
             .expect("collection tracker should be returned");
         assert!(delivery.entries.is_empty());
         assert!(take_fake_telegram_requests(&mut requests).is_empty());
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn fast_preparation_progress_does_not_send_extra_notice_e2e() {
+        let task_id = "fast-preparing-progress";
+        let (queue_root, _config, queue, _file_provider) = generation_guard_collection_queue(
+            "fast-preparing-progress-e2e",
+            task_id,
+            964,
+            123_456_789,
+        );
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let (progress, receiver) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_preparation_progress(
+            telegram,
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id: 123_456_789,
+                job_id: 964,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: false,
+                status_message_id: None,
+                update_interval: Duration::from_secs(5),
+            },
+            receiver,
+        ));
+        progress.send_replace(Some(JobProgress {
+            message: "Resolving video metadata".to_string(),
+            resolved_summary: None,
+            collection: None,
+        }));
+        tokio_timeout(
+            Duration::from_secs(1),
+            finish_job_progress(progress, progress_task),
+        )
+        .await
+        .expect("fast inspection should close without waiting for the next update");
+        assert!(take_fake_telegram_requests(&mut requests).is_empty());
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn planning_and_download_progress_reuse_message_and_update_interval_e2e() {
+        let task_id = "planning-progress-reuse";
+        let job_id = 960;
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, _file_provider) = generation_guard_collection_queue(
+            "planning-progress-reuse-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        queue
+            .set_status(task_id, TaskStatus::Running, None)
+            .unwrap();
+        queue.set_status_message_id(task_id, 700).unwrap();
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let (progress, receiver) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress(
+            telegram,
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id,
+                job_id,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: false,
+                status_message_id: Some(700),
+                update_interval: Duration::from_millis(200),
+            },
+            receiver,
+        ));
+        for done in 0..=64 {
+            progress.send_replace(Some(JobProgress {
+                message: format!("Planning episodes: {done}/202"),
+                resolved_summary: None,
+                collection: None,
+            }));
+        }
+        assert!(
+            tokio_timeout(Duration::from_millis(75), requests.recv())
+                .await
+                .is_err()
+        );
+        let first = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(first.method, "editMessageText");
+        assert_eq!(first.body["message_id"].as_i64(), Some(700));
+        assert!(first.body["text"].as_str().unwrap().contains("64/202"));
+        for done in 1..=10 {
+            progress.send_replace(Some(JobProgress {
+                message: format!("Downloading video: {done}%"),
+                resolved_summary: Some("Season: 202 episodes".to_string()),
+                collection: None,
+            }));
+        }
+        assert!(
+            tokio_timeout(Duration::from_millis(75), requests.recv())
+                .await
+                .is_err()
+        );
+        let second = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(second.method, "editMessageText");
+        assert_eq!(second.body["message_id"].as_i64(), Some(700));
+        assert!(second.body["text"].as_str().unwrap().contains("10%"));
+        finish_job_progress(progress, progress_task).await;
+        assert!(take_fake_telegram_requests(&mut requests).is_empty());
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn progress_without_initial_message_sends_once_then_reuses_fallback_e2e() {
+        let task_id = "planning-progress-fallback";
+        let job_id = 961;
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, _file_provider) = generation_guard_collection_queue(
+            "planning-progress-fallback-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        queue
+            .set_status(task_id, TaskStatus::Running, None)
+            .unwrap();
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = ProgressDeliveryContext {
+            telegram: &telegram,
+            queue: &queue,
+            task_id,
+            generation: 0,
+            chat_id,
+            job_id,
+            job_label: "Bilibili download",
+        };
+        let delivery = deliver_progress_message(
+            context,
+            ProgressDelivery::Send,
+            "Planning episodes: 64/202".to_string(),
+            "Planning episodes: 64/202",
+        )
+        .await;
+        assert_eq!(delivery, ProgressDelivery::Edit(1_000));
+        assert_eq!(
+            queue.get(task_id).unwrap().unwrap().status_message_id,
+            Some(1_000)
+        );
+        let second_delivery = deliver_progress_message(
+            context,
+            delivery,
+            "Downloading video: 10%".to_string(),
+            "Downloading video: 10%",
+        )
+        .await;
+        assert_eq!(second_delivery, delivery);
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].method, "sendMessage");
+        assert_eq!(recorded[1].method, "editMessageText");
+        assert_eq!(recorded[1].body["message_id"].as_i64(), Some(1_000));
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn failed_progress_edit_defers_fallback_then_reuses_new_message_e2e() {
+        let task_id = "planning-progress-edit-failure";
+        let job_id = 965;
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, _file_provider) = generation_guard_collection_queue(
+            "planning-progress-edit-failure-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let (progress, receiver) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress(
+            telegram.clone(),
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id,
+                job_id,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: false,
+                status_message_id: Some(-404_405),
+                update_interval: Duration::from_millis(100),
+            },
+            receiver,
+        ));
+        progress.send_replace(Some(JobProgress {
+            message: "Planning episodes: 64/202".to_string(),
+            resolved_summary: None,
+            collection: None,
+        }));
+        let failed_update = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(failed_update.method, "editMessageText");
+        assert_eq!(failed_update.body["message_id"].as_i64(), Some(-404_405));
+        assert!(take_fake_telegram_requests(&mut requests).is_empty());
+        progress.send_replace(Some(JobProgress {
+            message: "Planning episodes: 65/202".to_string(),
+            resolved_summary: None,
+            collection: None,
+        }));
+        let replacement = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(replacement.method, "sendMessage");
+        progress.send_replace(Some(JobProgress {
+            message: "Planning episodes: 66/202".to_string(),
+            resolved_summary: None,
+            collection: None,
+        }));
+        let next_update = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(next_update.method, "editMessageText");
+        assert_eq!(next_update.body["message_id"].as_i64(), Some(1_000));
+        let message_id = finish_job_progress(progress, progress_task).await;
+        assert_eq!(message_id, Some(1_000));
+        edit_or_send(
+            &telegram,
+            chat_id,
+            message_id.unwrap(),
+            "Failed job #965".to_string(),
+        )
+        .await;
+        let terminal = collection_message_tests::receive_request(&mut requests).await;
+        assert_eq!(terminal.method, "editMessageText");
+        assert_eq!(terminal.body["message_id"].as_i64(), Some(1_000));
+        assert_eq!(terminal.body["text"].as_str(), Some("Failed job #965"));
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn progress_close_flush_returns_replacement_for_terminal_message_e2e() {
+        let task_id = "planning-progress-close-flush";
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, _file_provider) = generation_guard_collection_queue(
+            "planning-progress-close-flush-e2e",
+            task_id,
+            969,
+            chat_id,
+        );
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let (progress, receiver) = job_progress_channel();
+        let progress_task = tokio::spawn(forward_progress(
+            telegram.clone(),
+            Arc::clone(&queue),
+            JobProgressContext {
+                chat_id,
+                job_id: 969,
+                task_id: task_id.to_string(),
+                generation: 0,
+                job_label: "Bilibili download",
+                is_collection: false,
+                status_message_id: None,
+                update_interval: Duration::from_secs(5),
+            },
+            receiver,
+        ));
+        progress.send_replace(Some(JobProgress {
+            message: "Planning episodes: 1/202".to_string(),
+            resolved_summary: None,
+            collection: None,
+        }));
+        let message_id = tokio_timeout(
+            Duration::from_secs(2),
+            finish_job_progress(progress, progress_task),
+        )
+        .await
+        .expect("close flush should finish before the regular interval");
+        assert_eq!(message_id, Some(1_000));
+        assert_eq!(
+            queue.get(task_id).unwrap().unwrap().status_message_id,
+            message_id
+        );
+        edit_or_send(
+            &telegram,
+            chat_id,
+            message_id.unwrap(),
+            "Failed job #969".to_string(),
+        )
+        .await;
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].method, "sendMessage");
+        assert_eq!(recorded[1].method, "editMessageText");
+        assert_eq!(recorded[1].body["message_id"].as_i64(), Some(1_000));
+        assert_eq!(recorded[1].body["text"].as_str(), Some("Failed job #969"));
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn planning_failure_drains_progress_before_editing_terminal_status_e2e() {
+        let root = temp_main_test_dir("planning-failure-progress-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        config.tools.yt_dlp = root.join("missing-yt-dlp");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider;
+        let queue =
+            Arc::new(QueueManager::open_with_file_provider(&config, file_provider_trait).unwrap());
+        let task_id = "planning-failure-progress";
+        let chat_id = 123_456_789;
+        let job = JobRequest::Youtube {
+            url: "https://www.youtube.com/watch?v=planning-fixture".to_string(),
+        };
+        queue
+            .create(TaskRecord::new(
+                task_id.to_string(),
+                962,
+                963,
+                chat_id,
+                None,
+                0,
+                job.clone(),
+            ))
+            .unwrap();
+        queue.set_status(task_id, TaskStatus::Queued, None).unwrap();
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(963)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        tokio_timeout(
+            Duration::from_secs(5),
+            run_queued_job(
+                context,
+                Arc::new(Notify::new()),
+                chat_id,
+                962,
+                task_id.to_string(),
+                0,
+                None,
+                job,
+                JobRunMode::Direct,
+            ),
+        )
+        .await
+        .expect("failed inspection should close its progress forwarder");
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|r| r.method == "sendMessage")
+                .count(),
+            1
+        );
+        let edits = recorded
+            .iter()
+            .filter(|r| r.method == "editMessageText")
+            .collect::<Vec<_>>();
+        assert!(
+            edits.len() >= 2,
+            "planning should be visible before the failure notice"
+        );
+        assert!(
+            edits
+                .iter()
+                .all(|r| r.body["message_id"].as_i64() == Some(1_000))
+        );
+        assert!(edits[0].body["text"].as_str().unwrap().contains("metadata"));
+        assert!(
+            edits.last().unwrap().body["text"]
+                .as_str()
+                .unwrap()
+                .contains("Failed job #962")
+        );
+        assert_eq!(
+            queue.get(task_id).unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn plan_confirmation_sends_when_progress_delivery_rejects_dead_message_e2e() {
+        let root = temp_main_test_dir("plan-confirmation-dead-progress-message-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider;
+        let queue =
+            Arc::new(QueueManager::open_with_file_provider(&config, file_provider_trait).unwrap());
+        let task_id = "plan-confirmation-dead-progress-message";
+        let chat_id = 123_456_789;
+        let job = JobRequest::Pdf {
+            url: "https://example.test/report.pdf".to_string(),
+        };
+        let mut record = TaskRecord::new(
+            task_id.to_string(),
+            966,
+            967,
+            chat_id,
+            Some(42),
+            0,
+            job.clone(),
+        );
+        record.plan = Some(PlanValidationSnapshot {
+            stable_media_ids: vec!["pdf:previous-report.pdf".to_string()],
+            ..PlanValidationSnapshot::default()
+        });
+        queue.create(record).unwrap();
+        queue.set_status(task_id, TaskStatus::Queued, None).unwrap();
+        queue.set_status_message_id(task_id, -404_405).unwrap();
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(967)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        tokio_timeout(
+            Duration::from_secs(5),
+            run_queued_job(
+                context,
+                Arc::new(Notify::new()),
+                chat_id,
+                966,
+                task_id.to_string(),
+                0,
+                Some(-404_405),
+                job,
+                JobRunMode::Direct,
+            ),
+        )
+        .await
+        .expect("plan confirmation should finish after progress delivery drains");
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert!(recorded.iter().any(|request| {
+            request.method == "editMessageText"
+                && request.body["message_id"].as_i64() == Some(-404_405)
+        }));
+        let confirmation = recorded
+            .iter()
+            .find(|request| {
+                request.method == "sendMessage"
+                    && request.body["text"].as_str().is_some_and(|text| {
+                        text.contains("paused because its download plan changed")
+                    })
+            })
+            .expect("confirmation should be sent when the prior message is no longer editable");
+        assert!(confirmation.body["reply_markup"].is_object());
+        assert_eq!(
+            queue.get(task_id).unwrap().unwrap().status,
+            TaskStatus::AwaitingConfirmation
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_status_message_sends_cancellation_report_e2e() {
+        let task_id = "cancel-without-status-message";
+        let job_id = 968;
+        let chat_id = 123_456_789;
+        let (queue_root, config, queue, _file_provider) = generation_guard_collection_queue(
+            "cancel-without-status-message-e2e",
+            task_id,
+            job_id,
+            chat_id,
+        );
+        queue.set_status(task_id, TaskStatus::Queued, None).unwrap();
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let context = BotContext {
+            telegram,
+            config: Arc::new(config),
+            job_dispatch: JobDispatch {
+                download_semaphore: Arc::new(Semaphore::new(1)),
+                duplicate_scan_semaphore: Arc::new(Semaphore::new(1)),
+            },
+            next_job_id: Arc::new(AtomicU64::new(job_id + 1)),
+            queue: Arc::clone(&queue),
+            queue_start_retry_delay: Duration::ZERO,
+        };
+        let cancel = Arc::new(Notify::new());
+        cancel.notify_one();
+        tokio_timeout(
+            Duration::from_secs(5),
+            run_queued_job(
+                context,
+                cancel,
+                chat_id,
+                job_id,
+                task_id.to_string(),
+                0,
+                None,
+                queue.get(task_id).unwrap().unwrap().job,
+                JobRunMode::Direct,
+            ),
+        )
+        .await
+        .expect("preflight cancellation should finish");
+
+        let recorded = take_fake_telegram_requests(&mut requests);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].method, "sendMessage");
+        assert!(
+            recorded[0].body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Canceled job #968"))
+        );
 
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
@@ -11577,6 +12278,7 @@ mod tests {
             .await
             .expect("collection progress forwarding should finish within timeout")
             .expect("collection progress forwarding task should not panic")
+            .collection_delivery
             .expect("collection tracker should be returned");
         finalize_collection_messages(
             ProgressDeliveryContext {

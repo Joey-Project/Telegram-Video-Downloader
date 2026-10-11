@@ -1577,9 +1577,72 @@ pub async fn run_job(
     }
 }
 
-pub async fn inspect_job_plan(
+pub async fn inspect_job_plan_with_progress(
     config: &AppConfig,
     job: &JobRequest,
+    progress: Option<JobProgressSender>,
+) -> Result<PlanValidationSnapshot> {
+    let result = with_planning_heartbeat(
+        inspect_job_plan_inner(config, job, progress.clone()),
+        progress.clone(),
+        Duration::from_secs(config.bot.progress_update_seconds.max(1)),
+    )
+    .await;
+    if result.is_ok() {
+        send_progress(
+            progress.as_ref(),
+            "Plan complete (no media downloaded yet)".to_string(),
+        );
+    }
+    result
+}
+
+async fn with_planning_heartbeat<T, F>(
+    future: F,
+    progress: Option<JobProgressSender>,
+    interval: Duration,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let started = Instant::now();
+    let mut ticker = tokio::time::interval(interval.max(Duration::from_secs(1)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = ticker.tick() => {
+                refresh_planning_heartbeat(progress.as_ref(), started.elapsed());
+            }
+        }
+    }
+}
+
+fn strip_planning_elapsed(message: &str) -> String {
+    message
+        .lines()
+        .filter(|line| !line.starts_with("Planning elapsed: "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn refresh_planning_heartbeat(progress: Option<&JobProgressSender>, elapsed: Duration) {
+    if let Some(progress) = progress {
+        progress.send_modify(|current| {
+            if let Some(current) = current {
+                let base = strip_planning_elapsed(&current.message);
+                current.message = format!("{base}\nPlanning elapsed: {}s", elapsed.as_secs());
+            }
+        });
+    }
+}
+
+async fn inspect_job_plan_inner(
+    config: &AppConfig,
+    job: &JobRequest,
+    progress: Option<JobProgressSender>,
 ) -> Result<PlanValidationSnapshot> {
     match job {
         JobRequest::Pdf { url } => {
@@ -1599,8 +1662,13 @@ pub async fn inspect_job_plan(
             })
         }
         JobRequest::Youtube { url } => {
+            send_progress(
+                progress.as_ref(),
+                "Preparing download plan (no media downloaded yet): resolving YouTube metadata"
+                    .to_string(),
+            );
             let spec = youtube_metadata_command_spec(config, url);
-            let output = run_command(config, &spec, None).await?;
+            let output = run_command(config, &spec, progress.clone()).await?;
             if !output.status.success() {
                 bail!("yt-dlp metadata probe exited with status {}", output.status);
             }
@@ -1663,6 +1731,16 @@ pub async fn inspect_job_plan(
             Ok(snapshot)
         }
         JobRequest::Bilibili { url, selection } => {
+            send_progress(
+                progress.as_ref(),
+                if matches!(selection, Some(BilibiliSelection::Missing)) {
+                    "Preparing download plan (no media downloaded yet): checking existing media"
+                        .to_string()
+                } else {
+                    "Preparing download plan (no media downloaded yet): resolving Bilibili metadata"
+                        .to_string()
+                },
+            );
             sync_bilibili_rust_credentials(config).await?;
             let options = bilibili_core::download_options(config)?;
             let client = bilibili_core::client(config)?;
@@ -1676,16 +1754,20 @@ pub async fn inspect_job_plan(
                     &duplicate_scan_video_dir(config, job),
                     BILIBILI_METADATA_PROBE_TIMEOUT,
                     |_, _| {},
+                    |stage, done, total| {
+                        send_bilibili_planning_progress(progress.as_ref(), stage, done, total)
+                    },
                 )
                 .await?
                 .plan
             } else {
-                probe_bilibili_plan_with_mode(
+                probe_bilibili_plan_with_mode_and_progress(
                     &client,
                     url,
                     *selection,
                     options.mode,
                     BILIBILI_METADATA_PROBE_TIMEOUT,
+                    progress.as_ref(),
                 )
                 .await?
             };
@@ -1854,6 +1936,38 @@ pub async fn find_video_duplicate_with_probe(
     config: &AppConfig,
     job: &JobRequest,
 ) -> Result<VideoDuplicateCheck> {
+    find_video_duplicate_with_probe_and_progress(config, job, None).await
+}
+
+pub async fn find_video_duplicate_with_probe_and_progress(
+    config: &AppConfig,
+    job: &JobRequest,
+    progress: Option<JobProgressSender>,
+) -> Result<VideoDuplicateCheck> {
+    let result = with_planning_heartbeat(
+        find_video_duplicate_with_probe_inner(config, job, progress.clone()),
+        progress.clone(),
+        Duration::from_secs(config.bot.progress_update_seconds.max(1)),
+    )
+    .await;
+    if result.is_ok() {
+        send_progress(
+            progress.as_ref(),
+            "Duplicate check complete (no media downloaded yet)".to_string(),
+        );
+    }
+    result
+}
+
+async fn find_video_duplicate_with_probe_inner(
+    config: &AppConfig,
+    job: &JobRequest,
+    progress: Option<JobProgressSender>,
+) -> Result<VideoDuplicateCheck> {
+    send_progress(
+        progress.as_ref(),
+        "Preparing duplicate check (no media downloaded yet): scanning existing media".to_string(),
+    );
     let index = Arc::new(scan_video_identity_index(config, job).await?);
     let mut identities = video_identity(job).into_iter().collect::<Vec<_>>();
     let direct_overwrite_identities = identities
@@ -1868,12 +1982,25 @@ pub async fn find_video_duplicate_with_probe(
     let mut display_metadata = None;
 
     if let JobRequest::Bilibili { url, selection } = job {
+        send_progress(
+            progress.as_ref(),
+            "Preparing duplicate check (no media downloaded yet): resolving Bilibili metadata"
+                .to_string(),
+        );
         let probe_timeout = if direct_duplicate.is_some() {
             BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT
         } else {
             BILIBILI_METADATA_PROBE_TIMEOUT
         };
-        match probe_bilibili_duplicate_metadata(config, url, *selection, probe_timeout).await {
+        match probe_bilibili_duplicate_metadata(
+            config,
+            url,
+            *selection,
+            probe_timeout,
+            progress.as_ref(),
+        )
+        .await
+        {
             Ok(probe) => {
                 let plan = probe.plan;
                 push_bilibili_plan_identities(&mut identities, &plan);
@@ -1887,6 +2014,8 @@ pub async fn find_video_duplicate_with_probe(
                     let ffprobe = ffprobe_program(&config.tools.ffmpeg);
                     let probe_config = Arc::new(config.clone());
                     let mut duplicate_entries = 0;
+                    let mut checked_entries = 0;
+                    send_duplicate_entry_progress(progress.as_ref(), 0, plan.entries.len());
                     for batch in plan.entries.chunks(2) {
                         let mut probes = JoinSet::new();
                         for entry in batch {
@@ -1909,6 +2038,12 @@ pub async fn find_video_duplicate_with_probe(
                             if matches!(result, Ok(true)) {
                                 duplicate_entries += 1;
                             }
+                            checked_entries += 1;
+                            send_duplicate_entry_progress(
+                                progress.as_ref(),
+                                checked_entries,
+                                plan.entries.len(),
+                            );
                         }
                     }
                     skip_summary = (duplicate_entries > 0).then_some(BilibiliSkipSummary {
@@ -1956,7 +2091,7 @@ pub async fn find_video_duplicate_with_probe(
             .is_some_and(|metadata| metadata.stable_media_ids.len() == 1)
         && let Ok(Ok(plan)) = tokio_timeout(
             BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT,
-            inspect_job_plan(config, job),
+            inspect_job_plan_with_progress(config, job, progress.clone()),
         )
         .await
     {
@@ -1966,6 +2101,15 @@ pub async fn find_video_duplicate_with_probe(
         duplicate,
         display_metadata,
     })
+}
+
+fn send_duplicate_entry_progress(progress: Option<&JobProgressSender>, done: usize, total: usize) {
+    send_progress(
+        progress,
+        format!(
+            "Preparing duplicate check (no media downloaded yet): checked existing entries {done}/{total}"
+        ),
+    );
 }
 
 pub async fn inspect_job_display_metadata(
@@ -1980,6 +2124,7 @@ pub async fn inspect_job_display_metadata(
         url,
         *selection,
         BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT,
+        None,
     )
     .await?;
     Ok(Some(bilibili_metadata_display_snapshot(&metadata.plan)))
@@ -2805,6 +2950,7 @@ async fn plan_bilibili_missing_season(
     output_root: &Path,
     timeout: Duration,
     progress: impl Fn(usize, usize),
+    stage_progress: impl Fn(bilibili_planning::PlanningStage, usize, usize),
 ) -> Result<BilibiliMissingSeasonPlan> {
     if !bilibili_missing_skip_mode_supported(mode) {
         bail!(
@@ -2815,6 +2961,11 @@ async fn plan_bilibili_missing_season(
     let probe_config = Arc::new(config.clone());
     let output_root = output_root.to_path_buf();
     let primary_media_kind = bilibili_primary_media_kind(mode);
+    stage_progress(
+        bilibili_planning::PlanningStage::ScanningExistingMedia,
+        0,
+        0,
+    );
     let scan_permit = tokio_timeout(
         Duration::from_secs(6),
         bilibili_missing_validation_semaphore().acquire_owned(),
@@ -2835,13 +2986,14 @@ async fn plan_bilibili_missing_season(
         .context("Bilibili existing season media scan task failed")??;
     let index = Arc::new(index);
     let filter_index = Arc::clone(&index);
-    let (plan, resolved, skipped) = bilibili_planning::plan_download_filtered(
+    let (plan, resolved, skipped) = bilibili_planning::plan_download_filtered_with_progress(
         client,
         url,
         Some(Selection::All),
         mode,
         timeout,
         progress,
+        stage_progress,
         move |episode| {
             let entry = bilibili_entry_from_episode_metadata(&episode);
             let ffprobe = ffprobe.clone();
@@ -4146,13 +4298,9 @@ async fn run_bilibili_job_locked(
             &ffprobe_program(&config.tools.ffmpeg),
             worker_context.final_output_root.logical_root_path(),
             BILIBILI_METADATA_PROBE_TIMEOUT,
-            |done, total| {
-                send_progress(
-                    progress.as_ref(),
-                    format!(
-                        "BBDown-rust: planned missing episodes {done}/{total} (up to 2 at a time)"
-                    ),
-                );
+            |_, _| {},
+            |stage, done, total| {
+                send_bilibili_planning_progress(progress.as_ref(), stage, done, total)
             },
         )
         .await?;
@@ -8476,23 +8624,49 @@ async fn fetch_youtube_metadata(
     serde_json::from_str(json).context("failed to parse yt-dlp metadata JSON")
 }
 
-async fn probe_bilibili_plan_with_mode(
+async fn probe_bilibili_plan_with_mode_and_progress(
     client: &bbdown_core::BiliClient,
     url: &str,
     selection: Option<BilibiliSelection>,
     mode: DownloadMode,
     timeout: Duration,
+    progress: Option<&JobProgressSender>,
 ) -> Result<bbdown_core::DownloadPlan> {
-    bilibili_planning::plan_download(
+    bilibili_planning::plan_download_with_progress(
         client,
         url,
         bilibili_core::selection(selection),
         mode,
         timeout,
         |_, _| {},
+        |stage, done, total| send_bilibili_planning_progress(progress, stage, done, total),
     )
     .await
     .map(|(plan, _)| plan)
+}
+
+fn send_bilibili_planning_progress(
+    progress: Option<&JobProgressSender>,
+    stage: bilibili_planning::PlanningStage,
+    done: usize,
+    total: usize,
+) {
+    let message = match stage {
+        bilibili_planning::PlanningStage::ResolvingMetadata => {
+            "Preparing download plan (no media downloaded yet): resolving Bilibili metadata"
+                .to_string()
+        }
+        bilibili_planning::PlanningStage::ScanningExistingMedia => {
+            "Preparing download plan (no media downloaded yet): checking existing media".to_string()
+        }
+        bilibili_planning::PlanningStage::PlanningEpisodes => format!(
+            "Preparing download plan (no media downloaded yet): planning episodes {done}/{total}"
+        ),
+        bilibili_planning::PlanningStage::PlanComplete => {
+            "Plan complete (no media downloaded yet)".to_string()
+        }
+    };
+    send_progress(progress, message);
 }
 
 async fn probe_bilibili_duplicate_metadata(
@@ -8500,7 +8674,13 @@ async fn probe_bilibili_duplicate_metadata(
     url: &str,
     selection: Option<BilibiliSelection>,
     timeout: Duration,
+    progress: Option<&JobProgressSender>,
 ) -> Result<BilibiliDuplicateMetadataProbe> {
+    send_progress(
+        progress,
+        "Preparing duplicate check (no media downloaded yet): resolving Bilibili metadata"
+            .to_string(),
+    );
     sync_bilibili_rust_credentials(config).await?;
     let client = bilibili_core::client(config)?;
     let metadata = probe_bilibili_resolved_content(&client, url, selection, timeout).await?;
@@ -18709,6 +18889,7 @@ mod tests {
         )
         .expect("existing identity metadata should write");
 
+        let stages = StdMutex::new(Vec::new());
         let plan = tokio_timeout(
             Duration::from_secs(5),
             plan_bilibili_missing_season(
@@ -18720,11 +18901,29 @@ mod tests {
                 &output_dir,
                 Duration::from_secs(2),
                 |_, _| {},
+                |stage, done, total| stages.lock().unwrap().push((stage, done, total)),
             ),
         )
         .await
         .expect("mock planning should finish")
         .expect("missing season plan should succeed");
+        let stages = stages.into_inner().unwrap();
+        assert!(stages.contains(&(bilibili_planning::PlanningStage::ResolvingMetadata, 0, 0)));
+        assert!(stages.contains(&(
+            bilibili_planning::PlanningStage::ScanningExistingMedia,
+            0,
+            2
+        )));
+        let episode_stages = stages
+            .iter()
+            .filter(|(stage, _, _)| *stage == bilibili_planning::PlanningStage::PlanningEpisodes)
+            .collect::<Vec<_>>();
+        assert!(!episode_stages.is_empty());
+        assert!(episode_stages.iter().all(|(_, _, total)| *total == 1));
+        assert_eq!(
+            stages.last(),
+            Some(&(bilibili_planning::PlanningStage::PlanComplete, 1, 1))
+        );
 
         let complete_output_dir = temp_test_dir("missing-season-preflight-complete-output");
         fs::create_dir_all(&complete_output_dir).expect("complete output dir should create");
@@ -18750,6 +18949,7 @@ mod tests {
             &complete_output_dir,
             Duration::from_secs(2),
             |_, _| {},
+            |_, _, _| {},
         )
         .await
         .expect("fully existing season should still produce a plan snapshot");
@@ -25948,6 +26148,112 @@ mv video.original video.m4s || exit 46
 
         assert_eq!(take_latest_progress(&mut rx).message, "event 999");
         assert_no_progress(&rx);
+    }
+
+    #[test]
+    fn planning_progress_reports_episode_totals_and_completion() {
+        let (tx, mut rx) = job_progress_channel();
+        send_bilibili_planning_progress(
+            Some(&tx),
+            bilibili_planning::PlanningStage::PlanningEpisodes,
+            0,
+            4,
+        );
+        assert!(
+            take_latest_progress(&mut rx)
+                .message
+                .contains("planning episodes 0/4")
+        );
+        send_bilibili_planning_progress(
+            Some(&tx),
+            bilibili_planning::PlanningStage::PlanningEpisodes,
+            3,
+            4,
+        );
+        assert!(
+            take_latest_progress(&mut rx)
+                .message
+                .contains("planning episodes 3/4")
+        );
+        send_bilibili_planning_progress(
+            Some(&tx),
+            bilibili_planning::PlanningStage::PlanComplete,
+            4,
+            4,
+        );
+        let complete = take_latest_progress(&mut rx).message;
+        assert!(complete.contains("Plan complete"));
+        assert!(complete.contains("no media downloaded yet"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn planning_heartbeat_tracks_elapsed_time_and_stops_on_cancellation() {
+        let (tx, mut rx) = job_progress_channel();
+        tx.send_replace(Some(JobProgress {
+            message: "Planning episodes 2/5".to_string(),
+            resolved_summary: Some("Resolved title".to_string()),
+            collection: None,
+        }));
+        let _ = rx.borrow_and_update();
+
+        let heartbeat = tokio::spawn(with_planning_heartbeat(
+            std::future::pending::<Result<()>>(),
+            Some(tx.clone()),
+            Duration::from_secs(5),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !rx.has_changed()
+                .expect("progress receiver should remain open")
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(rx.has_changed().expect("heartbeat should update progress"));
+        let latest = rx
+            .borrow_and_update()
+            .clone()
+            .expect("progress should exist");
+        assert_eq!(
+            latest.message,
+            "Planning episodes 2/5\nPlanning elapsed: 5s"
+        );
+        assert_eq!(latest.resolved_summary.as_deref(), Some("Resolved title"));
+
+        heartbeat.abort();
+        assert!(
+            heartbeat
+                .await
+                .expect_err("pending heartbeat task should abort")
+                .is_cancelled()
+        );
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !rx.has_changed()
+                .expect("progress receiver should remain open")
+        );
+    }
+
+    #[test]
+    fn planning_heartbeat_refreshes_without_losing_counts_or_summary() {
+        let (tx, mut rx) = job_progress_channel();
+        tx.send_replace(Some(JobProgress {
+            message: "Planning episodes 2/5\nPlanning elapsed: 1s".to_string(),
+            resolved_summary: Some("Resolved title".to_string()),
+            collection: None,
+        }));
+
+        refresh_planning_heartbeat(Some(&tx), Duration::from_secs(7));
+        let latest = take_latest_progress(&mut rx);
+        assert_eq!(
+            latest.message,
+            "Planning episodes 2/5\nPlanning elapsed: 7s"
+        );
+        assert_eq!(latest.resolved_summary.as_deref(), Some("Resolved title"));
+        assert_eq!(latest.message.matches("Planning elapsed:").count(), 1);
     }
 
     #[test]
