@@ -548,6 +548,8 @@ struct BilibiliWorkerExpectedEntry {
     stable_media_id: String,
     #[serde(default)]
     output_template: Option<String>,
+    #[serde(default)]
+    collection_output_folder: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2220,6 +2222,16 @@ async fn run_bilibili_episode_group_with_inventory(
     let missing_selection = matches!(selection, Some(BilibiliSelection::Missing));
     let options = bilibili_core::download_options(config)?;
     let media_profile = bilibili_group_media_profile(&options, config);
+    let collection_output_folder = if inventory.source == BilibiliGroupSource::Collection {
+        Some(
+            inventory
+                .output_folder
+                .as_deref()
+                .context("Bilibili collection inventory omitted its selected output directory")?,
+        )
+    } else {
+        None
+    };
     validate_group_inventory_snapshot(
         &inventory,
         expected_plan.as_ref(),
@@ -2346,6 +2358,7 @@ async fn run_bilibili_episode_group_with_inventory(
                     .iter()
                     .find(|saved| saved.index == entry.download.index)
                     .expect("entry was just looked up"),
+                collection_output_folder,
             )
             .await
             {
@@ -2413,6 +2426,7 @@ async fn run_bilibili_episode_group_with_inventory(
                     &output_root_path,
                     &entry.download,
                     &saved_receipt,
+                    collection_output_folder,
                 )
                 .await
                 {
@@ -2474,6 +2488,7 @@ async fn run_bilibili_episode_group_with_inventory(
                 output_root_path.clone(),
                 entry.stable_media_id.clone(),
                 media_profile.clone(),
+                collection_output_folder.map(str::to_string),
             )
             .await
             {
@@ -2496,6 +2511,7 @@ async fn run_bilibili_episode_group_with_inventory(
                         &output_root_path,
                         &entry.download,
                         &receipt,
+                        collection_output_folder,
                     )
                     .await
                     {
@@ -2572,6 +2588,7 @@ async fn run_bilibili_episode_group_with_inventory(
                     &output_root_path,
                     &entry.download,
                     &prior_receipt,
+                    collection_output_folder,
                 )
                 .await
                 {
@@ -2720,6 +2737,11 @@ async fn run_bilibili_episode_group_with_inventory(
             attempt.copy_stage_from_progress(entry.download.index);
             match execution {
                 Ok(report) => {
+                    validate_bilibili_group_paths_in_collection_folder(
+                        &output_root_path,
+                        collection_output_folder,
+                        &report.primary_media_paths,
+                    )?;
                     attempt.update(
                         entry.download.index,
                         BilibiliAttemptUpdate::Stage {
@@ -2855,7 +2877,14 @@ async fn run_bilibili_episode_group_with_inventory(
             .find(|saved| saved.index == entry.download.index)
             .cloned()
             .context("verified Bilibili group entry disappeared before completion")?;
-        match revalidate_group_snapshot_entry(&output_root_path, &entry.download, &saved).await {
+        match revalidate_group_snapshot_entry(
+            &output_root_path,
+            &entry.download,
+            &saved,
+            collection_output_folder,
+        )
+        .await
+        {
             Ok(Some(_)) => {
                 for (path, hash) in saved.published_media_hashes {
                     if expected_media_hashes
@@ -3153,12 +3182,20 @@ async fn execute_bilibili_group_entry(
     let (url, selection) =
         bilibili_group_child_url_selection(inventory.source, entry, collection_page)?;
     let child_job = JobRequest::Bilibili { url, selection };
-    let expected_entry = BilibiliWorkerExpectedEntry {
-        index: entry.download.index,
-        title: entry.download.title.clone(),
-        stable_media_id: entry.stable_media_id.clone(),
-        output_template: inventory.output_template.clone(),
-    };
+    let expected_entry =
+        BilibiliWorkerExpectedEntry {
+            index: entry.download.index,
+            title: entry.download.title.clone(),
+            stable_media_id: entry.stable_media_id.clone(),
+            output_template: inventory.output_template.clone(),
+            collection_output_folder: if inventory.source == BilibiliGroupSource::Collection {
+                Some(inventory.output_folder.clone().context(
+                    "Bilibili collection inventory omitted its selected output directory",
+                )?)
+            } else {
+                None
+            },
+        };
     let child_media_profile =
         bilibili_group_media_profile(&bilibili_core::download_options(config)?, config);
     let (child_progress, child_receiver) = job_progress_channel();
@@ -3462,8 +3499,18 @@ async fn revalidate_group_snapshot_entry(
     output_root: &Path,
     entry: &BilibiliDownloadEntry,
     saved: &crate::bilibili_attempt::BilibiliAttemptEntry,
+    collection_output_folder: Option<&str>,
 ) -> Result<Option<BilibiliGroupOutputVerification>> {
     if saved.published_media_paths.is_empty() || saved.published_media_hashes.is_empty() {
+        return Ok(None);
+    }
+    let root = RootedFs::new(output_root)
+        .context("failed to bind output root while revalidating grouped media scope")?;
+    if !bilibili_group_paths_are_in_collection_folder(
+        &root,
+        collection_output_folder,
+        &saved.published_media_paths,
+    )? {
         return Ok(None);
     }
     let result = verify_group_output_paths(
@@ -3490,12 +3537,14 @@ async fn persist_bilibili_group_publication_receipt(
     media_profile: String,
     media_paths: Vec<PathBuf>,
 ) -> Result<BilibiliGroupPublicationReceipt> {
+    let collection_output_folder = expected_entry.collection_output_folder.clone();
     tokio::task::spawn_blocking(move || {
         persist_bilibili_group_publication_receipt_blocking(
             &output_root,
             &expected_entry.stable_media_id,
             &media_profile,
             &media_paths,
+            collection_output_folder.as_deref(),
         )
     })
     .await
@@ -3522,12 +3571,14 @@ async fn verify_bilibili_group_publication_plan_receipt(
     output_root: PathBuf,
     receipt: BilibiliGroupPublicationReceipt,
     published_paths: Vec<PathBuf>,
+    collection_output_folder: Option<String>,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         verify_bilibili_group_publication_plan_receipt_blocking(
             &output_root,
             &receipt,
             &published_paths,
+            collection_output_folder.as_deref(),
         )
     })
     .await
@@ -3539,12 +3590,14 @@ async fn load_bilibili_group_publication_receipt(
     output_root: PathBuf,
     stable_media_id: String,
     media_profile: String,
+    collection_output_folder: Option<String>,
 ) -> Result<BilibiliGroupReceiptLookup> {
     tokio::task::spawn_blocking(move || {
         load_bilibili_group_publication_receipt_blocking(
             &output_root,
             &stable_media_id,
             &media_profile,
+            collection_output_folder.as_deref(),
         )
     })
     .await
@@ -3583,7 +3636,20 @@ async fn verify_bilibili_group_publication_receipt(
     output_root: &Path,
     entry: &BilibiliDownloadEntry,
     receipt: &BilibiliGroupPublicationReceipt,
+    collection_output_folder: Option<&str>,
 ) -> Result<Option<BilibiliGroupOutputVerification>> {
+    if receipt.collection_output_folder.as_deref() != collection_output_folder {
+        return Ok(None);
+    }
+    let root = RootedFs::new(output_root)
+        .context("failed to bind output root while validating Bilibili group receipt scope")?;
+    if !bilibili_group_paths_are_in_collection_folder(
+        &root,
+        collection_output_folder,
+        &receipt.paths,
+    )? {
+        return Ok(None);
+    }
     let verified = match verify_group_output_paths(
         output_root.to_path_buf(),
         entry.clone(),
@@ -3607,6 +3673,7 @@ fn persist_bilibili_group_publication_receipt_blocking(
     stable_media_id: &str,
     media_profile: &str,
     media_paths: &[PathBuf],
+    collection_output_folder: Option<&str>,
 ) -> Result<BilibiliGroupPublicationReceipt> {
     if stable_media_id.trim().is_empty() || media_profile.trim().is_empty() {
         bail!("Bilibili group publication receipt has an empty stable identity or profile");
@@ -3645,6 +3712,11 @@ fn persist_bilibili_group_publication_receipt_blocking(
     if paths.is_empty() || paths.len() > BILIBILI_GROUP_RECEIPT_MAX_PATHS {
         bail!("Bilibili group publication receipt has an invalid normalized path count");
     }
+    if !bilibili_group_paths_are_in_collection_folder(&root, collection_output_folder, &paths)? {
+        bail!(
+            "Bilibili group publication receipt identity mismatch: media paths do not belong to the selected collection output directory"
+        );
+    }
     let hashes = crate::queue::hash_primary_media_with_expected_identities(
         output_root,
         &paths,
@@ -3658,10 +3730,16 @@ fn persist_bilibili_group_publication_receipt_blocking(
         root_inode: root.root_identity().inode(),
         stable_media_id: stable_media_id.to_string(),
         media_profile: media_profile.to_string(),
+        collection_output_folder: collection_output_folder.map(str::to_string),
         paths,
         hashes,
     };
-    persist_bilibili_group_publication_receipt_record(&root, stable_media_id, receipt)
+    persist_bilibili_group_publication_receipt_record(
+        &root,
+        stable_media_id,
+        collection_output_folder,
+        receipt,
+    )
 }
 
 fn persist_bilibili_group_publication_plan_receipt_blocking(
@@ -3670,6 +3748,7 @@ fn persist_bilibili_group_publication_plan_receipt_blocking(
     stable_media_id: &str,
     media_profile: &str,
     media_moves: &[(PathBuf, PathBuf)],
+    collection_output_folder: Option<&str>,
 ) -> Result<BilibiliGroupPublicationReceipt> {
     if stable_media_id.trim().is_empty() || media_profile.trim().is_empty() {
         bail!("Bilibili group publication receipt has an empty stable identity or profile");
@@ -3731,6 +3810,16 @@ fn persist_bilibili_group_publication_plan_receipt_blocking(
             .context("Bilibili group publication plan lost a source content hash")?;
         hashes.insert(destination.display().to_string(), source_hash.clone());
     }
+    let planned_paths = destinations.iter().cloned().collect::<Vec<_>>();
+    if !bilibili_group_paths_are_in_collection_folder(
+        &root,
+        collection_output_folder,
+        &planned_paths,
+    )? {
+        bail!(
+            "Bilibili group publication receipt identity mismatch: planned media paths do not belong to the selected collection output directory"
+        );
+    }
     root.validate_configured_root()?;
     let receipt = BilibiliGroupPublicationReceipt {
         version: BILIBILI_GROUP_RECEIPT_VERSION,
@@ -3738,16 +3827,23 @@ fn persist_bilibili_group_publication_plan_receipt_blocking(
         root_inode: root.root_identity().inode(),
         stable_media_id: stable_media_id.to_string(),
         media_profile: media_profile.to_string(),
+        collection_output_folder: collection_output_folder.map(str::to_string),
         paths: destinations.into_iter().collect(),
         hashes,
     };
-    persist_bilibili_group_publication_receipt_record(&root, stable_media_id, receipt)
+    persist_bilibili_group_publication_receipt_record(
+        &root,
+        stable_media_id,
+        collection_output_folder,
+        receipt,
+    )
 }
 
 fn verify_bilibili_group_publication_plan_receipt_blocking(
     output_root: &Path,
     receipt: &BilibiliGroupPublicationReceipt,
     published_paths: &[PathBuf],
+    collection_output_folder: Option<&str>,
 ) -> Result<()> {
     let root = RootedFs::new(output_root)
         .context("failed to bind output root while verifying Bilibili group publication")?;
@@ -3775,6 +3871,13 @@ fn verify_bilibili_group_publication_plan_receipt_blocking(
         identities.insert(logical, file.identity());
     }
     let paths = paths.into_iter().collect::<Vec<_>>();
+    if receipt.collection_output_folder.as_deref() != collection_output_folder
+        || !bilibili_group_paths_are_in_collection_folder(&root, collection_output_folder, &paths)?
+    {
+        bail!(
+            "Bilibili group publication receipt identity mismatch: published paths do not belong to the selected collection output directory"
+        );
+    }
     if paths != receipt.paths {
         bail!("published Bilibili media paths differ from the durable group receipt");
     }
@@ -3800,6 +3903,8 @@ fn validate_bilibili_group_publication_plan_mapping(
 ) -> Result<()> {
     if receipt.stable_media_id != expected_entry.stable_media_id
         || receipt.media_profile != media_profile
+        || receipt.collection_output_folder.as_deref()
+            != expected_entry.collection_output_folder.as_deref()
         || receipt.root_device != root.root_identity().device()
         || receipt.root_inode != root.root_identity().inode()
     {
@@ -3818,15 +3923,30 @@ fn validate_bilibili_group_publication_plan_mapping(
     if planned_paths.is_empty() || planned_paths != receipt_paths {
         bail!("Bilibili group publication destinations changed after receipt persistence");
     }
+    if !bilibili_group_paths_are_in_collection_folder(
+        root,
+        expected_entry.collection_output_folder.as_deref(),
+        &planned_paths.into_iter().collect::<Vec<_>>(),
+    )? {
+        bail!(
+            "Bilibili group publication receipt identity mismatch: planned paths do not belong to the selected collection output directory"
+        );
+    }
     Ok(())
 }
 
 fn persist_bilibili_group_publication_receipt_record(
     root: &RootedFs,
     stable_media_id: &str,
+    collection_output_folder: Option<&str>,
     receipt: BilibiliGroupPublicationReceipt,
 ) -> Result<BilibiliGroupPublicationReceipt> {
-    validate_bilibili_group_publication_receipt(root, stable_media_id, &receipt)?;
+    validate_bilibili_group_publication_receipt(
+        root,
+        stable_media_id,
+        collection_output_folder,
+        &receipt,
+    )?;
     let contents = serde_json::to_vec(&receipt)
         .context("failed to encode Bilibili group publication receipt")?;
     if contents.len() > BILIBILI_GROUP_RECEIPT_LIMIT {
@@ -3838,8 +3958,10 @@ fn persist_bilibili_group_publication_receipt_record(
 
     let directory = bilibili_group_receipt_directory(root, true)?
         .context("Bilibili group publication receipt directory disappeared")?;
-    let receipt_path = bilibili_group_receipt_path(&directory, stable_media_id);
-    let temp_path = bilibili_group_receipt_temp_path(&directory, stable_media_id);
+    let receipt_path =
+        bilibili_group_receipt_path(&directory, stable_media_id, collection_output_folder);
+    let temp_path =
+        bilibili_group_receipt_temp_path(&directory, stable_media_id, collection_output_folder);
     remove_stale_bilibili_group_receipt_temp(root, &temp_path)?;
     let receipt_entry = root.bind_entry(&receipt_path, false)?;
     let existing_identity = root.bound_entry_identity(&receipt_entry)?;
@@ -3851,7 +3973,12 @@ fn persist_bilibili_group_publication_receipt_record(
         let prior: BilibiliGroupPublicationReceipt =
             serde_json::from_slice(&existing.read_limited(BILIBILI_GROUP_RECEIPT_LIMIT)?)
                 .context("failed to parse prior Bilibili group publication receipt")?;
-        validate_bilibili_group_publication_receipt(root, stable_media_id, &prior)?;
+        validate_bilibili_group_publication_receipt(
+            root,
+            stable_media_id,
+            collection_output_folder,
+            &prior,
+        )?;
         let (_, identity) = root.replace_bound_file_atomically_if_identity(
             &receipt_entry,
             existing_identity,
@@ -3906,6 +4033,7 @@ fn load_bilibili_group_publication_receipt_blocking(
     output_root: &Path,
     stable_media_id: &str,
     media_profile: &str,
+    collection_output_folder: Option<&str>,
 ) -> Result<BilibiliGroupReceiptLookup> {
     let root = RootedFs::new(output_root)
         .context("failed to bind the output root for Bilibili group publication receipt lookup")?;
@@ -3913,7 +4041,7 @@ fn load_bilibili_group_publication_receipt_blocking(
     let Some(directory) = bilibili_group_receipt_directory(&root, false)? else {
         return Ok(BilibiliGroupReceiptLookup::Missing);
     };
-    let path = bilibili_group_receipt_path(&directory, stable_media_id);
+    let path = bilibili_group_receipt_path(&directory, stable_media_id, collection_output_folder);
     let Some(file) = root.open_bound_file(&path)? else {
         return Ok(BilibiliGroupReceiptLookup::Missing);
     };
@@ -3921,7 +4049,12 @@ fn load_bilibili_group_publication_receipt_blocking(
     let receipt: BilibiliGroupPublicationReceipt =
         serde_json::from_slice(&file.read_limited(BILIBILI_GROUP_RECEIPT_LIMIT)?)
             .context("failed to parse Bilibili group publication receipt")?;
-    validate_bilibili_group_publication_receipt(&root, stable_media_id, &receipt)?;
+    validate_bilibili_group_publication_receipt(
+        &root,
+        stable_media_id,
+        collection_output_folder,
+        &receipt,
+    )?;
     if root.entry_identity(&path)? != Some(file.identity()) {
         bail!("Bilibili group publication receipt changed while being read");
     }
@@ -3936,18 +4069,29 @@ fn load_bilibili_group_publication_receipt_blocking(
 fn validate_bilibili_group_publication_receipt(
     root: &RootedFs,
     stable_media_id: &str,
+    collection_output_folder: Option<&str>,
     receipt: &BilibiliGroupPublicationReceipt,
 ) -> Result<()> {
     if receipt.version != BILIBILI_GROUP_RECEIPT_VERSION
         || receipt.root_device != root.root_identity().device()
         || receipt.root_inode != root.root_identity().inode()
         || receipt.stable_media_id != stable_media_id
+        || receipt.collection_output_folder.as_deref() != collection_output_folder
         || receipt.media_profile.trim().is_empty()
         || receipt.paths.is_empty()
         || receipt.paths.len() > BILIBILI_GROUP_RECEIPT_MAX_PATHS
         || receipt.hashes.len() != receipt.paths.len()
     {
         bail!("Bilibili group publication receipt does not match its root or entry");
+    }
+    if !bilibili_group_paths_are_in_collection_folder(
+        root,
+        collection_output_folder,
+        &receipt.paths,
+    )? {
+        bail!(
+            "Bilibili group publication receipt identity mismatch: media paths do not belong to the selected collection output directory"
+        );
     }
     let mut paths = BTreeSet::new();
     for path in &receipt.paths {
@@ -3999,17 +4143,37 @@ fn bilibili_group_receipt_directory(
 fn bilibili_group_receipt_path(
     directory: &BilibiliGroupReceiptDirectory,
     stable_media_id: &str,
+    collection_output_folder: Option<&str>,
 ) -> PathBuf {
-    let key = format!("{:x}", Sha256::digest(stable_media_id.as_bytes()));
+    let key = bilibili_group_receipt_key(stable_media_id, collection_output_folder);
     directory.path.join(format!("{key}.json"))
 }
 
 fn bilibili_group_receipt_temp_path(
     directory: &BilibiliGroupReceiptDirectory,
     stable_media_id: &str,
+    collection_output_folder: Option<&str>,
 ) -> PathBuf {
-    let key = format!("{:x}", Sha256::digest(stable_media_id.as_bytes()));
+    let key = bilibili_group_receipt_key(stable_media_id, collection_output_folder);
     directory.path.join(format!(".{key}.next"))
+}
+
+fn bilibili_group_receipt_key(
+    stable_media_id: &str,
+    collection_output_folder: Option<&str>,
+) -> String {
+    let mut digest = Sha256::new();
+    if let Some(collection_output_folder) = collection_output_folder {
+        digest.update(b"bilibili-group-receipt\0collection\0");
+        digest.update((collection_output_folder.len() as u64).to_be_bytes());
+        digest.update(collection_output_folder.as_bytes());
+        digest.update((stable_media_id.len() as u64).to_be_bytes());
+        digest.update(stable_media_id.as_bytes());
+    } else {
+        // Keep the legacy key for non-collection receipts so existing recovery remains valid.
+        digest.update(stable_media_id.as_bytes());
+    }
+    format!("{:x}", digest.finalize())
 }
 
 fn remove_stale_bilibili_group_receipt_temp(root: &RootedFs, path: &Path) -> Result<()> {
@@ -10662,6 +10826,9 @@ async fn run_staged_video_job(
             final_dir.clone(),
             receipt.clone(),
             primary_media_paths.clone(),
+            expected_bilibili_entry
+                .as_ref()
+                .and_then(|entry| entry.collection_output_folder.clone()),
         )
         .await
     {
@@ -10821,6 +10988,58 @@ fn validate_already_complete_primary_media_paths(
         bail!("already-complete report contains no primary media for a media download");
     }
     Ok(false)
+}
+
+fn bilibili_group_collection_output_folder_path(
+    root: &RootedFs,
+    collection_output_folder: &str,
+) -> Result<PathBuf> {
+    let mut components = Path::new(collection_output_folder).components();
+    let Some(std::path::Component::Normal(name)) = components.next() else {
+        bail!("Bilibili collection output directory scope is not a direct child path");
+    };
+    if components.next().is_some() || name != std::ffi::OsStr::new(collection_output_folder) {
+        bail!("Bilibili collection output directory scope is not a direct child path");
+    }
+    Ok(root.logical_root_path().join(name))
+}
+
+fn bilibili_group_paths_are_in_collection_folder(
+    root: &RootedFs,
+    collection_output_folder: Option<&str>,
+    paths: &[PathBuf],
+) -> Result<bool> {
+    let Some(collection_output_folder) = collection_output_folder else {
+        return Ok(true);
+    };
+    let folder = bilibili_group_collection_output_folder_path(root, collection_output_folder)?;
+    for path in paths {
+        let Some(logical) = logical_download_root_path(root, path)? else {
+            return Ok(false);
+        };
+        if logical == folder || !logical.starts_with(&folder) {
+            return Ok(false);
+        }
+    }
+    Ok(!paths.is_empty())
+}
+
+fn validate_bilibili_group_paths_in_collection_folder(
+    output_root: &Path,
+    collection_output_folder: Option<&str>,
+    paths: &[PathBuf],
+) -> Result<()> {
+    if collection_output_folder.is_none() {
+        return Ok(());
+    }
+    let root = RootedFs::new(output_root)
+        .context("failed to bind output root while validating grouped media scope")?;
+    if !bilibili_group_paths_are_in_collection_folder(&root, collection_output_folder, paths)? {
+        bail!(
+            "Bilibili group publication receipt identity mismatch: media paths do not belong to the selected collection output directory"
+        );
+    }
+    Ok(())
 }
 
 fn logical_download_root_path(root: &RootedFs, path: &Path) -> Result<Option<PathBuf>> {
@@ -11781,6 +12000,8 @@ struct BilibiliGroupPublicationReceipt {
     root_inode: u64,
     stable_media_id: String,
     media_profile: String,
+    #[serde(default)]
+    collection_output_folder: Option<String>,
     paths: Vec<PathBuf>,
     hashes: BTreeMap<String, String>,
 }
@@ -17637,6 +17858,10 @@ where
             &receipt_context.expected_entry.stable_media_id,
             receipt_context.media_profile,
             &media_moves,
+            receipt_context
+                .expected_entry
+                .collection_output_folder
+                .as_deref(),
         ) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -19664,6 +19889,7 @@ mod tests {
             &entry.stable_media_id,
             media_profile,
             &[(source.clone(), media_path.clone())],
+            None,
         )
         .expect("durable publication plan should be saved before test publication");
         fs::rename(&source, &media_path).expect("test media should publish to its title path");
@@ -20502,6 +20728,9 @@ mod tests {
     fn durable_group_receipt_precedes_production_staged_publication_move() {
         let output_root = temp_test_dir("episode-group-receipt-before-move");
         let root = RootedFs::new(&output_root).expect("output root should bind");
+        let selected_folder = "selected-collection";
+        let collection_dir = output_root.join(selected_folder);
+        fs::create_dir(&collection_dir).expect("selected collection directory should exist");
         let staging =
             create_video_staging_dir(&root).expect("production staging directory should create");
         let staging_dir = staging.path().to_path_buf();
@@ -20518,15 +20747,17 @@ mod tests {
             title: entry.download.title.clone(),
             stable_media_id: entry.stable_media_id.clone(),
             output_template: None,
+            collection_output_folder: Some(selected_folder.to_string()),
         };
         let media_profile = "test-group-publication-profile-v2";
         let staged_files = vec![staged_media.clone()];
-        let expected_target = output_root.join("Episode 1.mkv");
+        let expected_target = collection_dir.join("Episode 1.mkv");
         assert!(staged_media.is_file());
         match load_bilibili_group_publication_receipt_blocking(
             &output_root,
             &expected_entry.stable_media_id,
             media_profile,
+            Some(selected_folder),
         )
         .expect("receipt lookup should succeed before publication")
         {
@@ -20538,6 +20769,16 @@ mod tests {
                 panic!("missing receipt cannot have a profile mismatch")
             }
         }
+        assert!(matches!(
+            load_bilibili_group_publication_receipt_blocking(
+                &output_root,
+                &expected_entry.stable_media_id,
+                media_profile,
+                None,
+            )
+            .expect("unscoped lookup should not find a collection receipt"),
+            BilibiliGroupReceiptLookup::Missing
+        ));
         assert!(!expected_target.exists());
 
         let duplicate = VideoDuplicate {
@@ -20561,7 +20802,7 @@ mod tests {
                 }),
             },
             &staging_dir,
-            &output_root,
+            &collection_dir,
             &staged_files,
             VideoDuplicateAction::KeepBoth,
             &duplicate,
@@ -20576,10 +20817,15 @@ mod tests {
                     root.logical_root_path(),
                     &expected_entry.stable_media_id,
                     media_profile,
+                    Some(selected_folder),
                 )? {
                     BilibiliGroupReceiptLookup::Found(saved) => {
                         assert_eq!(saved.paths, receipt.paths);
                         assert_eq!(saved.hashes, receipt.hashes);
+                        assert_eq!(
+                            saved.collection_output_folder.as_deref(),
+                            Some(selected_folder)
+                        );
                     }
                     BilibiliGroupReceiptLookup::Missing => {
                         bail!("group mover did not persist its receipt before publication")
@@ -20609,11 +20855,218 @@ mod tests {
             &output_root,
             receipt,
             &publication.primary_destinations,
+            Some(selected_folder),
         )
         .expect("the pre-move durable receipt should validate the published output");
         staging
             .finish()
             .expect("published staging directory should be removed");
+        fs::remove_dir_all(output_root).expect("test output root should be removed");
+    }
+
+    #[test]
+    fn collection_publication_receipts_are_scoped_by_selected_folder() {
+        let output_root = temp_test_dir("episode-group-receipt-folder-scope");
+        let selected_folder = output_root.join("selected-collection");
+        let other_folder = output_root.join("other-collection");
+        fs::create_dir(&selected_folder).expect("selected directory should be created");
+        fs::create_dir(&other_folder).expect("other directory should be created");
+        let entry = test_group_entry(1);
+        let media_profile = "test-group-publication-profile-v2";
+        let selected_media = selected_folder.join("Episode 1.mp4");
+        let other_media = other_folder.join("Episode 1.mp4");
+        fs::write(&selected_media, b"selected collection media")
+            .expect("selected media should be written");
+        fs::write(&other_media, b"other collection media").expect("other media should be written");
+
+        // Old non-collection receipts remain readable only through the legacy unscoped key.
+        persist_bilibili_group_publication_receipt_blocking(
+            &output_root,
+            &entry.stable_media_id,
+            media_profile,
+            std::slice::from_ref(&other_media),
+            None,
+        )
+        .expect("legacy unscoped receipt should persist");
+        assert!(matches!(
+            load_bilibili_group_publication_receipt_blocking(
+                &output_root,
+                &entry.stable_media_id,
+                media_profile,
+                Some("selected-collection"),
+            )
+            .expect("collection lookup should ignore an unscoped legacy receipt"),
+            BilibiliGroupReceiptLookup::Missing
+        ));
+
+        persist_bilibili_group_publication_receipt_blocking(
+            &output_root,
+            &entry.stable_media_id,
+            media_profile,
+            std::slice::from_ref(&selected_media),
+            Some("selected-collection"),
+        )
+        .expect("selected collection receipt should persist");
+        persist_bilibili_group_publication_receipt_blocking(
+            &output_root,
+            &entry.stable_media_id,
+            media_profile,
+            std::slice::from_ref(&other_media),
+            Some("other-collection"),
+        )
+        .expect("other collection receipt should persist independently");
+
+        let selected = load_bilibili_group_publication_receipt_blocking(
+            &output_root,
+            &entry.stable_media_id,
+            media_profile,
+            Some("selected-collection"),
+        )
+        .expect("selected receipt should load");
+        let other = load_bilibili_group_publication_receipt_blocking(
+            &output_root,
+            &entry.stable_media_id,
+            media_profile,
+            Some("other-collection"),
+        )
+        .expect("other receipt should load");
+        match (selected, other) {
+            (
+                BilibiliGroupReceiptLookup::Found(selected),
+                BilibiliGroupReceiptLookup::Found(other),
+            ) => {
+                assert_eq!(selected.paths.len(), 1);
+                assert_eq!(other.paths.len(), 1);
+                assert!(selected.paths[0].ends_with("selected-collection/Episode 1.mp4"));
+                assert!(other.paths[0].ends_with("other-collection/Episode 1.mp4"));
+                assert_eq!(
+                    selected.collection_output_folder.as_deref(),
+                    Some("selected-collection")
+                );
+                assert_eq!(
+                    other.collection_output_folder.as_deref(),
+                    Some("other-collection")
+                );
+            }
+            _ => panic!("each collection should retain its own publication receipt"),
+        }
+        assert!(matches!(
+            load_bilibili_group_publication_receipt_blocking(
+                &output_root,
+                &entry.stable_media_id,
+                media_profile,
+                None,
+            )
+            .expect("legacy receipt lookup should remain readable"),
+            BilibiliGroupReceiptLookup::Found(_)
+        ));
+
+        fs::remove_dir_all(output_root).expect("test output root should be removed");
+    }
+
+    #[tokio::test]
+    async fn group_resume_redownloads_verified_snapshot_paths_from_another_collection() {
+        let (config, output_root) =
+            test_group_config("episode-group-foreign-collection-snapshot-path");
+        let selected_folder = "selected-collection";
+        let other_folder = "other-collection";
+        let selected_dir = output_root.join(selected_folder);
+        let other_dir = output_root.join(other_folder);
+        fs::create_dir(&selected_dir).expect("selected directory should be created");
+        fs::create_dir(&other_dir).expect("other directory should be created");
+        let rooted_output = RootedFs::new(&output_root).expect("output root should bind");
+        let selected_identity = rooted_output
+            .entry_identity(&selected_dir)
+            .expect("selected directory identity should be readable")
+            .expect("selected directory should exist");
+        let inventory = test_collection_group_inventory(selected_folder, Some(selected_identity));
+        let entry = inventory.entries[0].clone();
+        let options =
+            bilibili_core::download_options(&config).expect("test Bilibili options should parse");
+        let media_profile = bilibili_group_media_profile(&options, &config);
+        let old_path = other_dir.join("Episode 1.mp4");
+        fs::write(&old_path, b"published in a different collection")
+            .expect("prior media should be written");
+        let old_media = verify_group_output_paths(
+            output_root.clone(),
+            entry.download.clone(),
+            vec![old_path.clone()],
+            None,
+        )
+        .await
+        .expect("prior media should be hash-verified");
+        persist_bilibili_group_publication_receipt_blocking(
+            &output_root,
+            &entry.stable_media_id,
+            &media_profile,
+            &old_media.paths,
+            Some(other_folder),
+        )
+        .expect("other collection receipt should be durable");
+        let mut previous = BilibiliAttemptSnapshot::new_independent(
+            inventory.title.clone(),
+            [(
+                entry.download.index,
+                entry.download.title.clone(),
+                Some(entry.stable_media_id.clone()),
+            )],
+            0,
+        );
+        previous.media_profile = Some(media_profile);
+        BilibiliAttemptUpdate::Verified {
+            media_paths: old_media.paths,
+            hashes: old_media.hashes,
+        }
+        .apply(&mut previous, entry.download.index);
+        previous.finish(BilibiliAttemptOutcome::Verified);
+        previous.prepare_resume(false);
+
+        let execute_count = Arc::new(StdMutex::new(0usize));
+        let executor_count = Arc::clone(&execute_count);
+        let executor_folder = selected_dir.clone();
+        let execute_entry: BilibiliGroupEntryExecutor = Arc::new(move |entry| {
+            let count = Arc::clone(&executor_count);
+            let folder = executor_folder.clone();
+            Box::pin(async move {
+                *count
+                    .lock()
+                    .expect("execution counter should remain healthy") += 1;
+                let path = folder.join(format!("refetched-{}.mp4", entry.download.index));
+                fs::write(&path, b"fresh media in selected collection")
+                    .expect("refetched media should be written");
+                Ok(report_for_group_test_media(path))
+            })
+        });
+        let scan_count = Arc::new(StdMutex::new(0usize));
+        let scanner_counter = Arc::clone(&scan_count);
+        let scanner: BilibiliGroupExistingMediaScanner = Arc::new(move |_| {
+            let count = Arc::clone(&scanner_counter);
+            Box::pin(async move {
+                *count.lock().expect("scanner counter should remain healthy") += 1;
+                Ok(None)
+            })
+        });
+
+        let report = run_bilibili_episode_group_with_inventory(
+            &config,
+            &test_group_job(BilibiliSelection::All),
+            inventory.clone(),
+            Some(previous),
+            Some(test_group_validation_snapshot(&inventory, &config)),
+            None,
+            test_group_hooks(execute_entry, scanner),
+        )
+        .await
+        .expect("foreign verified snapshot paths should be redownloaded in the selected folder");
+
+        assert_eq!(*execute_count.lock().unwrap(), 1);
+        assert_eq!(
+            *scan_count.lock().unwrap(),
+            0,
+            "a foreign receipt must not enter existing-media reuse"
+        );
+        assert!(report.primary_media_paths[0].starts_with(&selected_dir));
+        assert!(!report.primary_media_paths.contains(&old_path));
         fs::remove_dir_all(output_root).expect("test output root should be removed");
     }
 
@@ -21032,7 +21485,7 @@ mod tests {
         let directory = bilibili_group_receipt_directory(&rooted, false)
             .expect("receipt directory should validate")
             .expect("receipt directory should exist");
-        let receipt_path = bilibili_group_receipt_path(&directory, &entry.stable_media_id);
+        let receipt_path = bilibili_group_receipt_path(&directory, &entry.stable_media_id, None);
         fs::write(&receipt_path, b"not valid receipt JSON")
             .expect("tampered receipt should be written");
 
@@ -21280,6 +21733,7 @@ mod tests {
         let (config, root) = test_group_config("episode-group-collection-cid-change");
         let mut inventory = test_group_inventory(2);
         inventory.source = BilibiliGroupSource::Collection;
+        inventory.output_folder = Some("selected-collection".to_string());
         let calls = Arc::new(StdMutex::new(Vec::<u32>::new()));
         let executor_calls = Arc::clone(&calls);
         let executor_root = root.clone();

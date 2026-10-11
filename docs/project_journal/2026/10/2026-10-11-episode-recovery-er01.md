@@ -42,8 +42,9 @@ offer a way to select failed episodes.
   inventory changes. Distinguish settled partial results from restart
   interruptions, and offer finalization resume when all outputs are verified.
 - Bind artifact requirements to output receipts and persist one latest private
-  publication receipt per stable media identity and output root. Recovery does
-  not depend on optional NFO or sidecars; content hashes and bound path checks
+  publication receipt per stable media identity, output root, and selected
+  collection directory. Recovery does not depend on optional NFO or sidecars;
+  content hashes and bound path checks
   distinguish invalid output from unreadable recovery state.
 - Recover published outputs even when the episode-start event was not saved,
   preserve explicit fresh All keep-both behavior, and compare original receipt
@@ -57,10 +58,14 @@ offer a way to select failed episodes.
   completes final hashing and persistence, with matching failure/restart outcomes.
   Legacy collection plans and Missing-to-Existing directory transitions use the
   existing plan confirmation flow while retaining valid episode receipts.
+- Partition collection publication receipts by their selected relative directory
+  and validate that durable and queue-snapshot media paths remain in that scope.
+  Shared media identities in separate collections retain independent recovery;
+  legacy unscoped receipts cannot silently supply collection recovery evidence.
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed with 705 passed and 15 existing
+- Rust 1.95.0: all-target offline tests passed with 707 passed and 15 existing
   opt-in tests ignored. Offline build, all-target Clippy with warnings denied,
   formatting, diff checks, and project journal validation passed.
 - Regression tests exercise the actual episode driver through injected child
@@ -87,6 +92,9 @@ offer a way to select failed episodes.
 - Finalization regressions preserve verified episode files while replacing the
   provisional group outcome after parent failure or restart. Collection plan
   regressions retain reviewed directory identity across delayed execution.
+- Cross-collection recovery regressions retain independent receipts for the same
+  media identity in two directories; foreign queue paths cannot count
+  as successful outputs in the selected collection.
 - State and mock Telegram tests cover independent completion counts, restart,
   error retention, progress-channel closure, paginated episode views, message
   reuse, stale generation callbacks, and cross-chat action rejection.
