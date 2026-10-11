@@ -562,6 +562,8 @@ struct BilibiliWorkerExpectedEntry {
 #[serde(deny_unknown_fields)]
 struct BilibiliGroupConfirmedStreams {
     selected_format_ids: Vec<String>,
+    #[serde(default)]
+    exact_sizes: Option<Vec<PlanSize>>,
     resolution_codecs: Vec<String>,
 }
 
@@ -577,6 +579,13 @@ fn bilibili_group_streams_for(
             .filter(|value| value.starts_with(&prefix))
             .cloned()
             .collect(),
+        exact_sizes: Some(
+            plan.exact_sizes
+                .iter()
+                .filter(|size| size.subject.starts_with(&prefix))
+                .cloned()
+                .collect(),
+        ),
         resolution_codecs: plan
             .resolution_codecs
             .iter()
@@ -604,7 +613,7 @@ fn bilibili_group_entry_media_profile(
         return base.to_string();
     };
     let mut digest = Sha256::new();
-    digest.update(b"bilibili-group-selected-streams-v1\0");
+    digest.update(b"bilibili-group-selected-streams-v2\0");
     for values in [&confirmed.selected_format_ids, &confirmed.resolution_codecs] {
         digest.update((values.len() as u64).to_be_bytes());
         for value in values {
@@ -612,7 +621,21 @@ fn bilibili_group_entry_media_profile(
             digest.update(value.as_bytes());
         }
     }
-    format!("{base}|resolved-v1:{:x}", digest.finalize())
+    match &confirmed.exact_sizes {
+        Some(exact_sizes) => {
+            digest.update([1]);
+            digest.update((exact_sizes.len() as u64).to_be_bytes());
+            for size in exact_sizes {
+                for value in [&size.subject, &size.provenance] {
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value.as_bytes());
+                }
+                digest.update(size.bytes.to_be_bytes());
+            }
+        }
+        None => digest.update([0]),
+    }
+    format!("{base}|resolved-v2:{:x}", digest.finalize())
 }
 
 fn validate_bilibili_group_confirmed_streams(
@@ -622,7 +645,7 @@ fn validate_bilibili_group_confirmed_streams(
     let current = bilibili_group_streams_for(current, &expected.stable_media_id);
     if expected.confirmed_streams.as_ref() != Some(&current) {
         bail!(
-            "Bilibili media requirements changed since the reviewed plan: entry {} has new or changed resolved formats or resolution/codecs; resume to review the updated plan before downloading",
+            "Bilibili media requirements changed since the reviewed plan: entry {} has new or changed resolved formats, exact sizes, or resolution/codecs; resume to review the updated plan before downloading",
             expected.index
         );
     }
@@ -5809,10 +5832,15 @@ async fn bilibili_plan_entry_compatible_existing_media_from_shared_index(
     let config = config.clone();
     let entry = entry.clone();
     let ffprobe = ffprobe.to_path_buf();
-    bilibili_probe_shared_identity_index(index, Duration::from_secs(6), move |index| {
+    let entry_for_probe = entry.clone();
+    bilibili_probe_shared_identity_index(index, &entry, Duration::from_secs(6), move |index| {
         let _permit = permit;
         bilibili_plan_entry_compatible_existing_media_blocking(
-            &config, index, &entry, mode, &ffprobe,
+            &config,
+            index,
+            &entry_for_probe,
+            mode,
+            &ffprobe,
         )
     })
     .await
@@ -5820,22 +5848,29 @@ async fn bilibili_plan_entry_compatible_existing_media_from_shared_index(
 
 async fn bilibili_probe_shared_identity_index<F>(
     index: Arc<tokio::sync::Mutex<VideoIdentityIndex>>,
+    entry: &BilibiliDownloadEntry,
     timeout: Duration,
     probe: F,
 ) -> Result<Option<ExistingEpisodeEvidence>>
 where
     F: FnOnce(&VideoIdentityIndex) -> Option<ExistingEpisodeEvidence> + Send + 'static,
 {
-    // Only take the shared lock long enough to clone the immutable index. A timed-out
+    // Keep the shared lock only while making a bounded snapshot for this entry. A timed-out
     // spawn_blocking worker cannot be cancelled, so it must never retain the publication lock.
     let index_snapshot = tokio_timeout(timeout, async {
         let index = index.lock().await;
-        index.clone()
+        index.bilibili_entry_identity_snapshot(entry)
     })
     .await
     .context(
         "shared output recovery failure: timed out waiting to snapshot the shared Bilibili media index",
     )?;
+    let Some(index_snapshot) = index_snapshot else {
+        info!(
+            "existing Bilibili media candidates exceed the bounded snapshot; planning episode for download"
+        );
+        return Ok(None);
+    };
     let task = tokio::task::spawn_blocking(move || probe(&index_snapshot));
     match tokio_timeout(timeout, task).await {
         Ok(Ok(evidence)) => Ok(evidence),
@@ -6344,24 +6379,8 @@ fn bilibili_exact_entry_metadata_paths(
     entry: &BilibiliDownloadEntry,
 ) -> BTreeSet<PathBuf> {
     let mut paths = BTreeSet::new();
-    if entry.cid != 0 {
-        paths.extend(
-            index
-                .metadata_videos(&bilibili_collection_cid_identity(entry.cid))
-                .iter()
-                .cloned(),
-        );
-    }
-    if let Some(epid) = entry.epid.filter(|epid| *epid != 0) {
-        paths.extend(
-            index
-                .metadata_videos(&VideoIdentity {
-                    provider: VideoProvider::Bilibili,
-                    id: format!("ep{epid}"),
-                })
-                .iter()
-                .cloned(),
-        );
+    for identity in bilibili_entry_metadata_identities(entry) {
+        paths.extend(index.metadata_videos(&identity).iter().cloned());
     }
     paths.retain(|video| {
         index.metadata_video_is_current(video)
@@ -6371,6 +6390,20 @@ fn bilibili_exact_entry_metadata_paths(
                 .is_some_and(|sidecars| bilibili_sidecars_match_entry(sidecars, entry))
     });
     paths
+}
+
+fn bilibili_entry_metadata_identities(entry: &BilibiliDownloadEntry) -> Vec<VideoIdentity> {
+    let mut identities = Vec::with_capacity(2);
+    if entry.cid != 0 {
+        identities.push(bilibili_collection_cid_identity(entry.cid));
+    }
+    if let Some(epid) = entry.epid.filter(|epid| *epid != 0) {
+        identities.push(VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: format!("ep{epid}"),
+        });
+    }
+    identities
 }
 
 fn bilibili_sidecars_match_entry(
@@ -6762,6 +6795,11 @@ struct VideoIdentityIndex {
     file_identities: BTreeMap<PathBuf, EntryIdentity>,
 }
 
+const BILIBILI_ENTRY_CANDIDATE_PATH_LIMIT: usize = 256;
+const BILIBILI_ENTRY_SIDECAR_SET_LIMIT: usize = 1024;
+const BILIBILI_ENTRY_SIDECAR_IDENTITY_LIMIT: usize = 4096;
+const BILIBILI_ENTRY_SIDECAR_IDENTITY_BYTE_LIMIT: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IdentityIndexReadPolicy {
     BestEffort,
@@ -6769,6 +6807,73 @@ enum IdentityIndexReadPolicy {
 }
 
 impl VideoIdentityIndex {
+    fn bilibili_entry_identity_snapshot(&self, entry: &BilibiliDownloadEntry) -> Option<Self> {
+        let identities = bilibili_entry_metadata_identities(entry);
+        let mut candidate_path_references = 0usize;
+        for identity in &identities {
+            candidate_path_references =
+                candidate_path_references.checked_add(self.metadata_videos(identity).len())?;
+            if candidate_path_references > BILIBILI_ENTRY_CANDIDATE_PATH_LIMIT {
+                return None;
+            }
+        }
+
+        let mut candidate_paths = BTreeSet::new();
+        for identity in &identities {
+            candidate_paths.extend(self.metadata_videos(identity).iter().cloned());
+        }
+
+        let mut sidecar_set_count = 0usize;
+        let mut sidecar_identity_count = 0usize;
+        let mut sidecar_identity_byte_count = 0usize;
+        for video in &candidate_paths {
+            let Some(sidecars) = self.metadata_sidecar_identities_by_video.get(video) else {
+                continue;
+            };
+            sidecar_set_count = sidecar_set_count.checked_add(sidecars.len())?;
+            if sidecar_set_count > BILIBILI_ENTRY_SIDECAR_SET_LIMIT {
+                return None;
+            }
+            for identities in sidecars {
+                sidecar_identity_count = sidecar_identity_count.checked_add(identities.len())?;
+                if sidecar_identity_count > BILIBILI_ENTRY_SIDECAR_IDENTITY_LIMIT {
+                    return None;
+                }
+                for identity in identities {
+                    sidecar_identity_byte_count =
+                        sidecar_identity_byte_count.checked_add(identity.id.len())?;
+                    if sidecar_identity_byte_count > BILIBILI_ENTRY_SIDECAR_IDENTITY_BYTE_LIMIT {
+                        return None;
+                    }
+                }
+            }
+        }
+
+        let mut snapshot = Self {
+            root: self.root.clone(),
+            ..Self::default()
+        };
+        for identity in identities {
+            let paths = self.metadata_videos(&identity);
+            if !paths.is_empty() {
+                snapshot
+                    .metadata_videos_by_identity
+                    .insert(identity, paths.to_vec());
+            }
+        }
+        for video in candidate_paths {
+            if let Some(identities) = self.metadata_sidecar_identities_by_video.get(&video) {
+                snapshot
+                    .metadata_sidecar_identities_by_video
+                    .insert(video.clone(), identities.clone());
+            }
+            if let Some(identity) = self.file_identities.get(&video) {
+                snapshot.file_identities.insert(video, *identity);
+            }
+        }
+        Some(snapshot)
+    }
+
     fn insert_published_evidence(
         &mut self,
         evidence: &ExistingEpisodeEvidence,
@@ -21029,6 +21134,18 @@ mod tests {
             stable_media_ids: vec![id.clone(), other_id.clone()],
             bilibili_resolved_stream_ids: vec![id.clone(), other_id.clone()],
             selected_format_ids: vec![format!("{id}:video:80"), format!("{other_id}:video:125")],
+            exact_sizes: vec![
+                PlanSize {
+                    subject: format!("{id}:video:80"),
+                    bytes: 123_456,
+                    provenance: "Bilibili plan stream size".to_string(),
+                },
+                PlanSize {
+                    subject: format!("{other_id}:video:125"),
+                    bytes: 654_321,
+                    provenance: "Bilibili plan stream size".to_string(),
+                },
+            ],
             resolution_codecs: vec![
                 format!("{id}:video:80:1920x1080:avc1"),
                 format!("{other_id}:video:125:2880x2160:hvc1"),
@@ -21047,9 +21164,50 @@ mod tests {
         };
         let mut current = reviewed.clone();
         current.selected_format_ids[1] = format!("{other_id}:video:80");
+        current.exact_sizes[1].bytes = 1;
         current.resolution_codecs[1] = format!("{other_id}:video:80:1920x1080:avc1");
         validate_bilibili_group_confirmed_streams(&expected, &current)
             .expect("another episode's different streams must not reject this episode");
+        let mut legacy_expected = expected.clone();
+        legacy_expected.confirmed_streams = Some(
+            serde_json::from_value(serde_json::json!({
+                "selected_format_ids": [format!("{id}:video:80")],
+                "resolution_codecs": [format!("{id}:video:80:1920x1080:avc1")]
+            }))
+            .expect("legacy confirmation should deserialize without exact-size evidence"),
+        );
+        assert!(
+            legacy_expected
+                .confirmed_streams
+                .as_ref()
+                .unwrap()
+                .exact_sizes
+                .is_none()
+        );
+        assert!(validate_bilibili_group_confirmed_streams(&legacy_expected, &current).is_err());
+        let mut no_size_confirmed = expected.clone();
+        no_size_confirmed
+            .confirmed_streams
+            .as_mut()
+            .expect("reviewed streams should be bound")
+            .exact_sizes = Some(Vec::new());
+        assert!(validate_bilibili_group_confirmed_streams(&no_size_confirmed, &current).is_err());
+        let confirmed = expected
+            .confirmed_streams
+            .as_ref()
+            .expect("reviewed streams should be bound");
+        let reviewed_profile = bilibili_group_entry_media_profile("profile", Some(confirmed));
+        let mut changed_size = confirmed.clone();
+        changed_size
+            .exact_sizes
+            .as_mut()
+            .expect("new confirmations record exact sizes")[0]
+            .bytes += 1;
+        assert_ne!(
+            reviewed_profile,
+            bilibili_group_entry_media_profile("profile", Some(&changed_size)),
+            "confirmed exact sizes must contribute to the receipt fingerprint"
+        );
 
         for changed in [
             PlanValidationSnapshot {
@@ -21062,6 +21220,18 @@ mod tests {
             },
             PlanValidationSnapshot {
                 resolution_codecs: vec![format!("{id}:video:80:1280x720:avc1")],
+                ..current.clone()
+            },
+            PlanValidationSnapshot {
+                exact_sizes: vec![PlanSize {
+                    subject: format!("{id}:video:80"),
+                    bytes: 123_457,
+                    provenance: "Bilibili plan stream size".to_string(),
+                }],
+                ..current.clone()
+            },
+            PlanValidationSnapshot {
+                exact_sizes: Vec::new(),
                 ..current.clone()
             },
         ] {
@@ -21095,6 +21265,7 @@ mod tests {
             bilibili_group_confirmed_streams_for(&reviewed, &entry.stable_media_id),
             Some(BilibiliGroupConfirmedStreams {
                 selected_format_ids: Vec::new(),
+                exact_sizes: Some(Vec::new()),
                 resolution_codecs: Vec::new(),
             })
         );
@@ -21113,6 +21284,7 @@ mod tests {
         let mut reviewed = test_group_validation_snapshot(&inventory, &config);
         let original_streams = BilibiliGroupConfirmedStreams {
             selected_format_ids: vec![format!("{}:video-80", entry.stable_media_id)],
+            exact_sizes: Some(Vec::new()),
             resolution_codecs: vec![format!("{}:1920x1080:avc1", entry.stable_media_id)],
         };
         let base_profile = reviewed.media_profile.as_deref().unwrap();
@@ -21713,6 +21885,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_entry_probe_snapshots_only_candidate_records_from_large_index() {
+        let mut entry = test_group_entry(17).download;
+        entry.epid = Some(7017);
+        let cid_identity = bilibili_collection_cid_identity(entry.cid);
+        let epid_identity = VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: format!("ep{}", entry.epid.expect("test entry should have epid")),
+        };
+        let candidate = PathBuf::from("/test/output/episode-17.mkv");
+        let candidate_identity = EntryIdentity::regular_file(1, 17);
+        let sidecar_identities = vec![vec![cid_identity.clone(), epid_identity.clone()]];
+        let mut index = VideoIdentityIndex::default();
+        index
+            .metadata_videos_by_identity
+            .insert(cid_identity.clone(), vec![candidate.clone()]);
+        index
+            .metadata_videos_by_identity
+            .insert(epid_identity.clone(), vec![candidate.clone()]);
+        index
+            .file_identities
+            .insert(candidate.clone(), candidate_identity);
+        index
+            .metadata_sidecar_identities_by_video
+            .insert(candidate.clone(), sidecar_identities.clone());
+
+        for unrelated in 0u32..2048 {
+            let identity = VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: format!("unrelated-{unrelated}"),
+            };
+            let path = PathBuf::from(format!("/test/output/unrelated-{unrelated}.mkv"));
+            index
+                .videos_by_identity
+                .insert(identity.clone(), vec![path.clone()]);
+            index
+                .overwrite_videos_by_identity
+                .insert(identity.clone(), vec![path.clone()]);
+            index
+                .metadata_videos_by_identity
+                .insert(identity.clone(), vec![path.clone()]);
+            index.file_identities.insert(
+                path.clone(),
+                EntryIdentity::regular_file(2, u64::from(unrelated) + 1),
+            );
+            index
+                .metadata_sidecar_identities_by_video
+                .insert(path, vec![vec![identity]]);
+        }
+
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::channel();
+        let result = bilibili_probe_shared_identity_index(
+            Arc::new(tokio::sync::Mutex::new(index)),
+            &entry,
+            Duration::from_secs(2),
+            move |snapshot| {
+                let only_candidate_records = snapshot.videos_by_identity.is_empty()
+                    && snapshot.overwrite_videos_by_identity.is_empty()
+                    && snapshot.metadata_videos_by_identity.len() == 2
+                    && snapshot.metadata_videos_by_identity.get(&cid_identity)
+                        == Some(&vec![candidate.clone()])
+                    && snapshot.metadata_videos_by_identity.get(&epid_identity)
+                        == Some(&vec![candidate.clone()])
+                    && snapshot.file_identities.len() == 1
+                    && snapshot.file_identities.get(&candidate) == Some(&candidate_identity)
+                    && snapshot.metadata_sidecar_identities_by_video.len() == 1
+                    && snapshot
+                        .metadata_sidecar_identities_by_video
+                        .get(&candidate)
+                        == Some(&sidecar_identities);
+                snapshot_tx
+                    .send(only_candidate_records)
+                    .expect("test should observe the probe snapshot");
+                None
+            },
+        )
+        .await
+        .expect("the bounded entry probe should finish");
+
+        assert!(result.is_none(), "the probe does not claim existing media");
+        assert!(
+            snapshot_rx
+                .recv()
+                .expect("the probe should have received a snapshot"),
+            "a 2,048-entry unrelated index must not enter the per-entry snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_entry_candidates_fall_back_before_running_probe() {
+        let entry = test_group_entry(18).download;
+        let identity = bilibili_collection_cid_identity(entry.cid);
+        let paths = (0..=BILIBILI_ENTRY_CANDIDATE_PATH_LIMIT)
+            .map(|index| PathBuf::from(format!("/test/output/candidate-{index}.mkv")))
+            .collect::<Vec<_>>();
+        let mut index = VideoIdentityIndex::default();
+        index.metadata_videos_by_identity.insert(identity, paths);
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&probe_calls);
+
+        let result = bilibili_probe_shared_identity_index(
+            Arc::new(tokio::sync::Mutex::new(index)),
+            &entry,
+            Duration::from_secs(2),
+            move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+        )
+        .await
+        .expect("oversized candidate fallback should be handled normally");
+
+        assert!(
+            result.is_none(),
+            "oversized evidence must not skip download"
+        );
+        assert_eq!(
+            probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an over-limit candidate list must be rejected before the blocking probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_entry_sidecar_snapshot_falls_back_before_running_probe() {
+        let entry = test_group_entry(20).download;
+        let identity = bilibili_collection_cid_identity(entry.cid);
+        let candidate = PathBuf::from("/test/output/episode-20.mkv");
+        let mut index = VideoIdentityIndex::default();
+        index
+            .metadata_videos_by_identity
+            .insert(identity.clone(), vec![candidate.clone()]);
+        index.metadata_sidecar_identities_by_video.insert(
+            candidate,
+            vec![vec![identity.clone()]; BILIBILI_ENTRY_SIDECAR_SET_LIMIT + 1],
+        );
+        let probe_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = Arc::clone(&probe_calls);
+
+        let result = bilibili_probe_shared_identity_index(
+            Arc::new(tokio::sync::Mutex::new(index)),
+            &entry,
+            Duration::from_secs(2),
+            move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+        )
+        .await
+        .expect("oversized sidecar fallback should be handled normally");
+
+        assert!(
+            result.is_none(),
+            "oversized evidence must not skip download"
+        );
+        assert_eq!(
+            probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an over-limit sidecar list must be rejected before the blocking probe"
+        );
+
+        let oversized_identity = VideoIdentity {
+            provider: VideoProvider::Bilibili,
+            id: "x".repeat(BILIBILI_ENTRY_SIDECAR_IDENTITY_BYTE_LIMIT + 1),
+        };
+        let candidate = PathBuf::from("/test/output/episode-20.mkv");
+        let mut index = VideoIdentityIndex::default();
+        index
+            .metadata_videos_by_identity
+            .insert(identity.clone(), vec![candidate.clone()]);
+        index
+            .metadata_sidecar_identities_by_video
+            .insert(candidate, vec![vec![oversized_identity]]);
+        let calls = Arc::clone(&probe_calls);
+        let result = bilibili_probe_shared_identity_index(
+            Arc::new(tokio::sync::Mutex::new(index)),
+            &entry,
+            Duration::from_secs(2),
+            move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                None
+            },
+        )
+        .await
+        .expect("oversized sidecar identity fallback should be handled normally");
+
+        assert!(
+            result.is_none(),
+            "oversized evidence must not skip download"
+        );
+        assert_eq!(
+            probe_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an over-limit sidecar identity payload must be rejected before the blocking probe"
+        );
+    }
+
+    #[tokio::test]
     async fn timed_out_index_probe_does_not_hold_publication_lock() {
         let index = Arc::new(tokio::sync::Mutex::new(VideoIdentityIndex::default()));
         let probe_index = Arc::clone(&index);
@@ -21720,8 +22089,10 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let probe_task = tokio::spawn(async move {
+            let entry = test_group_entry(19).download;
             bilibili_probe_shared_identity_index(
                 probe_index,
+                &entry,
                 Duration::from_millis(100),
                 move |_| {
                     started_tx

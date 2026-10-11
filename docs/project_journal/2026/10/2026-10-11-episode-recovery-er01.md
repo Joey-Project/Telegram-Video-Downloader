@@ -25,7 +25,7 @@ offer a way to select failed episodes.
 - Resolve group inventory and inspect selected episode streams with at most two
   concurrent probes and independent timeouts. Individual unavailable streams do
   not abort inspection; fresh execution plans must match confirmed per-episode
-  formats, resolutions, and codecs before downloading.
+  formats, resolutions, codecs, and exact stream sizes before downloading.
 - Publish verified episodes individually. Retry transient episode failures at
   most twice beyond the initial episode attempt, then continue later episodes.
   Shared authentication, storage, permission, and identity failures interrupt
@@ -45,7 +45,8 @@ offer a way to select failed episodes.
   failed, partial, and interrupted task receipts.
 - Reconcile approved inventory changes with saved episode state, invalidate
   receipts when media requirements change, and recover published outputs after
-  interrupted completion bookkeeping. Reuse one existing-media index per run.
+  interrupted completion bookkeeping. Reuse one existing-media index per run
+  and snapshot only the candidate identities and paths needed by each episode.
 - Preserve limited retry scopes by stable media identity across approved
   inventory changes. Distinguish settled partial results from restart
   interruptions, and offer finalization resume when all outputs are verified.
@@ -88,7 +89,7 @@ offer a way to select failed episodes.
 ## Validation
 
 - Rust 1.95.0: all-target offline tests passed with eight parallel threads,
-  734 passed and 15 existing
+  737 passed and 15 existing
   opt-in tests ignored. Offline build, all-target Clippy with warnings denied,
   formatting, diff checks, and project journal validation passed.
 - Regression tests exercise the actual episode driver through injected child
@@ -122,6 +123,11 @@ offer a way to select failed episodes.
   unavailable episode, resolved-empty versus unresolved streams, and execution
   checks against the confirmed per-entry fingerprint. Durable recovery rejects
   an old-format receipt without saved queue paths after new streams are accepted.
+  Exact-size changes, missing or newly available exact sizes, and legacy requests
+  without explicit size evidence require confirmation; another episode's size
+  changes do not invalidate this episode. Exact sizes bind recovery fingerprints.
+  Shared-index tests exclude 2,048 unrelated identities from entry snapshots and
+  reject oversized candidate references and sidecar evidence before probing.
 - Task isolation and restart regressions reject another All task's publication
   evidence, preserve task namespaces, retain cancellation over failed summaries,
   and pause on output-root disappearance while keeping single-file misses local.
