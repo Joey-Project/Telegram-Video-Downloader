@@ -37,6 +37,12 @@ offer a way to select failed episodes.
   Persist invalid receipt markers across scoped retries until redownload is
   verified. Keep legacy attempts compatible and reject stale generation callbacks.
 - Preserve legacy execution for artifact-only All selections.
+- Exclude compatible existing episodes from Missing-mode stream probes and size
+  totals while retaining the complete identity inventory.
+- Pause once for shared executable launch or configuration failures.
+- Remove task-scoped publication metadata only after durable completion or
+  cancellation, retry interrupted cleanup at startup, and retain resumable
+  failed, partial, and interrupted task receipts.
 - Reconcile approved inventory changes with saved episode state, invalidate
   receipts when media requirements change, and recover published outputs after
   interrupted completion bookkeeping. Reuse one existing-media index per run.
@@ -82,7 +88,7 @@ offer a way to select failed episodes.
 ## Validation
 
 - Rust 1.95.0: all-target offline tests passed with eight parallel threads,
-  720 passed and 15 existing
+  734 passed and 15 existing
   opt-in tests ignored. Offline build, all-target Clippy with warnings denied,
   formatting, diff checks, and project journal validation passed.
 - Regression tests exercise the actual episode driver through injected child
@@ -130,6 +136,13 @@ offer a way to select failed episodes.
 - Output-lock tests accept only the documented acquisition progress when another
   parallel test holds the shared lock, while retaining explicit contention and
   clean-marker recovery-scan assertions.
+- Terminal cleanup regressions preserve other tasks, legacy receipts, and media;
+  reject namespace replacement and private-access-policy changes; and recover
+  interrupted removals. Cleanup protects directory/file object identity and
+  owner-private access, comparing device, inode, type, mode, ownership, and
+  regular-file link count for those properties. Child churn, timestamps, and unused terminal
+  receipt content are not mutation signals. Queue tests cover persistence
+  failure, lost attempt snapshots, startup retries, and stale generations.
 - Builds use an isolated temporary Cargo target with debug information and
   incremental compilation disabled. This workstream does not deploy or restart
   the canonical macOS LaunchAgent.

@@ -1890,6 +1890,28 @@ impl BilibiliGroupIdentityIndexCache {
     }
 }
 
+fn new_bilibili_group_identity_index_cache(
+    config: Arc<AppConfig>,
+    inventory: Arc<BilibiliEpisodeGroupInventory>,
+    mode: DownloadMode,
+) -> BilibiliGroupIdentityIndexCache {
+    let scan_config = Arc::clone(&config);
+    let scan_inventory = Arc::clone(&inventory);
+    let index_builder: BilibiliGroupIdentityIndexBuilder = Arc::new(move || {
+        let config = Arc::clone(&scan_config);
+        let inventory = Arc::clone(&scan_inventory);
+        Box::pin(
+            async move { build_bilibili_group_identity_index(&config, &inventory, mode).await },
+        )
+    });
+    BilibiliGroupIdentityIndexCache {
+        config,
+        mode,
+        index: Arc::new(OnceCell::new()),
+        index_builder,
+    }
+}
+
 struct BilibiliGroupAttemptGuard {
     snapshot: BilibiliAttemptSnapshot,
     progress: Option<JobProgressSender>,
@@ -2268,17 +2290,84 @@ enum BilibiliGroupProbeResult {
     IdentityChanged(String),
 }
 
+async fn bilibili_group_entries_needing_stream_probe(
+    config: &AppConfig,
+    inventory: &BilibiliEpisodeGroupInventory,
+    mode: DownloadMode,
+    progress: Option<&JobProgressSender>,
+) -> Result<Vec<BilibiliGroupEntry>> {
+    const MAX_CONCURRENT_EXISTING_MEDIA_CHECKS: usize = 2;
+
+    let entries = Arc::new(inventory.entries.clone());
+    let cache = new_bilibili_group_identity_index_cache(
+        Arc::new(config.clone()),
+        Arc::new(inventory.clone()),
+        mode,
+    );
+    let total = entries.len();
+    send_bilibili_planning_progress(
+        progress,
+        bilibili_planning::PlanningStage::ScanningExistingMedia,
+        0,
+        total,
+    );
+    let existing_media = bounded_bilibili_group_probes(
+        total,
+        MAX_CONCURRENT_EXISTING_MEDIA_CHECKS,
+        move |index| {
+            let cache = cache.clone();
+            let entry = entries[index].clone();
+            async move {
+                cache.find_compatible(&entry).await.with_context(|| {
+                    format!(
+                        "failed to inspect existing Bilibili media for episode {}",
+                        entry.download.index
+                    )
+                })
+            }
+        },
+        |done, total| {
+            send_bilibili_planning_progress(
+                progress,
+                bilibili_planning::PlanningStage::ScanningExistingMedia,
+                done,
+                total,
+            );
+        },
+    )
+    .await?;
+
+    inventory
+        .entries
+        .iter()
+        .cloned()
+        .zip(existing_media)
+        .filter_map(|(entry, result)| match result {
+            Ok(Some(_evidence)) => None,
+            Ok(None) => Some(Ok(entry)),
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
 async fn probe_bilibili_episode_group_streams(
     config: &AppConfig,
     inventory: &BilibiliEpisodeGroupInventory,
     options: &bbdown_core::DownloadOptions,
+    missing_selection: bool,
     progress: Option<&JobProgressSender>,
 ) -> Result<PlanValidationSnapshot> {
     const MAX_CONCURRENT_ENTRY_PROBES: usize = 2;
 
     let mut snapshot = inventory.validation_snapshot(bilibili_group_media_profile(options, config));
     let client = Arc::new(bilibili_core::client(config)?);
-    let entries = Arc::new(inventory.entries.clone());
+    let entries_to_probe = if missing_selection {
+        bilibili_group_entries_needing_stream_probe(config, inventory, options.mode, progress)
+            .await?
+    } else {
+        inventory.entries.clone()
+    };
+    let entries = Arc::new(entries_to_probe);
     let options = Arc::new(options.clone());
     let source = inventory.source;
     let total = entries.len();
@@ -2604,22 +2693,11 @@ pub async fn run_bilibili_episode_group(
 
     let shared_config = Arc::new(config.clone());
     let shared_inventory = Arc::new(inventory.clone());
-    let scan_config = Arc::clone(&shared_config);
-    let scan_inventory = Arc::clone(&shared_inventory);
-    let scan_mode = options.mode;
-    let index_builder: BilibiliGroupIdentityIndexBuilder = Arc::new(move || {
-        let config = Arc::clone(&scan_config);
-        let inventory = Arc::clone(&scan_inventory);
-        Box::pin(async move {
-            build_bilibili_group_identity_index(&config, &inventory, scan_mode).await
-        })
-    });
-    let identity_index_cache = BilibiliGroupIdentityIndexCache {
-        config: Arc::clone(&shared_config),
-        mode: scan_mode,
-        index: Arc::new(OnceCell::new()),
-        index_builder,
-    };
+    let identity_index_cache = new_bilibili_group_identity_index_cache(
+        Arc::clone(&shared_config),
+        Arc::clone(&shared_inventory),
+        options.mode,
+    );
     let find_existing_media = identity_index_cache.scanner();
     let record_published_evidence = identity_index_cache.evidence_recorder();
     let execute_progress = progress.clone();
@@ -4609,7 +4687,7 @@ fn persist_bilibili_group_publication_receipt_record(
         );
     }
 
-    let directory = bilibili_group_receipt_directory(root, true)?
+    let directory = bilibili_group_receipt_directory(root, publication_namespace, true)?
         .context("Bilibili group publication receipt directory disappeared")?;
     let receipt_path = bilibili_group_receipt_path(
         &directory,
@@ -4701,7 +4779,8 @@ fn load_bilibili_group_publication_receipt_blocking(
     let root = RootedFs::new(output_root)
         .context("failed to bind the output root for Bilibili group publication receipt lookup")?;
     root.validate_configured_root()?;
-    let Some(directory) = bilibili_group_receipt_directory(&root, false)? else {
+    let Some(directory) = bilibili_group_receipt_directory(&root, publication_namespace, false)?
+    else {
         return Ok(BilibiliGroupReceiptLookup::Missing);
     };
     let path = bilibili_group_receipt_path(
@@ -4784,16 +4863,39 @@ fn validate_bilibili_group_publication_receipt(
 
 fn bilibili_group_receipt_directory(
     root: &RootedFs,
+    publication_namespace: Option<&str>,
     create: bool,
 ) -> Result<Option<BilibiliGroupReceiptDirectory>> {
     let control = video_control_directory(root)?;
     root.validate_private_bound_directory(&control.entry, control.identity, 0o700)?;
     let path = control.path.join(BILIBILI_GROUP_RECEIPTS_DIR_NAME);
+    let Some(base) = bind_private_bilibili_group_receipt_directory(root, path, create)? else {
+        return Ok(None);
+    };
+    let directory = if let Some(namespace) = publication_namespace {
+        if namespace.trim().is_empty() {
+            bail!("Bilibili group publication namespace is empty");
+        }
+        let key = format!("{:x}", Sha256::digest(namespace.as_bytes()));
+        bind_private_bilibili_group_receipt_directory(root, base.path.join(key), create)?
+    } else {
+        Some(base)
+    };
+    root.validate_private_bound_directory(&control.entry, control.identity, 0o700)?;
+    Ok(directory)
+}
+
+fn bind_private_bilibili_group_receipt_directory(
+    root: &RootedFs,
+    path: PathBuf,
+    create: bool,
+) -> Result<Option<BilibiliGroupReceiptDirectory>> {
+    let mut created = None;
     if root.entry_identity(&path)?.is_none() {
         if !create {
             return Ok(None);
         }
-        root.create_dir(&path, 0o700)?;
+        created = root.create_dir(&path, 0o700)?;
     }
     let entry = root.bind_entry(&path, false)?;
     let identity = root
@@ -4802,13 +4904,113 @@ fn bilibili_group_receipt_directory(
     if !identity.is_dir() {
         bail!("Bilibili group publication receipt path is not a directory");
     }
+    if created.is_some_and(|created| created != identity) {
+        bail!("Bilibili group publication receipt directory changed after creation");
+    }
     root.validate_private_bound_directory(&entry, identity, 0o700)?;
-    root.validate_private_bound_directory(&control.entry, control.identity, 0o700)?;
     Ok(Some(BilibiliGroupReceiptDirectory {
         path,
         entry,
         identity,
     }))
+}
+
+pub(crate) fn cleanup_bilibili_group_publication_receipts(
+    root: &RootedFs,
+    publication_namespace: &str,
+) -> Result<()> {
+    cleanup_bilibili_group_publication_receipts_with_hook(root, publication_namespace, |_| Ok(()))
+}
+
+fn cleanup_bilibili_group_publication_receipts_with_hook<F>(
+    root: &RootedFs,
+    publication_namespace: &str,
+    before_removal: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    root.validate_configured_root()?;
+    let Some(directory) =
+        bilibili_group_receipt_directory(root, Some(publication_namespace), false)?
+    else {
+        return Ok(());
+    };
+    reconcile_bilibili_receipt_removals(root, &directory)?;
+    let mut files = Vec::new();
+    for (name, identity) in root.list_bound_directory(&directory.entry, directory.identity)? {
+        let name_text = name
+            .to_str()
+            .context("Bilibili task receipt has a non-UTF-8 name")?;
+        let key = name_text.strip_suffix(".json").or_else(|| {
+            name_text
+                .strip_prefix('.')
+                .and_then(|name| name.strip_suffix(".next"))
+        });
+        if !key.is_some_and(|key| {
+            key.len() == 64
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            bail!("Bilibili task receipt directory contains an unexpected entry");
+        }
+        let entry =
+            root.bind_direct_child_of_bound_directory(&directory.entry, directory.identity, &name)?;
+        let file = root.open_bound_file_if_identity(&entry, identity)?;
+        file.validate_private_single_link(0o600)?;
+        files.push((entry, identity));
+    }
+    before_removal(&directory.path)?;
+    // Delete only this terminal task's private metadata objects. Media contents and other
+    // tasks' namespaces are outside this operation; directory timestamps are irrelevant.
+    root.validate_private_bound_directory(&directory.entry, directory.identity, 0o700)?;
+    for (entry, identity) in files {
+        let file = root.open_bound_file_if_identity(&entry, identity)?;
+        file.validate_private_single_link(0o600)?;
+        drop(file);
+        root.remove_bound_file_if_identity(&entry, identity)?;
+    }
+    root.validate_private_bound_directory(&directory.entry, directory.identity, 0o700)?;
+    root.remove_bound_dir_if_identity(&directory.entry, directory.identity)?;
+    root.validate_configured_root()?;
+    Ok(())
+}
+
+fn reconcile_bilibili_receipt_removals(
+    root: &RootedFs,
+    directory: &BilibiliGroupReceiptDirectory,
+) -> Result<()> {
+    let report = root
+        .reconcile_remove_quarantines_in_bound_directory_with_status_and_restore_decider(
+            &directory.entry,
+            directory.identity,
+            |_| Ok(true),
+        )?;
+    if report.unresolved || report.incomplete {
+        bail!("Bilibili receipt removal recovery is incomplete");
+    }
+    root.validate_private_bound_directory(&directory.entry, directory.identity, 0o700)
+}
+
+pub(crate) fn recover_bilibili_group_receipt_removals(root: &RootedFs) -> Result<()> {
+    root.validate_configured_root()?;
+    if let Some(base) = bilibili_group_receipt_directory(root, None, false)? {
+        reconcile_bilibili_receipt_removals(root, &base)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn bilibili_group_receipt_namespace_path_for_test(
+    root: &RootedFs,
+    publication_namespace: &str,
+) -> Result<PathBuf> {
+    Ok(
+        bilibili_group_receipt_directory(root, Some(publication_namespace), true)?
+            .context("test receipt namespace directory should exist")?
+            .path,
+    )
 }
 
 fn bilibili_group_receipt_path(
@@ -5077,6 +5279,7 @@ async fn inspect_job_plan_inner(
                     config,
                     &inventory,
                     &options,
+                    matches!(selection, Some(BilibiliSelection::Missing)),
                     progress.as_ref(),
                 )
                 .await;
@@ -22219,6 +22422,131 @@ mod tests {
     }
 
     #[test]
+    fn terminal_receipt_cleanup_preserves_media_other_tasks_and_legacy_receipts() {
+        let output_root = temp_test_dir("terminal-receipt-task-isolation");
+        let root = RootedFs::new(&output_root).expect("test root should bind");
+        let media = output_root.join("Episode.mp4");
+        fs::write(&media, b"published episode").expect("media should write");
+        for namespace in [Some("selected-task"), Some("other-task"), None] {
+            persist_bilibili_group_publication_receipt_blocking(
+                &output_root,
+                "cid123",
+                "profile",
+                std::slice::from_ref(&media),
+                namespace,
+                None,
+            )
+            .expect("private receipt should persist");
+        }
+        let selected = bilibili_group_receipt_namespace_path_for_test(&root, "selected-task")
+            .expect("selected namespace should exist");
+        let temporary = selected.join(format!(".{}.next", "a".repeat(64)));
+        root.create_new_bound_file(&temporary, b"interrupted receipt", 0o600)
+            .expect("private temporary receipt should create");
+        cleanup_bilibili_group_publication_receipts(&root, "selected-task")
+            .expect("terminal task metadata should clean");
+        cleanup_bilibili_group_publication_receipts(&root, "selected-task")
+            .expect("already-cleaned task should remain harmless");
+        assert!(!selected.exists());
+        assert_eq!(fs::read(&media).unwrap(), b"published episode");
+        for namespace in [Some("other-task"), None] {
+            assert!(matches!(
+                load_bilibili_group_publication_receipt_blocking(
+                    &output_root,
+                    "cid123",
+                    "profile",
+                    namespace,
+                    None,
+                )
+                .expect("unrelated receipt should remain readable"),
+                BilibiliGroupReceiptLookup::Found(_)
+            ));
+        }
+        fs::remove_dir_all(output_root).expect("test root should clean");
+    }
+
+    #[test]
+    fn terminal_receipt_cleanup_recovers_an_interrupted_private_file_removal() {
+        let output_root = temp_test_dir("terminal-receipt-interrupted-removal");
+        let root = RootedFs::new(&output_root).expect("test root should bind");
+        let directory = bilibili_group_receipt_namespace_path_for_test(&root, "selected-task")
+            .expect("namespace should create");
+        let receipt = directory.join(format!("{}.json", "a".repeat(64)));
+        let (entry, identity) = root
+            .create_new_bound_file(&receipt, b"terminal metadata", 0o600)
+            .expect("private receipt should create");
+        root.leave_validated_file_removal_quarantined_for_test(&entry, identity)
+            .expect("interrupted private removal should persist");
+        assert!(!receipt.exists());
+        cleanup_bilibili_group_publication_receipts(&root, "selected-task")
+            .expect("owned interrupted removal should recover and finish cleanup");
+        assert!(!directory.exists());
+        fs::remove_dir_all(output_root).expect("test root should clean");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_receipt_cleanup_rejects_namespace_directory_replacement() {
+        let output_root = temp_test_dir("terminal-receipt-directory-replacement");
+        let root = RootedFs::new(&output_root).expect("test root should bind");
+        let directory = bilibili_group_receipt_namespace_path_for_test(&root, "selected-task")
+            .expect("namespace should create");
+        let receipt_name = format!("{}.json", "a".repeat(64));
+        let receipt = directory.join(&receipt_name);
+        root.create_new_bound_file(&receipt, b"original private metadata", 0o600)
+            .expect("private receipt should create");
+        let retired = output_root.join("retired-namespace");
+        cleanup_bilibili_group_publication_receipts_with_hook(&root, "selected-task", |path| {
+            fs::rename(path, &retired)?;
+            fs::create_dir(path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            fs::write(path.join(&receipt_name), b"foreign replacement metadata")?;
+            fs::set_permissions(path.join(&receipt_name), fs::Permissions::from_mode(0o600))?;
+            Ok(())
+        })
+        .expect_err("a replacement namespace must not be adopted during cleanup");
+        assert_eq!(
+            fs::read(retired.join(&receipt_name)).unwrap(),
+            b"original private metadata"
+        );
+        assert_eq!(fs::read(&receipt).unwrap(), b"foreign replacement metadata");
+        fs::remove_dir_all(output_root).expect("test root should clean");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_receipt_cleanup_retains_unexpected_entries_and_hard_links() {
+        let output_root = temp_test_dir("terminal-receipt-private-validation");
+        let root = RootedFs::new(&output_root).expect("test root should bind");
+        let directory = bilibili_group_receipt_namespace_path_for_test(&root, "selected-task")
+            .expect("namespace should create");
+        let receipt = directory.join(format!("{}.json", "a".repeat(64)));
+        root.create_new_bound_file(&receipt, b"terminal metadata", 0o600)
+            .expect("private receipt should create");
+        let unexpected = directory.join("unrecognized-file");
+        fs::write(&unexpected, b"retain me").expect("unexpected file should create");
+        cleanup_bilibili_group_publication_receipts(&root, "selected-task")
+            .expect_err("unexpected contents should be retained");
+        assert!(receipt.is_file());
+        assert!(unexpected.is_file());
+        fs::remove_file(unexpected).expect("unexpected test entry should remove");
+
+        let outside_link = output_root.join("outside-receipt-link");
+        fs::hard_link(&receipt, &outside_link).expect("hard link should create");
+        cleanup_bilibili_group_publication_receipts(&root, "selected-task")
+            .expect_err("multi-linked metadata should be retained");
+        assert!(receipt.is_file());
+        assert!(outside_link.is_file());
+        fs::remove_file(outside_link).expect("test link should remove");
+        fs::write(&receipt, b"changed terminal metadata")
+            .expect("benign metadata-content change should retain its object identity");
+        cleanup_bilibili_group_publication_receipts(&root, "selected-task")
+            .expect("private terminal metadata does not require content stability");
+        assert!(!directory.exists());
+        fs::remove_dir_all(output_root).expect("test root should clean");
+    }
+
+    #[test]
     fn collection_publication_receipts_are_scoped_by_selected_folder() {
         let output_root = temp_test_dir("episode-group-receipt-folder-scope");
         let selected_folder = output_root.join("selected-collection");
@@ -22988,9 +23316,13 @@ mod tests {
             b"published output with a corrupt ledger",
         );
         let rooted = RootedFs::new(&root).expect("test output root should bind");
-        let directory = bilibili_group_receipt_directory(&rooted, false)
-            .expect("receipt directory should validate")
-            .expect("receipt directory should exist");
+        let directory = bilibili_group_receipt_directory(
+            &rooted,
+            Some(TEST_GROUP_PUBLICATION_NAMESPACE),
+            false,
+        )
+        .expect("receipt directory should validate")
+        .expect("receipt directory should exist");
         let receipt_path = bilibili_group_receipt_path(
             &directory,
             &entry.stable_media_id,
@@ -26251,6 +26583,210 @@ mod tests {
         let error = validate_missing_plan_snapshot(&expected, &changed)
             .expect_err("changed filtered inventory must require review before download");
         assert!(error.to_string().contains("retry the queued job"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grouped_missing_plan_snapshot_probes_only_entries_without_compatible_media() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock API listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("mock API address should read")
+        );
+        let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0_u8; 8192];
+                let Ok(read) = stream.read(&mut request).await else {
+                    break;
+                };
+                let request_line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                server_requests
+                    .lock()
+                    .expect("request log should lock")
+                    .push(request_line.clone());
+                let body = if request_line.contains("/pgc/view/web/season")
+                    && request_line.contains("ep_id=3003")
+                {
+                    serde_json::json!({
+                        "code": 0,
+                        "result": {
+                            "season_id": 123,
+                            "title": "Test season",
+                            "episodes": [{
+                                "aid": 1003,
+                                "bvid": "BV3",
+                                "cid": 2003,
+                                "id": 9003,
+                                "ep_id": 3003,
+                                "title": "Episode 3"
+                            }]
+                        }
+                    })
+                } else if request_line.contains("/pgc/player/web/v2/playurl")
+                    && request_line.contains("ep_id=3003")
+                {
+                    serde_json::json!({
+                        "code": 0,
+                        "result": {
+                            "video_info": {
+                                "dash": {
+                                    "duration": 1,
+                                    "video": [{
+                                        "id": 64,
+                                        "baseUrl": "https://media.example/video.m4s",
+                                        "base_url": "https://media.example/video.m4s",
+                                        "codecs": "avc1",
+                                        "bandwidth": 8000000,
+                                        "size": 1234,
+                                        "width": 1920,
+                                        "height": 1080,
+                                        "mimeType": "video/mp4",
+                                        "mime_type": "video/mp4"
+                                    }],
+                                    "audio": []
+                                }
+                            }
+                        }
+                    })
+                } else {
+                    serde_json::json!({"code": -404, "message": "unexpected episode probe"})
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (mut config, output_root) = test_group_config("grouped-missing-plan-filtered-streams");
+        config.bilibili.extra_args = vec![
+            "--only".to_string(),
+            "video".to_string(),
+            "--pgc-base".to_string(),
+            base_url,
+            "--request-timeout-seconds".to_string(),
+            "2".to_string(),
+        ];
+        let ffmpeg = output_root.join("ffmpeg");
+        config.tools.ffmpeg = ffmpeg;
+        let ffprobe = output_root.join("ffprobe");
+        fs::write(&ffprobe, "#!/bin/sh\nset -eu\nprintf 'video\\naudio\\n'\n")
+            .expect("controlled probe should write");
+        fs::set_permissions(&ffprobe, fs::Permissions::from_mode(0o755))
+            .expect("controlled probe should be executable");
+
+        let mut inventory = test_group_inventory(3);
+        inventory.source = BilibiliGroupSource::Season;
+        for entry in &mut inventory.entries {
+            entry.download.epid = Some(3000 + u64::from(entry.download.index));
+            entry.stable_media_id = bilibili_plan_stable_media_id(
+                entry.download.bvid.as_deref(),
+                entry.download.aid,
+                entry.download.cid,
+                entry.download.epid,
+            );
+        }
+        for entry in &inventory.entries[..2] {
+            let media = output_root.join(format!("{}.mp4", entry.download.title));
+            fs::write(
+                &media,
+                b"synthetic media; streams supplied by the controlled probe",
+            )
+            .expect("existing media should write");
+            fs::write(
+                media.with_extension("nfo"),
+                format!(
+                    "<movie><uniqueid type=\"bilibili-cid\">cid{}</uniqueid><uniqueid type=\"bilibili-epid\">ep{}</uniqueid></movie>",
+                    entry.download.cid,
+                    entry.download.epid.expect("season entry should have an epid")
+                ),
+            )
+            .expect("existing identity metadata should write");
+        }
+
+        let options = bilibili_core::download_options(&config)
+            .expect("video-only Bilibili options should parse");
+        assert_eq!(options.mode, DownloadMode::VideoOnly);
+        let snapshot =
+            probe_bilibili_episode_group_streams(&config, &inventory, &options, true, None)
+                .await
+                .expect("Missing grouped plan should probe only the absent episode");
+        server.abort();
+
+        let missing_id = &inventory.entries[2].stable_media_id;
+        assert_eq!(
+            snapshot.stable_media_ids,
+            inventory
+                .entries
+                .iter()
+                .map(|entry| entry.stable_media_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(snapshot.bilibili_group_entries.len(), 3);
+        assert_eq!(
+            snapshot.bilibili_resolved_stream_ids,
+            vec![missing_id.clone()]
+        );
+        let expected_format = format!("{missing_id}:video:64");
+        assert_eq!(snapshot.selected_format_ids, vec![expected_format.clone()]);
+        let size_subjects = snapshot
+            .exact_sizes
+            .iter()
+            .chain(&snapshot.approximate_sizes)
+            .map(|size| size.subject.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(size_subjects, BTreeSet::from([expected_format]));
+        for present_entry in &inventory.entries[..2] {
+            let present_id = &present_entry.stable_media_id;
+            assert!(bilibili_group_confirmed_streams_for(&snapshot, present_id).is_none());
+            let expected_entry = BilibiliWorkerExpectedEntry {
+                index: present_entry.download.index,
+                title: present_entry.download.title.clone(),
+                stable_media_id: present_id.clone(),
+                bilibili_publication_namespace: None,
+                output_template: None,
+                collection_output_folder: None,
+                collection_directory: BilibiliCollectionDirectorySnapshot::Untracked,
+                confirmed_streams: None,
+            };
+            let current = PlanValidationSnapshot {
+                bilibili_resolved_stream_ids: vec![present_id.clone()],
+                selected_format_ids: vec![format!("{present_id}:video:125")],
+                resolution_codecs: vec![format!("{present_id}:video:125:1920x1080:hvc1")],
+                ..PlanValidationSnapshot::default()
+            };
+            assert!(validate_bilibili_group_confirmed_streams(&expected_entry, &current).is_err());
+        }
+
+        let requests = requests.lock().expect("request log should lock");
+        assert!(requests.iter().any(|request| {
+            request.contains("/pgc/player/web/v2/playurl") && request.contains("ep_id=3003")
+        }));
+        assert!(
+            requests.iter().all(|request| {
+                !request.contains("ep_id=3001") && !request.contains("ep_id=3002")
+            })
+        );
+        let _ = fs::remove_dir_all(output_root);
     }
 
     #[cfg(unix)]

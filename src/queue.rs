@@ -1624,6 +1624,7 @@ impl QueueManager {
             if entry.record_path.parent() == Some(store.queue_dir.as_path()) {
                 return store.save_mutated_record(record, entry, true);
             }
+            store.cleanup_terminal_bilibili_group_receipts(&record);
             return Ok(record);
         };
         if let Some(pending_target) = &entry.move_target {
@@ -1644,6 +1645,7 @@ impl QueueManager {
                 entry.move_target = None;
                 return store.save_mutated_record(record, entry, true);
             }
+            store.cleanup_terminal_bilibili_group_receipts(&record);
             return Ok(record);
         }
         match store.move_record_to_sidecar(&record.id, &entry.record_path, &destination) {
@@ -1657,6 +1659,7 @@ impl QueueManager {
                     error = %error,
                     "published task is complete; retaining its pending sidecar migration for recovery"
                 );
+                store.cleanup_terminal_bilibili_group_receipts(&record);
                 return Ok(record);
             }
             Err(error) => return Err(error),
@@ -2107,6 +2110,16 @@ impl QueueManager {
     }
 
     fn recover_interrupted_tasks(&self) -> Result<()> {
+        // Recover receipt-directory removal once, rather than scanning the common base
+        // again for every terminal record in history.
+        if let Err(error) =
+            crate::downloader::recover_bilibili_group_receipt_removals(&self.video.root)
+        {
+            tracing::warn!(
+                error = %error,
+                "failed to recover interrupted Bilibili receipt cleanup; retained for retry"
+            );
+        }
         let stores = if self.video.shares_root(&self.pdf) {
             vec![&self.video]
         } else {
@@ -2114,6 +2127,7 @@ impl QueueManager {
         };
         for store in stores {
             for mut record in store.list_records()? {
+                store.cleanup_terminal_bilibili_group_receipts(&record);
                 if record.status.is_unfinished()
                     && !matches!(
                         record.status,
@@ -2550,6 +2564,36 @@ impl DownloadStore {
             .join(format!("task-{id}.json")))
     }
 
+    fn cleanup_terminal_bilibili_group_receipts(&self, record: &TaskRecord) {
+        if !matches!(record.status, TaskStatus::Completed | TaskStatus::Cancelled)
+            || !(record
+                .bilibili_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.independent_entries)
+                || record
+                    .plan
+                    .as_ref()
+                    .is_some_and(|plan| !plan.bilibili_group_entries.is_empty())
+                || record
+                    .proposed_plan
+                    .as_ref()
+                    .is_some_and(|plan| !plan.bilibili_group_entries.is_empty()))
+        {
+            return;
+        }
+
+        let namespace = record.bilibili_publication_namespace();
+        if let Err(error) =
+            crate::downloader::cleanup_bilibili_group_publication_receipts(&self.root, &namespace)
+        {
+            tracing::warn!(
+                task_id = %record.id,
+                error = %error,
+                "failed to clean terminal Bilibili publication receipts; queue recovery will retry"
+            );
+        }
+    }
+
     fn ensure_private_history_directory(&self) -> Result<()> {
         self.ensure_private_directory()?;
         let path = self.queue_dir.join(TERMINAL_HISTORY_DIRECTORY);
@@ -2908,6 +2952,7 @@ impl DownloadStore {
         }
         index.tasks.insert(record.id.clone(), entry);
         self.write_index(&index)?;
+        self.cleanup_terminal_bilibili_group_receipts(&record);
         Ok(record)
     }
 
@@ -3547,7 +3592,7 @@ fn poisoned_lock<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::file_provider::MockQueueFileProvider;
@@ -3622,6 +3667,38 @@ mod tests {
         fs::create_dir_all(&config.downloads.video_dir).unwrap();
         fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
         config
+    }
+
+    fn add_private_group_receipt_fixture(
+        root: &RootedFs,
+        publication_namespace: &str,
+        filename: &str,
+    ) -> PathBuf {
+        let directory = crate::downloader::bilibili_group_receipt_namespace_path_for_test(
+            root,
+            publication_namespace,
+        )
+        .expect("private receipt namespace should create");
+        let path = directory.join(filename);
+        fs::write(&path, b"{}").expect("receipt fixture should write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("receipt fixture should be owner-private");
+        path
+    }
+
+    fn attach_grouped_attempt(queue: &QueueManager, id: &str) -> TaskRecord {
+        queue
+            .set_bilibili_attempt_if_generation(id, 0, grouped_attempt())
+            .expect("independent grouped attempt should persist")
+            .expect("task should still exist")
+    }
+
+    fn verified_grouped_attempt() -> BilibiliAttemptSnapshot {
+        let mut attempt = grouped_attempt();
+        for index in [16, 17, 18] {
+            attempt.entry_verified(index);
+        }
+        attempt
     }
 
     #[test]
@@ -6989,6 +7066,382 @@ mod tests {
         };
         fs::write(root.join(format!("owner-{slot}-result")), result)
             .expect("queue owner child result should write");
+    }
+
+    #[test]
+    fn terminal_independent_group_records_clean_only_their_receipts() {
+        let temp_root = temp_queue_root("terminal-group-receipt-cleanup");
+        let config = test_video_config(&temp_root);
+        let queue = QueueManager::open(&config).expect("task queue should open");
+
+        let cancelled_id = "task-receipt-cleanup-cancelled";
+        assert!(
+            queue
+                .create(bilibili_task(cancelled_id))
+                .expect("cancelled task should persist")
+        );
+        let cancelled = attach_grouped_attempt(&queue, cancelled_id);
+        let cancelled_receipt = add_private_group_receipt_fixture(
+            &queue.video.root,
+            &cancelled.bilibili_publication_namespace(),
+            &format!("{}.json", "a".repeat(64)),
+        );
+
+        let completed_id = "task-receipt-cleanup-completed";
+        assert!(
+            queue
+                .create(bilibili_task(completed_id))
+                .expect("completed task should persist")
+        );
+        queue
+            .set_status(completed_id, TaskStatus::Running, None)
+            .expect("completed task should start");
+        queue
+            .set_bilibili_attempt_if_generation(completed_id, 0, verified_grouped_attempt())
+            .expect("verified grouped attempt should persist")
+            .expect("completed task should still exist");
+        let completed = queue.get(completed_id).expect("task should load").unwrap();
+        let completed_receipt = add_private_group_receipt_fixture(
+            &queue.video.root,
+            &completed.bilibili_publication_namespace(),
+            &format!(".{}.next", "b".repeat(64)),
+        );
+        queue
+            .begin_verification(completed_id)
+            .expect("verification should begin")
+            .expect("completed task should still exist");
+
+        let unrelated_id = "task-receipt-cleanup-unrelated";
+        assert!(
+            queue
+                .create(bilibili_task(unrelated_id))
+                .expect("unrelated task should persist")
+        );
+        let unrelated = attach_grouped_attempt(&queue, unrelated_id);
+        let unrelated_receipt = add_private_group_receipt_fixture(
+            &queue.video.root,
+            &unrelated.bilibili_publication_namespace(),
+            &format!("{}.json", "c".repeat(64)),
+        );
+
+        let cancelled = queue
+            .cancel(cancelled_id, 123_456_789)
+            .expect("cancellation should persist")
+            .expect("cancelled task should still exist");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert!(!cancelled_receipt.exists());
+        assert!(completed_receipt.is_file());
+        assert!(unrelated_receipt.is_file());
+
+        let published_media = queue.video.root_path.join("published-episode.mp4");
+        fs::write(
+            &published_media,
+            b"published media should survive receipt cleanup",
+        )
+        .expect("test publication should write");
+        let completed = queue
+            .complete(
+                completed_id,
+                queue.video.root_path.display().to_string(),
+                std::slice::from_ref(&published_media),
+                BTreeMap::new(),
+            )
+            .expect("verified group should complete");
+        assert_eq!(completed.status, TaskStatus::Completed);
+        assert!(!completed_receipt.exists());
+        assert!(unrelated_receipt.is_file());
+        assert!(published_media.is_file());
+
+        drop(queue);
+        fs::remove_dir_all(temp_root).expect("test directory should clean");
+    }
+
+    #[test]
+    fn cancelled_group_plan_cleans_receipts_when_attempt_snapshot_is_missing() {
+        let temp_root = temp_queue_root("cancelled-group-plan-without-attempt");
+        let config = test_video_config(&temp_root);
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-cancelled-group-plan-without-attempt";
+        assert!(
+            queue
+                .create(bilibili_task(id))
+                .expect("task should persist")
+        );
+        queue
+            .set_status(id, TaskStatus::Running, None)
+            .expect("task should start");
+        let planned = queue
+            .set_plan_if_generation(
+                id,
+                0,
+                grouped_plan(
+                    "Season",
+                    None,
+                    &[(16, "Episode A", "media-a"), (17, "Episode B", "media-b")],
+                ),
+            )
+            .expect("accepted group plan should persist")
+            .expect("task should still exist")
+            .0;
+        assert!(planned.bilibili_attempt.is_none());
+        let receipt = add_private_group_receipt_fixture(
+            &queue.video.root,
+            &planned.bilibili_publication_namespace(),
+            &format!("{}.json", "3".repeat(64)),
+        );
+        queue
+            .set_status(id, TaskStatus::AwaitingConfirmation, None)
+            .expect("task should leave active running state");
+
+        let cancelled = queue
+            .cancel(id, 123_456_789)
+            .expect("cancellation should persist")
+            .expect("task should be cancelled");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert!(!receipt.exists());
+
+        drop(queue);
+        fs::remove_dir_all(temp_root).expect("test directory should clean");
+    }
+
+    #[test]
+    fn nonterminal_group_records_retain_receipts() {
+        let temp_root = temp_queue_root("nonterminal-group-receipt-retention");
+        let config = test_video_config(&temp_root);
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let cases = [
+            ("task-receipt-retain-failed", TaskStatus::Failed, "d"),
+            (
+                "task-receipt-retain-partial",
+                TaskStatus::PartiallyCompleted,
+                "a",
+            ),
+            (
+                "task-receipt-retain-interrupted",
+                TaskStatus::Interrupted,
+                "e",
+            ),
+        ];
+        let mut receipts = Vec::new();
+        for (id, status, hex) in cases {
+            assert!(
+                queue
+                    .create(bilibili_task(id))
+                    .expect("task should persist")
+            );
+            let record = attach_grouped_attempt(&queue, id);
+            receipts.push(add_private_group_receipt_fixture(
+                &queue.video.root,
+                &record.bilibili_publication_namespace(),
+                &format!("{}.json", hex.repeat(64)),
+            ));
+            queue
+                .set_status(id, status, None)
+                .expect("nonterminal status should persist");
+        }
+        assert!(receipts.iter().all(|receipt| receipt.is_file()));
+
+        drop(queue);
+        fs::remove_dir_all(temp_root).expect("test directory should clean");
+    }
+
+    #[test]
+    fn terminal_receipt_cleanup_waits_for_durable_queue_index_write() {
+        let temp_root = temp_queue_root("terminal-receipt-index-write-failure");
+        let config = test_video_config(&temp_root);
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let file_provider_trait: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, file_provider_trait)
+            .expect("task queue should open");
+        let id = "task-receipt-index-write-failure";
+        assert!(
+            queue
+                .create(bilibili_task(id))
+                .expect("task should persist")
+        );
+        let record = attach_grouped_attempt(&queue, id);
+        let receipt = add_private_group_receipt_fixture(
+            &queue.video.root,
+            &record.bilibili_publication_namespace(),
+            &format!("{}.json", "f".repeat(64)),
+        );
+
+        // The cancellation lookup writes the first index; the record write succeeds next, then
+        // the terminal move intent index write fails. Cleanup must wait for all durable writes.
+        file_provider.fail_write_after(2, "injected terminal index write failure");
+        assert!(queue.cancel(id, 123_456_789).is_err());
+        let persisted = queue
+            .video
+            .read_record(&queue.video.task_path(id).unwrap())
+            .expect("terminal record should read")
+            .expect("terminal record should remain on disk");
+        assert_eq!(persisted.status, TaskStatus::Cancelled);
+        assert!(receipt.is_file(), "failed index write must retain receipts");
+
+        drop(queue);
+        fs::remove_dir_all(temp_root).expect("test directory should clean");
+    }
+
+    #[test]
+    fn startup_retries_cleanup_for_terminal_history_records() {
+        let temp_root = temp_queue_root("startup-terminal-receipt-cleanup");
+        let config = test_video_config(&temp_root);
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-startup-terminal-receipt-cleanup";
+        assert!(
+            queue
+                .create(bilibili_task(id))
+                .expect("task should persist")
+        );
+        let record = attach_grouped_attempt(&queue, id);
+        let receipt = add_private_group_receipt_fixture(
+            &queue.video.root,
+            &record.bilibili_publication_namespace(),
+            &format!("{}.json", "1".repeat(64)),
+        );
+
+        let (mut persisted, mut entry) = queue
+            .video
+            .get_task(id)
+            .expect("task should load")
+            .expect("task should exist");
+        persisted.status = TaskStatus::Completed;
+        persisted.revision = persisted.revision.saturating_add(1);
+        let source = entry.record_path.clone();
+        let destination = queue
+            .video
+            .terminal_history_path(id)
+            .expect("history path should resolve");
+        queue
+            .video
+            .ensure_private_history_directory()
+            .expect("history directory should be private");
+        queue
+            .video
+            .write_record(&source, &persisted)
+            .expect("terminal record should persist");
+        entry.move_target = Some(destination.clone());
+        entry.revision = persisted.revision;
+        entry.updated_at = persisted.updated_at;
+        queue
+            .video
+            .save_index_task(id, entry.clone())
+            .expect("terminal move intent should persist");
+        assert_eq!(
+            queue
+                .video
+                .move_record_to_sidecar(id, &source, &destination)
+                .expect("terminal history move should succeed"),
+            SidecarMoveStatus::Moved
+        );
+        entry.record_path = destination;
+        entry.move_target = None;
+        queue
+            .video
+            .save_index_task(id, entry)
+            .expect("terminal history index should persist");
+        assert!(receipt.is_file());
+
+        drop(queue);
+        let reopened = QueueManager::open(&config).expect("terminal history should recover");
+        assert!(
+            !receipt.exists(),
+            "startup should retry cleanup for already-terminal history records"
+        );
+        let recovered = reopened
+            .get(id)
+            .expect("terminal history record should load")
+            .expect("terminal history record should remain indexed");
+        assert_eq!(recovered.status, TaskStatus::Completed);
+
+        drop(reopened);
+        fs::remove_dir_all(temp_root).expect("test directory should clean");
+    }
+
+    #[test]
+    fn receipt_cleanup_failure_does_not_fail_terminal_persistence_and_retries_at_startup() {
+        let temp_root = temp_queue_root("receipt-cleanup-failure-retry");
+        let config = test_video_config(&temp_root);
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-receipt-cleanup-failure-retry";
+        assert!(
+            queue
+                .create(bilibili_task(id))
+                .expect("task should persist")
+        );
+        let record = attach_grouped_attempt(&queue, id);
+        let namespace = record.bilibili_publication_namespace();
+        let receipt = add_private_group_receipt_fixture(
+            &queue.video.root,
+            &namespace,
+            &format!("{}.json", "4".repeat(64)),
+        );
+        let namespace_directory =
+            crate::downloader::bilibili_group_receipt_namespace_path_for_test(
+                &queue.video.root,
+                &namespace,
+            )
+            .expect("receipt namespace should exist");
+        let unexpected = namespace_directory.join("unrecognized-entry");
+        fs::write(&unexpected, b"retain until recovery")
+            .expect("unexpected namespace entry should write");
+
+        let cancelled = queue
+            .cancel(id, 123_456_789)
+            .expect("cleanup failure should not fail terminal persistence")
+            .expect("task should remain available");
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert!(receipt.is_file());
+        assert!(unexpected.is_file());
+        fs::remove_file(&unexpected).expect("unexpected fixture should remove before restart");
+
+        drop(queue);
+        let reopened = QueueManager::open(&config).expect("terminal task should recover");
+        assert!(
+            !receipt.exists(),
+            "startup should retry a cleanup that previously failed"
+        );
+        assert_eq!(
+            reopened
+                .get(id)
+                .expect("terminal history should load")
+                .expect("cancelled task should remain indexed")
+                .status,
+            TaskStatus::Cancelled
+        );
+
+        drop(reopened);
+        fs::remove_dir_all(temp_root).expect("test directory should clean");
+    }
+
+    #[test]
+    fn stale_generation_does_not_clean_group_receipts() {
+        let temp_root = temp_queue_root("stale-generation-receipt-retention");
+        let config = test_video_config(&temp_root);
+        let queue = QueueManager::open(&config).expect("task queue should open");
+        let id = "task-stale-generation-receipt-retention";
+        assert!(
+            queue
+                .create(bilibili_task(id))
+                .expect("task should persist")
+        );
+        let record = attach_grouped_attempt(&queue, id);
+        let receipt = add_private_group_receipt_fixture(
+            &queue.video.root,
+            &record.bilibili_publication_namespace(),
+            &format!("{}.json", "2".repeat(64)),
+        );
+
+        assert!(
+            queue
+                .complete_if_generation(id, 1, "stale completion".into(), &[], BTreeMap::new())
+                .expect("stale completion should be ignored")
+                .is_none()
+        );
+        assert!(receipt.is_file());
+
+        drop(queue);
+        fs::remove_dir_all(temp_root).expect("test directory should clean");
     }
 
     #[test]

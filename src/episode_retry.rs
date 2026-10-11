@@ -38,7 +38,8 @@ pub fn classify_episode_failure_with_retry_after(
 ) -> EpisodeFailureDisposition {
     let chain = format!("{error:#}").to_ascii_lowercase();
 
-    if is_shared_output_recovery_failure(&chain)
+    if is_shared_executable_launch_failure(error, &chain)
+        || is_shared_output_recovery_failure(&chain)
         || is_unsafe_publication_or_identity_failure(&chain)
         || is_shared_storage_failure(error, &chain)
         || is_group_authentication_failure(&chain)
@@ -91,6 +92,17 @@ fn retry_or_fail(
 fn is_shared_output_recovery_failure(chain: &str) -> bool {
     chain.contains("video output recovery scan is incomplete")
         || chain.contains("shared output recovery failure: bilibili group publication receipt")
+}
+
+fn is_shared_executable_launch_failure(error: &Error, chain: &str) -> bool {
+    if !chain.contains("failed to run ") {
+        return false;
+    }
+
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<std::io::Error>().is_some())
+        || chain.contains("(os error ")
 }
 
 fn is_group_authentication_failure(chain: &str) -> bool {
@@ -575,6 +587,57 @@ mod tests {
         assert_eq!(
             classify("HTTP 404 Not Found", 0),
             EpisodeFailureDisposition::FailEntry
+        );
+    }
+
+    #[test]
+    fn missing_worker_executable_pauses_for_typed_and_ipc_string_errors() {
+        let missing_executable = Error::new(std::io::Error::from_raw_os_error(2))
+            .context("failed to run /configured/tools/ffprobe");
+        for retries_used in [0, MAX_ADDITIONAL_EPISODE_RETRIES] {
+            assert_eq!(
+                classify_episode_failure(&missing_executable, retries_used),
+                EpisodeFailureDisposition::PauseGroup
+            );
+
+            // Worker IPC can preserve the display chain while discarding typed I/O causes.
+            let ipc_error = anyhow!("{missing_executable:#}");
+            assert_eq!(
+                classify_episode_failure(&ipc_error, retries_used),
+                EpisodeFailureDisposition::PauseGroup
+            );
+        }
+
+        let other_worker_tool = anyhow!(
+            "failed to run /configured/tools/media-helper: No such file or directory (os error 2)"
+        );
+        assert_eq!(
+            classify_episode_failure(&other_worker_tool, 0),
+            EpisodeFailureDisposition::PauseGroup
+        );
+
+        let missing_media = Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("failed to open one episode sidecar");
+        assert_eq!(
+            classify_episode_failure(&missing_media, 0),
+            EpisodeFailureDisposition::FailEntry
+        );
+    }
+
+    #[test]
+    fn invalid_worker_executable_pauses_for_typed_and_ipc_string_errors() {
+        let invalid_executable = Error::new(std::io::Error::from_raw_os_error(8))
+            .context("failed to run /configured/tools/ffmpeg");
+        assert_eq!(
+            classify_episode_failure(&invalid_executable, 0),
+            EpisodeFailureDisposition::PauseGroup
+        );
+
+        // Worker IPC can preserve the OS error text without the typed I/O cause.
+        let ipc_error = anyhow!("{invalid_executable:#}");
+        assert_eq!(
+            classify_episode_failure(&ipc_error, 0),
+            EpisodeFailureDisposition::PauseGroup
         );
     }
 
