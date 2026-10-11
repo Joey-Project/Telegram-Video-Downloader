@@ -3110,19 +3110,10 @@ async fn execute_bilibili_group_entry(
         let ResolvedContent::Video(video) = resolved else {
             bail!("Bilibili collection item did not resolve to a video");
         };
-        Some(
-            video
-                .pages
-                .iter()
-                .find(|page| page.cid == entry.download.cid)
-                .with_context(|| {
-                    format!(
-                        "Bilibili collection item {} changed its CID while refreshing",
-                        entry.download.index
-                    )
-                })?
-                .index,
-        )
+        Some(bilibili_collection_page_index_for_saved_cid(
+            &entry.download,
+            video.pages.iter().map(|page| (page.cid, page.index)),
+        )?)
     } else {
         None
     };
@@ -3156,6 +3147,21 @@ async fn execute_bilibili_group_entry(
     drop(child_progress);
     let _ = bridge.await;
     result
+}
+
+fn bilibili_collection_page_index_for_saved_cid(
+    entry: &BilibiliDownloadEntry,
+    pages: impl IntoIterator<Item = (u64, u32)>,
+) -> Result<u32> {
+    pages
+        .into_iter()
+        .find_map(|(cid, page_index)| (cid == entry.cid).then_some(page_index))
+        .with_context(|| {
+            format!(
+                "Bilibili collection item {} identity changed while refreshing: saved CID {} is absent from the refreshed video",
+                entry.index, entry.cid
+            )
+        })
 }
 
 fn bilibili_group_child_url_selection(
@@ -20986,6 +20992,71 @@ mod tests {
                 .all(|entry| entry.state == BilibiliAttemptEntryState::Verified)
         );
 
+        fs::remove_dir_all(root).expect("test output root should be removed");
+    }
+
+    #[tokio::test]
+    async fn collection_cid_identity_change_interrupts_before_later_episode() {
+        let (config, root) = test_group_config("episode-group-collection-cid-change");
+        let mut inventory = test_group_inventory(2);
+        inventory.source = BilibiliGroupSource::Collection;
+        let calls = Arc::new(StdMutex::new(Vec::<u32>::new()));
+        let executor_calls = Arc::clone(&calls);
+        let executor_root = root.clone();
+        let execute_entry: BilibiliGroupEntryExecutor = Arc::new(move |entry| {
+            let calls = Arc::clone(&executor_calls);
+            let root = executor_root.clone();
+            Box::pin(async move {
+                calls
+                    .lock()
+                    .expect("test calls lock should remain healthy")
+                    .push(entry.download.index);
+                // Model the collection refresh returning page metadata with a different CID.
+                // Production uses this same lookup helper after fetching the refreshed video.
+                let refreshed_page = (entry.download.cid.saturating_add(1), 7);
+                bilibili_collection_page_index_for_saved_cid(&entry.download, [refreshed_page])?;
+                let path = write_group_test_media(&root, entry.download.index);
+                Ok(report_for_group_test_media(path))
+            })
+        });
+        let scanner: BilibiliGroupExistingMediaScanner = Arc::new(|_| Box::pin(async { Ok(None) }));
+        let (progress, _receiver) = job_progress_channel();
+
+        let result = run_bilibili_episode_group_with_inventory(
+            &config,
+            &test_group_job(BilibiliSelection::All),
+            inventory.clone(),
+            None,
+            Some(test_group_validation_snapshot(&inventory, &config)),
+            Some(progress.clone()),
+            test_group_hooks(execute_entry, scanner),
+        )
+        .await;
+        let error = result.expect_err("a changed collection CID must pause the group");
+
+        assert!(
+            format!("{error:#}").contains("identity changed while refreshing"),
+            "the paused error should explain the saved media identity changed: {error:#}"
+        );
+        assert_eq!(
+            *calls.lock().expect("test calls lock should remain healthy"),
+            vec![1],
+            "the later collection entry must not start after identity drift"
+        );
+        let snapshot = progress
+            .bilibili_attempt_snapshot()
+            .expect("interrupted group snapshot should remain available");
+        assert_eq!(snapshot.outcome, Some(BilibiliAttemptOutcome::Interrupted));
+        assert_eq!(
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.index == 2)
+                .expect("later entry should remain in the group snapshot")
+                .state,
+            BilibiliAttemptEntryState::Pending,
+            "identity drift must leave later entries pending for resume"
+        );
         fs::remove_dir_all(root).expect("test output root should be removed");
     }
 

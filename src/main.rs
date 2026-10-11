@@ -1911,6 +1911,16 @@ fn queue_task_buttons(
 ) -> Vec<InlineKeyboardButton> {
     let mut buttons = Vec::new();
     let task_action = match record.status {
+        TaskStatus::Failed
+            if record.bilibili_attempt.as_ref().is_some_and(|attempt| {
+                attempt.independent_entries
+                    && attempt.failed_entries() == 0
+                    && attempt.verified_entries() == 0
+                    && group_has_remaining_entries(attempt)
+            }) =>
+        {
+            Some((episode_group_resume_label(record), "resume"))
+        }
         TaskStatus::PartiallyCompleted
             if record
                 .bilibili_attempt
@@ -10944,6 +10954,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn failed_group_planning_after_scoped_retry_offers_a_working_resume() {
+        let task_id = "failed-group-retry-planning-resume";
+        let chat_id = 123_456_789;
+        let (queue_root, _config, queue, _file_provider) =
+            generation_guard_collection_queue(task_id, task_id, 968, chat_id);
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [16, 17].map(|index| {
+                (
+                    index,
+                    format!("Episode {index}"),
+                    Some(format!("episode:{index}")),
+                )
+            }),
+            0,
+        );
+        for index in [16, 17] {
+            attempt.entry_failed_with_error(index, 3, "HTTP 403 Forbidden".into());
+        }
+        attempt.finish(BilibiliAttemptOutcome::Failed);
+        queue
+            .fail_with_bilibili_attempt_if_generation(
+                task_id,
+                0,
+                "episode attempts exhausted".into(),
+                Some(attempt),
+            )
+            .unwrap()
+            .unwrap();
+        let retry = queue.claim_resume(task_id, true).unwrap().unwrap();
+        assert_eq!(retry.generation, 1);
+        assert_eq!(retry.bilibili_attempt.as_ref().unwrap().failed_entries(), 0);
+        let failed = queue
+            .fail_if_generation(task_id, 1, "plan inspection failed before execution".into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, TaskStatus::Failed);
+        assert!(queue.claim_resume(task_id, true).unwrap().is_none());
+
+        let buttons = queue_task_buttons(&failed, 1, &queue_task_display(&failed));
+        let resume_button = buttons
+            .iter()
+            .find(|button| {
+                matches!(
+                    parse_queue_callback_data(&button.callback_data),
+                    Some(QueueCallbackAction::Resume { .. })
+                )
+            })
+            .expect("failed planning must offer normal resume");
+        assert!(resume_button.text.starts_with("Resume remaining episodes"));
+        assert!(!buttons.iter().any(|button| matches!(
+            parse_queue_callback_data(&button.callback_data),
+            Some(QueueCallbackAction::Retry { .. })
+        )));
+        assert!(
+            episode_group_terminal_keyboard(&failed)
+                .inline_keyboard
+                .iter()
+                .flatten()
+                .any(|button| button.callback_data == resume_button.callback_data)
+        );
+        let Some(QueueCallbackAction::Resume { id, generation }) =
+            parse_queue_callback_data(&resume_button.callback_data)
+        else {
+            panic!("expected a resume callback");
+        };
+        let resumed = queue
+            .claim_resume_for_chat_if_generation(&id, generation, chat_id, false)
+            .unwrap()
+            .expect("the rendered resume action must be claimable");
+        assert_eq!(resumed.status, TaskStatus::Preparing);
+        assert_eq!(resumed.generation, 2);
+        drop(queue);
+        fs::remove_dir_all(queue_root).unwrap();
     }
 
     #[test]

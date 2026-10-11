@@ -540,7 +540,14 @@ impl BilibiliAttemptSnapshot {
 
     pub fn finish(&mut self, mut outcome: BilibiliAttemptOutcome) {
         if self.outcome.is_some() {
-            return;
+            if self.outcome == Some(BilibiliAttemptOutcome::Interrupted)
+                && outcome == BilibiliAttemptOutcome::Cancelled
+            {
+                // An explicit parent cancellation is authoritative over a guard's Drop snapshot.
+                self.outcome = None;
+            } else {
+                return;
+            }
         }
 
         if self.independent_entries
@@ -1203,6 +1210,50 @@ mod tests {
             attempt.outcome,
             Some(BilibiliAttemptOutcome::PartiallyCompleted)
         );
+    }
+
+    #[test]
+    fn explicit_cancel_replaces_interrupted_but_preserves_real_terminal_outcomes() {
+        let mut interrupted = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [(1, "Episode 1".to_string(), None)],
+            0,
+        );
+        interrupted.entry_started(1);
+        interrupted.finish(BilibiliAttemptOutcome::Interrupted);
+        interrupted.finish(BilibiliAttemptOutcome::Cancelled);
+        assert_eq!(interrupted.outcome, Some(BilibiliAttemptOutcome::Cancelled));
+        assert_eq!(
+            interrupted.entries[0].state,
+            BilibiliAttemptEntryState::Interrupted
+        );
+
+        let mut partial = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [
+                (1, "Episode 1".to_string(), None),
+                (2, "Episode 2".to_string(), None),
+            ],
+            0,
+        );
+        partial.entry_verified(1);
+        partial.entry_failed(2);
+        partial.finish(BilibiliAttemptOutcome::PartiallyCompleted);
+        partial.finish(BilibiliAttemptOutcome::Cancelled);
+        assert_eq!(
+            partial.outcome,
+            Some(BilibiliAttemptOutcome::PartiallyCompleted)
+        );
+
+        let mut verified = BilibiliAttemptSnapshot::new_independent(
+            "Season".to_string(),
+            [(1, "Episode 1".to_string(), None)],
+            0,
+        );
+        verified.entry_verified(1);
+        verified.finish(BilibiliAttemptOutcome::Verified);
+        verified.finish(BilibiliAttemptOutcome::Cancelled);
+        assert_eq!(verified.outcome, Some(BilibiliAttemptOutcome::Verified));
     }
 
     #[test]

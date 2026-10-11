@@ -4734,6 +4734,109 @@ mod tests {
     }
 
     #[test]
+    fn parent_cancel_overrides_guard_interruption_and_survives_late_snapshot_and_reload() {
+        use crate::router::BilibiliSelection;
+        let directory = temp_queue_root("episode-group-cancel-after-interrupt");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = directory.join("videos");
+        config.downloads.pdf_dir = directory.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = test_task(
+            "episode-group-cancel-after-interrupt",
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        queue.create(task.clone()).unwrap();
+
+        // The group guard's Drop records Interrupted before the parent cancellation is finalized.
+        let mut guard_snapshot = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [
+                (16, "Episode 16".into(), Some("ep-16".into())),
+                (17, "Episode 17".into(), Some("ep-17".into())),
+                (18, "Episode 18".into(), Some("ep-18".into())),
+            ],
+            0,
+        );
+        guard_snapshot.entry_verified(16);
+        guard_snapshot.entry_started(17);
+        guard_snapshot.finish(BilibiliAttemptOutcome::Interrupted);
+        assert_eq!(
+            guard_snapshot.outcome,
+            Some(BilibiliAttemptOutcome::Interrupted)
+        );
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, guard_snapshot.clone())
+            .unwrap()
+            .unwrap();
+
+        let requested = queue
+            .cancel_if_generation(&task.id, 0, task.chat_id)
+            .unwrap()
+            .unwrap();
+        assert!(requested.cancel_requested);
+        let cancelled = queue
+            .finish_cancellation_with_bilibili_attempt_if_generation(&task.id, 0, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, TaskStatus::Cancelled);
+        assert_eq!(
+            cancelled.bilibili_attempt.as_ref().unwrap().outcome,
+            Some(BilibiliAttemptOutcome::Cancelled)
+        );
+
+        // An in-flight guard snapshot arriving after cancellation must keep the parent result.
+        let delayed = queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, guard_snapshot)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delayed.status, TaskStatus::Cancelled);
+        assert_eq!(
+            delayed.bilibili_attempt.as_ref().unwrap().outcome,
+            Some(BilibiliAttemptOutcome::Cancelled)
+        );
+        assert!(
+            delayed
+                .bilibili_attempt
+                .as_ref()
+                .unwrap()
+                .summary()
+                .contains("Outcome: cancelled")
+        );
+
+        drop(queue);
+        let queue = QueueManager::open(&config).unwrap();
+        let restored = queue.get(&task.id).unwrap().unwrap();
+        assert_eq!(restored.status, TaskStatus::Cancelled);
+        let attempt = restored.bilibili_attempt.unwrap();
+        assert_eq!(attempt.outcome, Some(BilibiliAttemptOutcome::Cancelled));
+        assert_eq!(attempt.verified_entries(), 1);
+        for state in [
+            BilibiliAttemptEntryState::Interrupted,
+            BilibiliAttemptEntryState::Pending,
+        ] {
+            assert_eq!(
+                attempt
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.state == state)
+                    .count(),
+                1
+            );
+        }
+        assert!(attempt.summary().contains("Outcome: cancelled"));
+        assert!(!attempt.summary().contains("Outcome: interrupted"));
+
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn bilibili_attempt_restart_preserves_downloaded_entries_without_reporting_them_verified() {
         let directory = temp_queue_root("episode-results-restart");
         let mut config = AppConfig::for_test();
