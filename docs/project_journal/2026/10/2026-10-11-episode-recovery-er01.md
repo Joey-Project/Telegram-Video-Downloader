@@ -81,7 +81,8 @@ offer a way to select failed episodes.
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed with 720 passed and 15 existing
+- Rust 1.95.0: all-target offline tests passed with eight parallel threads,
+  720 passed and 15 existing
   opt-in tests ignored. Offline build, all-target Clippy with warnings denied,
   formatting, diff checks, and project journal validation passed.
 - Regression tests exercise the actual episode driver through injected child
@@ -126,6 +127,9 @@ offer a way to select failed episodes.
 - State and mock Telegram tests cover independent completion counts, restart,
   error retention, progress-channel closure, paginated episode views, message
   reuse, stale generation callbacks, and cross-chat action rejection.
+- Output-lock tests accept only the documented acquisition progress when another
+  parallel test holds the shared lock, while retaining explicit contention and
+  clean-marker recovery-scan assertions.
 - Builds use an isolated temporary Cargo target with debug information and
   incremental compilation disabled. This workstream does not deploy or restart
   the canonical macOS LaunchAgent.

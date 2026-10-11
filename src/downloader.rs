@@ -24488,6 +24488,20 @@ mod tests {
         );
     }
 
+    fn assert_only_output_lock_acquisition_progress(receiver: &mut JobProgressReceiver) {
+        // Parallel tests share the process-wide output lock, even with distinct roots.
+        if let Some(progress) = receiver.borrow_and_update().as_ref() {
+            assert_eq!(
+                progress,
+                &JobProgress {
+                    message: "Bilibili download: video output slot acquired".to_string(),
+                    resolved_summary: None,
+                    collection: None,
+                }
+            );
+        }
+    }
+
     fn metadata_with_subtitles() -> YoutubeMetadata {
         YoutubeMetadata {
             subtitles: BTreeMap::from([
@@ -30622,13 +30636,13 @@ mod tests {
             )
             .expect("recovery state should remain incomplete")
         );
-        let (tx, rx) = job_progress_channel();
+        let (tx, mut rx) = job_progress_channel();
         let error = match video_output_lock(&final_dir, "Bilibili download", Some(&tx)).await {
             Ok(_) => panic!("incomplete recovery state should block a new download"),
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("video output recovery scan is incomplete"));
-        assert_no_progress(&rx);
+        assert_only_output_lock_acquisition_progress(&mut rx);
 
         recover_pending_overwrite_transactions(&final_dir)
             .expect("a complete retry should clear the recovery marker");
@@ -30643,7 +30657,7 @@ mod tests {
         let guard = video_output_lock(&final_dir, "Bilibili download", Some(&tx))
             .await
             .expect("complete recovery should allow a new download");
-        assert_no_progress(&rx);
+        assert_only_output_lock_acquisition_progress(&mut rx);
         drop(guard);
         let _ = fs::remove_dir_all(final_dir);
     }
@@ -34009,7 +34023,7 @@ mv video.original video.m4s || exit 46
         let guard = video_output_lock(&video_dir, "Bilibili download", Some(&tx))
             .await
             .expect("output lock should acquire");
-        assert_no_progress(&rx);
+        assert_only_output_lock_acquisition_progress(&mut rx);
         drop(guard);
 
         let held_guard = VIDEO_OUTPUT_LOCK
@@ -34149,13 +34163,13 @@ mv video.original video.m4s || exit 46
             .0
             .write_state(VIDEO_RECOVERY_STATE_CLEAN)
             .expect("recovery state should become clean");
-        let (tx, rx) = job_progress_channel();
+        let (tx, mut rx) = job_progress_channel();
 
         let guard = video_output_lock(&video_dir, "Bilibili download", Some(&tx))
             .await
             .expect("clean output lock should acquire");
 
-        assert_no_progress(&rx);
+        assert_only_output_lock_acquisition_progress(&mut rx);
         assert!(unresolved.is_dir());
         drop(guard);
         let _ = fs::remove_dir_all(video_dir);
