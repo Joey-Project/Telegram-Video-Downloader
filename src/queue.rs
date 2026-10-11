@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
@@ -104,6 +104,13 @@ pub struct PrimaryMediaHashManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BilibiliGroupEntryIdentity {
+    pub index: u32,
+    pub title: String,
+    pub stable_media_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanValidationSnapshot {
     pub stable_media_ids: Vec<String>,
     pub selected_format_ids: Vec<String>,
@@ -111,6 +118,10 @@ pub struct PlanValidationSnapshot {
     pub approximate_sizes: Vec<PlanSize>,
     pub resolution_codecs: Vec<String>,
     pub title: Option<String>,
+    #[serde(default)]
+    pub media_profile: Option<String>,
+    #[serde(default)]
+    pub bilibili_group_entries: Vec<BilibiliGroupEntryIdentity>,
 }
 
 impl PlanValidationSnapshot {
@@ -118,6 +129,19 @@ impl PlanValidationSnapshot {
         let mut differences = Vec::new();
         if self.stable_media_ids != current.stable_media_ids {
             differences.push("media identity");
+        }
+        let previous_episode_numbers = self
+            .bilibili_group_entries
+            .iter()
+            .map(|entry| (entry.stable_media_id.as_str(), entry.index))
+            .collect::<BTreeMap<_, _>>();
+        let current_episode_numbers = current
+            .bilibili_group_entries
+            .iter()
+            .map(|entry| (entry.stable_media_id.as_str(), entry.index))
+            .collect::<BTreeMap<_, _>>();
+        if previous_episode_numbers != current_episode_numbers {
+            differences.push("episode numbering");
         }
         if self.selected_format_ids != current.selected_format_ids {
             differences.push("selected format");
@@ -128,8 +152,45 @@ impl PlanValidationSnapshot {
         if self.resolution_codecs != current.resolution_codecs {
             differences.push("media properties");
         }
+        if self.media_profile != current.media_profile {
+            differences.push("download requirements");
+        }
         differences
     }
+
+    fn media_requirements_match_for(&self, current: &Self, stable_media_id: &str) -> bool {
+        self.media_profile == current.media_profile
+            && self
+                .selected_format_ids
+                .iter()
+                .filter(|value| has_media_id_prefix(value, stable_media_id))
+                .eq(current
+                    .selected_format_ids
+                    .iter()
+                    .filter(|value| has_media_id_prefix(value, stable_media_id)))
+            && self
+                .exact_sizes
+                .iter()
+                .filter(|value| has_media_id_prefix(&value.subject, stable_media_id))
+                .eq(current
+                    .exact_sizes
+                    .iter()
+                    .filter(|value| has_media_id_prefix(&value.subject, stable_media_id)))
+            && self
+                .resolution_codecs
+                .iter()
+                .filter(|value| has_media_id_prefix(value, stable_media_id))
+                .eq(current
+                    .resolution_codecs
+                    .iter()
+                    .filter(|value| has_media_id_prefix(value, stable_media_id)))
+    }
+}
+
+fn has_media_id_prefix(value: &str, stable_media_id: &str) -> bool {
+    value
+        .strip_prefix(stable_media_id)
+        .is_some_and(|suffix| suffix.starts_with(':'))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +392,95 @@ fn refresh_bilibili_attempt_counts(record: &mut TaskRecord) {
         snapshot.skipped_entries.saturating_add(verified).min(total)
     };
     record.media_entries_failed = snapshot.failed_entries().min(total);
+}
+
+fn reconcile_accepted_bilibili_attempt(
+    record: &mut TaskRecord,
+    previous_plan: Option<&PlanValidationSnapshot>,
+    accepted_plan: &PlanValidationSnapshot,
+) {
+    let Some(mut attempt) = record.bilibili_attempt.take() else {
+        return;
+    };
+    if !attempt.independent_entries || accepted_plan.bilibili_group_entries.is_empty() {
+        record.media_entries_total = 1;
+        record.media_entries_completed = 0;
+        record.media_entries_failed = 0;
+        return;
+    }
+
+    let old_profile_matches_attempt =
+        previous_plan.is_some_and(|plan| plan.media_profile == attempt.media_profile);
+    let old_plan_contains = |stable_media_id: &str| {
+        previous_plan.is_some_and(|plan| {
+            plan.stable_media_ids.iter().any(|id| id == stable_media_id)
+                || plan
+                    .bilibili_group_entries
+                    .iter()
+                    .any(|entry| entry.stable_media_id == stable_media_id)
+        })
+    };
+    let old_attempt_contains = |stable_media_id: &str| {
+        attempt
+            .entries
+            .iter()
+            .any(|entry| entry.stable_media_id == stable_media_id)
+    };
+
+    let mut preserved_verified_ids = BTreeSet::new();
+    let mut requires_redownload_ids = BTreeSet::new();
+    for identity in &accepted_plan.bilibili_group_entries {
+        let stable_media_id = identity.stable_media_id.as_str();
+        let old_identity_exists =
+            old_plan_contains(stable_media_id) || old_attempt_contains(stable_media_id);
+        let requirements_match = old_profile_matches_attempt
+            && previous_plan.is_some_and(|old_plan| {
+                old_plan.media_requirements_match_for(accepted_plan, stable_media_id)
+                    && old_plan_contains(stable_media_id)
+            });
+        let previous_entry = attempt
+            .entries
+            .iter()
+            .find(|entry| entry.stable_media_id == stable_media_id);
+        if requirements_match
+            && previous_entry.is_some_and(|entry| {
+                entry.state == BilibiliAttemptEntryState::Verified && !entry.requires_redownload
+            })
+        {
+            preserved_verified_ids.insert(stable_media_id.to_string());
+        }
+        if old_identity_exists
+            && (!requirements_match
+                || previous_entry.is_some_and(|entry| entry.requires_redownload))
+        {
+            requires_redownload_ids.insert(stable_media_id.to_string());
+        }
+    }
+
+    let title = accepted_plan
+        .title
+        .clone()
+        .unwrap_or_else(|| attempt.title.clone());
+    let entries = accepted_plan
+        .bilibili_group_entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.index,
+                entry.title.clone(),
+                entry.stable_media_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    attempt.reconcile_independent_inventory(
+        title,
+        accepted_plan.media_profile.clone(),
+        entries,
+        &preserved_verified_ids,
+        &requires_redownload_ids,
+    );
+    record.bilibili_attempt = Some(attempt);
+    refresh_bilibili_attempt_counts(record);
 }
 
 fn terminal_bilibili_attempt_outcome(status: TaskStatus) -> Option<BilibiliAttemptOutcome> {
@@ -1007,6 +1157,8 @@ impl QueueManager {
             return Ok(None);
         };
         let generation = record.generation;
+        let previous_plan = record.plan.clone();
+        reconcile_accepted_bilibili_attempt(&mut record, previous_plan.as_ref(), &plan);
         record.plan = Some(plan);
         record.status = TaskStatus::Preparing;
         record.cancel_requested = false;
@@ -3320,6 +3472,33 @@ mod tests {
         )
     }
 
+    fn grouped_plan(
+        title: &str,
+        media_profile: Option<&str>,
+        entries: &[(u32, &str, &str)],
+    ) -> PlanValidationSnapshot {
+        let identities = entries
+            .iter()
+            .map(
+                |(index, title, stable_media_id)| BilibiliGroupEntryIdentity {
+                    index: *index,
+                    title: (*title).to_string(),
+                    stable_media_id: (*stable_media_id).to_string(),
+                },
+            )
+            .collect::<Vec<_>>();
+        PlanValidationSnapshot {
+            stable_media_ids: identities
+                .iter()
+                .map(|entry| entry.stable_media_id.clone())
+                .collect(),
+            title: Some(title.to_string()),
+            media_profile: media_profile.map(str::to_string),
+            bilibili_group_entries: identities,
+            ..PlanValidationSnapshot::default()
+        }
+    }
+
     fn bilibili_task(id: &str) -> TaskRecord {
         test_task(
             id,
@@ -3455,6 +3634,279 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn accepted_group_inventory_rebuilds_entries_by_stable_media_id() {
+        let directory = temp_queue_root("grouped-inventory-reconcile");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = bilibili_task("grouped-inventory-reconcile");
+        task.status = TaskStatus::Running;
+        queue.create(task.clone()).unwrap();
+
+        let old_plan = grouped_plan(
+            "Season",
+            Some("mode=all;quality=high"),
+            &[(1, "Episode A", "media-a"), (2, "Episode B", "media-b")],
+        );
+        queue
+            .set_plan_if_generation(&task.id, 0, old_plan)
+            .unwrap()
+            .unwrap();
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [
+                (1, "Episode A".into(), Some("media-a".into())),
+                (2, "Episode B".into(), Some("media-b".into())),
+            ],
+            0,
+        );
+        attempt.media_profile = Some("mode=all;quality=high".into());
+        let episode_a = config.downloads.video_dir.join("episode-a.mp4");
+        attempt.entry_verified_with_outputs(
+            1,
+            vec![episode_a.clone()],
+            BTreeMap::from([(episode_a.display().to_string(), "a".repeat(64))]),
+        );
+        attempt.entry_failed_with_error(2, 2, "temporary media error".into());
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, attempt)
+            .unwrap()
+            .unwrap();
+
+        let proposed = grouped_plan(
+            "Season revised",
+            Some("mode=all;quality=high"),
+            &[
+                (1, "Episode B", "media-b"),
+                (2, "Episode A", "media-a"),
+                (3, "Episode C", "media-c"),
+            ],
+        );
+        let differences = queue
+            .set_plan_if_generation(&task.id, 0, proposed)
+            .unwrap()
+            .unwrap()
+            .1;
+        assert!(differences.contains(&"media identity"));
+
+        let accepted = queue
+            .accept_proposed_plan_for_chat_if_generation(&task.id, 0, task.chat_id)
+            .unwrap()
+            .unwrap();
+        let snapshot = accepted.bilibili_attempt.unwrap();
+        assert_eq!(snapshot.title, "Season revised");
+        assert_eq!(
+            snapshot.media_profile.as_deref(),
+            Some("mode=all;quality=high")
+        );
+        assert_eq!(snapshot.retry_indices, None);
+        assert_eq!(snapshot.entries.len(), 3);
+        assert_eq!(snapshot.entries[0].index, 1);
+        assert_eq!(snapshot.entries[0].stable_media_id, "media-b");
+        assert_eq!(
+            snapshot.entries[0].state,
+            BilibiliAttemptEntryState::Pending
+        );
+        assert_eq!(snapshot.entries[0].attempts, 2);
+        assert_eq!(
+            snapshot.entries[0].error.as_deref(),
+            Some("temporary media error")
+        );
+        assert_eq!(snapshot.entries[1].index, 2);
+        assert_eq!(snapshot.entries[1].stable_media_id, "media-a");
+        assert_eq!(
+            snapshot.entries[1].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert_eq!(snapshot.entries[1].published_media_paths, vec![episode_a]);
+        assert_eq!(snapshot.entries[2].stable_media_id, "media-c");
+        assert_eq!(
+            snapshot.entries[2].state,
+            BilibiliAttemptEntryState::Pending
+        );
+        assert!(!snapshot.entries[2].requires_redownload);
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn accepting_new_media_profile_invalidates_legacy_group_receipts() {
+        let directory = temp_queue_root("grouped-profile-reconcile");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = bilibili_task("grouped-profile-reconcile");
+        task.status = TaskStatus::Running;
+        queue.create(task.clone()).unwrap();
+
+        let old_plan = grouped_plan(
+            "Season",
+            None,
+            &[(1, "Episode A", "media-a"), (2, "Episode B", "media-b")],
+        );
+        queue
+            .set_plan_if_generation(&task.id, 0, old_plan)
+            .unwrap()
+            .unwrap();
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [
+                (1, "Episode A".into(), Some("media-a".into())),
+                (2, "Episode B".into(), Some("media-b".into())),
+            ],
+            0,
+        );
+        let episode_a = config.downloads.video_dir.join("episode-a.mp4");
+        attempt.entry_verified_with_outputs(
+            1,
+            vec![episode_a],
+            BTreeMap::from([("episode-a".into(), "b".repeat(64))]),
+        );
+        attempt.entry_started(2);
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, attempt)
+            .unwrap()
+            .unwrap();
+
+        let accepted_profile = "mode=audio-only;quality=preferred";
+        let proposed = grouped_plan(
+            "Season",
+            Some(accepted_profile),
+            &[(1, "Episode A", "media-a"), (2, "Episode B", "media-b")],
+        );
+        let differences = queue
+            .set_plan_if_generation(&task.id, 0, proposed)
+            .unwrap()
+            .unwrap()
+            .1;
+        assert!(differences.contains(&"download requirements"));
+
+        let accepted = queue
+            .accept_proposed_plan_for_chat_if_generation(&task.id, 0, task.chat_id)
+            .unwrap()
+            .unwrap();
+        let snapshot = accepted.bilibili_attempt.unwrap();
+        assert_eq!(snapshot.media_profile.as_deref(), Some(accepted_profile));
+        assert!(snapshot.entries.iter().all(|entry| {
+            entry.state == BilibiliAttemptEntryState::Pending
+                && entry.requires_redownload
+                && entry.published_media_paths.is_empty()
+                && entry.published_media_hashes.is_empty()
+        }));
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_plan_validation_snapshots_default_new_group_fields() {
+        let legacy = serde_json::json!({
+            "stable_media_ids": ["media-a"],
+            "selected_format_ids": [],
+            "exact_sizes": [],
+            "approximate_sizes": [],
+            "resolution_codecs": [],
+            "title": "Season"
+        });
+        let snapshot: PlanValidationSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(snapshot.media_profile, None);
+        assert!(snapshot.bilibili_group_entries.is_empty());
+    }
+
+    #[test]
+    fn plan_validation_blocks_episode_renumbering_but_not_title_changes() {
+        let original = grouped_plan(
+            "Original title",
+            Some("mode=all;quality=high"),
+            &[(16, "Episode A", "media-a"), (17, "Episode B", "media-b")],
+        );
+        let title_changed = grouped_plan(
+            "Updated title",
+            Some("mode=all;quality=high"),
+            &[(16, "Updated A", "media-a"), (17, "Updated B", "media-b")],
+        );
+        assert!(original.blocking_differences(&title_changed).is_empty());
+
+        let renumbered = grouped_plan(
+            "Original title",
+            Some("mode=all;quality=high"),
+            &[(101, "Episode A", "media-a"), (102, "Episode B", "media-b")],
+        );
+        assert_eq!(
+            original.blocking_differences(&renumbered),
+            vec!["episode numbering"]
+        );
+    }
+
+    #[test]
+    fn accepted_group_inventory_reindexes_verified_receipt_by_stable_id() {
+        let directory = temp_queue_root("grouped-inventory-reindex");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = bilibili_task("grouped-inventory-reindex");
+        task.status = TaskStatus::Running;
+        queue.create(task.clone()).unwrap();
+
+        let media_profile = "mode=all;quality=high";
+        let old_plan = grouped_plan(
+            "Season",
+            Some(media_profile),
+            &[(16, "Episode A", "media-a"), (17, "Episode B", "media-b")],
+        );
+        queue
+            .set_plan_if_generation(&task.id, 0, old_plan)
+            .unwrap()
+            .unwrap();
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [
+                (16, "Episode A".into(), Some("media-a".into())),
+                (17, "Episode B".into(), Some("media-b".into())),
+            ],
+            0,
+        );
+        attempt.media_profile = Some(media_profile.into());
+        let published_path = config.downloads.video_dir.join("episode-a.mp4");
+        attempt.entry_verified_with_outputs(
+            16,
+            vec![published_path.clone()],
+            BTreeMap::from([(published_path.display().to_string(), "c".repeat(64))]),
+        );
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, attempt)
+            .unwrap()
+            .unwrap();
+
+        let renumbered = grouped_plan(
+            "Season",
+            Some(media_profile),
+            &[(101, "Episode A", "media-a"), (102, "Episode B", "media-b")],
+        );
+        let differences = queue
+            .set_plan_if_generation(&task.id, 0, renumbered)
+            .unwrap()
+            .unwrap()
+            .1;
+        assert!(differences.contains(&"episode numbering"));
+        let accepted = queue
+            .accept_proposed_plan_for_chat_if_generation(&task.id, 0, task.chat_id)
+            .unwrap()
+            .unwrap();
+        let snapshot = accepted.bilibili_attempt.unwrap();
+        assert_eq!(snapshot.entries[0].index, 101);
+        assert_eq!(snapshot.entries[0].stable_media_id, "media-a");
+        assert_eq!(
+            snapshot.entries[0].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert_eq!(
+            snapshot.entries[0].published_media_paths,
+            vec![published_path]
+        );
+        assert_eq!(snapshot.entries[1].index, 102);
+        assert_eq!(snapshot.entries[1].stable_media_id, "media-b");
         drop(queue);
         fs::remove_dir_all(directory).unwrap();
     }

@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-11
 updated: 2026-10-11
 branch: wip/bilibili-episode-recovery
-pr:
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/38
 supersedes: []
 superseded_by:
 ---
@@ -35,16 +35,22 @@ offer a way to select failed episodes.
   Persist invalid receipt markers across scoped retries until redownload is
   verified. Keep legacy attempts compatible and reject stale generation callbacks.
 - Preserve legacy execution for artifact-only All selections.
+- Reconcile approved inventory changes with saved episode state, invalidate
+  receipts when media requirements change, and recover published outputs after
+  interrupted completion bookkeeping. Reuse one existing-media index per run.
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed with 659 passed and 15 existing
+- Rust 1.95.0: all-target offline tests passed with 673 passed and 15 existing
   opt-in tests ignored. Offline build, all-target Clippy with warnings denied,
   formatting, diff checks, and project journal validation passed.
 - Regression tests exercise the actual episode driver through injected child
   executors: bounded 403 retries followed by continuation, publication before
   the next entry, failed-only and single-entry scopes, invalid receipt recovery
   across two resumes, and cancellation preserving verified outputs.
+- Recovery regressions cover one shared index with new publication evidence,
+  approved inventory growth and renumbering, media requirement changes,
+  interrupted All publications, single-entry URLs, and zero-success failures.
 - State and mock Telegram tests cover independent completion counts, restart,
   error retention, progress-channel closure, paginated episode views, message
   reuse, stale generation callbacks, and cross-chat action rejection.

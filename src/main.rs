@@ -6205,11 +6205,7 @@ async fn run_queued_job(
                 queue_callback_data("cancel", &task_id, generation),
             ),
         ]);
-        let text = format!(
-            "Task {} paused because its download plan changed ({}). Review and confirm the updated plan before downloading.",
-            task_id,
-            differences.join(", ")
-        );
+        let text = plan_confirmation_text(&updated_task, &differences);
         if let Some(message_id) = status_message_id {
             if is_collection {
                 edit_task_message_with_keyboard_if_current(
@@ -6697,11 +6693,34 @@ where
 }
 
 fn plan_confirmation_text(task: &TaskRecord, differences: &[&str]) -> String {
-    format!(
+    let mut text = format!(
         "Task {} paused because its download plan changed ({}). Review and confirm the updated plan before downloading.",
         task.id,
         differences.join(", ")
-    )
+    );
+    if is_bilibili_episode_group(&task.job)
+        && let Some(updated) = task.proposed_plan.as_ref()
+    {
+        let previous_count = task
+            .plan
+            .as_ref()
+            .map(|plan| plan.stable_media_ids.len())
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "\nEpisodes: {previous_count} → {}. Compatible completed episodes will be retained; changed or missing outputs will be downloaded again.",
+            updated.stable_media_ids.len()
+        ));
+        if task
+            .plan
+            .as_ref()
+            .is_some_and(|previous| previous.media_profile != updated.media_profile)
+        {
+            text.push_str(
+                "\nDownload requirements changed. Previously completed episodes must be downloaded again to meet the updated requirements.",
+            );
+        }
+    }
+    text
 }
 
 fn send_collection_failure_lifecycle(progress: &JobProgressSender) {
@@ -10683,6 +10702,42 @@ mod tests {
             queue_plan_size(&overflow),
             ("unknown".to_string(), "unknown".to_string())
         );
+    }
+
+    #[test]
+    fn episode_plan_confirmation_explains_inventory_and_receipt_invalidation() {
+        let mut record = TaskRecord::new(
+            "episode-plan-confirmation".to_string(),
+            1,
+            2,
+            123_456_789,
+            None,
+            0,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".to_string(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        record.plan = Some(PlanValidationSnapshot {
+            stable_media_ids: vec!["episode-a".to_string(), "episode-b".to_string()],
+            media_profile: Some("mode=AudioOnly".to_string()),
+            ..PlanValidationSnapshot::default()
+        });
+        record.proposed_plan = Some(PlanValidationSnapshot {
+            stable_media_ids: vec!["episode-a".to_string()],
+            media_profile: Some("mode=AudioOnly".to_string()),
+            ..PlanValidationSnapshot::default()
+        });
+        let inventory_only = plan_confirmation_text(&record, &["media identity"]);
+        assert!(inventory_only.contains("Episodes: 2 → 1"));
+        assert!(inventory_only.contains("Compatible completed episodes will be retained"));
+        assert!(!inventory_only.contains("Download requirements changed"));
+
+        record.proposed_plan.as_mut().unwrap().media_profile = Some("mode=All".to_string());
+        let changed_requirements = plan_confirmation_text(&record, &["media requirements"]);
+        assert!(changed_requirements.contains("Download requirements changed"));
+        assert!(changed_requirements.contains("must be downloaded again"));
+        assert!(!changed_requirements.contains("mode="));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 
 use crate::redaction::redact_sensitive_text;
@@ -117,6 +117,9 @@ pub struct BilibiliAttemptSnapshot {
     pub independent_entries: bool,
     #[serde(default)]
     pub retry_indices: Option<Vec<u32>>,
+    /// Normalized media requirements used to create the episode receipts.
+    #[serde(default)]
+    pub media_profile: Option<String>,
 }
 
 const SUMMARY_MAX_BYTES: usize = 1_800;
@@ -151,6 +154,7 @@ impl BilibiliAttemptSnapshot {
             outcome: None,
             independent_entries: false,
             retry_indices: None,
+            media_profile: None,
         }
     }
 
@@ -432,6 +436,79 @@ impl BilibiliAttemptSnapshot {
         entry.published_media_hashes.clear();
         self.refresh_independent_skipped_entries();
         true
+    }
+
+    /// Reconcile this grouped attempt with a newly approved inventory.
+    ///
+    /// Only compatible verified receipts survive. Other matching entries retain their
+    /// attempt/error history, while their state and published outputs are reset.
+    pub fn reconcile_independent_inventory(
+        &mut self,
+        title: String,
+        media_profile: Option<String>,
+        entries: impl IntoIterator<Item = (u32, String, String)>,
+        preserved_verified_ids: &std::collections::BTreeSet<String>,
+        requires_redownload_ids: &std::collections::BTreeSet<String>,
+    ) {
+        let mut previous_by_id = BTreeMap::<String, VecDeque<_>>::new();
+        for entry in std::mem::take(&mut self.entries) {
+            if entry.stable_media_id.is_empty() {
+                continue;
+            }
+            previous_by_id
+                .entry(entry.stable_media_id.clone())
+                .or_default()
+                .push_back(entry);
+        }
+
+        self.entries = entries
+            .into_iter()
+            .map(|(index, title, stable_media_id)| {
+                let previous = previous_by_id
+                    .get_mut(&stable_media_id)
+                    .and_then(VecDeque::pop_front);
+                let preserve_verified = previous.as_ref().is_some_and(|entry| {
+                    entry.state == BilibiliAttemptEntryState::Verified
+                        && !entry.requires_redownload
+                        && preserved_verified_ids.contains(&stable_media_id)
+                });
+                let mut entry = BilibiliAttemptEntry {
+                    index,
+                    title,
+                    state: BilibiliAttemptEntryState::Pending,
+                    stage: String::new(),
+                    already_present: false,
+                    requires_redownload: requires_redownload_ids.contains(&stable_media_id),
+                    attempts: 0,
+                    error: None,
+                    stable_media_id,
+                    published_media_paths: Vec::new(),
+                    published_media_hashes: BTreeMap::new(),
+                };
+                if let Some(previous) = previous {
+                    entry.attempts = previous.attempts;
+                    entry.error = previous.error;
+                    entry.requires_redownload |= previous.requires_redownload;
+                    if preserve_verified {
+                        entry.state = BilibiliAttemptEntryState::Verified;
+                        entry.already_present = previous.already_present;
+                        entry.published_media_paths = previous.published_media_paths;
+                        entry.published_media_hashes = previous.published_media_hashes;
+                    }
+                }
+                entry
+            })
+            .collect();
+        self.title = title;
+        self.skipped_entries = self
+            .entries
+            .iter()
+            .filter(|entry| entry.already_present)
+            .count();
+        self.outcome = None;
+        self.retry_indices = None;
+        self.independent_entries = true;
+        self.media_profile = media_profile;
     }
 
     pub fn verified_entries(&self) -> usize {

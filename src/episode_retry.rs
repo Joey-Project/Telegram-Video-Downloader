@@ -38,7 +38,8 @@ pub fn classify_episode_failure_with_retry_after(
 ) -> EpisodeFailureDisposition {
     let chain = format!("{error:#}").to_ascii_lowercase();
 
-    if is_unsafe_publication_or_identity_failure(&chain)
+    if is_shared_output_recovery_failure(&chain)
+        || is_unsafe_publication_or_identity_failure(&chain)
         || is_shared_storage_failure(error, &chain)
         || is_group_authentication_failure(&chain)
     {
@@ -85,6 +86,10 @@ fn retry_or_fail(
             refresh_plan,
         }
     }
+}
+
+fn is_shared_output_recovery_failure(chain: &str) -> bool {
+    chain.contains("video output recovery scan is incomplete")
 }
 
 fn is_group_authentication_failure(chain: &str) -> bool {
@@ -193,6 +198,11 @@ fn is_unsafe_publication_or_identity_failure(chain: &str) -> bool {
             "unsafe destination",
             "identity mismatch",
             "identity changed",
+            "changed identity since it was saved",
+            "bilibili group inventory changed since the reviewed plan",
+            "bilibili group episode numbering changed since the reviewed plan",
+            "bilibili media requirements changed since the reviewed plan",
+            "saved bilibili group inventory no longer matches the current selection",
             "object identity changed",
             "path identity changed",
             "output root or staging directory changed",
@@ -453,6 +463,11 @@ mod tests {
             "Bilibili mux staging directory access path changed: /downloads/.staging",
             "configured output root identity changed: /downloads",
             "failed to validate moved destination through the configured output root",
+            "Bilibili group inventory changed since the reviewed plan; inspect the group again",
+            "Bilibili group episode numbering changed since the reviewed plan; inspect the group again",
+            "Bilibili media requirements changed since the reviewed plan; inspect the group again",
+            "saved Bilibili group inventory no longer matches the current selection",
+            "Bilibili group entry 17 changed identity since it was saved; inspect the group again",
         ] {
             assert_eq!(
                 classify(message, 0),
@@ -489,6 +504,26 @@ mod tests {
                 delay: Duration::from_secs(5),
                 refresh_plan: true,
             }
+        );
+    }
+
+    #[test]
+    fn output_recovery_failure_pauses_group_but_episode_failure_stays_local() {
+        let recovery_error = anyhow!(
+            "video output recovery scan is incomplete; restore access to the reported directories and restart the bot before starting another download"
+        )
+        .context("failed to acquire the video output guard")
+        .context("Bilibili episode 3 download failed");
+        assert_eq!(
+            classify_episode_failure(&recovery_error, 0),
+            EpisodeFailureDisposition::PauseGroup
+        );
+
+        let episode_error =
+            anyhow!("HTTP 404 Not Found").context("failed to download selected episode 4");
+        assert_eq!(
+            classify_episode_failure(&episode_error, 0),
+            EpisodeFailureDisposition::FailEntry
         );
     }
 
