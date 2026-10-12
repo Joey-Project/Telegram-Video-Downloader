@@ -6652,7 +6652,7 @@ async fn run_queued_job(
         message = with_bilibili_attempt_summary(&message, snapshot);
     }
 
-    let Some(terminal_record) = terminal_record_for_delivery_with_retry_delay(
+    let terminal_record = match terminal_record_for_delivery_with_retry_delay(
         &telegram,
         &queue,
         &task_id,
@@ -6664,8 +6664,18 @@ async fn run_queued_job(
         context.queue_start_retry_delay,
     )
     .await
-    else {
-        return;
+    {
+        Ok(Some(record)) => record,
+        Ok(None) => return,
+        Err(err) => {
+            warn!(
+                task_id,
+                generation,
+                error = %err,
+                "failed to confirm terminal task state before final delivery"
+            );
+            return;
+        }
     };
 
     if is_bilibili_episode_group(&job)
@@ -6856,6 +6866,18 @@ async fn persist_terminal_failure_with_retry(
             Ok(Some(current)) => current,
             Ok(None) => return Ok(TerminalFailureResolution::Superseded),
             Err(err) => {
+                let retryable = is_retryable_terminal_state_error(&err);
+                if !retryable {
+                    warn!(
+                        task_id,
+                        generation,
+                        job_label,
+                        retryable,
+                        error = %err,
+                        "permanent task generation lookup failure while resolving terminal download state"
+                    );
+                    return Err(err);
+                }
                 let disk_full = disk_space::is_disk_space_failure(&err);
                 if disk_full && grouped {
                     mark_disk_space_pause_error(&mut error, grouped);
@@ -6878,10 +6900,11 @@ async fn persist_terminal_failure_with_retry(
                     task_id,
                     generation,
                     job_label,
+                    retryable,
                     error = %err,
                     "task generation lookup failed while resolving terminal download state; retrying"
                 );
-                tokio::time::sleep(retry_delay).await;
+                sleep_before_terminal_retry(retry_delay).await;
                 continue;
             }
         };
@@ -6920,7 +6943,7 @@ async fn persist_terminal_failure_with_retry(
                         error = %err,
                         "failed to persist the superseding cancellation; retrying"
                     );
-                    tokio::time::sleep(retry_delay).await;
+                    sleep_before_terminal_retry(retry_delay).await;
                     continue;
                 }
             }
@@ -6979,17 +7002,25 @@ async fn persist_terminal_failure_with_retry(
                 if disk_full && grouped {
                     mark_disk_space_pause_error(&mut error, grouped);
                 }
-                let retryable = disk_full
-                    || is_file_provider_access_error(&err)
-                    || format!("{err:#}").contains("pending cancellation request")
-                    || format!("{err:#}").contains("already terminal");
+                let retryable = is_retryable_terminal_state_error(&err);
                 if !retryable {
                     return Err(err);
                 }
-                tokio::time::sleep(retry_delay).await;
+                sleep_before_terminal_retry(retry_delay).await;
             }
         }
     }
+}
+
+fn is_retryable_terminal_state_error(error: &anyhow::Error) -> bool {
+    disk_space::is_disk_space_failure(error)
+        || is_file_provider_access_error(error)
+        || format!("{error:#}").contains("pending cancellation request")
+        || format!("{error:#}").contains("already terminal")
+}
+
+async fn sleep_before_terminal_retry(retry_delay: Duration) {
+    tokio::time::sleep(retry_delay.max(Duration::from_millis(1))).await;
 }
 
 fn mark_disk_space_pause_error(error: &mut String, grouped: bool) {
@@ -7058,7 +7089,7 @@ async fn terminal_record_for_delivery_with_retry_delay(
     grouped: bool,
     expected_outcome: CollectionFinalOutcome,
     retry_delay: Duration,
-) -> Option<TaskRecord> {
+) -> Result<Option<TaskRecord>> {
     let mut uncertainty_notice_sent = false;
     let mut disk_space_notice_sent = false;
     loop {
@@ -7068,7 +7099,7 @@ async fn terminal_record_for_delivery_with_retry_delay(
                     || (record.status == TaskStatus::Cancelled
                         && expected_outcome != CollectionFinalOutcome::Cancelled) =>
             {
-                return None;
+                return Ok(None);
             }
             Ok(Some(record))
                 if match expected_outcome {
@@ -7082,17 +7113,29 @@ async fn terminal_record_for_delivery_with_retry_delay(
                     ),
                 } =>
             {
-                return Some(record);
+                return Ok(Some(record));
             }
-            Ok(Some(_)) | Ok(None) => return None,
+            Ok(Some(_)) | Ok(None) => return Ok(None),
             Err(err) => {
+                let retryable = is_retryable_terminal_state_error(&err);
+                if !retryable {
+                    warn!(
+                        task_id,
+                        generation,
+                        retryable,
+                        error = %err,
+                        "permanent task state lookup failure before terminal delivery"
+                    );
+                    return Err(err);
+                }
+                let disk_full = disk_space::is_disk_space_failure(&err);
                 send_terminal_failure_recovery_notice(
                     telegram,
                     task_id,
                     generation,
                     chat_id,
                     job_id,
-                    false,
+                    disk_full,
                     grouped,
                     false,
                     &mut uncertainty_notice_sent,
@@ -7103,10 +7146,11 @@ async fn terminal_record_for_delivery_with_retry_delay(
                 warn!(
                     task_id,
                     generation,
+                    retryable,
                     error = %err,
                     "task state lookup failed before terminal delivery; retrying"
                 );
-                tokio::time::sleep(retry_delay).await;
+                sleep_before_terminal_retry(retry_delay).await;
             }
         }
     }
@@ -14436,6 +14480,7 @@ mod tests {
             Duration::from_millis(1),
         )
         .await
+        .expect("terminal record lookup should succeed")
         .expect("persisted pause should remain eligible for terminal delivery");
         let keyboard = episode_group_terminal_keyboard(&terminal);
         let resume_button = keyboard
@@ -14476,6 +14521,165 @@ mod tests {
             terminal_requests[0].body["reply_markup"]["inline_keyboard"]
                 .as_array()
                 .is_some_and(|rows| !rows.is_empty())
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn terminal_lookup_retries_transient_errors_and_propagates_permanent_mismatches() {
+        let root = temp_main_test_dir("terminal-lookup-error-classification");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, provider)
+                .expect("task queue should open with the fake File Provider"),
+        );
+        let task_id = "terminal-lookup-error-classification";
+        let chat_id = 123_456_789;
+        let mut task = TaskRecord::new(
+            task_id.into(),
+            1103,
+            2103,
+            chat_id,
+            None,
+            0,
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=terminal-lookup-retry".into(),
+            },
+        );
+        task.status = TaskStatus::Running;
+        assert!(queue.create(task).expect("running task should persist"));
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        file_provider.fail_next_read("simulated transient terminal lookup failure");
+        file_provider
+            .fail_next_file_provider_write("simulated transient terminal persistence failure");
+        let resolution = tokio_timeout(
+            Duration::from_secs(2),
+            persist_terminal_failure_with_retry(
+                &telegram,
+                &queue,
+                task_id,
+                0,
+                chat_id,
+                1103,
+                "YouTube download",
+                Duration::ZERO,
+                "simulated worker failure".into(),
+                None,
+                false,
+            ),
+        )
+        .await
+        .expect("transient provider failures should not stall terminal persistence")
+        .expect("terminal state should persist after transient provider failures clear");
+        let TerminalFailureResolution::Persisted(record) = resolution else {
+            panic!("current generation should persist as failed");
+        };
+        assert_eq!(record.status, TaskStatus::Failed);
+        assert_eq!(take_fake_telegram_requests(&mut requests).len(), 1);
+
+        file_provider.fail_next_read("simulated transient terminal delivery lookup failure");
+        let terminal = tokio_timeout(
+            Duration::from_secs(2),
+            terminal_record_for_delivery_with_retry_delay(
+                &telegram,
+                &queue,
+                task_id,
+                0,
+                chat_id,
+                1103,
+                false,
+                CollectionFinalOutcome::Failed,
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("transient provider failure should not stall terminal delivery")
+        .expect("terminal lookup should eventually succeed")
+        .expect("failed task should remain eligible for terminal delivery");
+        assert_eq!(terminal.status, TaskStatus::Failed);
+        assert_eq!(take_fake_telegram_requests(&mut requests).len(), 1);
+
+        let task_file = config
+            .downloads
+            .video_dir
+            .join(".telegram-video-downloader-queue")
+            .join(format!("task-{task_id}.json"));
+        let mut mismatched_record = queue
+            .get(task_id)
+            .expect("task should remain readable before corruption")
+            .expect("current task should exist");
+        mismatched_record.id = "different-task-id".into();
+        fs::write(
+            &task_file,
+            serde_json::to_vec(&mismatched_record).expect("mismatched record should serialize"),
+        )
+        .expect("mismatched task record should replace the selected queue file");
+
+        let persistence_result = tokio_timeout(
+            Duration::from_secs(1),
+            persist_terminal_failure_with_retry(
+                &telegram,
+                &queue,
+                task_id,
+                0,
+                chat_id,
+                1103,
+                "YouTube download",
+                Duration::ZERO,
+                "simulated worker failure".into(),
+                None,
+                false,
+            ),
+        )
+        .await
+        .expect("permanent mismatch should be rejected without retrying forever");
+        let persistence_error = match persistence_result {
+            Err(error) => error,
+            Ok(_) => panic!("permanent task mismatch should propagate from terminal persistence"),
+        };
+        assert!(
+            format!("{persistence_error:#}").contains("task index points to a mismatched record")
+        );
+        assert!(
+            take_fake_telegram_requests(&mut requests).is_empty(),
+            "permanent lookup errors should not send a retry notice"
+        );
+
+        let delivery_result = tokio_timeout(
+            Duration::from_secs(1),
+            terminal_record_for_delivery_with_retry_delay(
+                &telegram,
+                &queue,
+                task_id,
+                0,
+                chat_id,
+                1103,
+                false,
+                CollectionFinalOutcome::Failed,
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("permanent mismatch should be rejected without retrying forever");
+        let delivery_error = match delivery_result {
+            Err(error) => error,
+            Ok(_) => panic!("permanent task mismatch should propagate from terminal delivery"),
+        };
+        assert!(format!("{delivery_error:#}").contains("task index points to a mismatched record"));
+        assert!(
+            take_fake_telegram_requests(&mut requests).is_empty(),
+            "permanent lookup errors should not send a retry notice"
         );
 
         drop(queue);
@@ -14584,6 +14788,7 @@ mod tests {
                 Duration::ZERO,
             )
             .await
+            .expect("cancelled terminal task should remain readable")
             .is_none()
         );
 
@@ -14660,6 +14865,7 @@ mod tests {
                 Duration::ZERO,
             )
             .await
+            .expect("superseded terminal task should remain readable")
             .is_none()
         );
         let current = queue.get("retry-replaced").unwrap().unwrap();

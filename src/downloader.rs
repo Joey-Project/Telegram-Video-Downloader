@@ -11569,6 +11569,17 @@ async fn run_youtube_job_locked(
     })
 }
 
+fn ensure_staged_video_publication_disk_space(root: &RootedFs, job: &JobRequest) -> Result<()> {
+    if matches!(job, JobRequest::Bilibili { .. }) {
+        crate::disk_space::ensure_disk_space(
+            root,
+            0,
+            "publishing the current episode and saving task state",
+        )?;
+    }
+    Ok(())
+}
+
 async fn run_staged_video_job(
     config: &AppConfig,
     job: &JobRequest,
@@ -11782,11 +11793,7 @@ async fn run_staged_video_job(
     staging
         .validate_for_path_access()
         .context("output root or staging directory changed during download")?;
-    crate::disk_space::ensure_disk_space(
-        &root,
-        0,
-        "publishing the current episode and saving task state",
-    )?;
+    ensure_staged_video_publication_disk_space(&root, job)?;
     let mut staged_files = collect_regular_files(&staging_dir)?
         .into_iter()
         .filter(|path| !is_staging_support_file(&staging_dir, path))
@@ -14144,7 +14151,7 @@ async fn run_command_with_execution_context_and_additional_fds(
     spec: &CommandSpec,
     bound_cwd: Option<&BoundDirectory>,
     inherited_files: &[BoundFile],
-    mut additional_inherited_fds: Vec<AdditionalInheritedCommandFd>,
+    additional_inherited_fds: Vec<AdditionalInheritedCommandFd>,
     progress: Option<JobProgressSender>,
     policy: CommandExecutionPolicy,
 ) -> Result<CommandOutput> {
@@ -14164,7 +14171,7 @@ async fn run_command_with_execution_context_and_additional_fds(
     } else {
         None
     };
-    let mut file_activity = match &spec.activity_dir {
+    let file_activity = match &spec.activity_dir {
         Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
             Ok(tracker) => Some(tracker),
             Err(err) => {
@@ -14182,6 +14189,44 @@ async fn run_command_with_execution_context_and_additional_fds(
             None
         }
     };
+
+    run_command_with_execution_context_and_additional_fds_and_monitors(
+        config,
+        spec,
+        bound_cwd,
+        inherited_files,
+        additional_inherited_fds,
+        CommandExecutionOptions {
+            progress,
+            policy,
+            disk_space_root,
+            file_activity,
+        },
+    )
+    .await
+}
+
+struct CommandExecutionOptions {
+    progress: Option<JobProgressSender>,
+    policy: CommandExecutionPolicy,
+    disk_space_root: Option<RootedFs>,
+    file_activity: Option<FileActivityTracker>,
+}
+
+async fn run_command_with_execution_context_and_additional_fds_and_monitors(
+    config: &AppConfig,
+    spec: &CommandSpec,
+    bound_cwd: Option<&BoundDirectory>,
+    inherited_files: &[BoundFile],
+    mut additional_inherited_fds: Vec<AdditionalInheritedCommandFd>,
+    options: CommandExecutionOptions,
+) -> Result<CommandOutput> {
+    let CommandExecutionOptions {
+        progress,
+        policy,
+        disk_space_root,
+        mut file_activity,
+    } = options;
 
     #[cfg(unix)]
     let descendant_fence = if policy.descendant_fence {
@@ -14365,7 +14410,7 @@ async fn run_command_with_execution_context_and_additional_fds(
                     summarize_output(&String::from_utf8_lossy(&stdout), &String::from_utf8_lossy(&stderr))
                 );
             }
-            _ = sleep_until(next_activity_poll), if file_activity.is_some() => {
+            _ = sleep_until(next_activity_poll), if file_activity.is_some() || disk_space_root.is_some() => {
                 next_activity_poll = Instant::now() + activity_poll_interval;
                 if let Some(root) = disk_space_root.as_ref()
                     && let Err(error) = crate::disk_space::ensure_disk_space(root, 0, "downloading or merging the current episode")
@@ -14375,22 +14420,23 @@ async fn run_command_with_execution_context_and_additional_fds(
                     process_group_guard.disarm();
                     return Err(error);
                 }
-                let tracker = file_activity.as_mut().expect("guarded by is_some");
-                match tracker.poll().await {
-                    Ok(report) => {
-                        if report.changed_since_previous_poll {
-                            last_activity_at = Instant::now();
+                if let Some(tracker) = file_activity.as_mut() {
+                    match tracker.poll().await {
+                        Ok(report) => {
+                            if report.changed_since_previous_poll {
+                                last_activity_at = Instant::now();
+                            }
+                            progress_tracker.emit_file_activity(report);
                         }
-                        progress_tracker.emit_file_activity(report);
-                    }
-                    Err(err) => {
-                        info!(
-                            command = %spec.program.display(),
-                            activity_dir = %tracker.root.display(),
-                            error = %err,
-                            "file activity tracking stopped"
-                        );
-                        file_activity = None;
+                        Err(err) => {
+                            info!(
+                                command = %spec.program.display(),
+                                activity_dir = %tracker.root.display(),
+                                error = %err,
+                                "file activity tracking stopped"
+                            );
+                            file_activity = None;
+                        }
                     }
                 }
             }
@@ -35090,6 +35136,32 @@ mv video.original video.m4s || exit 46
     }
 
     #[test]
+    fn staged_video_publication_space_guard_is_bilibili_only() {
+        let output_dir = temp_test_dir("staged-publication-space-guard");
+        let root = RootedFs::new(&output_dir).expect("output root should bind");
+        fs::remove_dir_all(&output_dir).expect("output root should become unavailable");
+
+        ensure_staged_video_publication_disk_space(
+            &root,
+            &JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=example".to_string(),
+            },
+        )
+        .expect("YouTube publication should not require the Bilibili space reserve");
+
+        let error = ensure_staged_video_publication_disk_space(
+            &root,
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV1xx411c7mD".to_string(),
+                selection: None,
+            },
+        )
+        .expect_err("Bilibili publication should retain its capacity check");
+        assert!(format!("{error:#}").contains("failed to query available disk space"));
+        let _ = fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
     fn throttles_percent_progress_updates() {
         let (tx, mut rx) = job_progress_channel();
         let mut tracker =
@@ -35715,6 +35787,78 @@ mv video.original video.m4s || exit 46
                 .any(|message| message.contains("Last file change:"))
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disk_space_monitor_continues_when_file_activity_is_absent() {
+        let parent = temp_test_dir("disk-space-without-file-activity");
+        let output_dir = parent.join("output");
+        let moved_output_dir = parent.join("moved-output");
+        fs::create_dir_all(&output_dir).expect("output directory should create");
+        let disk_space_root =
+            RootedFs::new(&output_dir).expect("disk-space root should bind before command");
+
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 10;
+        config.bot.command_idle_timeout_seconds = 10;
+        config.bot.progress_update_seconds = 1;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "mv \"$1\" \"$2\"; sleep 5".to_string(),
+                "disk-space-test".to_string(),
+                output_dir.display().to_string(),
+                moved_output_dir.display().to_string(),
+            ],
+            cwd: parent.clone(),
+            activity_dir: None,
+            cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
+        };
+
+        let started_at = Instant::now();
+        let error = tokio_timeout(
+            Duration::from_secs(8),
+            run_command_with_execution_context_and_additional_fds_and_monitors(
+                &config,
+                &spec,
+                None,
+                &[],
+                Vec::new(),
+                CommandExecutionOptions {
+                    progress: None,
+                    policy: CommandExecutionPolicy::EXTERNAL,
+                    disk_space_root: Some(disk_space_root),
+                    file_activity: None,
+                },
+            ),
+        )
+        .await
+        .expect("disk-space monitoring should not hang")
+        .expect_err("capacity monitoring should stop the command after its root is moved");
+        let elapsed = started_at.elapsed();
+
+        let message = format!("{error:#}");
+        let _ = fs::remove_dir_all(&moved_output_dir);
+        let _ = fs::remove_dir_all(parent);
+        assert!(
+            message.contains("failed to query available disk space"),
+            "{message}"
+        );
+        assert!(
+            message.contains("failed to re-open output root"),
+            "{message}"
+        );
+        assert!(
+            message.contains("No such file or directory (os error 2)"),
+            "{message}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "capacity monitoring should terminate the still-running child, elapsed {elapsed:?}"
+        );
     }
 
     #[cfg(unix)]

@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-12
 updated: 2026-10-12
 branch: wip/bilibili-space-progress
-pr:
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/39
 supersedes: []
 superseded_by:
 ---
@@ -28,14 +28,20 @@ superseded_by:
 - Query unprivileged capacity through the bound output filesystem descriptor.
   Check download/mux peak space, actual mux input sizes, and publication state
   overhead. Monitor the 256 MiB margin while the worker runs.
+- Keep capacity monitoring active independently of file-activity tracking.
+  Apply the publication reserve only to resumable Bilibili jobs.
 - Treat ENOSPC and quota exhaustion as shared storage failures. Preserve existing
   files and retry saving the pause after space is freed, with an explicit notice
   while persistence remains incomplete.
+  Recognize serialized Darwin quota errors (`Disc quota exceeded`, errno 69)
+  as well as Linux quota errors after a child worker reports them through stderr.
 - Avoid unchanged queue index writes during ordinary lookup and listing.
+- Retry transient terminal-state lookup errors, but return permanently invalid
+  task records instead of repeatedly polling them.
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed, 751 passed, zero failed, and
+- Rust 1.95.0: all-target offline tests passed, 755 passed, zero failed, and
   15 existing opt-in tests ignored. Capacity thresholds and failure paths use
   injected values and mock writes; no disk-filling test was performed.
 - Offline build, all-target Clippy with warnings denied, formatting, diff, and

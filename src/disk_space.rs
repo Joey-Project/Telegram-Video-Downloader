@@ -71,10 +71,13 @@ pub(crate) fn is_disk_space_failure(error: &anyhow::Error) -> bool {
         "disk is full",
         "disk full",
         "disk quota exceeded",
+        "disc quota exceeded",
         "os error 28",
         "os error: 28",
         "os error 122",
         "os error: 122",
+        "os error 69",
+        "os error: 69",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -164,6 +167,19 @@ mod tests {
             assert!(is_disk_space_failure(&anyhow!("{message}")));
         }
         assert!(!is_disk_space_failure(&anyhow!("network timeout")));
+    }
+
+    #[test]
+    fn recognizes_serialized_darwin_quota_failures() {
+        for message in [
+            "Bilibili worker exited: Disc quota exceeded (os error 69)",
+            "worker stderr: Disc quota exceeded",
+            "worker stderr: os error 69",
+            "worker stderr: os error: 69",
+        ] {
+            assert!(is_disk_space_failure(&anyhow!("{message}")));
+        }
+        assert!(!is_disk_space_failure(&anyhow!("HTTP error 403")));
     }
 
     #[test]
