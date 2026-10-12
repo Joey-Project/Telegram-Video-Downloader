@@ -28,6 +28,8 @@ superseded_by:
 - Query unprivileged capacity through the bound output filesystem descriptor.
   Check download/mux peak space, actual mux input sizes, and publication state
   overhead. Monitor the 256 MiB margin while the worker runs.
+  For multipart plans, reserve all selected streams plus the largest entry's
+  temporary mux output instead of doubling the whole plan.
 - Keep capacity monitoring active independently of file-activity tracking.
   Cap safety polling separately from Telegram progress delivery intervals.
   Apply the publication reserve only to resumable Bilibili jobs.
@@ -43,7 +45,7 @@ superseded_by:
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed, 756 passed, zero failed, and
+- Rust 1.95.0: all-target offline tests passed, 757 passed, zero failed, and
   15 existing opt-in tests ignored. Capacity thresholds and failure paths use
   injected values and mock writes; no disk-filling test was performed.
 - Offline build, all-target Clippy with warnings denied, formatting, diff, and

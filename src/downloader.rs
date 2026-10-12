@@ -1192,6 +1192,26 @@ fn bilibili_planned_media_bytes(
     plan: &bbdown_core::DownloadPlan,
     options: &bbdown_core::DownloadOptions,
 ) -> u64 {
+    bilibili_planned_media_size_estimates(plan, options).0
+}
+
+fn bilibili_download_peak_bytes(
+    plan: &bbdown_core::DownloadPlan,
+    options: &bbdown_core::DownloadOptions,
+    mux_locally: bool,
+) -> u64 {
+    let (planned_bytes, largest_entry_bytes) = bilibili_planned_media_size_estimates(plan, options);
+    if mux_locally {
+        planned_bytes.saturating_add(largest_entry_bytes)
+    } else {
+        planned_bytes
+    }
+}
+
+fn bilibili_planned_media_size_estimates(
+    plan: &bbdown_core::DownloadPlan,
+    options: &bbdown_core::DownloadOptions,
+) -> (u64, u64) {
     let stream_bytes = |stream: &bbdown_core::MediaStream, duration: Option<u32>| {
         stream
             .size
@@ -1202,31 +1222,35 @@ fn bilibili_planned_media_bytes(
             })
             .unwrap_or(0)
     };
-    plan.entries.iter().fold(0_u64, |total, entry| {
-        let video = bilibili_selected_video(entry, &options.stream_selection);
-        let audio = bilibili_selected_audio(entry, &options.stream_selection);
-        let bytes = match options.mode {
-            DownloadMode::All => match (video, audio) {
-                (Some(video), Some(audio)) => stream_bytes(video, entry.streams.duration_seconds)
-                    .saturating_add(stream_bytes(audio, entry.streams.duration_seconds)),
-                _ => entry
-                    .streams
-                    .flv_segments
-                    .iter()
-                    .fold(0_u64, |total, segment| {
-                        total.saturating_add(segment.size.unwrap_or(0))
-                    }),
-            },
-            DownloadMode::VideoOnly => video.map_or(0, |stream| {
-                stream_bytes(stream, entry.streams.duration_seconds)
-            }),
-            DownloadMode::AudioOnly => audio.map_or(0, |stream| {
-                stream_bytes(stream, entry.streams.duration_seconds)
-            }),
-            _ => 0,
-        };
-        total.saturating_add(bytes)
-    })
+    plan.entries
+        .iter()
+        .fold((0_u64, 0_u64), |(total, largest), entry| {
+            let video = bilibili_selected_video(entry, &options.stream_selection);
+            let audio = bilibili_selected_audio(entry, &options.stream_selection);
+            let bytes = match options.mode {
+                DownloadMode::All => match (video, audio) {
+                    (Some(video), Some(audio)) => {
+                        stream_bytes(video, entry.streams.duration_seconds)
+                            .saturating_add(stream_bytes(audio, entry.streams.duration_seconds))
+                    }
+                    _ => entry
+                        .streams
+                        .flv_segments
+                        .iter()
+                        .fold(0_u64, |total, segment| {
+                            total.saturating_add(segment.size.unwrap_or(0))
+                        }),
+                },
+                DownloadMode::VideoOnly => video.map_or(0, |stream| {
+                    stream_bytes(stream, entry.streams.duration_seconds)
+                }),
+                DownloadMode::AudioOnly => audio.map_or(0, |stream| {
+                    stream_bytes(stream, entry.streams.duration_seconds)
+                }),
+                _ => 0,
+            };
+            (total.saturating_add(bytes), largest.max(bytes))
+        })
 }
 
 fn bilibili_resolved_download_summary(
@@ -8395,12 +8419,7 @@ async fn run_bilibili_job_locked(
         ),
     );
     let progress_reporter = BilibiliCoreProgress::new(progress.clone(), collection_progress);
-    let planned_bytes = bilibili_planned_media_bytes(&core_plan, &options);
-    let peak_bytes = if mux_locally {
-        planned_bytes.saturating_mul(2)
-    } else {
-        planned_bytes
-    };
+    let peak_bytes = bilibili_download_peak_bytes(&core_plan, &options, mux_locally);
     crate::disk_space::ensure_disk_space(
         root,
         peak_bytes,
@@ -24951,6 +24970,14 @@ mod tests {
             bilibili_planned_media_bytes(&plan, &options),
             4 * 1024 * 1024
         );
+        assert_eq!(
+            bilibili_download_peak_bytes(&plan, &options, true),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            bilibili_download_peak_bytes(&plan, &options, false),
+            4 * 1024 * 1024
+        );
         options.mode = DownloadMode::VideoOnly;
         assert_eq!(
             bilibili_planned_media_bytes(&plan, &options),
@@ -24968,6 +24995,37 @@ mod tests {
         );
         let huge = test_bilibili_plan(vec![test_bilibili_entry(1, Some(u64::MAX), Some(1))]);
         assert_eq!(bilibili_planned_media_bytes(&huge, &options), u64::MAX);
+        assert_eq!(
+            bilibili_download_peak_bytes(&huge, &options, true),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn local_mux_peak_adds_only_the_largest_entry_to_planned_inputs() {
+        const MIB: u64 = 1024 * 1024;
+        const SPACE_RESERVE_BYTES: u64 = 256 * MIB;
+
+        let plan = test_bilibili_plan(vec![
+            test_bilibili_entry(1, Some(60 * MIB), Some(10 * MIB)),
+            test_bilibili_entry(2, Some(20 * MIB), Some(10 * MIB)),
+        ]);
+        let mut options = bbdown_core::DownloadOptions::new("downloads");
+        options.mode = DownloadMode::All;
+
+        let planned_bytes = bilibili_planned_media_bytes(&plan, &options);
+        let peak_bytes = bilibili_download_peak_bytes(&plan, &options, true);
+        let old_double_count_peak = planned_bytes.saturating_mul(2);
+        let simulated_available_bytes = 430 * MIB;
+
+        assert_eq!(planned_bytes, 100 * MIB);
+        assert_eq!(peak_bytes, 170 * MIB);
+        assert_eq!(
+            bilibili_download_peak_bytes(&plan, &options, false),
+            planned_bytes
+        );
+        assert!(simulated_available_bytes >= SPACE_RESERVE_BYTES + peak_bytes);
+        assert!(simulated_available_bytes < SPACE_RESERVE_BYTES + old_double_count_peak);
     }
 
     #[test]
