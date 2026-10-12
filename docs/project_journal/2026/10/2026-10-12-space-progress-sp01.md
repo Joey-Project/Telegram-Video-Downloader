@@ -29,6 +29,7 @@ superseded_by:
   Check download/mux peak space, actual mux input sizes, and publication state
   overhead. Monitor the 256 MiB margin while the worker runs.
 - Keep capacity monitoring active independently of file-activity tracking.
+  Cap safety polling separately from Telegram progress delivery intervals.
   Apply the publication reserve only to resumable Bilibili jobs.
 - Treat ENOSPC and quota exhaustion as shared storage failures. Preserve existing
   files and retry saving the pause after space is freed, with an explicit notice
@@ -38,10 +39,11 @@ superseded_by:
 - Avoid unchanged queue index writes during ordinary lookup and listing.
 - Retry transient terminal-state lookup errors, but return permanently invalid
   task records instead of repeatedly polling them.
+  Apply the same classification when saving a superseding cancellation.
 
 ## Validation
 
-- Rust 1.95.0: all-target offline tests passed, 755 passed, zero failed, and
+- Rust 1.95.0: all-target offline tests passed, 756 passed, zero failed, and
   15 existing opt-in tests ignored. Capacity thresholds and failure paths use
   injected values and mock writes; no disk-filling test was performed.
 - Offline build, all-target Clippy with warnings denied, formatting, diff, and

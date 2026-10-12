@@ -66,6 +66,8 @@ fn bilibili_missing_validation_semaphore() -> Arc<Semaphore> {
         .clone()
 }
 static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
+// Keep storage failures visible promptly even when progress updates are throttled.
+const DISK_SPACE_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
 const VIDEO_STAGING_INITIALIZING_DIR_PREFIX: &str = ".initializing-job-";
 const VIDEO_STAGING_OWNER_FILE_NAME: &str = ".owner.json";
@@ -14357,6 +14359,7 @@ async fn run_command_with_execution_context_and_additional_fds_and_monitors(
         progress_interval
     };
     let mut next_activity_poll = started_at + activity_poll_interval;
+    let mut next_disk_space_check = started_at + DISK_SPACE_MONITOR_INTERVAL;
     let mut progress_tracker =
         ProgressTracker::new(command_progress_name(spec), progress_interval, progress);
 
@@ -14410,8 +14413,8 @@ async fn run_command_with_execution_context_and_additional_fds_and_monitors(
                     summarize_output(&String::from_utf8_lossy(&stdout), &String::from_utf8_lossy(&stderr))
                 );
             }
-            _ = sleep_until(next_activity_poll), if file_activity.is_some() || disk_space_root.is_some() => {
-                next_activity_poll = Instant::now() + activity_poll_interval;
+            _ = sleep_until(next_disk_space_check), if disk_space_root.is_some() => {
+                next_disk_space_check = Instant::now() + DISK_SPACE_MONITOR_INTERVAL;
                 if let Some(root) = disk_space_root.as_ref()
                     && let Err(error) = crate::disk_space::ensure_disk_space(root, 0, "downloading or merging the current episode")
                 {
@@ -14420,6 +14423,9 @@ async fn run_command_with_execution_context_and_additional_fds_and_monitors(
                     process_group_guard.disarm();
                     return Err(error);
                 }
+            }
+            _ = sleep_until(next_activity_poll), if file_activity.is_some() => {
+                next_activity_poll = Instant::now() + activity_poll_interval;
                 if let Some(tracker) = file_activity.as_mut() {
                     match tracker.poll().await {
                         Ok(report) => {
@@ -35802,7 +35808,7 @@ mv video.original video.m4s || exit 46
         let mut config = test_config();
         config.bot.command_timeout_seconds = 10;
         config.bot.command_idle_timeout_seconds = 10;
-        config.bot.progress_update_seconds = 1;
+        config.bot.progress_update_seconds = 600;
         let spec = CommandSpec {
             program: PathBuf::from("/bin/sh"),
             args: vec![
@@ -35829,7 +35835,7 @@ mv video.original video.m4s || exit 46
                 Vec::new(),
                 CommandExecutionOptions {
                     progress: None,
-                    policy: CommandExecutionPolicy::EXTERNAL,
+                    policy: CommandExecutionPolicy::BILIBILI_WORKER,
                     disk_space_root: Some(disk_space_root),
                     file_activity: None,
                 },

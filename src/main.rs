@@ -6921,6 +6921,18 @@ async fn persist_terminal_failure_with_retry(
                 Ok(Some(_)) => return Ok(TerminalFailureResolution::Cancelled),
                 Ok(None) => return Ok(TerminalFailureResolution::Superseded),
                 Err(err) => {
+                    let retryable = is_retryable_terminal_state_error(&err);
+                    if !retryable {
+                        warn!(
+                            task_id,
+                            generation,
+                            job_label,
+                            retryable,
+                            error = %err,
+                            "permanent failure while persisting the superseding cancellation"
+                        );
+                        return Err(err);
+                    }
                     let disk_full = disk_space::is_disk_space_failure(&err);
                     send_terminal_failure_recovery_notice(
                         telegram,
@@ -6940,6 +6952,7 @@ async fn persist_terminal_failure_with_retry(
                         task_id,
                         generation,
                         job_label,
+                        retryable,
                         error = %err,
                         "failed to persist the superseding cancellation; retrying"
                     );
@@ -14681,6 +14694,82 @@ mod tests {
             take_fake_telegram_requests(&mut requests).is_empty(),
             "permanent lookup errors should not send a retry notice"
         );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn terminal_cancellation_returns_permanent_write_errors_without_retry_notice() {
+        let root = temp_main_test_dir("terminal-cancellation-permanent-write-error");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, provider)
+                .expect("task queue should open with the fake File Provider"),
+        );
+        let task_id = "terminal-cancellation-permanent-write-error";
+        let chat_id = 123_456_789;
+        let mut task = TaskRecord::new(
+            task_id.into(),
+            1104,
+            2104,
+            chat_id,
+            None,
+            0,
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=terminal-cancellation-write-error".into(),
+            },
+        );
+        task.status = TaskStatus::Running;
+        assert!(queue.create(task).expect("running task should persist"));
+        let requested = queue
+            .cancel_for_chat_if_generation(task_id, 0, chat_id)
+            .expect("cancellation request should persist")
+            .expect("running task should accept cancellation");
+        assert!(requested.cancel_requested);
+        let writes_before_finish = file_provider.write_paths().len();
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        file_provider.fail_next_write("simulated read-only queue write failure");
+        let result = tokio_timeout(
+            Duration::from_secs(1),
+            persist_terminal_failure_with_retry(
+                &telegram,
+                &queue,
+                task_id,
+                0,
+                chat_id,
+                1104,
+                "YouTube download",
+                Duration::ZERO,
+                "simulated worker failure".into(),
+                None,
+                false,
+            ),
+        )
+        .await
+        .expect("permanent cancellation write error should return promptly");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("permanent cancellation write error should propagate"),
+        };
+        assert!(format!("{error:#}").contains("simulated read-only queue write failure"));
+        assert_eq!(file_provider.write_paths().len(), writes_before_finish + 1);
+        assert!(take_fake_telegram_requests(&mut requests).is_empty());
+        let current = queue
+            .get(task_id)
+            .expect("task should remain readable after failed cancellation persistence")
+            .expect("current task should remain in the queue");
+        assert_eq!(current.status, TaskStatus::Running);
+        assert!(current.cancel_requested);
 
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
