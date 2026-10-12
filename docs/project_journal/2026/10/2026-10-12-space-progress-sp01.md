@@ -49,4 +49,3 @@ superseded_by:
 - A normal restart of the existing signed PR #38 binary recovered the affected
   task to Interrupted: three verified, one interrupted, and 199 pending. No new
   media download was started and no user media was deleted.
-
