@@ -1,7 +1,7 @@
 ---
 id: 20261012-sp01
 title: Disk Space Recovery and Season Progress
-status: active
+status: completed
 created: 2026-10-12
 updated: 2026-10-12
 branch: wip/bilibili-space-progress
@@ -50,6 +50,3 @@ superseded_by:
   task to Interrupted: three verified, one interrupted, and 199 pending. No new
   media download was started and no user media was deleted.
 
-## Next Steps
-
-- Land the checked fix and refresh the signed local deployment when authorized.
