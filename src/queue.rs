@@ -301,7 +301,7 @@ pub struct RestartSummary {
     pub failed_entries: usize,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct StoreIndex {
     version: u32,
     #[serde(default)]
@@ -310,7 +310,7 @@ struct StoreIndex {
     chat_activity: BTreeMap<String, ChatActivity>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TaskIndexEntry {
     chat_id: i64,
     record_path: PathBuf,
@@ -320,7 +320,7 @@ struct TaskIndexEntry {
     updated_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct ChatActivity {
     revision: u64,
     notified_revision: u64,
@@ -1689,9 +1689,45 @@ impl QueueManager {
         message: String,
         snapshot: Option<BilibiliAttemptSnapshot>,
     ) -> Result<Option<TaskRecord>> {
+        self.fail_with_bilibili_attempt_if_generation_inner(
+            id,
+            expected_generation,
+            message,
+            snapshot,
+            false,
+        )
+    }
+
+    pub fn fail_with_bilibili_attempt_if_generation_unless_cancelled(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        message: String,
+        snapshot: Option<BilibiliAttemptSnapshot>,
+    ) -> Result<Option<TaskRecord>> {
+        self.fail_with_bilibili_attempt_if_generation_inner(
+            id,
+            expected_generation,
+            message,
+            snapshot,
+            true,
+        )
+    }
+
+    fn fail_with_bilibili_attempt_if_generation_inner(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        message: String,
+        snapshot: Option<BilibiliAttemptSnapshot>,
+        reject_pending_cancellation: bool,
+    ) -> Result<Option<TaskRecord>> {
         self.update_if_generation(id, expected_generation, true, |record| {
             if matches!(record.status, TaskStatus::Cancelled | TaskStatus::Completed) {
                 bail!("task {id} is already terminal");
+            }
+            if reject_pending_cancellation && record.cancel_requested {
+                bail!("task {id} has a pending cancellation request");
             }
             if let Some(mut snapshot) = snapshot {
                 snapshot.sanitize_errors();
@@ -1732,9 +1768,45 @@ impl QueueManager {
         message: String,
         snapshot: Option<BilibiliAttemptSnapshot>,
     ) -> Result<Option<TaskRecord>> {
+        self.interrupt_with_bilibili_attempt_if_generation_inner(
+            id,
+            expected_generation,
+            message,
+            snapshot,
+            false,
+        )
+    }
+
+    pub fn interrupt_with_bilibili_attempt_if_generation_unless_cancelled(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        message: String,
+        snapshot: Option<BilibiliAttemptSnapshot>,
+    ) -> Result<Option<TaskRecord>> {
+        self.interrupt_with_bilibili_attempt_if_generation_inner(
+            id,
+            expected_generation,
+            message,
+            snapshot,
+            true,
+        )
+    }
+
+    fn interrupt_with_bilibili_attempt_if_generation_inner(
+        &self,
+        id: &str,
+        expected_generation: u64,
+        message: String,
+        snapshot: Option<BilibiliAttemptSnapshot>,
+        reject_pending_cancellation: bool,
+    ) -> Result<Option<TaskRecord>> {
         self.update_if_generation(id, expected_generation, true, |record| {
             if matches!(record.status, TaskStatus::Cancelled | TaskStatus::Completed) {
                 bail!("task {id} is already terminal");
+            }
+            if reject_pending_cancellation && record.cancel_requested {
+                bail!("task {id} has a pending cancellation request");
             }
             if let Some(mut snapshot) = snapshot {
                 snapshot.sanitize_errors();
@@ -2885,9 +2957,12 @@ impl DownloadStore {
 
     fn list_records(&self) -> Result<Vec<TaskRecord>> {
         let mut index = self.read_index()?;
+        let original_index = index.clone();
         self.scan_active_records(&mut index)?;
         self.reconcile_move_targets(&mut index)?;
-        self.write_index(&index)?;
+        if index != original_index {
+            self.write_index(&index)?;
+        }
         let mut records = Vec::with_capacity(index.tasks.len());
         for (id, entry) in &index.tasks {
             if let Some(record) = self.read_record(&entry.record_path)? {
@@ -2902,13 +2977,15 @@ impl DownloadStore {
 
     fn get_task(&self, id: &str) -> Result<Option<(TaskRecord, TaskIndexEntry)>> {
         let mut index = self.read_index()?;
+        let original_index = index.clone();
         self.scan_active_records(&mut index)?;
         self.reconcile_move_targets(&mut index)?;
-        if !index.tasks.contains_key(id) {
+        if index != original_index {
             self.write_index(&index)?;
+        }
+        if !index.tasks.contains_key(id) {
             return Ok(None);
         }
-        self.write_index(&index)?;
         let entry = index.tasks.get(id).expect("checked above").clone();
         let Some(record) = self.read_record(&entry.record_path)? else {
             return Ok(None);
@@ -3086,7 +3163,6 @@ impl DownloadStore {
     }
 
     fn reconcile_move_targets(&self, index: &mut StoreIndex) -> Result<()> {
-        let mut changed = false;
         for (id, entry) in &mut index.tasks {
             let Some(target) = entry.move_target.clone() else {
                 continue;
@@ -3097,10 +3173,6 @@ impl DownloadStore {
             }
             entry.record_path = target;
             entry.move_target = None;
-            changed = true;
-        }
-        if changed {
-            self.write_index(index)?;
         }
         Ok(())
     }
@@ -5359,6 +5431,55 @@ mod tests {
     }
 
     #[test]
+    fn terminal_failure_variants_do_not_supersede_pending_cancellation() {
+        let temp_root = temp_queue_root("terminal-failure-cancellation-guard");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = temp_root.join("videos");
+        config.downloads.pdf_dir = temp_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).unwrap();
+        fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
+        let queue = QueueManager::open(&config).unwrap();
+        let task_id = "terminal-failure-cancellation-guard";
+        let mut task = test_task(
+            task_id,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(crate::router::BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        assert!(queue.create(task).unwrap());
+        let requested = queue.cancel(task_id, 123_456_789).unwrap().unwrap();
+        assert!(requested.cancel_requested);
+
+        let failure = queue
+            .fail_with_bilibili_attempt_if_generation_unless_cancelled(
+                task_id,
+                0,
+                "worker failed".into(),
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{failure:#}").contains("pending cancellation request"));
+        let interruption = queue
+            .interrupt_with_bilibili_attempt_if_generation_unless_cancelled(
+                task_id,
+                0,
+                "worker interrupted".into(),
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{interruption:#}").contains("pending cancellation request"));
+
+        let current = queue.get(task_id).unwrap().unwrap();
+        assert_eq!(current.status, TaskStatus::Running);
+        assert!(current.cancel_requested);
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
     fn restart_replaces_group_verified_outcome_with_interrupted_summary() {
         use crate::router::BilibiliSelection;
         let directory = temp_queue_root("episode-group-finalization-restart");
@@ -6660,6 +6781,55 @@ mod tests {
         assert!(
             listing_reads.contains(&pdf_root.join(QUEUE_DIRECTORY)),
             "PDF queue directory scans should use coordinated reads: {listing_reads:?}"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn unchanged_queue_reads_do_not_rewrite_the_index() {
+        let temp_root = temp_queue_root("unchanged-queue-read-index");
+        let video_root = temp_root.join("videos");
+        let pdf_root = temp_root.join("pdfs");
+        fs::create_dir_all(&video_root).expect("video root should create");
+        fs::create_dir_all(&pdf_root).expect("PDF root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = video_root;
+        config.downloads.pdf_dir = pdf_root;
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, provider)
+            .expect("queue should open with the mock File Provider");
+        let task_id = "unchanged-queue-read-index";
+        assert!(
+            queue
+                .create(test_task(
+                    task_id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        let writes_before_reads = file_provider.write_paths().len();
+
+        queue
+            .get(task_id)
+            .expect("task lookup should succeed")
+            .expect("task should remain indexed");
+        queue
+            .get("missing-task")
+            .expect("missing task lookup should succeed");
+        queue
+            .list(123_456_789, false, 0)
+            .expect("queue listing should succeed");
+
+        assert_eq!(
+            file_provider.write_paths().len(),
+            writes_before_reads,
+            "ordinary reads should not write an unchanged queue index"
         );
 
         drop(queue);

@@ -501,6 +501,51 @@ impl RootedFs {
         self.validate_root()
     }
 
+    /// Returns the currently available, unprivileged bytes on the filesystem containing the
+    /// bound output root. This is a point-in-time estimate: it reserves no space and makes no
+    /// guarantee about whether purgeable filesystem or provider-managed data can be reclaimed.
+    #[allow(clippy::unnecessary_cast)] // statvfs unsigned field widths differ on macOS and Linux.
+    pub(crate) fn available_space_bytes(&self) -> Result<u64> {
+        self.validate_root()?;
+        if identity_for_fd(self.root_fd.as_ref())? != self.root_identity {
+            bail!("configured output root descriptor identity changed");
+        }
+
+        #[cfg(unix)]
+        let available_bytes = {
+            let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            let result =
+                unsafe { libc::fstatvfs(self.root_fd.as_ref().as_raw_fd(), stats.as_mut_ptr()) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to query filesystem capacity for the bound output root");
+            }
+            let stats = unsafe { stats.assume_init() };
+            let fragment_size = stats.f_frsize as u64;
+            let block_size = if fragment_size == 0 {
+                stats.f_bsize as u64
+            } else {
+                fragment_size
+            };
+            if block_size == 0 {
+                bail!("filesystem reported a zero allocation block size");
+            }
+            let available_blocks = stats.f_bavail as u64;
+            available_blocks.saturating_mul(block_size)
+        };
+
+        #[cfg(not(unix))]
+        let available_bytes = {
+            bail!("filesystem capacity queries are unsupported on this platform");
+        };
+
+        if identity_for_fd(self.root_fd.as_ref())? != self.root_identity {
+            bail!("configured output root descriptor identity changed during capacity query");
+        }
+        self.validate_root()?;
+        Ok(available_bytes)
+    }
+
     pub(crate) fn list_root_directory(&self) -> Result<Vec<(OsString, EntryIdentity)>> {
         self.validate_root()?;
         let entries = list_directory_entries(
@@ -3307,6 +3352,24 @@ mod tests {
             "telegram-video-downloader-safe-fs-{label}-{}-{stamp}",
             std::process::id()
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn available_space_query_reads_the_bound_root_filesystem() {
+        let root = temp_dir("available-space");
+        fs::create_dir_all(&root).expect("root should create");
+        let rooted = RootedFs::new(&root).expect("root should bind");
+
+        let _available = rooted
+            .available_space_bytes()
+            .expect("bound filesystem capacity should be queryable");
+
+        rooted
+            .validate_configured_root()
+            .expect("configured root should remain valid");
+        drop(rooted);
+        fs::remove_dir_all(root).expect("test root should be removed");
     }
 
     #[cfg(unix)]

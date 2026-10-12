@@ -4,6 +4,7 @@ mod bilibili_auth;
 mod bilibili_core;
 mod bilibili_planning;
 mod config;
+mod disk_space;
 mod downloader;
 mod episode_retry;
 mod file_provider;
@@ -6487,37 +6488,66 @@ async fn run_queued_job(
                             final_outcome = outcome;
                             message
                         }
-                        Ok(Some(_)) => {
-                            match persist_bilibili_terminal_failure(
+                        Ok(Some(_)) | Err(_) => {
+                            match persist_terminal_failure_with_retry(
+                                &telegram,
                                 &queue,
                                 &task_id,
                                 generation,
+                                chat_id,
+                                job_id,
+                                job.label(),
+                                context.queue_start_retry_delay,
                                 truncate(&error_chain),
                                 bilibili_attempt.clone(),
                                 is_bilibili_episode_group(&job),
-                            ) {
-                                Ok(Some(record)) => bilibili_attempt = record.bilibili_attempt,
-                                Ok(None) => deliver_final_message = false,
-                                Err(fail_error) => warn!(
-                                    task_id,
-                                    error = %fail_error,
-                                    "failed to persist task failure state"
-                                ),
-                            }
-                            episode_group_failure_message(
-                                job_id,
-                                job.label(),
-                                &error_chain,
-                                bilibili_attempt.as_ref(),
-                                is_bilibili_episode_group(&job),
                             )
+                            .await
+                            {
+                                Ok(TerminalFailureResolution::Persisted(record))
+                                    if record.status == TaskStatus::Completed =>
+                                {
+                                    let (outcome, message) = completed_task_finalization_fallback(
+                                        job_id,
+                                        job.label(),
+                                        &report.saved_location,
+                                        &error_chain,
+                                    );
+                                    final_outcome = outcome;
+                                    message
+                                }
+                                Ok(TerminalFailureResolution::Persisted(record)) => {
+                                    bilibili_attempt = record.bilibili_attempt;
+                                    let persisted_error =
+                                        record.error.as_deref().unwrap_or(&error_chain);
+                                    episode_group_failure_message(
+                                        job_id,
+                                        job.label(),
+                                        persisted_error,
+                                        bilibili_attempt.as_ref(),
+                                        is_bilibili_episode_group(&job),
+                                    )
+                                }
+                                Ok(TerminalFailureResolution::Cancelled) => {
+                                    final_outcome = CollectionFinalOutcome::Cancelled;
+                                    format!("Canceled job #{job_id}: {}", job.label())
+                                }
+                                Ok(TerminalFailureResolution::Superseded) => {
+                                    deliver_final_message = false;
+                                    String::new()
+                                }
+                                Err(fail_error) => {
+                                    warn!(
+                                        task_id,
+                                        error = %fail_error,
+                                        "terminal failure state could not be persisted"
+                                    );
+                                    deliver_final_message = false;
+                                    String::new()
+                                }
+                            }
                         }
                         Ok(None) => {
-                            deliver_final_message = false;
-                            String::new()
-                        }
-                        Err(get_error) => {
-                            warn!(task_id, error = %get_error, "failed to read task generation after finalization error");
                             deliver_final_message = false;
                             String::new()
                         }
@@ -6528,49 +6558,49 @@ async fn run_queued_job(
         Some(Err(err)) => {
             let error_chain = redact_sensitive_text(&format!("{err:#}"));
             error!(job_id, error = %error_chain, "job failed");
-            match task_if_generation_with_retry_delay(
+            match persist_terminal_failure_with_retry(
+                &telegram,
                 &queue,
                 &task_id,
                 generation,
+                chat_id,
+                job_id,
+                job.label(),
                 context.queue_start_retry_delay,
+                truncate(&error_chain),
+                bilibili_attempt.clone(),
+                is_bilibili_episode_group(&job),
             )
             .await
             {
-                Ok(Some(task)) if task.status == TaskStatus::Cancelled => {
+                Ok(TerminalFailureResolution::Cancelled) => {
                     final_outcome = CollectionFinalOutcome::Cancelled;
                     format!("Canceled job #{job_id}: {}", job.label())
                 }
-                Ok(Some(_)) => {
-                    match persist_bilibili_terminal_failure(
-                        &queue,
-                        &task_id,
-                        generation,
-                        truncate(&error_chain),
-                        bilibili_attempt.clone(),
-                        is_bilibili_episode_group(&job),
-                    ) {
-                        Ok(Some(record)) => bilibili_attempt = record.bilibili_attempt,
-                        Ok(None) => deliver_final_message = false,
-                        Err(fail_error) => warn!(
-                            task_id,
-                            error = %fail_error,
-                            "failed to persist task failure state"
-                        ),
-                    }
+                Ok(TerminalFailureResolution::Persisted(record))
+                    if record.status != TaskStatus::Completed =>
+                {
+                    bilibili_attempt = record.bilibili_attempt;
+                    let persisted_error = record.error.as_deref().unwrap_or(&error_chain);
                     episode_group_failure_message(
                         job_id,
                         job.label(),
-                        &error_chain,
+                        persisted_error,
                         bilibili_attempt.as_ref(),
                         is_bilibili_episode_group(&job),
                     )
                 }
-                Ok(None) => {
+                Ok(TerminalFailureResolution::Persisted(_))
+                | Ok(TerminalFailureResolution::Superseded) => {
                     deliver_final_message = false;
                     String::new()
                 }
-                Err(get_error) => {
-                    warn!(task_id, error = %get_error, "failed to read task generation after job error");
+                Err(fail_error) => {
+                    warn!(
+                        task_id,
+                        error = %fail_error,
+                        "terminal failure state could not be persisted"
+                    );
                     deliver_final_message = false;
                     String::new()
                 }
@@ -6603,11 +6633,17 @@ async fn run_queued_job(
     }
 
     if let Some(snapshot) = bilibili_attempt.as_mut() {
-        snapshot.finish(match final_outcome {
+        let outcome = match final_outcome {
             CollectionFinalOutcome::Verified => BilibiliAttemptOutcome::Verified,
+            CollectionFinalOutcome::Failed
+                if snapshot.outcome == Some(BilibiliAttemptOutcome::Interrupted) =>
+            {
+                BilibiliAttemptOutcome::Interrupted
+            }
             CollectionFinalOutcome::Failed => BilibiliAttemptOutcome::Failed,
             CollectionFinalOutcome::Cancelled => BilibiliAttemptOutcome::Cancelled,
-        });
+        };
+        snapshot.finish(outcome);
         match queue.set_bilibili_attempt_if_generation(&task_id, generation, snapshot.clone()) {
             Ok(Some(_)) => {}
             Ok(None) => return,
@@ -6616,15 +6652,29 @@ async fn run_queued_job(
         message = with_bilibili_attempt_summary(&message, snapshot);
     }
 
+    let Some(terminal_record) = terminal_record_for_delivery_with_retry_delay(
+        &telegram,
+        &queue,
+        &task_id,
+        generation,
+        chat_id,
+        job_id,
+        is_bilibili_episode_group(&job),
+        final_outcome,
+        context.queue_start_retry_delay,
+    )
+    .await
+    else {
+        return;
+    };
+
     if is_bilibili_episode_group(&job)
-        && bilibili_attempt
+        && (bilibili_attempt
             .as_ref()
             .is_some_and(|attempt| attempt.independent_entries)
+            || terminal_record.status == TaskStatus::Interrupted)
     {
-        let Ok(Some(record)) = queue.get_if_generation(&task_id, generation) else {
-            return;
-        };
-        let keyboard = episode_group_terminal_keyboard(&record);
+        let keyboard = episode_group_terminal_keyboard(&terminal_record);
         let edited = if let Some(message_id) = status_message_id {
             edit_task_message_with_keyboard_if_current(
                 &queue,
@@ -6761,15 +6811,304 @@ fn persist_bilibili_terminal_failure(
 ) -> Result<Option<TaskRecord>> {
     if snapshot.as_ref().is_some_and(|attempt| {
         attempt.independent_entries && attempt.outcome == Some(BilibiliAttemptOutcome::Interrupted)
-    }) || (grouped && group_error_requires_pause(&error))
+    }) || (grouped
+        && (group_error_requires_pause(&error)
+            || disk_space::is_disk_space_failure(&anyhow::anyhow!("{error}"))))
     {
         if let Some(attempt) = snapshot.as_mut() {
             attempt.outcome = None;
             attempt.finish(BilibiliAttemptOutcome::Interrupted);
         }
-        queue.interrupt_with_bilibili_attempt_if_generation(task_id, generation, error, snapshot)
+        queue.interrupt_with_bilibili_attempt_if_generation_unless_cancelled(
+            task_id, generation, error, snapshot,
+        )
     } else {
-        queue.fail_with_bilibili_attempt_if_generation(task_id, generation, error, snapshot)
+        queue.fail_with_bilibili_attempt_if_generation_unless_cancelled(
+            task_id, generation, error, snapshot,
+        )
+    }
+}
+
+enum TerminalFailureResolution {
+    Persisted(Box<TaskRecord>),
+    Cancelled,
+    Superseded,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_terminal_failure_with_retry(
+    telegram: &TelegramClient,
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    chat_id: i64,
+    job_id: u64,
+    job_label: &str,
+    retry_delay: Duration,
+    mut error: String,
+    snapshot: Option<BilibiliAttemptSnapshot>,
+    grouped: bool,
+) -> Result<TerminalFailureResolution> {
+    let mut uncertainty_notice_sent = false;
+    let mut disk_space_notice_sent = false;
+    loop {
+        let current = match queue.get_if_generation(task_id, generation) {
+            Ok(Some(current)) => current,
+            Ok(None) => return Ok(TerminalFailureResolution::Superseded),
+            Err(err) => {
+                let disk_full = disk_space::is_disk_space_failure(&err);
+                if disk_full && grouped {
+                    mark_disk_space_pause_error(&mut error, grouped);
+                }
+                send_terminal_failure_recovery_notice(
+                    telegram,
+                    task_id,
+                    generation,
+                    chat_id,
+                    job_id,
+                    disk_full,
+                    grouped,
+                    false,
+                    &mut uncertainty_notice_sent,
+                    &mut disk_space_notice_sent,
+                    snapshot.as_ref(),
+                )
+                .await;
+                warn!(
+                    task_id,
+                    generation,
+                    job_label,
+                    error = %err,
+                    "task generation lookup failed while resolving terminal download state; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+                continue;
+            }
+        };
+
+        if current.status == TaskStatus::Cancelled {
+            return Ok(TerminalFailureResolution::Cancelled);
+        }
+        if current.cancel_requested {
+            match queue.finish_cancellation_with_bilibili_attempt_if_generation(
+                task_id,
+                generation,
+                snapshot.clone(),
+            ) {
+                Ok(Some(_)) => return Ok(TerminalFailureResolution::Cancelled),
+                Ok(None) => return Ok(TerminalFailureResolution::Superseded),
+                Err(err) => {
+                    let disk_full = disk_space::is_disk_space_failure(&err);
+                    send_terminal_failure_recovery_notice(
+                        telegram,
+                        task_id,
+                        generation,
+                        chat_id,
+                        job_id,
+                        disk_full,
+                        grouped,
+                        true,
+                        &mut uncertainty_notice_sent,
+                        &mut disk_space_notice_sent,
+                        snapshot.as_ref(),
+                    )
+                    .await;
+                    warn!(
+                        task_id,
+                        generation,
+                        job_label,
+                        error = %err,
+                        "failed to persist the superseding cancellation; retrying"
+                    );
+                    tokio::time::sleep(retry_delay).await;
+                    continue;
+                }
+            }
+        }
+        let retry_pause_persistence = grouped
+            && disk_space::is_disk_space_failure(&anyhow::anyhow!("{error}"))
+            && matches!(
+                current.status,
+                TaskStatus::Failed | TaskStatus::PartiallyCompleted
+            );
+        if matches!(
+            current.status,
+            TaskStatus::Interrupted | TaskStatus::Completed
+        ) || (matches!(
+            current.status,
+            TaskStatus::Failed | TaskStatus::PartiallyCompleted
+        ) && !retry_pause_persistence)
+        {
+            return Ok(TerminalFailureResolution::Persisted(Box::new(current)));
+        }
+
+        match persist_bilibili_terminal_failure(
+            queue,
+            task_id,
+            generation,
+            error.clone(),
+            snapshot.clone(),
+            grouped,
+        ) {
+            Ok(Some(record)) => return Ok(TerminalFailureResolution::Persisted(Box::new(record))),
+            Ok(None) => return Ok(TerminalFailureResolution::Superseded),
+            Err(err) => {
+                let disk_full = disk_space::is_disk_space_failure(&err);
+                send_terminal_failure_recovery_notice(
+                    telegram,
+                    task_id,
+                    generation,
+                    chat_id,
+                    job_id,
+                    disk_full,
+                    grouped,
+                    current.cancel_requested,
+                    &mut uncertainty_notice_sent,
+                    &mut disk_space_notice_sent,
+                    snapshot.as_ref(),
+                )
+                .await;
+                warn!(
+                    task_id,
+                    generation,
+                    job_label,
+                    error = %err,
+                    "failed to persist terminal task state"
+                );
+
+                if disk_full && grouped {
+                    mark_disk_space_pause_error(&mut error, grouped);
+                }
+                let retryable = disk_full
+                    || is_file_provider_access_error(&err)
+                    || format!("{err:#}").contains("pending cancellation request")
+                    || format!("{err:#}").contains("already terminal");
+                if !retryable {
+                    return Err(err);
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
+    }
+}
+
+fn mark_disk_space_pause_error(error: &mut String, grouped: bool) {
+    if grouped && !disk_space::is_disk_space_failure(&anyhow::anyhow!("{error}")) {
+        *error = format!("No space left on device while saving paused state. {error}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_terminal_failure_recovery_notice(
+    telegram: &TelegramClient,
+    _task_id: &str,
+    _generation: u64,
+    chat_id: i64,
+    job_id: u64,
+    disk_full: bool,
+    grouped: bool,
+    cancellation_pending: bool,
+    uncertainty_notice_sent: &mut bool,
+    disk_space_notice_sent: &mut bool,
+    snapshot: Option<&BilibiliAttemptSnapshot>,
+) {
+    let message = if disk_full {
+        if *disk_space_notice_sent {
+            return;
+        }
+        *disk_space_notice_sent = true;
+        if grouped && !cancellation_pending {
+            format!(
+                "Download stopped: disk space exhausted; completed files retained; saving paused state will retry after space is freed.\nJob #{job_id}. The queue may still show Running until its paused state is saved."
+            )
+        } else if cancellation_pending {
+            format!(
+                "Download stopped: disk space exhausted; completed files retained; saving cancellation state will retry after space is freed.\nJob #{job_id}."
+            )
+        } else {
+            format!(
+                "Download stopped: disk space exhausted; completed files retained; saving task state will retry after space is freed.\nJob #{job_id}."
+            )
+        }
+    } else if !*uncertainty_notice_sent {
+        *uncertainty_notice_sent = true;
+        format!(
+            "A download attempt for job #{job_id} has stopped, but its latest saved status could not be confirmed. The bot will keep checking; completed files are retained."
+        )
+    } else {
+        return;
+    };
+
+    let message = if let Some(snapshot) = snapshot {
+        with_bilibili_attempt_summary(&message, snapshot)
+    } else {
+        message
+    };
+    send_or_log(telegram, chat_id, message).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn terminal_record_for_delivery_with_retry_delay(
+    telegram: &TelegramClient,
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    chat_id: i64,
+    job_id: u64,
+    grouped: bool,
+    expected_outcome: CollectionFinalOutcome,
+    retry_delay: Duration,
+) -> Option<TaskRecord> {
+    let mut uncertainty_notice_sent = false;
+    let mut disk_space_notice_sent = false;
+    loop {
+        match queue.get_if_generation(task_id, generation) {
+            Ok(Some(record))
+                if record.cancel_requested
+                    || (record.status == TaskStatus::Cancelled
+                        && expected_outcome != CollectionFinalOutcome::Cancelled) =>
+            {
+                return None;
+            }
+            Ok(Some(record))
+                if match expected_outcome {
+                    CollectionFinalOutcome::Verified => record.status == TaskStatus::Completed,
+                    CollectionFinalOutcome::Cancelled => record.status == TaskStatus::Cancelled,
+                    CollectionFinalOutcome::Failed => matches!(
+                        record.status,
+                        TaskStatus::Failed
+                            | TaskStatus::PartiallyCompleted
+                            | TaskStatus::Interrupted
+                    ),
+                } =>
+            {
+                return Some(record);
+            }
+            Ok(Some(_)) | Ok(None) => return None,
+            Err(err) => {
+                send_terminal_failure_recovery_notice(
+                    telegram,
+                    task_id,
+                    generation,
+                    chat_id,
+                    job_id,
+                    false,
+                    grouped,
+                    false,
+                    &mut uncertainty_notice_sent,
+                    &mut disk_space_notice_sent,
+                    None,
+                )
+                .await;
+                warn!(
+                    task_id,
+                    generation,
+                    error = %err,
+                    "task state lookup failed before terminal delivery; retrying"
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+        }
     }
 }
 
@@ -6780,13 +7119,29 @@ fn episode_group_failure_message(
     snapshot: Option<&BilibiliAttemptSnapshot>,
     grouped: bool,
 ) -> String {
+    let detailed_space_error = error.lines().find_map(|line| {
+        line.find("Insufficient disk space during ")
+            .map(|offset| &line[offset..])
+    });
+    let display_error = if let Some(detail) = detailed_space_error {
+        detail
+    } else if disk_space::is_disk_space_failure(&anyhow::anyhow!("{error}")) {
+        "Disk space ran out. Completed files were retained; free space, then resume the remaining episodes."
+    } else {
+        error
+    };
     let Some(attempt) = snapshot.filter(|attempt| attempt.independent_entries) else {
         if grouped && group_error_requires_pause(error) {
-            return format!("Paused job #{job_id}: {job_label}\n{}", truncate(error));
+            return format!(
+                "Paused job #{job_id}: {job_label}\n{}",
+                truncate(display_error)
+            );
         }
-        return failed_job_message(job_id, job_label, error);
+        return failed_job_message(job_id, job_label, display_error);
     };
-    let status = if attempt.outcome == Some(BilibiliAttemptOutcome::Interrupted) {
+    let status = if attempt.outcome == Some(BilibiliAttemptOutcome::Interrupted)
+        || (grouped && group_error_requires_pause(error))
+    {
         "Paused"
     } else if attempt
         .entries
@@ -6799,7 +7154,7 @@ fn episode_group_failure_message(
     };
     format!(
         "{status} job #{job_id}: {job_label}\n{}",
-        truncate(&redact_sensitive_text(error))
+        truncate(&redact_sensitive_text(display_error))
     )
 }
 
@@ -11542,7 +11897,7 @@ mod tests {
                     "message_id": 1031,
                     "chat": {"id": 123456789, "type": "private"},
                     "from": {"id": 701},
-                    "text": "/queue"
+                    "text": "https://www.bilibili.com/bangumi/play/ss12345"
                 }
             }),
             serde_json::json!({
@@ -11603,7 +11958,21 @@ mod tests {
         .expect("the redelivered updates should process after the transient failure clears");
         assert_eq!(offset, Some(933));
 
-        let recorded = take_fake_telegram_requests(&mut requests);
+        let recorded = tokio_timeout(Duration::from_secs(3), async {
+            let mut recorded = Vec::new();
+            let mut sent_messages = 0;
+            while sent_messages < 2 {
+                let request = requests
+                    .recv()
+                    .await
+                    .expect("fake Telegram request stream should remain open");
+                sent_messages += usize::from(request.method == "sendMessage");
+                recorded.push(request);
+            }
+            recorded
+        })
+        .await
+        .expect("the retried task setup and help update should send their messages");
         assert_eq!(
             recorded
                 .iter()
@@ -11611,7 +11980,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["getUpdates", "getUpdates", "sendMessage", "sendMessage"]
         );
+        let sent_messages = recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .collect::<Vec<_>>();
+        assert!(sent_messages.iter().any(|request| {
+            request.body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Bilibili"))
+                && request.body["reply_markup"].is_object()
+        }));
+        assert!(sent_messages.iter().any(|request| {
+            request.body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("/queue"))
+        }));
 
+        pending_bilibili_selection_jobs()
+            .lock()
+            .await
+            .retain(|_, pending| pending.task_id != "u931-0");
         drop(queue);
         stop_fake_telegram_api(shutdown, server).await;
         let _ = fs::remove_dir_all(queue_root);
@@ -11632,7 +12020,9 @@ mod tests {
             QueueManager::open_with_file_provider(&config, file_provider_trait)
                 .expect("task queue should open"),
         );
-        file_provider.fail_write_after(4, "simulated spawned setup File Provider failure");
+        // Two writes create the task record and index; fail the first write of the
+        // background transition to Preparing so the saved task remains Received.
+        file_provider.fail_write_after(2, "simulated spawned setup File Provider failure");
 
         let (telegram, mut requests, update_sender, shutdown, server) =
             spawn_fake_telegram_api().await;
@@ -11991,9 +12381,9 @@ mod tests {
         queue
             .set_status(task_id, TaskStatus::Preparing, None)
             .expect("task should enter preparing state");
-        // get_task writes the current index, then the task record succeeds; fail the
-        // index write that publishes AwaitingSelection to exercise the partial-save path.
-        file_provider.fail_write_after(2, "simulated selection index File Provider failure");
+        // The record write succeeds, then the index write that publishes AwaitingSelection
+        // fails to exercise the partial-save path.
+        file_provider.fail_write_after(1, "simulated selection index File Provider failure");
 
         let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
         let context = BotContext {
@@ -13950,6 +14340,335 @@ mod tests {
         );
         drop(queue);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn disk_space_terminal_persistence_retries_and_delivers_resume_only_after_pause() {
+        let root = temp_main_test_dir("disk-space-terminal-retry-e2e");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, provider)
+                .expect("task queue should open with the fake File Provider"),
+        );
+        let task_id = "disk-space-terminal-retry";
+        let chat_id = 123_456_789;
+        let mut snapshot = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [
+                (1, "Episode 1".into(), Some("ep-1".into())),
+                (2, "Episode 2".into(), Some("ep-2".into())),
+                (3, "Episode 3".into(), Some("ep-3".into())),
+            ],
+            0,
+        );
+        snapshot.entry_verified(1);
+        let mut task = TaskRecord::new(
+            task_id.into(),
+            1001,
+            2001,
+            chat_id,
+            None,
+            0,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::All),
+            },
+        );
+        task.status = TaskStatus::Running;
+        task.bilibili_attempt = Some(snapshot.clone());
+        assert!(queue.create(task).expect("running task should persist"));
+
+        file_provider.fail_next_write("No space left on device (os error 28)");
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let resolution = persist_terminal_failure_with_retry(
+            &telegram,
+            &queue,
+            task_id,
+            0,
+            chat_id,
+            1001,
+            "Bilibili download",
+            Duration::from_millis(1),
+            "No space left on device (os error 28)".into(),
+            Some(snapshot),
+            true,
+        )
+        .await
+        .expect("terminal state should persist after the injected ENOSPC failure clears");
+        let TerminalFailureResolution::Persisted(paused) = resolution else {
+            panic!("current generation should persist as interrupted");
+        };
+        assert_eq!(paused.status, TaskStatus::Interrupted);
+        let persisted_attempt = paused
+            .bilibili_attempt
+            .as_ref()
+            .expect("episode results should remain persisted");
+        assert_eq!(
+            persisted_attempt.outcome,
+            Some(BilibiliAttemptOutcome::Interrupted)
+        );
+        assert_eq!(persisted_attempt.verified_entries(), 1);
+
+        let notice_requests = take_fake_telegram_requests(&mut requests);
+        assert_eq!(notice_requests.len(), 1);
+        assert_eq!(notice_requests[0].method, "sendMessage");
+        assert!(notice_requests[0].body["text"].as_str().is_some_and(|text| {
+            text.contains("Download stopped: disk space exhausted; completed files retained; saving paused state will retry after space is freed")
+        }));
+        assert!(notice_requests[0].body.get("reply_markup").is_none());
+
+        let terminal = terminal_record_for_delivery_with_retry_delay(
+            &telegram,
+            &queue,
+            task_id,
+            0,
+            chat_id,
+            1001,
+            true,
+            CollectionFinalOutcome::Failed,
+            Duration::from_millis(1),
+        )
+        .await
+        .expect("persisted pause should remain eligible for terminal delivery");
+        let keyboard = episode_group_terminal_keyboard(&terminal);
+        let resume_button = keyboard
+            .inline_keyboard
+            .iter()
+            .flatten()
+            .find(|button| button.text == "Resume remaining episodes")
+            .expect("durable interrupted task should offer resume");
+        assert!(matches!(
+            parse_queue_callback_data(&resume_button.callback_data),
+            Some(QueueCallbackAction::Resume { generation: 0, .. })
+        ));
+        send_task_message_with_keyboard_id_if_current(
+            ProgressDeliveryContext {
+                telegram: &telegram,
+                queue: &queue,
+                task_id,
+                generation: 0,
+                chat_id,
+                job_id: 1001,
+                job_label: "Bilibili download",
+            },
+            episode_group_failure_message(
+                1001,
+                "Bilibili download",
+                paused.error.as_deref().unwrap_or_default(),
+                paused.bilibili_attempt.as_ref(),
+                true,
+            ),
+            keyboard,
+        )
+        .await
+        .expect("durable pause should send its resume action");
+        let terminal_requests = take_fake_telegram_requests(&mut requests);
+        assert_eq!(terminal_requests.len(), 1);
+        assert_eq!(terminal_requests[0].method, "sendMessage");
+        assert!(
+            terminal_requests[0].body["reply_markup"]["inline_keyboard"]
+                .as_array()
+                .is_some_and(|rows| !rows.is_empty())
+        );
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pending_disk_space_retry_is_superseded_by_cancellation_and_new_generation() {
+        let root = temp_main_test_dir("disk-space-retry-superseded");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = Arc::new(
+            QueueManager::open_with_file_provider(&config, provider)
+                .expect("task queue should open with the fake File Provider"),
+        );
+        let chat_id = 123_456_789;
+        for (task_id, job_id) in [("retry-cancelled", 1101), ("retry-replaced", 1102)] {
+            let mut task = TaskRecord::new(
+                task_id.into(),
+                job_id as i64,
+                job_id as i64 + 1000,
+                chat_id,
+                None,
+                0,
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                    selection: Some(BilibiliSelection::All),
+                },
+            );
+            task.status = TaskStatus::Running;
+            assert!(queue.create(task).expect("running task should persist"));
+        }
+
+        let (telegram, mut requests, _updates, shutdown, server) = spawn_fake_telegram_api().await;
+        let retry_delay = Duration::from_secs(1);
+        file_provider.fail_next_write("No space left on device (os error 28)");
+        let cancellation_telegram = telegram.clone();
+        let cancellation_queue = Arc::clone(&queue);
+        let cancellation_retry = tokio::spawn(async move {
+            persist_terminal_failure_with_retry(
+                &cancellation_telegram,
+                &cancellation_queue,
+                "retry-cancelled",
+                0,
+                chat_id,
+                1101,
+                "Bilibili download",
+                retry_delay,
+                "worker stopped after disk exhaustion".into(),
+                None,
+                true,
+            )
+            .await
+        });
+        let cancellation_notice = tokio_timeout(Duration::from_secs(3), async {
+            loop {
+                let request = requests
+                    .recv()
+                    .await
+                    .expect("fake Telegram request stream should remain open");
+                if request.method == "sendMessage" {
+                    break request;
+                }
+            }
+        })
+        .await
+        .expect("disk-space failure should be reported before retry");
+        assert!(
+            cancellation_notice.body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("saving paused state will retry"))
+        );
+        queue
+            .cancel_for_chat_if_generation("retry-cancelled", 0, chat_id)
+            .expect("cancellation should persist while terminal pause retries")
+            .expect("the running task should accept cancellation");
+        assert!(matches!(
+            tokio_timeout(Duration::from_secs(3), cancellation_retry)
+                .await
+                .expect("retry should observe cancellation")
+                .expect("retry task should join")
+                .expect("cancellation should finish cleanly"),
+            TerminalFailureResolution::Cancelled
+        ));
+        assert_eq!(
+            queue.get("retry-cancelled").unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
+        assert!(
+            terminal_record_for_delivery_with_retry_delay(
+                &telegram,
+                &queue,
+                "retry-cancelled",
+                0,
+                chat_id,
+                1101,
+                true,
+                CollectionFinalOutcome::Failed,
+                Duration::ZERO,
+            )
+            .await
+            .is_none()
+        );
+
+        file_provider.fail_next_write("No space left on device (os error 28)");
+        let replacement_telegram = telegram.clone();
+        let replacement_queue = Arc::clone(&queue);
+        let replacement_retry = tokio::spawn(async move {
+            persist_terminal_failure_with_retry(
+                &replacement_telegram,
+                &replacement_queue,
+                "retry-replaced",
+                0,
+                chat_id,
+                1102,
+                "Bilibili download",
+                retry_delay,
+                "worker stopped after disk exhaustion".into(),
+                None,
+                true,
+            )
+            .await
+        });
+        let replacement_notice = tokio_timeout(Duration::from_secs(3), async {
+            loop {
+                let request = requests
+                    .recv()
+                    .await
+                    .expect("fake Telegram request stream should remain open");
+                if request.method == "sendMessage" {
+                    break request;
+                }
+            }
+        })
+        .await
+        .expect("disk-space failure should be reported before retry");
+        assert!(
+            replacement_notice.body["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("saving paused state will retry"))
+        );
+        queue
+            .interrupt_with_bilibili_attempt_if_generation(
+                "retry-replaced",
+                0,
+                "paused by another current-generation action".into(),
+                None,
+            )
+            .expect("the current generation should pause")
+            .expect("the running task should remain current");
+        let resumed = queue
+            .claim_resume_for_chat_if_generation("retry-replaced", 0, chat_id, false)
+            .expect("the durable pause should resume")
+            .expect("the paused generation should advance");
+        assert_eq!(resumed.generation, 1);
+        assert_eq!(resumed.status, TaskStatus::Preparing);
+        assert!(matches!(
+            tokio_timeout(Duration::from_secs(3), replacement_retry)
+                .await
+                .expect("retry should observe the replacement generation")
+                .expect("retry task should join")
+                .expect("superseded retry should stop cleanly"),
+            TerminalFailureResolution::Superseded
+        ));
+        assert!(
+            terminal_record_for_delivery_with_retry_delay(
+                &telegram,
+                &queue,
+                "retry-replaced",
+                0,
+                chat_id,
+                1102,
+                true,
+                CollectionFinalOutcome::Failed,
+                Duration::ZERO,
+            )
+            .await
+            .is_none()
+        );
+        let current = queue.get("retry-replaced").unwrap().unwrap();
+        assert_eq!(current.generation, 1);
+        assert_eq!(current.status, TaskStatus::Preparing);
+
+        drop(queue);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
