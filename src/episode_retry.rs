@@ -39,6 +39,7 @@ pub fn classify_episode_failure_with_retry_after(
     let chain = format!("{error:#}").to_ascii_lowercase();
 
     if is_shared_executable_launch_failure(error, &chain)
+        || crate::disk_space::is_disk_space_failure(error)
         || is_shared_output_recovery_failure(&chain)
         || is_unsafe_publication_or_identity_failure(&chain)
         || is_shared_storage_failure(error, &chain)
@@ -163,6 +164,7 @@ fn is_shared_storage_failure(error: &Error, chain: &str) -> bool {
             "disk is full",
             "disk full",
             "insufficient disk space",
+            "failed to query available disk space",
             "read-only file system",
             "filesystem is read-only",
             "root permission",

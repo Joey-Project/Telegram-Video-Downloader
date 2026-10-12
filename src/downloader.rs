@@ -66,6 +66,8 @@ fn bilibili_missing_validation_semaphore() -> Arc<Semaphore> {
         .clone()
 }
 static OVERWRITE_BACKUP_COUNTER: AtomicU64 = AtomicU64::new(1);
+// Keep storage failures visible promptly even when progress updates are throttled.
+const DISK_SPACE_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 const VIDEO_STAGING_DIR_NAME: &str = ".telegram-video-downloader-staging";
 const VIDEO_STAGING_INITIALIZING_DIR_PREFIX: &str = ".initializing-job-";
 const VIDEO_STAGING_OWNER_FILE_NAME: &str = ".owner.json";
@@ -433,6 +435,7 @@ pub struct JobProgressSender {
     latest: watch::Sender<Option<JobProgress>>,
     lifecycle: mpsc::UnboundedSender<JobProgressLifecycleEvent>,
     attempt: Arc<StdMutex<Option<BilibiliAttemptSnapshot>>>,
+    include_attempt_summary: bool,
 }
 
 #[derive(Debug)]
@@ -442,6 +445,10 @@ pub struct JobProgressReceiver {
 }
 
 impl JobProgressSender {
+    fn without_attempt_summary(mut self) -> Self {
+        self.include_attempt_summary = false;
+        self
+    }
     pub fn send_modify<F>(&self, modify: F)
     where
         F: FnOnce(&mut Option<JobProgress>),
@@ -711,6 +718,7 @@ pub fn job_progress_channel() -> (JobProgressSender, JobProgressReceiver) {
             latest,
             lifecycle,
             attempt: Arc::new(StdMutex::new(None)),
+            include_attempt_summary: true,
         },
         JobProgressReceiver {
             latest: receiver,
@@ -1178,6 +1186,71 @@ impl ExpectedMediaSize {
             (known, _, false) => format!("at least {}", human_bytes(known)),
         }
     }
+}
+
+fn bilibili_planned_media_bytes(
+    plan: &bbdown_core::DownloadPlan,
+    options: &bbdown_core::DownloadOptions,
+) -> u64 {
+    bilibili_planned_media_size_estimates(plan, options).0
+}
+
+fn bilibili_download_peak_bytes(
+    plan: &bbdown_core::DownloadPlan,
+    options: &bbdown_core::DownloadOptions,
+    mux_locally: bool,
+) -> u64 {
+    let (planned_bytes, largest_entry_bytes) = bilibili_planned_media_size_estimates(plan, options);
+    if mux_locally {
+        planned_bytes.saturating_add(largest_entry_bytes)
+    } else {
+        planned_bytes
+    }
+}
+
+fn bilibili_planned_media_size_estimates(
+    plan: &bbdown_core::DownloadPlan,
+    options: &bbdown_core::DownloadOptions,
+) -> (u64, u64) {
+    let stream_bytes = |stream: &bbdown_core::MediaStream, duration: Option<u32>| {
+        stream
+            .size
+            .or_else(|| {
+                stream.bandwidth.zip(duration).map(|(bandwidth, duration)| {
+                    bandwidth.saturating_mul(u64::from(duration)).div_ceil(8)
+                })
+            })
+            .unwrap_or(0)
+    };
+    plan.entries
+        .iter()
+        .fold((0_u64, 0_u64), |(total, largest), entry| {
+            let video = bilibili_selected_video(entry, &options.stream_selection);
+            let audio = bilibili_selected_audio(entry, &options.stream_selection);
+            let bytes = match options.mode {
+                DownloadMode::All => match (video, audio) {
+                    (Some(video), Some(audio)) => {
+                        stream_bytes(video, entry.streams.duration_seconds)
+                            .saturating_add(stream_bytes(audio, entry.streams.duration_seconds))
+                    }
+                    _ => entry
+                        .streams
+                        .flv_segments
+                        .iter()
+                        .fold(0_u64, |total, segment| {
+                            total.saturating_add(segment.size.unwrap_or(0))
+                        }),
+                },
+                DownloadMode::VideoOnly => video.map_or(0, |stream| {
+                    stream_bytes(stream, entry.streams.duration_seconds)
+                }),
+                DownloadMode::AudioOnly => audio.map_or(0, |stream| {
+                    stream_bytes(stream, entry.streams.duration_seconds)
+                }),
+                _ => 0,
+            };
+            (total.saturating_add(bytes), largest.max(bytes))
+        })
 }
 
 fn bilibili_resolved_download_summary(
@@ -2214,7 +2287,14 @@ async fn resolve_bilibili_episode_group_inventory(
                     bvid: episode.bvid,
                     cid: episode.cid,
                     epid: Some(episode.epid),
-                    title: episode.title,
+                    title: episode
+                        .long_title
+                        .as_deref()
+                        .filter(|title| !title.trim().is_empty())
+                        .map(|long_title| {
+                            format!("{} {long_title}", episode.title).trim().to_string()
+                        })
+                        .unwrap_or(episode.title),
                     ..BilibiliDownloadEntry::default()
                 })
                 .collect();
@@ -3932,6 +4012,7 @@ async fn execute_bilibili_group_entry(
         expected_entry.confirmed_streams.as_ref(),
     );
     let (child_progress, child_receiver) = job_progress_channel();
+    let child_progress = child_progress.without_attempt_summary();
     let bridge = tokio::spawn(bridge_bilibili_group_child_progress(
         child_receiver,
         progress.cloned(),
@@ -4032,16 +4113,28 @@ async fn bridge_bilibili_group_child_progress(
                     continue;
                 }
                 if let Some(child) = latest.borrow_and_update().as_ref() {
-                    let message = redact_sensitive_text(&format!(
-                        "Episode {index}: {title}\n{}",
-                        child.message
-                    ));
+                    let snapshot = parent.bilibili_attempt_snapshot();
+                    let total = snapshot.as_ref().map_or(0, |snapshot| snapshot.total_entries());
+                    let position = snapshot.as_ref().and_then(|snapshot| snapshot.entries.iter().position(|entry| entry.index == index)).map_or(0, |position| position + 1);
+                    let title_prefix = format!("{index} ");
+                    let display_title = title.strip_prefix(&title_prefix).unwrap_or(&title);
+                    let episode = if display_title.trim().is_empty() || display_title.trim() == index.to_string() {
+                        format!("Current: episode {index} ({position}/{total})")
+                    } else {
+                        format!("Current: episode {index} ({position}/{total}) — {display_title}")
+                    };
+                    let media = child.resolved_summary.as_deref().map(|summary| {
+                        summary.lines().filter(|line| !line.starts_with("Entries:")).collect::<Vec<_>>().join("\n")
+                    }).filter(|summary| !summary.trim().is_empty());
+                    let message = redact_sensitive_text(&nonempty_join(vec![
+                        snapshot.as_ref().map(BilibiliAttemptSnapshot::summary).unwrap_or_default(),
+                        episode,
+                        child.message.clone(),
+                        media.map(|summary| format!("Current episode media:\n{summary}")).unwrap_or_default(),
+                    ]));
                     parent.send_replace(Some(JobProgress {
                         message,
-                        resolved_summary: child
-                            .resolved_summary
-                            .as_deref()
-                            .map(redact_sensitive_text),
+                        resolved_summary: None,
                         collection: None,
                     }));
                 }
@@ -7435,6 +7528,11 @@ pub async fn run_bilibili_worker() -> Result<()> {
         .context("failed to bind Bilibili final output root")?;
     validate_bilibili_worker_final_output_root(&final_output_root, &request)?;
     let (progress, progress_receiver) = job_progress_channel();
+    let progress = if request.expected_entry.is_some() {
+        progress.without_attempt_summary()
+    } else {
+        progress
+    };
     let progress_writer = tokio::spawn(async move {
         let mut emitted_summary = None;
         let (mut latest, mut lifecycle) = progress_receiver.into_parts();
@@ -8321,6 +8419,12 @@ async fn run_bilibili_job_locked(
         ),
     );
     let progress_reporter = BilibiliCoreProgress::new(progress.clone(), collection_progress);
+    let peak_bytes = bilibili_download_peak_bytes(&core_plan, &options, mux_locally);
+    crate::disk_space::ensure_disk_space(
+        root,
+        peak_bytes,
+        "episode download and temporary merge output",
+    )?;
     let command_started_at = SystemTime::now();
     let core_report = client
         .download_plan_with_progress(&core_plan, options, &progress_reporter)
@@ -9451,6 +9555,13 @@ async fn mux_bilibili_report_media(
         };
         let output_path = unique_bilibili_mux_output_path(&entry_dir, title, "mp4", since);
         let bound_inputs = bind_bilibili_mux_inputs(root, &media_inputs)?;
+        let merge_bytes = bound_inputs.iter().try_fold(0_u64, |total, input| {
+            input
+                .file
+                .byte_len()
+                .map(|bytes| total.saturating_add(bytes))
+        })?;
+        crate::disk_space::ensure_disk_space(root, merge_bytes, "merging the current episode")?;
         let output_reservation = ReservedMuxOutput::create(root, &output_path, &bound_inputs)?;
         let BilibiliMuxCommand {
             spec,
@@ -11479,6 +11590,17 @@ async fn run_youtube_job_locked(
     })
 }
 
+fn ensure_staged_video_publication_disk_space(root: &RootedFs, job: &JobRequest) -> Result<()> {
+    if matches!(job, JobRequest::Bilibili { .. }) {
+        crate::disk_space::ensure_disk_space(
+            root,
+            0,
+            "publishing the current episode and saving task state",
+        )?;
+    }
+    Ok(())
+}
+
 async fn run_staged_video_job(
     config: &AppConfig,
     job: &JobRequest,
@@ -11692,6 +11814,7 @@ async fn run_staged_video_job(
     staging
         .validate_for_path_access()
         .context("output root or staging directory changed during download")?;
+    ensure_staged_video_publication_disk_space(&root, job)?;
     let mut staged_files = collect_regular_files(&staging_dir)?
         .into_iter()
         .filter(|path| !is_staging_support_file(&staging_dir, path))
@@ -14049,7 +14172,7 @@ async fn run_command_with_execution_context_and_additional_fds(
     spec: &CommandSpec,
     bound_cwd: Option<&BoundDirectory>,
     inherited_files: &[BoundFile],
-    mut additional_inherited_fds: Vec<AdditionalInheritedCommandFd>,
+    additional_inherited_fds: Vec<AdditionalInheritedCommandFd>,
     progress: Option<JobProgressSender>,
     policy: CommandExecutionPolicy,
 ) -> Result<CommandOutput> {
@@ -14061,7 +14184,15 @@ async fn run_command_with_execution_context_and_additional_fds(
             .context("refused to run Bilibili mux outside its owned worker process group")?;
     }
     let _cleanup = CommandCleanup::new(spec.cleanup_paths.clone());
-    let mut file_activity = match &spec.activity_dir {
+    let disk_space_root = if command_progress_name(spec) == "BBDown-rust" {
+        spec.activity_dir
+            .as_deref()
+            .map(RootedFs::new)
+            .transpose()?
+    } else {
+        None
+    };
+    let file_activity = match &spec.activity_dir {
         Some(activity_dir) => match FileActivityTracker::new(activity_dir).await {
             Ok(tracker) => Some(tracker),
             Err(err) => {
@@ -14079,6 +14210,44 @@ async fn run_command_with_execution_context_and_additional_fds(
             None
         }
     };
+
+    run_command_with_execution_context_and_additional_fds_and_monitors(
+        config,
+        spec,
+        bound_cwd,
+        inherited_files,
+        additional_inherited_fds,
+        CommandExecutionOptions {
+            progress,
+            policy,
+            disk_space_root,
+            file_activity,
+        },
+    )
+    .await
+}
+
+struct CommandExecutionOptions {
+    progress: Option<JobProgressSender>,
+    policy: CommandExecutionPolicy,
+    disk_space_root: Option<RootedFs>,
+    file_activity: Option<FileActivityTracker>,
+}
+
+async fn run_command_with_execution_context_and_additional_fds_and_monitors(
+    config: &AppConfig,
+    spec: &CommandSpec,
+    bound_cwd: Option<&BoundDirectory>,
+    inherited_files: &[BoundFile],
+    mut additional_inherited_fds: Vec<AdditionalInheritedCommandFd>,
+    options: CommandExecutionOptions,
+) -> Result<CommandOutput> {
+    let CommandExecutionOptions {
+        progress,
+        policy,
+        disk_space_root,
+        mut file_activity,
+    } = options;
 
     #[cfg(unix)]
     let descendant_fence = if policy.descendant_fence {
@@ -14209,6 +14378,7 @@ async fn run_command_with_execution_context_and_additional_fds(
         progress_interval
     };
     let mut next_activity_poll = started_at + activity_poll_interval;
+    let mut next_disk_space_check = started_at + DISK_SPACE_MONITOR_INTERVAL;
     let mut progress_tracker =
         ProgressTracker::new(command_progress_name(spec), progress_interval, progress);
 
@@ -14262,24 +14432,36 @@ async fn run_command_with_execution_context_and_additional_fds(
                     summarize_output(&String::from_utf8_lossy(&stdout), &String::from_utf8_lossy(&stderr))
                 );
             }
+            _ = sleep_until(next_disk_space_check), if disk_space_root.is_some() => {
+                next_disk_space_check = Instant::now() + DISK_SPACE_MONITOR_INTERVAL;
+                if let Some(root) = disk_space_root.as_ref()
+                    && let Err(error) = crate::disk_space::ensure_disk_space(root, 0, "downloading or merging the current episode")
+                {
+                    terminate_command_tree(&mut child, process_group).await;
+                    let _ = collect_stream_outputs(stdout_handle, stderr_handle, descendant_fence_handle, process_group).await;
+                    process_group_guard.disarm();
+                    return Err(error);
+                }
+            }
             _ = sleep_until(next_activity_poll), if file_activity.is_some() => {
                 next_activity_poll = Instant::now() + activity_poll_interval;
-                let tracker = file_activity.as_mut().expect("guarded by is_some");
-                match tracker.poll().await {
-                    Ok(report) => {
-                        if report.changed_since_previous_poll {
-                            last_activity_at = Instant::now();
+                if let Some(tracker) = file_activity.as_mut() {
+                    match tracker.poll().await {
+                        Ok(report) => {
+                            if report.changed_since_previous_poll {
+                                last_activity_at = Instant::now();
+                            }
+                            progress_tracker.emit_file_activity(report);
                         }
-                        progress_tracker.emit_file_activity(report);
-                    }
-                    Err(err) => {
-                        info!(
-                            command = %spec.program.display(),
-                            activity_dir = %tracker.root.display(),
-                            error = %err,
-                            "file activity tracking stopped"
-                        );
-                        file_activity = None;
+                        Err(err) => {
+                            info!(
+                                command = %spec.program.display(),
+                                activity_dir = %tracker.root.display(),
+                                error = %err,
+                                "file activity tracking stopped"
+                            );
+                            file_activity = None;
+                        }
                     }
                 }
             }
@@ -15423,22 +15605,43 @@ impl ProgressTracker {
     }
 
     fn current_message(&self) -> String {
-        let mut lines = vec![
-            format!("{}: {}", self.command_name, self.stage.label()),
-            format!("Done: {}", self.stage.done_label()),
-            format!("Todo: {}", self.stage.todo_label()),
-        ];
+        let mut lines = if self.command_name == "BBDown-rust" {
+            vec![format!("Stage: {}", self.stage.label())]
+        } else {
+            vec![
+                format!("{}: {}", self.command_name, self.stage.label()),
+                format!("Done: {}", self.stage.done_label()),
+                format!("Todo: {}", self.stage.todo_label()),
+            ]
+        };
 
         if let Some(report) = self.last_file_activity {
+            let files_label = if self.command_name == "BBDown-rust" {
+                "Temporary file activity"
+            } else {
+                "Files"
+            };
             lines.push(format!(
-                "Files: {} changed, {} written",
+                "{files_label}: {} changed, {} written",
                 report.changed_file_count,
                 human_bytes(report.changed_size)
             ));
-            lines.push(format!(
-                "Speed: {}",
-                human_rate(report.speed_bytes_per_second)
-            ));
+            if self.command_name != "BBDown-rust"
+                || !matches!(
+                    self.stage,
+                    ProgressStage::Merging | ProgressStage::Finalizing
+                )
+            {
+                let rate_label = if self.command_name == "BBDown-rust" {
+                    "Write activity"
+                } else {
+                    "Speed"
+                };
+                lines.push(format!(
+                    "{rate_label}: {}",
+                    human_rate(report.speed_bytes_per_second)
+                ));
+            }
             lines.push(format!(
                 "Elapsed: {}",
                 format_duration_compact(report.elapsed)
@@ -15450,13 +15653,16 @@ impl ProgressTracker {
             lines.push(format!("Last file change: {last_change}"));
         }
 
-        if let Some(output) = &self.last_output {
+        if self.command_name != "BBDown-rust"
+            && let Some(output) = &self.last_output
+        {
             lines.push(format!("Last output: {output}"));
         }
 
         if let Some(snapshot) = self
             .progress
             .as_ref()
+            .filter(|sender| sender.include_attempt_summary)
             .and_then(JobProgressSender::bilibili_attempt_snapshot)
         {
             lines.insert(0, snapshot.summary());
@@ -15520,7 +15726,32 @@ fn summarize_progress_chunk(
 
 fn normalize_terminal_text(text: &str) -> String {
     let mut normalized = String::with_capacity(text.len());
-    for ch in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for code in chars.by_ref() {
+                        if ('@'..='~').contains(&code) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(code) = chars.next() {
+                        if code == '\u{7}' {
+                            break;
+                        }
+                        if code == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
         if ch == '\r' || ch == '\n' {
             normalized.push('\n');
         } else if ch.is_control() {
@@ -24640,8 +24871,161 @@ mod tests {
         );
         let latest = parent.borrow();
         let latest = latest.as_ref().expect("child progress should be bridged");
-        assert!(latest.message.starts_with("Episode 10: Episode 10"));
+        assert!(
+            latest
+                .message
+                .contains("Current: episode 10 (1/1) — Episode 10")
+        );
+        assert!(latest.message.contains("Episodes: 1"));
+        assert!(
+            latest
+                .message
+                .contains("Completed: 0; already present: 0; remaining: 1")
+        );
         assert_eq!(latest.collection, None);
+        assert_eq!(latest.resolved_summary, None);
+    }
+
+    #[tokio::test]
+    async fn grouped_child_progress_preserves_season_counts_during_episode_mux() {
+        let (parent, _receiver) = job_progress_channel();
+        let mut snapshot = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            (1..=203).map(|index| (index, index.to_string(), Some(format!("ep-{index}")))),
+            0,
+        );
+        for index in 1..=3 {
+            snapshot.entry_verified(index);
+        }
+        snapshot.entry_started(4);
+        parent.send_lifecycle(JobProgressLifecycleEvent::BilibiliAttempt { snapshot });
+        let (child, receiver) = job_progress_channel();
+        let child = child.without_attempt_summary();
+        let bridge = tokio::spawn(bridge_bilibili_group_child_progress(
+            receiver,
+            Some(parent.clone()),
+            4,
+            "4".into(),
+            "ep-4".into(),
+            "profile".into(),
+        ));
+        child.send_lifecycle(JobProgressLifecycleEvent::BilibiliAttempt {
+            snapshot: BilibiliAttemptSnapshot::new("Season".into(), [(4, "4".into())], 0),
+        });
+        let mut tracker = ProgressTracker::new(
+            "BBDown-rust".into(),
+            Duration::from_secs(1),
+            Some(child.clone()),
+        );
+        tracker.observe(CommandStream::Stdout, b"muxing media\n");
+        child.send_modify(|latest| {
+            latest.as_mut().unwrap().resolved_summary =
+                Some("Entries: 1 entry\nEstimated media: 454.2 MiB".into());
+        });
+        drop(tracker);
+        drop(child);
+        bridge.await.unwrap();
+        let latest = parent.borrow();
+        let message = &latest.as_ref().unwrap().message;
+        assert!(message.contains("Episodes: 203"));
+        assert!(message.contains("Completed: 3; already present: 0; remaining: 200"));
+        assert!(message.contains("Failed: 0; in progress: 1; waiting: 199; paused: 0"));
+        assert!(message.contains("Current: episode 4 (4/203)"));
+        assert!(message.contains("Stage: muxing media"));
+        assert!(!message.contains("Entries: 1 entry"));
+        assert!(!message.contains("Selected: 1"));
+        assert!(!message.contains("Episode 4: 4"));
+    }
+
+    #[test]
+    fn terminal_normalization_strips_color_and_hyperlink_sequences() {
+        assert_eq!(
+            normalize_terminal_text("\x1b[2m2026-10-11\x1b[0m \x1b[32mINFO\x1b[0m\r\n"),
+            "2026-10-11 INFO\n\n"
+        );
+        assert_eq!(
+            normalize_terminal_text("\x1b]8;;https://example.test\x1b\\title\x1b]8;;\x1b\\"),
+            "title"
+        );
+        let (sender, _) = job_progress_channel();
+        let mut tracker =
+            ProgressTracker::new("BBDown-rust".into(), Duration::from_secs(1), Some(sender));
+        tracker.observe(
+            CommandStream::Stdout,
+            b"\x1b[32mINFO\x1b[0m telegram_video_downloader::downloader: command progress\n",
+        );
+        assert!(!tracker.current_message().contains("Last output:"));
+        assert!(!tracker.current_message().contains("[32m"));
+    }
+
+    #[test]
+    fn episode_space_estimate_counts_only_selected_media_and_bounds_unknown_sizes() {
+        let plan = test_bilibili_plan(vec![test_bilibili_entry(
+            1,
+            Some(3 * 1024 * 1024),
+            Some(1024 * 1024),
+        )]);
+        let mut options = bbdown_core::DownloadOptions::new("downloads");
+        assert_eq!(
+            bilibili_planned_media_bytes(&plan, &options),
+            4 * 1024 * 1024
+        );
+        assert_eq!(
+            bilibili_download_peak_bytes(&plan, &options, true),
+            8 * 1024 * 1024
+        );
+        assert_eq!(
+            bilibili_download_peak_bytes(&plan, &options, false),
+            4 * 1024 * 1024
+        );
+        options.mode = DownloadMode::VideoOnly;
+        assert_eq!(
+            bilibili_planned_media_bytes(&plan, &options),
+            3 * 1024 * 1024
+        );
+        options.mode = DownloadMode::AudioOnly;
+        assert_eq!(bilibili_planned_media_bytes(&plan, &options), 1024 * 1024);
+        options.mode = DownloadMode::DanmakuOnly;
+        assert_eq!(bilibili_planned_media_bytes(&plan, &options), 0);
+        let unknown = test_bilibili_plan(vec![test_bilibili_entry(1, None, None)]);
+        options.mode = DownloadMode::All;
+        assert_eq!(
+            bilibili_planned_media_bytes(&unknown, &options),
+            (4_000_000 + 128_000) * 60 / 8
+        );
+        let huge = test_bilibili_plan(vec![test_bilibili_entry(1, Some(u64::MAX), Some(1))]);
+        assert_eq!(bilibili_planned_media_bytes(&huge, &options), u64::MAX);
+        assert_eq!(
+            bilibili_download_peak_bytes(&huge, &options, true),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn local_mux_peak_adds_only_the_largest_entry_to_planned_inputs() {
+        const MIB: u64 = 1024 * 1024;
+        const SPACE_RESERVE_BYTES: u64 = 256 * MIB;
+
+        let plan = test_bilibili_plan(vec![
+            test_bilibili_entry(1, Some(60 * MIB), Some(10 * MIB)),
+            test_bilibili_entry(2, Some(20 * MIB), Some(10 * MIB)),
+        ]);
+        let mut options = bbdown_core::DownloadOptions::new("downloads");
+        options.mode = DownloadMode::All;
+
+        let planned_bytes = bilibili_planned_media_bytes(&plan, &options);
+        let peak_bytes = bilibili_download_peak_bytes(&plan, &options, true);
+        let old_double_count_peak = planned_bytes.saturating_mul(2);
+        let simulated_available_bytes = 430 * MIB;
+
+        assert_eq!(planned_bytes, 100 * MIB);
+        assert_eq!(peak_bytes, 170 * MIB);
+        assert_eq!(
+            bilibili_download_peak_bytes(&plan, &options, false),
+            planned_bytes
+        );
+        assert!(simulated_available_bytes >= SPACE_RESERVE_BYTES + peak_bytes);
+        assert!(simulated_available_bytes < SPACE_RESERVE_BYTES + old_double_count_peak);
     }
 
     #[test]
@@ -34816,6 +35200,32 @@ mv video.original video.m4s || exit 46
     }
 
     #[test]
+    fn staged_video_publication_space_guard_is_bilibili_only() {
+        let output_dir = temp_test_dir("staged-publication-space-guard");
+        let root = RootedFs::new(&output_dir).expect("output root should bind");
+        fs::remove_dir_all(&output_dir).expect("output root should become unavailable");
+
+        ensure_staged_video_publication_disk_space(
+            &root,
+            &JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=example".to_string(),
+            },
+        )
+        .expect("YouTube publication should not require the Bilibili space reserve");
+
+        let error = ensure_staged_video_publication_disk_space(
+            &root,
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV1xx411c7mD".to_string(),
+                selection: None,
+            },
+        )
+        .expect_err("Bilibili publication should retain its capacity check");
+        assert!(format!("{error:#}").contains("failed to query available disk space"));
+        let _ = fs::remove_dir_all(output_dir);
+    }
+
+    #[test]
     fn throttles_percent_progress_updates() {
         let (tx, mut rx) = job_progress_channel();
         let mut tracker =
@@ -35441,6 +35851,78 @@ mv video.original video.m4s || exit 46
                 .any(|message| message.contains("Last file change:"))
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disk_space_monitor_continues_when_file_activity_is_absent() {
+        let parent = temp_test_dir("disk-space-without-file-activity");
+        let output_dir = parent.join("output");
+        let moved_output_dir = parent.join("moved-output");
+        fs::create_dir_all(&output_dir).expect("output directory should create");
+        let disk_space_root =
+            RootedFs::new(&output_dir).expect("disk-space root should bind before command");
+
+        let mut config = test_config();
+        config.bot.command_timeout_seconds = 10;
+        config.bot.command_idle_timeout_seconds = 10;
+        config.bot.progress_update_seconds = 600;
+        let spec = CommandSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "mv \"$1\" \"$2\"; sleep 5".to_string(),
+                "disk-space-test".to_string(),
+                output_dir.display().to_string(),
+                moved_output_dir.display().to_string(),
+            ],
+            cwd: parent.clone(),
+            activity_dir: None,
+            cleanup_paths: Vec::new(),
+            inherited_fd_base: None,
+        };
+
+        let started_at = Instant::now();
+        let error = tokio_timeout(
+            Duration::from_secs(8),
+            run_command_with_execution_context_and_additional_fds_and_monitors(
+                &config,
+                &spec,
+                None,
+                &[],
+                Vec::new(),
+                CommandExecutionOptions {
+                    progress: None,
+                    policy: CommandExecutionPolicy::BILIBILI_WORKER,
+                    disk_space_root: Some(disk_space_root),
+                    file_activity: None,
+                },
+            ),
+        )
+        .await
+        .expect("disk-space monitoring should not hang")
+        .expect_err("capacity monitoring should stop the command after its root is moved");
+        let elapsed = started_at.elapsed();
+
+        let message = format!("{error:#}");
+        let _ = fs::remove_dir_all(&moved_output_dir);
+        let _ = fs::remove_dir_all(parent);
+        assert!(
+            message.contains("failed to query available disk space"),
+            "{message}"
+        );
+        assert!(
+            message.contains("failed to re-open output root"),
+            "{message}"
+        );
+        assert!(
+            message.contains("No such file or directory (os error 2)"),
+            "{message}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "capacity monitoring should terminate the still-running child, elapsed {elapsed:?}"
+        );
     }
 
     #[cfg(unix)]

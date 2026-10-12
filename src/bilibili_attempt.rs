@@ -634,18 +634,48 @@ impl BilibiliAttemptSnapshot {
 
     pub fn summary(&self) -> String {
         let count = |state| self.count(state);
-        let mut output = format!(
-            "{}\nSelected: {}; skipped/already present: {}\nDownloaded pending mux/publication/verification: {}; verified: {}\nFailed: {}; not started: {}; interrupted: {}; running: {}",
-            truncate_text(&single_line(&self.title), 240),
-            self.total_entries(),
-            self.skipped_entries,
-            self.downloaded_entries(),
-            count(BilibiliAttemptEntryState::Verified),
-            count(BilibiliAttemptEntryState::Failed),
-            count(BilibiliAttemptEntryState::Pending),
-            count(BilibiliAttemptEntryState::Interrupted),
-            count(BilibiliAttemptEntryState::Downloading),
-        );
+        let mut output = if self.independent_entries {
+            let verified = count(BilibiliAttemptEntryState::Verified);
+            let completed = self
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.state == BilibiliAttemptEntryState::Verified && !entry.already_present
+                })
+                .count();
+            let mut summary = format!(
+                "{}\nEpisodes: {}\nCompleted: {}; already present: {}; remaining: {}\nFailed: {}; in progress: {}; waiting: {}; paused: {}",
+                truncate_text(&single_line(&self.title), 240),
+                self.total_entries(),
+                completed,
+                self.skipped_entries,
+                self.total_entries().saturating_sub(verified),
+                count(BilibiliAttemptEntryState::Failed),
+                count(BilibiliAttemptEntryState::Downloading) + self.downloaded_entries(),
+                count(BilibiliAttemptEntryState::Pending),
+                count(BilibiliAttemptEntryState::Interrupted)
+            );
+            if self.downloaded_entries() > 0 {
+                summary.push_str(&format!(
+                    "\nAwaiting merge, publication or verification: {}",
+                    self.downloaded_entries()
+                ));
+            }
+            summary
+        } else {
+            format!(
+                "{}\nSelected: {}; skipped/already present: {}\nDownloaded pending mux/publication/verification: {}; verified: {}\nFailed: {}; not started: {}; interrupted: {}; running: {}",
+                truncate_text(&single_line(&self.title), 240),
+                self.total_entries(),
+                self.skipped_entries,
+                self.downloaded_entries(),
+                count(BilibiliAttemptEntryState::Verified),
+                count(BilibiliAttemptEntryState::Failed),
+                count(BilibiliAttemptEntryState::Pending),
+                count(BilibiliAttemptEntryState::Interrupted),
+                count(BilibiliAttemptEntryState::Downloading),
+            )
+        };
         if let Some(outcome) = self.outcome {
             let label = match outcome {
                 BilibiliAttemptOutcome::Failed => "failed",
@@ -827,6 +857,30 @@ fn append_bounded(output: &mut String, addition: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independent_summary_distinguishes_completed_existing_and_unfinished_episodes() {
+        let mut snapshot = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            (1..=6).map(|index| {
+                (
+                    index,
+                    format!("Episode {index}"),
+                    Some(format!("ep-{index}")),
+                )
+            }),
+            0,
+        );
+        snapshot.entry_verified(1);
+        snapshot.entry_already_present_with_outputs(2, Vec::new(), BTreeMap::new());
+        snapshot.entry_started(3);
+        snapshot.entry_failed_with_error(4, 3, "HTTP 403".into());
+        let summary = snapshot.summary();
+        assert!(summary.contains("Episodes: 6"));
+        assert!(summary.contains("Completed: 1; already present: 1; remaining: 4"));
+        assert!(summary.contains("Failed: 1; in progress: 1; waiting: 2; paused: 0"));
+        assert!(summary.contains("Failed episodes: 4"));
+    }
 
     fn snapshot(indices: impl IntoIterator<Item = u32>) -> BilibiliAttemptSnapshot {
         BilibiliAttemptSnapshot::new(
