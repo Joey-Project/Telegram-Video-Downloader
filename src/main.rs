@@ -40,15 +40,16 @@ use crate::bilibili_attempt::{
 use crate::config::AppConfig;
 use crate::downloader::{
     BilibiliCollectionEntryProgress, BilibiliCollectionEntryStatus, BilibiliCollectionManifest,
-    BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, JobProgress,
-    JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, JobReport, VideoDuplicate,
-    VideoDuplicateAction, VideoDuplicateCheck, existing_bilibili_report_media_identities,
-    find_video_duplicate_with_probe_and_progress, human_bytes, inspect_job_display_metadata,
-    inspect_job_plan_with_progress, is_bilibili_episode_group, job_progress_channel,
-    recover_pending_overwrite_transactions, run_bilibili_episode_group, run_bilibili_worker,
-    run_job, run_job_with_duplicate_action, run_video_job_staged_keep_both,
-    run_video_job_staged_keep_both_with_plan, sync_bilibili_rust_credentials,
-    validate_bilibili_report_media_hashes, validate_existing_bilibili_report_for_completion,
+    BilibiliCollectionManifestEntry, BilibiliCollectionProgressSnapshot, BilibiliPlanningContext,
+    JobProgress, JobProgressLifecycleEvent, JobProgressReceiver, JobProgressSender, JobReport,
+    VideoDuplicate, VideoDuplicateAction, VideoDuplicateCheck,
+    existing_bilibili_report_media_identities, find_video_duplicate_with_probe_and_progress,
+    human_bytes, inspect_job_display_metadata, inspect_job_plan_with_progress_and_context,
+    is_bilibili_episode_group, job_progress_channel, recover_pending_overwrite_transactions,
+    run_bilibili_episode_group, run_bilibili_worker, run_job, run_job_with_duplicate_action,
+    run_video_job_staged_keep_both, run_video_job_staged_keep_both_with_plan,
+    sync_bilibili_rust_credentials, validate_bilibili_report_media_hashes,
+    validate_existing_bilibili_report_for_completion,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 #[cfg(test)]
@@ -4237,7 +4238,14 @@ async fn inspect_and_preserve_job_plan(
     job: &JobRequest,
     progress: Option<JobProgressSender>,
 ) -> Result<PlanValidationSnapshot> {
-    let result = inspect_job_plan_with_progress(config, job, progress).await;
+    let task =
+        task_if_generation_with_retry_delay(queue, task_id, generation, Duration::from_secs(1))
+            .await?
+            .context("task generation changed before download planning")?;
+    let planning_context = bilibili_planning_context_for_task(&task);
+    let result =
+        inspect_job_plan_with_progress_and_context(config, job, progress, Some(planning_context))
+            .await;
     preserve_job_plan_result(
         queue,
         task_id,
@@ -4246,6 +4254,32 @@ async fn inspect_and_preserve_job_plan(
         inspect_job_display_metadata(config, job),
     )
     .await
+}
+
+fn bilibili_planning_context_for_task(task: &TaskRecord) -> BilibiliPlanningContext {
+    let forced_redownload_ids = task
+        .bilibili_attempt
+        .as_ref()
+        .filter(|attempt| attempt.independent_entries)
+        .map(|attempt| {
+            attempt
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.requires_redownload
+                        && attempt
+                            .retry_indices
+                            .as_ref()
+                            .is_none_or(|scope| scope.contains(&entry.index))
+                })
+                .map(|entry| entry.stable_media_id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    BilibiliPlanningContext {
+        previous_plan: task.plan.clone(),
+        forced_redownload_ids,
+    }
 }
 
 async fn preserve_job_plan_result(
@@ -11194,6 +11228,63 @@ mod tests {
         assert_eq!(
             queue_plan_size(&overflow),
             ("unknown".to_string(), "unknown".to_string())
+        );
+    }
+
+    #[test]
+    fn resume_planning_context_uses_accepted_plan_and_scoped_redownload_markers() {
+        let mut task = TaskRecord::new(
+            "resume-planning-context".into(),
+            1,
+            2,
+            123_456_789,
+            None,
+            0,
+            JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/media/md1376".into(),
+                selection: Some(BilibiliSelection::Missing),
+            },
+        );
+        task.plan = Some(PlanValidationSnapshot {
+            stable_media_ids: vec!["episode:1".into()],
+            media_profile: Some("accepted".into()),
+            ..PlanValidationSnapshot::default()
+        });
+        task.proposed_plan = Some(PlanValidationSnapshot {
+            media_profile: Some("unaccepted".into()),
+            ..PlanValidationSnapshot::default()
+        });
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            [1, 2, 3].map(|index| {
+                (
+                    index,
+                    format!("Episode {index}"),
+                    Some(format!("episode:{index}")),
+                )
+            }),
+            0,
+        );
+        attempt.entries[0].requires_redownload = true;
+        attempt.entries[1].requires_redownload = true;
+        task.bilibili_attempt = Some(attempt);
+        let all = bilibili_planning_context_for_task(&task);
+        assert_eq!(all.previous_plan, task.plan);
+        assert_eq!(
+            all.forced_redownload_ids,
+            ["episode:1".into(), "episode:2".into()].into()
+        );
+
+        task.bilibili_attempt.as_mut().unwrap().retry_indices = Some(vec![2]);
+        let scoped = bilibili_planning_context_for_task(&task);
+        assert_eq!(scoped.forced_redownload_ids, ["episode:2".into()].into());
+        assert!(task.bilibili_attempt.as_ref().unwrap().entries[0].requires_redownload);
+
+        task.bilibili_attempt.as_mut().unwrap().independent_entries = false;
+        assert!(
+            bilibili_planning_context_for_task(&task)
+                .forced_redownload_ids
+                .is_empty()
         );
     }
 
