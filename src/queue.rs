@@ -205,15 +205,35 @@ impl PlanValidationSnapshot {
     }
 
     fn media_requirements_match_for(&self, current: &Self, stable_media_id: &str) -> bool {
-        self.bilibili_resolved_stream_ids
+        let previous_streams_resolved = self
+            .bilibili_resolved_stream_ids
             .iter()
-            .any(|id| id == stable_media_id)
-            == current
-                .bilibili_resolved_stream_ids
+            .any(|id| id == stable_media_id);
+        let current_streams_resolved = current
+            .bilibili_resolved_stream_ids
+            .iter()
+            .any(|id| id == stable_media_id);
+        let previous_has_stream_evidence = self
+            .selected_format_ids
+            .iter()
+            .any(|value| has_media_id_prefix(value, stable_media_id))
+            || self
+                .exact_sizes
                 .iter()
-                .any(|id| id == stable_media_id)
-            && self.media_profile == current.media_profile
-            && self
+                .any(|value| has_media_id_prefix(&value.subject, stable_media_id))
+            || self
+                .resolution_codecs
+                .iter()
+                .any(|value| has_media_id_prefix(value, stable_media_id));
+        let newly_resolved_without_old_evidence =
+            !previous_streams_resolved && current_streams_resolved && !previous_has_stream_evidence;
+
+        // A newly completed probe can add per-ID fields to a plan that had no stream evidence.
+        // Ignore only those newly discovered fields in that case. Legacy plans with known
+        // format, size, or codec evidence still compare every persisted field, and losing a
+        // previously completed probe remains incompatible with reusing its receipt.
+        let stream_details_match = newly_resolved_without_old_evidence
+            || (self
                 .selected_format_ids
                 .iter()
                 .filter(|value| has_media_id_prefix(value, stable_media_id))
@@ -221,22 +241,26 @@ impl PlanValidationSnapshot {
                     .selected_format_ids
                     .iter()
                     .filter(|value| has_media_id_prefix(value, stable_media_id)))
-            && self
-                .exact_sizes
-                .iter()
-                .filter(|value| has_media_id_prefix(&value.subject, stable_media_id))
-                .eq(current
+                && self
                     .exact_sizes
                     .iter()
-                    .filter(|value| has_media_id_prefix(&value.subject, stable_media_id)))
-            && self
-                .resolution_codecs
-                .iter()
-                .filter(|value| has_media_id_prefix(value, stable_media_id))
-                .eq(current
+                    .filter(|value| has_media_id_prefix(&value.subject, stable_media_id))
+                    .eq(current
+                        .exact_sizes
+                        .iter()
+                        .filter(|value| has_media_id_prefix(&value.subject, stable_media_id)))
+                && self
                     .resolution_codecs
                     .iter()
-                    .filter(|value| has_media_id_prefix(value, stable_media_id)))
+                    .filter(|value| has_media_id_prefix(value, stable_media_id))
+                    .eq(current
+                        .resolution_codecs
+                        .iter()
+                        .filter(|value| has_media_id_prefix(value, stable_media_id))));
+
+        (!previous_streams_resolved || current_streams_resolved)
+            && self.media_profile == current.media_profile
+            && stream_details_match
     }
 }
 
@@ -4177,6 +4201,208 @@ mod tests {
             original.blocking_differences(&renumbered),
             vec!["episode numbering"]
         );
+    }
+
+    #[test]
+    fn newly_resolved_streams_preserve_receipts_only_when_known_requirements_match() {
+        let unknown = grouped_plan(
+            "Season",
+            Some("mode=all;quality=high"),
+            &[(1, "Episode A", "media-a")],
+        );
+        let mut newly_resolved = unknown.clone();
+        newly_resolved.bilibili_resolved_stream_ids = vec!["media-a".into()];
+        newly_resolved.selected_format_ids = vec!["media-a:format-720".into()];
+        newly_resolved.exact_sizes = vec![PlanSize {
+            subject: "media-a:primary".into(),
+            bytes: 1_024,
+            provenance: "probe".into(),
+        }];
+        newly_resolved.resolution_codecs = vec!["media-a:1080p:h264".into()];
+        assert!(unknown.media_requirements_match_for(&newly_resolved, "media-a"));
+
+        let mut no_longer_resolved = newly_resolved.clone();
+        no_longer_resolved.bilibili_resolved_stream_ids.clear();
+        assert!(!newly_resolved.media_requirements_match_for(&no_longer_resolved, "media-a"));
+
+        // Older plans could persist media requirements before recording probe completion.
+        let mut legacy = unknown;
+        legacy.selected_format_ids = vec!["media-a:format-720".into()];
+        legacy.exact_sizes = vec![PlanSize {
+            subject: "media-a:primary".into(),
+            bytes: 1_024,
+            provenance: "probe".into(),
+        }];
+        legacy.resolution_codecs = vec!["media-a:1080p:h264".into()];
+
+        let mut legacy_resolved = legacy.clone();
+        legacy_resolved.bilibili_resolved_stream_ids = vec!["media-a".into()];
+        assert!(legacy.media_requirements_match_for(&legacy_resolved, "media-a"));
+
+        let mut changed_format = legacy_resolved.clone();
+        changed_format.selected_format_ids = vec!["media-a:format-1080".into()];
+        assert!(!legacy.media_requirements_match_for(&changed_format, "media-a"));
+
+        let mut changed_size = legacy_resolved.clone();
+        changed_size.exact_sizes[0].bytes += 1;
+        assert!(!legacy.media_requirements_match_for(&changed_size, "media-a"));
+
+        let mut changed_codec = legacy_resolved;
+        changed_codec.resolution_codecs = vec!["media-a:1080p:av1".into()];
+        assert!(!legacy.media_requirements_match_for(&changed_codec, "media-a"));
+    }
+
+    #[test]
+    fn accepting_newly_resolved_streams_preserves_compatible_receipts_and_counts() {
+        let directory = temp_queue_root("grouped-newly-resolved-reconcile");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).unwrap();
+        let mut task = bilibili_task("grouped-newly-resolved-reconcile");
+        task.status = TaskStatus::Running;
+        queue.create(task.clone()).unwrap();
+
+        let profile = "mode=all;quality=high";
+        let entries = [
+            (1, "Episode A", "media-a"),
+            (2, "Episode B", "media-b"),
+            (3, "Episode C", "media-c"),
+        ];
+        let old_plan = grouped_plan("Season", Some(profile), &entries);
+        queue
+            .set_plan_if_generation(&task.id, 0, old_plan.clone())
+            .unwrap()
+            .unwrap();
+
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            "Season".into(),
+            entries
+                .iter()
+                .map(|(index, title, id)| (*index, (*title).into(), Some((*id).into()))),
+            0,
+        );
+        attempt.media_profile = Some(profile.into());
+        let downloaded_path = config.downloads.video_dir.join("episode-a.mp4");
+        let already_present_path = config.downloads.video_dir.join("episode-b.mp4");
+        let downloaded_hash = "a".repeat(64);
+        let already_present_hash = "b".repeat(64);
+        attempt.entry_verified_with_outputs(
+            1,
+            vec![downloaded_path.clone()],
+            BTreeMap::from([(
+                downloaded_path.display().to_string(),
+                downloaded_hash.clone(),
+            )]),
+        );
+        attempt.entry_already_present_with_outputs(
+            2,
+            vec![already_present_path.clone()],
+            BTreeMap::from([(
+                already_present_path.display().to_string(),
+                already_present_hash.clone(),
+            )]),
+        );
+        attempt.entries[2].requires_redownload = true;
+        queue
+            .set_bilibili_attempt_if_generation(&task.id, 0, attempt)
+            .unwrap()
+            .unwrap();
+
+        let mut proposed = old_plan;
+        proposed.bilibili_resolved_stream_ids =
+            entries.iter().map(|(_, _, id)| (*id).into()).collect();
+        proposed.selected_format_ids = entries
+            .iter()
+            .map(|(_, _, id)| format!("{id}:format-720"))
+            .collect();
+        proposed.exact_sizes = entries
+            .iter()
+            .map(|(_, _, id)| PlanSize {
+                subject: format!("{id}:primary"),
+                bytes: 1_024,
+                provenance: "probe".into(),
+            })
+            .collect();
+        proposed.resolution_codecs = entries
+            .iter()
+            .map(|(_, _, id)| format!("{id}:1080p:h264"))
+            .collect();
+        let differences = queue
+            .set_plan_if_generation(&task.id, 0, proposed)
+            .unwrap()
+            .unwrap()
+            .1;
+        assert_eq!(
+            differences,
+            vec![
+                "resolved stream availability",
+                "selected format",
+                "exact size",
+                "media properties"
+            ]
+        );
+
+        let accepted = queue
+            .accept_proposed_plan_for_chat_if_generation(&task.id, 0, task.chat_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.media_entries_total, 3);
+        assert_eq!(accepted.media_entries_completed, 2);
+        assert_eq!(accepted.media_entries_failed, 0);
+        let snapshot = accepted.bilibili_attempt.unwrap();
+        assert_eq!(snapshot.skipped_entries, 1);
+        assert_eq!(
+            snapshot.entries[0].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert!(!snapshot.entries[0].already_present);
+        assert_eq!(
+            snapshot.entries[0]
+                .published_media_hashes
+                .get(&downloaded_path.display().to_string()),
+            Some(&downloaded_hash)
+        );
+        assert_eq!(
+            snapshot.entries[0].published_media_paths,
+            vec![downloaded_path]
+        );
+        assert_eq!(
+            snapshot.entries[1].state,
+            BilibiliAttemptEntryState::Verified
+        );
+        assert!(snapshot.entries[1].already_present);
+        assert_eq!(
+            snapshot.entries[1]
+                .published_media_hashes
+                .get(&already_present_path.display().to_string()),
+            Some(&already_present_hash)
+        );
+        assert_eq!(
+            snapshot.entries[1].published_media_paths,
+            vec![already_present_path]
+        );
+        assert_eq!(
+            snapshot.entries[2].state,
+            BilibiliAttemptEntryState::Pending
+        );
+        assert!(snapshot.entries[2].requires_redownload);
+
+        let verified = queue
+            .update_bilibili_attempt_if_generation(
+                &task.id,
+                0,
+                3,
+                &BilibiliAttemptUpdate::Verified {
+                    media_paths: vec![config.downloads.video_dir.join("episode-c.mp4")],
+                    hashes: BTreeMap::new(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let verified_snapshot = verified.bilibili_attempt.unwrap();
+        assert_eq!(verified.media_entries_completed, 3);
+        assert!(!verified_snapshot.entries[2].requires_redownload);
+        drop(queue);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

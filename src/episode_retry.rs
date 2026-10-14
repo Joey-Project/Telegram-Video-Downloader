@@ -226,6 +226,7 @@ fn is_unsafe_publication_or_identity_failure(chain: &str) -> bool {
             "bilibili group inventory changed since the reviewed plan",
             "bilibili group episode numbering changed since the reviewed plan",
             "bilibili media requirements changed since the reviewed plan",
+            "needs a confirmed stream plan",
             "saved bilibili group inventory no longer matches the current selection",
             "object identity changed",
             "path identity changed",
@@ -514,6 +515,7 @@ mod tests {
             "Bilibili group inventory changed since the reviewed plan; inspect the group again",
             "Bilibili group episode numbering changed since the reviewed plan; inspect the group again",
             "Bilibili media requirements changed since the reviewed plan; inspect the group again",
+            "Bilibili episode 1 needs a confirmed stream plan; resume to resolve it before downloading",
             "saved Bilibili group inventory no longer matches the current selection",
             "Bilibili group entry 17 changed identity since it was saved; inspect the group again",
         ] {
