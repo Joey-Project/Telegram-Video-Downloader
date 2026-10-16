@@ -41,6 +41,10 @@ danmaku_formats = ["xml", "ass"]
 
 [bilibili.danmaku]
 enabled = true
+# These settings affect generated ASS danmaku only. XML sidecars stay unchanged.
+font_scale = 3.0
+opacity = 0.7
+display_area = 0.5
 
 [bilibili.auth]
 # Legacy bot-managed Web cookie state; BBDown-rust credentials live in credential_file.

@@ -110,6 +110,12 @@ pub struct BilibiliConfig {
 pub struct BilibiliDanmakuConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_bilibili_danmaku_font_scale")]
+    pub font_scale: f64,
+    #[serde(default = "default_bilibili_danmaku_opacity")]
+    pub opacity: f64,
+    #[serde(default = "default_bilibili_danmaku_display_area")]
+    pub display_area: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -293,6 +299,7 @@ impl AppConfig {
         if self.bilibili.danmaku_formats.is_empty() {
             bail!("bilibili.danmaku_formats must not be empty");
         }
+        self.bilibili.danmaku.validate()?;
         for format in &self.bilibili.danmaku_formats {
             if !matches!(format.as_str(), "xml" | "ass") {
                 bail!("bilibili.danmaku_formats entries must be xml or ass");
@@ -610,7 +617,27 @@ impl Default for BilibiliConfig {
 
 impl Default for BilibiliDanmakuConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            font_scale: default_bilibili_danmaku_font_scale(),
+            opacity: default_bilibili_danmaku_opacity(),
+            display_area: default_bilibili_danmaku_display_area(),
+        }
+    }
+}
+
+impl BilibiliDanmakuConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.font_scale.is_finite() || self.font_scale <= 0.0 || self.font_scale > 10.0 {
+            bail!("bilibili.danmaku.font_scale must be finite, greater than 0, and at most 10");
+        }
+        if !self.opacity.is_finite() || !(0.0..=1.0).contains(&self.opacity) {
+            bail!("bilibili.danmaku.opacity must be finite and between 0 and 1");
+        }
+        if !self.display_area.is_finite() || self.display_area <= 0.0 || self.display_area > 1.0 {
+            bail!("bilibili.danmaku.display_area must be finite, greater than 0, and at most 1");
+        }
+        Ok(())
     }
 }
 
@@ -766,6 +793,18 @@ fn default_bilibili_poll_interval_seconds() -> u64 {
     2
 }
 
+fn default_bilibili_danmaku_font_scale() -> f64 {
+    3.0
+}
+
+fn default_bilibili_danmaku_opacity() -> f64 {
+    0.7
+}
+
+fn default_bilibili_danmaku_display_area() -> f64 {
+    0.5
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::SystemTime;
@@ -848,6 +887,9 @@ mod tests {
         assert!(config.bilibili.restricted_api_proxies.is_empty());
         assert_eq!(config.bilibili.danmaku_formats, vec!["xml", "ass"]);
         assert!(config.bilibili.danmaku.enabled);
+        assert_eq!(config.bilibili.danmaku.font_scale, 3.0);
+        assert_eq!(config.bilibili.danmaku.opacity, 0.7);
+        assert_eq!(config.bilibili.danmaku.display_area, 0.5);
         assert_eq!(
             config.bilibili.auth.state_path,
             home.join(".local")
@@ -1138,6 +1180,62 @@ mod tests {
         .expect("disabled danmaku config should parse");
 
         assert!(!config.bilibili.danmaku.enabled);
+        assert_eq!(config.bilibili.danmaku.font_scale, 3.0);
+        assert_eq!(config.bilibili.danmaku.opacity, 0.7);
+        assert_eq!(config.bilibili.danmaku.display_area, 0.5);
+    }
+
+    #[test]
+    fn loads_custom_bilibili_danmaku_settings() {
+        let config = AppConfig::from_toml_str(
+            r#"
+            [telegram]
+            token = "token"
+            allow_all_chats = true
+
+            [bilibili.danmaku]
+            font_scale = 2.5
+            opacity = 0.4
+            display_area = 0.75
+            "#,
+            PathBuf::from("."),
+        )
+        .expect("custom danmaku settings should parse");
+
+        assert!(config.bilibili.danmaku.enabled);
+        assert_eq!(config.bilibili.danmaku.font_scale, 2.5);
+        assert_eq!(config.bilibili.danmaku.opacity, 0.4);
+        assert_eq!(config.bilibili.danmaku.display_area, 0.75);
+    }
+
+    #[test]
+    fn rejects_invalid_bilibili_danmaku_settings() {
+        for (key, value) in [
+            ("font_scale", "nan"),
+            ("font_scale", "inf"),
+            ("font_scale", "0"),
+            ("font_scale", "10.1"),
+            ("opacity", "nan"),
+            ("opacity", "-inf"),
+            ("opacity", "-0.1"),
+            ("opacity", "1.1"),
+            ("display_area", "inf"),
+            ("display_area", "0"),
+            ("display_area", "1.1"),
+        ] {
+            let toml = format!(
+                "[telegram]\ntoken = \"token\"\nallow_all_chats = true\n\n[bilibili.danmaku]\n{key} = {value}\n"
+            );
+            let error = AppConfig::from_toml_str(&toml, PathBuf::from("."))
+                .expect_err("invalid danmaku setting should fail validation");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("bilibili.danmaku.{key}")),
+                "unexpected error for {key} = {value}: {error}"
+            );
+        }
     }
 
     #[test]
