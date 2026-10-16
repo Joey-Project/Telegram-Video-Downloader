@@ -3,9 +3,9 @@ id: 20261007-fmm01
 title: 文件管理 Mini App 设计与实施计划
 status: active
 created: 2026-10-07
-updated: 2026-10-09
+updated: 2026-10-16
 branch: "wip/file-management-cloud"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/32"
 supersedes: []
 superseded_by: ""
 ---
@@ -23,9 +23,9 @@ superseded_by: ""
 - 当前接受的架构大方向是公开托管的静态界面自动加载文件库并提交操作；Telegram webhook 进入 Cloudflare Worker，再进入 D1 持久收件箱。本机 Rust bot 主动领取操作，并由本机通过同一 Telegram bot 发送或编辑进度消息。本机没有公网入站接口。偏好使用 Cloudflare Free；达到额度限制时暂停操作并提示用户。
 - Rust 通过固定 Worker API 补领、确认和回写状态；Mini App 验证 Telegram initData。休眠 WebSocket 推送完整请求，固定共享密钥鉴权，本机落盘后才确认接收。状态通过持久递增版本防止旧回写覆盖新快照。
 - 第一至第四阶段的本地代码已落在隔离分支：Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段 `/settings` 与新下载位置选择仍延期。
-- Cloudflare 等待卡片重复问题已修复，类型检查、23 项测试及 Wrangler dry-run 已通过。Rust 完整测试为 572 项通过、0 项失败、11 项忽略，包含 mock Telegram/cloud 和文件管理覆盖。
+- Cloudflare 等待卡片重复问题已修复。2026-10-16 同步后的类型检查、23 项 Cloud 测试及 Wrangler dry-run 通过；Rust 完整测试为 798 项通过、0 项失败、15 项忽略，包含 mock Telegram/cloud、文件管理和新单集发布记录覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
-- 实施分支 `wip/file-management-cloud` 基于更新后的 `origin/master`（`b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`）。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，直到最终本地 gate、后续生产验证及第五阶段范围明确。
+- 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `6a7184b9fcd67ca5a1aec95dcbca8a2e4578268c` 的 master 修复。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
 
 ## 已确认的产品与交互
 
@@ -178,10 +178,13 @@ superseded_by: ""
 
 ### 测试与交付约定
 
+- 2026-10-16 整合 master 的 MP4 发布验证、独立分集规划与精确跳过、逐集结果/恢复/重试、磁盘不足暂停和压缩弹幕解码修复，保留 `bbdown-core` 最新固定版本。
+- 媒体库按单集 `Verified` 发布记录的稳定 ID、路径和摘要生成来源线索，不把失败或待下载的全计划条目算作已发布；保留原始集索引和旧式整任务完成记录。新记录成功持久化后才通知扫描，普通进度不通知；任务的部分完成、恢复和历史状态语义保持独立。
+
 - 已新增 Rust 单元与 mock Telegram/cloud 测试、Cloudflare Worker 测试、TypeScript 检查及 CI workflow。Node.js 25.8.2、Wrangler 4.149.0 下，`npm run typecheck`、`npm test`（23/23）与 `npm run build`（仅 dry-run）通过。
-- Rust 1.95.0 下，`cargo fmt --all -- --check`、`cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline` 均通过；`cargo test --all-targets --locked --offline --quiet` 完整结果为 572 passed、0 failed、11 ignored。忽略项不计为已执行通过，本地构建没有安装或重启 bot。
+- Rust 1.95.0 下，`cargo fmt --all -- --check`、`cargo check --all-targets --locked --offline`、`cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline` 均通过；`cargo test --all-targets --locked --offline --quiet` 完整结果为 798 passed、0 failed、15 ignored。编译命令显式使用当前 worktree 的 target 目录，忽略项不计为已执行通过，本地 debug 构建没有安装或重启 bot。
 - Rust 通过的覆盖包含本地 Cloud REST 落盘先于 ACK、ACK 失败后重送、重启恢复、乱序与重复序列、`/queue` 分派、WebSocket 空闲后收件、队列发布触发 scan、Telegram 单条批次 receipt 和执行失败编辑。
-- 实现与修复由 GPT-6 Luna Max 子代理承担，GPT-6.1 coordinator 统一执行最终本地 gate。新增 Cloudflare CI 与现有完整 Rust CI 一起覆盖本次功能；尚未推送，因此没有远端 CI 结果。
+- 实现、修复与验证由 GPT-6 Luna Max 子代理承担，GPT-6.1 coordinator 统一协调交付。新增 Cloudflare CI 与现有完整 Rust CI 一起覆盖本次功能；远端结果以 PR 当前提交的 checks 和 Codex review 为准，不能沿用旧提交结果。
 - 文件操作使用合成目录，并区分对象身份、内容稳定性和访问策略；实际部署还要单独验证云端配额、owner/鉴权、休眠连接及 webhook 切换。mock 结果不能替代生产验证。
 
 ## 待决事项

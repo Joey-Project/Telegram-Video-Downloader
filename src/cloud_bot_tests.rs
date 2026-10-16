@@ -441,6 +441,164 @@ fn parses_stable_bilibili_ids_into_per_entry_source_hints() {
     );
 }
 
+#[tokio::test]
+async fn cloud_queue_hints_use_only_persisted_verified_episode_receipts() {
+    let root = temp_cloud_bot_dir("verified-episode-hints");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+
+    let stable_ids = vec![
+        "bvid:BV1xx411c7mD:cid:101:epid:1001".to_string(),
+        "bvid:BV1xx411c7mD:cid:102:epid:1002".to_string(),
+        "bvid:BV1xx411c7mD:cid:103:epid:1003".to_string(),
+    ];
+    let mut partial = TaskRecord::new(
+        "partial-episode-hints".to_string(),
+        1,
+        1,
+        123_456_789,
+        Some(123_456_789),
+        0,
+        JobRequest::Bilibili {
+            url: "https://www.bilibili.com/bangumi/play/ss123".to_string(),
+            selection: None,
+        },
+    );
+    partial.status = TaskStatus::PartiallyCompleted;
+    partial.plan = Some(PlanValidationSnapshot {
+        stable_media_ids: stable_ids.clone(),
+        title: Some("Season title".to_string()),
+        ..PlanValidationSnapshot::default()
+    });
+    let mut attempt = BilibiliAttemptSnapshot::new_independent(
+        "Season title".to_string(),
+        [
+            (1, "Episode 1".to_string(), Some(stable_ids[0].clone())),
+            (2, "Episode 2".to_string(), Some(stable_ids[1].clone())),
+            (3, "Episode 3".to_string(), Some(stable_ids[2].clone())),
+        ],
+        0,
+    );
+    attempt.entry_failed(1);
+    partial.bilibili_attempt = Some(attempt);
+    queue.create(partial).expect("partial task should persist");
+
+    let legacy_path = config.downloads.video_dir.join("legacy.mp4");
+    let mut legacy = TaskRecord::new(
+        "legacy-completed-hints".to_string(),
+        2,
+        2,
+        123_456_789,
+        Some(123_456_789),
+        1,
+        JobRequest::Bilibili {
+            url: "https://www.bilibili.com/video/BV1legacyabc".to_string(),
+            selection: None,
+        },
+    );
+    legacy.status = TaskStatus::Completed;
+    legacy.saved_location = Some(legacy_path.display().to_string());
+    legacy.plan = Some(PlanValidationSnapshot {
+        stable_media_ids: vec!["bvid:BV1legacyabc:cid:401:epid:4001".to_string()],
+        title: Some("Legacy title".to_string()),
+        ..PlanValidationSnapshot::default()
+    });
+    legacy.primary_media_hashes =
+        BTreeMap::from([(legacy_path.display().to_string(), "b".repeat(64))]);
+    queue.create(legacy).expect("legacy task should persist");
+
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let publication_notify = queue.publication_notify();
+    let progress_notification = publication_notify.notified();
+    queue
+        .update_bilibili_attempt_if_generation(
+            "partial-episode-hints",
+            0,
+            3,
+            &BilibiliAttemptUpdate::Started,
+        )
+        .expect("ordinary progress should persist");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), progress_notification)
+            .await
+            .is_err(),
+        "ordinary progress must not request a library scan"
+    );
+
+    let episode_path = config.downloads.video_dir.join("episode-2.mp4");
+    let episode_hash = "a".repeat(64);
+    let verified_notification = publication_notify.notified();
+    queue
+        .update_bilibili_attempt_if_generation(
+            "partial-episode-hints",
+            0,
+            2,
+            &BilibiliAttemptUpdate::Verified {
+                media_paths: vec![episode_path.clone()],
+                hashes: BTreeMap::from([(episode_path.display().to_string(), episode_hash)]),
+            },
+        )
+        .expect("verified output receipt should persist");
+    tokio::time::timeout(Duration::from_secs(1), verified_notification)
+        .await
+        .expect("new receipt should request a debounced library refresh");
+
+    let hints = queue_source_hints(&runtime.bot).expect("queue hints should load");
+    assert_eq!(
+        hints.len(),
+        2,
+        "only episode 2 and the legacy task should hint"
+    );
+    let partial_hint = hints
+        .iter()
+        .find(|hint| hint.relative_path.as_deref() == Some("episode-2.mp4"))
+        .expect("verified episode should bind to its published path");
+    assert_eq!(partial_hint.source_ids, vec!["cid102", "ep1002"]);
+    assert_eq!(
+        partial_hint
+            .collection
+            .as_ref()
+            .and_then(|value| value.order),
+        Some(2)
+    );
+    assert_eq!(
+        partial_hint.title, None,
+        "group title must not replace episode NFO title"
+    );
+    assert!(!hints.iter().any(|hint| {
+        hint.source_ids.iter().any(|source_id| {
+            source_id == "cid101"
+                || source_id == "ep1001"
+                || source_id == "cid103"
+                || source_id == "ep1003"
+        })
+    }));
+    assert!(hints.iter().any(|hint| {
+        hint.relative_path.as_deref() == Some("legacy.mp4")
+            && hint.source_ids.contains(&"BV1legacyabc".to_string())
+    }));
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    std::fs::remove_dir_all(root).expect("test download roots should clean up");
+}
+
 #[test]
 fn local_transient_retries_back_off_to_one_minute() {
     assert_eq!(cloud_retry_delay_seconds(1), 5);

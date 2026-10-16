@@ -6,10 +6,14 @@
 
 - 普通消息中的 Bilibili 链接通过 `BBDown-rust` 的 `bbdown-core` crate 解析和下载，保存到视频下载目录，并默认保留 XML/ASS 弹幕 sidecar。
 - Bilibili 番剧和 intl 链接走内嵌 plan/download API；`ss/md` 系列入口会先提示选择最新一集或全集。
+- 番剧按所选剧集分别规划播放地址，最多同时解析 2 集，每集有独立的 60 秒期限；全集不再共用一分钟总期限。规划进度显示已完成集数，单集失败或超时会报告具体集号并终止其他在途规划，结果仍按原剧集顺序下载。
+- 番剧全集命中已下载剧集时，可以选择 `Skip duplicates`，仅跳过当前 sidecar 精确匹配 CID/EPID、且音视频流满足下载模式的剧集，并继续下载其余集数；`Cancel entire job` 才会取消整个任务。跳过选择保存在队列中，恢复时会重新核对现有文件；若等待目录锁期间计划发生变化，任务会停止并提示重试，由队列重新验证计划。字幕、弹幕或封面单独下载模式不提供这个跳过选项。
+- 番剧下载进度和最终结果会区分下载阶段完成、已验证保存、失败、未开始、被中断和已有跳过的集数，并列出失败集号与最后报告的阶段。失败摘要位于长日志之前，队列会保存当前尝试的逐集状态；重试清空本轮计数。下载阶段完成不代表可播放文件已经合并、验证并发布；某集的终态错误仍会停止本轮下载，后续未开始的集不计为失败。
 - 普通消息中的 Bilibili `opus` 文章链接会规范化为 `www.bilibili.com/opus/<id>` 并保存为 PDF。
 - 私聊中可以用 `/bbdown login`、`/bbdown status`、`/bbdown logout` 管理 BBDown 使用的 Bilibili 登录态。
 - `/help` 会显示 bot 支持的命令；启动时也会向 Telegram 注册 slash command 提示。
 - `/queue` 查看可操作的持久任务；可以恢复中断任务、重试失败任务或取消任务，`/queue history` 查看已完成和已取消记录。重启后需要重新选择的任务会重新显示选择项；下载计划或媒体规格变化时，bot 会暂停并要求确认。
+  队列会保留重复检查取得的标题；单条视频重复确认时会尝试补齐所选流的画质和预估体积，并标为 Preview。缺少精确流大小时，可以根据码率和时长显示标为 about 的估算值；失败或中断任务会显示原因，流信息不可获取时仍保留已取得的标题。预览不代替执行前的计划核验；旧记录没有保存详情时，需要 Resume/Retry 才能刷新。
 - 可选的 Cloudflare 接收模式把 Telegram 更新先写入 D1，再通过休眠 WebSocket 通知本机；断线后经 HTTPS 补领。本机落盘后才确认接收，Telegram 回复仍由本机直接发送。
 - 启用云端模式后，`/file` 打开文件管理 Mini App：扫描下载根目录、搜索和选择媒体、预览整理方案，再确认移动视频及可靠关联的附件。旧消息线索可用于补齐 NFO，无需重新下载完整视频。
 - macOS 上队列索引和记录通过 File Provider 协调读写，云端占位内容可在读取时按需物化。若系统无法协调访问，bot 会提示检查 Finder 中隐藏队列目录的下载状态并重试；读取失败不会清理队列或 staging 数据。
@@ -43,7 +47,7 @@ cp config.example.toml config.toml
 
 `video.subtitle_languages` 默认按中文、英文、日语优先。YouTube 会先找人工字幕；如果这些语言没有人工字幕，再使用自动字幕。`write_nfo = true` 会为视频生成同 basename 的 `.nfo`，`keep_sidecars = true` 会让 yt-dlp 保留 `.info.json`、`.description` 和封面 sidecar。
 
-重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` plan API 解析 bvid、aid、cid 和 epid，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 能由 NFO 或 info JSON sidecar 证明并唯一匹配一个现有文件时才允许覆盖，文件名里的 cid/epid 只用于重复提示。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。实际下载使用的 plan 还必须保留确认时的精确 cid/epid，否则任务中止。覆盖时，bot 会先把旧媒体及明确属于同 basename 的 sidecar 移入本次事务独占的隐藏备份目录，再从已取得的文件重建严格身份索引；无法明确归属的裸 `danmaku.*`、`subtitle-*` 或 `cover-*` 文件不会被旧文件清理误删。目标缺失、metadata 不可读、身份变化、路径被重新占用或新增歧义都会拒绝覆盖并尝试恢复原文件。如果单个已完成任务意外产出多个主媒体文件，bot 会保留旧文件并把全部新产物按“两者并存”提交，避免清理 staging 时丢失下载结果。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
+重复视频检测会单次扫描视频文件名与同 basename sidecar，建立媒体 ID 索引后复用。YouTube 使用 URL 中的 video id；Bilibili 会先使用 URL 中的 `BV...` / `av...` / `ep...`，再通过 `bbdown-core` metadata API 解析所选条目的 bvid、aid、cid 和 epid，不请求播放地址，因此 `b23.tv` 短链和番剧条目也可以在下载前弹出重复选择。Bilibili 的 bvid/aid 可能同时对应多个分 P，只用于提示存在相关文件；只有单条下载计划的 cid/epid 能由 NFO 或 info JSON sidecar 证明并唯一匹配一个现有文件时才允许覆盖，文件名里的 cid/epid 只用于重复提示。全集和歧义匹配不会显示覆盖按钮，服务端也会再次拒绝不安全的覆盖请求。实际下载使用的 plan 还必须保留确认时的精确 cid/epid，否则任务中止。覆盖时，bot 会先把旧媒体及明确属于同 basename 的 sidecar 移入本次事务独占的隐藏备份目录，再从已取得的文件重建严格身份索引；无法明确归属的裸 `danmaku.*`、`subtitle-*` 或 `cover-*` 文件不会被旧文件清理误删。目标缺失、metadata 不可读、身份变化、路径被重新占用或新增歧义都会拒绝覆盖并尝试恢复原文件。如果单个已完成任务意外产出多个主媒体文件，bot 会保留旧文件并把全部新产物按“两者并存”提交，避免清理 staging 时丢失下载结果。检测失败时任务仍走 staging keep-both 移动，避免直接覆盖最终目录里的同名文件。
 
 覆盖按钮生成时会以 `O_NOFOLLOW` 打开并持有现有媒体文件，直到任务完成，避免确认后删除并复用 inode 的同路径文件继承覆盖授权。旧媒体备份保留原文件名；完整视频覆盖会先提交主媒体，再提交 sidecar，对每个已提交输出执行 `fsync`，然后为其在事务目录创建同 inode 的硬链接锚点，并以“完整写入临时文件后原子交换”的方式把 recovery manifest 从 `acquired` 切换为 `committed`。只有这些输出内容和 committed recovery state 都持久化后才会删除旧备份。旧备份全部安全清理前锚点始终存在，因此输出路径即使被删除也不能把已记录 inode 转让给无关替换文件。最后一次输出验证后，包含 manifest 和全部锚点的事务目录会整体原子移入受控删除隔离区；崩溃恢复不会看到只删除了一部分锚点的 committed 事务。bot 每次启动都会扫描这些受控事务；正常任务还会在持有跨进程输出锁时，把 `.telegram-video-downloader-control` 私有目录里的恢复状态通过原子文件替换写为 dirty，只有任务和恢复都干净结束后才写回 clean。控制目录由绑定根目录和控制目录 inode 的 owner 记录认证，状态文件要求私有权限且硬链接数为 1；升级时旧根目录 marker 只读检测并触发一次恢复扫描，不会被修改。后续任务只在标记不干净时再次递归恢复，避免每次下载前后都完整扫描媒体库。`acquired` 事务只在目标路径仍为空时回滚，路径被占用时保留全部对象供人工处理；v3 `committed` 事务只有在当前输出仍与持久锚点相同、且 manifest 身份一致时才完成清理；没有锚点的旧 v2 committed 事务会 fail closed 并保留备份。视频目录里的持久锁文件会跨 bot、`--replay-message` 和启动恢复进程串行化输出事务。无法识别的旧版备份目录、结构异常的事务和无关的不可读子目录会分别保留或跳过并写入日志，不会误删文件或阻止其他事务恢复。
 
@@ -55,11 +59,42 @@ staging 下载成功后会先持久化身份绑定的 `.retained.json`；Bilibil
 
 `bilibili.danmaku.enabled = true` 时，bot 会让 `bbdown-core` 写出配置里的弹幕格式，默认是 `.xml` 和 `.ass` sidecar，并让它们跟随 staging、覆盖和两者并存流程移动。后续会接入 `bbdown-core` 的 danmaku update API，用于只更新已有视频的弹幕 sidecar；暂时不做 PGO/PGS 图形字幕预渲染。
 
+The pinned SDK decodes plain, raw DEFLATE, zlib, and gzip danmaku payloads
+before XML validation and ASS conversion. Malformed, truncated, or oversized
+payloads produce an explicit SDK error instead of silently generating a
+header-only ASS from compressed bytes.
+
 `bilibili.auth.credential_file` 是 `bbdown-core` credential 文件，默认写到 `~/.local/state/telegram-video-downloader/bbdown-credentials.json`；可选的 `credential_profile` 会选择同一文件里的 profile。`credential_file` 的直接父目录不能是符号链接；需要使用链接目录时，请配置其解析后的真实目录。`/bbdown login` 默认等同 `/bbdown login web`，会直接创建并轮询 Web QR；`/bbdown login tv` 会保存 TV 专用 `tv_access_key`；`/bbdown login access-key` 通过 BiliPlus 获取 Bilibili 授权 QR 和链接，用户使用 Bilibili app 扫码并确认后，bot 自动轮询并保存通用 `access_key`，不再要求复制 callback URL 或凭据消息。BiliPlus 会参与该授权流程；登录请求不携带现有 cookie 或 access key，二维码和授权结果不会写入普通日志。此流程受 `login_timeout_seconds` 限制，过期、失败和 `/bbdown logout` 会终止轮询；通用 access key 与 TV 专用 key 分开保存。`/bbdown status` 通过 crate API 检查 cookie、`access_key` 和 `tv_access_key`；`/bbdown logout` 清理当前 credential/profile，并兼容删除旧版 bot Web cookie state。legacy cookie migration、fresh login 和 logout 使用同一个常驻、`O_NOFOLLOW` 打开的跨进程锁文件。该文件通过两个交替写入、`fsync` 的固定大小槽位保存认证 epoch，并能从旧版有界 append log 自动迁移：登录开始时冻结当前 epoch，写入凭据前必须仍匹配；status、登录成功和 logout 的最终 Telegram 回复会在持有同一跨进程锁时重新核对 epoch。这样并行进程既不能在 logout 后用等待中的登录重新创建凭据，也不能在凭据变化后发送过期的“有效/成功”回复。
 
 `bot.progress_update_seconds` 控制进度回复频率，默认 5 秒。进度通道只保留最新状态，Telegram 按该间隔合并刷新，不会因全集任务的高频事件积压消息。视频计划解析得到的媒体摘要会作为进度上下文保留，后续速度、文件增长、下载和 mux 阶段更新不会覆盖它。YouTube/PDF 外部命令会刷新文件增长快照；Bilibili 会转发 `bbdown-core` 的关键 plan、download 和 mux 阶段。`bot.command_timeout_seconds` 是单个外部命令的总超时；direct Bilibili 下载不受这个总时限约束，而是把 `bot.command_idle_timeout_seconds` 作为媒体读取 idle timeout 传给 `bbdown-core`。Bilibili API 请求仍受独立的 request timeout 约束，bot 调用的 ffmpeg 等外部命令仍受总超时和 idle timeout 约束。
 
+Video preparation and plan inspection also report metadata resolution, existing-media checks, and planned episode counts before media transfer begins. Slow duplicate checks show progress at the configured interval; checks that finish sooner add no progress notice. Queueing, planning, and downloading reuse the status message. Queue plan inspection and download share one coalescing progress channel and the same `bot.progress_update_seconds` timer. Slow planning updates include elapsed time. If no status message is available, the first successful progress send becomes the message reused by later edits; an edit failure defers replacement to a later progress update. Replacement messages are also reused for plan confirmation, cancellation, and the final result. Slow Telegram responses cannot trigger nearby catch-up edits.
+
+Per-entry Bilibili attempt state is saved in batches at that same configured interval, with forced saves at attempt snapshots and progress-channel closure. Queue completion counts include already-present entries and verified outputs; raw downloaded streams remain pending finalization. Optional queue summaries and error details share the remaining page text budget so task actions and history navigation remain available.
+
+Bilibili all-episode and missing-episode jobs keep one queue item and execute episodes independently. Each successful episode is muxed, verified, and published before the next episode starts. Temporary episode errors receive at most two additional attempts; HTTP 403 retries resolve a fresh play plan using the configured resolver. Retry progress edits the existing message at the configured interval. Exhausted episode errors record the episode number, stage, error, and attempt count, then allow later episodes to proceed. Authentication, local storage, permission, and filesystem identity failures pause the group instead.
+
+Live episode progress keeps the season-wide completed, already-present, failed, and remaining counts above the current episode and stage. A single episode's stream estimate is labeled separately. Merge progress does not show a download speed of zero, and internal worker logs and terminal color sequences are excluded from the progress display.
+
+Before each Bilibili episode download, the bot checks the output filesystem's available space against the selected stream sizes plus temporary mux output. It checks actual input sizes again before mux and preserves a 256 MiB margin for task state and sidecars through publication. The worker monitor stops further writes if that margin is exhausted. These checks do not reserve space, and other applications, unknown stream sizes, or quotas can still cause writes to fail. Disk-space failures pause the group and retain completed media. If the queue cannot save the paused state, the bot reports that separately and retries after space is freed; Resume appears only after the paused state is durably saved.
+
+Shared executable launch failures also pause the group for operator repair. Missing-mode plan sizes and selected streams cover only episodes without compatible existing media, while the full episode inventory remains available. Private publication receipts are stored in task-specific directories and removed after completed or cancelled queue states are durably saved. Failed, partial, and interrupted groups keep their recovery receipts; startup retries any unfinished terminal cleanup.
+
+The final summary distinguishes completed, failed, skipped, and unstarted episodes. Partially completed groups remain in the active queue with **Retry failed episodes**, **Episodes**, and **Failure details** actions. Episode pages also support retrying a single unfinished episode. If all episodes are verified but final bookkeeping fails, both the terminal message and queue expose **Resume finalization**. Resume and retry preserve successful episodes only after checking their media identity and published content hashes; a changed or missing output is downloaded again. Older saved attempts retain their original restart behavior.
+
+Group planning probes episode streams with at most two concurrent requests and an independent timeout per episode. A temporarily unavailable episode does not stop the remaining probes. Execution refreshes the play plan and checks the confirmed format, resolution, codec, and exact stream size before downloading; a newly available or changed stream requires updated plan confirmation. If the season inventory or configured media or artifact requirements change, the group also pauses for plan confirmation. These requirements include danmaku formats, NFO output, and sidecar retention. Accepting the updated plan reconciles saved episode states with the approved inventory; completed outputs remain reusable only when their media identity and requirements still match. Durable recovery receipts include confirmed stream requirements, even when queue receipt persistence was interrupted. Failed-only and single-episode retry scopes follow the selected media identities through renumbering and never expand to newly added episodes.
+
+Resuming an interrupted episode also checks for media already published before its queue receipt was saved, including for all-episode selections with NFO disabled. Publication recovery keeps a small internal receipt in the bot's private control directory, independently of optional user-facing metadata. Each stable media identity has one latest receipt per logical queue task, output root, and selected collection directory; republishing within that scope replaces it. Recovery checks the stored task identity, requirements, bound output paths, collection directory scope, and content hashes before reusing media. An All task does not use another task's receipt or the shared media index as proof that its requested new copy was published. The same video can retain independent recovery receipts in separate tasks and collections; collection recovery does not trust older unscoped receipts or queue paths belonging to another collection. Missing selections still use the shared index to skip verified existing media.
+
+Collection plans retain the reviewed output directory identity until execution and pass it into each child publication. The mover binds destination parents to that object through rename, so replacing the directory pauses the group even after initial validation. An initially absent directory is atomically created by the task, and later episodes carry that created object's identity. Legacy collection plans and an externally created directory after a plan reviewed it as absent require updated plan confirmation; valid episode receipts remain eligible for recovery after confirmation. Normal child-file changes do not replace the directory identity. Before automatically retrying a child, verified copied or durable publication receipts are recovered so retryable cleanup errors do not create duplicate copies; changed media still redownloads. If parent final hashing or persistence fails after episode verification, the task and summary report partial completion or interruption and retain the verified outputs for resume.
+
+Recovery does not require a saved episode-start event. Fresh All jobs keep their requested keep-both behavior. Group completion and final queue hashing compare every published output with its original verified content hash; changed content fails completion, while unchanged content can be rematerialized. Collection-directory checks retain the initially selected object identity. Timed media probes snapshot only the candidate identities and paths needed by the episode, release the shared update lock before probing, and publication-index updates have a bounded wait.
+
 Bilibili 合集每轮执行只发送一条入队主消息和每个所选视频的一条状态消息；合集详情、进度、处理和最终结果编辑已有消息，下载完成后还会等待已发布文件校验。已存在且通过核验的视频显示跳过下载状态；取消时不为尚未开始的视频补发消息。通过 `/queue` 恢复或手动重试会开启新一轮，保留旧轮消息并创建新轮消息；网络和文件提供器的内部重试不会另开一轮。
+
+Bilibili 的文件描述符输出保留 MP4 索引（`moov`）在文件末尾，不启用 `faststart`。FFmpeg 的 `faststart` 第二遍搬移会重新打开输出；`fd:` 重新打开后共享文件偏移，可导致媒体数据被覆盖，即使命令返回成功。完整下载后的文件可正常本地播放。此前因此损坏的文件不会自动恢复；若原始音视频流已清理，需要重新下载，完成记录中的 SHA-256 一致只能证明文件未变化，不能证明内容可解码。
+
+每次 Bilibili 或 YouTube 媒体下载完成后，bot 会通过 FFmpeg 从头到尾解码全部音视频，检查解码完成及实际媒体输出；只有通过后才发布文件并标记任务完成。Bilibili 合并输出在检查通过前保持私有，原始音视频流也会保留。解码失败、超时或检查期间文件内容变化都会使任务失败并保留下载材料供修复，覆盖下载不会提前替换旧文件。检查期间会显示已解码时长；长视频会增加相应的检查时间。纯字幕、弹幕或封面下载无需音视频解码检查。
 
 ## 运行
 
@@ -138,4 +173,11 @@ scripts/test_launch_agent.sh
 uv run ruff format --check
 uv run ruff check
 uv run python -m unittest discover -s tests
+```
+
+安装了支持 `fd:`、libx264 和 AAC 的 FFmpeg 时，可以显式运行真实合并回归测试。测试生成临时音视频，执行完整 Bilibili 合并与原始流清理，比较合并前后的音视频包 SHA-256，并完整解码输出：
+
+```sh
+cargo test bilibili_fd_mux_preserves_streams_and_decodes_with_real_ffmpeg -- --ignored
+cargo test missing_season_probe_uses_actual_video_and_audio_streams -- --ignored
 ```
