@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
-bbdown-core = { git = "https://github.com/Joey-Project/BBDown-rust", rev = "0a94b071bbc1897ec1d1fec9dfcf7883c5754a15", package = "bbdown-core" }
+bbdown-core = { git = "https://github.com/Joey-Project/BBDown-rust", rev = "da70c4787b4b5f78bac2ce4f9b87fc035cffb74f", package = "bbdown-core" }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 libc = "0.2"
 qrcode = "0.14.1"
