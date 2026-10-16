@@ -8599,6 +8599,7 @@ async fn run_bilibili_job_locked(
         .await?;
     let mut report = BilibiliDownloadReport::from(&core_report);
     mark_bilibili_core_download_completed(root, Some(worker_context.request))?;
+    crate::bilibili_danmaku::validate_downloaded_danmaku(root, &core_report)?;
     let output_dir = bilibili_core::output_dir(config);
     if mux_locally {
         send_bilibili_worker_entry_stage(

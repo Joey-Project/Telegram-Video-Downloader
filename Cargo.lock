@@ -61,8 +61,8 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bbdown-core"
-version = "0.6.0"
-source = "git+https://github.com/Joey-Project/BBDown-rust?rev=0a94b071bbc1897ec1d1fec9dfcf7883c5754a15#0a94b071bbc1897ec1d1fec9dfcf7883c5754a15"
+version = "0.10.0"
+source = "git+https://github.com/Joey-Project/BBDown-rust?rev=b9d787631e21bcb52c8cce9bb78393a5a6291f85#b9d787631e21bcb52c8cce9bb78393a5a6291f85"
 dependencies = [
  "base64",
  "flate2",
@@ -73,6 +73,7 @@ dependencies = [
  "prost",
  "rand 0.8.8",
  "reqwest",
+ "roxmltree",
  "rsa",
  "serde",
  "serde_json",
@@ -1223,6 +1224,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1512,12 +1522,14 @@ dependencies = [
  "anyhow",
  "bbdown-core",
  "block2",
+ "flate2",
  "image",
  "libc",
  "objc2",
  "objc2-foundation",
  "qrcode",
  "reqwest",
+ "roxmltree",
  "rustix",
  "serde",
  "serde_json",
