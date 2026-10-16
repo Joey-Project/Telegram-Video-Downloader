@@ -2,7 +2,6 @@ mod bilibili_access_key;
 mod bilibili_attempt;
 mod bilibili_auth;
 mod bilibili_core;
-mod bilibili_danmaku;
 mod bilibili_planning;
 mod config;
 mod disk_space;

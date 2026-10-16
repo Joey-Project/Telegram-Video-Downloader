@@ -27,18 +27,18 @@ superseded_by:
   normalization before ASS conversion. Reqwest's optional deflate decoder
   accepts zlib wrapping only, so enabling that feature alone does not fix the
   observed raw stream. Retain the other dependency pins.
-- Validate downloaded XML and ASS before mux/publication. Reject malformed
-  XML and missing ASS events when supported XML comments exist; allow valid
-  empty pools and unsupported-only comments. Keep completed media available
-  for recovery when this bot post-download check fails.
+- Keep decoding, XML validation, and ASS conversion in the SDK rather than
+  duplicating its private conversion rules in the bot. Invalid, truncated,
+  and oversized payloads produce explicit SDK errors.
 
 ## Validation
 
-- Rust 1.95.0 all-target tests passed: 772 passed and 15 existing opt-in tests
+- Rust 1.95.0 all-target tests passed: 762 passed and 15 existing opt-in tests
   ignored. Strict all-target Clippy, formatting, and the release build passed
   with the final immutable SDK revision.
-- Regression tests cover malformed and compressed XML,
-  legitimate empty pools, and missing ASS events.
+- SDK regression coverage includes malformed and compressed XML, bounded
+  decoding, multi-member gzip, retries, cancellation, and logical-file progress;
+  its workspace suite passed 871 tests with three opt-in tests ignored.
 - No production credentials or live Bilibili requests are needed for tests.
 
 ## Local Recovery

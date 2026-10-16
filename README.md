@@ -56,9 +56,9 @@ staging 下载成功后会先持久化身份绑定的 `.retained.json`；Bilibil
 `bilibili.danmaku.enabled = true` 时，bot 会让 `bbdown-core` 写出配置里的弹幕格式，默认是 `.xml` 和 `.ass` sidecar，并让它们跟随 staging、覆盖和两者并存流程移动。后续会接入 `bbdown-core` 的 danmaku update API，用于只更新已有视频的弹幕 sidecar；暂时不做 PGO/PGS 图形字幕预渲染。
 
 The pinned SDK decodes plain, raw DEFLATE, zlib, and gzip danmaku payloads
-before conversion. Before publishing a download, the bot validates XML/ASS sidecars
-and rejects an empty ASS when its XML contains supported comments. Completed
-media remains available for recovery if this bot post-download check fails.
+before XML validation and ASS conversion. Malformed, truncated, or oversized
+payloads produce an explicit SDK error instead of silently generating a
+header-only ASS from compressed bytes.
 
 `bilibili.auth.credential_file` 是 `bbdown-core` credential 文件，默认写到 `~/.local/state/telegram-video-downloader/bbdown-credentials.json`；可选的 `credential_profile` 会选择同一文件里的 profile。`credential_file` 的直接父目录不能是符号链接；需要使用链接目录时，请配置其解析后的真实目录。`/bbdown login` 默认等同 `/bbdown login web`，会直接创建并轮询 Web QR；`/bbdown login tv` 会保存 TV 专用 `tv_access_key`；`/bbdown login access-key` 通过 BiliPlus 获取 Bilibili 授权 QR 和链接，用户使用 Bilibili app 扫码并确认后，bot 自动轮询并保存通用 `access_key`，不再要求复制 callback URL 或凭据消息。BiliPlus 会参与该授权流程；登录请求不携带现有 cookie 或 access key，二维码和授权结果不会写入普通日志。此流程受 `login_timeout_seconds` 限制，过期、失败和 `/bbdown logout` 会终止轮询；通用 access key 与 TV 专用 key 分开保存。`/bbdown status` 通过 crate API 检查 cookie、`access_key` 和 `tv_access_key`；`/bbdown logout` 清理当前 credential/profile，并兼容删除旧版 bot Web cookie state。legacy cookie migration、fresh login 和 logout 使用同一个常驻、`O_NOFOLLOW` 打开的跨进程锁文件。该文件通过两个交替写入、`fsync` 的固定大小槽位保存认证 epoch，并能从旧版有界 append log 自动迁移：登录开始时冻结当前 epoch，写入凭据前必须仍匹配；status、登录成功和 logout 的最终 Telegram 回复会在持有同一跨进程锁时重新核对 epoch。这样并行进程既不能在 logout 后用等待中的登录重新创建凭据，也不能在凭据变化后发送过期的“有效/成功”回复。
 
