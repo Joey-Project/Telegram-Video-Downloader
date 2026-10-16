@@ -179,6 +179,7 @@ superseded_by: ""
 ### 测试与交付约定
 
 - 2026-10-16 整合 master 的 MP4 发布验证、独立分集规划与精确跳过、逐集结果/恢复/重试、磁盘不足暂停和压缩弹幕解码修复，保留 `bbdown-core` 最新固定版本。
+- 稳定媒体 ID 解析使用固定长度数组切片 `as_chunks::<2>()`，保留原先偶数长度校验与解析行为，满足 CI 的 `chunks_exact_to_as_chunks` Clippy 规则。
 - 媒体库按单集 `Verified` 发布记录的稳定 ID、路径和摘要生成来源线索，不把失败或待下载的全计划条目算作已发布；保留原始集索引和旧式整任务完成记录。新记录成功持久化后才通知扫描，普通进度不通知；任务的部分完成、恢复和历史状态语义保持独立。
 
 - 已新增 Rust 单元与 mock Telegram/cloud 测试、Cloudflare Worker 测试、TypeScript 检查及 CI workflow。Node.js 25.8.2、Wrangler 4.149.0 下，`npm run typecheck`、`npm test`（23/23）与 `npm run build`（仅 dry-run）通过。

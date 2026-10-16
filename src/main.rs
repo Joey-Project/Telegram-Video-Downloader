@@ -2171,7 +2171,7 @@ fn parse_bilibili_stable_media_id(value: &str) -> Option<ParsedBilibiliStableMed
     let mut aid = None;
     let mut cid = None;
     let mut epid = None;
-    for pair in fields.chunks_exact(2) {
+    for pair in fields.as_chunks::<2>().0 {
         match pair[0] {
             "bvid" if pair[1].starts_with("BV") => bvid = Some(pair[1].to_string()),
             "aid" if pair[1].bytes().all(|byte| byte.is_ascii_digit()) => {
