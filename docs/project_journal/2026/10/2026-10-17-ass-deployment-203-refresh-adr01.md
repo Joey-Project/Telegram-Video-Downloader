@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-17
 updated: 2026-10-17
 branch: wip/ass-danmaku-defaults
-pr:
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/43
 supersedes: []
 superseded_by:
 ---
@@ -20,10 +20,13 @@ superseded_by:
 - Merge the already deployed main-branch SDK DEFLATE fix before deployment.
   The SDK remains pinned to `da70c4787b4b5f78bac2ce4f9b87fc035cffb74f`.
   Signed implementation commit `08de473` and signed compatibility merge
-  `ef2bccf` are pushed to `wip/ass-danmaku-defaults`; master is unchanged.
+  `ef2bccf` preserve the existing SDK fix in the ASS delivery branch.
+- The user subsequently authorized PR delivery into master and a refresh of
+  the local deployment. PR #43 carries the implementation and these records.
 - The main checkout's unrelated uncommitted changes remain untouched.
-- No PR or formal review was created. The previously reported local review
-  adapter ACL gate remains inconclusive; this is not a reviewed-delivery claim.
+- The initial direct deployment preceded PR review. The PR delivery uses the
+  repository's remote GitHub Codex review and Rust CI gates; the earlier local
+  review adapter ACL failure is not counted as a completed review.
 
 ## Deployment
 

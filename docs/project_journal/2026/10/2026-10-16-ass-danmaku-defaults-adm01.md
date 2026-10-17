@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-16
 updated: 2026-10-16
 branch: wip/ass-danmaku-defaults
-pr:
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/43
 supersedes: []
 superseded_by:
 ---
@@ -52,5 +52,6 @@ superseded_by:
 
 ## Scope
 
-- Only future ASS generation uses the new defaults. Previously downloaded
-  sidecars are not rewritten. Live bot deployment is separate from this change.
+- Future ASS generation uses the new defaults. The separate, explicitly
+  authorized deployment and existing-library refresh are recorded in
+  [the deployment journal](2026-10-17-ass-deployment-203-refresh-adr01.md).
