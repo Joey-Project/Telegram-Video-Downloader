@@ -1,0 +1,44 @@
+name: Cloudflare CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cloud:
+    name: Worker and Mini App checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: cloud
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 25.8.2
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Check Worker and Mini App types
+        run: npm run typecheck
+
+      - name: Run local Cloudflare integration tests
+        run: npm test
+
+      - name: Validate the deployment bundle
+        run: npm run build

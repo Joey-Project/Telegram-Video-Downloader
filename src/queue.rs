@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::bilibili_attempt::{
-    BilibiliAttemptEntryState, BilibiliAttemptOutcome, BilibiliAttemptSnapshot,
-    BilibiliAttemptUpdate,
+    BilibiliAttemptEntry, BilibiliAttemptEntryState, BilibiliAttemptOutcome,
+    BilibiliAttemptSnapshot, BilibiliAttemptUpdate,
 };
 use crate::config::AppConfig;
 use crate::file_provider::{
@@ -376,6 +376,7 @@ pub struct QueueManager {
     _pdf_owner_lock: Option<QueueOwnerLock>,
     operation_lock: Mutex<()>,
     cancellations: Mutex<HashMap<String, CancellationRegistration>>,
+    publication_notify: Arc<Notify>,
     #[cfg(test)]
     interrupt_after_sidecar_move: AtomicBool,
 }
@@ -482,6 +483,43 @@ fn refresh_bilibili_attempt_counts(record: &mut TaskRecord) {
         snapshot.skipped_entries.saturating_add(verified).min(total)
     };
     record.media_entries_failed = snapshot.failed_entries().min(total);
+}
+
+fn has_verified_bilibili_output_receipt(entry: &BilibiliAttemptEntry) -> bool {
+    entry.state == BilibiliAttemptEntryState::Verified
+        && !entry.stable_media_id.trim().is_empty()
+        && !entry.published_media_paths.is_empty()
+        && !entry.published_media_hashes.is_empty()
+        && entry.published_media_paths.iter().all(|path| {
+            entry
+                .published_media_hashes
+                .contains_key(path.to_string_lossy().as_ref())
+        })
+}
+
+type VerifiedBilibiliReceiptKey = (u32, String, Vec<(PathBuf, String)>);
+
+fn verified_bilibili_receipt_keys(record: &TaskRecord) -> BTreeSet<VerifiedBilibiliReceiptKey> {
+    record
+        .bilibili_attempt
+        .iter()
+        .flat_map(|attempt| &attempt.entries)
+        .filter(|entry| has_verified_bilibili_output_receipt(entry))
+        .map(|entry| {
+            let mut outputs = entry
+                .published_media_paths
+                .iter()
+                .filter_map(|path| {
+                    entry
+                        .published_media_hashes
+                        .get(path.to_string_lossy().as_ref())
+                        .map(|hash| (path.clone(), hash.clone()))
+                })
+                .collect::<Vec<_>>();
+            outputs.sort();
+            (entry.index, entry.stable_media_id.clone(), outputs)
+        })
+        .collect()
 }
 
 fn reconcile_accepted_bilibili_attempt(
@@ -651,6 +689,7 @@ impl QueueManager {
             _pdf_owner_lock: pdf_owner_lock,
             operation_lock: Mutex::new(()),
             cancellations: Mutex::new(HashMap::new()),
+            publication_notify: Arc::new(Notify::new()),
             #[cfg(test)]
             interrupt_after_sidecar_move: AtomicBool::new(false),
         };
@@ -670,6 +709,11 @@ impl QueueManager {
         }
         manager.recover_interrupted_tasks()?;
         Ok(manager)
+    }
+
+    /// Subscribe to newly published outputs without polling or rescanning task history.
+    pub fn publication_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.publication_notify)
     }
 
     pub fn create(&self, mut task: TaskRecord) -> Result<bool> {
@@ -733,6 +777,28 @@ impl QueueManager {
             .skip(start)
             .take(QUEUE_PAGE_SIZE)
             .collect())
+    }
+
+    /// Return legacy completed records and tasks with verified per-entry output receipts.
+    ///
+    /// This is used to seed the media library's source hints. It intentionally does not filter
+    /// by chat ID because the local library belongs to the single configured bot instance and
+    /// `allow_all_chats` has no finite configured chat list.
+    pub fn published_records(&self) -> Result<Vec<TaskRecord>> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let mut records = self.video.list_records()?;
+        if !self.video.shares_root(&self.pdf) {
+            records.extend(self.pdf.list_records()?);
+        }
+        records.retain(|record| {
+            if record.bilibili_attempt.is_some() {
+                !verified_bilibili_receipt_keys(record).is_empty()
+            } else {
+                record.status == TaskStatus::Completed && record.saved_location.is_some()
+            }
+        });
+        records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
+        Ok(records)
     }
 
     pub fn page_count(&self, chat_id: i64, history: bool) -> Result<usize> {
@@ -1338,7 +1404,9 @@ impl QueueManager {
         expected_generation: u64,
         mut snapshot: BilibiliAttemptSnapshot,
     ) -> Result<Option<TaskRecord>> {
-        self.update_if_generation(id, expected_generation, true, |record| {
+        let mut added_receipt = false;
+        let result = self.update_if_generation(id, expected_generation, true, |record| {
+            let previous_receipts = verified_bilibili_receipt_keys(record);
             if record.status == TaskStatus::Completed && snapshot.independent_entries {
                 return Ok(());
             }
@@ -1349,8 +1417,16 @@ impl QueueManager {
             }
             record.bilibili_attempt = Some(snapshot);
             refresh_bilibili_attempt_counts(record);
+            added_receipt = verified_bilibili_receipt_keys(record)
+                .difference(&previous_receipts)
+                .next()
+                .is_some();
             Ok(())
-        })
+        })?;
+        if result.is_some() && added_receipt {
+            self.publication_notify.notify_one();
+        }
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -1384,6 +1460,7 @@ impl QueueManager {
         if updates.is_empty() {
             return Ok(Some(record));
         }
+        let previous_receipts = verified_bilibili_receipt_keys(&record);
         let Some(snapshot) = record.bilibili_attempt.as_mut() else {
             return Ok(Some(record));
         };
@@ -1394,7 +1471,15 @@ impl QueueManager {
             update.apply(snapshot, *index);
         }
         refresh_bilibili_attempt_counts(&mut record);
-        store.save_mutated_record(record, entry, true).map(Some)
+        let added_receipt = verified_bilibili_receipt_keys(&record)
+            .difference(&previous_receipts)
+            .next()
+            .is_some();
+        let record = store.save_mutated_record(record, entry, true)?;
+        if added_receipt {
+            self.publication_notify.notify_one();
+        }
+        Ok(Some(record))
     }
 
     pub fn record_staging_path_if_generation(
@@ -1554,6 +1639,29 @@ impl QueueManager {
     }
 
     fn complete_if_generation_inner(
+        &self,
+        id: &str,
+        expected_generation: Option<u64>,
+        saved_location: String,
+        media_paths: &[PathBuf],
+        hashes: BTreeMap<String, String>,
+    ) -> Result<Option<TaskRecord>> {
+        let result = self.complete_if_generation_unnotified(
+            id,
+            expected_generation,
+            saved_location,
+            media_paths,
+            hashes,
+        )?;
+        if result.as_ref().is_some_and(|record| {
+            record.status == TaskStatus::Completed && record.saved_location.is_some()
+        }) {
+            self.publication_notify.notify_one();
+        }
+        Ok(result)
+    }
+
+    fn complete_if_generation_unnotified(
         &self,
         id: &str,
         expected_generation: Option<u64>,
