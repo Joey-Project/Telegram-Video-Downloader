@@ -77,12 +77,17 @@ export async function readJsonBody(
   }
 }
 
-export function canonicalJson(value: unknown): string {
+export function canonicalJson(
+  value: unknown,
+  options: { maxNodes?: number; complexityStatus?: number } = {},
+): string {
+  const maxNodes = options.maxNodes ?? 100_000;
+  const complexityStatus = options.complexityStatus ?? 400;
   let nodes = 0;
   const visit = (current: unknown, depth: number): string => {
     nodes += 1;
-    if (nodes > 100_000 || depth > 48) {
-      throw new HttpError(400, "JSON structure is too complex");
+    if (nodes > maxNodes || depth > 48) {
+      throw new HttpError(complexityStatus, "JSON structure is too complex");
     }
     if (current === null || typeof current !== "object") {
       const serialized = JSON.stringify(current);

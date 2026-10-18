@@ -43,6 +43,7 @@ export interface PendingSummary {
 const SNAPSHOT_CHUNK_BYTES = 500_000;
 const MAX_SNAPSHOT_BYTES = 12 * 1024 * 1024;
 const MAX_SNAPSHOT_CHUNKS = 24;
+const MAX_SNAPSHOT_CANONICAL_JSON_NODES = 1_000_000;
 const HEARTBEAT_WRITE_INTERVAL_MS = 30_000;
 const SNAPSHOT_STALE_AFTER_MS = 10 * 60_000;
 
@@ -166,8 +167,9 @@ export async function storeSnapshot(
   db: D1Database,
   snapshot: LocalSnapshot,
 ): Promise<{ ignoredOutOfOrder: boolean }> {
-  const libraryJson = canonicalJson(snapshot.library);
-  const stateJson = canonicalJson(stateOnly(snapshot));
+  const snapshotCanonicalJsonOptions = { maxNodes: MAX_SNAPSHOT_CANONICAL_JSON_NODES, complexityStatus: 413 };
+  const libraryJson = canonicalJson(snapshot.library, snapshotCanonicalJsonOptions);
+  const stateJson = canonicalJson(stateOnly(snapshot), snapshotCanonicalJsonOptions);
   const [libraryHash, stateHash, prior] = await Promise.all([
     sha256Hex(libraryJson),
     sha256Hex(stateJson),

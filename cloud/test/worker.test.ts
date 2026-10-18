@@ -11,7 +11,7 @@ import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "../public/file/s
 import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
-import { MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS } from "../src/validation";
+import { canonicalJson, MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS, MAX_STATE_BODY_BYTES } from "../src/validation";
 import worker from "../src/index";
 
 const testEnv = env as typeof env & { TEST_MIGRATIONS: D1Migration[] };
@@ -69,6 +69,18 @@ describe("selection limit", () => {
     expect(removed.ids).toHaveLength(MAX_SELECTED_ITEMS - 1);
     expect(removed.ids[0]).toBe("item-0");
     expect(removed.omittedCount).toBe(0);
+  });
+});
+
+describe("snapshot canonicalization bounds", () => {
+  it("keeps the default canonical JSON node cap for non-snapshot payloads", () => {
+    let error: unknown;
+    try {
+      canonicalJson(Array.from({ length: 100_000 }, () => null));
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toMatchObject({ status: 400, message: "JSON structure is too complex" });
   });
 });
 
@@ -452,6 +464,79 @@ describe("local client API and state snapshots", () => {
     expect(state.library.ready).toBe(false);
     expect(state.library.scanned_at).toBe(0);
     expect(state.last_seen).toBeGreaterThan(0);
+  });
+
+  it("stores a valid library snapshot with more than 6,700 media items", async () => {
+    const base = localSnapshot();
+    const library = base.library as Record<string, unknown>;
+    const items = Array.from({ length: 6_701 }, (_, index) => ({
+      id: `media-${index}`,
+      title: `Video ${index}`,
+      relative_path: `Videos/${index}.mp4`,
+      bytes: 1_024,
+      width: null,
+      height: null,
+      codec: null,
+      source_ids: [],
+      collection: null,
+      attachments: [],
+      confidence: "high",
+      metadata_status: "complete",
+      integrity_status: "verified",
+      presence: "present",
+    }));
+    const body = JSON.stringify({ ...base, library: { ...library, items } });
+    expect(textEncoder.encode(body).byteLength).toBeLessThan(MAX_STATE_BODY_BYTES);
+
+    const response = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body,
+    }));
+    expect(response.status).toBe(200);
+
+    const owner = await signInitData();
+    const stored = await responseJson<{ synced: boolean; library: { items: unknown[] } }>(await ownerRequest("/api/library", owner));
+    expect(stored.synced).toBe(true);
+    expect(stored.library.items).toHaveLength(6_701);
+  });
+
+  it("returns 413 for snapshot complexity while retaining bounded default and depth behavior", async () => {
+    const base = localSnapshot();
+    const library = base.library as Record<string, unknown>;
+    const nodeHeavyBody = JSON.stringify({
+      ...base,
+      library: { ...library, items: Array.from({ length: 1_000_000 }, () => null) },
+    });
+    expect(textEncoder.encode(nodeHeavyBody).byteLength).toBeLessThan(MAX_STATE_BODY_BYTES);
+
+    const nodeHeavy = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: nodeHeavyBody,
+    }));
+    expect(nodeHeavy.status).toBe(413);
+    expect(await responseJson<{ error: string }>(nodeHeavy)).toEqual({ error: "JSON structure is too complex" });
+
+    let deepValue: unknown = null;
+    for (let depth = 0; depth < 50; depth += 1) deepValue = [deepValue];
+    const tooDeep = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ ...base, library: { ...library, items: [], unexpected: deepValue } }),
+    }));
+    expect(tooDeep.status).toBe(413);
+    expect(await responseJson<{ error: string }>(tooDeep)).toEqual({ error: "JSON structure is too complex" });
+
+    const oversizedBody = JSON.stringify({ ...base, padding: "x".repeat(MAX_STATE_BODY_BYTES) });
+    expect(textEncoder.encode(oversizedBody).byteLength).toBeGreaterThan(MAX_STATE_BODY_BYTES);
+    const oversized = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: oversizedBody,
+    }));
+    expect(oversized.status).toBe(413);
+    expect(await responseJson<{ error: string }>(oversized)).toEqual({ error: "Request body is too large" });
   });
 
   it("keeps state_version monotonic, accepts identical retries, and rejects same-version mutations", async () => {

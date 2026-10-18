@@ -63,7 +63,7 @@ use crate::downloader::{
     sync_bilibili_rust_credentials, validate_bilibili_report_media_hashes,
     validate_existing_bilibili_report_for_completion,
 };
-use crate::file_manager::LibraryManager;
+use crate::file_manager::{LibraryManager, release_preview_anchors};
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 use crate::library::{
     ConflictPolicy, HintOrigin, LibrarySnapshot, MetadataPatch, MovePreview, SourceHint,
@@ -1432,6 +1432,12 @@ async fn dispatch_cloud_record(runtime: CloudBotRuntime, record: InboxRecord) {
     let seq = record.request.seq;
     match outcome {
         Ok(outcome) => {
+            let preview_id = outcome
+                .result
+                .as_ref()
+                .and_then(|result| result.get("preview_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             let inbox = Arc::clone(&runtime.inbox);
             let update = tokio::task::spawn_blocking(move || {
                 inbox.persist_dispatch_result(seq, outcome.status, outcome.result, outcome.error)
@@ -1441,7 +1447,7 @@ async fn dispatch_cloud_record(runtime: CloudBotRuntime, record: InboxRecord) {
                 Ok(Ok(_)) => {
                     if let Some((preview_seq, preview_status)) = outcome.related_preview {
                         let inbox = Arc::clone(&runtime.inbox);
-                        if let Err(error) = tokio::task::spawn_blocking(move || {
+                        let update = tokio::task::spawn_blocking(move || {
                             inbox.update(preview_seq, |preview| {
                                 preview.status = preview_status;
                                 preview.error = (preview_status == InboxStatus::Stale)
@@ -1450,9 +1456,13 @@ async fn dispatch_cloud_record(runtime: CloudBotRuntime, record: InboxRecord) {
                         })
                         .await
                         .context("cloud preview completion worker failed")
-                        .and_then(|result| result.map(|_| ()))
-                        {
+                        .and_then(|result| result.map(|_| ()));
+                        if let Err(error) = update {
                             warn!(seq, preview_seq, error = %format!("{error:#}"), "failed to close confirmed preview record");
+                        } else if preview_status != InboxStatus::AwaitingConfirmation
+                            && let Some(preview_id) = preview_id.as_deref()
+                        {
+                            release_preview_anchors(preview_id);
                         }
                     }
                     runtime.state_notify.notify_one();

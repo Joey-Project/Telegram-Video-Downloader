@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(target_os = "macos")]
+use std::ffi::CStr;
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -14,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::downloader::video_output_lock_file;
 use crate::file_provider::{
@@ -34,8 +39,10 @@ const LIBRARY_INDEX: &str = "index.json";
 const LIBRARY_LOCK: &str = "library.lock";
 const PREVIEW_PREFIX: &str = "preview-";
 const BATCH_PREFIX: &str = "batch-";
+const INDEX_QUARANTINE_PREFIX: &str = ".index.corrupt.";
 const INDEX_VERSION: u32 = 1;
 const INDEX_LIMIT: usize = 16 * 1024 * 1024;
+const MAX_INDEX_QUARANTINES: usize = 3;
 const MAX_MISSING_INDEX_RECORDS: usize = 1024;
 const PREVIEW_LIMIT: usize = 4 * 1024 * 1024;
 const MANIFEST_LIMIT: usize = 16 * 1024 * 1024;
@@ -47,18 +54,456 @@ const MAX_MEDIA_ITEMS: usize = 50_000;
 const MAX_PINNED_PREVIEWS: usize = 64;
 const MAX_PINNED_FILES_PER_PREVIEW: usize = 512;
 const MAX_PINNED_FILES_TOTAL: usize = 4096;
+const PREVIEW_ANCHOR_TTL: Duration = Duration::from_secs(60 * 60);
+const PREVIEW_ANCHOR_REAPER_INTERVAL: Duration = Duration::from_secs(60);
 const FFPROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const SCAN_TIMEOUT: Duration = Duration::from_secs(120);
 const FFPROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 static PRIVATE_TEMP_SERIAL: AtomicU64 = AtomicU64::new(0);
 static PROCESS_NONCE: OnceLock<String> = OnceLock::new();
 static LIVE_PREVIEW_ANCHORS: OnceLock<Mutex<PreviewAnchorStore>> = OnceLock::new();
+static PREVIEW_ANCHOR_REAPER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
 #[derive(Default)]
 struct PreviewAnchorStore {
-    by_preview: HashMap<String, HashMap<String, BoundFile>>,
+    by_preview: HashMap<String, PreviewAnchorEntry>,
     order: VecDeque<String>,
     file_count: usize,
+}
+
+struct PreviewAnchorEntry {
+    anchors: HashMap<String, BoundFile>,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct TargetReservationSet {
+    keys: HashSet<TargetReservationKey>,
+    semantics_by_directory: HashMap<(u64, u64), TargetNameSemantics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TargetReservationKey {
+    directory_device: u64,
+    directory_inode: u64,
+    components: Vec<String>,
+}
+
+// These keys only prevent preview-time collisions; they are not persisted as filesystem identity.
+// Unknown or unsupported name-comparison rules fail closed instead of being guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TargetNameSemantics {
+    normalization_insensitive: bool,
+    case_insensitive: bool,
+    hfs_ignorable: bool,
+}
+
+impl TargetReservationSet {
+    fn contains(&mut self, root: &RootedFs, target: &str) -> Result<bool> {
+        let key = self.key_for(root, target)?;
+        Ok(self.keys.contains(&key))
+    }
+
+    fn insert(&mut self, root: &RootedFs, target: &str) -> Result<()> {
+        let key = self.key_for(root, target)?;
+        self.keys.insert(key);
+        Ok(())
+    }
+
+    fn key_for(&mut self, root: &RootedFs, target: &str) -> Result<TargetReservationKey> {
+        let relative = safe_relative_path(target, false)?;
+        let components = relative
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => name
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("target filename is not valid UTF-8")),
+                _ => bail!("target path contains an invalid component"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (target_name, parent_components) = components
+            .split_last()
+            .ok_or_else(|| anyhow!("target path does not name a file"))?;
+
+        let mut existing_parent = PathBuf::new();
+        let mut parent_identity = root.root_identity();
+        let mut unresolved_at = parent_components.len();
+        for (index, component) in parent_components.iter().enumerate() {
+            let candidate = existing_parent.join(component);
+            let absolute = root.logical_root_path().join(&candidate);
+            match root.entry_identity(&absolute)? {
+                Some(identity) if identity.is_dir() => {
+                    existing_parent = candidate;
+                    parent_identity = identity;
+                }
+                Some(_) => bail!("target path parent is not a directory"),
+                None => {
+                    unresolved_at = index;
+                    break;
+                }
+            }
+        }
+
+        let directory_key = (parent_identity.device(), parent_identity.inode());
+        let semantics = if let Some(semantics) = self.semantics_by_directory.get(&directory_key) {
+            *semantics
+        } else {
+            let directory =
+                open_validated_target_directory(root, &existing_parent, parent_identity)?;
+            let semantics = target_name_semantics(&directory)?;
+            self.semantics_by_directory.insert(directory_key, semantics);
+            semantics
+        };
+
+        let mut names = parent_components[unresolved_at..].to_vec();
+        names.push(target_name.clone());
+        build_target_reservation_key(parent_identity, &names, semantics)
+    }
+}
+
+fn build_target_reservation_key(
+    directory: EntryIdentity,
+    names: &[String],
+    semantics: TargetNameSemantics,
+) -> Result<TargetReservationKey> {
+    build_target_reservation_key_with(directory, names, semantics, platform_case_fold)
+}
+
+fn build_target_reservation_key_with<F>(
+    directory: EntryIdentity,
+    names: &[String],
+    semantics: TargetNameSemantics,
+    case_fold: F,
+) -> Result<TargetReservationKey>
+where
+    F: Fn(&str) -> Result<String>,
+{
+    Ok(TargetReservationKey {
+        directory_device: directory.device(),
+        directory_inode: directory.inode(),
+        components: names
+            .iter()
+            .map(|name| target_component_key_with(name, semantics, |value| case_fold(value)))
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn open_validated_target_directory(
+    root: &RootedFs,
+    relative: &Path,
+    expected: EntryIdentity,
+) -> Result<File> {
+    let path = root.logical_root_path().join(relative);
+    let before = if relative.as_os_str().is_empty() {
+        root.root_identity()
+    } else {
+        root.entry_identity(&path)?
+            .ok_or_else(|| anyhow!("target parent directory disappeared"))?
+    };
+    if before != expected || !expected.is_dir() {
+        bail!("target parent directory identity changed");
+    }
+    let directory = File::open(&path).with_context(|| {
+        format!(
+            "failed to inspect target parent directory {}",
+            path.display()
+        )
+    })?;
+    let metadata = directory
+        .metadata()
+        .context("failed to inspect opened target parent directory")?;
+    if !metadata.is_dir()
+        || metadata.dev() != expected.device()
+        || metadata.ino() != expected.inode()
+    {
+        bail!("target parent directory changed while reading name semantics");
+    }
+    let after = if relative.as_os_str().is_empty() {
+        root.root_identity()
+    } else {
+        root.entry_identity(&path)?
+            .ok_or_else(|| anyhow!("target parent directory disappeared"))?
+    };
+    if after != expected {
+        bail!("target parent directory changed while reading name semantics");
+    }
+    Ok(directory)
+}
+
+fn target_component_key_with<F>(
+    name: &str,
+    semantics: TargetNameSemantics,
+    case_fold: F,
+) -> Result<String>
+where
+    F: FnOnce(&str) -> Result<String>,
+{
+    let normalized = if semantics.normalization_insensitive {
+        name.nfd().collect::<String>()
+    } else {
+        name.to_owned()
+    };
+    let folded = if semantics.case_insensitive {
+        case_fold(&normalized)?
+    } else {
+        normalized
+    };
+    let mut key = if semantics.normalization_insensitive {
+        folded.nfd().collect::<String>()
+    } else {
+        folded
+    };
+    if semantics.hfs_ignorable {
+        key.retain(|character| !is_hfs_ignorable(character));
+    }
+    Ok(key)
+}
+
+fn is_hfs_ignorable(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x200c..=0x200f | 0x202a..=0x202e | 0x206a..=0x206f | 0xfeff
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn target_name_semantics(directory: &File) -> Result<TargetNameSemantics> {
+    use std::ffi::c_void;
+    use std::mem::MaybeUninit;
+
+    #[repr(C)]
+    struct VolumeCapabilitiesOutput {
+        length: u32,
+        capabilities: libc::vol_capabilities_attr_t,
+    }
+
+    let mut filesystem = MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: `filesystem` points to writable storage for `libc::statfs`.
+    if unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to identify target filesystem");
+    }
+    // SAFETY: fstatfs initialized the full structure on success.
+    let filesystem = unsafe { filesystem.assume_init() };
+    // SAFETY: f_fstypename is a fixed-size nul-terminated field from fstatfs.
+    let filesystem_name = unsafe { CStr::from_ptr(filesystem.f_fstypename.as_ptr()) }
+        .to_str()
+        .context("target filesystem name is not valid UTF-8")?;
+    if !matches!(filesystem_name, "apfs" | "hfs") {
+        bail!("target filesystem name semantics are unsupported: {filesystem_name}");
+    }
+
+    let mut attributes = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: libc::ATTR_VOL_CAPABILITIES,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut output = MaybeUninit::<VolumeCapabilitiesOutput>::zeroed();
+    // SAFETY: both pointers reference writable/initialized ABI-compatible structures, and the
+    // output buffer has exactly the size described by `VolumeCapabilitiesOutput`.
+    if unsafe {
+        libc::fgetattrlist(
+            directory.as_raw_fd(),
+            (&mut attributes as *mut libc::attrlist).cast::<c_void>(),
+            output.as_mut_ptr().cast::<c_void>(),
+            std::mem::size_of::<VolumeCapabilitiesOutput>(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read target filesystem name capabilities");
+    }
+    // SAFETY: fgetattrlist initialized the result structure on success.
+    let output = unsafe { output.assume_init() };
+    if (output.length as usize) < std::mem::size_of::<VolumeCapabilitiesOutput>() {
+        bail!("target filesystem returned incomplete name capabilities");
+    }
+    let sensitive_bit = libc::VOL_CAP_FMT_CASE_SENSITIVE;
+    if output.capabilities.valid[0] & sensitive_bit == 0 {
+        bail!("target filesystem did not report whether names are case-sensitive");
+    }
+    let case_insensitive = output.capabilities.capabilities[0] & sensitive_bit == 0;
+    Ok(TargetNameSemantics {
+        normalization_insensitive: true,
+        case_insensitive,
+        // HFS uses additional ignorable characters; this conservative public-range subset does
+        // not claim to reproduce the complete historical HFS collation table.
+        hfs_ignorable: filesystem_name == "hfs" && case_insensitive,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn target_name_semantics(directory: &File) -> Result<TargetNameSemantics> {
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: `filesystem` points to writable storage for `libc::statfs`.
+    if unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to identify target filesystem");
+    }
+    // SAFETY: fstatfs initialized the full structure on success.
+    let filesystem = unsafe { filesystem.assume_init() };
+    let filesystem_type = filesystem.f_type as u64;
+    if !matches!(filesystem_type, 0xef53 | 0x0102_1994) {
+        bail!("target filesystem name semantics are unsupported (type {filesystem_type:#x})");
+    }
+    let flags = rustix::fs::ioctl_getflags(directory)
+        .context("failed to inspect Linux directory name flags")?;
+    linux_target_name_semantics(filesystem_type, flags.bits())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_target_name_semantics(
+    filesystem_type: u64,
+    directory_flags: u32,
+) -> Result<TargetNameSemantics> {
+    const EXT4_SUPER_MAGIC: u64 = 0xef53;
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const FS_CASEFOLD_FL: u32 = 0x4000_0000;
+
+    if !matches!(filesystem_type, EXT4_SUPER_MAGIC | TMPFS_MAGIC) {
+        bail!("target filesystem name semantics are unsupported (type {filesystem_type:#x})");
+    }
+    if directory_flags & FS_CASEFOLD_FL != 0 {
+        bail!("case-folded Linux target directories are not supported safely");
+    }
+    Ok(TargetNameSemantics {
+        normalization_insensitive: false,
+        case_insensitive: false,
+        hfs_ignorable: false,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn target_name_semantics(_directory: &File) -> Result<TargetNameSemantics> {
+    bail!("target filesystem name semantics are unsupported on this platform");
+}
+
+#[cfg(target_os = "macos")]
+fn platform_case_fold(value: &str) -> Result<String> {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    #[repr(C)]
+    struct CfRange {
+        location: i64,
+        length: i64,
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCharacters(
+            allocator: *const c_void,
+            characters: *const u16,
+            count: i64,
+        ) -> *const c_void;
+        fn CFStringCreateMutableCopy(
+            allocator: *const c_void,
+            max_length: i64,
+            string: *const c_void,
+        ) -> *mut c_void;
+        fn CFStringFold(string: *mut c_void, flags: u32, locale: *const c_void);
+        fn CFStringGetLength(string: *const c_void) -> i64;
+        fn CFStringGetCharacters(string: *const c_void, range: CfRange, buffer: *mut u16);
+        fn CFRelease(value: *const c_void);
+    }
+
+    const CF_COMPARE_CASE_INSENSITIVE: u32 = 1;
+    let characters = value.encode_utf16().collect::<Vec<_>>();
+    // SAFETY: the UTF-16 slice remains alive for the duration of CFStringCreateWithCharacters.
+    let source = unsafe {
+        CFStringCreateWithCharacters(ptr::null(), characters.as_ptr(), characters.len() as i64)
+    };
+    if source.is_null() {
+        bail!("CoreFoundation could not allocate a target name");
+    }
+    // SAFETY: `source` is a valid CFString retained by this function.
+    let folded = unsafe { CFStringCreateMutableCopy(ptr::null(), 0, source) };
+    // SAFETY: release the +1 source reference after making the mutable copy.
+    unsafe { CFRelease(source) };
+    if folded.is_null() {
+        bail!("CoreFoundation could not allocate a folded target name");
+    }
+    let result = (|| {
+        // SAFETY: `folded` is a valid mutable CFString; NULL selects the canonical locale.
+        unsafe { CFStringFold(folded, CF_COMPARE_CASE_INSENSITIVE, ptr::null()) };
+        // SAFETY: `folded` remains valid until the release below.
+        let length = unsafe { CFStringGetLength(folded) };
+        let length =
+            usize::try_from(length).context("CoreFoundation returned an invalid length")?;
+        let mut output = vec![0u16; length];
+        // SAFETY: output has exactly the UTF-16 code-unit capacity returned by CFStringGetLength.
+        unsafe {
+            CFStringGetCharacters(
+                folded,
+                CfRange {
+                    location: 0,
+                    length: length as i64,
+                },
+                output.as_mut_ptr(),
+            )
+        };
+        String::from_utf16(&output).context("CoreFoundation returned invalid UTF-16")
+    })();
+    // SAFETY: release the +1 mutable copy on both success and error paths.
+    unsafe { CFRelease(folded) };
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_case_fold(_value: &str) -> Result<String> {
+    bail!("case-insensitive target names are unsupported on this platform");
+}
+
+impl PreviewAnchorStore {
+    fn remove(&mut self, preview_id: &str) {
+        if let Some(entry) = self.by_preview.remove(preview_id) {
+            self.file_count = self.file_count.saturating_sub(entry.anchors.len());
+        }
+        self.order.retain(|id| id != preview_id);
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        let expired = self
+            .by_preview
+            .iter()
+            .filter_map(|(preview_id, entry)| {
+                (entry.expires_at <= now).then_some(preview_id.clone())
+            })
+            .collect::<Vec<_>>();
+        for preview_id in expired {
+            self.remove(&preview_id);
+        }
+    }
+
+    fn touch(&mut self, preview_id: &str, now: Instant) -> Option<&HashMap<String, BoundFile>> {
+        let entry = self.by_preview.get_mut(preview_id)?;
+        entry.expires_at = now + PREVIEW_ANCHOR_TTL;
+        self.order.retain(|id| id != preview_id);
+        self.order.push_back(preview_id.to_string());
+        self.by_preview.get(preview_id).map(|entry| &entry.anchors)
+    }
+
+    fn make_room_for(&mut self, preview_id: &str, file_count: usize) -> Result<()> {
+        self.remove(preview_id);
+        if file_count > MAX_PINNED_FILES_PER_PREVIEW || file_count > MAX_PINNED_FILES_TOTAL {
+            bail!("preview exceeds the in-process identity-anchor capacity");
+        }
+        while self.by_preview.len() >= MAX_PINNED_PREVIEWS
+            || self.file_count.saturating_add(file_count) > MAX_PINNED_FILES_TOTAL
+        {
+            let Some(oldest) = self.order.front().cloned() else {
+                bail!("preview identity-anchor capacity could not be reclaimed");
+            };
+            self.remove(&oldest);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -156,6 +601,31 @@ enum ManifestFileState {
 struct ScannedFile {
     relative_path: String,
     identity: EntryIdentity,
+}
+
+#[derive(Debug, Default)]
+struct SidecarIndex {
+    by_media: HashMap<String, Vec<String>>,
+    ambiguous_count: usize,
+}
+
+#[derive(Debug)]
+struct PrimaryStemOwner {
+    relative_path: String,
+    count: usize,
+}
+
+struct IndexQuarantineCandidate {
+    path: PathBuf,
+    identity: EntryIdentity,
+    timestamp: u128,
+    serial: u64,
+}
+
+struct IndexFileRead {
+    digest: String,
+    contents: Vec<u8>,
+    file: BoundFile,
 }
 
 struct BoundFileRead {
@@ -409,7 +879,7 @@ impl LibraryManager {
             .map(|item| (item.id.as_str(), item))
             .collect::<HashMap<_, _>>();
         let mut move_items = Vec::new();
-        let mut reserved_targets = HashSet::new();
+        let mut reserved_targets = TargetReservationSet::default();
         let mut preview_anchors = HashMap::new();
         for item_id in item_ids {
             let item = items_by_id
@@ -430,7 +900,7 @@ impl LibraryManager {
                 &item_target_dir,
                 rename,
                 conflict,
-                &reserved_targets,
+                &mut reserved_targets,
             )?;
             preview_anchors.extend(anchors);
             let main_target = files
@@ -452,7 +922,9 @@ impl LibraryManager {
             let reason = (outcome == MoveOutcome::Skip)
                 .then(|| "one or more target names already exist".to_string());
             if outcome == MoveOutcome::Move {
-                reserved_targets.extend(files.iter().map(|file| file.target_path.clone()));
+                for file in &files {
+                    reserved_targets.insert(&self.root, &file.target_path)?;
+                }
             }
             move_items.push(MovePreviewItem {
                 item_id: item.id.clone(),
@@ -611,7 +1083,7 @@ impl LibraryManager {
         target_dir: &Path,
         rename: bool,
         conflict: ConflictPolicy,
-        reserved_targets: &HashSet<String>,
+        reserved_targets: &mut TargetReservationSet,
     ) -> Result<(Vec<FileMovePreview>, HashMap<String, BoundFile>)> {
         let primary = self.absolute_path(&item.relative_path)?;
         let mut source_paths = vec![item.relative_path.clone()];
@@ -737,10 +1209,10 @@ impl LibraryManager {
         &self,
         source_paths: &[String],
         target_paths: &[String],
-        reserved_targets: &HashSet<String>,
+        reserved_targets: &mut TargetReservationSet,
     ) -> Result<bool> {
         for (source, target) in source_paths.iter().zip(target_paths) {
-            if reserved_targets.contains(target) {
+            if reserved_targets.contains(&self.root, target)? {
                 return Ok(true);
             }
             if source == target {
@@ -761,12 +1233,13 @@ impl LibraryManager {
         let Some(cache) = LIVE_PREVIEW_ANCHORS.get() else {
             return Ok(None);
         };
-        let cache = cache
+        let mut cache = cache
             .lock()
             .map_err(|_| anyhow!("preview identity-anchor cache is poisoned"))?;
+        let now = Instant::now();
+        cache.prune_expired(now);
         Ok(cache
-            .by_preview
-            .get(preview_id)
+            .touch(preview_id, now)
             .and_then(|anchors| anchors.get(identity))
             .cloned())
     }
@@ -1301,16 +1774,35 @@ impl LibraryManager {
     }
 
     fn scan_locked(&self, hints: &[SourceHint]) -> Result<LibrarySnapshot> {
-        let mut index = self.read_index()?;
+        let (mut index, index_warning) = self.read_index_with_recovery()?;
         let mut walk = ScanWalk::default();
+        if let Some(warning) = index_warning {
+            walk.warnings.push(warning);
+        }
         self.walk_directory(Path::new(""), 0, &mut walk)?;
         walk.files
             .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         if walk.files.len() > MAX_ENTRIES {
+            for file in walk.files.iter().skip(MAX_ENTRIES) {
+                let parent = Path::new(&file.relative_path)
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_string_lossy()
+                    .into_owned();
+                walk.incomplete_directories.insert(parent);
+            }
             walk.files.truncate(MAX_ENTRIES);
             walk.incomplete_scan = true;
             walk.warnings
                 .push(format!("scan stopped at the {MAX_ENTRIES}-entry limit"));
+        }
+
+        let sidecars = SidecarIndex::build(&walk.files, &walk.incomplete_directories);
+        if sidecars.ambiguous_count > 0 {
+            walk.warnings.push(format!(
+                "{} sidecar file(s) were left unattached because their longest matching media stem is ambiguous",
+                sidecars.ambiguous_count
+            ));
         }
 
         let mut videos = Vec::new();
@@ -1340,7 +1832,7 @@ impl LibraryManager {
             }
             match self.build_item(
                 file,
-                &walk.files,
+                &sidecars,
                 hints,
                 walk.started_at,
                 &mut walk.timed_out,
@@ -1600,6 +2092,7 @@ impl LibraryManager {
             } else if identity.is_file() {
                 if walk.files.len() >= MAX_ENTRIES {
                     walk.incomplete_scan = true;
+                    walk.incomplete_directories.insert(relative_string.clone());
                     walk.warnings
                         .push(format!("scan stopped at the {MAX_ENTRIES}-entry limit"));
                     return Ok(());
@@ -1617,7 +2110,7 @@ impl LibraryManager {
     fn build_item(
         &self,
         media: &ScannedFile,
-        all_files: &[ScannedFile],
+        sidecars: &SidecarIndex,
         hints: &[SourceHint],
         scan_started_at: Instant,
         scan_timed_out: &mut bool,
@@ -1680,7 +2173,7 @@ impl LibraryManager {
             MetadataStatus::Unknown
         };
         let mut sidecar_unreadable = false;
-        let attachments = attached_files(media, all_files, warnings)?;
+        let attachments = sidecars.attached_files(media);
         for attachment in &attachments {
             if scan_started_at.elapsed() >= SCAN_TIMEOUT {
                 *scan_timed_out = true;
@@ -1949,20 +2442,180 @@ impl LibraryManager {
         })
     }
 
+    #[cfg(test)]
     fn read_index(&self) -> Result<LibraryIndex> {
+        self.read_index_with_recovery().map(|(index, _)| index)
+    }
+
+    fn read_index_with_recovery(&self) -> Result<(LibraryIndex, Option<String>)> {
         let path = self.library_dir.join(LIBRARY_INDEX);
-        let Some(contents) = self.read_private_file(&path, INDEX_LIMIT)? else {
-            return Ok(LibraryIndex {
-                version: INDEX_VERSION,
-                ..LibraryIndex::default()
-            });
+        let Some(read) = self.read_index_file(&path)? else {
+            return Ok((empty_library_index(), None));
         };
-        let index: LibraryIndex = serde_json::from_slice(&contents)
-            .context("failed to parse the rebuildable media-library index")?;
-        if index.version != INDEX_VERSION {
-            bail!("unsupported media-library index version {}", index.version);
+        match serde_json::from_slice::<LibraryIndex>(&read.contents) {
+            Ok(index) if index.version == INDEX_VERSION => Ok((index, None)),
+            Ok(index) => {
+                let reason = format!("unsupported schema version {}", index.version);
+                let quarantine_name = self.quarantine_index_file(&path, &read)?;
+                self.prune_index_quarantines()?;
+                Ok((
+                    empty_library_index(),
+                    Some(index_recovery_warning(&reason, &quarantine_name)),
+                ))
+            }
+            Err(_) => {
+                let reason = "malformed or truncated JSON";
+                let quarantine_name = self.quarantine_index_file(&path, &read)?;
+                self.prune_index_quarantines()?;
+                Ok((
+                    empty_library_index(),
+                    Some(index_recovery_warning(reason, &quarantine_name)),
+                ))
+            }
         }
-        Ok(index)
+    }
+
+    fn read_index_file(&self, path: &Path) -> Result<Option<IndexFileRead>> {
+        self.coordinate_read(path, |coordinated| {
+            if coordinated != path {
+                bail!("coordinated media-library index path changed during read");
+            }
+            self.validate_library_directory()?;
+            let entry = self.root.bind_entry(coordinated, false)?;
+            let Some(identity) = self.root.bound_entry_identity(&entry)? else {
+                return Ok(None);
+            };
+            let file = self.root.open_bound_file_if_identity(&entry, identity)?;
+            file.validate_private_single_link(0o600)
+                .context("media-library index must be an owner-private regular file")?;
+            let initial_len = file.byte_len()?;
+            if initial_len > INDEX_LIMIT as u64 {
+                bail!(
+                    "media-library index exceeds the {INDEX_LIMIT}-byte recovery limit; it was not quarantined because its contents could not be safely verified"
+                );
+            }
+            let contents = file.read_limited(INDEX_LIMIT)?;
+            let digest = sha256_bytes(&contents);
+            let repeated_contents = file.read_limited(INDEX_LIMIT)?;
+            if repeated_contents != contents || file.byte_len()? != initial_len {
+                bail!("media-library index content changed while it was being read");
+            }
+            file.validate_private_single_link(0o600)
+                .context("media-library index access policy changed while it was being read")?;
+            self.validate_library_directory()?;
+            if self.root.bound_entry_identity(&entry)? != Some(identity) {
+                bail!("media-library index path was replaced while it was being read");
+            }
+            Ok(Some(IndexFileRead {
+                digest,
+                contents,
+                file,
+            }))
+        })
+    }
+
+    fn quarantine_index_file(&self, path: &Path, read: &IndexFileRead) -> Result<String> {
+        let identity = read.file.identity();
+        validate_index_contents(&read.file, &read.digest)?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_nanos();
+        let serial = PRIVATE_TEMP_SERIAL.fetch_add(1, Ordering::Relaxed);
+        let quarantine_name = format!("{INDEX_QUARANTINE_PREFIX}{timestamp}.{serial}.json");
+        let quarantine_path = path.with_file_name(&quarantine_name);
+
+        self.coordinate_move(
+            path,
+            &quarantine_path,
+            |coordinated_source, coordinated_target| {
+                if coordinated_source != path || coordinated_target != quarantine_path.as_path() {
+                    bail!("coordinated media-library index quarantine path changed");
+                }
+                self.validate_library_directory()?;
+                let source = self.root.bind_entry(coordinated_source, false)?;
+                let destination = self.root.bind_entry(coordinated_target, false)?;
+                let current = self.root.open_bound_file_if_identity(&source, identity)?;
+                validate_index_contents(&current, &read.digest)?;
+                self.root.rename_via_bound_parents_noreplace_if_identity(
+                    &source,
+                    &destination,
+                    identity,
+                )?;
+                let quarantined = self
+                    .root
+                    .open_bound_file_if_identity(&destination, identity)?;
+                validate_index_contents(&quarantined, &read.digest)?;
+                if self.root.bound_entry_identity(&source)?.is_some() {
+                    bail!("media-library index remained at its original path after quarantine");
+                }
+                self.validate_library_directory()?;
+                Ok(())
+            },
+        )?;
+        Ok(quarantine_name)
+    }
+
+    fn prune_index_quarantines(&self) -> Result<()> {
+        self.validate_library_directory()?;
+        let directory = self.root.bind_entry(&self.library_dir, false)?;
+        let identity = self
+            .root
+            .bound_entry_identity(&directory)?
+            .ok_or_else(|| anyhow!("private media-library directory disappeared"))?;
+        self.root
+            .validate_private_bound_directory(&directory, identity, 0o700)?;
+        let entries = self.root.list_bound_directory(&directory, identity)?;
+        let mut retained = Vec::with_capacity(MAX_INDEX_QUARANTINES + 1);
+        for (name, entry_identity) in entries {
+            if !entry_identity.is_file() {
+                continue;
+            }
+            let Some((timestamp, serial)) = parse_index_quarantine_name(&name) else {
+                continue;
+            };
+            retained.push(IndexQuarantineCandidate {
+                path: self.library_dir.join(&name),
+                identity: entry_identity,
+                timestamp,
+                serial,
+            });
+            if retained.len() > MAX_INDEX_QUARANTINES {
+                let oldest = retained
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, candidate)| (candidate.timestamp, candidate.serial))
+                    .map(|(index, _)| index)
+                    .expect("retained index quarantine list is nonempty");
+                let candidate = retained.remove(oldest);
+                self.remove_index_quarantine(candidate)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_index_quarantine(&self, candidate: IndexQuarantineCandidate) -> Result<()> {
+        self.validate_library_directory()?;
+        let entry = self.root.bind_entry(&candidate.path, false)?;
+        if self.root.bound_entry_identity(&entry)? != Some(candidate.identity) {
+            bail!("media-library index quarantine identity changed before pruning");
+        }
+        let file = self
+            .root
+            .open_bound_file_if_identity(&entry, candidate.identity)?;
+        file.validate_private_single_link(0o600)
+            .context("media-library index quarantine is not an owner-private regular file")?;
+        let digest = bounded_index_file_digest(&file)?;
+        let expected_identity = candidate.identity;
+        self.root.remove_bound_file_if_identity_with_validation(
+            &entry,
+            expected_identity,
+            || {
+                self.validate_library_directory()?;
+                validate_index_contents(&file, &digest)
+            },
+        )?;
+        Ok(())
     }
 
     fn write_index(&self, index: &LibraryIndex) -> Result<()> {
@@ -2609,32 +3262,48 @@ fn store_preview_anchors(preview_id: &str, anchors: HashMap<String, BoundFile>) 
             "preview selects too many files without a persistent creation-time signal; split the selection"
         );
     }
+    start_preview_anchor_reaper()?;
     let cache = LIVE_PREVIEW_ANCHORS.get_or_init(|| Mutex::new(PreviewAnchorStore::default()));
     let mut cache = cache
         .lock()
         .map_err(|_| anyhow!("preview identity-anchor cache is poisoned"))?;
-    let old_size = cache
-        .by_preview
-        .get(preview_id)
-        .map(HashMap::len)
-        .unwrap_or(0);
-    let new_total = cache
-        .file_count
-        .saturating_sub(old_size)
-        .saturating_add(anchors.len());
-    if (!cache.by_preview.contains_key(preview_id) && cache.by_preview.len() >= MAX_PINNED_PREVIEWS)
-        || new_total > MAX_PINNED_FILES_TOTAL
-    {
-        bail!(
-            "too many outstanding previews need in-process identity anchors; confirm or restart before creating another preview"
-        );
-    }
-    cache.file_count = new_total;
-    if !cache.by_preview.contains_key(preview_id) {
-        cache.order.push_back(preview_id.to_string());
-    }
-    cache.by_preview.insert(preview_id.to_string(), anchors);
+    let now = Instant::now();
+    cache.prune_expired(now);
+    cache.make_room_for(preview_id, anchors.len())?;
+    cache.file_count = cache.file_count.saturating_add(anchors.len());
+    cache.order.push_back(preview_id.to_string());
+    cache.by_preview.insert(
+        preview_id.to_string(),
+        PreviewAnchorEntry {
+            anchors,
+            expires_at: now + PREVIEW_ANCHOR_TTL,
+        },
+    );
     Ok(())
+}
+
+fn start_preview_anchor_reaper() -> Result<()> {
+    let started = PREVIEW_ANCHOR_REAPER.get_or_init(|| {
+        thread::Builder::new()
+            .name("preview-anchor-reaper".to_string())
+            .spawn(|| {
+                loop {
+                    thread::sleep(PREVIEW_ANCHOR_REAPER_INTERVAL);
+                    let Some(cache) = LIVE_PREVIEW_ANCHORS.get() else {
+                        continue;
+                    };
+                    if let Ok(mut cache) = cache.lock() {
+                        cache.prune_expired(Instant::now());
+                    }
+                }
+            })
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    });
+    started
+        .as_ref()
+        .map(|_| ())
+        .map_err(|error| anyhow!("failed to start preview identity-anchor reaper: {error}"))
 }
 
 fn require_preview_anchors(persisted: &PersistedPreview, process_nonce: &str) -> Result<()> {
@@ -2670,10 +3339,12 @@ fn require_preview_anchors(persisted: &PersistedPreview, process_nonce: &str) ->
         );
     }
     let cache = LIVE_PREVIEW_ANCHORS.get_or_init(|| Mutex::new(PreviewAnchorStore::default()));
-    let cache = cache
+    let mut cache = cache
         .lock()
         .map_err(|_| anyhow!("preview identity-anchor cache is poisoned"))?;
-    let anchors = cache.by_preview.get(&persisted.preview.id).ok_or_else(|| {
+    let now = Instant::now();
+    cache.prune_expired(now);
+    let anchors = cache.touch(&persisted.preview.id, now).ok_or_else(|| {
         anyhow!("selected object lost its in-process descriptor anchor; create a new preview")
     })?;
     for token in required {
@@ -2694,17 +3365,14 @@ fn require_preview_anchors(persisted: &PersistedPreview, process_nonce: &str) ->
     Ok(())
 }
 
-fn release_preview_anchors(preview_id: &str) {
+pub(crate) fn release_preview_anchors(preview_id: &str) {
     let Some(cache) = LIVE_PREVIEW_ANCHORS.get() else {
         return;
     };
     let Ok(mut cache) = cache.lock() else {
         return;
     };
-    if let Some(anchors) = cache.by_preview.remove(preview_id) {
-        cache.file_count = cache.file_count.saturating_sub(anchors.len());
-    }
-    cache.order.retain(|id| id != preview_id);
+    cache.remove(preview_id);
 }
 
 fn sha256_bound_file(file: &BoundFile) -> Result<String> {
@@ -3114,59 +3782,100 @@ fn is_sidecar(path: &str) -> bool {
     )
 }
 
-fn attached_files(
-    media: &ScannedFile,
-    all_files: &[ScannedFile],
-    warnings: &mut Vec<String>,
-) -> Result<Vec<String>> {
-    let media_path = Path::new(&media.relative_path);
-    let parent = media_path.parent().unwrap_or_else(|| Path::new(""));
-    let stem = media_path
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| anyhow!("media path has a non-UTF-8 stem"))?;
-    let same_stem_media = all_files
-        .iter()
-        .filter(|candidate| {
-            if !is_primary_media(&candidate.relative_path) {
-                return false;
+impl SidecarIndex {
+    fn build(files: &[ScannedFile], incomplete_directories: &BTreeSet<String>) -> Self {
+        let mut owners: HashMap<String, HashMap<String, PrimaryStemOwner>> = HashMap::new();
+        for file in files
+            .iter()
+            .filter(|file| is_primary_media(&file.relative_path))
+        {
+            let path = Path::new(&file.relative_path);
+            let parent = path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy()
+                .into_owned();
+            if incomplete_directories.contains(&parent) {
+                continue;
             }
-            let candidate_path = Path::new(&candidate.relative_path);
-            candidate_path.parent().unwrap_or_else(|| Path::new("")) == parent
-                && candidate_path.file_stem().and_then(OsStr::to_str) == Some(stem)
-        })
-        .map(|candidate| candidate.relative_path.as_str())
-        .collect::<Vec<_>>();
-    if same_stem_media.len() > 1
-        && same_stem_media.first().copied() != Some(media.relative_path.as_str())
-    {
-        warnings.push(format!(
-            "sidecars for same-stem media are assigned to the first entry only: {stem}"
-        ));
-        return Ok(Vec::new());
-    }
-    let mut attachments = all_files
-        .iter()
-        .filter(|candidate| {
-            candidate.relative_path != media.relative_path && is_sidecar(&candidate.relative_path)
-        })
-        .filter(|candidate| {
-            let candidate_path = Path::new(&candidate.relative_path);
-            if candidate_path.parent().unwrap_or_else(|| Path::new("")) != parent {
-                return false;
-            }
-            let Some(candidate_stem) = candidate_path.file_stem().and_then(OsStr::to_str) else {
-                return false;
+            let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+                continue;
             };
-            candidate_stem == stem
-                || candidate_stem
-                    .strip_prefix(stem)
-                    .is_some_and(|suffix| suffix.starts_with('.'))
-        })
-        .map(|candidate| candidate.relative_path.clone())
-        .collect::<Vec<_>>();
-    attachments.sort();
-    Ok(attachments)
+            let stems = owners.entry(parent).or_default();
+            match stems.entry(stem.to_string()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let owner = entry.get_mut();
+                    owner.count = owner.count.saturating_add(1);
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PrimaryStemOwner {
+                        relative_path: file.relative_path.clone(),
+                        count: 1,
+                    });
+                }
+            }
+        }
+
+        let mut index = Self::default();
+        for file in files.iter().filter(|file| is_sidecar(&file.relative_path)) {
+            let path = Path::new(&file.relative_path);
+            let parent = path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy()
+                .into_owned();
+            if incomplete_directories.contains(&parent) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
+                continue;
+            };
+            let Some(stems) = owners.get(&parent) else {
+                continue;
+            };
+            let Some(owner) = longest_matching_primary_stem(stem, stems) else {
+                continue;
+            };
+            if owner.count > 1 {
+                index.ambiguous_count = index.ambiguous_count.saturating_add(1);
+                continue;
+            }
+            index
+                .by_media
+                .entry(owner.relative_path.clone())
+                .or_default()
+                .push(file.relative_path.clone());
+        }
+        for attachments in index.by_media.values_mut() {
+            attachments.sort();
+        }
+        index
+    }
+
+    fn attached_files(&self, media: &ScannedFile) -> Vec<String> {
+        self.by_media
+            .get(&media.relative_path)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn longest_matching_primary_stem<'a>(
+    sidecar_stem: &str,
+    primary_stems: &'a HashMap<String, PrimaryStemOwner>,
+) -> Option<&'a PrimaryStemOwner> {
+    if let Some(owner) = primary_stems.get(sidecar_stem) {
+        return Some(owner);
+    }
+    for (boundary, _) in sidecar_stem.match_indices('.').rev() {
+        if boundary == 0 {
+            continue;
+        }
+        if let Some(owner) = primary_stems.get(&sidecar_stem[..boundary]) {
+            return Some(owner);
+        }
+    }
+    None
 }
 
 fn attachment_kind(path: &str) -> &'static str {
@@ -3253,6 +3962,67 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+fn empty_library_index() -> LibraryIndex {
+    LibraryIndex {
+        version: INDEX_VERSION,
+        ..LibraryIndex::default()
+    }
+}
+
+fn index_recovery_warning(reason: &str, quarantine_name: &str) -> String {
+    format!(
+        "rebuilt media-library index after {reason}; previous index preserved as {quarantine_name} (automatic recovery is limited to owner-private files up to {INDEX_LIMIT} bytes)"
+    )
+}
+
+fn parse_index_quarantine_name(name: &OsStr) -> Option<(u128, u64)> {
+    let name = name.to_str()?;
+    let body = name
+        .strip_prefix(INDEX_QUARANTINE_PREFIX)?
+        .strip_suffix(".json")?;
+    let (timestamp, serial) = body.split_once('.')?;
+    let timestamp = parse_canonical_decimal(timestamp)?;
+    let serial = parse_canonical_decimal(serial)?;
+    if timestamp == 0 || serial > u64::MAX as u128 {
+        return None;
+    }
+    Some((timestamp, serial as u64))
+}
+
+fn parse_canonical_decimal(value: &str) -> Option<u128> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn bounded_index_file_digest(file: &BoundFile) -> Result<String> {
+    file.validate_private_single_link(0o600)
+        .context("media-library index quarantine access policy changed")?;
+    let initial_len = file.byte_len()?;
+    if initial_len > INDEX_LIMIT as u64 {
+        bail!("media-library index quarantine exceeds the {INDEX_LIMIT}-byte verification limit");
+    }
+    let contents = file.read_limited(INDEX_LIMIT)?;
+    let repeated_contents = file.read_limited(INDEX_LIMIT)?;
+    if repeated_contents != contents || file.byte_len()? != initial_len {
+        bail!("media-library index quarantine content changed while being verified");
+    }
+    file.validate_private_single_link(0o600)
+        .context("media-library index quarantine access policy changed while being verified")?;
+    Ok(sha256_bytes(&contents))
+}
+
+fn validate_index_contents(file: &BoundFile, expected_digest: &str) -> Result<()> {
+    if bounded_index_file_digest(file)? != expected_digest {
+        bail!("media-library index content changed during quarantine validation");
+    }
+    Ok(())
 }
 
 fn deduplicate(values: Vec<String>) -> Vec<String> {
@@ -5616,6 +6386,410 @@ mod tests {
         );
     }
 
+    fn round4_scanned_file(relative_path: &str, inode: u64) -> ScannedFile {
+        ScannedFile {
+            relative_path: relative_path.to_string(),
+            identity: EntryIdentity::regular_file(1, inode),
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Round4IndexMutation {
+        ChildEntryChurn,
+        SameSizeContentChange,
+        ObjectReplacement,
+        AccessPolicyChange,
+    }
+
+    struct Round4IndexMutationProvider {
+        mutation: Round4IndexMutation,
+        applied: AtomicUsize,
+    }
+
+    impl Round4IndexMutationProvider {
+        fn new(mutation: Round4IndexMutation) -> Self {
+            Self {
+                mutation,
+                applied: AtomicUsize::new(0),
+            }
+        }
+
+        fn mutate_index_before_quarantine(&self, source: &Path) -> Result<()> {
+            match self.mutation {
+                Round4IndexMutation::ChildEntryChurn => {
+                    let marker = source
+                        .parent()
+                        .ok_or_else(|| anyhow!("index source should have a parent"))?
+                        .join("unrelated-child-entry");
+                    fs::write(marker, b"child churn")?;
+                }
+                Round4IndexMutation::SameSizeContentChange => {
+                    use std::io::{Seek, SeekFrom, Write};
+
+                    let mut contents = fs::read(source)?;
+                    contents[0] = b'[';
+                    let mut file = fs::OpenOptions::new().write(true).open(source)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    file.write_all(&contents)?;
+                    file.sync_all()?;
+                }
+                Round4IndexMutation::ObjectReplacement => {
+                    let displaced = source.with_file_name("index.replaced");
+                    fs::rename(source, &displaced)?;
+                    fs::write(source, b"{\"version\":1,\"records\":{}}")?;
+                    fs::set_permissions(source, fs::Permissions::from_mode(0o600))?;
+                }
+                Round4IndexMutation::AccessPolicyChange => {
+                    fs::set_permissions(source, fs::Permissions::from_mode(0o644))?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl QueueFileProvider for Round4IndexMutationProvider {
+        fn coordinate_read(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(path)
+        }
+
+        fn coordinate_write(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(path)
+        }
+
+        fn coordinate_move(
+            &self,
+            source: &Path,
+            destination: &Path,
+            accessor: &mut dyn FnMut(&Path, &Path) -> Result<()>,
+        ) -> Result<()> {
+            if source.file_name() == Some(OsStr::new(LIBRARY_INDEX))
+                && self.applied.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                self.mutate_index_before_quarantine(source)?;
+            }
+            accessor(source, destination)
+        }
+    }
+
+    #[test]
+    fn round4_sidecar_index_prefers_exact_stem_and_never_falls_back_from_ambiguity() {
+        let files = vec![
+            round4_scanned_file("episode.mp4", 1),
+            round4_scanned_file("episode.en.mp4", 2),
+            round4_scanned_file("episode.en.srt", 3),
+            round4_scanned_file("duplicate.mp4", 4),
+            round4_scanned_file("duplicate.mkv", 5),
+            round4_scanned_file("duplicate.srt", 6),
+            round4_scanned_file("episode.multi.mp4", 7),
+            round4_scanned_file("episode.multi.mkv", 8),
+            round4_scanned_file("episode.multi.en.srt", 9),
+        ];
+        let index = SidecarIndex::build(&files, &BTreeSet::new());
+
+        assert!(index.attached_files(&files[0]).is_empty());
+        assert_eq!(
+            index.attached_files(&files[1]),
+            vec!["episode.en.srt".to_string()]
+        );
+        assert!(index.attached_files(&files[3]).is_empty());
+        assert!(index.attached_files(&files[4]).is_empty());
+        assert!(index.attached_files(&files[6]).is_empty());
+        assert!(index.attached_files(&files[7]).is_empty());
+        assert_eq!(index.ambiguous_count, 2);
+    }
+
+    #[test]
+    fn round4_sidecar_index_scales_by_parent_and_stem_without_timing_assertions() {
+        const MEDIA_COUNT: usize = 2048;
+        let mut files = Vec::with_capacity(MEDIA_COUNT * 2);
+        for number in 0..MEDIA_COUNT {
+            let stem = format!("group-{number}/episode-{number}");
+            files.push(round4_scanned_file(
+                &format!("{stem}.mp4"),
+                number as u64 + 1,
+            ));
+            files.push(round4_scanned_file(
+                &format!("{stem}.srt"),
+                number as u64 + MEDIA_COUNT as u64 + 1,
+            ));
+        }
+
+        let index = SidecarIndex::build(&files, &BTreeSet::new());
+
+        assert_eq!(index.by_media.len(), MEDIA_COUNT);
+        assert_eq!(index.ambiguous_count, 0);
+        for number in [0, 1, 17, 1024, MEDIA_COUNT - 1] {
+            let media = &files[number * 2];
+            assert_eq!(
+                index.attached_files(media),
+                vec![format!("group-{number}/episode-{number}.srt")]
+            );
+        }
+    }
+
+    #[test]
+    fn round4_corrupt_index_is_quarantined_with_warning_and_rebuilt() {
+        for (label, contents, warning_fragment) in [
+            (
+                "malformed",
+                b"{\"version\":".as_slice(),
+                "malformed or truncated JSON",
+            ),
+            (
+                "unsupported",
+                b"{\"version\":77,\"records\":{}}".as_slice(),
+                "unsupported schema version 77",
+            ),
+        ] {
+            let root = TemporaryRoot::new(&format!("round4-index-{label}"));
+            let manager = manager(&root);
+            let index_path = manager.library_dir.join(LIBRARY_INDEX);
+            manager
+                .write_private_file(&index_path, contents)
+                .expect("corrupt index fixture should be written privately");
+
+            let snapshot = manager
+                .scan(&[])
+                .expect("rebuildable index should not block a scan");
+
+            let warning = snapshot
+                .warnings
+                .iter()
+                .find(|warning| warning.contains(warning_fragment))
+                .expect("scan should explain index recovery");
+            assert!(warning.contains("preserved as .index.corrupt."));
+            assert!(warning.contains(&format!("up to {INDEX_LIMIT} bytes")));
+            let quarantined = fs::read_dir(&manager.library_dir)
+                .expect("private library directory should list")
+                .filter_map(Result::ok)
+                .filter(|entry| parse_index_quarantine_name(&entry.file_name()).is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(quarantined.len(), 1);
+            assert_eq!(
+                fs::read(quarantined[0].path())
+                    .expect("quarantined diagnostic should remain")
+                    .as_slice(),
+                contents
+            );
+            let rebuilt = manager
+                .read_index()
+                .expect("replacement index should use the supported schema");
+            assert_eq!(rebuilt.version, INDEX_VERSION);
+            assert!(rebuilt.records.is_empty());
+        }
+    }
+
+    #[test]
+    fn round4_nonprivate_corrupt_index_remains_an_error_and_is_not_quarantined() {
+        let root = TemporaryRoot::new("round4-index-access-policy");
+        let manager = manager(&root);
+        let index_path = manager.library_dir.join(LIBRARY_INDEX);
+        let contents = b"{\"version\":";
+        manager
+            .write_private_file(&index_path, contents)
+            .expect("corrupt index fixture should be written privately");
+        fs::set_permissions(&index_path, fs::Permissions::from_mode(0o644))
+            .expect("fixture should lose its private access policy");
+
+        let error = manager
+            .scan(&[])
+            .expect_err("index access-policy failure must not look like a missing cache");
+
+        assert!(format!("{error:#}").contains("owner-private"));
+        assert_eq!(fs::read(&index_path).unwrap().as_slice(), contents);
+        assert_eq!(
+            fs::read_dir(&manager.library_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| parse_index_quarantine_name(&entry.file_name()).is_some())
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn round4_index_quarantine_allows_private_directory_child_entry_churn() {
+        let root = TemporaryRoot::new("round4-index-child-churn");
+        let provider: Arc<dyn QueueFileProvider> = Arc::new(Round4IndexMutationProvider::new(
+            Round4IndexMutation::ChildEntryChurn,
+        ));
+        let manager = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should open against the isolated fixture");
+        let index_path = manager.library_dir.join(LIBRARY_INDEX);
+        manager
+            .write_private_file(&index_path, b"{\"version\":")
+            .expect("corrupt index fixture should be written privately");
+
+        let snapshot = manager
+            .scan(&[])
+            .expect("benign sibling creation must not block index recovery");
+
+        assert!(snapshot.warnings.iter().any(|warning| {
+            warning.contains("malformed or truncated JSON")
+                && warning.contains("preserved as .index.corrupt.")
+        }));
+        assert!(manager.library_dir.join("unrelated-child-entry").exists());
+    }
+
+    #[test]
+    fn round4_index_quarantine_rejects_same_size_content_change() {
+        let root = TemporaryRoot::new("round4-index-content-race");
+        let provider: Arc<dyn QueueFileProvider> = Arc::new(Round4IndexMutationProvider::new(
+            Round4IndexMutation::SameSizeContentChange,
+        ));
+        let manager = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should open against the isolated fixture");
+        let index_path = manager.library_dir.join(LIBRARY_INDEX);
+        manager
+            .write_private_file(&index_path, b"{\"version\":")
+            .expect("corrupt index fixture should be written privately");
+
+        let error = manager
+            .scan(&[])
+            .expect_err("same-size content mutation must reject quarantine");
+
+        assert!(format!("{error:#}").contains("content changed"));
+        assert_eq!(fs::read(&index_path).unwrap().as_slice(), b"[\"version\":");
+        assert_eq!(
+            fs::read_dir(&manager.library_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| parse_index_quarantine_name(&entry.file_name()).is_some())
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn round4_index_quarantine_rejects_object_replacement() {
+        let root = TemporaryRoot::new("round4-index-replacement-race");
+        let provider: Arc<dyn QueueFileProvider> = Arc::new(Round4IndexMutationProvider::new(
+            Round4IndexMutation::ObjectReplacement,
+        ));
+        let manager = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should open against the isolated fixture");
+        let index_path = manager.library_dir.join(LIBRARY_INDEX);
+        manager
+            .write_private_file(&index_path, b"{\"version\":")
+            .expect("corrupt index fixture should be written privately");
+
+        let error = manager
+            .scan(&[])
+            .expect_err("a replacement object must reject quarantine");
+
+        assert!(format!("{error:#}").contains("identity changed"));
+        assert!(index_path.exists());
+        assert_eq!(
+            fs::read(&index_path).unwrap().as_slice(),
+            b"{\"version\":1,\"records\":{}}"
+        );
+        assert_eq!(
+            fs::read_to_string(manager.library_dir.join("index.replaced")).unwrap(),
+            "{\"version\":"
+        );
+        assert_eq!(
+            fs::read_dir(&manager.library_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| parse_index_quarantine_name(&entry.file_name()).is_some())
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn round4_index_quarantine_rejects_access_policy_change() {
+        let root = TemporaryRoot::new("round4-index-access-race");
+        let provider: Arc<dyn QueueFileProvider> = Arc::new(Round4IndexMutationProvider::new(
+            Round4IndexMutation::AccessPolicyChange,
+        ));
+        let manager = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should open against the isolated fixture");
+        let index_path = manager.library_dir.join(LIBRARY_INDEX);
+        manager
+            .write_private_file(&index_path, b"{\"version\":")
+            .expect("corrupt index fixture should be written privately");
+
+        let error = manager
+            .scan(&[])
+            .expect_err("access-policy change must reject quarantine");
+
+        assert!(format!("{error:#}").contains("access policy changed"));
+        assert!(index_path.exists());
+        assert_eq!(fs::read(&index_path).unwrap().as_slice(), b"{\"version\":");
+        assert_eq!(fs::metadata(&index_path).unwrap().mode() & 0o777, 0o644);
+        assert_eq!(
+            fs::read_dir(&manager.library_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| parse_index_quarantine_name(&entry.file_name()).is_some())
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn round4_index_quarantine_retention_is_bounded_and_name_strict() {
+        let root = TemporaryRoot::new("round4-index-quarantine-bound");
+        let manager = manager(&root);
+        for (name, contents) in [
+            (".index.corrupt.100.0.json", b"old-0".as_slice()),
+            (".index.corrupt.101.1.json", b"old-1".as_slice()),
+            (".index.corrupt.102.2.json", b"recent-2".as_slice()),
+            (".index.corrupt.103.3.json", b"recent-3".as_slice()),
+            (".index.corrupt.104.4.json", b"recent-4".as_slice()),
+            (".index.corrupt.000.5.json", b"noncanonical".as_slice()),
+            (".index.corrupt.105.5.json.backup", b"unrelated".as_slice()),
+        ] {
+            manager
+                .write_private_file(&manager.library_dir.join(name), contents)
+                .expect("quarantine fixture should be written privately");
+        }
+
+        manager
+            .prune_index_quarantines()
+            .expect("old generated quarantines should be safely pruned");
+
+        let mut retained = fs::read_dir(&manager.library_dir)
+            .expect("private library directory should list")
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                parse_index_quarantine_name(&entry.file_name()).map(|key| (key, entry.file_name()))
+            })
+            .collect::<Vec<_>>();
+        retained.sort_by_key(|(key, _)| *key);
+        assert_eq!(retained.len(), MAX_INDEX_QUARANTINES);
+        assert_eq!(
+            retained
+                .iter()
+                .map(|(_, name)| name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                ".index.corrupt.102.2.json".to_string(),
+                ".index.corrupt.103.3.json".to_string(),
+                ".index.corrupt.104.4.json".to_string(),
+            ]
+        );
+        assert_eq!(
+            fs::read(manager.library_dir.join(".index.corrupt.000.5.json"))
+                .expect("noncanonical name should not be pruned"),
+            b"noncanonical".to_vec()
+        );
+        assert_eq!(
+            fs::read(manager.library_dir.join(".index.corrupt.105.5.json.backup"))
+                .expect("backup name should not be pruned"),
+            b"unrelated".to_vec()
+        );
+    }
+
     #[test]
     fn standard_stem_uses_only_real_order_and_keeps_specs_and_source_id() {
         let item = LibraryItem {
@@ -5659,5 +6833,282 @@ mod tests {
             ..independent
         };
         assert!(standard_media_stem(&youtube).contains("[youtube_abcdefghijk]"));
+    }
+
+    #[test]
+    fn preview_anchor_store_touches_lru_and_drops_expired_handles() {
+        let root = TemporaryRoot::new("preview-anchor-expiration");
+        let media_path = root.path().join("clip.mp4");
+        fs::write(&media_path, b"preview anchor fixture").expect("media fixture should write");
+        let manager = manager(&root);
+        let read = manager
+            .read_file_with_token_and_handle(&media_path, None)
+            .expect("media fixture should bind")
+            .expect("media fixture should exist");
+        let now = Instant::now();
+        let mut anchors = HashMap::new();
+        anchors.insert(read.token.clone(), read.file);
+        let mut store = PreviewAnchorStore {
+            file_count: anchors.len(),
+            ..PreviewAnchorStore::default()
+        };
+        store
+            .order
+            .push_back("preview-anchor-expiration".to_string());
+        store.by_preview.insert(
+            "preview-anchor-expiration".to_string(),
+            PreviewAnchorEntry {
+                anchors,
+                expires_at: now - Duration::from_secs(1),
+            },
+        );
+        store.order.push_back("preview-anchor-recent".to_string());
+        store.by_preview.insert(
+            "preview-anchor-recent".to_string(),
+            PreviewAnchorEntry {
+                anchors: HashMap::new(),
+                expires_at: now + Duration::from_secs(10),
+            },
+        );
+
+        assert!(
+            store
+                .touch("preview-anchor-expiration", now)
+                .is_some_and(|entry| entry.contains_key(&read.token))
+        );
+        assert_eq!(
+            store.order.back().map(String::as_str),
+            Some("preview-anchor-expiration")
+        );
+        assert_eq!(
+            store.by_preview["preview-anchor-expiration"].expires_at,
+            now + PREVIEW_ANCHOR_TTL
+        );
+
+        store.prune_expired(now + PREVIEW_ANCHOR_TTL + Duration::from_secs(1));
+        assert!(store.by_preview.is_empty());
+        assert!(store.order.is_empty());
+        assert_eq!(store.file_count, 0);
+    }
+
+    #[test]
+    fn preview_anchor_terminal_release_drops_global_entry() {
+        let root = TemporaryRoot::new("preview-anchor-terminal-release");
+        let media_path = root.path().join("clip.mp4");
+        fs::write(&media_path, b"terminal release fixture").expect("media fixture should write");
+        let manager = manager(&root);
+        let read = manager
+            .read_file_with_token_and_handle(&media_path, None)
+            .expect("media fixture should bind")
+            .expect("media fixture should exist");
+        let preview_id = new_operation_id("test-preview-anchor-release");
+        let mut anchors = HashMap::new();
+        anchors.insert(read.token.clone(), read.file);
+        store_preview_anchors(&preview_id, anchors).expect("live preview anchors should be stored");
+        {
+            let cache = LIVE_PREVIEW_ANCHORS
+                .get()
+                .expect("anchor cache should initialize")
+                .lock()
+                .expect("anchor cache should remain healthy");
+            assert!(cache.by_preview.contains_key(&preview_id));
+            assert_eq!(
+                cache.by_preview[&preview_id].anchors.len(),
+                1,
+                "terminal release fixture should retain one descriptor"
+            );
+        }
+
+        release_preview_anchors(&preview_id);
+
+        let cache = LIVE_PREVIEW_ANCHORS
+            .get()
+            .expect("anchor cache should remain initialized")
+            .lock()
+            .expect("anchor cache should remain healthy");
+        assert!(!cache.by_preview.contains_key(&preview_id));
+    }
+
+    #[test]
+    fn preview_anchor_lru_capacity_evicts_oldest_and_keeps_all_limits() {
+        let now = Instant::now();
+        let mut store = PreviewAnchorStore::default();
+        for index in 0..MAX_PINNED_PREVIEWS {
+            let preview_id = format!("preview-capacity-{index}");
+            store.order.push_back(preview_id.clone());
+            store.by_preview.insert(
+                preview_id,
+                PreviewAnchorEntry {
+                    anchors: HashMap::new(),
+                    expires_at: now + PREVIEW_ANCHOR_TTL,
+                },
+            );
+        }
+        store
+            .make_room_for("preview-capacity-incoming", 1)
+            .expect("oldest preview should be evicted to stay within the preview cap");
+
+        assert!(!store.by_preview.contains_key("preview-capacity-0"));
+        assert_eq!(store.by_preview.len(), MAX_PINNED_PREVIEWS - 1);
+        assert_eq!(store.file_count, 0);
+        assert!(store.order.contains(&"preview-capacity-1".to_string()));
+    }
+
+    #[test]
+    fn target_component_keys_respect_case_and_normalization_policy() {
+        fn full_fold_for_test(value: &str) -> Result<String> {
+            let mut folded = String::new();
+            for character in value.chars() {
+                match character {
+                    'ß' | 'ẞ' => folded.push_str("ss"),
+                    'ς' => folded.push('σ'),
+                    _ => folded.extend(character.to_lowercase()),
+                }
+            }
+            Ok(folded)
+        }
+
+        let sensitive_normalized = TargetNameSemantics {
+            normalization_insensitive: true,
+            case_insensitive: false,
+            hfs_ignorable: false,
+        };
+        let insensitive = TargetNameSemantics {
+            normalization_insensitive: true,
+            case_insensitive: true,
+            hfs_ignorable: false,
+        };
+        let hfs_insensitive = TargetNameSemantics {
+            hfs_ignorable: true,
+            ..insensitive
+        };
+        let identity_fold = |value: &str| Ok(value.to_owned());
+
+        assert_ne!(
+            target_component_key_with("Episode", sensitive_normalized, identity_fold)
+                .expect("sensitive name should normalize"),
+            target_component_key_with("episode", sensitive_normalized, identity_fold)
+                .expect("sensitive name should normalize")
+        );
+        assert_eq!(
+            target_component_key_with("épisode", sensitive_normalized, identity_fold)
+                .expect("composed name should normalize"),
+            target_component_key_with("e\u{301}pisode", sensitive_normalized, identity_fold)
+                .expect("decomposed name should normalize")
+        );
+        assert_eq!(
+            target_component_key_with("Maße", insensitive, full_fold_for_test)
+                .expect("case-insensitive name should fold"),
+            target_component_key_with("MASSE", insensitive, full_fold_for_test)
+                .expect("case-insensitive name should fold")
+        );
+        assert_eq!(
+            target_component_key_with("Σ", insensitive, full_fold_for_test)
+                .expect("capital sigma should fold"),
+            target_component_key_with("ς", insensitive, full_fold_for_test)
+                .expect("final sigma should fold")
+        );
+        assert_eq!(
+            target_component_key_with("episode\u{200d}", hfs_insensitive, full_fold_for_test)
+                .expect("HFS ignorable should be removed conservatively"),
+            target_component_key_with("EPISODE", hfs_insensitive, full_fold_for_test)
+                .expect("HFS name should fold")
+        );
+        assert_ne!(
+            target_component_key_with("episode\u{200d}", insensitive, full_fold_for_test)
+                .expect("APFS should retain HFS-only ignorable behavior"),
+            target_component_key_with("EPISODE", insensitive, full_fold_for_test)
+                .expect("APFS should retain HFS-only ignorable behavior")
+        );
+        let reserved_key = TargetReservationKey {
+            directory_device: 7,
+            directory_inode: 9,
+            components: vec![
+                target_component_key_with("Maße.mp4", insensitive, full_fold_for_test)
+                    .expect("reserved case-insensitive name should fold"),
+            ],
+        };
+        let alias_key = TargetReservationKey {
+            directory_device: 7,
+            directory_inode: 9,
+            components: vec![
+                target_component_key_with("MASSE.MP4", insensitive, full_fold_for_test)
+                    .expect("case alias should fold"),
+            ],
+        };
+        assert!(HashSet::from([reserved_key]).contains(&alias_key));
+    }
+
+    #[test]
+    fn linux_target_name_semantics_support_known_case_sensitive_filesystems_only() {
+        let exact = TargetNameSemantics {
+            normalization_insensitive: false,
+            case_insensitive: false,
+            hfs_ignorable: false,
+        };
+
+        assert_eq!(
+            linux_target_name_semantics(0xef53, 0).expect("ext4 should be supported"),
+            exact
+        );
+        assert_eq!(
+            linux_target_name_semantics(0x0102_1994, 0).expect("tmpfs should be supported"),
+            exact
+        );
+        assert!(
+            linux_target_name_semantics(0xef53, 0x4000_0000)
+                .expect_err("case-folded ext4 directories must fail closed")
+                .to_string()
+                .contains("case-folded")
+        );
+        assert!(
+            linux_target_name_semantics(0x1234, 0)
+                .expect_err("unknown filesystems must fail closed")
+                .to_string()
+                .contains("unsupported")
+        );
+    }
+
+    #[test]
+    fn target_reservation_key_scopes_names_to_the_resolved_parent_identity() {
+        let root = TemporaryRoot::new("target-reservation-parent-identity");
+        fs::create_dir(root.path().join("nested")).expect("nested parent should create");
+        let manager = manager(&root);
+        let nested_identity = manager
+            .root
+            .entry_identity(&root.path().join("nested"))
+            .expect("nested parent identity should read")
+            .expect("nested parent should exist");
+        let exact = TargetNameSemantics {
+            normalization_insensitive: false,
+            case_insensitive: false,
+            hfs_ignorable: false,
+        };
+        let root_key = build_target_reservation_key(
+            manager.root.root_identity(),
+            &["Clip.mp4".to_string()],
+            exact,
+        )
+        .expect("root reservation key should build");
+        let nested_key =
+            build_target_reservation_key(nested_identity, &["Clip.mp4".to_string()], exact)
+                .expect("nested reservation key should build");
+
+        assert_ne!(root_key, nested_key);
+        assert_eq!(root_key.components, vec!["Clip.mp4".to_string()]);
+        assert_eq!(nested_key.components, vec!["Clip.mp4".to_string()]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_platform_fold_uses_full_locale_independent_casefold() {
+        assert_eq!(
+            platform_case_fold("Maße").expect("CFStringFold should support sharp s"),
+            platform_case_fold("MASSE").expect("CFStringFold should support uppercase")
+        );
+        assert_eq!(
+            platform_case_fold("Σ").expect("CFStringFold should support capital sigma"),
+            platform_case_fold("ς").expect("CFStringFold should support final sigma")
+        );
     }
 }
