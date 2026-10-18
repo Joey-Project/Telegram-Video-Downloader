@@ -440,6 +440,55 @@ describe("Mini App identity and actions", () => {
     expect(tooManyPatches.status).toBe(400);
   });
 
+  it("validates metadata titles by Unicode scalar count before enqueueing", async () => {
+    const initData = await signInitData();
+    const cjkWith501Utf8Bytes = "界".repeat(167);
+    expect(textEncoder.encode(cjkWith501Utf8Bytes).byteLength).toBe(501);
+
+    const titleCases: Array<{
+      requestId: string;
+      title: string;
+      expectedStatus: number;
+      collection?: boolean;
+    }> = [
+      { requestId: "00000000-0000-4000-8000-000000000101", title: "A".repeat(500), expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000102", title: "A".repeat(501), expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000000103", title: "界".repeat(500), expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000104", title: "界".repeat(501), expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000000105", title: cjkWith501Utf8Bytes, expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000106", title: "😀".repeat(500), expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000107", title: "😀".repeat(501), expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000000108", title: ` ${"A".repeat(500)} `, expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000109", title: "😀".repeat(500), expectedStatus: 202, collection: true },
+      { requestId: "00000000-0000-4000-8000-000000000110", title: "😀".repeat(501), expectedStatus: 400, collection: true },
+      { requestId: "00000000-0000-4000-8000-000000000111", title: "\uD800", expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000000112", title: "Invalid\u0001Title", expectedStatus: 400 },
+    ];
+    const before = await responseJson<{ requests: unknown[] }>(await localRequests());
+
+    for (const titleCase of titleCases) {
+      const metadataPatch = titleCase.collection
+        ? {
+            item_id: "item-a",
+            collection: { id: null, title: titleCase.title, kind: "series", order: null, part_id: null },
+          }
+        : { item_id: "item-a", title: titleCase.title };
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: titleCase.requestId,
+          kind: "file_preview",
+          payload: { metadata_patches: [metadataPatch] },
+        }),
+      });
+      expect(response.status, titleCase.requestId).toBe(titleCase.expectedStatus);
+    }
+
+    const after = await responseJson<{ requests: unknown[] }>(await localRequests());
+    const accepted = titleCases.filter((titleCase) => titleCase.expectedStatus === 202).length;
+    expect(after.requests).toHaveLength(before.requests.length + accepted);
+  });
+
   it("accepts a manual metadata patch without a hint index and keeps metadata-only items exact", async () => {
     const initData = await signInitData();
     const accepted = await ownerRequest("/api/actions", initData, {

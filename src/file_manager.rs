@@ -56,6 +56,8 @@ const MAX_OPERATION_STATE_BYTES_PER_PASS: usize = 32 * 1024 * 1024;
 const MAX_OPERATION_STATE_CLEANUP_ROOTS: usize = 8;
 const SIDE_CAR_LIMIT: usize = 1024 * 1024;
 const LEGACY_INPUT_LIMIT: usize = 1024 * 1024;
+pub(crate) const MAX_METADATA_TITLE_CHARS: usize = 500;
+const MAX_METADATA_TITLE_BYTES: usize = 4096;
 const MAX_DEPTH: usize = 48;
 const MAX_ENTRIES: usize = 200_000;
 const MAX_MEDIA_ITEMS: usize = 50_000;
@@ -5439,19 +5441,12 @@ fn is_youtube_video_id(value: &str) -> bool {
 fn nfo_source_ids(content: &str) -> Vec<String> {
     let mut cursor = 0;
     let mut ids = Vec::new();
-    while let Some(start) = find_ascii_case_insensitive(content, "<uniqueid", cursor) {
-        let Some(end_offset) = content[start..].find('>') else {
-            break;
-        };
-        let end = start + end_offset;
-        let Some(close) = find_ascii_case_insensitive(content, "</uniqueid>", end + 1) else {
-            break;
-        };
-        let tag = &content[start..=end];
+    while let Some(element) = xml_element_span(content, "uniqueid", cursor) {
+        let tag = &content[element.open_start..element.open_end];
         let kind = xml_attribute(tag, "type")
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let raw_id = xml_text_content(&content[end + 1..close])
+        let raw_id = xml_text_content(&content[element.open_end..element.close_start])
             .trim()
             .to_string();
         let canonical = match kind.as_str() {
@@ -5481,92 +5476,369 @@ fn nfo_source_ids(content: &str) -> Vec<String> {
                 format!("youtube:{raw_id}")
             }
             _ => {
-                cursor = close + "</uniqueid>".len();
+                cursor = element.close_end;
                 continue;
             }
         };
         ids.extend(normalize_source_ids(vec![canonical]));
-        cursor = close + "</uniqueid>".len();
+        cursor = element.close_end;
     }
     deduplicate(ids)
 }
 
 fn xml_tag_text(content: &str, name: &str) -> Option<String> {
-    let opening = format!("<{name}");
-    let mut search_from = 0;
-    while let Some(start) = find_ascii_case_insensitive(content, &opening, search_from) {
-        let after_name = start + opening.len();
-        if content
-            .as_bytes()
-            .get(after_name)
-            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'>' && *byte != b'/')
+    let element = xml_element_span(content, name, 0)?;
+    Some(
+        xml_text_content(&content[element.open_end..element.close_start])
+            .trim()
+            .to_string(),
+    )
+}
+
+fn xml_attribute(tag: &str, attribute: &str) -> Option<String> {
+    let markup = xml_next_markup(tag, 0)?;
+    if markup.kind != XmlMarkupKind::Start {
+        return None;
+    }
+
+    let bytes = tag.as_bytes();
+    let mut cursor = markup.name_end;
+    let tag_end = markup.end.checked_sub(1)?;
+    while cursor < tag_end {
+        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= tag_end || bytes[cursor] == b'/' {
+            break;
+        }
+
+        let name_start = cursor;
+        while cursor < tag_end
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b'=' | b'/' | b'>')
         {
-            search_from = after_name;
+            cursor += 1;
+        }
+        if name_start == cursor {
+            return None;
+        }
+        let name = &tag[name_start..cursor];
+
+        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= tag_end || bytes[cursor] != b'=' {
+            while cursor < tag_end && !bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
             continue;
         }
-        let open_end = content[after_name..].find('>')? + after_name;
-        if self_closing_xml_tag_slash(content, start, open_end).is_some() {
-            return Some(String::new());
+        cursor += 1;
+        while cursor < tag_end && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
         }
-        let close_marker = format!("</{name}>");
-        let close = find_ascii_case_insensitive(content, &close_marker, open_end + 1)?;
-        let value = xml_text_content(&content[open_end + 1..close]);
-        return Some(value.trim().to_string());
+        let quote = *bytes.get(cursor)?;
+        if quote != b'\'' && quote != b'"' {
+            return None;
+        }
+        cursor += 1;
+        let value_start = cursor;
+        while cursor < tag_end && bytes[cursor] != quote {
+            cursor += 1;
+        }
+        if cursor >= tag_end {
+            return None;
+        }
+        if name.eq_ignore_ascii_case(attribute) {
+            return Some(tag[value_start..cursor].to_string());
+        }
+        cursor += 1;
+    }
+
+    None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum XmlMarkupKind {
+    Start,
+    End,
+    Comment,
+    CData,
+    ProcessingInstruction,
+    Declaration,
+    Opaque,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct XmlMarkup<'a> {
+    start: usize,
+    end: usize,
+    kind: XmlMarkupKind,
+    name: &'a str,
+    name_end: usize,
+    self_closing: bool,
+    content_start: usize,
+    content_end: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct XmlElementSpan {
+    open_start: usize,
+    open_end: usize,
+    close_start: usize,
+    close_end: usize,
+    self_closing: bool,
+}
+
+fn xml_next_markup(content: &str, from: usize) -> Option<XmlMarkup<'_>> {
+    let bytes = content.as_bytes();
+    let mut cursor = from;
+
+    while cursor < bytes.len() {
+        let relative = content.get(cursor..)?.find('<')?;
+        let start = cursor + relative;
+        let remainder = &content[start..];
+
+        if remainder.starts_with("<!--") {
+            let body_start = start + 4;
+            let Some(offset) = content[body_start..].find("-->") else {
+                return Some(XmlMarkup {
+                    start,
+                    end: bytes.len(),
+                    kind: XmlMarkupKind::Comment,
+                    name: "",
+                    name_end: bytes.len(),
+                    self_closing: false,
+                    content_start: body_start,
+                    content_end: bytes.len(),
+                });
+            };
+            let end = body_start + offset + 3;
+            return Some(XmlMarkup {
+                start,
+                end,
+                kind: XmlMarkupKind::Comment,
+                name: "",
+                name_end: end,
+                self_closing: false,
+                content_start: body_start,
+                content_end: end - 3,
+            });
+        }
+
+        if remainder.starts_with("<![CDATA[") {
+            let body_start = start + 9;
+            let Some(offset) = content[body_start..].find("]]>") else {
+                return Some(XmlMarkup {
+                    start,
+                    end: bytes.len(),
+                    kind: XmlMarkupKind::CData,
+                    name: "",
+                    name_end: bytes.len(),
+                    self_closing: false,
+                    content_start: body_start,
+                    content_end: bytes.len(),
+                });
+            };
+            let content_end = body_start + offset;
+            let end = content_end + 3;
+            return Some(XmlMarkup {
+                start,
+                end,
+                kind: XmlMarkupKind::CData,
+                name: "",
+                name_end: end,
+                self_closing: false,
+                content_start: body_start,
+                content_end,
+            });
+        }
+
+        if remainder.starts_with("<?") {
+            let body_start = start + 2;
+            let end = content[body_start..]
+                .find("?>")
+                .map(|offset| body_start + offset + 2)
+                .unwrap_or(bytes.len());
+            return Some(XmlMarkup {
+                start,
+                end,
+                kind: XmlMarkupKind::ProcessingInstruction,
+                name: "",
+                name_end: end,
+                self_closing: false,
+                content_start: body_start,
+                content_end: end.saturating_sub(2),
+            });
+        }
+
+        if remainder.starts_with("<!") {
+            let body_start = start + 2;
+            let end = xml_declaration_end(content, body_start).unwrap_or(bytes.len());
+            return Some(XmlMarkup {
+                start,
+                end,
+                kind: XmlMarkupKind::Declaration,
+                name: "",
+                name_end: end,
+                self_closing: false,
+                content_start: body_start,
+                content_end: end.saturating_sub(1),
+            });
+        }
+
+        let (kind, name_start) = if remainder.starts_with("</") {
+            (XmlMarkupKind::End, start + 2)
+        } else {
+            (XmlMarkupKind::Start, start + 1)
+        };
+        let mut name_end = name_start;
+        while name_end < bytes.len()
+            && !bytes[name_end].is_ascii_whitespace()
+            && !matches!(bytes[name_end], b'/' | b'>')
+        {
+            name_end += 1;
+        }
+        if name_end == name_start || name_end == bytes.len() {
+            cursor = start + 1;
+            continue;
+        }
+
+        let mut quote = None;
+        let mut end = name_end;
+        let mut terminated = false;
+        while end < bytes.len() {
+            let byte = bytes[end];
+            match quote {
+                Some(active) if byte == active => quote = None,
+                Some(_) => {}
+                None if byte == b'\'' || byte == b'"' => quote = Some(byte),
+                None if byte == b'>' => {
+                    end += 1;
+                    terminated = true;
+                    break;
+                }
+                None => {}
+            }
+            end += 1;
+        }
+        if !terminated || quote.is_some() {
+            return Some(XmlMarkup {
+                start,
+                end: bytes.len(),
+                kind: XmlMarkupKind::Opaque,
+                name: "",
+                name_end: bytes.len(),
+                self_closing: false,
+                content_start: start,
+                content_end: bytes.len(),
+            });
+        }
+
+        let self_closing = kind == XmlMarkupKind::Start
+            && self_closing_xml_tag_slash(content, start, end - 1).is_some();
+        return Some(XmlMarkup {
+            start,
+            end,
+            kind,
+            name: &content[name_start..name_end],
+            name_end,
+            self_closing,
+            content_start: name_end,
+            content_end: end - 1,
+        });
+    }
+
+    None
+}
+
+fn xml_declaration_end(content: &str, from: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut cursor = from;
+    let mut quote = None;
+    let mut subset_depth = 0usize;
+
+    while cursor < bytes.len() {
+        if quote.is_none() && bytes[cursor..].starts_with(b"<!--") {
+            cursor = bytes[cursor + 4..]
+                .windows(3)
+                .position(|window| window == b"-->")
+                .map(|offset| cursor + 4 + offset + 3)?;
+            continue;
+        }
+        let byte = bytes[cursor];
+        match quote {
+            Some(active) if byte == active => quote = None,
+            Some(_) => {}
+            None if byte == b'\'' || byte == b'"' => quote = Some(byte),
+            None if byte == b'[' => subset_depth += 1,
+            None if byte == b']' => subset_depth = subset_depth.saturating_sub(1),
+            None if byte == b'>' && subset_depth == 0 => return Some(cursor + 1),
+            None => {}
+        }
+        cursor += 1;
+    }
+
+    None
+}
+
+fn xml_element_span(content: &str, name: &str, from: usize) -> Option<XmlElementSpan> {
+    let mut cursor = from;
+    while let Some(open) = xml_next_markup(content, cursor) {
+        cursor = open.end;
+        if open.kind != XmlMarkupKind::Start || !open.name.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        if open.self_closing {
+            return Some(XmlElementSpan {
+                open_start: open.start,
+                open_end: open.end,
+                close_start: open.end,
+                close_end: open.end,
+                self_closing: true,
+            });
+        }
+
+        let mut depth = 1usize;
+        let mut nested_cursor = open.end;
+        while let Some(markup) = xml_next_markup(content, nested_cursor) {
+            nested_cursor = markup.end;
+            if !markup.name.eq_ignore_ascii_case(name) {
+                continue;
+            }
+            match markup.kind {
+                XmlMarkupKind::Start if !markup.self_closing => depth += 1,
+                XmlMarkupKind::End => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(XmlElementSpan {
+                            open_start: open.start,
+                            open_end: open.end,
+                            close_start: markup.start,
+                            close_end: markup.end,
+                            self_closing: false,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        return None;
     }
     None
 }
 
-fn xml_attribute(tag: &str, attribute: &str) -> Option<String> {
-    let needle = format!("{attribute}=");
-    let offset = find_ascii_case_insensitive(tag, &needle, 0)? + needle.len();
-    let quote = tag.as_bytes().get(offset).copied()?;
-    if quote != b'\'' && quote != b'"' {
-        return None;
-    }
-    let end = tag.as_bytes()[offset + 1..]
-        .iter()
-        .position(|byte| *byte == quote)?
-        + offset
-        + 1;
-    Some(tag[offset + 1..end].to_string())
-}
-
-fn strip_xml_markup(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    let mut inside = false;
-    for character in value.chars() {
-        match character {
-            '<' => inside = true,
-            '>' => inside = false,
-            _ if !inside => result.push(character),
-            _ => {}
-        }
-    }
-    result
-}
-
 fn xml_text_content(value: &str) -> String {
-    const CDATA_OPEN: &str = "<![CDATA[";
-    const CDATA_CLOSE: &str = "]]>";
-
     let mut result = String::with_capacity(value.len());
     let mut cursor = 0;
-    while cursor < value.len() {
-        let Some(open_offset) = value[cursor..].find(CDATA_OPEN) else {
-            result.push_str(&xml_unescape(&strip_xml_markup(&value[cursor..])));
-            break;
-        };
-        let open = cursor + open_offset;
-        result.push_str(&xml_unescape(&strip_xml_markup(&value[cursor..open])));
-        let content_start = open + CDATA_OPEN.len();
-        let Some(close_offset) = value[content_start..].find(CDATA_CLOSE) else {
-            result.push_str(&value[content_start..]);
-            break;
-        };
-        let close = content_start + close_offset;
-        result.push_str(&value[content_start..close]);
-        cursor = close + CDATA_CLOSE.len();
+    while let Some(markup) = xml_next_markup(value, cursor) {
+        result.push_str(&xml_unescape(&value[cursor..markup.start]));
+        if markup.kind == XmlMarkupKind::CData {
+            result.push_str(&value[markup.content_start..markup.content_end]);
+        }
+        cursor = markup.end;
     }
+    result.push_str(&xml_unescape(&value[cursor..]));
     result
 }
 
@@ -5785,44 +6057,26 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
 }
 
 fn replace_xml_element(content: &str, name: &str, value: &str) -> Result<String> {
-    let opening = format!("<{name}");
-    let mut search_from = 0;
-    let (start, open_end) = loop {
-        let Some(start) = find_ascii_case_insensitive(content, &opening, search_from) else {
-            bail!("NFO element disappeared while preparing its confirmed update");
-        };
-        let boundary = content.as_bytes().get(start + opening.len()).copied();
-        if !boundary.is_some_and(|byte| byte.is_ascii_whitespace() || byte == b'>' || byte == b'/')
-        {
-            search_from = start + opening.len();
-            continue;
-        }
-        let end = content[start + opening.len()..]
-            .find('>')
-            .map(|offset| start + opening.len() + offset)
-            .ok_or_else(|| anyhow!("NFO element has an incomplete opening tag"))?;
-        break (start, end);
-    };
-    if let Some(slash) = self_closing_xml_tag_slash(content, start, open_end) {
+    let element = xml_element_span(content, name, 0)
+        .ok_or_else(|| anyhow!("NFO element disappeared or has no matching close"))?;
+    if element.self_closing {
+        let slash = self_closing_xml_tag_slash(content, element.open_start, element.open_end - 1)
+            .ok_or_else(|| anyhow!("NFO self-closing element has no closing slash"))?;
         let mut output = String::with_capacity(content.len() + value.len() + name.len() + 3);
         output.push_str(&content[..slash]);
-        output.push_str(&content[slash + 1..open_end + 1]);
+        output.push_str(&content[slash + 1..element.open_end]);
         output.push_str(&xml_escape(value));
         output.push_str("</");
         output.push_str(name);
         output.push('>');
-        output.push_str(&content[open_end + 1..]);
+        output.push_str(&content[element.open_end..]);
         return Ok(output);
     }
-    let close_marker = format!("</{name}>");
-    let close_start = find_ascii_case_insensitive(content, &close_marker, open_end + 1)
-        .ok_or_else(|| anyhow!("NFO element has no closing tag"))?;
-    let close_end = close_start + close_marker.len();
     let mut output = String::with_capacity(content.len() + value.len());
-    output.push_str(&content[..open_end + 1]);
+    output.push_str(&content[..element.open_end]);
     output.push_str(&xml_escape(value));
-    output.push_str(&content[close_start..close_end]);
-    output.push_str(&content[close_end..]);
+    output.push_str(&content[element.close_start..element.close_end]);
+    output.push_str(&content[element.close_end..]);
     Ok(output)
 }
 
@@ -5880,44 +6134,51 @@ fn new_nfo(title: &str, patch: &MetadataPatch) -> String {
 
 fn root_close_start(content: &str) -> Option<usize> {
     let mut cursor = 0;
-    let root_name = loop {
-        let start = find_ascii_case_insensitive(content, "<", cursor)?;
-        let next = *content.as_bytes().get(start + 1)?;
-        if next == b'?' || next == b'!' || next == b'/' {
-            cursor = start + 2;
-            continue;
+    let root = loop {
+        let markup = xml_next_markup(content, cursor)?;
+        cursor = markup.end;
+        if markup.kind == XmlMarkupKind::Start {
+            break markup;
         }
-        let name_start = start + 1;
-        let name_end = content[name_start..].find(|character: char| {
-            character.is_ascii_whitespace() || character == '>' || character == '/'
-        })? + name_start;
-        break &content[name_start..name_end];
     };
-    let closing = format!("</{root_name}");
-    let mut close_start = None;
-    let mut search_from = 0;
-    while let Some(found) = find_ascii_case_insensitive(content, &closing, search_from) {
-        close_start = Some(found);
-        search_from = found + closing.len();
-    }
-    let close_start = close_start?;
-    let close_end = content[close_start..].find('>')? + close_start + 1;
-    if !content[close_end..].trim().is_empty() {
+    if root.self_closing {
         return None;
     }
-    Some(close_start)
+
+    let mut depth = 1usize;
+    while let Some(markup) = xml_next_markup(content, cursor) {
+        cursor = markup.end;
+        if !markup.name.eq_ignore_ascii_case(root.name) {
+            continue;
+        }
+        match markup.kind {
+            XmlMarkupKind::Start if !markup.self_closing => depth += 1,
+            XmlMarkupKind::End => {
+                depth -= 1;
+                if depth == 0 {
+                    return xml_trailing_misc_only(content, markup.end).then_some(markup.start);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
-fn find_ascii_case_insensitive(haystack: &str, needle: &str, from: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(from);
+fn xml_trailing_misc_only(content: &str, mut cursor: usize) -> bool {
+    while let Some(markup) = xml_next_markup(content, cursor) {
+        if !content[cursor..markup.start].trim().is_empty() {
+            return false;
+        }
+        if !matches!(
+            markup.kind,
+            XmlMarkupKind::Comment | XmlMarkupKind::ProcessingInstruction
+        ) {
+            return false;
+        }
+        cursor = markup.end;
     }
-    haystack
-        .as_bytes()
-        .get(from..)?
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-        .map(|offset| from + offset)
+    content[cursor..].trim().is_empty()
 }
 
 fn source_id_nfo_value(id: &str) -> Option<(&'static str, String)> {
@@ -5951,7 +6212,7 @@ fn validate_metadata_patch(patch: &MetadataPatch) -> Result<()> {
     if patch
         .title
         .as_deref()
-        .is_some_and(|title| title.len() > 4096)
+        .is_some_and(|title| !metadata_title_within_limits(title))
     {
         bail!("metadata title exceeds its size limit");
     }
@@ -5961,7 +6222,7 @@ fn validate_metadata_patch(patch: &MetadataPatch) -> Result<()> {
         bail!("metadata source IDs are invalid or duplicated");
     }
     if let Some(collection) = &patch.collection {
-        if collection.title.trim().is_empty() || collection.title.len() > 1024 {
+        if collection.title.trim().is_empty() || !metadata_title_within_limits(&collection.title) {
             bail!("collection title is empty or too long");
         }
         if collection.id.as_deref().is_some_and(|id| id.len() > 256)
@@ -5983,6 +6244,11 @@ fn validate_metadata_patch(patch: &MetadataPatch) -> Result<()> {
         bail!("metadata patch has no fields to apply");
     }
     Ok(())
+}
+
+pub(crate) fn metadata_title_within_limits(title: &str) -> bool {
+    title.len() <= MAX_METADATA_TITLE_BYTES
+        && title.trim().chars().count() <= MAX_METADATA_TITLE_CHARS
 }
 
 fn metadata_from_json(
@@ -6455,9 +6721,9 @@ fn parse_legacy_import(input: &str) -> LegacyImportReport {
     let parsed_json = serde_json::from_str::<serde_json::Value>(input).ok();
     let (text_blocks, origin) = match parsed_json.as_ref() {
         Some(value) => {
-            let mut blocks = Vec::new();
-            collect_legacy_text(value, &mut blocks, LEGACY_INPUT_LIMIT);
-            (blocks, HintOrigin::LegacyTelegramJson)
+            let mut collector = LegacyTextCollector::default();
+            collect_legacy_text(value, &mut collector, LEGACY_INPUT_LIMIT);
+            (collector.blocks, HintOrigin::LegacyTelegramJson)
         }
         None => (vec![input.to_string()], HintOrigin::LegacyText),
     };
@@ -6513,20 +6779,48 @@ fn parse_legacy_import(input: &str) -> LegacyImportReport {
     }
 }
 
-fn collect_legacy_text(value: &serde_json::Value, output: &mut Vec<String>, remaining: usize) {
-    if output.iter().map(String::len).sum::<usize>() >= remaining {
+#[derive(Default)]
+struct LegacyTextCollector {
+    blocks: Vec<String>,
+    bytes_used: usize,
+    #[cfg(test)]
+    visited_values: usize,
+}
+
+fn collect_legacy_text(
+    value: &serde_json::Value,
+    collector: &mut LegacyTextCollector,
+    byte_limit: usize,
+) {
+    if collector.bytes_used >= byte_limit {
         return;
+    }
+    #[cfg(test)]
+    {
+        collector.visited_values = collector.visited_values.saturating_add(1);
     }
     match value {
         serde_json::Value::String(text) => {
-            let room = remaining.saturating_sub(output.iter().map(String::len).sum::<usize>());
-            if room > 0 {
-                output.push(text.chars().take(room).collect());
+            let remaining_bytes = byte_limit.saturating_sub(collector.bytes_used);
+            let mut end = 0;
+            for (index, character) in text.char_indices() {
+                let next = index + character.len_utf8();
+                if next > remaining_bytes {
+                    break;
+                }
+                end = next;
+            }
+            if end > 0 {
+                collector.bytes_used = collector.bytes_used.saturating_add(end);
+                collector.blocks.push(text[..end].to_string());
             }
         }
         serde_json::Value::Array(values) => {
             for value in values {
-                collect_legacy_text(value, output, remaining);
+                if collector.bytes_used >= byte_limit {
+                    break;
+                }
+                collect_legacy_text(value, collector, byte_limit);
             }
         }
         serde_json::Value::Object(fields) => {
@@ -6537,7 +6831,10 @@ fn collect_legacy_text(value: &serde_json::Value, output: &mut Vec<String>, rema
                     || value.is_object()
                     || value.is_array()
                 {
-                    collect_legacy_text(value, output, remaining);
+                    if collector.bytes_used >= byte_limit {
+                        break;
+                    }
+                    collect_legacy_text(value, collector, byte_limit);
                 }
             }
         }
@@ -6551,7 +6848,7 @@ fn title_hint_from_line(line: &str) -> Option<String> {
     for prefix in ["title:", "title：", "标题:", "标题：", "名称:", "名称："] {
         if lower.starts_with(prefix) || trimmed.starts_with(prefix) {
             let value = trimmed[prefix.len()..].trim();
-            if !value.is_empty() && value.len() <= 512 {
+            if !value.is_empty() && metadata_title_within_limits(value) {
                 return Some(value.to_string());
             }
         }
@@ -6560,7 +6857,7 @@ fn title_hint_from_line(line: &str) -> Option<String> {
         && !title.trim().is_empty()
         && !title.contains("http")
         && !extract_source_ids(rest).is_empty()
-        && title.len() <= 512
+        && metadata_title_within_limits(title)
     {
         return Some(title.trim().to_string());
     }
@@ -6865,6 +7162,74 @@ mod tests {
             xml_text_content("<title><![CDATA[&#38; &amp;]]></title>"),
             "&#38; &amp;"
         );
+    }
+
+    #[test]
+    fn round7_xml_comment_decoys_do_not_affect_nfo_read_or_patch() {
+        let original = "<movie><!-- fake </movie> <title>Comment title</title><uniqueid type=\"bilibili-cid\">999</uniqueid> --><titleExtra>not the title</titleExtra><title>Real title</title><uniqueid type='bilibili-cid'>123</uniqueid><future>keep</future></movie>";
+        assert_eq!(
+            xml_tag_text(original, "title").as_deref(),
+            Some("Real title")
+        );
+        assert_eq!(nfo_source_ids(original), vec!["cid123"]);
+        assert_eq!(
+            root_close_start(original),
+            Some(original.rfind("</movie>").expect("real root close exists"))
+        );
+
+        let patched = append_metadata_patch(
+            original,
+            &MetadataPatch {
+                item_id: "item".to_string(),
+                title: Some("Patched title".to_string()),
+                source_ids: vec!["cid456".to_string()],
+                collection: None,
+            },
+        )
+        .expect("metadata patch should target real XML elements");
+
+        assert!(patched.contains(
+            "<!-- fake </movie> <title>Comment title</title><uniqueid type=\"bilibili-cid\">999</uniqueid> -->"
+        ));
+        assert!(patched.contains("<title>Patched title</title>"));
+        assert!(patched.contains("<uniqueid type='bilibili-cid'>123</uniqueid>"));
+        assert!(patched.contains("<uniqueid type=\"bilibili-cid\">cid456</uniqueid>"));
+        assert_eq!(nfo_source_ids(&patched), vec!["cid123", "cid456"]);
+        assert!(patched.contains("<future>keep</future>"));
+    }
+
+    #[test]
+    fn round7_xml_scanner_skips_pi_declarations_and_quoted_attribute_decoys() {
+        let nfo = r#"<?xml version="1.0"?>
+<!DOCTYPE movie [ <!ENTITY fake "<title>Declaration title</title></movie>"> ]>
+<?probe <title>PI title</title><uniqueid type="bilibili">888</uniqueid> ?>
+<movie>
+  <note decoy="<title>Attribute title</title>">
+    <title><![CDATA[Literal <title>CDATA title</title> &amp;]]></title>
+  </note>
+  <uniqueid note="type='youtube' <uniqueid type='bilibili'>777</uniqueid>" type='bilibili-cid'>321</uniqueid>
+  <!-- </movie> -->
+</movie>
+"#;
+
+        assert_eq!(
+            xml_tag_text(nfo, "title").as_deref(),
+            Some("Literal <title>CDATA title</title> &amp;")
+        );
+        assert_eq!(nfo_source_ids(nfo), vec!["cid321"]);
+        assert_eq!(
+            root_close_start(nfo),
+            Some(nfo.rfind("</movie>").expect("real root close exists"))
+        );
+
+        let patched = replace_xml_element(nfo, "title", "Patched & title")
+            .expect("patch should replace only the actual title element");
+        assert!(patched.contains(r#"<note decoy="<title>Attribute title</title>">"#));
+        assert!(patched.contains("<title>Patched &amp; title</title>"));
+        assert!(patched.contains("<uniqueid note=\"type='youtube' <uniqueid type='bilibili'>777</uniqueid>\" type='bilibili-cid'>321</uniqueid>"));
+        assert!(patched.contains(
+            "<?probe <title>PI title</title><uniqueid type=\"bilibili\">888</uniqueid> ?>"
+        ));
     }
 
     #[test]
@@ -7568,6 +7933,110 @@ mod tests {
             )
             .id
         );
+    }
+
+    #[test]
+    fn round7_legacy_text_collector_is_linear_bounded_and_utf8_safe() {
+        let mut values = Vec::with_capacity(50_000);
+        values.extend((0..25_000).map(|_| serde_json::Value::String(String::new())));
+        values.extend((0..25_000).map(|_| serde_json::Value::String("x".to_string())));
+        let input = serde_json::Value::Array(values);
+        let mut collector = LegacyTextCollector::default();
+        collect_legacy_text(&input, &mut collector, 10);
+
+        assert_eq!(collector.bytes_used, 10);
+        assert_eq!(collector.blocks.len(), 10);
+        assert_eq!(collector.blocks.concat(), "x".repeat(10));
+        assert_eq!(
+            collector.visited_values,
+            1 + 25_000 + 10,
+            "the collector should stop visiting entries as soon as its byte budget is full"
+        );
+
+        let input = serde_json::json!("a界🙂z");
+        let mut collector = LegacyTextCollector::default();
+        collect_legacy_text(&input, &mut collector, 5);
+        assert_eq!(collector.bytes_used, 4);
+        assert_eq!(collector.blocks, ["a界"]);
+    }
+
+    #[test]
+    fn round7_legacy_title_hints_use_the_shared_unicode_scalar_limit() {
+        for scalar in ["a", "界", "🙂"] {
+            let accepted = scalar.repeat(MAX_METADATA_TITLE_CHARS);
+            let trimmed_line = format!("Title:  {accepted}  ");
+            assert_eq!(
+                title_hint_from_line(&trimmed_line).as_deref(),
+                Some(accepted.as_str()),
+                "500 trimmed Unicode scalar values should be accepted"
+            );
+
+            let rejected = scalar.repeat(MAX_METADATA_TITLE_CHARS + 1);
+            assert_eq!(
+                title_hint_from_line(&format!("Title: {rejected}")),
+                None,
+                "501 Unicode scalar values should be rejected"
+            );
+        }
+
+        let cjk_title = "界".repeat(167);
+        assert_eq!(cjk_title.len(), 501);
+        assert!(metadata_title_within_limits(&cjk_title));
+        assert_eq!(
+            title_hint_from_line(&format!("Title: {cjk_title}")),
+            Some(cjk_title)
+        );
+    }
+
+    #[test]
+    fn round7_metadata_patch_validation_uses_scalar_limits_for_titles() {
+        for scalar in ["a", "界", "🙂"] {
+            let accepted_title = scalar.repeat(MAX_METADATA_TITLE_CHARS);
+            let patch = MetadataPatch {
+                item_id: "fixture-item".to_string(),
+                title: Some(accepted_title),
+                source_ids: Vec::new(),
+                collection: None,
+            };
+            assert!(validate_metadata_patch(&patch).is_ok());
+
+            let rejected_title = scalar.repeat(MAX_METADATA_TITLE_CHARS + 1);
+            let patch = MetadataPatch {
+                item_id: "fixture-item".to_string(),
+                title: Some(rejected_title),
+                source_ids: Vec::new(),
+                collection: None,
+            };
+            assert!(validate_metadata_patch(&patch).is_err());
+
+            let accepted_collection = MetadataPatch {
+                item_id: "fixture-item".to_string(),
+                title: None,
+                source_ids: Vec::new(),
+                collection: Some(CollectionMetadata {
+                    id: None,
+                    title: scalar.repeat(MAX_METADATA_TITLE_CHARS),
+                    kind: "season".to_string(),
+                    order: None,
+                    part_id: None,
+                }),
+            };
+            assert!(validate_metadata_patch(&accepted_collection).is_ok());
+
+            let rejected_collection = MetadataPatch {
+                item_id: "fixture-item".to_string(),
+                title: None,
+                source_ids: Vec::new(),
+                collection: Some(CollectionMetadata {
+                    id: None,
+                    title: scalar.repeat(MAX_METADATA_TITLE_CHARS + 1),
+                    kind: "season".to_string(),
+                    order: None,
+                    part_id: None,
+                }),
+            };
+            assert!(validate_metadata_patch(&rejected_collection).is_err());
+        }
     }
 
     #[test]

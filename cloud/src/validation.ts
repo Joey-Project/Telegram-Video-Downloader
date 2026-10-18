@@ -13,6 +13,8 @@ export const MAX_ACTION_BODY_BYTES = 320_000;
 export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
 export const MAX_LEGACY_TEXT_BYTES = 256 * 1024;
 export const MAX_SELECTED_ITEMS = 100;
+const MAX_TITLE_SCALAR_VALUES = 500;
+const MAX_TITLE_CODE_UNITS = MAX_TITLE_SCALAR_VALUES * 2;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -131,6 +133,32 @@ function boundedString(
   return normalized;
 }
 
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const nextCodeUnit = value.charCodeAt(index + 1);
+      if (!(nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff)) return true;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function boundedTitle(value: unknown, field: string): string {
+  // A valid 500-scalar string uses at most 1,000 UTF-16 code units.
+  const normalized = boundedString(value, field, MAX_TITLE_CODE_UNITS);
+  if (hasUnpairedSurrogate(normalized)) {
+    throw new HttpError(400, `${field} contains an unpaired surrogate`);
+  }
+  if (Array.from(normalized).length > MAX_TITLE_SCALAR_VALUES) {
+    throw new HttpError(400, `${field} is empty or too long`);
+  }
+  return normalized;
+}
+
 function stringList(value: unknown, field: string, maxItems: number, maxLength: number): string[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > maxItems) {
     throw new HttpError(400, `${field} must contain between 1 and ${maxItems} values`);
@@ -145,7 +173,7 @@ function parseCollection(value: unknown): CollectionMetadata {
     !["id", "title", "kind", "order", "part_id"].every((key) => Object.hasOwn(value, key))) {
     throw new HttpError(400, "metadata_patches.collection has an invalid shape");
   }
-  const title = boundedString(value.title, "collection.title", 500);
+  const title = boundedTitle(value.title, "collection.title");
   const kind = boundedString(value.kind, "collection.kind", 64);
   const id = value.id === undefined || value.id === null
     ? null
@@ -178,7 +206,7 @@ function parseMetadataPatches(value: unknown): MetadataPatch[] {
       }
       patch.hint_index = entry.hint_index as number;
     }
-    if (entry.title !== undefined) patch.title = boundedString(entry.title, `metadata_patches[${index}].title`, 500);
+    if (entry.title !== undefined) patch.title = boundedTitle(entry.title, `metadata_patches[${index}].title`);
     if (entry.source_ids !== undefined) patch.source_ids = stringList(entry.source_ids, `metadata_patches[${index}].source_ids`, 64, 128);
     if (entry.collection !== undefined) patch.collection = parseCollection(entry.collection);
     if (patch.title === undefined && patch.source_ids === undefined && patch.collection === undefined) {

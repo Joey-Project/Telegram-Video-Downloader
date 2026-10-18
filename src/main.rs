@@ -63,7 +63,7 @@ use crate::downloader::{
     sync_bilibili_rust_credentials, validate_bilibili_report_media_hashes,
     validate_existing_bilibili_report_for_completion,
 };
-use crate::file_manager::{LibraryManager, release_preview_anchors};
+use crate::file_manager::{LibraryManager, metadata_title_within_limits, release_preview_anchors};
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 use crate::library::{
     ConflictPolicy, HintOrigin, LibrarySnapshot, MetadataPatch, MovePreview, SourceHint,
@@ -1922,14 +1922,18 @@ fn validate_file_preview_payload(
                 .title
                 .as_ref()
                 .is_some_and(|title| title.trim().is_empty())
-            || patch.title.as_ref().is_some_and(|title| title.len() > 500)
+            || patch
+                .title
+                .as_ref()
+                .is_some_and(|title| !metadata_title_within_limits(title))
             || patch.source_ids.len() > 64
             || patch
                 .source_ids
                 .iter()
                 .any(|source_id| source_id.trim().is_empty() || source_id.len() > 128)
             || patch.collection.as_ref().is_some_and(|collection| {
-                collection.title.len() > 256
+                collection.title.trim().is_empty()
+                    || !metadata_title_within_limits(&collection.title)
                     || collection.kind.len() > 64
                     || collection.id.as_ref().is_some_and(|id| id.len() > 128)
                     || collection.part_id.as_ref().is_some_and(|id| id.len() > 128)
@@ -11732,6 +11736,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::file_manager::MAX_METADATA_TITLE_CHARS;
     use crate::file_provider::{MockQueueFileProvider, QueueFileProvider};
     use anyhow::{Context, Result, anyhow};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11870,6 +11875,89 @@ mod tests {
                 .is_err_and(|error| error.contains("field outside its allowed size")),
             "65 source IDs should be rejected at the preview boundary"
         );
+    }
+
+    #[test]
+    fn round7_cloud_metadata_titles_use_500_unicode_scalars_through_library_preview() {
+        let test_root = temp_main_test_dir("cloud-metadata-title-scalars");
+        let library_root = test_root.join("library");
+        fs::create_dir_all(&library_root).expect("library fixture root should create");
+        fs::write(library_root.join("clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let manager = LibraryManager::open(&library_root).expect("library manager should open");
+        let snapshot = manager.scan(&[]).expect("library should scan");
+        let item_id = snapshot
+            .items
+            .iter()
+            .find(|item| item.relative_path == "clip.mp4")
+            .expect("fixture media should be present")
+            .id
+            .clone();
+
+        let cases = vec![
+            ("ascii-500", "a".repeat(500), true),
+            ("ascii-501", "a".repeat(501), false),
+            ("cjk-500", "界".repeat(500), true),
+            ("cjk-501", "界".repeat(501), false),
+            ("emoji-500", "🙂".repeat(500), true),
+            ("emoji-501", "🙂".repeat(501), false),
+            ("cjk-over-500-bytes", "界".repeat(167), true),
+        ];
+        for (label, title, expected_valid) in cases {
+            assert_eq!(
+                title.trim().chars().count() <= MAX_METADATA_TITLE_CHARS,
+                expected_valid,
+                "fixture {label} should express its expected scalar boundary"
+            );
+            for field in ["title", "collection.title"] {
+                let padded_title = format!("  {title}  ");
+                let payload_value = if field == "title" {
+                    serde_json::json!({
+                        "metadata_patches": [{
+                            "item_id": item_id.clone(),
+                            "title": padded_title,
+                        }]
+                    })
+                } else {
+                    serde_json::json!({
+                        "metadata_patches": [{
+                            "item_id": item_id.clone(),
+                            "collection": {
+                                "id": null,
+                                "title": padded_title,
+                                "kind": "season",
+                                "order": null,
+                                "part_id": null,
+                            }
+                        }]
+                    })
+                };
+                let payload = serde_json::from_value::<FilePreviewPayload>(payload_value)
+                    .expect("title boundary payload should deserialize");
+                let prepared = validate_file_preview_payload(payload);
+                assert_eq!(
+                    prepared.is_ok(),
+                    expected_valid,
+                    "cloud validation for {label} in {field} should match the scalar contract"
+                );
+                if let Ok(prepared) = prepared {
+                    manager
+                        .preview_with_patches(
+                            &[],
+                            None,
+                            false,
+                            prepared.conflict,
+                            &prepared.patches,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("library preview should accept {label} in {field}: {error}")
+                        });
+                }
+            }
+        }
+
+        drop(manager);
+        let _ = fs::remove_dir_all(test_root);
     }
 
     #[test]
