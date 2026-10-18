@@ -72,13 +72,21 @@ export function requireWebhookAuthorization(request: Request, env: Env): void {
   }
 }
 
+export function requireConfiguredOwnerUserId(ownerUserId: string): string {
+  if (!/^[1-9]\d{0,15}$/u.test(ownerUserId)) {
+    throw new HttpError(503, "Owner authorization is not configured");
+  }
+  return ownerUserId;
+}
+
 export async function requireOwner(
   request: Request,
   env: Env,
 ): Promise<{ userId: string }> {
-  if (!env.BOT_TOKEN || !/^[1-9]\d{0,15}$/u.test(env.OWNER_USER_ID)) {
+  if (!env.BOT_TOKEN) {
     throw new HttpError(503, "Mini App authorization is not configured");
   }
+  requireConfiguredOwnerUserId(env.OWNER_USER_ID);
   const initData = request.headers.get("x-telegram-init-data") ?? "";
   if (initData.length === 0 || utf8.encode(initData).byteLength > MAX_INIT_DATA_BYTES) {
     throw new HttpError(401, "Unauthorized");

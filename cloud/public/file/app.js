@@ -3,7 +3,7 @@ import { getOrCreateLegacySelection, updateLegacySelection } from "./legacy-mapp
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
-import { buildWaitingEntries, isPresentMedia, isReviewablePreviewStatus, operationHistoryEntries, presentMediaItems } from "./state-view.js";
+import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
 import { sourceIdUrl } from "./source-links.js";
 
 const API = "/api";
@@ -383,9 +383,8 @@ function renderWaiting() {
   const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
   const cloudQueue = Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : [];
   const { cloud: pendingRequests, local } = buildWaitingEntries(cloudQueue, tasks, operations);
-  const isPending = (entry) => !["completed", "failed", "cancelled", "confirmed"].includes(String(entry.status).toLowerCase());
-  const pendingCloud = pendingRequests.filter(isPending);
-  const pending = local.filter(isPending);
+  const pendingCloud = pendingRequests.filter(isWaitingEntryPending);
+  const pending = local.filter(isWaitingEntryPending);
   const localQueue = readActionQueue();
   byId("waiting-count").textContent = String(pendingCloud.length + pending.length + localQueue.length);
   const cards = [];
@@ -403,7 +402,19 @@ function operationPreview(operation) {
 
 function previews() {
   const collected = [];
-  for (const preview of Array.isArray(state.snapshot?.previews) ? state.snapshot.previews : []) collected.push({ id: preview.preview_id ?? preview.id, revision: preview.revision ?? preview.preview?.revision, preview: preview.preview ?? preview, status: preview.status });
+  for (const preview of Array.isArray(state.snapshot?.previews) ? state.snapshot.previews : []) {
+    const incomplete = preview.preview_incomplete === true || preview.incomplete === true || preview.reload_required === true;
+    collected.push({
+      id: preview.preview_id ?? preview.id ?? (incomplete ? "omitted-preview-details" : undefined),
+      revision: preview.revision ?? preview.preview?.revision ?? (incomplete ? String(preview.omitted_count ?? "unknown") : undefined),
+      preview: incomplete ? null : preview.preview ?? preview,
+      incomplete: preview.incomplete === true,
+      preview_incomplete: preview.preview_incomplete === true,
+      reload_required: preview.reload_required === true,
+      reason: preview.reason,
+      status: preview.status,
+    });
+  }
   for (const operation of Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []) {
     const found = operationPreview(operation);
     if (found) collected.push(found);
@@ -438,6 +449,10 @@ function renderPreviews() {
   const pending = previews().filter((entry) => isReviewablePreviewStatus(entry.status));
   byId("organizing-count").textContent = String(pending.length);
   byId("preview-list").innerHTML = pending.map((entry) => {
+    if (isIncompletePreview(entry)) {
+      const reason = entry.reason || "Preview details were omitted from the saved snapshot. Request a fresh preview before confirming.";
+      return `<article class="stack-card"><div class="stack-card-head"><div><h3>Preview needs to be regenerated</h3><p>${escapeHtml(reason)}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+    }
     const preview = entry.preview;
     const hasMetadataChanges = hasMetadataPreviewChanges(preview);
     const hasMoveItems = Array.isArray(preview.items) && preview.items.length > 0;
@@ -448,11 +463,23 @@ function renderPreviews() {
 }
 
 function renderLegacyMappings() {
-  const operations = legacyOperations();
-  const operation = [...operations].reverse().find((entry) => Array.isArray(entry.result?.hints) && Array.isArray(entry.result?.candidates));
+  const operation = [...legacyOperations()].reverse()[0];
   state.legacyOperation = operation ?? null;
   const container = byId("legacy-mappings");
   if (!operation) {
+    container.classList.add("hidden");
+    return;
+  }
+  const incompleteWarning = operationDetailsWarning(operation);
+  if (incompleteWarning) {
+    state.legacyOperation = null;
+    state.legacyOperationKey = null;
+    container.classList.remove("hidden");
+    container.innerHTML = `<p class="warning-text">${escapeHtml(incompleteWarning)}</p>`;
+    return;
+  }
+  if (!Array.isArray(operation.result?.hints) || !Array.isArray(operation.result?.candidates)) {
+    state.legacyOperation = null;
     container.classList.add("hidden");
     return;
   }
@@ -501,14 +528,17 @@ function renderOperations() {
     const items = Array.isArray(outcome.items) ? outcome.items : Array.isArray(result.items) ? result.items : [];
     const hintCount = Array.isArray(result.hints) ? result.hints.length : 0;
     const candidateCount = Array.isArray(result.candidates) ? result.candidates.length : 0;
+    const detailsWarning = operationDetailsWarning(entry);
     const movedFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.moved_files) ? item.moved_files : 0), 0);
     const totalFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.total_files) ? item.total_files : 0), 0);
     const metadataUpdated = items.filter((item) => item.metadata_patched === true).length;
     const summary = items.length
       ? `${items.length} item${items.length === 1 ? "" : "s"} · ${movedFiles}/${totalFiles} related file${totalFiles === 1 ? "" : "s"} moved · ${metadataUpdated} metadata update${metadataUpdated === 1 ? "" : "s"}`
       : entry.kind === "legacy_import"
-        ? `${hintCount} hints read · ${candidateCount} possible matches. Choose the matches above to prepare updates.`
-        : "Request received by your computer.";
+        ? detailsWarning
+          ? "Legacy import report is incomplete; see the warning below."
+          : `${hintCount} hints read · ${candidateCount} possible matches. Choose the matches above to prepare updates.`
+          : "Request received by your computer.";
     const warnings = [
       ...(Array.isArray(entry.warnings) ? entry.warnings : []),
       ...(Array.isArray(result.warnings) ? result.warnings : []),
@@ -523,6 +553,7 @@ function renderOperations() {
       return `<div class="preview-line"><span>${escapeHtml(label)}<br><span class="field-hint">${escapeHtml(fileProgress + metadata)}</span>${item.error ? `<br><span class="preview-reason">${escapeHtml(item.error)}</span>` : ""}</span><strong class="${item.error ? "skip" : "move"}">${item.error ? "Needs review" : "Done"}</strong></div>`;
     }).join("");
     const warningDetails = [...warnings, ...(typeof telegramWarning === "string" ? [telegramWarning] : [])];
+    if (detailsWarning) warningDetails.push(detailsWarning);
     return `<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(operationTitle(entry))}</h3><p>${escapeHtml(entry.error ?? summary)}</p></div><span class="state-pill">${escapeHtml(statusText(entry.status))}</span></div>${entry.created_at ? `<p>Received ${escapeHtml(timeAgo(entry.created_at))}</p>` : ""}${itemResults ? `<div class="preview-table">${itemResults}</div>` : ""}${warningDetails.length ? `<div class="operation-warnings">${warningDetails.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}</div>` : ""}${entry.kind === "legacy_import" && result.revision ? `<p>Library revision: ${escapeHtml(result.revision)}</p>` : ""}</article>`;
   }).join("");
 }
@@ -726,6 +757,11 @@ function bindEvents() {
     if (details) { state.detailId = details.dataset.details; renderDetail(); return; }
     const confirm = event.target.closest("[data-confirm]");
     if (confirm) {
+      const matchingPreview = previews().find((entry) => entry.id === confirm.dataset.confirm && entry.revision === confirm.dataset.revision);
+      if (!matchingPreview || isIncompletePreview(matchingPreview)) {
+        showToast("This preview is incomplete. Request a fresh preview before confirming.");
+        return;
+      }
       confirm.disabled = true;
       submitAction("file_confirm", { preview_id: confirm.dataset.confirm, revision: confirm.dataset.revision });
       return;

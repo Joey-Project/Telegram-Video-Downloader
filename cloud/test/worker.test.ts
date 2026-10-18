@@ -9,7 +9,8 @@ import { getOrCreateLegacySelection, updateLegacySelection } from "../public/fil
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "../public/file/metadata-preview.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
 import { sourceIdUrl } from "../public/file/source-links.js";
-import { buildWaitingEntries, isPresentMedia, isReviewablePreviewStatus, mergeRequestEntries, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
+import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
+import worker from "../src/index";
 
 const testEnv = env as typeof env & { TEST_MIGRATIONS: D1Migration[] };
 const ownerId = 123456789;
@@ -127,6 +128,19 @@ async function webhook(update: unknown, secret: string = webhookToken): Promise<
   }));
 }
 
+async function webhookWithOwnerId(update: unknown, ownerUserId: string, secret: string = webhookToken): Promise<Response> {
+  const overriddenEnv = Object.create(testEnv) as object;
+  Object.defineProperty(overriddenEnv, "OWNER_USER_ID", { value: ownerUserId });
+  return worker.fetch(
+    new Request(`${workerUrl}/webhook`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-telegram-bot-api-secret-token": secret },
+      body: JSON.stringify(update),
+    }),
+    overriddenEnv as Env,
+  );
+}
+
 function localHeaders(): HeadersInit {
   return { authorization: `Bearer ${ownerToken}` };
 }
@@ -191,6 +205,24 @@ describe("durable Telegram ingress", () => {
     expect(await listDurableObjectIds(testEnv.NOTIFIER)).toHaveLength(0);
     expect((await localRequests()).status).toBe(200);
     expect(await responseJson<{ requests: unknown[] }>(await localRequests())).toEqual({ requests: [] });
+  });
+
+  it("rejects authorized webhooks until the owner ID is configured", async () => {
+    const placeholder = await webhookWithOwnerId(ownerMessage(9), "0");
+    const invalid = await webhookWithOwnerId(ownerMessage(10), "not-a-user-id");
+    const unauthorized = await webhookWithOwnerId(ownerMessage(11), "0", "wrong-secret");
+
+    expect(placeholder.status).toBe(503);
+    expect(invalid.status).toBe(503);
+    expect(unauthorized.status).toBe(401);
+    expect((await responseJson<{ error: string }>(placeholder)).error).toContain("Owner authorization");
+    expect((await responseJson<{ requests: unknown[] }>(await localRequests())).requests).toHaveLength(0);
+    expect(await listDurableObjectIds(testEnv.NOTIFIER)).toHaveLength(0);
+
+    const configured = await webhookWithOwnerId(ownerMessage(12), String(ownerId));
+    expect(configured.status).toBe(200);
+    expect(await responseJson<{ stored: boolean }>(configured)).toMatchObject({ stored: true });
+    expect((await responseJson<{ requests: unknown[] }>(await localRequests())).requests).toHaveLength(1);
   });
 
   it("ignores valid updates outside the configured owner's private message/callback path", async () => {
@@ -352,6 +384,14 @@ describe("local client API and state snapshots", () => {
   it("requires the shared local authorization for every local endpoint", async () => {
     const response = await SELF.fetch(new Request(`${workerUrl}/api/local/requests`));
     expect(response.status).toBe(401);
+  });
+
+  it("caps the local request page at the shared 100-entry batch size", async () => {
+    const defaultPage = await SELF.fetch(new Request(`${workerUrl}/api/local/requests`, { headers: localHeaders() }));
+    const oversizedPage = await localRequests(101);
+    expect(defaultPage.status).toBe(200);
+    expect(oversizedPage.status).toBe(400);
+    expect((await responseJson<{ error: string }>(oversizedPage)).error).toContain("1 to 100");
   });
 
   it("stores the first incomplete scan health state without reporting an empty ready library", async () => {
@@ -529,5 +569,59 @@ describe("offline action queue helpers", () => {
       failedWithPreview,
       other,
     ]);
+  });
+
+  it("does not count terminal file previews as waiting", () => {
+    for (const status of [
+      "confirmed",
+      "completed",
+      "cancelled",
+      "expired",
+      "failed",
+      "uncertain",
+      "partial_failure",
+      "stale",
+      "rejected",
+    ]) {
+      expect(isWaitingEntryPending({ kind: "file_preview", status }), status).toBe(false);
+    }
+    for (const status of ["waiting_for_local", "awaiting_confirmation", "processing", "retryable"]) {
+      expect(isWaitingEntryPending({ kind: "file_preview", status }), status).toBe(true);
+    }
+    expect(isWaitingEntryPending({ kind: "file_confirm", status: "received" })).toBe(true);
+    expect(isWaitingEntryPending({ kind: "file_confirm", status: "completed" })).toBe(false);
+  });
+
+  it("requires a fresh preview when the saved details were omitted", () => {
+    expect(isIncompletePreview({
+      preview_id: "preview-a",
+      revision: "revision-a",
+      status: "awaiting_confirmation",
+      preview_incomplete: true,
+      incomplete: true,
+      reload_required: true,
+      reason: "Preview details were omitted from the cloud snapshot.",
+      preview: null,
+    })).toBe(true);
+    expect(isIncompletePreview({ incomplete: true, omitted_count: 3, reload_required: true })).toBe(true);
+    expect(isIncompletePreview({ preview: { items: [], metadata_patches: [] } })).toBe(false);
+    expect(isIncompletePreview({ preview: null })).toBe(true);
+  });
+
+  it("shows when saved operation details were omitted from history", () => {
+    expect(operationDetailsWarning({
+      kind: "legacy_import",
+      details_incomplete: true,
+      result_truncated: true,
+      result: { hints_summary: "omitted" },
+    })).toContain("submit the import again");
+    expect(operationDetailsWarning({
+      kind: "file_confirm",
+      result: { operation: { details_incomplete: true } },
+    })).toContain("omitted from the saved history");
+    expect(operationDetailsWarning({
+      kind: "legacy_import",
+      result: { hints: [], candidates: [] },
+    })).toBeNull();
   });
 });

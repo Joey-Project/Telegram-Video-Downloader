@@ -198,6 +198,8 @@ pub struct BatchMoveResult {
     pub id: String,
     pub revision: String,
     pub status: BatchStatus,
+    #[serde(default)]
+    pub retryable_access_error: bool,
     pub items: Vec<MoveResultItem>,
     pub warnings: Vec<String>,
 }

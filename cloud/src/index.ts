@@ -1,6 +1,6 @@
 import type { InboxEnvelope } from "./types";
 import { HttpError } from "./types";
-import { requireLocalAuthorization, requireOwner, requireWebhookAuthorization } from "./security";
+import { requireConfiguredOwnerUserId, requireLocalAuthorization, requireOwner, requireWebhookAuthorization } from "./security";
 import { acknowledge, emptySnapshot, enqueue, getPending, getPendingSummary, readSnapshot, storeSnapshot } from "./store";
 import {
   MAX_ACTION_BODY_BYTES,
@@ -17,6 +17,7 @@ import {
 export { NotificationHub } from "./notification_hub";
 
 const NOTIFIER_ID = "telegram-single-owner";
+const CLOUD_REQUEST_PAGE_SIZE = 100;
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, {
@@ -40,8 +41,9 @@ async function notifyAfterPersist(env: Env, envelope: InboxEnvelope): Promise<vo
 
 async function handleWebhook(request: Request, env: Env): Promise<Response> {
   requireWebhookAuthorization(request, env);
+  const ownerUserId = requireConfiguredOwnerUserId(env.OWNER_USER_ID);
   const rawUpdate = validateTelegramUpdate(await readJsonBody(request, MAX_WEBHOOK_BODY_BYTES));
-  if (!isOwnerPrivateTelegramUpdate(rawUpdate, env.OWNER_USER_ID)) {
+  if (!isOwnerPrivateTelegramUpdate(rawUpdate, ownerUserId)) {
     return json({ ok: true, stored: false, ignored: true });
   }
   const result = await enqueue(env.DB, `tg:${rawUpdate.update_id}`, "telegram", rawUpdate);
@@ -59,7 +61,7 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
 
 async function handleLocalRequests(request: Request, env: Env): Promise<Response> {
   requireLocalAuthorization(request, env);
-  const limit = parseLimit(new URL(request.url).searchParams.get("limit"));
+  const limit = parseLimit(new URL(request.url).searchParams.get("limit"), CLOUD_REQUEST_PAGE_SIZE);
   return json({ requests: await getPending(env.DB, limit) });
 }
 
@@ -90,7 +92,7 @@ async function handleState(request: Request, env: Env): Promise<Response> {
   await requireOwner(request, env);
   const [snapshot, pendingRequests] = await Promise.all([
     readSnapshot(env.DB),
-    getPendingSummary(env.DB, 100),
+    getPendingSummary(env.DB, CLOUD_REQUEST_PAGE_SIZE),
   ]);
   return json({ ...(snapshot ?? emptySnapshot()), pending_requests: pendingRequests });
 }

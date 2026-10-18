@@ -105,6 +105,8 @@ struct BatchManifest {
     version: u32,
     preview: MovePreview,
     status: BatchStatus,
+    #[serde(default)]
+    retryable_access_error: bool,
     files: Vec<ManifestFile>,
     patches: Vec<PreparedNfoPatch>,
     items: Vec<MoveResultItem>,
@@ -840,6 +842,7 @@ impl LibraryManager {
                     version: 1,
                     preview: preview.clone(),
                     status: BatchStatus::Partial,
+                    retryable_access_error: false,
                     files,
                     patches: persisted.patches.clone(),
                     items,
@@ -847,6 +850,7 @@ impl LibraryManager {
                 }
             }
         };
+        manifest.retryable_access_error = false;
         for item in &mut manifest.items {
             item.moved_files = 0;
             item.error = None;
@@ -878,6 +882,9 @@ impl LibraryManager {
                             manifest.items[item_index].moved_files += 1;
                         }
                         Err(error) => {
+                            if is_file_provider_access_error(&error) {
+                                manifest.retryable_access_error = true;
+                            }
                             let message = format!(
                                 "previously moved target no longer matches its approved object: {error:#}"
                             );
@@ -899,6 +906,9 @@ impl LibraryManager {
                         manifest.items[item_index].moved_files += 1;
                     }
                     Err(error) => {
+                        if is_file_provider_access_error(&error) {
+                            manifest.retryable_access_error = true;
+                        }
                         let message = format!("{error:#}");
                         manifest.files[file_index].error = Some(message.clone());
                         manifest.items[item_index].error = Some(message);
@@ -939,6 +949,9 @@ impl LibraryManager {
                     }
                 }
                 Err(error) => {
+                    if is_file_provider_access_error(&error) {
+                        manifest.retryable_access_error = true;
+                    }
                     let message = format!("{error:#}");
                     manifest.warnings.push(message.clone());
                     if let Some(result) = manifest
@@ -2581,6 +2594,7 @@ fn batch_result(manifest: &BatchManifest) -> BatchMoveResult {
         id: manifest.preview.id.clone(),
         revision: manifest.preview.revision.clone(),
         status: manifest.status,
+        retryable_access_error: manifest.retryable_access_error,
         items: manifest.items.clone(),
         warnings: manifest.warnings.clone(),
     }
@@ -3360,12 +3374,15 @@ fn xml_tag_text(content: &str, name: &str) -> Option<String> {
         if content
             .as_bytes()
             .get(after_name)
-            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'>')
+            .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'>' && *byte != b'/')
         {
             search_from = after_name;
             continue;
         }
         let open_end = content[after_name..].find('>')? + after_name;
+        if self_closing_xml_tag_slash(content, start, open_end).is_some() {
+            return Some(String::new());
+        }
         let close_marker = format!("</{name}>");
         let close = find_ascii_case_insensitive(content, &close_marker, open_end + 1)?;
         let value = strip_xml_markup(&content[open_end + 1..close]);
@@ -3419,6 +3436,16 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn self_closing_xml_tag_slash(content: &str, start: usize, open_end: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut last_non_whitespace = open_end;
+    while last_non_whitespace > start && bytes[last_non_whitespace - 1].is_ascii_whitespace() {
+        last_non_whitespace -= 1;
+    }
+    (last_non_whitespace > start && bytes[last_non_whitespace - 1] == b'/')
+        .then_some(last_non_whitespace - 1)
 }
 
 fn metadata_field_changes(before: Option<&str>, after: &str) -> Vec<MetadataFieldChange> {
@@ -3534,7 +3561,7 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
 fn replace_xml_element(content: &str, name: &str, value: &str) -> Result<String> {
     let opening = format!("<{name}");
     let mut search_from = 0;
-    let open_end = loop {
+    let (start, open_end) = loop {
         let Some(start) = find_ascii_case_insensitive(content, &opening, search_from) else {
             bail!("NFO element disappeared while preparing its confirmed update");
         };
@@ -3548,8 +3575,19 @@ fn replace_xml_element(content: &str, name: &str, value: &str) -> Result<String>
             .find('>')
             .map(|offset| start + opening.len() + offset)
             .ok_or_else(|| anyhow!("NFO element has an incomplete opening tag"))?;
-        break end;
+        break (start, end);
     };
+    if let Some(slash) = self_closing_xml_tag_slash(content, start, open_end) {
+        let mut output = String::with_capacity(content.len() + value.len() + name.len() + 3);
+        output.push_str(&content[..slash]);
+        output.push_str(&content[slash + 1..open_end + 1]);
+        output.push_str(&xml_escape(value));
+        output.push_str("</");
+        output.push_str(name);
+        output.push('>');
+        output.push_str(&content[open_end + 1..]);
+        return Ok(output);
+    }
     let close_marker = format!("</{name}>");
     let close_start = find_ascii_case_insensitive(content, &close_marker, open_end + 1)
         .ok_or_else(|| anyhow!("NFO element has no closing tag"))?;
@@ -4782,6 +4820,34 @@ mod tests {
     }
 
     #[test]
+    fn repeated_metadata_patch_expands_self_closing_tag_without_losing_siblings() {
+        let original = "<movie><title/><futureField key=\"x\">keep &amp; opaque</futureField><actor>keep actor</actor></movie>";
+        let first_patch = MetadataPatch {
+            item_id: "fixture-item".to_string(),
+            title: Some("First title".to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+        };
+        let once = append_metadata_patch(original, &first_patch)
+            .expect("first patch should expand the self-closing title");
+        assert!(once.contains("<title>First title</title>"));
+        assert!(once.contains("<futureField key=\"x\">keep &amp; opaque</futureField>"));
+        assert!(once.contains("<actor>keep actor</actor>"));
+
+        let second_patch = MetadataPatch {
+            title: Some("Second title".to_string()),
+            ..first_patch
+        };
+        let twice = append_metadata_patch(&once, &second_patch)
+            .expect("second patch should replace only the title value");
+
+        assert_eq!(twice.matches("<title").count(), 1);
+        assert!(twice.contains("<title>Second title</title>"));
+        assert!(twice.contains("<futureField key=\"x\">keep &amp; opaque</futureField>"));
+        assert!(twice.contains("<actor>keep actor</actor>"));
+    }
+
+    #[test]
     fn complete_nfo_metadata_is_recognized_and_collection_identity_round_trips() {
         let root = TemporaryRoot::new("complete-nfo");
         fs::write(root.path().join("complete.mp4"), b"fixture-video")
@@ -5405,6 +5471,104 @@ mod tests {
         assert!(root.path().join("Moved/clip.mp4").exists());
         assert!(!root.path().join("clip.mp4").exists());
         assert!(!root.path().join("clip.srt").exists());
+    }
+
+    #[derive(Default)]
+    struct FailSecondMoveWithAccessErrorProvider {
+        move_count: AtomicUsize,
+    }
+
+    impl QueueFileProvider for FailSecondMoveWithAccessErrorProvider {
+        fn coordinate_read(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(path)
+        }
+
+        fn coordinate_write(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(path)
+        }
+
+        fn coordinate_move(
+            &self,
+            source: &Path,
+            destination: &Path,
+            accessor: &mut dyn FnMut(&Path, &Path) -> Result<()>,
+        ) -> Result<()> {
+            if self.move_count.fetch_add(1, Ordering::SeqCst) == 1 {
+                return Err(crate::file_provider::FileProviderAccessError::new(
+                    source,
+                    "move",
+                    "injected transient access failure",
+                )
+                .into());
+            }
+            accessor(source, destination)
+        }
+    }
+
+    #[test]
+    fn partial_file_provider_access_error_is_durable_and_retryable_after_reopen() {
+        let root = TemporaryRoot::new("partial-file-provider-retryable");
+        fs::write(root.path().join("clip.mp4"), b"primary-video")
+            .expect("primary media should write");
+        fs::write(root.path().join("clip.srt"), b"subtitle")
+            .expect("subtitle attachment should write");
+        let provider_impl = Arc::new(FailSecondMoveWithAccessErrorProvider::default());
+        let provider: Arc<dyn QueueFileProvider> = provider_impl.clone();
+        let manager = LibraryManager::open_with_provider(root.path(), Arc::clone(&provider))
+            .expect("library manager should open");
+        let snapshot = manager
+            .scan(&[])
+            .expect("scan should find primary and subtitle");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        let preview = manager
+            .preview(&[item_id], "Moved", false, ConflictPolicy::KeepBoth)
+            .expect("group move should preview");
+
+        let partial = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("transient File Provider error should persist a partial result");
+        assert_eq!(partial.status, BatchStatus::Partial);
+        assert!(partial.retryable_access_error);
+        let manifest_path = manager.batch_path(&preview.id);
+        let persisted = manager
+            .read_private_file(&manifest_path, MANIFEST_LIMIT)
+            .expect("partial manifest should be readable")
+            .expect("partial manifest should be persisted");
+        let manifest: BatchManifest =
+            serde_json::from_slice(&persisted).expect("partial manifest should parse");
+        assert_eq!(manifest.status, BatchStatus::Partial);
+        assert!(manifest.retryable_access_error);
+        assert!(root.path().join("Moved/clip.srt").exists());
+        assert!(root.path().join("clip.mp4").exists());
+
+        drop(manager);
+        let reopened = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should reopen with the same provider");
+        let complete = reopened
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("the persisted partial batch should resume");
+        assert_eq!(complete.status, BatchStatus::Complete);
+        assert!(!complete.retryable_access_error);
+        assert!(root.path().join("Moved/clip.srt").exists());
+        assert!(root.path().join("Moved/clip.mp4").exists());
+        assert!(!root.path().join("clip.mp4").exists());
+        let persisted = reopened
+            .read_private_file(&manifest_path, MANIFEST_LIMIT)
+            .expect("completed manifest should be readable")
+            .expect("completed manifest should remain persisted");
+        let manifest: BatchManifest =
+            serde_json::from_slice(&persisted).expect("completed manifest should parse");
+        assert_eq!(manifest.status, BatchStatus::Complete);
+        assert!(!manifest.retryable_access_error);
+        assert_eq!(provider_impl.move_count.load(Ordering::SeqCst), 3);
     }
 
     #[test]

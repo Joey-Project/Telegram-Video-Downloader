@@ -7,6 +7,7 @@ mod bilibili_planning;
 mod cloud;
 #[cfg(test)]
 mod cloud_bot_tests;
+mod cloud_snapshot_budget;
 mod config;
 mod disk_space;
 mod downloader;
@@ -26,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -44,8 +45,9 @@ use crate::bilibili_attempt::{
     BilibiliAttemptUpdate,
 };
 use crate::cloud::{
-    CloudClient, CloudInbox, CloudRequest, CloudSettings, CloudState, CloudStatePostError,
-    CloudWebSocket, InboxRecord, InboxStatus, next_websocket_request, now_millis, now_seconds,
+    CLOUD_REQUEST_PAGE_SIZE, CloudClient, CloudInbox, CloudRequest, CloudSettings, CloudState,
+    CloudStatePostError, CloudWebSocket, InboxRecord, InboxStatus, next_websocket_request,
+    now_millis, now_seconds,
 };
 use crate::config::{AppConfig, CloudConfig};
 use crate::downloader::{
@@ -95,6 +97,7 @@ static PENDING_BILIBILI_SELECTION_JOBS: OnceLock<Mutex<HashMap<u64, PendingBilib
 static PENDING_COLLECTION_DETAILS: OnceLock<Mutex<HashMap<u64, PendingCollectionDetails>>> =
     OnceLock::new();
 const CLOUD_STATE_UPLOAD_SOFT_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+const CLOUD_STATE_PREVIEW_ENTRY_LIMIT: usize = 100;
 const CLOUD_QUEUE_STATE_COALESCE: Duration = Duration::from_secs(2);
 static PENDING_BILIBILI_ACCESS_KEY_LOGINS: OnceLock<
     Mutex<HashMap<i64, PendingBilibiliAccessKeyLogin>>,
@@ -412,6 +415,10 @@ struct CloudBotRuntime {
     library_scan_warning: Arc<Mutex<Option<String>>>,
     telegram_dispatch: Arc<Semaphore>,
     management_dispatch: Arc<Semaphore>,
+    backlog_sync_gate: Arc<Mutex<()>>,
+    reconciliation_complete: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
 }
 
 #[derive(Clone)]
@@ -451,6 +458,31 @@ impl CloudStateSnapshot {
             },
         };
         Ok(serde_json::to_vec(&state)?.len())
+    }
+
+    fn compact_operation_receipts(&mut self) -> bool {
+        cloud_snapshot_budget::compact_operation_receipts(&mut self.operations)
+    }
+
+    fn reduce_after_payload_too_large(
+        &mut self,
+        state_version: u64,
+        max_bytes: usize,
+    ) -> Result<bool> {
+        let compacted_operations = self.compact_operation_receipts();
+        let compacted_size = self.encoded_size(state_version)?;
+        if compacted_size.saturating_add(1024) > max_bytes {
+            return self.trim_library_for_upload(state_version, max_bytes);
+        }
+        if compacted_operations {
+            return Ok(true);
+        }
+
+        // A remote 413 can have a lower limit than our local soft cap. If operation receipts
+        // could not shrink this payload, force a smaller library prefix so the next retry makes
+        // measurable progress instead of posting the same body under a new version.
+        let reduced_budget = compacted_size.saturating_mul(3) / 4;
+        self.trim_library_for_upload(state_version, reduced_budget.min(max_bytes))
     }
 
     fn trim_library_for_upload(&mut self, state_version: u64, max_bytes: usize) -> Result<bool> {
@@ -571,6 +603,10 @@ async fn run_cloud_bot(
         library_scan_warning: Arc::new(Mutex::new(None)),
         telegram_dispatch: Arc::new(Semaphore::new(1)),
         management_dispatch: Arc::new(Semaphore::new(1)),
+        backlog_sync_gate: Arc::new(Mutex::new(())),
+        reconciliation_complete: Arc::new(AtomicBool::new(false)),
+        #[cfg(test)]
+        test_file_provider: None,
     };
 
     info!(
@@ -679,6 +715,7 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
     let mut published_version: Option<u64> = None;
     let mut permanently_rejected_fingerprint: Option<Vec<u8>> = None;
     let mut published_oversized_source_fingerprint: Option<Vec<u8>> = None;
+    let mut published_oversized_snapshot: Option<CloudStateSnapshot> = None;
     let mut pending: Option<PendingCloudState> = None;
 
     loop {
@@ -703,42 +740,30 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
                         let Some(state_version) = published_version else {
                             continue;
                         };
-                        let mut heartbeat_snapshot = snapshot;
-                        match heartbeat_snapshot.trim_library_for_upload(
-                            state_version,
-                            CLOUD_STATE_UPLOAD_SOFT_LIMIT_BYTES,
-                        ) {
-                            Ok(true) => match heartbeat_snapshot.fingerprint() {
-                                Ok(heartbeat_fingerprint)
-                                    if published_fingerprint.as_ref()
-                                        == Some(&heartbeat_fingerprint) =>
-                                {
-                                    pending = Some(PendingCloudState {
-                                        snapshot: heartbeat_snapshot,
-                                        fingerprint: heartbeat_fingerprint,
-                                        state_version,
-                                        rejected_fingerprint: Some(fingerprint),
-                                    });
-                                    continue;
-                                }
-                                Ok(_) => {
-                                    warn!(
-                                        state_version,
-                                        "skipping heartbeat because the retrimmed snapshot differs from the published snapshot"
-                                    );
-                                    continue;
-                                }
-                                Err(error) => {
-                                    warn!(error = %format!("{error:#}"), "failed to fingerprint the heartbeat snapshot");
-                                    continue;
-                                }
-                            },
-                            Ok(false) => continue,
+                        let Some(heartbeat_snapshot) = published_oversized_snapshot.clone() else {
+                            continue;
+                        };
+                        let heartbeat_fingerprint = match heartbeat_snapshot.fingerprint() {
+                            Ok(fingerprint) => fingerprint,
                             Err(error) => {
-                                warn!(error = %format!("{error:#}"), "failed to prepare the heartbeat snapshot");
+                                warn!(error = %format!("{error:#}"), "failed to fingerprint the accepted incomplete heartbeat snapshot");
                                 continue;
                             }
+                        };
+                        if published_fingerprint.as_ref() != Some(&heartbeat_fingerprint) {
+                            warn!(
+                                state_version,
+                                "skipping heartbeat because the cached incomplete snapshot differs from the published state"
+                            );
+                            continue;
                         }
+                        pending = Some(PendingCloudState {
+                            snapshot: heartbeat_snapshot,
+                            fingerprint: heartbeat_fingerprint,
+                            state_version,
+                            rejected_fingerprint: Some(fingerprint),
+                        });
+                        continue;
                     }
                     if permanently_rejected_fingerprint.as_ref() == Some(&fingerprint) {
                         continue;
@@ -787,6 +812,10 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
                 published_version = Some(state.state_version);
                 permanently_rejected_fingerprint = state.rejected_fingerprint.clone();
                 published_oversized_source_fingerprint = state.rejected_fingerprint.clone();
+                published_oversized_snapshot = state
+                    .rejected_fingerprint
+                    .as_ref()
+                    .map(|_| state.snapshot.clone());
                 pending = None;
             }
             Err(error) if error.is_payload_too_large() => {
@@ -797,28 +826,34 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
                     .rejected_fingerprint
                     .clone()
                     .unwrap_or_else(|| rejected.fingerprint.clone());
-                let next_version = match next_cloud_state_version(&runtime).await {
-                    Ok(version) => version,
-                    Err(version_error) => {
-                        warn!(
-                            state_version = rejected.state_version,
-                            error = %format!("{version_error:#}"),
-                            "failed to persist a new version for the incomplete cloud snapshot"
-                        );
-                        permanently_rejected_fingerprint = Some(rejected_fingerprint);
-                        continue;
-                    }
-                };
                 let mut trimmed = rejected.snapshot;
-                match trimmed
-                    .trim_library_for_upload(next_version, CLOUD_STATE_UPLOAD_SOFT_LIMIT_BYTES)
-                {
+                match trimmed.reduce_after_payload_too_large(
+                    rejected.state_version,
+                    CLOUD_STATE_UPLOAD_SOFT_LIMIT_BYTES,
+                ) {
                     Ok(true) => match trimmed.fingerprint() {
-                        Ok(fingerprint) => {
+                        Ok(fingerprint)
+                            if fingerprint != rejected.fingerprint
+                                && fingerprint.len() < rejected.fingerprint.len() =>
+                        {
+                            let next_version = match next_cloud_state_version(&runtime).await {
+                                Ok(version) => version,
+                                Err(version_error) => {
+                                    warn!(
+                                        state_version = rejected.state_version,
+                                        error = %format!("{version_error:#}"),
+                                        "failed to persist a new version for the reduced cloud snapshot"
+                                    );
+                                    permanently_rejected_fingerprint = Some(rejected_fingerprint);
+                                    continue;
+                                }
+                            };
                             warn!(
                                 state_version = rejected.state_version,
                                 retry_state_version = next_version,
-                                "cloud rejected an oversized state; retrying an explicitly incomplete library snapshot"
+                                reduced_bytes = fingerprint.len(),
+                                original_bytes = rejected.fingerprint.len(),
+                                "cloud rejected an oversized state; retrying a smaller operation receipt or explicitly incomplete library snapshot"
                             );
                             pending = Some(PendingCloudState {
                                 snapshot: trimmed,
@@ -827,20 +862,33 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
                                 rejected_fingerprint: Some(rejected_fingerprint),
                             });
                         }
+                        Ok(_) => {
+                            warn!(
+                                state_version = rejected.state_version,
+                                "cloud rejected the state and no smaller content snapshot could be produced"
+                            );
+                            permanently_rejected_fingerprint = Some(rejected_fingerprint);
+                            published_oversized_source_fingerprint = None;
+                            published_oversized_snapshot = None;
+                        }
                         Err(fingerprint_error) => {
                             warn!(
                                 error = %format!("{fingerprint_error:#}"),
                                 "failed to fingerprint the incomplete cloud snapshot"
                             );
                             permanently_rejected_fingerprint = Some(rejected_fingerprint);
+                            published_oversized_source_fingerprint = None;
+                            published_oversized_snapshot = None;
                         }
                     },
                     Ok(false) => {
                         warn!(
                             state_version = rejected.state_version,
-                            "cloud rejected an oversized state that cannot be reduced without hiding the remaining library item"
+                            "cloud rejected an oversized state that cannot be reduced while preserving a library item"
                         );
                         permanently_rejected_fingerprint = Some(rejected_fingerprint);
+                        published_oversized_source_fingerprint = None;
+                        published_oversized_snapshot = None;
                     }
                     Err(trim_error) => {
                         warn!(
@@ -848,6 +896,8 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
                             "failed to reduce the oversized cloud state"
                         );
                         permanently_rejected_fingerprint = Some(rejected_fingerprint);
+                        published_oversized_source_fingerprint = None;
+                        published_oversized_snapshot = None;
                     }
                 }
             }
@@ -864,6 +914,7 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
                         .unwrap_or(failed_fingerprint),
                 );
                 published_oversized_source_fingerprint = None;
+                published_oversized_snapshot = None;
                 pending = None;
             }
             Err(error) => {
@@ -891,46 +942,16 @@ async fn build_cloud_state_snapshot(
     runtime: &CloudBotRuntime,
 ) -> Result<Option<CloudStateSnapshot>> {
     let library = runtime.library_snapshot.lock().await.clone();
-    let records = cloud_state_records(runtime).await?;
+    let (records, omitted_preview_count) =
+        cloud_state_records_bounded(runtime, CLOUD_STATE_PREVIEW_ENTRY_LIMIT).await?;
     let mut management_records = records
         .iter()
         .filter(|record| record.request.kind != "telegram")
         .collect::<Vec<_>>();
     management_records.sort_by_key(|record| record.request.seq);
-    let operations = management_records
-        .iter()
-        .rev()
-        .take(100)
-        .rev()
-        .map(|record| {
-            let result = record.result.as_ref().map(|result| {
-                if record.request.kind == "library_scan" {
-                    serde_json::json!({
-                        "revision": result.get("revision"),
-                        "scanned_at": result.get("scanned_at"),
-                    })
-                } else {
-                    result.clone()
-                }
-            });
-            serde_json::json!({
-                "seq": record.request.seq,
-                "kind": record.request.kind,
-                "status": record.status,
-                "created_at": record.request.created_at,
-                "updated_at": record.updated_at,
-                "attempts": record.attempts,
-                "next_attempt_at": record.next_attempt_at,
-                "result": result,
-                "error": record.error,
-            })
-        })
-        .collect::<Vec<_>>();
-    let previews = management_records
-        .iter()
-        .filter(|record| record.status == InboxStatus::AwaitingConfirmation)
-        .filter_map(|record| record.result.as_ref()?.get("preview").cloned())
-        .collect::<Vec<_>>();
+    let operations = cloud_snapshot_budget::operation_snapshots(&management_records)?;
+    let previews =
+        cloud_snapshot_budget::preview_snapshots(&management_records, omitted_preview_count);
     let config = Arc::clone(&runtime.bot.config);
     let queue = Arc::clone(&runtime.bot.queue);
     let tasks = tokio::task::spawn_blocking(move || cloud_task_summaries(&config, &queue))
@@ -1084,11 +1105,9 @@ async fn receive_cloud_websocket_session(
         match next.await? {
             Some(request) => {
                 let seq = request.seq;
-                if let Err(error) = persist_cloud_request(runtime, request).await {
-                    warn!(seq, error = %format!("{error:#}"), "failed to persist WebSocket request");
-                } else if let Err(error) = runtime.client.acknowledge(&[seq]).await {
-                    warn!(seq, error = %format!("{error:#}"), "failed to acknowledge durable WebSocket request");
-                }
+                sync_cloud_backlog_through(runtime, &request)
+                    .await
+                    .with_context(|| format!("failed to reconcile WebSocket request {seq}"))?;
             }
             None => return Ok(()),
         }
@@ -1096,16 +1115,91 @@ async fn receive_cloud_websocket_session(
 }
 
 async fn sync_cloud_backlog(runtime: &CloudBotRuntime) -> Result<()> {
-    let mut requests = runtime.client.fetch_requests().await?;
-    requests.sort_by_key(|request| request.seq);
-    for request in requests {
-        let seq = request.seq;
-        persist_cloud_request(runtime, request).await?;
-        // Acknowledge only after persist() has fsynced the complete private envelope. Repeated
-        // delivery after a lost ACK is safe because persist() deduplicates by exact sequence and
-        // exact envelope, not by a high-water mark.
-        runtime.client.acknowledge(&[seq]).await?;
+    sync_cloud_backlog_inner(runtime, None).await
+}
+
+async fn sync_cloud_backlog_through(
+    runtime: &CloudBotRuntime,
+    websocket_request: &CloudRequest,
+) -> Result<()> {
+    sync_cloud_backlog_inner(runtime, Some(websocket_request)).await
+}
+
+async fn sync_cloud_backlog_inner(
+    runtime: &CloudBotRuntime,
+    websocket_request: Option<&CloudRequest>,
+) -> Result<()> {
+    let _gate = runtime.backlog_sync_gate.lock().await;
+    // A failed fetch or ACK leaves this false, so the periodic dispatcher cannot bypass a
+    // partially reconciled authoritative backlog.
+    runtime
+        .reconciliation_complete
+        .store(false, Ordering::Release);
+
+    let mut expected_request_seen = false;
+    let mut previous_page_last_seq = None;
+    loop {
+        let mut requests = runtime.client.fetch_requests().await?;
+        let page_len = requests.len();
+        if page_len > CLOUD_REQUEST_PAGE_SIZE {
+            bail!("cloud request endpoint returned {page_len} entries, above the page limit");
+        }
+        requests.sort_by_key(|request| request.seq);
+        if requests.is_empty() {
+            break;
+        }
+        let first_seq = requests[0].seq;
+        let last_seq = requests[page_len - 1].seq;
+        if previous_page_last_seq.is_some_and(|previous| first_seq <= previous) {
+            bail!("cloud request backlog pagination did not advance after acknowledgement");
+        }
+        let mut acknowledged = Vec::with_capacity(page_len);
+        for request in requests {
+            if let Some(expected) = websocket_request
+                && request.seq == expected.seq
+            {
+                if request != *expected {
+                    bail!(
+                        "WebSocket request sequence {} did not match its authoritative REST envelope",
+                        expected.seq
+                    );
+                }
+                expected_request_seen = true;
+            }
+            let seq = request.seq;
+            persist_cloud_request(runtime, request).await?;
+            acknowledged.push(seq);
+        }
+        // Every envelope in this page was fsynced before this page ACK. Exact-sequence durable
+        // deduplication makes a repeated page safe if this request or its response is lost.
+        runtime.client.acknowledge(&acknowledged).await?;
+        if page_len < CLOUD_REQUEST_PAGE_SIZE {
+            break;
+        }
+        previous_page_last_seq = Some(last_seq);
     }
+
+    if let Some(expected) = websocket_request
+        && !expected_request_seen
+    {
+        let inbox = Arc::clone(&runtime.inbox);
+        let expected = expected.clone();
+        let durable = tokio::task::spawn_blocking(move || inbox.record(expected.seq))
+            .await
+            .context("cloud inbox verification worker failed")??;
+        if durable.is_none_or(|record| record.request != expected) {
+            bail!(
+                "WebSocket request sequence {} was absent from authoritative backlog and local durable inbox",
+                expected.seq
+            );
+        }
+    }
+
+    runtime
+        .reconciliation_complete
+        .store(true, Ordering::Release);
+    runtime.request_notify.notify_one();
+    runtime.state_notify.notify_one();
     Ok(())
 }
 
@@ -1114,11 +1208,6 @@ async fn persist_cloud_request(runtime: &CloudBotRuntime, request: CloudRequest)
     tokio::task::spawn_blocking(move || inbox.persist(request))
         .await
         .context("cloud inbox persistence worker failed")??;
-    // A previous process may have persisted but not yet dispatched an event; waking the
-    // dispatcher is harmless and makes restart/reconnect recovery prompt. Also publish the
-    // durable pending receipt immediately so the cloud UI stays informed after its D1 row is ACKed.
-    runtime.request_notify.notify_one();
-    runtime.state_notify.notify_one();
     Ok(())
 }
 
@@ -1127,6 +1216,10 @@ async fn cloud_request_dispatcher(runtime: CloudBotRuntime) {
         tokio::select! {
             _ = runtime.request_notify.notified() => {},
             _ = sleep(Duration::from_secs(1)) => {},
+        }
+        let _gate = runtime.backlog_sync_gate.lock().await;
+        if !runtime.reconciliation_complete.load(Ordering::Acquire) {
+            continue;
         }
         let inbox = Arc::clone(&runtime.inbox);
         let pending = match tokio::task::spawn_blocking(move || inbox.pending()).await {
@@ -1462,11 +1555,16 @@ async fn dispatch_cloud_management(
             let preview_id_for_execution = confirm_preview_id.clone();
             let revision_for_execution = confirm_revision.clone();
             let context = runtime.bot.clone();
+            #[cfg(test)]
+            let file_provider = runtime.test_file_provider.clone();
+            #[cfg(not(test))]
+            let file_provider = None;
             let execution = tokio::task::spawn_blocking(move || {
-                execute_cloud_file_preview(
+                execute_cloud_file_preview_with_provider(
                     &context,
                     &preview_id_for_execution,
                     &revision_for_execution,
+                    file_provider,
                 )
             })
             .await;
@@ -1545,6 +1643,7 @@ async fn dispatch_cloud_management(
             let telegram_progress_warning = final_message_warning.or(start_message_warning);
             let result_json = serde_json::to_value(&result)?;
             let completed = result.status == crate::library::BatchStatus::Complete;
+            let retryable_access_error = result.retryable_access_error;
             Ok(CloudDispatchOutcome {
                 status: if completed { InboxStatus::Completed } else { InboxStatus::Failed },
                 result: Some(serde_json::json!({
@@ -1553,11 +1652,19 @@ async fn dispatch_cloud_management(
                     "operation": result_json,
                     "telegram_progress_warning": telegram_progress_warning,
                 })),
-                error: (!completed).then(|| "The confirmed operation completed with skipped or failed items; review the per-item result before retrying.".to_string()),
+                error: (!completed).then(|| {
+                    if retryable_access_error {
+                        "Some files could not be accessed temporarily. The preview remains available; confirm it again after local file access recovers.".to_string()
+                    } else {
+                        "The confirmed operation completed with skipped or failed items; review the per-item result before retrying.".to_string()
+                    }
+                }),
                 related_preview: Some((
                     preview_seq,
                     if completed {
                         InboxStatus::Completed
+                    } else if retryable_access_error {
+                        InboxStatus::AwaitingConfirmation
                     } else {
                         InboxStatus::Stale
                     },
@@ -1922,6 +2029,16 @@ async fn cloud_state_records(runtime: &CloudBotRuntime) -> Result<Vec<InboxRecor
         .context("cloud inbox state listing worker failed")?
 }
 
+async fn cloud_state_records_bounded(
+    runtime: &CloudBotRuntime,
+    max_awaiting_previews: usize,
+) -> Result<(Vec<InboxRecord>, usize)> {
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || inbox.state_records_bounded(max_awaiting_previews))
+        .await
+        .context("cloud inbox bounded state listing worker failed")?
+}
+
 fn configured_cloud_management_chat_id(config: &AppConfig) -> Option<i64> {
     if config.telegram.allow_all_chats || config.telegram.allowed_chat_ids.len() != 1 {
         return None;
@@ -2143,12 +2260,18 @@ fn render_cloud_batch_result(result: &crate::library::BatchMoveResult) -> String
     )
 }
 
-fn execute_cloud_file_preview(
+fn execute_cloud_file_preview_with_provider(
     bot: &BotContext,
     preview_id: &str,
     revision: &str,
+    file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
 ) -> Result<(crate::library::BatchMoveResult, LibrarySnapshot)> {
-    let manager = LibraryManager::open(&bot.config.downloads.video_dir)?;
+    let manager = match file_provider {
+        Some(file_provider) => {
+            LibraryManager::open_with_provider(&bot.config.downloads.video_dir, file_provider)?
+        }
+        None => LibraryManager::open(&bot.config.downloads.video_dir)?,
+    };
     let result = manager.execute_preview(preview_id, revision)?;
     let snapshot = manager.scan(&queue_source_hints(bot)?)?;
     Ok((result, snapshot))

@@ -23,7 +23,7 @@ superseded_by: ""
 - 当前接受的架构大方向是公开托管的静态界面自动加载文件库并提交操作；Telegram webhook 进入 Cloudflare Worker，再进入 D1 持久收件箱。本机 Rust bot 主动领取操作，并由本机通过同一 Telegram bot 发送或编辑进度消息。本机没有公网入站接口。偏好使用 Cloudflare Free；达到额度限制时暂停操作并提示用户。
 - Rust 通过固定 Worker API 补领、确认和回写状态；Mini App 验证 Telegram initData。休眠 WebSocket 推送完整请求，固定共享密钥鉴权，本机落盘后才确认接收。状态通过持久递增版本防止旧回写覆盖新快照。
 - 第一至第四阶段的本地代码已落在隔离分支：Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段 `/settings` 与新下载位置选择仍延期。
-- Cloudflare 等待卡片重复问题已修复。2026-10-18 的类型检查、33 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 830 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理和单集发布记录覆盖。
+- Cloudflare 等待卡片重复问题已修复。2026-10-18 的类型检查、38 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 846 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理和单集发布记录覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
 - 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `fefdfcb3cd03a5e153e9e02fd8f9bdf6c727e5b0` 的 master 修复，包含 ASS 弹幕显示默认值及恢复工作流收尾。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
 
@@ -34,7 +34,8 @@ superseded_by: ""
 - Telegram 更新取得执行许可后才标记处理中；本地收件保留持久去重记录，待处理及状态摘要使用独立索引。任务状态与进度触发合并后的状态同步，单集发布仍单独触发文件库扫描。
 - 超大状态上传和生成结果有独立失败恢复；永久失效的确认会关闭旧预览并要求重新预览。活动任务摘要覆盖多页，元数据字段限制与 Worker 对齐。
 - 文件冲突跳过不再计为成功；NFO 完整度按字段判断，YouTube 来源及合集 ID/类型可以往返保存，同一物理对象移动后的队列元数据可以跨重启保留。旧记录关联使用同一次带队列线索的扫描；已确认缺失的历史索引有数量及体积上限。
-- HTTP 模拟覆盖 503 同版本重试、413 后的部分快照上传、裁剪成功后的心跳续期及后续状态更新。暂态确认测试覆盖重试收据、退避和预览保留，未注入真实 File Provider callback 错误贯穿 dispatcher；永久失效确认已覆盖实际 dispatcher 路径。生产休眠、真实配额与 webhook 切换仍留待部署验证。
+- 后续审查补充了启动和 WS 通知前的有序权威补领、owner 未配置时拒绝确认 webhook、暂态部分失败后保留原预览、状态历史的编码体积预算、认证恢复重试、终态等待卡片过滤，以及自闭合 NFO 元素的安全连续修改。过大的历史结果明确标记截断；最新导入报告优先保留供手动关联，不完整预览禁止确认。
+- HTTP 模拟覆盖 503 同版本重试、认证恢复、操作历史压缩、低于本地软限制仍反复 413 时的真缩减、裁剪成功后的心跳续期及后续状态更新，并覆盖无法继续缩减时停止分配版本。暂态确认通过测试专用 provider 注入真实 File Provider access error 贯穿 dispatcher，验证部分移动后沿用原预览继续完成；独立文件管理测试还验证了重开 manager 后恢复。生产休眠、真实配额与 webhook 切换仍留待部署验证。
 
 ## 已确认的产品与交互
 
@@ -124,7 +125,7 @@ superseded_by: ""
 
 ### 已确认的领取与持久确认边界
 
-- 正常在线时，Worker 先把新请求持久写入 D1 并分配唯一序列号，再通过 WS 直接推送该编号和完整 payload，省去一次领取请求。
+- 正常在线时，Worker 先把新请求持久写入 D1 并分配唯一序列号，再通过 WS 推送该编号和完整 payload。Rust 在执行通知对应请求前仍先核对 D1 的权威有序 backlog，避免并发通知乱序造成命令反向执行；正确性优先于原先省去一次读取的优化。
 - Rust 先把完整 envelope 原子写入私有本地 inbox，落盘成功后逐条 `POST /api/local/ack`；ACK 表示本机已持久接收，不表示操作已完成。WS 没有独立 ACK frame。ACK 失败时 REST backlog 重送，完全相同的 sequence/envelope 由 inbox 去重。
 - WS 推送和 HTTPS 补领使用同一请求编号及相同的本地持久化、去重流程。启动、重连和漏通知恢复时补领未确认记录；不能仅按已见最大序号过滤旧序号，以免并发推送乱序时漏掉请求。
 - REST ACK 使用固定 Worker API 和本地 Bearer 鉴权；不会批量塞入状态回写，也不会要求 WS 返回 ACK frame。

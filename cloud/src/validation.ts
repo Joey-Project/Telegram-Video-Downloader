@@ -357,11 +357,13 @@ export function validateSnapshot(value: unknown): LocalSnapshot {
   return value as unknown as LocalSnapshot;
 }
 
-export function parseLimit(value: string | null): number {
-  if (value === null) return 100;
-  if (!/^\d{1,3}$/u.test(value)) throw new HttpError(400, "limit must be an integer from 1 to 500");
+export function parseLimit(value: string | null, maximum = 500): number {
+  const fallback = Math.min(100, maximum);
+  const range = `1 to ${maximum}`;
+  if (value === null) return fallback;
+  if (!/^\d{1,3}$/u.test(value)) throw new HttpError(400, `limit must be an integer from ${range}`);
   const limit = Number(value);
-  if (limit < 1 || limit > 500) throw new HttpError(400, "limit must be an integer from 1 to 500");
+  if (limit < 1 || limit > maximum) throw new HttpError(400, `limit must be an integer from ${range}`);
   return limit;
 }
 

@@ -34,6 +34,7 @@ const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_LEGACY_IMPORT_BYTES: usize = 256 * 1024;
 const MAX_MANAGEMENT_STATE_RECORDS: usize = 100;
+pub(crate) const CLOUD_REQUEST_PAGE_SIZE: usize = 100;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type CloudWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -124,7 +125,9 @@ impl CloudStatePostError {
         match self {
             Self::Transport(_) => true,
             Self::HttpStatus(status) => {
-                *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                *status == reqwest::StatusCode::UNAUTHORIZED
+                    || *status == reqwest::StatusCode::FORBIDDEN
+                    || *status == reqwest::StatusCode::REQUEST_TIMEOUT
                     || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
                     || status.is_server_error()
             }
@@ -186,10 +189,11 @@ impl CloudClient {
     }
 
     pub async fn fetch_requests(&self) -> Result<Vec<CloudRequest>> {
+        let page_size = CLOUD_REQUEST_PAGE_SIZE.to_string();
         let response = self
             .client
             .get(self.api_url("api/local/requests")?)
-            .query(&[("limit", "100")])
+            .query(&[("limit", page_size.as_str())])
             .header(AUTHORIZATION, self.authorization.clone())
             .send()
             .await
@@ -334,11 +338,24 @@ impl InboxStateIndex {
         }
     }
 
-    fn sequences(&self) -> BTreeSet<u64> {
-        self.recent_management
-            .union(&self.awaiting_previews)
+    fn sequences_bounded(&self, max_awaiting_previews: usize) -> (BTreeSet<u64>, usize) {
+        let omitted_previews = self
+            .awaiting_previews
+            .len()
+            .saturating_sub(max_awaiting_previews);
+        let selected_previews = self
+            .awaiting_previews
+            .iter()
+            .rev()
+            .take(max_awaiting_previews)
             .copied()
-            .collect()
+            .collect::<BTreeSet<_>>();
+        let mut sequences = self.recent_management.clone();
+        for omitted_seq in self.awaiting_previews.difference(&selected_previews) {
+            sequences.remove(omitted_seq);
+        }
+        sequences.extend(selected_previews);
+        (sequences, omitted_previews)
     }
 }
 
@@ -498,22 +515,34 @@ impl CloudInbox {
     /// Return the recent management history and every preview still awaiting confirmation.
     /// The index stores sequence numbers only; each selected durable record is revalidated/read.
     pub fn state_records(&self) -> Result<Vec<InboxRecord>> {
+        self.state_records_bounded(usize::MAX)
+            .map(|(records, _)| records)
+    }
+
+    /// Return recent management history and the newest bounded set of active previews.
+    /// The omitted count comes from the index, so older preview records are not read merely to
+    /// count them for a cloud snapshot.
+    pub fn state_records_bounded(
+        &self,
+        max_awaiting_previews: usize,
+    ) -> Result<(Vec<InboxRecord>, usize)> {
         let _guard = self
             .operation_lock
             .lock()
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
-        let sequences = self
+        let (sequences, omitted_previews) = self
             .state_index
             .lock()
             .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
-            .sequences();
-        sequences
+            .sequences_bounded(max_awaiting_previews);
+        let records = sequences
             .into_iter()
             .map(|seq| {
                 self.read_record_path(&self.record_path(seq))?
                     .ok_or_else(|| anyhow!("indexed cloud state request {seq} is missing"))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((records, omitted_previews))
     }
 
     pub fn record(&self, seq: u64) -> Result<Option<InboxRecord>> {
@@ -1084,6 +1113,47 @@ mod tests {
     }
 
     #[test]
+    fn bounded_state_index_counts_omitted_previews_without_selecting_them() {
+        let mut index = InboxStateIndex::default();
+        for seq in 1..=120 {
+            let mut preview = request(seq, "preview");
+            preview.kind = "file_preview".to_string();
+            index.record(&InboxRecord {
+                schema_version: INBOX_RECORD_VERSION,
+                request: preview,
+                status: InboxStatus::AwaitingConfirmation,
+                attempts: 0,
+                updated_at: 1,
+                next_attempt_at: 0,
+                error: None,
+                result: None,
+            });
+        }
+        for seq in 121..=220 {
+            let mut operation = request(seq, "scan");
+            operation.kind = "library_scan".to_string();
+            index.record(&InboxRecord {
+                schema_version: INBOX_RECORD_VERSION,
+                request: operation,
+                status: InboxStatus::Completed,
+                attempts: 1,
+                updated_at: 2,
+                next_attempt_at: 0,
+                error: None,
+                result: None,
+            });
+        }
+
+        let (sequences, omitted) = index.sequences_bounded(10);
+        assert_eq!(omitted, 110);
+        assert!(!sequences.contains(&1));
+        assert!(sequences.contains(&111));
+        assert!(sequences.contains(&120));
+        assert!(sequences.contains(&121));
+        assert!(sequences.contains(&220));
+    }
+
+    #[test]
     fn inbox_persists_full_request_before_duplicate_ack_and_reloads_pending() {
         let root = temp_root("durable-inbox");
         fs::create_dir_all(&root).expect("root should create");
@@ -1279,19 +1349,37 @@ mod tests {
             };
             index.record(&record);
         }
-        let sequences = index.sequences().into_iter().collect::<Vec<_>>();
-        assert_eq!(sequences.len(), MAX_MANAGEMENT_STATE_RECORDS + 1);
-        assert_eq!(sequences[0], 1, "awaiting preview should remain visible");
+        let (sequences, omitted_previews) = index.sequences_bounded(1);
         assert_eq!(
-            sequences[1], 6,
+            omitted_previews, 0,
+            "the selected preview should not be omitted"
+        );
+        assert_eq!(sequences.len(), MAX_MANAGEMENT_STATE_RECORDS + 1);
+        assert!(
+            sequences.contains(&1),
+            "awaiting preview should remain visible"
+        );
+        assert_eq!(
+            sequences.iter().nth(1),
+            Some(&6),
             "only the latest 100 management items remain"
         );
-        assert_eq!(sequences.last(), Some(&105));
+        assert_eq!(sequences.iter().next_back(), Some(&105));
+
+        let (without_previews, omitted_previews) = index.sequences_bounded(0);
+        assert_eq!(
+            omitted_previews, 1,
+            "the active preview omission must be counted"
+        );
+        assert_eq!(without_previews.len(), MAX_MANAGEMENT_STATE_RECORDS);
+        assert!(!without_previews.contains(&1));
 
         preview.status = InboxStatus::Stale;
         index.record(&preview);
-        assert_eq!(index.sequences().len(), MAX_MANAGEMENT_STATE_RECORDS);
-        assert!(!index.sequences().contains(&1));
+        let (sequences, omitted_previews) = index.sequences_bounded(1);
+        assert_eq!(omitted_previews, 0);
+        assert_eq!(sequences.len(), MAX_MANAGEMENT_STATE_RECORDS);
+        assert!(!sequences.contains(&1));
     }
 
     #[test]
@@ -1343,6 +1431,8 @@ mod tests {
     #[test]
     fn cloud_state_post_errors_classify_transient_and_payload_rejections() {
         for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
             reqwest::StatusCode::REQUEST_TIMEOUT,
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
