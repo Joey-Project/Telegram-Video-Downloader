@@ -35,6 +35,7 @@ struct FakeCloudApiState {
     inbox_root: PathBuf,
     state_posts: StdMutex<Vec<serde_json::Value>>,
     state_post_statuses: StdMutex<Vec<u16>>,
+    state_post_response_headers: StdMutex<Vec<Vec<(String, String)>>>,
 }
 
 async fn spawn_fake_telegram_api() -> (
@@ -211,6 +212,7 @@ async fn spawn_fake_cloud_api(
         inbox_root,
         state_posts: StdMutex::new(Vec::new()),
         state_post_statuses: StdMutex::new(Vec::new()),
+        state_post_response_headers: StdMutex::new(Vec::new()),
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let task_state = Arc::clone(&state);
@@ -318,7 +320,15 @@ async fn spawn_fake_cloud_api(
                         }
                         _ => (404, serde_json::json!({"error":"not found"})),
                     };
-                    stream.write_all(fake_http_response(status, &payload).as_bytes()).await
+                    let response_headers = if request.method == "state" {
+                        let mut headers = task_state.state_post_response_headers
+                            .lock()
+                            .expect("fake state response header lock should not poison");
+                        if headers.is_empty() { Vec::new() } else { headers.remove(0) }
+                    } else {
+                        Vec::new()
+                    };
+                    stream.write_all(fake_http_response_with_headers(status, &payload, &response_headers).as_bytes()).await
                         .context("fake cloud API response write failed")?;
                 }
             }
@@ -328,6 +338,14 @@ async fn spawn_fake_cloud_api(
 }
 
 fn fake_http_response(status: u16, payload: &serde_json::Value) -> String {
+    fake_http_response_with_headers(status, payload, &[])
+}
+
+fn fake_http_response_with_headers(
+    status: u16,
+    payload: &serde_json::Value,
+    headers: &[(String, String)],
+) -> String {
     let payload = payload.to_string();
     let reason = match status {
         200 => "OK",
@@ -340,8 +358,12 @@ fn fake_http_response(status: u16, payload: &serde_json::Value) -> String {
         503 => "Service Unavailable",
         _ => "Error",
     };
+    let extra_headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
     format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n{extra_headers}\r\n{payload}",
         payload.len()
     )
 }

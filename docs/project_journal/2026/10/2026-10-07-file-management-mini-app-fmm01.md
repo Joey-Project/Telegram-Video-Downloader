@@ -23,7 +23,7 @@ superseded_by: ""
 - 当前接受的架构大方向是公开托管的静态界面自动加载文件库并提交操作；Telegram webhook 进入 Cloudflare Worker，再进入 D1 持久收件箱。本机 Rust bot 主动领取操作，并由本机通过同一 Telegram bot 发送或编辑进度消息。本机没有公网入站接口。偏好使用 Cloudflare Free；达到额度限制时暂停操作并提示用户。
 - Rust 通过固定 Worker API 补领、确认和回写状态；Mini App 验证 Telegram initData。休眠 WebSocket 推送完整请求，固定共享密钥鉴权，本机落盘后才确认接收。状态通过持久递增版本防止旧回写覆盖新快照。
 - 第一至第四阶段的本地代码已落在隔离分支：Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段 `/settings` 与新下载位置选择仍延期。
-- Cloudflare 等待卡片重复问题已修复。2026-10-18 的类型检查、38 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 846 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理和单集发布记录覆盖。
+- Cloudflare 等待卡片重复问题已修复。2026-10-18 的类型检查、40 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 853 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复和单集发布记录覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
 - 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `fefdfcb3cd03a5e153e9e02fd8f9bdf6c727e5b0` 的 master 修复，包含 ASS 弹幕显示默认值及恢复工作流收尾。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
 
@@ -36,6 +36,7 @@ superseded_by: ""
 - 文件冲突跳过不再计为成功；NFO 完整度按字段判断，YouTube 来源及合集 ID/类型可以往返保存，同一物理对象移动后的队列元数据可以跨重启保留。旧记录关联使用同一次带队列线索的扫描；已确认缺失的历史索引有数量及体积上限。
 - 后续审查补充了启动和 WS 通知前的有序权威补领、owner 未配置时拒绝确认 webhook、暂态部分失败后保留原预览、状态历史的编码体积预算、认证恢复重试、终态等待卡片过滤，以及自闭合 NFO 元素的安全连续修改。过大的历史结果明确标记截断；最新导入报告优先保留供手动关联，不完整预览禁止确认。
 - HTTP 模拟覆盖 503 同版本重试、认证恢复、操作历史压缩、低于本地软限制仍反复 413 时的真缩减、裁剪成功后的心跳续期及后续状态更新，并覆盖无法继续缩减时停止分配版本。暂态确认通过测试专用 provider 注入真实 File Provider access error 贯穿 dispatcher，验证部分移动后沿用原预览继续完成；独立文件管理测试还验证了重开 manager 后恢复。生产休眠、真实配额与 webhook 切换仍留待部署验证。
+- 状态计数器丢失或迁移后，已鉴权的 Worker 在冲突响应中提供已保存版本，本机持久保存更高版本后重试原快照；缺失或无效提示继续退避恢复，计数耗尽不永久屏蔽相同内容。Mini App 的可见项、合集和单项选择共同遵守每批 100 项上限，提交前再次检查并提示分批操作。
 
 ## 已确认的产品与交互
 

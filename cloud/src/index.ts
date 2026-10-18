@@ -19,10 +19,10 @@ export { NotificationHub } from "./notification_hub";
 const NOTIFIER_ID = "telegram-single-owner";
 const CLOUD_REQUEST_PAGE_SIZE = 100;
 
-function json(data: unknown, status = 200): Response {
+function json(data: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return Response.json(data, {
     status,
-    headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
+    headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", ...extraHeaders },
   });
 }
 
@@ -157,7 +157,13 @@ export default {
     try {
       return await dispatch(request, env);
     } catch (error) {
-      if (error instanceof HttpError) return json({ error: error.message }, error.status);
+      if (error instanceof HttpError) {
+        const stateVersion = error.stateVersion;
+        const extraHeaders = error.status === 409 && Number.isSafeInteger(stateVersion) && stateVersion !== undefined && stateVersion > 0
+          ? { "X-Cloud-State-Version": String(stateVersion) }
+          : {};
+        return json({ error: error.message }, error.status, extraHeaders);
+      }
       const path = new URL(request.url).pathname;
       console.error(JSON.stringify({ event: "request_failed", path }));
       return json({ error: "Service unavailable" }, 503);

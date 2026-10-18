@@ -372,6 +372,419 @@ async fn cloud_state_reporter_stops_retrying_413_when_no_smaller_snapshot_is_pos
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn cloud_state_reporter_advances_same_version_conflict_and_heartbeats_the_accepted_content() {
+    let root = temp_cloud_bot_dir("state-reporter-version-conflict-same-version");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    queue_state_post_response(&cloud_state, 409, Some("1"));
+    queue_state_post_response(&cloud_state, 200, None);
+    queue_state_post_response(&cloud_state, 200, None);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *runtime.library_snapshot.lock().await =
+        Some(empty_cloud_test_library_snapshot("same-version-conflict"));
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        Duration::from_millis(250),
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+    ));
+    runtime.state_notify.notify_one();
+
+    let first = wait_for_state_posts(&cloud_state, 1).await;
+    assert_eq!(first[0]["status"], 409);
+    assert_eq!(first[0]["state_version"], 1);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state post lock should not poison")
+            .len(),
+        1,
+        "a version conflict must be paced before allocating and posting a retry"
+    );
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 2),
+    )
+    .await
+    .expect("the state-version conflict should recover");
+    assert_eq!(posts[1]["status"], 200);
+    assert_eq!(posts[1]["state_version"], 2);
+    assert_eq!(posts[0]["content_hash"], posts[1]["content_hash"]);
+    assert_ne!(posts[0]["reported_at"], posts[1]["reported_at"]);
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 3),
+    )
+    .await
+    .expect("the accepted state should continue heartbeating");
+    assert_eq!(posts[2]["status"], 200);
+    assert_eq!(posts[2]["state_version"], posts[1]["state_version"]);
+    assert_eq!(posts[2]["content_hash"], posts[1]["content_hash"]);
+    assert_ne!(posts[2]["reported_at"], posts[1]["reported_at"]);
+
+    reporter.abort();
+    let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cloud_state_reporter_recovers_after_lost_version_file_and_continues_after_restart() {
+    let root = temp_cloud_bot_dir("state-reporter-version-file-lost");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    assert_eq!(
+        inbox
+            .next_state_version()
+            .expect("initial state version should persist"),
+        1
+    );
+    let version_path = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud")
+        .join(".state-version.json");
+    std::fs::remove_file(&version_path)
+        .expect("the test should simulate a lost local version file");
+
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    queue_state_post_response(&cloud_state, 409, Some("50"));
+    queue_state_post_response(&cloud_state, 200, None);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *runtime.library_snapshot.lock().await =
+        Some(empty_cloud_test_library_snapshot("remote-version"));
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+    ));
+    runtime.state_notify.notify_one();
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 2),
+    )
+    .await
+    .expect("the reporter should advance beyond the remotely stored version");
+    assert_eq!(posts[0]["state_version"], 1);
+    assert_eq!(posts[1]["state_version"], 51);
+    assert_eq!(posts[0]["content_hash"], posts[1]["content_hash"]);
+
+    reporter.abort();
+    let _ = reporter.await;
+    drop(runtime);
+    drop(inbox);
+
+    let reopened_inbox = Arc::new(
+        CloudInbox::open(&config.downloads.video_dir)
+            .expect("cloud inbox should reopen with its version counter"),
+    );
+    let mut restarted_runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&reopened_inbox),
+    );
+    restarted_runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *restarted_runtime.library_snapshot.lock().await =
+        Some(empty_cloud_test_library_snapshot("after-restart"));
+    let restarted_reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        restarted_runtime.clone(),
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+    ));
+    restarted_runtime.state_notify.notify_one();
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 3),
+    )
+    .await
+    .expect("the reopened reporter should continue the persisted version sequence");
+    assert_eq!(posts[2]["status"], 200);
+    assert_eq!(posts[2]["state_version"], 52);
+    assert_eq!(posts[2]["revision"], "after-restart");
+    assert_ne!(posts[2]["content_hash"], posts[1]["content_hash"]);
+
+    restarted_reporter.abort();
+    let _ = restarted_reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(restarted_runtime);
+    drop(reopened_inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cloud_state_reporter_retries_unknown_conflicts_and_paces_version_exhaustion() {
+    let root = temp_cloud_bot_dir("state-reporter-version-hint-invalid");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    queue_state_post_response(&cloud_state, 409, None);
+    queue_state_post_response(&cloud_state, 409, Some("not-a-version"));
+    queue_state_post_response(&cloud_state, 200, None);
+    queue_state_post_response(
+        &cloud_state,
+        409,
+        Some(&MAX_CLOUD_STATE_VERSION.to_string()),
+    );
+    queue_state_post_response(&cloud_state, 200, None);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *runtime.library_snapshot.lock().await =
+        Some(empty_cloud_test_library_snapshot("unknown-conflict"));
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        Duration::from_millis(250),
+        Duration::from_millis(100),
+        Duration::from_millis(500),
+    ));
+    runtime.state_notify.notify_one();
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 1),
+    )
+    .await
+    .expect("the initial state post should reach the fake server");
+    assert_eq!(posts[0]["status"], 409);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state post lock should not poison")
+            .len(),
+        1,
+        "a missing hint should retain the bounded retry delay"
+    );
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 3),
+    )
+    .await
+    .expect("missing and invalid version hints should retry the same state");
+    for post in &posts[..3] {
+        assert_eq!(post["state_version"], 1);
+        assert_eq!(post["content_hash"], posts[0]["content_hash"]);
+    }
+    assert_eq!(posts[1]["status"], 409);
+    assert_eq!(posts[2]["status"], 200);
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 4),
+    )
+    .await
+    .expect("the heartbeat should exercise the maximum remote version hint");
+    assert_eq!(posts[3]["status"], 409);
+    assert_eq!(posts[3]["state_version"], 1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state post lock should not poison")
+            .len(),
+        4,
+        "a maximum remote hint must wait for the longer exhaustion backoff"
+    );
+    let version_path = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud")
+        .join(".state-version.json");
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&version_path).expect("local version should persist"),
+    )
+    .expect("local version should be valid JSON");
+    assert_eq!(
+        persisted["state_version"], 1,
+        "an unincrementable remote hint must not poison the local counter"
+    );
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 5),
+    )
+    .await
+    .expect("the pending state should retry after the server version is repaired");
+    assert_eq!(posts[4]["status"], 200);
+    assert_eq!(posts[4]["state_version"], 1);
+    assert_eq!(posts[4]["content_hash"], posts[0]["content_hash"]);
+
+    reporter.abort();
+    let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cloud_state_reporter_paces_when_local_state_version_is_exhausted() {
+    let root = temp_cloud_bot_dir("state-reporter-local-version-exhausted");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    assert_eq!(
+        inbox
+            .next_state_version_after(MAX_CLOUD_STATE_VERSION - 1)
+            .expect("the maximum safe version should persist"),
+        MAX_CLOUD_STATE_VERSION
+    );
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *runtime.library_snapshot.lock().await =
+        Some(empty_cloud_test_library_snapshot("local-counter-exhausted"));
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        Duration::from_millis(500),
+    ));
+    runtime.state_notify.notify_one();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state post lock should not poison")
+            .is_empty(),
+        "an exhausted local counter must not wrap or post a duplicate version"
+    );
+    let version_path = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud")
+        .join(".state-version.json");
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(version_path).expect("max local version should remain readable"),
+    )
+    .expect("max local version should remain valid JSON");
+    assert_eq!(persisted["state_version"], MAX_CLOUD_STATE_VERSION);
+
+    reporter.abort();
+    let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn queue_state_post_response(
+    state: &Arc<FakeCloudApiState>,
+    status: u16,
+    version_header: Option<&str>,
+) {
+    state
+        .state_post_statuses
+        .lock()
+        .expect("fake state status lock should not poison")
+        .push(status);
+    let headers = version_header
+        .map(|version| vec![("X-Cloud-State-Version".to_string(), version.to_string())])
+        .unwrap_or_default();
+    state
+        .state_post_response_headers
+        .lock()
+        .expect("fake state response-header lock should not poison")
+        .push(headers);
+}
+
 fn cloud_test_request(seq: u64, kind: &str) -> CloudRequest {
     CloudRequest {
         seq,

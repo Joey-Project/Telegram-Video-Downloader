@@ -46,8 +46,8 @@ use crate::bilibili_attempt::{
 };
 use crate::cloud::{
     CLOUD_REQUEST_PAGE_SIZE, CloudClient, CloudInbox, CloudRequest, CloudSettings, CloudState,
-    CloudStatePostError, CloudWebSocket, InboxRecord, InboxStatus, next_websocket_request,
-    now_millis, now_seconds,
+    CloudStatePostError, CloudWebSocket, InboxRecord, InboxStatus, MAX_CLOUD_STATE_VERSION,
+    is_state_version_exhausted, next_websocket_request, now_millis, now_seconds,
 };
 use crate::config::{AppConfig, CloudConfig};
 use crate::downloader::{
@@ -708,6 +708,21 @@ async fn cloud_state_reporter(runtime: CloudBotRuntime) {
 }
 
 async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: Duration) {
+    cloud_state_reporter_with_retry_policy(
+        runtime,
+        period,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+    )
+    .await;
+}
+
+async fn cloud_state_reporter_with_retry_policy(
+    runtime: CloudBotRuntime,
+    period: Duration,
+    retry_backoff: Duration,
+    version_exhausted_backoff: Duration,
+) {
     let mut heartbeat = interval(period);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     heartbeat.tick().await;
@@ -777,8 +792,19 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
                         _ => match next_cloud_state_version(&runtime).await {
                             Ok(version) => version,
                             Err(error) => {
-                                warn!(error = %format!("{error:#}"), "failed to persist local cloud state version");
-                                sleep(Duration::from_secs(5)).await;
+                                let exhausted = is_state_version_exhausted(&error);
+                                warn!(
+                                    exhausted,
+                                    max_state_version = MAX_CLOUD_STATE_VERSION,
+                                    error = %format!("{error:#}"),
+                                    "failed to allocate local cloud state version; reconcile the local counter or remote snapshot version if exhausted"
+                                );
+                                sleep(if exhausted {
+                                    version_exhausted_backoff
+                                } else {
+                                    retry_backoff
+                                })
+                                .await;
                                 runtime.state_notify.notify_one();
                                 continue;
                             }
@@ -839,12 +865,21 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
                             let next_version = match next_cloud_state_version(&runtime).await {
                                 Ok(version) => version,
                                 Err(version_error) => {
+                                    let exhausted = is_state_version_exhausted(&version_error);
                                     warn!(
                                         state_version = rejected.state_version,
+                                        exhausted,
+                                        max_state_version = MAX_CLOUD_STATE_VERSION,
                                         error = %format!("{version_error:#}"),
-                                        "failed to persist a new version for the reduced cloud snapshot"
+                                        "failed to allocate a new version for the reduced cloud snapshot; reconcile the local counter or remote snapshot version if exhausted"
                                     );
-                                    permanently_rejected_fingerprint = Some(rejected_fingerprint);
+                                    sleep(if exhausted {
+                                        version_exhausted_backoff
+                                    } else {
+                                        retry_backoff
+                                    })
+                                    .await;
+                                    runtime.state_notify.notify_one();
                                     continue;
                                 }
                             };
@@ -901,6 +936,55 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
                     }
                 }
             }
+            Err(error) if error.stored_version_hint().is_some() => {
+                let Some(state) = pending.as_mut() else {
+                    continue;
+                };
+                let observed_version = error
+                    .stored_version_hint()
+                    .expect("the conflict guard requires a server version hint");
+                match next_cloud_state_version_after(&runtime, observed_version).await {
+                    Ok(next_version) => {
+                        warn!(
+                            attempted_version = failed_version,
+                            observed_version,
+                            retry_state_version = next_version,
+                            "cloud rejected the state version; persisting a newer version and retrying identical snapshot content"
+                        );
+                        state.state_version = next_version;
+                        // Keep the same snapshot and fingerprint, and pace repeated version
+                        // conflicts so a stale or continuously advancing server cannot cause
+                        // a tight loop of counter writes.
+                        sleep(retry_backoff).await;
+                    }
+                    Err(version_error) => {
+                        let exhausted = is_state_version_exhausted(&version_error);
+                        warn!(
+                            attempted_version = failed_version,
+                            observed_version,
+                            exhausted,
+                            max_state_version = MAX_CLOUD_STATE_VERSION,
+                            error = %format!("{version_error:#}"),
+                            "could not advance the local cloud state version after a conflict; reconcile the local counter or remote snapshot version if exhausted"
+                        );
+                        sleep(if exhausted {
+                            version_exhausted_backoff
+                        } else {
+                            retry_backoff
+                        })
+                        .await;
+                    }
+                }
+            }
+            Err(CloudStatePostError::HttpStatus(status))
+                if status == reqwest::StatusCode::CONFLICT =>
+            {
+                warn!(
+                    state_version = failed_version,
+                    "cloud returned HTTP 409 without a valid X-Cloud-State-Version hint; retrying the same state with backoff (check Worker compatibility and its response header)"
+                );
+                sleep(retry_backoff).await;
+            }
             Err(error) if !error.is_retryable() => {
                 warn!(
                     state_version = failed_version,
@@ -925,7 +1009,7 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
                 );
                 // Reuse the exact state version and content on retry. If the previous request
                 // reached the Worker before a timeout, its idempotence check accepts this copy.
-                sleep(Duration::from_secs(5)).await;
+                sleep(retry_backoff).await;
             }
         }
     }
@@ -934,6 +1018,16 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
 async fn next_cloud_state_version(runtime: &CloudBotRuntime) -> Result<u64> {
     let inbox = Arc::clone(&runtime.inbox);
     tokio::task::spawn_blocking(move || inbox.next_state_version())
+        .await
+        .context("cloud state-version persistence worker failed")?
+}
+
+async fn next_cloud_state_version_after(
+    runtime: &CloudBotRuntime,
+    observed_version: u64,
+) -> Result<u64> {
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || inbox.next_state_version_after(observed_version))
         .await
         .context("cloud state-version persistence worker failed")?
 }

@@ -31,6 +31,7 @@ const CLOUD_REQUEST_PREFIX: &str = "request-";
 const CLOUD_REQUEST_SUFFIX: &str = ".json";
 const INBOX_RECORD_VERSION: u32 = 1;
 const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+pub(crate) const MAX_CLOUD_STATE_VERSION: u64 = MAX_JS_SAFE_INTEGER;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_LEGACY_IMPORT_BYTES: usize = 256 * 1024;
 const MAX_MANAGEMENT_STATE_RECORDS: usize = 100;
@@ -38,6 +39,24 @@ pub(crate) const CLOUD_REQUEST_PAGE_SIZE: usize = 100;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type CloudWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Debug)]
+pub(crate) struct CloudStateVersionExhausted;
+
+impl std::fmt::Display for CloudStateVersionExhausted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cloud state version is outside JavaScript's safe integer range"
+        )
+    }
+}
+
+impl std::error::Error for CloudStateVersionExhausted {}
+
+pub(crate) fn is_state_version_exhausted(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CloudStateVersionExhausted>().is_some()
+}
 
 #[cfg(test)]
 // Catalog fixture: pool joey-private-v3, token ID bearer-a, role bearer, state active.
@@ -114,19 +133,29 @@ pub struct CloudClient {
     authorization: HeaderValue,
 }
 
+fn parse_cloud_state_version_hint(bytes: &[u8]) -> Option<u64> {
+    if bytes.is_empty() || bytes[0] == b'0' || !bytes.iter().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let version = std::str::from_utf8(bytes).ok()?.parse::<u64>().ok()?;
+    (version <= MAX_CLOUD_STATE_VERSION).then_some(version)
+}
+
 #[derive(Debug)]
 pub enum CloudStatePostError {
     Transport(anyhow::Error),
     HttpStatus(reqwest::StatusCode),
+    Conflict { stored_version: u64 },
 }
 
 impl CloudStatePostError {
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Transport(_) => true,
+            Self::Transport(_) | Self::Conflict { .. } => true,
             Self::HttpStatus(status) => {
                 *status == reqwest::StatusCode::UNAUTHORIZED
                     || *status == reqwest::StatusCode::FORBIDDEN
+                    || *status == reqwest::StatusCode::CONFLICT
                     || *status == reqwest::StatusCode::REQUEST_TIMEOUT
                     || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
                     || status.is_server_error()
@@ -137,6 +166,13 @@ impl CloudStatePostError {
     pub fn is_payload_too_large(&self) -> bool {
         matches!(self, Self::HttpStatus(status) if *status == reqwest::StatusCode::PAYLOAD_TOO_LARGE)
     }
+
+    pub fn stored_version_hint(&self) -> Option<u64> {
+        match self {
+            Self::Conflict { stored_version } => Some(*stored_version),
+            Self::Transport(_) | Self::HttpStatus(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for CloudStatePostError {
@@ -144,6 +180,10 @@ impl std::fmt::Display for CloudStatePostError {
         match self {
             Self::Transport(error) => write!(formatter, "{error:#}"),
             Self::HttpStatus(status) => write!(formatter, "HTTP {status}"),
+            Self::Conflict { stored_version } => write!(
+                formatter,
+                "HTTP 409; server cloud state version is {stored_version}"
+            ),
         }
     }
 }
@@ -254,6 +294,15 @@ impl CloudClient {
         let status = response.status();
         if status.is_success() {
             Ok(())
+        } else if status == reqwest::StatusCode::CONFLICT {
+            match response
+                .headers()
+                .get("X-Cloud-State-Version")
+                .and_then(|value| parse_cloud_state_version_hint(value.as_bytes()))
+            {
+                Some(stored_version) => Err(CloudStatePostError::Conflict { stored_version }),
+                None => Err(CloudStatePostError::HttpStatus(status)),
+            }
         } else {
             Err(CloudStatePostError::HttpStatus(status))
         }
@@ -635,17 +684,25 @@ impl CloudInbox {
     }
 
     pub fn next_state_version(&self) -> Result<u64> {
+        self.next_state_version_after(0)
+    }
+
+    pub fn next_state_version_after(&self, observed_version: u64) -> Result<u64> {
         let _guard = self
             .operation_lock
             .lock()
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        if observed_version > MAX_JS_SAFE_INTEGER {
+            bail!("observed cloud state version is outside JavaScript's safe integer range");
+        }
         let path = self.directory.join(CLOUD_STATE_VERSION_FILE);
         let current = self.read_state_version(&path)?.unwrap_or(0);
         let next = current
+            .max(observed_version)
             .checked_add(1)
-            .ok_or_else(|| anyhow!("cloud state version counter is exhausted"))?;
-        if next > MAX_JS_SAFE_INTEGER {
-            bail!("cloud state version is outside JavaScript's safe integer range");
+            .ok_or(CloudStateVersionExhausted)?;
+        if next > MAX_CLOUD_STATE_VERSION {
+            return Err(CloudStateVersionExhausted.into());
         }
         self.write_state_version(&path, next)?;
         Ok(next)
@@ -1237,6 +1294,83 @@ mod tests {
     }
 
     #[test]
+    fn state_version_advances_after_remote_or_local_version_and_survives_restart() {
+        let root = temp_root("state-version-conflict");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+
+        assert_eq!(
+            inbox
+                .next_state_version_after(40)
+                .expect("missing local version should advance past the remote version"),
+            41
+        );
+        assert_eq!(
+            inbox
+                .next_state_version_after(5)
+                .expect("higher local version should win"),
+            42
+        );
+        assert_eq!(
+            inbox
+                .next_state_version_after(80)
+                .expect("higher remote version should win"),
+            81
+        );
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        assert_eq!(
+            reopened
+                .next_state_version_after(80)
+                .expect("persisted local version should survive restart"),
+            82
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn state_version_exhaustion_is_typed_and_does_not_write_out_of_range_values() {
+        let root = temp_root("state-version-exhausted");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+
+        let remote_error = inbox
+            .next_state_version_after(MAX_CLOUD_STATE_VERSION)
+            .expect_err("the maximum JavaScript-safe value cannot be incremented");
+        assert!(is_state_version_exhausted(&remote_error));
+        assert_eq!(
+            inbox
+                .next_state_version()
+                .expect("failed remote advancement should not write a version"),
+            1
+        );
+
+        let state_path = inbox.directory.join(CLOUD_STATE_VERSION_FILE);
+        inbox
+            .write_state_version(&state_path, MAX_CLOUD_STATE_VERSION)
+            .expect("maximum safe local version should persist");
+        let local_error = inbox
+            .next_state_version_after(1)
+            .expect_err("a maximum local value cannot be incremented");
+        assert!(is_state_version_exhausted(&local_error));
+        assert_eq!(
+            inbox
+                .read_state_version(&state_path)
+                .expect("maximum safe value should remain readable"),
+            Some(MAX_CLOUD_STATE_VERSION)
+        );
+
+        let invalid_error = inbox
+            .next_state_version_after(MAX_CLOUD_STATE_VERSION + 1)
+            .expect_err("an unsafe observed value should be rejected");
+        assert!(!is_state_version_exhausted(&invalid_error));
+        drop(inbox);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn retryable_inbox_requests_respect_persisted_next_attempt_time() {
         let root = temp_root("retry-backoff");
         fs::create_dir_all(&root).expect("root should create");
@@ -1433,6 +1567,7 @@ mod tests {
         for status in [
             reqwest::StatusCode::UNAUTHORIZED,
             reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::CONFLICT,
             reqwest::StatusCode::REQUEST_TIMEOUT,
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
@@ -1445,6 +1580,34 @@ mod tests {
                 .is_payload_too_large()
         );
         assert!(CloudStatePostError::Transport(anyhow!("connection reset")).is_retryable());
+        let conflict = CloudStatePostError::Conflict { stored_version: 42 };
+        assert!(conflict.is_retryable());
+        assert_eq!(conflict.stored_version_hint(), Some(42));
+        assert_eq!(
+            CloudStatePostError::HttpStatus(reqwest::StatusCode::CONFLICT).stored_version_hint(),
+            None
+        );
+    }
+
+    #[test]
+    fn cloud_state_version_hint_requires_positive_canonical_safe_decimal() {
+        let cases: &[(&[u8], Option<u64>)] = &[
+            (b"1", Some(1)),
+            (b"9007199254740991", Some(MAX_CLOUD_STATE_VERSION)),
+            (b"", None),
+            (b"0", None),
+            (b"01", None),
+            (b"+1", None),
+            (b"-1", None),
+            (b" 1", None),
+            (b"1 ", None),
+            (b"9007199254740992", None),
+            (b"18446744073709551616", None),
+            (b"1.0", None),
+        ];
+        for (header, expected) in cases {
+            assert_eq!(parse_cloud_state_version_hint(header), *expected);
+        }
     }
 
     #[test]

@@ -184,7 +184,7 @@ export async function storeSnapshot(
   }
   const now = Date.now();
   if (prior !== null && snapshot.state_version < prior.state_version) {
-    throw new HttpError(409, "Snapshot state_version is older than the stored state");
+    throw new HttpError(409, "Snapshot state_version is older than the stored state", prior.state_version);
   }
 
   const contentMatches = prior !== null &&
@@ -192,7 +192,7 @@ export async function storeSnapshot(
     prior.library_hash === libraryHash &&
     prior.state_hash === stateHash;
   if (prior !== null && snapshot.state_version === prior.state_version && !contentMatches) {
-    throw new HttpError(409, "Snapshot state_version was reused with different content");
+    throw new HttpError(409, "Snapshot state_version was reused with different content", prior.state_version);
   }
 
   const heartbeatDue = prior === null || now - prior.received_at >= HEARTBEAT_WRITE_INTERVAL_MS;
@@ -212,7 +212,7 @@ export async function storeSnapshot(
     ).first<SnapshotMetaRow>();
     if (latest === null || latest.state_version !== snapshot.state_version ||
       latest.library_hash !== libraryHash || latest.state_hash !== stateHash) {
-      throw new HttpError(409, "Snapshot was superseded by a newer local state");
+      throw new HttpError(409, "Snapshot was superseded by a newer local state", latest?.state_version);
     }
     return { ignoredOutOfOrder: false };
   }
@@ -280,11 +280,11 @@ export async function storeSnapshot(
   ).first<SnapshotMetaRow>();
   if (latest === null) throw new Error("D1 snapshot metadata was not readable after write");
   if (latest.state_version > snapshot.state_version) {
-    throw new HttpError(409, "Snapshot was superseded by a newer local state");
+    throw new HttpError(409, "Snapshot was superseded by a newer local state", latest.state_version);
   }
   if (latest.state_version !== snapshot.state_version || latest.library_revision !== snapshot.library.revision ||
     latest.library_hash !== libraryHash || latest.state_hash !== stateHash) {
-    throw new HttpError(409, "Snapshot state_version was reused with different content");
+    throw new HttpError(409, "Snapshot state_version was reused with different content", latest.state_version);
   }
   return { ignoredOutOfOrder: false };
 }

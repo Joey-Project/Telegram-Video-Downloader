@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --local",
-    "typecheck": "wrangler types && tsc --noEmit && tsc -p test/tsconfig.json --noEmit && node --check public/file/app.js && node --check public/file/action-queue.js && node --check public/file/state-view.js && node --check public/file/legacy-mapping-state.js && node --check public/file/metadata-preview.js && node --check public/file/snapshot-session.js && node --check public/file/http-error.js && node --check public/file/source-links.js",
+    "typecheck": "wrangler types && tsc --noEmit && tsc -p test/tsconfig.json --noEmit && node --check public/file/app.js && node --check public/file/action-queue.js && node --check public/file/state-view.js && node --check public/file/legacy-mapping-state.js && node --check public/file/metadata-preview.js && node --check public/file/snapshot-session.js && node --check public/file/http-error.js && node --check public/file/source-links.js && node --check public/file/selection-limit.js",
     "test": "vitest run",
     "build": "wrangler deploy --dry-run --outdir .wrangler-build"
   },

@@ -7,9 +7,11 @@ import { ACTION_QUEUE_LIMIT, appendAction, removeQueuedAction, shouldRetryAction
 import { HttpResponseError } from "../public/file/http-error.js";
 import { getOrCreateLegacySelection, updateLegacySelection } from "../public/file/legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "../public/file/metadata-preview.js";
+import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "../public/file/selection-limit.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
+import { MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS } from "../src/validation";
 import worker from "../src/index";
 
 const testEnv = env as typeof env & { TEST_MIGRATIONS: D1Migration[] };
@@ -47,6 +49,26 @@ describe("metadata preview details", () => {
   it("detects actual metadata changes instead of treating an empty patch list as an update", () => {
     expect(hasMetadataPreviewChanges({ items: [{ item_id: "video" }], metadata_patches: [] })).toBe(false);
     expect(hasMetadataPreviewChanges({ metadata_patches: [{ changes: [{ field: "title", before: "Old", after: "New" }] }] })).toBe(true);
+  });
+});
+
+describe("selection limit", () => {
+  it("matches the Worker request limit and preserves order while capping additions", () => {
+    expect(MAX_SELECTED_ITEMS).toBe(WORKER_MAX_SELECTED_ITEMS);
+    const added = updateSelectionWithinLimit(
+      ["already-selected"],
+      Array.from({ length: MAX_SELECTED_ITEMS }, (_, index) => `item-${index}`),
+      true,
+    );
+    expect(added.ids).toHaveLength(MAX_SELECTED_ITEMS);
+    expect(added.ids[0]).toBe("already-selected");
+    expect(added.ids.at(-1)).toBe(`item-${MAX_SELECTED_ITEMS - 2}`);
+    expect(added.omittedCount).toBe(1);
+
+    const removed = updateSelectionWithinLimit(added.ids, ["already-selected"], false);
+    expect(removed.ids).toHaveLength(MAX_SELECTED_ITEMS - 1);
+    expect(removed.ids[0]).toBe("item-0");
+    expect(removed.omittedCount).toBe(0);
   });
 });
 
@@ -259,6 +281,7 @@ describe("durable Telegram ingress", () => {
     expect(duplicate.status).toBe(200);
     expect((await responseJson<{ duplicate: boolean }>(duplicate)).duplicate).toBe(true);
     expect(conflict.status).toBe(409);
+    expect(conflict.headers.get("X-Cloud-State-Version")).toBeNull();
     expect((await responseJson<{ requests: unknown[] }>(await localRequests())).requests).toHaveLength(1);
   });
 
@@ -353,8 +376,16 @@ describe("Mini App identity and actions", () => {
     const base = { request_id: "00000000-0000-4000-8000-000000000002", kind: "file_preview", payload: {} };
     const unsafe = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, payload: { item_ids: ["item-a"], target_relative_dir: "../private" } }) });
     const invalidPatch = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, payload: { metadata_patches: [{ item_id: "item-a", hint_index: 1000, source_ids: ["source-a"] }] } }) });
+    const maxItems = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, request_id: "00000000-0000-4000-8000-000000000022", payload: { item_ids: Array.from({ length: MAX_SELECTED_ITEMS }, (_, index) => `item-${index}`), target_relative_dir: "" } }) });
+    const maxPatches = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, request_id: "00000000-0000-4000-8000-000000000023", payload: { metadata_patches: Array.from({ length: MAX_SELECTED_ITEMS }, (_, index) => ({ item_id: `item-${index}`, title: "Selected" })) } }) });
+    const tooManyItems = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, request_id: "00000000-0000-4000-8000-000000000020", payload: { item_ids: Array.from({ length: MAX_SELECTED_ITEMS + 1 }, (_, index) => `item-${index}`) } }) });
+    const tooManyPatches = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, request_id: "00000000-0000-4000-8000-000000000021", payload: { metadata_patches: Array.from({ length: MAX_SELECTED_ITEMS + 1 }, (_, index) => ({ item_id: `item-${index}`, title: "Selected" })) } }) });
     expect(unsafe.status).toBe(400);
     expect(invalidPatch.status).toBe(400);
+    expect(maxItems.status).toBe(202);
+    expect(maxPatches.status).toBe(202);
+    expect(tooManyItems.status).toBe(400);
+    expect(tooManyPatches.status).toBe(400);
   });
 
   it("accepts a manual metadata patch without a hint index and keeps metadata-only items exact", async () => {
@@ -383,7 +414,14 @@ describe("Mini App identity and actions", () => {
 describe("local client API and state snapshots", () => {
   it("requires the shared local authorization for every local endpoint", async () => {
     const response = await SELF.fetch(new Request(`${workerUrl}/api/local/requests`));
+    const state = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(localSnapshot({ state_version: 0 })),
+    }));
     expect(response.status).toBe(401);
+    expect(state.status).toBe(401);
+    expect(state.headers.get("X-Cloud-State-Version")).toBeNull();
   });
 
   it("caps the local request page at the shared 100-entry batch size", async () => {
@@ -432,9 +470,34 @@ describe("local client API and state snapshots", () => {
     expect(first.status).toBe(200);
     expect(retry.status).toBe(200);
     expect(changedSameVersion.status).toBe(409);
+    expect(changedSameVersion.headers.get("X-Cloud-State-Version")).toBe("1");
     expect(oldVersion.status).toBe(400);
+    expect(oldVersion.headers.get("X-Cloud-State-Version")).toBeNull();
     expect(newer.status).toBe(200);
     expect(lateOlder.status).toBe(409);
+    expect(lateOlder.headers.get("X-Cloud-State-Version")).toBe("2");
+  });
+
+  it("returns the actual newer version when a concurrent snapshot supersedes a write", async () => {
+    const sendState = (snapshot: Record<string, unknown>) => SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(snapshot),
+    }));
+    const current = localSnapshot();
+    expect((await sendState(current)).status).toBe(200);
+    await testEnv.DB.prepare(
+      "CREATE TRIGGER supersede_snapshot_during_write AFTER INSERT ON snapshot_chunks WHEN NEW.kind = 'library' BEGIN UPDATE snapshot_meta SET state_version = 51 WHERE id = 1; END",
+    ).run();
+    const library = current.library as Record<string, unknown>;
+    const superseded = await sendState({
+      ...current,
+      state_version: 2,
+      library: { ...library, revision: "library-hash-concurrent" },
+    });
+    expect(superseded.status).toBe(409);
+    expect(superseded.headers.get("X-Cloud-State-Version")).toBe("51");
+    expect(await responseJson<{ error: string }>(superseded)).toEqual({ error: "Snapshot was superseded by a newer local state" });
   });
 
   it.each([100, 500])("atomically acknowledges %i inbox sequences without exceeding D1's bind limit", async (count) => {

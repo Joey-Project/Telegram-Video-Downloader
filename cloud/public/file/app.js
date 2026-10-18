@@ -3,6 +3,7 @@ import { getOrCreateLegacySelection, updateLegacySelection } from "./legacy-mapp
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
+import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limit.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
 import { sourceIdUrl } from "./source-links.js";
 
@@ -239,6 +240,14 @@ async function drainActionQueue() {
 
 async function submitAction(kind, payload) {
   if (!mayDispatchActions(state)) return false;
+  if (kind === "file_preview") {
+    for (const field of ["item_ids", "metadata_patches"]) {
+      if (Array.isArray(payload?.[field]) && payload[field].length > MAX_SELECTED_ITEMS) {
+        showToast(`Choose at most ${MAX_SELECTED_ITEMS} ${field === "item_ids" ? "videos" : "metadata matches"} per request.`);
+        return false;
+      }
+    }
+  }
   const action = { request_id: crypto.randomUUID(), kind, payload };
   const queued = appendAction(readActionQueue(), action);
   if (!queued.ok) {
@@ -256,6 +265,19 @@ async function submitAction(kind, payload) {
   showToast("Sending the saved request");
   await drainActionQueue();
   return true;
+}
+
+function updateSelectedItems(candidateIds, selected) {
+  const result = updateSelectionWithinLimit(state.selected, candidateIds, selected);
+  state.selected.clear();
+  for (const id of result.ids) state.selected.add(id);
+  return result.omittedCount;
+}
+
+function selectionLimitMessage(omittedCount = 0) {
+  return omittedCount > 0
+    ? `Only ${MAX_SELECTED_ITEMS} items can be selected. ${omittedCount} more were left unselected; deselect an item to add another.`
+    : `Selection limit: ${MAX_SELECTED_ITEMS}. Deselect an item to select another.`;
 }
 
 function allFolders() {
@@ -351,7 +373,7 @@ function renderLibrary() {
   byId("library-summary").textContent = firstScanPending
     ? "Your computer is connected, but the first scan has not completed."
     : state.snapshot?.synced
-    ? `${visible.toLocaleString()} shown of ${total.toLocaleString()} item${total === 1 ? "" : "s"}${state.selected.size ? ` · ${state.selected.size} selected` : ""}`
+    ? `${visible.toLocaleString()} shown of ${total.toLocaleString()} item${total === 1 ? "" : "s"}${state.selected.size ? ` · ${state.selected.size} selected${state.selected.size >= MAX_SELECTED_ITEMS ? ` · selection limit ${MAX_SELECTED_ITEMS}; deselect to add more` : ""}` : ""}`
     : "A first scan has not completed yet.";
   byId("needs-count").textContent = synced && !firstScanPending ? String(libraryItems().filter(needsOrganizing).length) : "—";
   byId("needs-summary").textContent = firstScanPending
@@ -643,6 +665,7 @@ function previewSelectedLegacy() {
   const hints = operation.result.hints;
   const selections = [...document.querySelectorAll("[data-map-select]:checked")];
   if (!selections.length) return showToast("Select at least one explicit hint-to-video match.");
+  if (selections.length > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} metadata matches per request.`);
   const patches = [];
   const usedItems = new Set();
   for (const selected of selections) {
@@ -664,6 +687,7 @@ function previewSelectedLegacy() {
     if (hasMetadataPatchFields(patch)) patches.push(patch);
   }
   if (!patches.length) return showToast("Choose at least one metadata field to apply.");
+  if (patches.length > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} metadata matches per request.`);
   submitAction("file_preview", { metadata_patches: patches, rename: false, conflict: "skip" });
 }
 
@@ -671,11 +695,9 @@ function selectVisible() {
   const filtered = filteredItems();
   const visible = presentMediaItems(state.view === "needs" ? filtered.filter(needsOrganizing) : filtered);
   const allSelected = visible.length > 0 && visible.every((item) => state.selected.has(String(item.id)));
-  for (const item of visible) {
-    const id = String(item.id);
-    if (allSelected) state.selected.delete(id); else state.selected.add(id);
-  }
+  const omittedCount = updateSelectedItems(visible.map((item) => String(item.id)), !allSelected);
   renderLibrary();
+  if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
 }
 
 function bindEvents() {
@@ -688,6 +710,7 @@ function bindEvents() {
   byId("select-visible").addEventListener("click", selectVisible);
   byId("root-target").addEventListener("click", () => { byId("target-dir").value = ""; byId("target-dir").focus(); });
   byId("preview-move").addEventListener("click", () => {
+    if (state.selected.size > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} videos per request.`);
     const target = byId("target-dir").value.trim().replaceAll("\\", "/");
     if (target.startsWith("/") || target.split("/").some((part) => part === ".." || part === "." || part === "" && target !== "")) return showToast("Use a safe relative folder path without empty segments.");
     submitAction("file_preview", { item_ids: [...state.selected], target_relative_dir: target, rename: byId("rename-toggle").checked, conflict: byId("conflict-select").value });
@@ -715,6 +738,17 @@ function bindEvents() {
     const manualTarget = event.target.closest("[data-manual-target]");
     if (mapCheckbox || mapField || manualTarget) {
       const key = mapCheckbox?.dataset.mapSelect ?? mapField?.dataset.mapKey ?? manualTarget?.dataset.manualTarget;
+      if (mapCheckbox?.checked) {
+        const existingKeys = [...document.querySelectorAll("[data-map-select]:checked")]
+          .filter((checkbox) => checkbox !== mapCheckbox)
+          .map((checkbox) => checkbox.dataset.mapSelect);
+        const result = updateSelectionWithinLimit(existingKeys, [key], true);
+        if (result.omittedCount > 0) {
+          mapCheckbox.checked = false;
+          showToast(selectionLimitMessage(result.omittedCount));
+          return;
+        }
+      }
       if (mapCheckbox) updateLegacySelection(state.legacySelection, key, { selected: mapCheckbox.checked });
       if (mapField) updateLegacySelection(state.legacySelection, key, { [mapField.dataset.mapField]: mapField.checked });
       if (manualTarget) updateLegacySelection(state.legacySelection, key, { item_id: manualTarget.value });
@@ -726,11 +760,9 @@ function bindEvents() {
       const filtered = filteredItems();
       const visibleItems = presentMediaItems(state.view === "needs" ? filtered.filter(needsOrganizing) : filtered);
       const groupItems = visibleItems.filter((item) => (item.collection?.title ?? item.collection ?? "Uncollected") === groupTitle);
-      for (const item of groupItems) {
-        const id = String(item.id);
-        if (groupCheckbox.checked) state.selected.add(id); else state.selected.delete(id);
-      }
+      const omittedCount = updateSelectedItems(groupItems.map((item) => String(item.id)), groupCheckbox.checked);
       renderLibrary();
+      if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
       return;
     }
     const checkbox = event.target.closest("[data-select-item]");
@@ -742,11 +774,9 @@ function bindEvents() {
       renderLibrary();
       return;
     }
-    if (checkbox.checked) state.selected.add(itemId); else state.selected.delete(itemId);
-    const row = checkbox.closest(".library-row");
-    row?.classList.toggle("selected", checkbox.checked);
-    byId("library-summary").textContent = `${filteredItems().length.toLocaleString()} shown of ${libraryItems().length.toLocaleString()} item${libraryItems().length === 1 ? "" : "s"}${state.selected.size ? ` · ${state.selected.size} selected` : ""}`;
-    byId("preview-move").disabled = state.selected.size === 0;
+    const omittedCount = updateSelectedItems([itemId], checkbox.checked);
+    renderLibrary();
+    if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
   });
   document.body.addEventListener("click", (event) => {
     const groupCheckbox = event.target.closest("[data-select-group]");
