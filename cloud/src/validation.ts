@@ -13,6 +13,7 @@ export const MAX_ACTION_BODY_BYTES = 320_000;
 export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
 export const MAX_LEGACY_TEXT_BYTES = 256 * 1024;
 export const MAX_SELECTED_ITEMS = 100;
+const MAX_COLLECTION_ORDER = 0xffff_ffff;
 const MAX_TITLE_SCALAR_VALUES = 500;
 const MAX_TITLE_CODE_UNITS = MAX_TITLE_SCALAR_VALUES * 2;
 
@@ -184,8 +185,9 @@ function parseCollection(value: unknown): CollectionMetadata {
   const order = value.order === undefined || value.order === null
     ? null
     : value.order;
-  if (order !== null && (!Number.isSafeInteger(order) || (order as number) < 0)) {
-    throw new HttpError(400, "collection.order must be a non-negative integer or null");
+  if (order !== null &&
+    (!Number.isSafeInteger(order) || (order as number) < 0 || (order as number) > MAX_COLLECTION_ORDER)) {
+    throw new HttpError(400, `collection.order must be an integer from 0 to ${MAX_COLLECTION_ORDER} or null`);
   }
   return { id, title, kind, order: order as number | null, part_id: partId };
 }

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::CStr;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -717,6 +717,7 @@ struct BuiltLibraryItem {
 struct ScanTestHooks {
     incomplete_directories: BTreeSet<String>,
     expire_after_built_item: bool,
+    index_budget: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -966,6 +967,14 @@ impl LibraryManager {
             .lock()
             .expect("scan test-hook lock should remain healthy")
             .expire_after_built_item = true;
+    }
+
+    #[cfg(test)]
+    fn limit_next_scan_index_to(&self, bytes: usize) {
+        self.scan_test_hooks
+            .lock()
+            .expect("scan test-hook lock should remain healthy")
+            .index_budget = Some(bytes);
     }
 
     #[cfg(test)]
@@ -2812,6 +2821,10 @@ impl LibraryManager {
                 .map_err(|_| anyhow!("scan test-hook lock is poisoned"))?;
             std::mem::take(&mut *hooks)
         };
+        #[cfg(test)]
+        let index_budget = test_hooks.index_budget.unwrap_or(INDEX_LIMIT);
+        #[cfg(not(test))]
+        let index_budget = INDEX_LIMIT;
         walk.warnings.extend(operation_state_warnings);
         if let Some(warning) = index_warning {
             walk.warnings.push(warning);
@@ -2986,6 +2999,8 @@ impl LibraryManager {
         // scanned item, so they prevent a unique-rename inference for this scan.
         let can_match_unique_rename = walk.incomplete_directories.is_empty();
         let mut used_ids = HashSet::new();
+        let mut deferred_identity_ids = HashSet::new();
+        let mut deferred_identity_items = 0usize;
         for (item_index, item) in videos.iter_mut().enumerate() {
             let Some(fingerprint) = fingerprints.get(&item.relative_path) else {
                 continue;
@@ -3001,24 +3016,24 @@ impl LibraryManager {
                             .then_some((id, record))
                     })
                 });
+            let identity_candidates = old_by_identity
+                .get(&key)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| {
+                    let record = old_records.get(id)?;
+                    (!used_ids.contains(id) && index_record_matches(record, fingerprint))
+                        .then_some((id, record))
+                })
+                .collect::<Vec<_>>();
             let current_identity_count =
                 (fingerprint.identity.device(), fingerprint.identity.inode());
             let unique_rename = if exact.is_none()
                 && can_match_unique_rename
                 && scanned_primary_identity_counts.get(&current_identity_count) == Some(&1)
             {
-                let candidates = old_by_identity
-                    .get(&key)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|id| {
-                        let record = old_records.get(id)?;
-                        (!used_ids.contains(id) && index_record_matches(record, fingerprint))
-                            .then_some((id, record))
-                    })
-                    .collect::<Vec<_>>();
-                if candidates.len() == 1 {
-                    candidates.first().copied()
+                if identity_candidates.len() == 1 {
+                    identity_candidates.first().copied()
                 } else {
                     None
                 }
@@ -3026,6 +3041,19 @@ impl LibraryManager {
                 None
             };
             let prior = exact.or(unique_rename);
+            if exact.is_none() && !can_match_unique_rename && !identity_candidates.is_empty() {
+                // An incomplete directory may hide another hard-link name, so do not publish a
+                // path-derived ID over an older identity that cannot yet be matched safely.
+                // Keep the older records untouched until a complete scan can prove uniqueness.
+                for (id, _) in &identity_candidates {
+                    deferred_identity_ids.insert((*id).clone());
+                }
+                deferred_identity_items = deferred_identity_items.saturating_add(1);
+                item.presence = Presence::Unavailable;
+                item.id = physical_item_id(fingerprint, &item.relative_path);
+                queue_metadata[item_index] = item_queue_metadata;
+                continue;
+            }
             let stable_id = prior
                 .map(|(id, _)| id.clone())
                 .unwrap_or_else(|| physical_item_id(fingerprint, &item.relative_path));
@@ -3056,6 +3084,11 @@ impl LibraryManager {
                 },
             );
         }
+        if deferred_identity_items > 0 {
+            walk.warnings.push(format!(
+                "{deferred_identity_items} media item(s) with an existing object identity are unavailable until a complete scan can confirm a unique move; previous identity and queue metadata were preserved"
+            ));
+        }
 
         let observed = videos
             .iter()
@@ -3063,6 +3096,11 @@ impl LibraryManager {
             .collect::<HashSet<_>>();
         for (id, record) in &mut index.records {
             if observed.contains(id) {
+                continue;
+            }
+            if deferred_identity_ids.contains(id) {
+                record.item.presence = Presence::Unavailable;
+                record.missing_since = None;
                 continue;
             }
             let unreadable_status = unreadable_media.get(&record.item.relative_path).copied();
@@ -3091,8 +3129,13 @@ impl LibraryManager {
             }
         }
 
-        let pruned_missing =
-            prune_missing_index_records(&mut index, MAX_MISSING_INDEX_RECORDS, INDEX_LIMIT)?;
+        index.version = INDEX_VERSION;
+        let mut persisted_index = compact_index_for_persistence(&index);
+        let pruned_missing = prune_missing_index_records(
+            &mut persisted_index,
+            MAX_MISSING_INDEX_RECORDS,
+            index_budget,
+        )?;
         if !pruned_missing.is_empty() {
             let pruned_count = pruned_missing.len();
             let pruned_ids = pruned_missing.into_iter().collect::<HashSet<_>>();
@@ -3106,6 +3149,12 @@ impl LibraryManager {
         videos.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         let categories = walk.root_categories.clone();
         let revision = snapshot_revision(&videos)?;
+        if !self.write_index(&persisted_index, index_budget)? {
+            walk.warnings.push(
+                "media-library index exceeded its configured size limit; any previous valid index was kept, this snapshot is usable, but identity and queue association changes from this scan are not durable"
+                    .to_string(),
+            );
+        }
         let snapshot = LibrarySnapshot {
             revision,
             scanned_at: unix_now(),
@@ -3120,8 +3169,6 @@ impl LibraryManager {
             categories: categories.into_iter().collect(),
             warnings: deduplicate(walk.warnings),
         };
-        index.version = INDEX_VERSION;
-        self.write_index(&index)?;
         *self
             .last_snapshot
             .lock()
@@ -3917,12 +3964,17 @@ impl LibraryManager {
         Ok(())
     }
 
-    fn write_index(&self, index: &LibraryIndex) -> Result<()> {
-        let contents = serde_json::to_vec(index).context("failed to encode media-library index")?;
-        if contents.len() > INDEX_LIMIT {
-            bail!("media-library index exceeds its size limit");
-        }
-        self.write_private_file(&self.library_dir.join(LIBRARY_INDEX), &contents)
+    fn write_index(&self, index: &LibraryIndex, max_serialized_bytes: usize) -> Result<bool> {
+        let limit = max_serialized_bytes.min(INDEX_LIMIT);
+        let Some(writer) = serialize_index(index, IndexSerializationWriter::new(limit, true))?
+        else {
+            return Ok(false);
+        };
+        let contents = writer
+            .capture
+            .expect("index serialization should capture bytes for persistence");
+        self.write_private_file(&self.library_dir.join(LIBRARY_INDEX), &contents)?;
+        Ok(true)
     }
 
     fn read_private_file(&self, path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
@@ -4835,8 +4887,7 @@ fn prune_missing_index_records(
         removed.insert(id.clone());
     }
 
-    let encoded = serde_json::to_vec(index).context("failed to size the media-library index")?;
-    if encoded.len() <= max_serialized_bytes {
+    if index_fits_budget(index, max_serialized_bytes)? {
         return Ok(removed.into_iter().collect());
     }
 
@@ -4856,14 +4907,9 @@ fn prune_missing_index_records(
     without_missing
         .records
         .retain(|_, record| record.item.presence != Presence::Missing);
-    let base_size = serde_json::to_vec(&without_missing)
-        .context("failed to size the media-library index without missing records")?
-        .len();
-    if base_size > max_serialized_bytes {
-        for (id, _) in remaining {
-            index.records.remove(&id);
-            removed.insert(id);
-        }
+    if !index_fits_budget(&without_missing, max_serialized_bytes)? {
+        // The live identity cache alone exceeds the available budget. Keep the bounded
+        // missing history in memory and let the caller preserve the previous on-disk index.
         return Ok(removed.into_iter().collect());
     }
 
@@ -4877,10 +4923,7 @@ fn prune_missing_index_records(
                 candidate.records.insert(id.clone(), record.clone());
             }
         }
-        let size = serde_json::to_vec(&candidate)
-            .context("failed to size the bounded media-library index")?
-            .len();
-        if size <= max_serialized_bytes {
+        if index_fits_budget(&candidate, max_serialized_bytes)? {
             low = keep_count;
         } else {
             high = keep_count;
@@ -4892,6 +4935,73 @@ fn prune_missing_index_records(
         removed.insert(id.clone());
     }
     Ok(removed.into_iter().collect())
+}
+
+fn compact_index_for_persistence(index: &LibraryIndex) -> LibraryIndex {
+    let mut compact = index.clone();
+    for record in compact.records.values_mut() {
+        if record.item.presence == Presence::Present {
+            // Present media directories were completely enumerated during this scan, so these
+            // attachment paths are a rebuildable view rather than durable identity metadata.
+            record.item.attachments.clear();
+        }
+    }
+    compact
+}
+
+fn index_fits_budget(index: &LibraryIndex, max_bytes: usize) -> Result<bool> {
+    let limit = max_bytes.min(INDEX_LIMIT);
+    let writer = IndexSerializationWriter::new(limit, false);
+    Ok(serialize_index(index, writer)?.is_some())
+}
+
+struct IndexSerializationWriter {
+    limit: usize,
+    written: usize,
+    capture: Option<Vec<u8>>,
+    exceeded: bool,
+}
+
+impl IndexSerializationWriter {
+    fn new(limit: usize, capture: bool) -> Self {
+        Self {
+            limit,
+            written: 0,
+            capture: capture.then(Vec::new),
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for IndexSerializationWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.written) {
+            self.exceeded = true;
+            return Err(std::io::Error::other(
+                "media-library index exceeds its configured size limit",
+            ));
+        }
+        self.written += bytes.len();
+        if let Some(capture) = self.capture.as_mut() {
+            capture.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_index(
+    index: &LibraryIndex,
+    mut writer: IndexSerializationWriter,
+) -> Result<Option<IndexSerializationWriter>> {
+    match serde_json::to_writer(&mut writer, index) {
+        Ok(()) => Ok(Some(writer)),
+        Err(_) if writer.exceeded => Ok(None),
+        Err(error) => Err(error).context("failed to serialize media-library index"),
+    }
 }
 
 fn physical_item_id(fingerprint: &FileFingerprint, relative_path: &str) -> String {
@@ -5008,10 +5118,8 @@ fn probe_media(file: &BoundFile) -> Result<MediaSpecs> {
         .args([
             "-v",
             "error",
-            "-select_streams",
-            "v:0",
             "-show_entries",
-            "stream=codec_name,width,height",
+            "stream=codec_type,codec_name,width,height:stream_disposition=attached_pic",
             "-of",
             "json",
             "-i",
@@ -5086,27 +5194,52 @@ fn probe_media(file: &BoundFile) -> Result<MediaSpecs> {
     }
     let value: serde_json::Value =
         serde_json::from_slice(&stdout).context("ffprobe returned invalid JSON")?;
-    let Some(stream) = value
-        .get("streams")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|streams| streams.first())
-    else {
-        return Ok(MediaSpecs::default());
+    Ok(media_specs_from_ffprobe_json(&value))
+}
+
+fn media_specs_from_ffprobe_json(value: &serde_json::Value) -> MediaSpecs {
+    let Some(streams) = value.get("streams").and_then(serde_json::Value::as_array) else {
+        return MediaSpecs::default();
     };
-    Ok(MediaSpecs {
-        width: stream
-            .get("width")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok()),
-        height: stream
-            .get("height")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok()),
+
+    let real_video = streams.iter().find(|stream| {
+        stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("video")
+            && !stream_is_attached_picture(stream)
+    });
+    let (stream, is_video) = if let Some(video) = real_video {
+        (video, true)
+    } else if let Some(audio) = streams.iter().find(|stream| {
+        stream.get("codec_type").and_then(serde_json::Value::as_str) == Some("audio")
+    }) {
+        (audio, false)
+    } else {
+        return MediaSpecs::default();
+    };
+
+    MediaSpecs {
+        width: is_video
+            .then(|| stream.get("width").and_then(serde_json::Value::as_u64))
+            .flatten()
+            .and_then(|value| u32::try_from(value).ok()),
+        height: is_video
+            .then(|| stream.get("height").and_then(serde_json::Value::as_u64))
+            .flatten()
+            .and_then(|value| u32::try_from(value).ok()),
         codec: stream
             .get("codec_name")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
-    })
+    }
+}
+
+fn stream_is_attached_picture(stream: &serde_json::Value) -> bool {
+    let Some(value) = stream
+        .get("disposition")
+        .and_then(|disposition| disposition.get("attached_pic"))
+    else {
+        return false;
+    };
+    value.as_bool() == Some(true) || value.as_u64() == Some(1)
 }
 
 fn excluded_entry(
@@ -6997,6 +7130,98 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn round9_media_probe_selects_real_video_or_audio_streams() {
+        let cases = [
+            (
+                "audio-only file uses its audio codec without dimensions",
+                serde_json::json!({
+                    "streams": [{
+                        "codec_type": "audio",
+                        "codec_name": "flac",
+                        "width": 640,
+                        "height": 480
+                    }]
+                }),
+                Some("flac"),
+                None,
+                None,
+            ),
+            (
+                "attached cover art falls back to the audio stream",
+                serde_json::json!({
+                    "streams": [
+                        {
+                            "codec_type": "video",
+                            "codec_name": "mjpeg",
+                            "width": 1200,
+                            "height": 1200,
+                            "disposition": {"attached_pic": 1}
+                        },
+                        {"codec_type": "audio", "codec_name": "aac"}
+                    ]
+                }),
+                Some("aac"),
+                None,
+                None,
+            ),
+            (
+                "real video is preferred even when an audio stream comes first",
+                serde_json::json!({
+                    "streams": [
+                        {"codec_type": "audio", "codec_name": "aac"},
+                        {
+                            "codec_type": "video",
+                            "codec_name": "h264",
+                            "width": 1920,
+                            "height": 1080,
+                            "disposition": {"attached_pic": 0}
+                        }
+                    ]
+                }),
+                Some("h264"),
+                Some(1920),
+                Some(1080),
+            ),
+            (
+                "video without disposition remains compatible with older probe output",
+                serde_json::json!({
+                    "streams": [{
+                        "codec_type": "video",
+                        "codec_name": "hevc",
+                        "width": 3840,
+                        "height": 2160
+                    }]
+                }),
+                Some("hevc"),
+                Some(3840),
+                Some(2160),
+            ),
+            (
+                "cover-only input does not publish cover dimensions or codec",
+                serde_json::json!({
+                    "streams": [{
+                        "codec_type": "video",
+                        "codec_name": "png",
+                        "width": 1200,
+                        "height": 1200,
+                        "disposition": {"attached_pic": true}
+                    }]
+                }),
+                None,
+                None,
+                None,
+            ),
+        ];
+
+        for (description, probe, codec, width, height) in cases {
+            let actual = media_specs_from_ffprobe_json(&probe);
+            assert_eq!(actual.codec.as_deref(), codec, "{description}");
+            assert_eq!(actual.width, width, "{description}");
+            assert_eq!(actual.height, height, "{description}");
+        }
+    }
+
     struct TemporaryRoot(PathBuf);
 
     impl TemporaryRoot {
@@ -7946,6 +8171,132 @@ mod tests {
     }
 
     #[test]
+    fn round9_partial_rename_preserves_old_identity_until_complete_reconciliation() {
+        let root = TemporaryRoot::new("round9-partial-rename-identity");
+        let before = root.path().join("Before");
+        let after = root.path().join("After");
+        fs::create_dir(&before).expect("source directory should create");
+        fs::create_dir(&after).expect("destination directory should create");
+        fs::create_dir(root.path().join("Interrupted"))
+            .expect("incomplete directory fixture should create");
+        fs::write(before.join("clip.mp4"), b"stable-media-object")
+            .expect("media fixture should write");
+        let hint = SourceHint {
+            source_ids: vec!["abcdefghijk".to_string()],
+            title: Some("Queue title".to_string()),
+            relative_path: Some("Before/clip.mp4".to_string()),
+            collection: Some(CollectionMetadata {
+                id: Some("playlist-9".to_string()),
+                title: "Queue collection".to_string(),
+                kind: "youtube_playlist".to_string(),
+                order: Some(9),
+                part_id: None,
+            }),
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let initial_manager = manager(&root);
+        let initial = initial_manager
+            .scan(std::slice::from_ref(&hint))
+            .expect("initial queue-aware scan should complete");
+        let stable_id = item_at(&initial, "Before/clip.mp4").id.clone();
+        fs::rename(before.join("clip.mp4"), after.join("clip.mp4"))
+            .expect("manual media move should complete");
+        initial_manager.mark_next_scan_directory_incomplete("Interrupted");
+
+        let partial = initial_manager
+            .scan(&[])
+            .expect("partial scan should remain useful while deferring identity");
+        let provisional = item_at(&partial, "After/clip.mp4");
+        assert_eq!(provisional.presence, Presence::Unavailable);
+        assert_ne!(provisional.id, stable_id);
+        assert!(
+            partial
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("complete scan can confirm a unique move") })
+        );
+        assert_eq!(partial.items.len(), 1);
+
+        let partial_index = initial_manager
+            .read_index()
+            .expect("deferred scan should preserve its prior index");
+        assert_eq!(partial_index.records.len(), 1);
+        let prior = &partial_index.records[&stable_id];
+        assert_eq!(prior.item.relative_path, "Before/clip.mp4");
+        assert_eq!(prior.item.presence, Presence::Unavailable);
+        assert_eq!(prior.missing_since, None);
+        assert_eq!(prior.queue_metadata.title.as_deref(), Some("Queue title"));
+        assert_eq!(prior.queue_metadata.source_ids, vec!["youtube:abcdefghijk"]);
+        assert_eq!(
+            prior
+                .queue_metadata
+                .collection
+                .as_ref()
+                .map(|value| value.title.as_str()),
+            Some("Queue collection")
+        );
+        assert!(
+            !partial_index.records.contains_key(&provisional.id),
+            "a provisional path-derived ID must not become authoritative"
+        );
+        drop(initial_manager);
+
+        let reopened = manager(&root);
+        let complete = reopened
+            .scan(&[])
+            .expect("complete scan should reconcile the retained identity");
+        assert_eq!(complete.items.len(), 1);
+        let moved = item_at(&complete, "After/clip.mp4");
+        assert_eq!(moved.id, stable_id);
+        assert_eq!(moved.presence, Presence::Present);
+        assert_eq!(moved.title, "Queue title");
+        assert_eq!(moved.source_ids, vec!["youtube:abcdefghijk"]);
+        assert_eq!(
+            moved.collection.as_ref().map(|value| value.title.as_str()),
+            Some("Queue collection")
+        );
+        let complete_index = reopened
+            .read_index()
+            .expect("reconciled index should remain readable");
+        assert_eq!(complete_index.records.len(), 1);
+        assert_eq!(
+            complete_index.records[&stable_id].item.relative_path,
+            "After/clip.mp4"
+        );
+    }
+
+    #[test]
+    fn round9_partial_rename_does_not_demote_a_later_exact_hardlink_alias() {
+        let root = TemporaryRoot::new("round9-partial-exact-alias");
+        let exact_path = root.path().join("clip.mp4");
+        let renamed_path = root.path().join("a-renamed.mp4");
+        fs::create_dir(root.path().join("Interrupted"))
+            .expect("incomplete directory fixture should create");
+        fs::write(&exact_path, b"stable-hardlink-object").expect("media fixture should write");
+        let manager = manager(&root);
+        let initial = manager.scan(&[]).expect("initial scan should complete");
+        let stable_id = item_at(&initial, "clip.mp4").id.clone();
+        fs::rename(&exact_path, &renamed_path).expect("manual rename should complete");
+        fs::hard_link(&renamed_path, &exact_path).expect("exact-path alias should create");
+        manager.mark_next_scan_directory_incomplete("Interrupted");
+
+        let partial = manager
+            .scan(&[])
+            .expect("partial scan should conservatively retain both hard-link names");
+        let exact = item_at(&partial, "clip.mp4");
+        let renamed = item_at(&partial, "a-renamed.mp4");
+        assert_eq!(exact.id, stable_id);
+        assert_eq!(exact.presence, Presence::Present);
+        assert_eq!(renamed.presence, Presence::Unavailable);
+        let index = manager
+            .read_index()
+            .expect("partial alias scan should persist readable index state");
+        assert_eq!(index.records[&stable_id].item.relative_path, "clip.mp4");
+        assert_eq!(index.records[&stable_id].item.presence, Presence::Present);
+    }
+
+    #[test]
     fn unobserved_records_are_unavailable_for_incomplete_or_unreadable_scans() {
         let mut walk = ScanWalk::default();
         walk.complete_directories.insert(String::new());
@@ -8002,9 +8353,11 @@ mod tests {
                 ),
             );
         }
-        manager
-            .write_index(&index)
-            .expect("large but bounded fixture index should persist");
+        assert!(
+            manager
+                .write_index(&index, INDEX_LIMIT)
+                .expect("large but bounded fixture index should persist")
+        );
 
         let snapshot = manager
             .scan(&[])
@@ -8072,6 +8425,146 @@ mod tests {
         let decoded: LibraryIndex = serde_json::from_value(old_schema)
             .expect("index records without missing_since must remain readable");
         assert_eq!(decoded.records["new"].missing_since, None);
+    }
+
+    #[test]
+    fn round9_present_index_compaction_drops_only_rebuildable_attachments() {
+        let mut record =
+            index_fixture_record("present", "clip.mp4", Presence::Present, 7, 70, None);
+        record.item.attachments.push(LibraryAttachment {
+            relative_path: "clip.en.srt".to_string(),
+            kind: "subtitle".to_string(),
+        });
+        record.queue_metadata = QueueMetadataProvenance {
+            title: Some("Queue title".to_string()),
+            source_ids: vec!["youtube:abcdefghijk".to_string()],
+            collection: Some(CollectionMetadata {
+                id: Some("playlist-7".to_string()),
+                title: "Queue collection".to_string(),
+                kind: "youtube_playlist".to_string(),
+                order: Some(7),
+                part_id: None,
+            }),
+            requires_confirmation: false,
+        };
+        let mut index = LibraryIndex {
+            version: INDEX_VERSION,
+            records: BTreeMap::from([("present".to_string(), record)]),
+        };
+
+        let compact = compact_index_for_persistence(&index);
+        assert_eq!(index.records["present"].item.attachments.len(), 1);
+        assert!(compact.records["present"].item.attachments.is_empty());
+        assert_eq!(compact.records["present"].item.id, "present");
+        assert_eq!(compact.records["present"].item.relative_path, "clip.mp4");
+        assert_eq!(compact.records["present"].device, 7);
+        assert_eq!(compact.records["present"].inode, 70);
+        assert_eq!(
+            compact.records["present"].queue_metadata.title.as_deref(),
+            Some("Queue title")
+        );
+        assert_eq!(
+            compact.records["present"].queue_metadata.source_ids,
+            vec!["youtube:abcdefghijk"]
+        );
+        assert!(
+            serde_json::to_vec(&compact).unwrap().len() < serde_json::to_vec(&index).unwrap().len()
+        );
+
+        index.records.get_mut("present").unwrap().item.presence = Presence::Unavailable;
+        let unavailable = compact_index_for_persistence(&index);
+        assert_eq!(unavailable.records["present"].item.attachments.len(), 1);
+    }
+
+    #[test]
+    fn round9_oversized_index_keeps_previous_bytes_and_publishes_full_snapshot() {
+        let root = TemporaryRoot::new("round9-index-budget-fallback");
+        fs::write(root.path().join("clip.mp4"), b"fixture media")
+            .expect("media fixture should write");
+        fs::write(
+            root.path().join("clip.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\nsubtitle\n",
+        )
+        .expect("subtitle fixture should write");
+        let hint = SourceHint {
+            source_ids: vec!["abcdefghijk".to_string()],
+            title: Some("Queue title".to_string()),
+            relative_path: Some("clip.mp4".to_string()),
+            collection: Some(CollectionMetadata {
+                id: Some("playlist-7".to_string()),
+                title: "Queue collection".to_string(),
+                kind: "youtube_playlist".to_string(),
+                order: Some(7),
+                part_id: None,
+            }),
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let manager = manager(&root);
+        let initial = manager
+            .scan(std::slice::from_ref(&hint))
+            .expect("initial scan should persist a valid index");
+        let initial_item = item_at(&initial, "clip.mp4");
+        assert!(
+            initial_item
+                .attachments
+                .iter()
+                .any(|file| file.relative_path == "clip.srt")
+        );
+        let index_path = root.path().join(LIBRARY_DIRECTORY).join(LIBRARY_INDEX);
+        let previous_bytes = fs::read(&index_path).expect("persisted index should be readable");
+        let small_budget = previous_bytes.len() - 1;
+
+        manager.limit_next_scan_index_to(small_budget);
+        let partial = manager
+            .scan(&[])
+            .expect("an oversized rebuildable cache should not fail the scan");
+        let item = item_at(&partial, "clip.mp4");
+        assert!(
+            item.attachments
+                .iter()
+                .any(|file| file.relative_path == "clip.srt")
+        );
+        assert_eq!(item.title, "Queue title");
+        assert_eq!(item.source_ids, vec!["youtube:abcdefghijk"]);
+        assert_eq!(
+            item.collection.as_ref().map(|value| value.title.as_str()),
+            Some("Queue collection")
+        );
+        assert!(partial.warnings.iter().any(|warning| {
+            warning.contains("previous valid index was kept")
+                && warning.contains(
+                    "identity and queue association changes from this scan are not durable",
+                )
+        }));
+        assert_eq!(fs::read(&index_path).unwrap(), previous_bytes);
+        let preserved = manager
+            .read_index()
+            .expect("previous index should remain valid");
+        assert_eq!(preserved.records.len(), 1);
+        assert_eq!(
+            preserved
+                .records
+                .values()
+                .next()
+                .unwrap()
+                .queue_metadata
+                .title
+                .as_deref(),
+            Some("Queue title")
+        );
+
+        manager.limit_next_scan_index_to(small_budget);
+        let repeated = manager
+            .scan(&[])
+            .expect("repeated over-budget scans should remain usable");
+        assert!(
+            repeated
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("previous valid index was kept") })
+        );
+        assert_eq!(fs::read(&index_path).unwrap(), previous_bytes);
     }
 
     #[test]

@@ -440,6 +440,40 @@ describe("Mini App identity and actions", () => {
     expect(tooManyPatches.status).toBe(400);
   });
 
+  it("bounds collection order to Rust u32 before enqueueing", async () => {
+    const initData = await signInitData();
+    const orderCases: Array<{ requestId: string; order: unknown; expectedStatus: number }> = [
+      { requestId: "00000000-0000-4000-8000-000000000201", order: 0, expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000202", order: 4_294_967_295, expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000203", order: 4_294_967_296, expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000000204", order: Number.MAX_SAFE_INTEGER, expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000000205", order: 1.5, expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000000206", order: -1, expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000000207", order: "1", expectedStatus: 400 },
+    ];
+    const before = await responseJson<{ requests: unknown[] }>(await localRequests());
+
+    for (const orderCase of orderCases) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: orderCase.requestId,
+          kind: "file_preview",
+          payload: {
+            metadata_patches: [{
+              item_id: "item-a",
+              collection: { id: null, title: "Series", kind: "series", order: orderCase.order, part_id: null },
+            }],
+          },
+        }),
+      });
+      expect(response.status, orderCase.requestId).toBe(orderCase.expectedStatus);
+    }
+
+    const after = await responseJson<{ requests: unknown[] }>(await localRequests());
+    expect(after.requests).toHaveLength(before.requests.length + 2);
+  });
+
   it("validates metadata titles by Unicode scalar count before enqueueing", async () => {
     const initData = await signInitData();
     const cjkWith501Utf8Bytes = "界".repeat(167);
