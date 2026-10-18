@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -90,6 +91,34 @@ pub(crate) struct BoundFile {
 pub(crate) struct BoundDirectory {
     fd: Arc<OwnedFd>,
     identity: EntryIdentity,
+}
+
+pub(crate) struct BoundDirectoryCursor {
+    entry: BoundEntry,
+    expected: EntryIdentity,
+    directory: BoundDirectory,
+    reader: rustix::fs::Dir,
+    pending: VecDeque<BoundDirectoryCursorEntry>,
+    exhausted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum BoundDirectoryCursorEntry {
+    Present {
+        name: OsString,
+        identity: EntryIdentity,
+    },
+    Unreadable {
+        name: OsString,
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BoundDirectoryCursorPage {
+    pub(crate) entry: Option<BoundDirectoryCursorEntry>,
+    pub(crate) names_read: usize,
+    pub(crate) exhausted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1204,6 +1233,100 @@ impl RootedFs {
         }
         self.validate_bound_parent(&entry.parent)?;
         Ok(entries)
+    }
+
+    pub(crate) fn start_bound_directory_cursor(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        mode: u16,
+    ) -> Result<BoundDirectoryCursor> {
+        self.validate_private_bound_directory(entry, expected, mode)?;
+        let directory = self.open_bound_directory(entry, expected)?;
+        let reader = rustix::fs::Dir::read_from(directory.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to start bound directory cursor")?;
+        let cursor = BoundDirectoryCursor {
+            entry: entry.clone(),
+            expected,
+            directory,
+            reader,
+            pending: VecDeque::new(),
+            exhausted: false,
+        };
+        self.validate_private_bound_directory_cursor(&cursor, mode)?;
+        Ok(cursor)
+    }
+
+    pub(crate) fn peek_bound_directory_cursor(
+        &self,
+        cursor: &mut BoundDirectoryCursor,
+        max_names: usize,
+        mode: u16,
+    ) -> Result<BoundDirectoryCursorPage> {
+        self.validate_private_bound_directory_cursor(cursor, mode)?;
+        let mut names_read = 0;
+        if max_names > 0 && cursor.pending.is_empty() && !cursor.exhausted {
+            while names_read < max_names {
+                let Some(item) = cursor.reader.read() else {
+                    cursor.exhausted = true;
+                    break;
+                };
+                names_read += 1;
+                let item = item
+                    .map_err(errno_to_io)
+                    .context("failed while advancing bound directory cursor")?;
+                let c_name = item.file_name();
+                if matches!(c_name.to_bytes(), b"." | b"..") {
+                    continue;
+                }
+                let name = os_string_from_directory_name(c_name);
+                match identity_at(cursor.directory.fd.as_ref(), &name) {
+                    Ok(Some(identity)) => cursor
+                        .pending
+                        .push_back(BoundDirectoryCursorEntry::Present { name, identity }),
+                    Ok(None) => {
+                        // Child churn is ordinary directory activity; a vanished entry is skipped.
+                    }
+                    Err(error) => cursor
+                        .pending
+                        .push_back(BoundDirectoryCursorEntry::Unreadable {
+                            name,
+                            error: error.to_string(),
+                        }),
+                }
+            }
+        }
+        self.validate_private_bound_directory_cursor(cursor, mode)?;
+        Ok(BoundDirectoryCursorPage {
+            entry: cursor.pending.front().cloned(),
+            names_read,
+            exhausted: cursor.exhausted && cursor.pending.is_empty(),
+        })
+    }
+
+    pub(crate) fn consume_bound_directory_cursor_entry(&self, cursor: &mut BoundDirectoryCursor) {
+        cursor.pending.pop_front();
+    }
+
+    fn validate_private_bound_directory_cursor(
+        &self,
+        cursor: &BoundDirectoryCursor,
+        mode: u16,
+    ) -> Result<()> {
+        self.validate_private_bound_directory(&cursor.entry, cursor.expected, mode)?;
+        let reader_fd = cursor
+            .reader
+            .fd()
+            .map_err(errno_to_io)
+            .context("failed to inspect bound directory cursor descriptor")?;
+        if cursor.directory.identity != cursor.expected
+            || identity_for_fd(cursor.directory.fd.as_ref())? != cursor.expected
+            || identity_for_fd(reader_fd)? != cursor.expected
+        {
+            bail!("bound directory cursor identity changed");
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_private_bound_directory(
@@ -3336,9 +3459,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::collections::HashSet;
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -4448,5 +4575,298 @@ mod tests {
         );
         assert_eq!(fs::read(quarantine.join("entry")).unwrap(), b"user-owned");
         let _ = fs::remove_dir_all(root);
+    }
+
+    // The cursor is bound to one directory object and its owner-private access policy. Child
+    // entries may change while scanning without changing either protected property.
+    #[cfg(unix)]
+    struct Round5BoundDirectoryCursorFixture {
+        root: PathBuf,
+        rooted: RootedFs,
+        directory: PathBuf,
+        entry: BoundEntry,
+        identity: EntryIdentity,
+    }
+
+    #[cfg(unix)]
+    impl Round5BoundDirectoryCursorFixture {
+        fn new(label: &str, file_count: usize) -> Self {
+            let root = temp_dir(label);
+            fs::create_dir_all(&root).expect("cursor test root should create");
+            let rooted = RootedFs::new(&root).expect("cursor test root should bind");
+            let directory = root.join("private-state");
+            let created_identity = rooted
+                .create_dir(&directory, 0o700)
+                .expect("private test directory should create")
+                .expect("private test directory should be new");
+            let entry = rooted
+                .bind_entry(&directory, false)
+                .expect("private test directory should bind");
+            let identity = rooted
+                .bound_entry_identity(&entry)
+                .expect("private test directory identity should read")
+                .expect("private test directory should exist");
+            assert_eq!(identity, created_identity);
+            rooted
+                .open_bound_directory(&entry, identity)
+                .expect("private test directory descriptor should open")
+                .set_private_mode(0o700)
+                .expect("private test directory mode should be exact");
+
+            let fixture = Self {
+                root,
+                rooted,
+                directory,
+                entry,
+                identity,
+            };
+            for index in 0..file_count {
+                fixture.create_private_file(&format!("entry-{index:03}.txt"));
+            }
+            fixture
+        }
+
+        fn create_private_file(&self, name: &str) {
+            let path = self.directory.join(name);
+            fs::write(&path, b"private cursor fixture").expect("private fixture file should write");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("private fixture file mode should be set");
+            assert_eq!(
+                fs::metadata(path)
+                    .expect("private fixture metadata should read")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "cursor fixture files must be owner-private"
+            );
+        }
+
+        fn start(&self) -> BoundDirectoryCursor {
+            self.rooted
+                .start_bound_directory_cursor(&self.entry, self.identity, 0o700)
+                .expect("private directory cursor should start")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Round5BoundDirectoryCursorFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_same_round5_cursor_entry(
+        left: &BoundDirectoryCursorEntry,
+        right: &BoundDirectoryCursorEntry,
+    ) {
+        match (left, right) {
+            (
+                BoundDirectoryCursorEntry::Present {
+                    name: left_name,
+                    identity: left_identity,
+                },
+                BoundDirectoryCursorEntry::Present {
+                    name: right_name,
+                    identity: right_identity,
+                },
+            ) => {
+                assert_eq!(left_name, right_name);
+                assert_eq!(left_identity, right_identity);
+            }
+            (
+                BoundDirectoryCursorEntry::Unreadable {
+                    name: left_name,
+                    error: left_error,
+                },
+                BoundDirectoryCursorEntry::Unreadable {
+                    name: right_name,
+                    error: right_error,
+                },
+            ) => {
+                assert_eq!(left_name, right_name);
+                assert_eq!(left_error, right_error);
+            }
+            _ => panic!("cursor peek should preserve the exact pending entry kind"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round5_bound_directory_cursor_advances_with_a_bounded_name_budget() {
+        let fixture = Round5BoundDirectoryCursorFixture::new("cursor-bounded-progress", 64);
+        let expected = (0..64)
+            .map(|index| OsString::from(format!("entry-{index:03}.txt")))
+            .collect::<HashSet<_>>();
+        let mut cursor = fixture.start();
+
+        let first_page = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
+            .expect("first bounded page should read");
+        assert_eq!(first_page.names_read, 32);
+        assert!(!first_page.exhausted);
+        let first_entry = first_page
+            .entry
+            .expect("first bounded page should have a pending entry");
+
+        let repeated_page = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
+            .expect("repeated peek should retain the pending entry");
+        assert_eq!(repeated_page.names_read, 0);
+        assert_same_round5_cursor_entry(
+            &first_entry,
+            repeated_page
+                .entry
+                .as_ref()
+                .expect("repeated peek should return the pending entry"),
+        );
+
+        let zero_budget_page = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 0, 0o700)
+            .expect("zero budget should not fail the cursor");
+        assert_eq!(zero_budget_page.names_read, 0);
+        assert_same_round5_cursor_entry(
+            &first_entry,
+            zero_budget_page
+                .entry
+                .as_ref()
+                .expect("zero budget may expose but must not consume pending work"),
+        );
+
+        let mut seen = HashSet::new();
+        loop {
+            let page = fixture
+                .rooted
+                .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
+                .expect("bounded cursor should keep reading remaining entries");
+            assert!(page.names_read <= 32);
+            match page.entry {
+                Some(BoundDirectoryCursorEntry::Present { name, .. }) => {
+                    assert!(seen.insert(name), "cursor should not emit a name twice");
+                    fixture
+                        .rooted
+                        .consume_bound_directory_cursor_entry(&mut cursor);
+                }
+                Some(BoundDirectoryCursorEntry::Unreadable { name, error }) => {
+                    panic!("private fixture entry {name:?} should be readable: {error}");
+                }
+                None if page.exhausted => break,
+                None => assert!(
+                    page.names_read > 0,
+                    "a non-exhausted empty page should have made bounded progress"
+                ),
+            }
+        }
+        assert_eq!(seen, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round5_bound_directory_cursor_zero_budget_does_not_advance_an_empty_buffer() {
+        let fixture = Round5BoundDirectoryCursorFixture::new("cursor-zero-budget", 4);
+        let mut cursor = fixture.start();
+
+        let zero_budget = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 0, 0o700)
+            .expect("zero-name budget should be a no-op");
+        assert!(zero_budget.entry.is_none());
+        assert_eq!(zero_budget.names_read, 0);
+        assert!(!zero_budget.exhausted);
+
+        let first_progress = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
+            .expect("a later positive budget should continue from the same reader position");
+        assert!(first_progress.names_read > 0);
+        assert!(first_progress.entry.is_some());
+        assert!(!first_progress.exhausted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round5_bound_directory_cursor_ignores_benign_child_entry_churn() {
+        let fixture = Round5BoundDirectoryCursorFixture::new("cursor-child-churn", 48);
+        let mut cursor = fixture.start();
+        let first_page = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
+            .expect("first page should read before child churn");
+        assert_eq!(first_page.names_read, 32);
+        assert!(first_page.entry.is_some());
+
+        loop {
+            let pending = fixture
+                .rooted
+                .peek_bound_directory_cursor(&mut cursor, 0, 0o700)
+                .expect("zero budget should drain no state");
+            if pending.entry.is_none() {
+                assert_eq!(pending.names_read, 0);
+                break;
+            }
+            fixture
+                .rooted
+                .consume_bound_directory_cursor_entry(&mut cursor);
+        }
+
+        fixture.create_private_file("unrelated-child-churn.txt");
+        fs::remove_file(fixture.directory.join("unrelated-child-churn.txt"))
+            .expect("unrelated child should be removed after directory metadata changes");
+
+        let next_page = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
+            .expect("child-entry churn must not invalidate the same directory object");
+        assert!(next_page.names_read > 0);
+        assert!(next_page.entry.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round5_bound_directory_cursor_rejects_directory_object_replacement() {
+        let fixture = Round5BoundDirectoryCursorFixture::new("cursor-replacement", 4);
+        let mut cursor = fixture.start();
+        let initial = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
+            .expect("initial cursor page should read");
+        assert!(initial.entry.is_some());
+
+        let displaced = fixture.root.join("private-state-displaced");
+        fs::rename(&fixture.directory, &displaced)
+            .expect("the original directory should remain available under a new name");
+        fs::create_dir(&fixture.directory).expect("replacement directory should create");
+        fs::set_permissions(&fixture.directory, fs::Permissions::from_mode(0o700))
+            .expect("replacement directory should have private mode");
+
+        let error = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
+            .expect_err("a replacement directory must not inherit the cursor");
+        assert!(format!("{error:#}").contains("identity changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round5_bound_directory_cursor_rejects_access_policy_change() {
+        let fixture = Round5BoundDirectoryCursorFixture::new("cursor-access-policy", 4);
+        let mut cursor = fixture.start();
+        let initial = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
+            .expect("initial cursor page should read");
+        assert!(initial.entry.is_some());
+        fs::set_permissions(&fixture.directory, fs::Permissions::from_mode(0o750))
+            .expect("test should change the directory access policy");
+
+        let error = fixture
+            .rooted
+            .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
+            .expect_err("a directory permission change must invalidate the private cursor");
+        assert!(format!("{error:#}").contains("ownership or permissions changed"));
     }
 }

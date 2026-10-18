@@ -32,7 +32,9 @@ use crate::library::{
     MetadataStatus, MoveOutcome, MovePreview, MovePreviewItem, MoveResultItem, Presence,
     SourceHint,
 };
-use crate::safe_fs::{BoundFile, EntryIdentity, RootedFs};
+use crate::safe_fs::{
+    BoundDirectoryCursor, BoundDirectoryCursorEntry, BoundFile, EntryIdentity, RootedFs,
+};
 
 const LIBRARY_DIRECTORY: &str = ".telegram-video-downloader-library";
 const LIBRARY_INDEX: &str = "index.json";
@@ -46,6 +48,12 @@ const MAX_INDEX_QUARANTINES: usize = 3;
 const MAX_MISSING_INDEX_RECORDS: usize = 1024;
 const PREVIEW_LIMIT: usize = 4 * 1024 * 1024;
 const MANIFEST_LIMIT: usize = 16 * 1024 * 1024;
+const ABANDONED_PREVIEW_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const TERMINAL_BATCH_RECOVERY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const MAX_OPERATION_STATE_DIRECTORY_NAMES_PER_PASS: usize = 32;
+const MAX_OPERATION_STATE_FILES_PER_PASS: usize = 32;
+const MAX_OPERATION_STATE_BYTES_PER_PASS: usize = 32 * 1024 * 1024;
+const MAX_OPERATION_STATE_CLEANUP_ROOTS: usize = 8;
 const SIDE_CAR_LIMIT: usize = 1024 * 1024;
 const LEGACY_INPUT_LIMIT: usize = 1024 * 1024;
 const MAX_DEPTH: usize = 48;
@@ -63,6 +71,73 @@ static PRIVATE_TEMP_SERIAL: AtomicU64 = AtomicU64::new(0);
 static PROCESS_NONCE: OnceLock<String> = OnceLock::new();
 static LIVE_PREVIEW_ANCHORS: OnceLock<Mutex<PreviewAnchorStore>> = OnceLock::new();
 static PREVIEW_ANCHOR_REAPER: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+static OPERATION_STATE_CLEANUP_CURSORS: OnceLock<Mutex<OperationStateCleanupCursorRegistry>> =
+    OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OperationStateCleanupCursorKey {
+    canonical_root: PathBuf,
+    library_device: u64,
+    library_inode: u64,
+}
+
+struct OperationStateCleanupCursorEntry {
+    key: OperationStateCleanupCursorKey,
+    cursor: Arc<Mutex<Option<BoundDirectoryCursor>>>,
+}
+
+#[derive(Default)]
+struct OperationStateCleanupCursorRegistry {
+    entries: VecDeque<OperationStateCleanupCursorEntry>,
+}
+
+impl OperationStateCleanupCursorRegistry {
+    fn cursor_for(
+        &mut self,
+        key: OperationStateCleanupCursorKey,
+    ) -> Arc<Mutex<Option<BoundDirectoryCursor>>> {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let entry = self
+                .entries
+                .remove(index)
+                .expect("cursor registry position was found");
+            let cursor = Arc::clone(&entry.cursor);
+            self.entries.push_back(entry);
+            return cursor;
+        }
+        if self.entries.len() >= MAX_OPERATION_STATE_CLEANUP_ROOTS {
+            self.entries.pop_front();
+        }
+        let cursor = Arc::new(Mutex::new(None));
+        self.entries.push_back(OperationStateCleanupCursorEntry {
+            key,
+            cursor: Arc::clone(&cursor),
+        });
+        cursor
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationStateFileKind {
+    Preview,
+    Batch,
+}
+
+struct OperationStateCleanupCandidate {
+    entry: crate::safe_fs::BoundEntry,
+    identity: EntryIdentity,
+    file: BoundFile,
+    digest: String,
+    bytes: Vec<u8>,
+    byte_len: usize,
+    modified_seconds: i64,
+}
+
+enum OperationStateCandidateRead {
+    Missing,
+    Deferred,
+    Ready(Box<OperationStateCleanupCandidate>),
+}
 
 #[derive(Default)]
 struct PreviewAnchorStore {
@@ -80,6 +155,7 @@ struct PreviewAnchorEntry {
 struct TargetReservationSet {
     keys: HashSet<TargetReservationKey>,
     semantics_by_directory: HashMap<(u64, u64), TargetNameSemantics>,
+    private_library_identity: Option<EntryIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -112,6 +188,7 @@ impl TargetReservationSet {
 
     fn key_for(&mut self, root: &RootedFs, target: &str) -> Result<TargetReservationKey> {
         let relative = safe_relative_path(target, false)?;
+        validate_not_private_downloader_path(root, &relative, self.private_library_identity)?;
         let components = relative
             .components()
             .map(|component| match component {
@@ -258,6 +335,82 @@ where
         key.retain(|character| !is_hfs_ignorable(character));
     }
     Ok(key)
+}
+
+fn is_private_downloader_component_with<F>(
+    name: &str,
+    semantics: TargetNameSemantics,
+    case_fold: &F,
+) -> Result<bool>
+where
+    F: Fn(&str) -> Result<String>,
+{
+    let key = target_component_key_with(name, semantics, |value| case_fold(value))?;
+    let prefix = target_component_key_with(".telegram-video-downloader-", semantics, |value| {
+        case_fold(value)
+    })?;
+    Ok(key.starts_with(&prefix))
+}
+
+fn is_private_downloader_component(name: &str, semantics: TargetNameSemantics) -> Result<bool> {
+    is_private_downloader_component_with(name, semantics, &platform_case_fold)
+}
+
+fn validate_not_private_downloader_path(
+    root: &RootedFs,
+    relative: &Path,
+    private_library_identity: Option<EntryIdentity>,
+) -> Result<()> {
+    let mut parent = PathBuf::new();
+    let mut parent_identity = root.root_identity();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            bail!("relative path contains an invalid component");
+        };
+        let name_text = name
+            .to_str()
+            .ok_or_else(|| anyhow!("relative path is not UTF-8"))?;
+        let directory = open_validated_target_directory(root, &parent, parent_identity)?;
+        let semantics = target_name_semantics(&directory).with_context(|| {
+            format!("cannot determine name semantics under {}", parent.display())
+        })?;
+        if is_private_downloader_component(name_text, semantics)? {
+            bail!("relative path targets a private downloader entry");
+        }
+
+        let candidate = parent.join(name);
+        let candidate_absolute = root.logical_root_path().join(&candidate);
+        let identity = root.entry_identity(&candidate_absolute)?;
+        if identity.is_some_and(|identity| Some(identity) == private_library_identity) {
+            bail!("relative path resolves to the private media-library directory");
+        }
+        match identity {
+            Some(identity) if components.peek().is_some() => {
+                if !identity.is_dir() {
+                    bail!("relative path parent is not a directory");
+                }
+                parent = candidate;
+                parent_identity = identity;
+            }
+            Some(_) => return Ok(()),
+            None => {
+                for remaining in components {
+                    let Component::Normal(name) = remaining else {
+                        bail!("relative path contains an invalid component");
+                    };
+                    let name = name
+                        .to_str()
+                        .ok_or_else(|| anyhow!("relative path is not UTF-8"))?;
+                    if is_private_downloader_component(name, semantics)? {
+                        bail!("relative path targets a private downloader entry");
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_hfs_ignorable(character: char) -> bool {
@@ -511,6 +664,7 @@ pub struct LibraryManager {
     root: RootedFs,
     provider: Arc<dyn QueueFileProvider>,
     library_dir: PathBuf,
+    library_dir_identity: EntryIdentity,
     in_process_lock: Arc<Mutex<()>>,
     last_snapshot: Arc<Mutex<Option<LibrarySnapshot>>>,
     process_nonce: String,
@@ -535,6 +689,37 @@ struct IndexRecord {
     birth_nanoseconds: Option<i64>,
     #[serde(default)]
     missing_since: Option<u64>,
+    #[serde(default)]
+    queue_metadata: QueueMetadataProvenance,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct QueueMetadataProvenance {
+    title: Option<String>,
+    source_ids: Vec<String>,
+    collection: Option<CollectionMetadata>,
+    requires_confirmation: bool,
+}
+
+struct BuiltLibraryItem {
+    item: LibraryItem,
+    sidecar_title_present: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HintPathResolution {
+    Item(usize),
+    PresentUnmatched,
+    ConfirmedAbsent,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HintPathLookup {
+    Entry(EntryIdentity),
+    Missing,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -550,6 +735,10 @@ struct BatchManifest {
     version: u32,
     preview: MovePreview,
     status: BatchStatus,
+    /// Becomes true only after the final result was durably written. Older manifests default to
+    /// false so cleanup retains records whose execution outcome cannot be proven terminal.
+    #[serde(default)]
+    attempt_finished: bool,
     #[serde(default)]
     retryable_access_error: bool,
     files: Vec<ManifestFile>,
@@ -647,6 +836,7 @@ struct ScanWalk {
     complete_directories: BTreeSet<String>,
     incomplete_directories: BTreeSet<String>,
     root_categories: BTreeSet<String>,
+    directory_name_semantics: HashMap<String, TargetNameSemantics>,
     warnings: Vec<String>,
     started_at: Instant,
     timed_out: bool,
@@ -660,6 +850,7 @@ impl Default for ScanWalk {
             complete_directories: BTreeSet::new(),
             incomplete_directories: BTreeSet::new(),
             root_categories: BTreeSet::new(),
+            directory_name_semantics: HashMap::new(),
             warnings: Vec::new(),
             started_at: Instant::now(),
             timed_out: false,
@@ -711,11 +902,13 @@ impl LibraryManager {
         let root =
             rooted.ok_or_else(|| anyhow!("File Provider supplied no download-root accessor"))?;
         let library_dir = root.logical_root_path().join(LIBRARY_DIRECTORY);
-        ensure_private_directory(&root, provider.as_ref(), &library_dir)?;
+        let library_dir_identity =
+            ensure_private_directory(&root, provider.as_ref(), &library_dir)?;
         let manager = Self {
             root,
             provider,
             library_dir,
+            library_dir_identity,
             in_process_lock: Arc::new(Mutex::new(())),
             last_snapshot: Arc::new(Mutex::new(None)),
             process_nonce: PROCESS_NONCE
@@ -819,6 +1012,9 @@ impl LibraryManager {
             .lock()
             .map_err(|_| anyhow!("media-library lock is poisoned"))?;
         let _disk_guard = self.lock_store()?;
+        for warning in self.prune_persisted_operation_states() {
+            eprintln!("persisted operation-state cleanup: {warning}");
+        }
         let persisted = self.read_persisted_preview(preview_id)?;
         if persisted.preview.revision != revision {
             release_preview_anchors(preview_id);
@@ -863,7 +1059,7 @@ impl LibraryManager {
             bail!("select at least one media item or metadata patch");
         }
         let target_dir = target_relative_dir
-            .map(|value| safe_relative_path(value, true))
+            .map(|value| self.safe_relative_path(value, true))
             .transpose()?;
         let target_relative_dir = target_dir
             .as_deref()
@@ -879,7 +1075,10 @@ impl LibraryManager {
             .map(|item| (item.id.as_str(), item))
             .collect::<HashMap<_, _>>();
         let mut move_items = Vec::new();
-        let mut reserved_targets = TargetReservationSet::default();
+        let mut reserved_targets = TargetReservationSet {
+            private_library_identity: Some(self.library_dir_identity),
+            ..TargetReservationSet::default()
+        };
         let mut preview_anchors = HashMap::new();
         for item_id in item_ids {
             let item = items_by_id
@@ -1103,6 +1302,28 @@ impl LibraryManager {
             .file_stem()
             .and_then(OsStr::to_str)
             .ok_or_else(|| anyhow!("selected media has a non-UTF-8 filename"))?;
+        let primary_parent = Path::new(&item.relative_path)
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let primary_parent_absolute = self.root.logical_root_path().join(primary_parent);
+        let name_semantics = self.coordinate_read(&primary_parent_absolute, |coordinated| {
+            if self.path_in_root(coordinated)? != primary_parent_absolute {
+                bail!("coordinated attachment directory changed during preview");
+            }
+            let identity = if primary_parent.as_os_str().is_empty() {
+                self.root.root_identity()
+            } else {
+                self.root
+                    .entry_identity(&primary_parent_absolute)?
+                    .ok_or_else(|| anyhow!("attachment directory disappeared during preview"))?
+            };
+            if !identity.is_dir() {
+                bail!("attachment path is no longer a directory");
+            }
+            let directory = open_validated_target_directory(&self.root, primary_parent, identity)?;
+            target_name_semantics(&directory)
+                .context("filesystem name semantics unavailable for attachment matching")
+        })?;
         let target_stem = if rename {
             standard_media_stem(item)
         } else {
@@ -1115,10 +1336,13 @@ impl LibraryManager {
                 .file_stem()
                 .and_then(OsStr::to_str)
                 .ok_or_else(|| anyhow!("attached media has a non-UTF-8 filename"))?;
-            let suffix = source_stem
-                .strip_prefix(primary_stem)
-                .filter(|suffix| suffix.is_empty() || suffix.starts_with('.'))
-                .unwrap_or("");
+            let suffix = matching_sidecar_suffix_with(
+                source_stem,
+                primary_stem,
+                name_semantics,
+                platform_case_fold,
+            )?
+            .unwrap_or_default();
             let target_primary_stem = primary_target
                 .file_stem()
                 .and_then(OsStr::to_str)
@@ -1251,7 +1475,11 @@ impl LibraryManager {
     fn read_persisted_preview(&self, id: &str) -> Result<PersistedPreview> {
         let bytes = self
             .read_private_file(&self.preview_path(id), PREVIEW_LIMIT)?
-            .ok_or_else(|| anyhow!("move preview was not found"))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "move preview expired or is no longer available; scan and preview the selected items again"
+                )
+            })?;
         let persisted: PersistedPreview =
             serde_json::from_slice(&bytes).context("failed to parse persisted move preview")?;
         if persisted.version != 1 || persisted.preview.id != id {
@@ -1315,6 +1543,7 @@ impl LibraryManager {
                     version: 1,
                     preview: preview.clone(),
                     status: BatchStatus::Partial,
+                    attempt_finished: false,
                     retryable_access_error: false,
                     files,
                     patches: persisted.patches.clone(),
@@ -1323,6 +1552,7 @@ impl LibraryManager {
                 }
             }
         };
+        manifest.attempt_finished = false;
         manifest.retryable_access_error = false;
         for item in &mut manifest.items {
             item.moved_files = 0;
@@ -1479,6 +1709,7 @@ impl LibraryManager {
         } else {
             BatchStatus::Failed
         };
+        manifest.attempt_finished = true;
         self.write_batch_manifest(&batch_path, &manifest)?;
         Ok(batch_result(&manifest))
     }
@@ -1754,6 +1985,429 @@ impl LibraryManager {
         self.write_private_file(path, &contents)
     }
 
+    fn prune_persisted_operation_states(&self) -> Vec<String> {
+        let registry = OPERATION_STATE_CLEANUP_CURSORS
+            .get_or_init(|| Mutex::new(OperationStateCleanupCursorRegistry::default()));
+        self.prune_persisted_operation_states_with_registry(registry)
+    }
+
+    fn prune_persisted_operation_states_with_registry(
+        &self,
+        registry: &Mutex<OperationStateCleanupCursorRegistry>,
+    ) -> Vec<String> {
+        let key = OperationStateCleanupCursorKey {
+            canonical_root: self.root.root_path().to_path_buf(),
+            library_device: self.library_dir_identity.device(),
+            library_inode: self.library_dir_identity.inode(),
+        };
+        let cursor_handle = match registry.lock() {
+            Ok(mut registry) => registry.cursor_for(key),
+            Err(_) => {
+                return vec!["persisted operation-state cleanup registry is unavailable".into()];
+            }
+        };
+        let mut cursor = match cursor_handle.lock() {
+            Ok(cursor) => cursor,
+            Err(_) => {
+                return vec!["persisted operation-state cleanup cursor is unavailable".into()];
+            }
+        };
+        let mut warnings = Vec::new();
+        let mut names_read = 0usize;
+        let mut files_examined = 0usize;
+        let mut content_bytes = 0usize;
+        let now = SystemTime::now();
+
+        while files_examined < MAX_OPERATION_STATE_FILES_PER_PASS {
+            let names_left =
+                MAX_OPERATION_STATE_DIRECTORY_NAMES_PER_PASS.saturating_sub(names_read);
+            let page = match self.peek_operation_state_cursor(&mut cursor, names_left) {
+                Ok(page) => page,
+                Err(error) => {
+                    *cursor = None;
+                    warnings.push(format!(
+                        "persisted operation-state cleanup cursor was reset after a read or directory validation error: {error:#}"
+                    ));
+                    break;
+                }
+            };
+            names_read = names_read.saturating_add(page.names_read);
+            let Some(entry) = page.entry else {
+                if page.exhausted {
+                    *cursor = None;
+                }
+                if page.names_read == 0
+                    || names_read >= MAX_OPERATION_STATE_DIRECTORY_NAMES_PER_PASS
+                {
+                    break;
+                }
+                continue;
+            };
+            files_examined += 1;
+
+            let (name, identity) = match entry {
+                BoundDirectoryCursorEntry::Present { name, identity } => (name, identity),
+                BoundDirectoryCursorEntry::Unreadable { name, error } => {
+                    warnings.push(format!(
+                        "retained unreadable persisted operation-state directory entry {name:?}: {error}"
+                    ));
+                    if let Some(cursor) = cursor.as_mut() {
+                        self.root.consume_bound_directory_cursor_entry(cursor);
+                    }
+                    continue;
+                }
+            };
+            if !identity.is_file() {
+                if let Some(cursor) = cursor.as_mut() {
+                    self.root.consume_bound_directory_cursor_entry(cursor);
+                }
+                continue;
+            }
+            let Some((kind, id)) = parse_operation_state_file_name(&name) else {
+                if let Some(cursor) = cursor.as_mut() {
+                    self.root.consume_bound_directory_cursor_entry(cursor);
+                }
+                continue;
+            };
+            let path = self.library_dir.join(&name);
+            let limit = match kind {
+                OperationStateFileKind::Preview => PREVIEW_LIMIT,
+                OperationStateFileKind::Batch => MANIFEST_LIMIT,
+            };
+            let candidate = match self.read_operation_state_candidate(
+                &path,
+                identity,
+                limit,
+                MAX_OPERATION_STATE_BYTES_PER_PASS.saturating_sub(content_bytes),
+            ) {
+                Ok(OperationStateCandidateRead::Missing) => {
+                    if let Some(cursor) = cursor.as_mut() {
+                        self.root.consume_bound_directory_cursor_entry(cursor);
+                    }
+                    continue;
+                }
+                Ok(OperationStateCandidateRead::Deferred) => break,
+                Ok(OperationStateCandidateRead::Ready(candidate)) => *candidate,
+                Err(error) => {
+                    warnings.push(format!(
+                        "retained unreadable persisted operation-state file {}: {error:#}",
+                        path.file_name()
+                            .unwrap_or_else(|| OsStr::new("unknown"))
+                            .to_string_lossy()
+                    ));
+                    if let Some(cursor) = cursor.as_mut() {
+                        self.root.consume_bound_directory_cursor_entry(cursor);
+                    }
+                    continue;
+                }
+            };
+            content_bytes = content_bytes.saturating_add(candidate.byte_len);
+
+            let expired = match kind {
+                OperationStateFileKind::Preview => {
+                    let persisted =
+                        match serde_json::from_slice::<PersistedPreview>(&candidate.bytes) {
+                            Ok(persisted)
+                                if persisted.version == 1 && persisted.preview.id == id =>
+                            {
+                                persisted
+                            }
+                            Ok(_) => {
+                                warnings.push(format!(
+                                    "retained persisted preview with mismatched identity: {}",
+                                    path.display()
+                                ));
+                                if let Some(cursor) = cursor.as_mut() {
+                                    self.root.consume_bound_directory_cursor_entry(cursor);
+                                }
+                                continue;
+                            }
+                            Err(error) => {
+                                warnings.push(format!(
+                                    "retained unreadable persisted preview {}: {error}",
+                                    path.display()
+                                ));
+                                if let Some(cursor) = cursor.as_mut() {
+                                    self.root.consume_bound_directory_cursor_entry(cursor);
+                                }
+                                continue;
+                            }
+                        };
+                    let _ = persisted;
+                    if operation_state_is_expired(
+                        candidate.modified_seconds,
+                        now,
+                        ABANDONED_PREVIEW_TTL,
+                    ) {
+                        match self.operation_state_path_exists(&self.batch_path(&id)) {
+                            Ok(false) => true,
+                            Ok(true) => false,
+                            Err(error) => {
+                                warnings.push(format!(
+                                    "retained persisted preview because its batch state could not be checked: {error:#}"
+                                ));
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    }
+                }
+                OperationStateFileKind::Batch => {
+                    let manifest = match serde_json::from_slice::<BatchManifest>(&candidate.bytes) {
+                        Ok(manifest) if manifest.version == 1 && manifest.preview.id == id => {
+                            manifest
+                        }
+                        Ok(_) => {
+                            warnings.push(format!(
+                                "retained persisted batch with mismatched identity: {}",
+                                path.display()
+                            ));
+                            if let Some(cursor) = cursor.as_mut() {
+                                self.root.consume_bound_directory_cursor_entry(cursor);
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            warnings.push(format!(
+                                "retained unreadable persisted batch {}: {error}",
+                                path.display()
+                            ));
+                            if let Some(cursor) = cursor.as_mut() {
+                                self.root.consume_bound_directory_cursor_entry(cursor);
+                            }
+                            continue;
+                        }
+                    };
+                    let recoverable = !manifest.attempt_finished || manifest.retryable_access_error;
+                    !recoverable
+                        && operation_state_is_expired(
+                            candidate.modified_seconds,
+                            now,
+                            TERMINAL_BATCH_RECOVERY_RETENTION,
+                        )
+                }
+            };
+
+            if expired {
+                if candidate.byte_len
+                    > MAX_OPERATION_STATE_BYTES_PER_PASS.saturating_sub(content_bytes)
+                {
+                    break;
+                }
+                content_bytes = content_bytes.saturating_add(candidate.byte_len);
+                let retention = match kind {
+                    OperationStateFileKind::Preview => ABANDONED_PREVIEW_TTL,
+                    OperationStateFileKind::Batch => TERMINAL_BATCH_RECOVERY_RETENTION,
+                };
+                match self.remove_operation_state_candidate(
+                    &candidate,
+                    limit,
+                    kind,
+                    &id,
+                    retention,
+                ) {
+                    Ok(true) => {
+                        if kind == OperationStateFileKind::Preview {
+                            release_preview_anchors(&id);
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => warnings.push(format!(
+                        "retained persisted operation-state file after safe cleanup could not be verified: {error:#}"
+                    )),
+                }
+            }
+            if let Some(cursor) = cursor.as_mut() {
+                self.root.consume_bound_directory_cursor_entry(cursor);
+            }
+        }
+        warnings
+    }
+
+    fn peek_operation_state_cursor(
+        &self,
+        cursor: &mut Option<BoundDirectoryCursor>,
+        max_names: usize,
+    ) -> Result<crate::safe_fs::BoundDirectoryCursorPage> {
+        self.coordinate_read(&self.library_dir, |coordinated| {
+            if coordinated != self.library_dir {
+                bail!("coordinated operation-state directory changed during cleanup");
+            }
+            self.validate_library_directory()?;
+            if cursor.is_none() && max_names == 0 {
+                return Ok(crate::safe_fs::BoundDirectoryCursorPage {
+                    entry: None,
+                    names_read: 0,
+                    exhausted: false,
+                });
+            }
+            let directory = self.root.bind_entry(&self.library_dir, false)?;
+            if self.root.bound_entry_identity(&directory)? != Some(self.library_dir_identity) {
+                bail!("private media-library directory changed during cleanup");
+            }
+            if cursor.is_none() {
+                *cursor = Some(self.root.start_bound_directory_cursor(
+                    &directory,
+                    self.library_dir_identity,
+                    0o700,
+                )?);
+            }
+            let cursor = cursor
+                .as_mut()
+                .ok_or_else(|| anyhow!("operation-state cleanup cursor was not initialized"))?;
+            self.root
+                .peek_bound_directory_cursor(cursor, max_names, 0o700)
+        })
+    }
+
+    fn read_operation_state_candidate(
+        &self,
+        path: &Path,
+        expected: EntryIdentity,
+        limit: usize,
+        remaining_bytes: usize,
+    ) -> Result<OperationStateCandidateRead> {
+        self.coordinate_read(path, |coordinated| {
+            if coordinated != path {
+                bail!("coordinated operation-state path changed during cleanup");
+            }
+            self.validate_library_directory()?;
+            let entry = self.root.bind_entry(coordinated, false)?;
+            match self.root.bound_entry_identity(&entry)? {
+                None => return Ok(OperationStateCandidateRead::Missing),
+                Some(identity) if identity != expected => {
+                    bail!("persisted operation-state path was replaced during cleanup")
+                }
+                Some(_) => {}
+            }
+            let file = self.root.open_bound_file_if_identity(&entry, expected)?;
+            file.validate_private_single_link(0o600)
+                .context("persisted operation-state file is not owner-private")?;
+            let byte_len = usize::try_from(file.byte_len()?)
+                .context("persisted operation-state file length is not representable")?;
+            if byte_len > limit {
+                bail!("persisted operation-state file exceeds its read limit");
+            }
+            if byte_len > remaining_bytes {
+                return Ok(OperationStateCandidateRead::Deferred);
+            }
+            let bytes = file.read_limited(limit)?;
+            if bytes.len() != byte_len || usize::try_from(file.byte_len()?)? != byte_len {
+                bail!("persisted operation-state file changed length while being read");
+            }
+            file.validate_private_single_link(0o600)
+                .context("persisted operation-state file access policy changed while being read")?;
+            let digest = sha256_bytes(&bytes);
+            let modified_seconds = file.content_stamp()?.1;
+            if self.root.bound_entry_identity(&entry)? != Some(expected) {
+                bail!("persisted operation-state file path was replaced while being read");
+            }
+            self.validate_library_directory()?;
+            Ok(OperationStateCandidateRead::Ready(Box::new(
+                OperationStateCleanupCandidate {
+                    entry,
+                    identity: expected,
+                    file,
+                    digest,
+                    bytes,
+                    byte_len,
+                    modified_seconds,
+                },
+            )))
+        })
+    }
+
+    fn operation_state_path_exists(&self, path: &Path) -> Result<bool> {
+        self.coordinate_read(path, |coordinated| {
+            if coordinated != path {
+                bail!("coordinated operation-state path changed during lookup");
+            }
+            self.validate_library_directory()?;
+            let entry = self.root.bind_entry(coordinated, false)?;
+            self.root
+                .bound_entry_identity(&entry)
+                .map(|identity| identity.is_some())
+        })
+    }
+
+    fn remove_operation_state_candidate(
+        &self,
+        candidate: &OperationStateCleanupCandidate,
+        limit: usize,
+        kind: OperationStateFileKind,
+        id: &str,
+        retention: Duration,
+    ) -> Result<bool> {
+        self.remove_operation_state_candidate_with_hook(
+            candidate,
+            limit,
+            kind,
+            id,
+            retention,
+            || {},
+        )
+    }
+
+    fn remove_operation_state_candidate_with_hook(
+        &self,
+        candidate: &OperationStateCleanupCandidate,
+        limit: usize,
+        kind: OperationStateFileKind,
+        id: &str,
+        retention: Duration,
+        before_quarantine: impl FnOnce(),
+    ) -> Result<bool> {
+        self.validate_library_directory()?;
+        candidate
+            .file
+            .validate_private_single_link(0o600)
+            .context("persisted operation-state file access policy changed before cleanup")?;
+        let expected = candidate.identity;
+        let mut no_longer_eligible = false;
+        before_quarantine();
+        let result = self.root.remove_bound_file_if_identity_with_validation(
+            &candidate.entry,
+            expected,
+            || {
+                self.validate_library_directory()?;
+                candidate.file.validate_private_single_link(0o600)?;
+                let contents = candidate.file.read_limited(limit)?;
+                if contents.len() != candidate.byte_len
+                    || sha256_bytes(&contents) != candidate.digest
+                {
+                    bail!("persisted operation-state file content changed before cleanup");
+                }
+                let modified_seconds = candidate.file.content_stamp()?.1;
+                if !operation_state_is_expired(modified_seconds, SystemTime::now(), retention) {
+                    no_longer_eligible = true;
+                    bail!("persisted operation-state file was refreshed before cleanup");
+                }
+                if kind == OperationStateFileKind::Preview {
+                    match self.operation_state_path_exists(&self.batch_path(id)) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            no_longer_eligible = true;
+                            bail!("a batch state appeared before preview cleanup");
+                        }
+                        Err(error) => {
+                            return Err(error.context(
+                                "could not recheck associated batch state before preview cleanup",
+                            ));
+                        }
+                    }
+                }
+                candidate.file.validate_private_single_link(0o600)?;
+                self.validate_library_directory()
+            },
+        );
+        match result {
+            Ok(()) => Ok(true),
+            Err(_) if no_longer_eligible => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn coordinate_move<T>(
         &self,
         source: &Path,
@@ -1774,8 +2428,10 @@ impl LibraryManager {
     }
 
     fn scan_locked(&self, hints: &[SourceHint]) -> Result<LibrarySnapshot> {
+        let operation_state_warnings = self.prune_persisted_operation_states();
         let (mut index, index_warning) = self.read_index_with_recovery()?;
         let mut walk = ScanWalk::default();
+        walk.warnings.extend(operation_state_warnings);
         if let Some(warning) = index_warning {
             walk.warnings.push(warning);
         }
@@ -1797,7 +2453,11 @@ impl LibraryManager {
                 .push(format!("scan stopped at the {MAX_ENTRIES}-entry limit"));
         }
 
-        let sidecars = SidecarIndex::build(&walk.files, &walk.incomplete_directories);
+        let sidecars = SidecarIndex::build(
+            &walk.files,
+            &walk.incomplete_directories,
+            &walk.directory_name_semantics,
+        )?;
         if sidecars.ambiguous_count > 0 {
             walk.warnings.push(format!(
                 "{} sidecar file(s) were left unattached because their longest matching media stem is ambiguous",
@@ -1806,6 +2466,7 @@ impl LibraryManager {
         }
 
         let mut videos = Vec::new();
+        let mut sidecar_title_paths = HashSet::new();
         let mut unreadable_media = HashMap::new();
         for file in walk
             .files
@@ -1833,12 +2494,16 @@ impl LibraryManager {
             match self.build_item(
                 file,
                 &sidecars,
-                hints,
                 walk.started_at,
                 &mut walk.timed_out,
                 &mut walk.warnings,
             ) {
-                Ok(item) => videos.push(item),
+                Ok(built) => {
+                    if built.sidecar_title_present {
+                        sidecar_title_paths.insert(built.item.relative_path.clone());
+                    }
+                    videos.push(built.item);
+                }
                 Err(error) => {
                     let metadata_status = if is_file_provider_access_error(&error) {
                         MetadataStatus::ProviderUnavailable
@@ -1854,7 +2519,18 @@ impl LibraryManager {
             }
         }
 
-        attach_matching_hints(&mut videos, hints);
+        let (hint_path_resolutions, unresolved_hint_paths) =
+            self.resolve_hint_paths_for_scan(hints, &walk.files, &videos, &walk);
+        if unresolved_hint_paths > 0 {
+            walk.warnings.push(format!(
+                "{} queue hint path(s) could not be safely resolved; source-ID fallback was skipped",
+                unresolved_hint_paths
+            ));
+        }
+        let hint_matches =
+            matching_hint_indices_for_items(&videos, hints, &hint_path_resolutions, &walk);
+        let mut queue_metadata =
+            attach_matching_hints(&mut videos, hints, &hint_matches, &sidecar_title_paths);
         let mut fingerprints = BTreeMap::new();
         let mut current_object_counts: HashMap<(u64, u64, Option<i64>, Option<i64>), usize> =
             HashMap::new();
@@ -1878,10 +2554,11 @@ impl LibraryManager {
         }
         let old_records = index.records.clone();
         let mut used_ids = HashSet::new();
-        for item in &mut videos {
+        for (item_index, item) in videos.iter_mut().enumerate() {
             let Some(fingerprint) = fingerprints.get(&item.relative_path) else {
                 continue;
             };
+            let mut item_queue_metadata = queue_metadata[item_index].clone();
             let key = index_object_key(fingerprint);
             let exact = old_records.iter().find(|(id, record)| {
                 !used_ids.contains(*id)
@@ -1910,8 +2587,14 @@ impl LibraryManager {
             if let Some((_, record)) = prior {
                 // Queue metadata follows a physical item only after the index's object identity
                 // signals match. The current path alone never carries an old association.
-                preserve_indexed_metadata(item, &record.item);
+                merge_queue_metadata(&mut item_queue_metadata, &record.queue_metadata);
+                preserve_queue_metadata(
+                    item,
+                    &item_queue_metadata,
+                    sidecar_title_paths.contains(&item.relative_path),
+                );
             }
+            queue_metadata[item_index] = item_queue_metadata.clone();
             used_ids.insert(stable_id.clone());
             item.id = stable_id.clone();
             index.records.insert(
@@ -1924,6 +2607,7 @@ impl LibraryManager {
                     birth_seconds: fingerprint.birth_seconds,
                     birth_nanoseconds: fingerprint.birth_nanoseconds,
                     missing_since: None,
+                    queue_metadata: item_queue_metadata,
                 },
             );
         }
@@ -2001,6 +2685,161 @@ impl LibraryManager {
         Ok(snapshot)
     }
 
+    fn resolve_hint_paths_for_scan(
+        &self,
+        hints: &[SourceHint],
+        scanned_files: &[ScannedFile],
+        items: &[LibraryItem],
+        walk: &ScanWalk,
+    ) -> (HashMap<String, HintPathResolution>, usize) {
+        let mut item_by_path = HashMap::new();
+        for (item_index, item) in items.iter().enumerate() {
+            item_by_path.insert(item.relative_path.as_str(), item_index);
+        }
+
+        let mut media_by_path = HashMap::new();
+        let mut media_by_identity: HashMap<(u64, u64), Vec<&ScannedFile>> = HashMap::new();
+        for file in scanned_files
+            .iter()
+            .filter(|file| is_primary_media(&file.relative_path))
+        {
+            media_by_path.insert(file.relative_path.as_str(), file.identity);
+            media_by_identity
+                .entry((file.identity.device(), file.identity.inode()))
+                .or_default()
+                .push(file);
+        }
+
+        let mut resolutions = HashMap::new();
+        let mut unresolved_paths = 0usize;
+        for path in hints
+            .iter()
+            .filter_map(|hint| hint.relative_path.as_deref())
+        {
+            if resolutions.contains_key(path) {
+                continue;
+            }
+            let resolution = match self.resolve_hint_path_for_scan(
+                path,
+                &media_by_path,
+                &media_by_identity,
+                &item_by_path,
+                walk,
+            ) {
+                Ok(resolution) => resolution,
+                Err(_) => {
+                    unresolved_paths = unresolved_paths.saturating_add(1);
+                    HintPathResolution::Unavailable
+                }
+            };
+            resolutions.insert(path.to_string(), resolution);
+        }
+        (resolutions, unresolved_paths)
+    }
+
+    fn resolve_hint_path_for_scan(
+        &self,
+        path: &str,
+        media_by_path: &HashMap<&str, EntryIdentity>,
+        media_by_identity: &HashMap<(u64, u64), Vec<&ScannedFile>>,
+        item_by_path: &HashMap<&str, usize>,
+        walk: &ScanWalk,
+    ) -> Result<HintPathResolution> {
+        let lookup = self.lookup_hint_path(path)?;
+        if let Some(expected_identity) = media_by_path.get(path) {
+            return Ok(match lookup {
+                HintPathLookup::Entry(current_identity)
+                    if current_identity == *expected_identity =>
+                {
+                    item_by_path
+                        .get(path)
+                        .copied()
+                        .map(HintPathResolution::Item)
+                        .unwrap_or(HintPathResolution::PresentUnmatched)
+                }
+                HintPathLookup::Entry(_) | HintPathLookup::Missing | HintPathLookup::Blocked => {
+                    // A path that participated in this scan remains exclusive even if it changed
+                    // or disappeared before hint resolution. It must never fall through by ID.
+                    HintPathResolution::PresentUnmatched
+                }
+            });
+        }
+
+        let HintPathLookup::Entry(identity) = lookup else {
+            return Ok(match lookup {
+                HintPathLookup::Missing if scan_confirms_hint_path_absent(path, walk) => {
+                    HintPathResolution::ConfirmedAbsent
+                }
+                HintPathLookup::Missing | HintPathLookup::Blocked => {
+                    HintPathResolution::PresentUnmatched
+                }
+                HintPathLookup::Entry(_) => unreachable!("entry lookup matched above"),
+            });
+        };
+        if !identity.is_file() {
+            return Ok(HintPathResolution::PresentUnmatched);
+        }
+
+        let candidates = media_by_identity
+            .get(&(identity.device(), identity.inode()))
+            .into_iter()
+            .flatten()
+            .filter_map(|file| {
+                if file.identity != identity
+                    || !case_only_path_alias(
+                        path,
+                        &file.relative_path,
+                        &walk.directory_name_semantics,
+                    )
+                {
+                    return None;
+                }
+                item_by_path.get(file.relative_path.as_str()).copied()
+            })
+            .collect::<Vec<_>>();
+        Ok(match candidates.as_slice() {
+            [item_index] => HintPathResolution::Item(*item_index),
+            _ => HintPathResolution::PresentUnmatched,
+        })
+    }
+
+    fn lookup_hint_path(&self, path: &str) -> Result<HintPathLookup> {
+        let relative = safe_relative_path(path, false)?;
+        let mut parent = PathBuf::new();
+        let mut parent_identity = self.root.root_identity();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                bail!("hint path contains an invalid component");
+            };
+            let name_text = name
+                .to_str()
+                .ok_or_else(|| anyhow!("hint path is not UTF-8"))?;
+            let directory = open_validated_target_directory(&self.root, &parent, parent_identity)?;
+            let semantics = target_name_semantics(&directory)
+                .context("filesystem name semantics unavailable while resolving queue hint")?;
+            if is_private_downloader_component(name_text, semantics)? {
+                return Ok(HintPathLookup::Blocked);
+            }
+
+            let candidate = parent.join(name);
+            let absolute = self.root.logical_root_path().join(&candidate);
+            let Some(identity) = self.root.entry_identity(&absolute)? else {
+                return Ok(HintPathLookup::Missing);
+            };
+            if components.peek().is_some() {
+                if !identity.is_dir() {
+                    return Ok(HintPathLookup::Blocked);
+                }
+                parent = candidate;
+                parent_identity = identity;
+            } else {
+                return Ok(HintPathLookup::Entry(identity));
+            }
+        }
+        Ok(HintPathLookup::Blocked)
+    }
+
     fn walk_directory(&self, relative: &Path, depth: usize, walk: &mut ScanWalk) -> Result<()> {
         let relative_string = path_to_relative_string(relative)?;
         if walk.started_at.elapsed() >= SCAN_TIMEOUT {
@@ -2031,8 +2870,8 @@ impl LibraryManager {
             if expected != absolute {
                 bail!("coordinated directory path changed during scan");
             }
-            let entries = if relative.as_os_str().is_empty() {
-                self.root.list_root_directory()?
+            let (entries, identity) = if relative.as_os_str().is_empty() {
+                (self.root.list_root_directory()?, self.root.root_identity())
             } else {
                 let entry = self.root.bind_entry(&absolute, false)?;
                 let Some(identity) = self.root.bound_entry_identity(&entry)? else {
@@ -2041,17 +2880,23 @@ impl LibraryManager {
                 if !identity.is_dir() {
                     bail!("scan path is no longer a directory");
                 }
-                self.root.list_bound_directory(&entry, identity)?
+                (self.root.list_bound_directory(&entry, identity)?, identity)
             };
-            Ok(entries)
+            let directory = open_validated_target_directory(&self.root, relative, identity)?;
+            let semantics = target_name_semantics(&directory)
+                .context("filesystem name semantics unavailable")?;
+            Ok((entries, semantics))
         });
 
-        let entries = match result {
-            Ok(entries) => entries,
+        let (entries, semantics) = match result {
+            Ok(result) => result,
             Err(error) => {
                 walk.incomplete_directories.insert(relative_string.clone());
+                let error_text = format!("{error:#}");
                 let class = if is_file_provider_access_error(&error) {
                     "File Provider access unavailable"
+                } else if error_text.contains("filesystem name semantics unavailable") {
+                    "filesystem name semantics unavailable"
                 } else {
                     "directory unreadable"
                 };
@@ -2060,6 +2905,8 @@ impl LibraryManager {
                 return Ok(());
             }
         };
+        walk.directory_name_semantics
+            .insert(relative_string.clone(), semantics);
         walk.complete_directories.insert(relative_string.clone());
         for (name, identity) in entries {
             if walk.started_at.elapsed() >= SCAN_TIMEOUT {
@@ -2074,7 +2921,7 @@ impl LibraryManager {
                 }
                 return Ok(());
             }
-            if excluded_entry(&name) {
+            if excluded_entry(&name, identity, semantics, self.library_dir_identity)? {
                 continue;
             }
             let Some(name_text) = name.to_str() else {
@@ -2111,11 +2958,10 @@ impl LibraryManager {
         &self,
         media: &ScannedFile,
         sidecars: &SidecarIndex,
-        hints: &[SourceHint],
         scan_started_at: Instant,
         scan_timed_out: &mut bool,
         warnings: &mut Vec<String>,
-    ) -> Result<LibraryItem> {
+    ) -> Result<BuiltLibraryItem> {
         let absolute = self.absolute_path(&media.relative_path)?;
         let opened = self.read_media_file(&absolute);
         let opened_file = match opened {
@@ -2131,21 +2977,24 @@ impl LibraryManager {
                     media.relative_path
                 ));
                 let id = physical_item_id_from_identity(media.identity, &media.relative_path);
-                return Ok(LibraryItem {
-                    id,
-                    title: title_from_path(&media.relative_path),
-                    relative_path: media.relative_path.clone(),
-                    bytes: 0,
-                    width: None,
-                    height: None,
-                    codec: None,
-                    source_ids: Vec::new(),
-                    collection: None,
-                    attachments: Vec::new(),
-                    confidence: Confidence::Low,
-                    metadata_status: status,
-                    integrity_status: IntegrityStatus::Unverified,
-                    presence: Presence::Unavailable,
+                return Ok(BuiltLibraryItem {
+                    item: LibraryItem {
+                        id,
+                        title: title_from_path(&media.relative_path),
+                        relative_path: media.relative_path.clone(),
+                        bytes: 0,
+                        width: None,
+                        height: None,
+                        codec: None,
+                        source_ids: Vec::new(),
+                        collection: None,
+                        attachments: Vec::new(),
+                        confidence: Confidence::Low,
+                        metadata_status: status,
+                        integrity_status: IntegrityStatus::Unverified,
+                        presence: Presence::Unavailable,
+                    },
+                    sidecar_title_present: false,
                 });
             }
         };
@@ -2167,6 +3016,7 @@ impl LibraryManager {
         let mut collection = None;
         let mut nfo_title_present = false;
         let mut nfo_source_id_present = false;
+        let mut sidecar_title_present = false;
         let mut metadata_status = if presence == Presence::Missing {
             MetadataStatus::ProviderUnavailable
         } else {
@@ -2193,6 +3043,7 @@ impl LibraryManager {
                                 title = value.trim().to_string();
                             }
                             nfo_title_present |= nfo_title.is_some();
+                            sidecar_title_present |= nfo_title.is_some();
                             nfo_source_id_present |= !nfo_ids.is_empty();
                             source_ids.extend(nfo_ids);
                             if let Some(value) = xml_tag_text(&text, "set")
@@ -2230,10 +3081,11 @@ impl LibraryManager {
                         if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&contents) {
                             let (json_title, json_ids, json_collection) =
                                 metadata_from_json(&value);
-                            if title == title_from_path(&media.relative_path)
-                                && let Some(json_title) = json_title
-                            {
-                                title = json_title;
+                            if let Some(json_title) = json_title {
+                                if !sidecar_title_present {
+                                    title = json_title;
+                                }
+                                sidecar_title_present = true;
                             }
                             source_ids.extend(json_ids);
                             collection = collection.or(json_collection);
@@ -2251,32 +3103,13 @@ impl LibraryManager {
             }
         }
         source_ids = normalize_source_ids(source_ids);
-        let relevant_hints = matching_hints_for_item(&media.relative_path, &source_ids, hints);
-        let mut confidence = if !source_ids.is_empty() && metadata_status == MetadataStatus::Partial
-        {
+        let confidence = if !source_ids.is_empty() && metadata_status == MetadataStatus::Partial {
             Confidence::High
         } else if !source_ids.is_empty() {
             Confidence::Medium
         } else {
             Confidence::Low
         };
-        for hint in relevant_hints {
-            source_ids.extend(hint.source_ids.iter().cloned());
-            if title == title_from_path(&media.relative_path)
-                && let Some(hint_title) = hint.title.as_deref()
-                && !hint_title.trim().is_empty()
-            {
-                title = hint_title.trim().to_string();
-            }
-            collection = collection.or_else(|| hint.collection.clone());
-            if hint.requires_confirmation {
-                confidence = Confidence::NeedsConfirmation;
-            } else if confidence == Confidence::Low {
-                confidence = Confidence::Medium;
-            }
-            metadata_status = MetadataStatus::Partial;
-        }
-        source_ids = normalize_source_ids(source_ids);
         if sidecar_unreadable {
             metadata_status = MetadataStatus::Unreadable;
         } else if nfo_title_present && nfo_source_id_present {
@@ -2312,27 +3145,40 @@ impl LibraryManager {
                 kind: attachment_kind(path).to_string(),
             })
             .collect();
-        Ok(LibraryItem {
-            id,
-            title,
-            relative_path: media.relative_path.clone(),
-            bytes,
-            width: media_specs.width,
-            height: media_specs.height,
-            codec: media_specs.codec,
-            source_ids,
-            collection,
-            attachments: library_attachments,
-            confidence,
-            metadata_status,
-            integrity_status: IntegrityStatus::Unverified,
-            presence,
+        Ok(BuiltLibraryItem {
+            item: LibraryItem {
+                id,
+                title,
+                relative_path: media.relative_path.clone(),
+                bytes,
+                width: media_specs.width,
+                height: media_specs.height,
+                codec: media_specs.codec,
+                source_ids,
+                collection,
+                attachments: library_attachments,
+                confidence,
+                metadata_status,
+                integrity_status: IntegrityStatus::Unverified,
+                presence,
+            },
+            sidecar_title_present,
         })
     }
 
     fn absolute_path(&self, relative: &str) -> Result<PathBuf> {
-        let relative = safe_relative_path(relative, false)?;
+        let relative = self.safe_relative_path(relative, false)?;
         Ok(self.root.logical_root_path().join(relative))
+    }
+
+    fn safe_relative_path(&self, value: &str, allow_empty: bool) -> Result<PathBuf> {
+        let relative = safe_relative_path(value, allow_empty)?;
+        validate_not_private_downloader_path(
+            &self.root,
+            &relative,
+            Some(self.library_dir_identity),
+        )?;
+        Ok(relative)
     }
 
     fn path_in_root(&self, coordinated: &Path) -> Result<PathBuf> {
@@ -2699,6 +3545,9 @@ impl LibraryManager {
             .root
             .bound_entry_identity(&entry)?
             .ok_or_else(|| anyhow!("private media-library directory disappeared"))?;
+        if identity != self.library_dir_identity {
+            bail!("private media-library directory identity changed");
+        }
         self.root
             .validate_private_bound_directory(&entry, identity, 0o700)
     }
@@ -2789,8 +3638,8 @@ fn ensure_private_directory(
     root: &RootedFs,
     provider: &dyn QueueFileProvider,
     path: &Path,
-) -> Result<()> {
-    let mut created = false;
+) -> Result<EntryIdentity> {
+    let mut directory_identity = None;
     let mut accessor = |coordinated_path: &Path| -> Result<()> {
         let rooted_path = coordinated_path_under_root(root, coordinated_path)?;
         if rooted_path != path {
@@ -2803,16 +3652,15 @@ fn ensure_private_directory(
             .ok_or_else(|| anyhow!("private media-library directory disappeared"))?;
         root.validate_private_bound_directory(&entry, identity, 0o700)
             .context("media-library state directory must be owner-private")?;
-        created = true;
+        directory_identity = Some(identity);
         Ok(())
     };
     provider
         .coordinate_write(path, &mut accessor)
         .map_err(|error| classify_deadlock_error(path, "write", error))?;
-    if !created {
-        bail!("File Provider supplied no private media-library directory accessor");
-    }
-    Ok(())
+    directory_identity.ok_or_else(|| {
+        anyhow!("File Provider supplied no private media-library directory accessor")
+    })
 }
 
 fn coordinated_path_under_root(root: &RootedFs, path: &Path) -> Result<PathBuf> {
@@ -2849,12 +3697,8 @@ fn safe_relative_path(value: &str, allow_empty: bool) -> Result<PathBuf> {
         let Component::Normal(name) = component else {
             bail!("relative path must not contain root, current, or parent components");
         };
-        let text = name
-            .to_str()
+        name.to_str()
             .ok_or_else(|| anyhow!("relative path is not UTF-8"))?;
-        if text.starts_with(LIBRARY_DIRECTORY) || text.starts_with(".telegram-video-downloader-") {
-            bail!("relative path targets a private downloader entry");
-        }
         normalized.push(name);
     }
     if normalized.as_os_str().is_empty() && !allow_empty {
@@ -3426,53 +4270,88 @@ fn index_record_matches(record: &IndexRecord, fingerprint: &FileFingerprint) -> 
         && record.birth_nanoseconds == fingerprint.birth_nanoseconds
 }
 
-fn preserve_indexed_metadata(item: &mut LibraryItem, previous: &LibraryItem) {
-    let current_name_title = title_from_path(&item.relative_path);
-    let previous_name_title = title_from_path(&previous.relative_path);
-    let previous_has_queue_title = previous.title != previous_name_title;
-    if item.title == current_name_title
-        && previous_has_queue_title
-        && !previous.title.trim().is_empty()
+fn merge_queue_metadata(current: &mut QueueMetadataProvenance, previous: &QueueMetadataProvenance) {
+    if current.title.is_none() {
+        current.title = previous.title.clone();
+    }
+    current
+        .source_ids
+        .extend(previous.source_ids.iter().cloned());
+    current.source_ids = normalize_source_ids(std::mem::take(&mut current.source_ids));
+    if let Some(previous_collection) = &previous.collection {
+        merge_collection_metadata(current.collection.as_mut(), previous_collection);
+        if current.collection.is_none() {
+            current.collection = Some(previous_collection.clone());
+        }
+    }
+    current.requires_confirmation |= previous.requires_confirmation;
+}
+
+fn merge_collection_metadata(
+    current: Option<&mut CollectionMetadata>,
+    previous: &CollectionMetadata,
+) {
+    let Some(current) = current else {
+        return;
+    };
+    if current.id.is_none() {
+        current.id = previous.id.clone();
+    }
+    if current.kind.trim().is_empty() || current.kind == "nfo_set" {
+        current.kind = previous.kind.clone();
+    }
+    if current.title.trim().is_empty() {
+        current.title = previous.title.clone();
+    }
+    if current.order.is_none() {
+        current.order = previous.order;
+    }
+    if current.part_id.is_none() {
+        current.part_id = previous.part_id.clone();
+    }
+}
+
+fn preserve_queue_metadata(
+    item: &mut LibraryItem,
+    provenance: &QueueMetadataProvenance,
+    sidecar_title_present: bool,
+) {
+    if !sidecar_title_present
+        && let Some(title) = provenance
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
     {
-        item.title = previous.title.clone();
+        item.title = title.to_string();
     }
 
-    item.source_ids.extend(previous.source_ids.iter().cloned());
+    item.source_ids
+        .extend(provenance.source_ids.iter().cloned());
     item.source_ids = normalize_source_ids(std::mem::take(&mut item.source_ids));
 
-    if let Some(previous_collection) = &previous.collection {
-        match item.collection.as_mut() {
-            Some(collection) => {
-                if collection.id.is_none() {
-                    collection.id = previous_collection.id.clone();
-                }
-                if collection.kind.trim().is_empty() || collection.kind == "nfo_set" {
-                    collection.kind = previous_collection.kind.clone();
-                }
-                if collection.title.trim().is_empty() {
-                    collection.title = previous_collection.title.clone();
-                }
-                if collection.order.is_none() {
-                    collection.order = previous_collection.order;
-                }
-                if collection.part_id.is_none() {
-                    collection.part_id = previous_collection.part_id.clone();
-                }
-            }
-            None => item.collection = Some(previous_collection.clone()),
+    if let Some(collection) = provenance.collection.as_ref() {
+        if let Some(current) = item.collection.as_mut() {
+            merge_collection_metadata(Some(current), collection);
+        } else {
+            item.collection = Some(collection.clone());
         }
     }
 
-    if item.confidence == Confidence::Low && previous.confidence != Confidence::Low {
-        item.confidence = previous.confidence;
+    if provenance.requires_confirmation {
+        item.confidence = Confidence::NeedsConfirmation;
+    } else if item.confidence == Confidence::Low
+        && (provenance.title.is_some()
+            || !provenance.source_ids.is_empty()
+            || provenance.collection.is_some())
+    {
+        item.confidence = Confidence::Medium;
     }
     if item.metadata_status == MetadataStatus::Unknown
-        && (previous_has_queue_title
-            || !previous.source_ids.is_empty()
-            || previous.collection.is_some())
+        && (provenance.title.is_some()
+            || !provenance.source_ids.is_empty()
+            || provenance.collection.is_some())
     {
-        // The cached association restores useful metadata, but does not prove the current NFO
-        // still contains a complete record.
+        // Queue associations do not prove that the current sidecar is complete.
         item.metadata_status = MetadataStatus::Partial;
     }
 }
@@ -3591,6 +4470,33 @@ fn validate_identifier(value: &str) -> Result<()> {
         bail!("operation identifier is invalid");
     }
     Ok(())
+}
+
+fn parse_operation_state_file_name(name: &OsStr) -> Option<(OperationStateFileKind, String)> {
+    let name = name.to_str()?;
+    let (kind, id) = if let Some(suffix) = name.strip_prefix(PREVIEW_PREFIX) {
+        let id = suffix.strip_suffix(".json")?;
+        (OperationStateFileKind::Preview, id.to_string())
+    } else {
+        let suffix = name.strip_prefix(BATCH_PREFIX)?;
+        let id = suffix.strip_suffix(".json")?;
+        (OperationStateFileKind::Batch, id.to_string())
+    };
+    let hash = id.strip_prefix(PREVIEW_PREFIX)?;
+    if hash.len() != 24
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some((kind, id))
+}
+
+fn operation_state_is_expired(modified_seconds: i64, now: SystemTime, retention: Duration) -> bool {
+    let now_seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let cutoff = now_seconds.saturating_sub(retention.as_secs());
+    modified_seconds <= i64::try_from(cutoff).unwrap_or(i64::MAX)
 }
 
 fn private_temp_sibling(path: &Path) -> PathBuf {
@@ -3717,14 +4623,19 @@ fn probe_media(file: &BoundFile) -> Result<MediaSpecs> {
     })
 }
 
-fn excluded_entry(name: &OsStr) -> bool {
+fn excluded_entry(
+    name: &OsStr,
+    identity: EntryIdentity,
+    semantics: TargetNameSemantics,
+    private_library_identity: EntryIdentity,
+) -> Result<bool> {
     let Some(name) = name.to_str() else {
-        return true;
+        return Ok(true);
     };
-    name == LIBRARY_DIRECTORY
-        || name == ".telegram-video-downloader-queue"
-        || name == ".telegram-video-downloader-staging"
-        || name.starts_with(".telegram-video-downloader-")
+    if identity == private_library_identity {
+        return Ok(true);
+    }
+    is_private_downloader_component(name, semantics)
 }
 
 fn is_primary_media(path: &str) -> bool {
@@ -3783,7 +4694,28 @@ fn is_sidecar(path: &str) -> bool {
 }
 
 impl SidecarIndex {
-    fn build(files: &[ScannedFile], incomplete_directories: &BTreeSet<String>) -> Self {
+    fn build(
+        files: &[ScannedFile],
+        incomplete_directories: &BTreeSet<String>,
+        directory_name_semantics: &HashMap<String, TargetNameSemantics>,
+    ) -> Result<Self> {
+        Self::build_with_case_fold(
+            files,
+            incomplete_directories,
+            directory_name_semantics,
+            platform_case_fold,
+        )
+    }
+
+    fn build_with_case_fold<F>(
+        files: &[ScannedFile],
+        incomplete_directories: &BTreeSet<String>,
+        directory_name_semantics: &HashMap<String, TargetNameSemantics>,
+        case_fold: F,
+    ) -> Result<Self>
+    where
+        F: Fn(&str) -> Result<String> + Copy,
+    {
         let mut owners: HashMap<String, HashMap<String, PrimaryStemOwner>> = HashMap::new();
         for file in files
             .iter()
@@ -3798,11 +4730,16 @@ impl SidecarIndex {
             if incomplete_directories.contains(&parent) {
                 continue;
             }
+            let semantics = directory_name_semantics
+                .get(&parent)
+                .copied()
+                .ok_or_else(|| anyhow!("filesystem name semantics unavailable under {parent}"))?;
             let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
                 continue;
             };
+            let key = target_component_key_with(stem, semantics, |value| case_fold(value))?;
             let stems = owners.entry(parent).or_default();
-            match stems.entry(stem.to_string()) {
+            match stems.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let owner = entry.get_mut();
                     owner.count = owner.count.saturating_add(1);
@@ -3827,13 +4764,19 @@ impl SidecarIndex {
             if incomplete_directories.contains(&parent) {
                 continue;
             }
+            let semantics = directory_name_semantics
+                .get(&parent)
+                .copied()
+                .ok_or_else(|| anyhow!("filesystem name semantics unavailable under {parent}"))?;
             let Some(stem) = path.file_stem().and_then(OsStr::to_str) else {
                 continue;
             };
             let Some(stems) = owners.get(&parent) else {
                 continue;
             };
-            let Some(owner) = longest_matching_primary_stem(stem, stems) else {
+            let Some(owner) =
+                longest_matching_primary_stem_with(stem, stems, semantics, case_fold)?
+            else {
                 continue;
             };
             if owner.count > 1 {
@@ -3849,7 +4792,7 @@ impl SidecarIndex {
         for attachments in index.by_media.values_mut() {
             attachments.sort();
         }
-        index
+        Ok(index)
     }
 
     fn attached_files(&self, media: &ScannedFile) -> Vec<String> {
@@ -3860,22 +4803,57 @@ impl SidecarIndex {
     }
 }
 
-fn longest_matching_primary_stem<'a>(
+fn longest_matching_primary_stem_with<'a, F>(
     sidecar_stem: &str,
     primary_stems: &'a HashMap<String, PrimaryStemOwner>,
-) -> Option<&'a PrimaryStemOwner> {
-    if let Some(owner) = primary_stems.get(sidecar_stem) {
-        return Some(owner);
+    semantics: TargetNameSemantics,
+    case_fold: F,
+) -> Result<Option<&'a PrimaryStemOwner>>
+where
+    F: Fn(&str) -> Result<String> + Copy,
+{
+    let exact_key = target_component_key_with(sidecar_stem, semantics, |value| case_fold(value))?;
+    if let Some(owner) = primary_stems.get(&exact_key) {
+        return Ok(Some(owner));
     }
     for (boundary, _) in sidecar_stem.match_indices('.').rev() {
         if boundary == 0 {
             continue;
         }
-        if let Some(owner) = primary_stems.get(&sidecar_stem[..boundary]) {
-            return Some(owner);
+        let prefix = &sidecar_stem[..boundary];
+        let prefix_key = target_component_key_with(prefix, semantics, |value| case_fold(value))?;
+        if let Some(owner) = primary_stems.get(&prefix_key) {
+            return Ok(Some(owner));
         }
     }
-    None
+    Ok(None)
+}
+
+fn matching_sidecar_suffix_with<F>(
+    sidecar_stem: &str,
+    primary_stem: &str,
+    semantics: TargetNameSemantics,
+    case_fold: F,
+) -> Result<Option<String>>
+where
+    F: Fn(&str) -> Result<String> + Copy,
+{
+    let primary_key = target_component_key_with(primary_stem, semantics, |value| case_fold(value))?;
+    let sidecar_key = target_component_key_with(sidecar_stem, semantics, |value| case_fold(value))?;
+    if sidecar_key == primary_key {
+        return Ok(Some(String::new()));
+    }
+    for (boundary, _) in sidecar_stem.match_indices('.').rev() {
+        if boundary == 0 {
+            continue;
+        }
+        let prefix = &sidecar_stem[..boundary];
+        let prefix_key = target_component_key_with(prefix, semantics, |value| case_fold(value))?;
+        if prefix_key == primary_key {
+            return Ok(Some(sidecar_stem[boundary..].to_string()));
+        }
+    }
+    Ok(None)
 }
 
 fn attachment_kind(path: &str) -> &'static str {
@@ -4048,10 +5026,12 @@ fn normalize_source_ids(ids: Vec<String>) -> Vec<String> {
         }
         let lower = value.to_ascii_lowercase();
         let canonical = if value.len() >= 8
-            && value.starts_with("BV")
+            && value
+                .get(..2)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("BV"))
             && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
         {
-            value.to_string()
+            format!("BV{}", &value[2..])
         } else if ["av", "cid", "ep"].iter().any(|prefix| {
             lower.strip_prefix(prefix).is_some_and(|digits| {
                 !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
@@ -4098,7 +5078,9 @@ fn nfo_source_ids(content: &str) -> Vec<String> {
         let kind = xml_attribute(tag, "type")
             .unwrap_or_default()
             .to_ascii_lowercase();
-        let raw_id = xml_unescape(content[end + 1..close].trim());
+        let raw_id = xml_text_content(&content[end + 1..close])
+            .trim()
+            .to_string();
         let canonical = match kind.as_str() {
             "bilibili" | "bilibili-video" => raw_id,
             "bilibili-aid" | "bilibili_aid" => {
@@ -4155,8 +5137,8 @@ fn xml_tag_text(content: &str, name: &str) -> Option<String> {
         }
         let close_marker = format!("</{name}>");
         let close = find_ascii_case_insensitive(content, &close_marker, open_end + 1)?;
-        let value = strip_xml_markup(&content[open_end + 1..close]);
-        return Some(xml_unescape(value.trim()));
+        let value = xml_text_content(&content[open_end + 1..close]);
+        return Some(value.trim().to_string());
     }
     None
 }
@@ -4186,6 +5168,31 @@ fn strip_xml_markup(value: &str) -> String {
             _ if !inside => result.push(character),
             _ => {}
         }
+    }
+    result
+}
+
+fn xml_text_content(value: &str) -> String {
+    const CDATA_OPEN: &str = "<![CDATA[";
+    const CDATA_CLOSE: &str = "]]>";
+
+    let mut result = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let Some(open_offset) = value[cursor..].find(CDATA_OPEN) else {
+            result.push_str(&xml_unescape(&strip_xml_markup(&value[cursor..])));
+            break;
+        };
+        let open = cursor + open_offset;
+        result.push_str(&xml_unescape(&strip_xml_markup(&value[cursor..open])));
+        let content_start = open + CDATA_OPEN.len();
+        let Some(close_offset) = value[content_start..].find(CDATA_CLOSE) else {
+            result.push_str(&value[content_start..]);
+            break;
+        };
+        let close = content_start + close_offset;
+        result.push_str(&value[content_start..close]);
+        cursor = close + CDATA_CLOSE.len();
     }
     result
 }
@@ -4535,73 +5542,143 @@ fn metadata_from_json(
     let mut title = None;
     let mut ids = Vec::new();
     let mut collection = None;
-    collect_metadata_json(value, &mut title, &mut ids, &mut collection);
+    for object in json_media_objects(value) {
+        collect_metadata_json_object(object, &mut title, &mut ids, &mut collection);
+    }
     (title, normalize_source_ids(ids), collection)
 }
 
-fn collect_metadata_json(
+fn json_media_objects(
     value: &serde_json::Value,
+) -> Vec<&serde_json::Map<String, serde_json::Value>> {
+    let Some(root) = value.as_object() else {
+        return Vec::new();
+    };
+    if is_non_media_json_container(root) {
+        return Vec::new();
+    }
+    if let Some(video_details) = root
+        .get("videoDetails")
+        .and_then(serde_json::Value::as_object)
+        .filter(|object| !is_non_media_json_container(object))
+    {
+        return vec![video_details];
+    }
+    if let Some(view) = root
+        .get("View")
+        .and_then(serde_json::Value::as_object)
+        .filter(|object| !is_non_media_json_container(object))
+    {
+        return vec![view];
+    }
+    if let Some(data) = root.get("data").and_then(serde_json::Value::as_object) {
+        if is_non_media_json_container(data) {
+            return Vec::new();
+        }
+        if let Some(view) = data
+            .get("View")
+            .and_then(serde_json::Value::as_object)
+            .filter(|object| !is_non_media_json_container(object))
+        {
+            return vec![view];
+        }
+        if let Some(video_details) = data
+            .get("videoDetails")
+            .and_then(serde_json::Value::as_object)
+            .filter(|object| !is_non_media_json_container(object))
+        {
+            return vec![video_details];
+        }
+    }
+
+    if has_direct_media_fields(root) {
+        return vec![root];
+    }
+    if root.contains_key("code")
+        && let Some(data) = root.get("data").and_then(serde_json::Value::as_object)
+        && !is_non_media_json_container(data)
+        && has_direct_media_fields(data)
+    {
+        return vec![data];
+    }
+    Vec::new()
+}
+
+fn has_direct_media_fields(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    [
+        "title",
+        "bvid",
+        "aid",
+        "avid",
+        "cid",
+        "epid",
+        "episode_id",
+        "videoId",
+    ]
+    .iter()
+    .any(|key| object.contains_key(*key))
+}
+
+fn is_non_media_json_container(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    object
+        .get("_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "playlist" | "multi_video" | "multi-video"
+            )
+        })
+}
+
+fn collect_metadata_json_object(
+    object: &serde_json::Map<String, serde_json::Value>,
     title: &mut Option<String>,
     ids: &mut Vec<String>,
     collection: &mut Option<CollectionMetadata>,
 ) {
-    match value {
-        serde_json::Value::Object(object) => {
-            for (key, value) in object {
-                let key_lower = key.to_ascii_lowercase();
-                match (key_lower.as_str(), value) {
-                    ("bvid", serde_json::Value::String(value)) => ids.push(value.clone()),
-                    ("aid" | "avid", serde_json::Value::Number(value)) => {
-                        ids.push(format!("av{value}"))
-                    }
-                    ("aid" | "avid", serde_json::Value::String(value)) => {
-                        ids.push(format!("av{}", value.trim_start_matches("av")))
-                    }
-                    ("cid", serde_json::Value::Number(value)) => ids.push(format!("cid{value}")),
-                    ("cid", serde_json::Value::String(value)) => {
-                        ids.push(format!("cid{}", value.trim_start_matches("cid")))
-                    }
-                    ("epid" | "episode_id", serde_json::Value::Number(value)) => {
-                        ids.push(format!("ep{value}"))
-                    }
-                    ("epid" | "episode_id", serde_json::Value::String(value)) => {
-                        ids.push(format!("ep{}", value.trim_start_matches("ep")))
-                    }
-                    ("title", serde_json::Value::String(value))
-                        if title.is_none() && !value.trim().is_empty() =>
-                    {
-                        *title = Some(value.trim().to_string());
-                    }
-                    ("ugc_season" | "season", serde_json::Value::Object(season))
-                        if collection.is_none() =>
-                    {
-                        let season_title = season
-                            .get("title")
-                            .or_else(|| season.get("name"))
-                            .and_then(serde_json::Value::as_str);
-                        if let Some(season_title) =
-                            season_title.filter(|title| !title.trim().is_empty())
-                        {
-                            *collection = Some(CollectionMetadata {
-                                id: season.get("id").and_then(json_scalar_string),
-                                title: season_title.to_string(),
-                                kind: "bilibili_season".to_string(),
-                                order: None,
-                                part_id: None,
-                            });
-                        }
-                    }
-                    _ => {}
+    for (key, value) in object {
+        let key_lower = key.to_ascii_lowercase();
+        match (key_lower.as_str(), value) {
+            ("bvid", serde_json::Value::String(value)) => ids.push(value.clone()),
+            ("aid" | "avid", serde_json::Value::Number(value)) => ids.push(format!("av{value}")),
+            ("aid" | "avid", serde_json::Value::String(value)) => {
+                ids.push(format!("av{}", value.trim_start_matches("av")))
+            }
+            ("cid", serde_json::Value::Number(value)) => ids.push(format!("cid{value}")),
+            ("cid", serde_json::Value::String(value)) => {
+                ids.push(format!("cid{}", value.trim_start_matches("cid")))
+            }
+            ("epid" | "episode_id", serde_json::Value::Number(value)) => {
+                ids.push(format!("ep{value}"))
+            }
+            ("epid" | "episode_id", serde_json::Value::String(value)) => {
+                ids.push(format!("ep{}", value.trim_start_matches("ep")))
+            }
+            ("title", serde_json::Value::String(value))
+                if title.is_none() && !value.trim().is_empty() =>
+            {
+                *title = Some(value.trim().to_string());
+            }
+            ("ugc_season" | "season", serde_json::Value::Object(season))
+                if collection.is_none() =>
+            {
+                let season_title = season
+                    .get("title")
+                    .or_else(|| season.get("name"))
+                    .and_then(serde_json::Value::as_str);
+                if let Some(season_title) = season_title.filter(|title| !title.trim().is_empty()) {
+                    *collection = Some(CollectionMetadata {
+                        id: season.get("id").and_then(json_scalar_string),
+                        title: season_title.to_string(),
+                        kind: "bilibili_season".to_string(),
+                        order: None,
+                        part_id: None,
+                    });
                 }
-                collect_metadata_json(value, title, ids, collection);
             }
+            _ => {}
         }
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_metadata_json(value, title, ids, collection);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -4657,51 +5734,208 @@ fn extract_source_ids(text: &str) -> Vec<String> {
     deduplicate(result)
 }
 
-fn matching_hints_for_item<'a>(
-    relative_path: &str,
-    source_ids: &[String],
-    hints: &'a [SourceHint],
-) -> Vec<&'a SourceHint> {
-    let item_ids = source_ids.iter().cloned().collect::<HashSet<_>>();
-    hints
-        .iter()
-        .filter(|hint| {
-            if hint.relative_path.as_deref() == Some(relative_path) {
-                return true;
-            }
-            let hint_ids = normalize_source_ids(hint.source_ids.clone())
-                .into_iter()
-                .collect::<HashSet<_>>();
-            if hint_ids.is_empty() || item_ids.is_empty() {
+fn case_only_path_alias(
+    hint_path: &str,
+    scanned_path: &str,
+    directory_semantics: &HashMap<String, TargetNameSemantics>,
+) -> bool {
+    let hint_components = Path::new(hint_path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let scanned_components = Path::new(scanned_path)
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => name.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if hint_components.len() != scanned_components.len() {
+        return false;
+    }
+
+    let mut parent = PathBuf::new();
+    let mut differs_only_by_case = false;
+    for (hint_component, scanned_component) in hint_components.iter().zip(scanned_components.iter())
+    {
+        if hint_component != scanned_component {
+            let parent_key = parent
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if !directory_semantics
+                .get(&parent_key)
+                .is_some_and(|semantics| semantics.case_insensitive)
+                || !same_unicode_text_ignoring_case(hint_component, scanned_component)
+            {
                 return false;
             }
-            let hint_cids = hint_ids
-                .iter()
-                .filter(|id| id.starts_with("cid"))
-                .collect::<HashSet<_>>();
-            let item_cids = item_ids
-                .iter()
-                .filter(|id| id.starts_with("cid"))
-                .collect::<HashSet<_>>();
-            if !hint_cids.is_empty() || !item_cids.is_empty() {
-                return hint_cids.iter().any(|cid| item_cids.contains(cid));
-            }
-            hint_ids.iter().any(|id| item_ids.contains(id))
-        })
-        .collect()
+            differs_only_by_case = true;
+        }
+        parent.push(scanned_component);
+    }
+    differs_only_by_case
 }
 
-fn attach_matching_hints(items: &mut [LibraryItem], hints: &[SourceHint]) {
-    for item in items {
-        for hint in matching_hints_for_item(&item.relative_path, &item.source_ids, hints) {
-            item.source_ids.extend(hint.source_ids.iter().cloned());
-            if item.title == title_from_path(&item.relative_path)
-                && let Some(title) = hint
-                    .title
-                    .as_deref()
-                    .filter(|title| !title.trim().is_empty())
+fn same_unicode_text_ignoring_case(left: &str, right: &str) -> bool {
+    left != right
+        && left
+            .chars()
+            .flat_map(char::to_lowercase)
+            .eq(right.chars().flat_map(char::to_lowercase))
+}
+
+fn matching_hint_indices_for_items(
+    items: &[LibraryItem],
+    hints: &[SourceHint],
+    path_resolutions: &HashMap<String, HintPathResolution>,
+    walk: &ScanWalk,
+) -> Vec<Vec<usize>> {
+    let mut items_without_cid_by_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut items_with_cid_by_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (item_index, item) in items.iter().enumerate() {
+        let cids = item
+            .source_ids
+            .iter()
+            .filter(|id| id.starts_with("cid"))
+            .collect::<Vec<_>>();
+        let index = if cids.is_empty() {
+            &mut items_without_cid_by_id
+        } else {
+            &mut items_with_cid_by_id
+        };
+        let ids = if cids.is_empty() {
+            item.source_ids.iter().collect::<Vec<_>>()
+        } else {
+            cids
+        };
+        for id in ids {
+            index.entry(id.as_str()).or_default().push(item_index);
+        }
+    }
+
+    let can_resolve_unique_ids =
+        !walk.timed_out && !walk.incomplete_scan && walk.incomplete_directories.is_empty();
+    let mut matches = vec![Vec::new(); items.len()];
+    for (hint_index, hint) in hints.iter().enumerate() {
+        if let Some(path) = hint.relative_path.as_deref() {
+            match path_resolutions
+                .get(path)
+                .copied()
+                .unwrap_or(HintPathResolution::Unavailable)
             {
-                item.title = title.trim().to_string();
+                HintPathResolution::Item(item_index) if item_index < items.len() => {
+                    matches[item_index].push(hint_index);
+                    continue;
+                }
+                HintPathResolution::ConfirmedAbsent
+                    if scan_confirms_hint_path_absent(path, walk) => {}
+                HintPathResolution::Item(_)
+                | HintPathResolution::PresentUnmatched
+                | HintPathResolution::ConfirmedAbsent
+                | HintPathResolution::Unavailable => continue,
+            }
+        }
+        if !can_resolve_unique_ids {
+            continue;
+        }
+
+        let hint_ids = normalize_source_ids(hint.source_ids.clone());
+        if hint_ids.is_empty() {
+            continue;
+        }
+        let hint_cids = hint_ids
+            .iter()
+            .filter(|id| id.starts_with("cid"))
+            .collect::<Vec<_>>();
+        let item_index = if hint_cids.is_empty() {
+            unique_indexed_candidate(
+                &items_without_cid_by_id,
+                hint_ids.iter().map(String::as_str),
+            )
+        } else {
+            unique_indexed_candidate(
+                &items_with_cid_by_id,
+                hint_cids.into_iter().map(String::as_str),
+            )
+        };
+        if let Some(item_index) = item_index {
+            matches[item_index].push(hint_index);
+        }
+    }
+    matches
+}
+
+fn unique_indexed_candidate<'index, 'id>(
+    index: &HashMap<&'index str, Vec<usize>>,
+    ids: impl IntoIterator<Item = &'id str>,
+) -> Option<usize> {
+    let mut candidate = None;
+    for id in ids {
+        for item_index in index.get(id).into_iter().flatten() {
+            if candidate.is_some_and(|existing| existing != *item_index) {
+                return None;
+            }
+            candidate = Some(*item_index);
+        }
+    }
+    candidate
+}
+
+fn scan_confirms_hint_path_absent(path: &str, walk: &ScanWalk) -> bool {
+    if path.is_empty() || walk.timed_out || walk.incomplete_scan {
+        return false;
+    }
+    let mut parent = parent_relative(path);
+    loop {
+        if directory_under_incomplete(parent, &walk.incomplete_directories) {
+            return false;
+        }
+        if walk.complete_directories.contains(parent) {
+            return true;
+        }
+        if parent.is_empty() {
+            return false;
+        }
+        parent = parent_relative(parent);
+    }
+}
+
+fn attach_matching_hints(
+    items: &mut [LibraryItem],
+    hints: &[SourceHint],
+    matched_hint_indices: &[Vec<usize>],
+    sidecar_title_paths: &HashSet<String>,
+) -> Vec<QueueMetadataProvenance> {
+    let mut queue_metadata = vec![QueueMetadataProvenance::default(); items.len()];
+    for (item_index, item) in items.iter_mut().enumerate() {
+        let provenance = &mut queue_metadata[item_index];
+        for hint_index in &matched_hint_indices[item_index] {
+            let hint = &hints[*hint_index];
+            let hint_source_ids = normalize_source_ids(hint.source_ids.clone());
+            item.source_ids.extend(hint_source_ids.iter().cloned());
+            if let Some(title) = hint
+                .title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+            {
+                if hint.origin == HintOrigin::Queue && provenance.title.is_none() {
+                    provenance.title = Some(title.trim().to_string());
+                }
+                if !sidecar_title_paths.contains(&item.relative_path)
+                    && item.title == title_from_path(&item.relative_path)
+                {
+                    item.title = title.trim().to_string();
+                }
+            }
+            if hint.origin == HintOrigin::Queue {
+                provenance.source_ids.extend(hint_source_ids);
+                if provenance.collection.is_none() {
+                    provenance.collection = hint.collection.clone();
+                }
+                provenance.requires_confirmation |= hint.requires_confirmation;
             }
             item.collection = item.collection.clone().or_else(|| hint.collection.clone());
             if hint.requires_confirmation {
@@ -4714,7 +5948,9 @@ fn attach_matching_hints(items: &mut [LibraryItem], hints: &[SourceHint]) {
             }
         }
         item.source_ids = normalize_source_ids(std::mem::take(&mut item.source_ids));
+        provenance.source_ids = normalize_source_ids(std::mem::take(&mut provenance.source_ids));
     }
+    queue_metadata
 }
 
 fn normalize_title(title: &str) -> String {
@@ -4924,6 +6160,95 @@ mod tests {
             .expect("library manager should open against the isolated fixture")
     }
 
+    fn cleanup_preview(manager: &LibraryManager, item_id: &str) -> MovePreview {
+        manager
+            .preview(
+                &[item_id.to_string()],
+                "Cleanup archive",
+                false,
+                ConflictPolicy::Skip,
+            )
+            .expect("cleanup preview fixture should persist")
+    }
+
+    fn cleanup_batch(
+        preview: &MovePreview,
+        attempt_finished: bool,
+        retryable_access_error: bool,
+        pending_file: bool,
+    ) -> BatchManifest {
+        BatchManifest {
+            version: 1,
+            preview: preview.clone(),
+            status: BatchStatus::Failed,
+            attempt_finished,
+            retryable_access_error,
+            files: if pending_file {
+                vec![ManifestFile {
+                    item_id: "fixture-item".to_string(),
+                    source_path: "clip.mp4".to_string(),
+                    target_path: "Cleanup archive/clip.mp4".to_string(),
+                    identity: "fixture-identity".to_string(),
+                    state: ManifestFileState::Pending,
+                    error: Some("permanent fixture failure".to_string()),
+                }]
+            } else {
+                Vec::new()
+            },
+            patches: Vec::new(),
+            items: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
+    fn set_operation_state_age(path: &Path, age: Duration) {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("operation-state fixture should open for mtime adjustment");
+        file.set_modified(SystemTime::now() - age)
+            .expect("operation-state fixture mtime should update");
+    }
+
+    fn run_operation_state_cleanup(
+        manager: &LibraryManager,
+        registry: &Mutex<OperationStateCleanupCursorRegistry>,
+    ) -> Vec<String> {
+        let _process_guard = manager
+            .in_process_lock
+            .lock()
+            .expect("library manager lock should remain healthy");
+        let _disk_guard = manager
+            .lock_store()
+            .expect("library store lock should remain healthy");
+        manager.prune_persisted_operation_states_with_registry(registry)
+    }
+
+    fn cleanup_preview_candidate(
+        manager: &LibraryManager,
+        preview: &MovePreview,
+    ) -> OperationStateCleanupCandidate {
+        let path = manager.preview_path(&preview.id);
+        let entry = manager
+            .root
+            .bind_entry(&path, false)
+            .expect("persisted preview path should bind");
+        let identity = manager
+            .root
+            .bound_entry_identity(&entry)
+            .expect("persisted preview identity should read")
+            .expect("persisted preview should exist");
+        match manager
+            .read_operation_state_candidate(&path, identity, PREVIEW_LIMIT, PREVIEW_LIMIT)
+            .expect("persisted preview should be safely readable")
+        {
+            OperationStateCandidateRead::Ready(candidate) => *candidate,
+            OperationStateCandidateRead::Missing | OperationStateCandidateRead::Deferred => {
+                panic!("persisted preview should produce a cleanup candidate")
+            }
+        }
+    }
+
     fn item_at<'a>(snapshot: &'a LibrarySnapshot, relative_path: &str) -> &'a LibraryItem {
         snapshot
             .items
@@ -4978,6 +6303,7 @@ mod tests {
             birth_seconds: Some(inode as i64),
             birth_nanoseconds: Some(0),
             missing_since,
+            queue_metadata: QueueMetadataProvenance::default(),
         }
     }
 
@@ -4999,6 +6325,419 @@ mod tests {
             normalize_source_ids(vec!["youtube:cid12345678".to_string()]),
             vec!["youtube:cid12345678".to_string()]
         );
+        assert_eq!(
+            normalize_source_ids(vec!["bv1AbCdEfG".to_string()]),
+            vec!["BV1AbCdEfG".to_string()]
+        );
+    }
+
+    #[test]
+    fn round5_json_metadata_ignores_nested_chapters_and_non_media_wrappers() {
+        let direct = serde_json::json!({
+            "title": "Video title",
+            "cid": 123,
+            "chapters": [{ "title": "Opening chapter", "cid": 987 }],
+            "playlist": [{ "title": "Other video", "aid": 654 }]
+        });
+        let (title, ids, collection) = metadata_from_json(&direct);
+        assert_eq!(title.as_deref(), Some("Video title"));
+        assert_eq!(ids, vec!["cid123"]);
+        assert!(collection.is_none());
+
+        let wrapped = serde_json::json!({
+            "title": "Playlist title",
+            "cid": 999,
+            "chapters": [{ "title": "Wrong chapter", "cid": 998 }],
+            "data": {
+                "title": "Season wrapper",
+                "cid": 997,
+                "View": {
+                    "title": "Episode title",
+                    "cid": 321,
+                    "bvid": "BV1AbCdEfG",
+                    "ugc_season": { "id": 55, "title": "Season title" },
+                    "episodes": [{ "cid": 996, "title": "Other episode" }]
+                }
+            }
+        });
+        let (title, ids, collection) = metadata_from_json(&wrapped);
+        assert_eq!(title.as_deref(), Some("Episode title"));
+        assert_eq!(ids, vec!["BV1AbCdEfG", "cid321"]);
+        assert_eq!(
+            collection.as_ref().map(|value| value.title.as_str()),
+            Some("Season title")
+        );
+
+        let direct_with_data = serde_json::json!({
+            "title": "Root media title",
+            "cid": 456,
+            "data": { "title": "Unrelated nested payload", "cid": 789 }
+        });
+        let (title, ids, _) = metadata_from_json(&direct_with_data);
+        assert_eq!(title.as_deref(), Some("Root media title"));
+        assert_eq!(ids, vec!["cid456"]);
+
+        for payload_type in ["playlist", "multi_video"] {
+            let collection_payload = serde_json::json!({
+                "_type": payload_type,
+                "title": "Collection title",
+                "cid": 555,
+                "entries": [{ "title": "Playlist entry", "cid": 556 }]
+            });
+            let (title, ids, collection) = metadata_from_json(&collection_payload);
+            assert!(title.is_none());
+            assert!(ids.is_empty());
+            assert!(collection.is_none());
+        }
+    }
+
+    #[test]
+    fn round5_nfo_text_nodes_preserve_cdata_for_titles_and_source_ids() {
+        let nfo = "<movie><title><![CDATA[Rock & Roll]]></title><uniqueid type=\"bilibili-cid\"><![CDATA[123456789]]></uniqueid></movie>";
+        assert_eq!(xml_tag_text(nfo, "title").as_deref(), Some("Rock & Roll"));
+        assert_eq!(nfo_source_ids(nfo), vec!["cid123456789"]);
+    }
+
+    #[test]
+    fn round5_legacy_index_records_default_queue_provenance_to_unknown() {
+        let value = serde_json::json!({
+            "item": index_fixture_item("legacy", "clip.mp4", Presence::Present),
+            "device": 1,
+            "inode": 2,
+            "file_type": "regular_file",
+            "birth_seconds": 2,
+            "birth_nanoseconds": 0,
+            "missing_since": null
+        });
+        let record: IndexRecord = serde_json::from_value(value)
+            .expect("an index record from the prior schema should remain readable");
+        assert!(record.queue_metadata.title.is_none());
+        assert!(record.queue_metadata.source_ids.is_empty());
+        assert!(record.queue_metadata.collection.is_none());
+        assert!(!record.queue_metadata.requires_confirmation);
+    }
+
+    #[test]
+    fn round5_hint_paths_are_exclusive_and_fallback_requires_absence_and_uniqueness() {
+        let mut first = index_fixture_item("first", "first-av123456789.mp4", Presence::Present);
+        first.source_ids = vec!["av123456789".to_string()];
+        let mut second = index_fixture_item("second", "second-av123456789.mp4", Presence::Present);
+        second.source_ids = vec!["av123456789".to_string()];
+        let items = vec![first, second];
+        let hint = SourceHint {
+            source_ids: vec!["av123456789".to_string()],
+            title: Some("Queue title".to_string()),
+            relative_path: Some("first-av123456789.mp4".to_string()),
+            collection: None,
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let mut walk = ScanWalk::default();
+        walk.complete_directories.insert(String::new());
+
+        let exact = HashMap::from([(
+            "first-av123456789.mp4".to_string(),
+            HintPathResolution::Item(0),
+        )]);
+        assert_eq!(
+            matching_hint_indices_for_items(&items, std::slice::from_ref(&hint), &exact, &walk),
+            vec![vec![0], vec![]]
+        );
+
+        let absent = HashMap::from([(
+            "missing.mp4".to_string(),
+            HintPathResolution::ConfirmedAbsent,
+        )]);
+        let missing_hint = SourceHint {
+            relative_path: Some("missing.mp4".to_string()),
+            ..hint.clone()
+        };
+        assert_eq!(
+            matching_hint_indices_for_items(
+                &items,
+                std::slice::from_ref(&missing_hint),
+                &absent,
+                &walk
+            ),
+            vec![Vec::<usize>::new(), Vec::<usize>::new()],
+            "a duplicate source ID must stay ambiguous after an absent path"
+        );
+
+        let unique = vec![items[0].clone()];
+        assert_eq!(
+            matching_hint_indices_for_items(
+                &unique,
+                std::slice::from_ref(&missing_hint),
+                &absent,
+                &walk
+            ),
+            vec![vec![0]],
+            "a confirmed absent path may use one unique source-ID candidate"
+        );
+
+        let mut incomplete_walk = walk.clone();
+        incomplete_walk
+            .incomplete_directories
+            .insert("unreadable".to_string());
+        let unavailable_parent_hint = SourceHint {
+            relative_path: Some("unreadable/clip.mp4".to_string()),
+            ..missing_hint.clone()
+        };
+        let absent_under_incomplete_parent = HashMap::from([(
+            "unreadable/clip.mp4".to_string(),
+            HintPathResolution::ConfirmedAbsent,
+        )]);
+        assert_eq!(
+            matching_hint_indices_for_items(
+                &unique,
+                std::slice::from_ref(&unavailable_parent_hint),
+                &absent_under_incomplete_parent,
+                &incomplete_walk,
+            ),
+            vec![Vec::<usize>::new()],
+            "an unreadable directory must not be treated as proof that the hint path is absent"
+        );
+
+        let pathless_hint = SourceHint {
+            relative_path: None,
+            ..missing_hint.clone()
+        };
+        assert_eq!(
+            matching_hint_indices_for_items(
+                &unique,
+                std::slice::from_ref(&pathless_hint),
+                &HashMap::new(),
+                &walk
+            ),
+            vec![vec![0]],
+            "a pathless hint may use one unique source-ID candidate"
+        );
+        assert_eq!(
+            matching_hint_indices_for_items(&items, &[pathless_hint], &HashMap::new(), &walk),
+            vec![Vec::<usize>::new(), Vec::<usize>::new()],
+            "a pathless hint must not attach to multiple copies"
+        );
+
+        let present = HashMap::from([(
+            "directory/clip.mp4".to_string(),
+            HintPathResolution::PresentUnmatched,
+        )]);
+        let existing_hint = SourceHint {
+            relative_path: Some("directory/clip.mp4".to_string()),
+            ..missing_hint.clone()
+        };
+        assert_eq!(
+            matching_hint_indices_for_items(&unique, &[existing_hint], &present, &walk),
+            vec![Vec::<usize>::new()],
+            "an existing non-media path must not fall back by source ID"
+        );
+
+        let unavailable = HashMap::from([(
+            "unreadable/clip.mp4".to_string(),
+            HintPathResolution::Unavailable,
+        )]);
+        let unreadable_hint = SourceHint {
+            relative_path: Some("unreadable/clip.mp4".to_string()),
+            ..missing_hint
+        };
+        assert_eq!(
+            matching_hint_indices_for_items(&unique, &[unreadable_hint], &unavailable, &walk),
+            vec![Vec::<usize>::new()],
+            "a failed rooted lookup must remain distinct from a missing path"
+        );
+    }
+
+    #[test]
+    fn round5_case_only_hint_alias_requires_case_insensitive_directory_semantics() {
+        let insensitive = HashMap::from([(String::new(), round5_semantics(true, false))]);
+        let sensitive = HashMap::from([(String::new(), round5_semantics(false, false))]);
+        assert!(case_only_path_alias("clip.mp4", "Clip.mp4", &insensitive));
+        assert!(!case_only_path_alias("clip.mp4", "Clip.mp4", &sensitive));
+        assert!(!case_only_path_alias("alias.mp4", "Clip.mp4", &insensitive));
+    }
+
+    #[test]
+    fn round5_queue_provenance_survives_sidecar_edits_without_resurrecting_old_fields() {
+        let root = TemporaryRoot::new("round5-queue-provenance");
+        fs::write(root.path().join("clip.mp4"), b"fixture media")
+            .expect("media fixture should write");
+        let nfo_path = root.path().join("clip.nfo");
+        fs::write(
+            &nfo_path,
+            "<movie><title>Sidecar One</title><uniqueid type=\"bilibili-cid\">111111111</uniqueid><set>Set One</set></movie>",
+        )
+        .expect("NFO fixture should write");
+        let manager = manager(&root);
+        let queue_collection = CollectionMetadata {
+            id: Some("queue-season".to_string()),
+            title: "Queue Season".to_string(),
+            kind: "queue".to_string(),
+            order: Some(3),
+            part_id: None,
+        };
+        let queue_hint = SourceHint {
+            source_ids: vec!["av123456789".to_string()],
+            title: Some("Queue title".to_string()),
+            relative_path: Some("clip.mp4".to_string()),
+            collection: Some(queue_collection.clone()),
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+
+        let first = manager
+            .scan(&[queue_hint])
+            .expect("initial scan should combine current sidecar and queue metadata");
+        let first_item = item_at(&first, "clip.mp4");
+        assert_eq!(first_item.title, "Sidecar One");
+        assert!(first_item.source_ids.contains(&"cid111111111".to_string()));
+        assert!(first_item.source_ids.contains(&"av123456789".to_string()));
+        assert_eq!(first_item.collection.as_ref().unwrap().title, "Set One");
+
+        fs::write(
+            &nfo_path,
+            "<movie><title>Sidecar Two</title><uniqueid type=\"bilibili-cid\">222222222</uniqueid><set>Set Two</set></movie>",
+        )
+        .expect("edited NFO fixture should write");
+        let edited = manager
+            .scan(&[])
+            .expect("edited sidecar should replace prior sidecar-derived metadata");
+        let edited_item = item_at(&edited, "clip.mp4");
+        assert_eq!(edited_item.title, "Sidecar Two");
+        assert!(edited_item.source_ids.contains(&"cid222222222".to_string()));
+        assert!(!edited_item.source_ids.contains(&"cid111111111".to_string()));
+        assert!(edited_item.source_ids.contains(&"av123456789".to_string()));
+        assert_eq!(edited_item.collection.as_ref().unwrap().title, "Set Two");
+
+        fs::remove_file(&nfo_path).expect("NFO fixture should be removable");
+        let removed = manager
+            .scan(&[])
+            .expect("queue-origin metadata should survive removal of the NFO");
+        let removed_item = item_at(&removed, "clip.mp4");
+        assert_eq!(removed_item.title, "Queue title");
+        assert_eq!(removed_item.source_ids, vec!["av123456789"]);
+        assert_eq!(removed_item.collection.as_ref().unwrap(), &queue_collection);
+    }
+
+    #[test]
+    fn round5_existing_directory_and_symlink_hint_paths_block_id_fallback() {
+        let root = TemporaryRoot::new("round5-existing-hint-paths");
+        fs::write(
+            root.path().join("candidate-av123456789.mp4"),
+            b"fixture media",
+        )
+        .expect("candidate media should write");
+        fs::create_dir(root.path().join("existing-directory.mp4"))
+            .expect("existing hint directory should create");
+        symlink(
+            "candidate-av123456789.mp4",
+            root.path().join("existing-link.mp4"),
+        )
+        .expect("existing hint symlink should create");
+        fs::write(
+            root.path().join("existing-non-media.txt"),
+            b"not the candidate",
+        )
+        .expect("existing non-media entry should write");
+
+        let hints = [
+            "existing-directory.mp4",
+            "existing-link.mp4",
+            "existing-non-media.txt",
+        ]
+        .into_iter()
+        .map(|path| SourceHint {
+            source_ids: vec!["av123456789".to_string()],
+            title: Some("Must not attach".to_string()),
+            relative_path: Some(path.to_string()),
+            collection: None,
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        })
+        .collect::<Vec<_>>();
+        let snapshot = manager(&root)
+            .scan(&hints)
+            .expect("existing non-media paths should not fail the library scan");
+        assert_eq!(
+            item_at(&snapshot, "candidate-av123456789.mp4").title,
+            "candidate-av123456789"
+        );
+    }
+
+    #[test]
+    fn round5_scanned_hint_path_binds_one_copy_and_missing_path_falls_back_uniquely() {
+        let root = TemporaryRoot::new("round5-exclusive-hint-path");
+        fs::write(root.path().join("selected-av123456789.mp4"), b"first copy")
+            .expect("selected copy should write");
+        fs::write(root.path().join("other-av123456789.mp4"), b"second copy")
+            .expect("second copy should write");
+        let selected_hint = SourceHint {
+            source_ids: vec!["av123456789".to_string()],
+            title: Some("Selected queue title".to_string()),
+            relative_path: Some("selected-av123456789.mp4".to_string()),
+            collection: None,
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let selected = manager(&root)
+            .scan(&[selected_hint])
+            .expect("exact durable path should resolve to one library copy");
+        assert_eq!(
+            item_at(&selected, "selected-av123456789.mp4").title,
+            "Selected queue title"
+        );
+        assert_ne!(
+            item_at(&selected, "other-av123456789.mp4").title,
+            "Selected queue title",
+            "a shared source ID must not spread an exact-path queue hint to another copy"
+        );
+
+        let unique_root = TemporaryRoot::new("round5-missing-hint-fallback");
+        fs::write(
+            unique_root.path().join("unique-av987654321.mp4"),
+            b"unique copy",
+        )
+        .expect("unique copy should write");
+        let missing_path_hint = SourceHint {
+            source_ids: vec!["av987654321".to_string()],
+            title: Some("Recovered queue title".to_string()),
+            relative_path: Some("previous-location.mp4".to_string()),
+            collection: None,
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let recovered = manager(&unique_root)
+            .scan(&[missing_path_hint])
+            .expect("confirmed absent path with a unique ID should recover the hint");
+        assert_eq!(
+            item_at(&recovered, "unique-av987654321.mp4").title,
+            "Recovered queue title"
+        );
+    }
+
+    #[test]
+    fn round5_case_insensitive_existing_hint_alias_binds_only_when_identity_resolves() {
+        let root = TemporaryRoot::new("round5-case-only-hint-alias");
+        fs::write(root.path().join("Clip.mp4"), b"fixture media")
+            .expect("media fixture should write");
+        let directory = File::open(root.path()).expect("fixture root should open");
+        let semantics = target_name_semantics(&directory)
+            .expect("fixture filesystem name semantics should be available");
+        let hint = SourceHint {
+            source_ids: Vec::new(),
+            title: Some("Queue alias title".to_string()),
+            relative_path: Some("clip.mp4".to_string()),
+            collection: None,
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let snapshot = manager(&root)
+            .scan(&[hint])
+            .expect("case-only alias scan should complete");
+        if semantics.case_insensitive {
+            assert_eq!(item_at(&snapshot, "Clip.mp4").title, "Queue alias title");
+        } else {
+            assert_eq!(item_at(&snapshot, "Clip.mp4").title, "Clip");
+        }
     }
 
     #[test]
@@ -6393,6 +8132,31 @@ mod tests {
         }
     }
 
+    fn round4_semantics_by_parent(
+        files: &[ScannedFile],
+        semantics: TargetNameSemantics,
+    ) -> HashMap<String, TargetNameSemantics> {
+        files
+            .iter()
+            .map(|file| {
+                let parent = Path::new(&file.relative_path)
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_string_lossy()
+                    .into_owned();
+                (parent, semantics)
+            })
+            .collect()
+    }
+
+    fn round4_sensitive_semantics() -> TargetNameSemantics {
+        TargetNameSemantics {
+            normalization_insensitive: false,
+            case_insensitive: false,
+            hfs_ignorable: false,
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum Round4IndexMutation {
         ChildEntryChurn,
@@ -6492,7 +8256,9 @@ mod tests {
             round4_scanned_file("episode.multi.mkv", 8),
             round4_scanned_file("episode.multi.en.srt", 9),
         ];
-        let index = SidecarIndex::build(&files, &BTreeSet::new());
+        let semantics = round4_semantics_by_parent(&files, round4_sensitive_semantics());
+        let index = SidecarIndex::build(&files, &BTreeSet::new(), &semantics)
+            .expect("filesystem name semantics should be available for every fixture parent");
 
         assert!(index.attached_files(&files[0]).is_empty());
         assert_eq!(
@@ -6522,7 +8288,9 @@ mod tests {
             ));
         }
 
-        let index = SidecarIndex::build(&files, &BTreeSet::new());
+        let semantics = round4_semantics_by_parent(&files, round4_sensitive_semantics());
+        let index = SidecarIndex::build(&files, &BTreeSet::new(), &semantics)
+            .expect("filesystem name semantics should be available for every fixture parent");
 
         assert_eq!(index.by_media.len(), MEDIA_COUNT);
         assert_eq!(index.ambiguous_count, 0);
@@ -6533,6 +8301,301 @@ mod tests {
                 vec![format!("group-{number}/episode-{number}.srt")]
             );
         }
+    }
+
+    fn round5_full_fold_for_test(value: &str) -> Result<String> {
+        let mut folded = String::new();
+        for character in value.chars() {
+            match character {
+                'ß' | 'ẞ' => folded.push_str("ss"),
+                'ς' => folded.push('σ'),
+                _ => folded.extend(character.to_lowercase()),
+            }
+        }
+        Ok(folded)
+    }
+
+    fn round5_semantics(
+        case_insensitive: bool,
+        normalization_insensitive: bool,
+    ) -> TargetNameSemantics {
+        TargetNameSemantics {
+            normalization_insensitive,
+            case_insensitive,
+            hfs_ignorable: false,
+        }
+    }
+
+    #[test]
+    fn round5_private_downloader_names_follow_directory_case_and_hfs_rules() {
+        let sensitive = round5_semantics(false, false);
+        let insensitive = round5_semantics(true, true);
+        let hfs_insensitive = TargetNameSemantics {
+            hfs_ignorable: true,
+            ..insensitive
+        };
+
+        assert!(
+            is_private_downloader_component_with(
+                ".TELEGRAM-VIDEO-DOWNLOADER-LIBRARY",
+                insensitive,
+                &round5_full_fold_for_test,
+            )
+            .expect("case-insensitive alias should normalize")
+        );
+        assert!(
+            !is_private_downloader_component_with(
+                ".TELEGRAM-VIDEO-DOWNLOADER-LIBRARY",
+                sensitive,
+                &round5_full_fold_for_test,
+            )
+            .expect("case-sensitive spelling should stay distinct")
+        );
+        assert!(
+            is_private_downloader_component_with(
+                ".telegram-video-downloader-\u{200c}library",
+                hfs_insensitive,
+                &round5_full_fold_for_test,
+            )
+            .expect("HFS comparison should remove the documented ignorable")
+        );
+        assert!(
+            is_private_downloader_component_with(
+                ".telegram-video-downloader-\u{200c}library",
+                insensitive,
+                &round5_full_fold_for_test,
+            )
+            .expect("an ignorable after the reserved prefix must remain private on APFS")
+        );
+        assert!(
+            is_private_downloader_component_with(
+                ".telegram-video-down\u{200c}loader-library",
+                hfs_insensitive,
+                &round5_full_fold_for_test,
+            )
+            .expect("HFS comparison should remove an ignorable inside the reserved prefix")
+        );
+        assert!(
+            !is_private_downloader_component_with(
+                ".telegram-video-down\u{200c}loader-library",
+                insensitive,
+                &round5_full_fold_for_test,
+            )
+            .expect("APFS comparison should preserve an HFS-only ignorable in the prefix")
+        );
+
+        let root = TemporaryRoot::new("round5-private-entry-identity");
+        let manager = manager(&root);
+        assert!(
+            excluded_entry(
+                OsStr::new("renamed-entry"),
+                manager.library_dir_identity,
+                sensitive,
+                manager.library_dir_identity,
+            )
+            .expect("the saved private-directory identity should exclude aliases")
+        );
+    }
+
+    #[test]
+    fn round5_sidecar_index_uses_case_and_normalization_semantics_and_keeps_ambiguity() {
+        let insensitive = round5_semantics(true, true);
+        let insensitive_files = vec![
+            round4_scanned_file("Movie.mp4", 1),
+            round4_scanned_file("movie.en.srt", 2),
+            round4_scanned_file("movie.zh.srt", 3),
+        ];
+        let insensitive_semantics = round4_semantics_by_parent(&insensitive_files, insensitive);
+        let insensitive_index = SidecarIndex::build_with_case_fold(
+            &insensitive_files,
+            &BTreeSet::new(),
+            &insensitive_semantics,
+            round5_full_fold_for_test,
+        )
+        .expect("simulated insensitive directory should index attachments");
+        assert_eq!(
+            insensitive_index.attached_files(&insensitive_files[0]),
+            vec!["movie.en.srt".to_string(), "movie.zh.srt".to_string()]
+        );
+
+        let sensitive_files = vec![
+            round4_scanned_file("Movie.mp4", 4),
+            round4_scanned_file("movie.en.srt", 5),
+        ];
+        let sensitive_semantics =
+            round4_semantics_by_parent(&sensitive_files, round4_sensitive_semantics());
+        let sensitive_index = SidecarIndex::build_with_case_fold(
+            &sensitive_files,
+            &BTreeSet::new(),
+            &sensitive_semantics,
+            round5_full_fold_for_test,
+        )
+        .expect("simulated sensitive directory should index attachments");
+        assert!(
+            sensitive_index
+                .attached_files(&sensitive_files[0])
+                .is_empty()
+        );
+
+        let normalized_files = vec![
+            round4_scanned_file("café.mp4", 6),
+            round4_scanned_file("cafe\u{301}.en.srt", 7),
+        ];
+        let normalized_semantics =
+            round4_semantics_by_parent(&normalized_files, round5_semantics(false, true));
+        let normalized_index = SidecarIndex::build_with_case_fold(
+            &normalized_files,
+            &BTreeSet::new(),
+            &normalized_semantics,
+            round5_full_fold_for_test,
+        )
+        .expect("normalization-insensitive directory should associate equivalent stems");
+        assert_eq!(
+            normalized_index.attached_files(&normalized_files[0]),
+            vec!["cafe\u{301}.en.srt".to_string()]
+        );
+
+        let ambiguous_files = vec![
+            round4_scanned_file("Movie.mp4", 8),
+            round4_scanned_file("movie.mkv", 9),
+            round4_scanned_file("movie.en.srt", 10),
+        ];
+        let ambiguous_semantics = round4_semantics_by_parent(&ambiguous_files, insensitive);
+        let ambiguous_index = SidecarIndex::build_with_case_fold(
+            &ambiguous_files,
+            &BTreeSet::new(),
+            &ambiguous_semantics,
+            round5_full_fold_for_test,
+        )
+        .expect("filesystem-equivalent primary stems should remain safely ambiguous");
+        assert!(
+            ambiguous_index
+                .attached_files(&ambiguous_files[0])
+                .is_empty()
+        );
+        assert!(
+            ambiguous_index
+                .attached_files(&ambiguous_files[1])
+                .is_empty()
+        );
+        assert_eq!(ambiguous_index.ambiguous_count, 1);
+
+        let missing_semantics = HashMap::new();
+        let error = SidecarIndex::build_with_case_fold(
+            &sensitive_files,
+            &BTreeSet::new(),
+            &missing_semantics,
+            round5_full_fold_for_test,
+        )
+        .expect_err("missing filesystem semantics must fail closed");
+        assert!(format!("{error:#}").contains("filesystem name semantics unavailable"));
+    }
+
+    #[test]
+    fn round5_attachment_suffix_preserves_language_qualifiers_after_folded_match() {
+        let insensitive = round5_semantics(true, true);
+        assert_eq!(
+            matching_sidecar_suffix_with(
+                "movie.en",
+                "Movie",
+                insensitive,
+                round5_full_fold_for_test,
+            )
+            .expect("case alias should match"),
+            Some(".en".to_string())
+        );
+        assert_eq!(
+            matching_sidecar_suffix_with(
+                "movie.zh",
+                "Movie",
+                insensitive,
+                round5_full_fold_for_test,
+            )
+            .expect("case alias should match"),
+            Some(".zh".to_string())
+        );
+        assert_eq!(
+            matching_sidecar_suffix_with(
+                "MASSE.en",
+                "Maße",
+                insensitive,
+                round5_full_fold_for_test,
+            )
+            .expect("fold expansion should preserve the original suffix boundary"),
+            Some(".en".to_string())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn round5_private_path_guard_uses_detected_macos_name_semantics() {
+        let root = TemporaryRoot::new("round5-macos-private-alias");
+        let manager = manager(&root);
+        let directory = File::open(root.path()).expect("temporary root should open");
+        let semantics = target_name_semantics(&directory)
+            .expect("temporary root should report supported macOS name semantics");
+        let result =
+            manager.safe_relative_path(".TELEGRAM-VIDEO-DOWNLOADER-LIBRARY/clip.mp4", false);
+        assert_eq!(
+            result.is_err(),
+            semantics.case_insensitive,
+            "the guard should reject the private-directory alias exactly when the volume folds case"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn round5_casefold_sidecars_keep_language_suffixes_during_move() {
+        let root = TemporaryRoot::new("round5-macos-sidecar-suffix");
+        fs::write(root.path().join("Movie.mp4"), b"video").expect("primary media should write");
+        fs::write(root.path().join("movie.en.srt"), b"english")
+            .expect("English sidecar should write");
+        fs::write(root.path().join("movie.zh.srt"), b"Chinese")
+            .expect("Chinese sidecar should write");
+        let manager = manager(&root);
+        let directory = File::open(root.path()).expect("temporary root should open");
+        let semantics = target_name_semantics(&directory)
+            .expect("temporary root should report supported macOS name semantics");
+        let snapshot = manager.scan(&[]).expect("fixture scan should complete");
+        let item = item_at(&snapshot, "Movie.mp4");
+
+        if !semantics.case_insensitive {
+            assert!(
+                item.attachments.is_empty(),
+                "case-sensitive volumes must keep case-distinct sidecars separate"
+            );
+            return;
+        }
+        assert_eq!(item.attachments.len(), 2);
+        let preview = manager
+            .preview(
+                std::slice::from_ref(&item.id),
+                "Moved",
+                true,
+                ConflictPolicy::KeepBoth,
+            )
+            .expect("case-folded sidecars should produce a move preview");
+        let files = &preview.items[0].files;
+        assert!(
+            files
+                .iter()
+                .any(|file| file.target_path.ends_with(".en.srt"))
+        );
+        assert!(
+            files
+                .iter()
+                .any(|file| file.target_path.ends_with(".zh.srt"))
+        );
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("move with language sidecars should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+        assert!(
+            files
+                .iter()
+                .all(|file| root.path().join(&file.target_path).exists())
+        );
     }
 
     #[test]
@@ -6833,6 +8896,371 @@ mod tests {
             ..independent
         };
         assert!(standard_media_stem(&youtube).contains("[youtube_abcdefghijk]"));
+    }
+
+    #[test]
+    fn operation_state_file_parser_matches_generated_preview_and_batch_paths() {
+        let root = TemporaryRoot::new("operation-state-file-name-parser");
+        fs::write(root.path().join("clip.mp4"), b"media fixture").expect("media should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        let preview = cleanup_preview(&manager, &item_id);
+
+        let preview_path = manager.preview_path(&preview.id);
+        let preview_name = preview_path
+            .file_name()
+            .expect("generated preview path should have a filename");
+        assert_eq!(
+            parse_operation_state_file_name(preview_name),
+            Some((OperationStateFileKind::Preview, preview.id.clone()))
+        );
+
+        let batch_path = manager.batch_path(&preview.id);
+        let batch_name = batch_path
+            .file_name()
+            .expect("generated batch path should have a filename");
+        assert_eq!(
+            parse_operation_state_file_name(batch_name),
+            Some((OperationStateFileKind::Batch, preview.id.clone()))
+        );
+
+        let hash = preview
+            .id
+            .strip_prefix(PREVIEW_PREFIX)
+            .expect("generated preview ID should carry its prefix");
+        for malformed in [
+            format!("{PREVIEW_PREFIX}{hash}.json"),
+            format!("batch-{hash}.json"),
+            format!("{PREVIEW_PREFIX}{PREVIEW_PREFIX}{}.json", preview.id),
+            "batch-preview-not-a-24-character-hex-id.json".to_string(),
+        ] {
+            assert_eq!(
+                parse_operation_state_file_name(OsStr::new(&malformed)),
+                None,
+                "malformed generated state filename should be ignored: {malformed}"
+            );
+        }
+        release_preview_anchors(&preview.id);
+    }
+
+    #[test]
+    fn operation_state_cleanup_prunes_old_terminal_state_but_preserves_recovery() {
+        let root = TemporaryRoot::new("operation-state-retention");
+        let media_path = root.path().join("clip.mp4");
+        let partial_download_path = root.path().join("clip.mp4.part");
+        fs::write(&media_path, b"permanent media fixture").expect("media should write");
+        fs::write(&partial_download_path, b"user download fragment")
+            .expect("download fragment should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+
+        let abandoned = cleanup_preview(&manager, &item_id);
+        let fresh = cleanup_preview(&manager, &item_id);
+        let interrupted = cleanup_preview(&manager, &item_id);
+        let retryable = cleanup_preview(&manager, &item_id);
+        let finalized_pending = cleanup_preview(&manager, &item_id);
+        let terminal = cleanup_preview(&manager, &item_id);
+
+        let interrupted_path = manager.batch_path(&interrupted.id);
+        let interrupted_manifest = cleanup_batch(&interrupted, false, false, true);
+        let mut legacy = serde_json::to_value(&interrupted_manifest)
+            .expect("legacy batch fixture should encode");
+        legacy
+            .as_object_mut()
+            .expect("batch fixture should be an object")
+            .remove("attempt_finished");
+        let interrupted_manifest: BatchManifest =
+            serde_json::from_value(legacy).expect("old batch schema should remain readable");
+        assert!(!interrupted_manifest.attempt_finished);
+        manager
+            .write_batch_manifest(&interrupted_path, &interrupted_manifest)
+            .expect("interrupted batch should persist");
+
+        let retryable_path = manager.batch_path(&retryable.id);
+        manager
+            .write_batch_manifest(
+                &retryable_path,
+                &cleanup_batch(&retryable, true, true, true),
+            )
+            .expect("retryable batch should persist");
+
+        let finalized_pending_path = manager.batch_path(&finalized_pending.id);
+        manager
+            .write_batch_manifest(
+                &finalized_pending_path,
+                &cleanup_batch(&finalized_pending, true, false, true),
+            )
+            .expect("finalized permanent-failure batch should persist");
+
+        let terminal_path = manager.batch_path(&terminal.id);
+        manager
+            .write_batch_manifest(
+                &terminal_path,
+                &cleanup_batch(&terminal, true, false, false),
+            )
+            .expect("terminal batch should persist");
+
+        let old_age = Duration::from_secs(9 * 24 * 60 * 60);
+        for preview in [
+            &abandoned,
+            &interrupted,
+            &retryable,
+            &finalized_pending,
+            &terminal,
+        ] {
+            set_operation_state_age(&manager.preview_path(&preview.id), old_age);
+        }
+        for path in [
+            &interrupted_path,
+            &retryable_path,
+            &finalized_pending_path,
+            &terminal_path,
+        ] {
+            set_operation_state_age(path, old_age);
+        }
+
+        let registry = Mutex::new(OperationStateCleanupCursorRegistry::default());
+        for _ in 0..4 {
+            let warnings = run_operation_state_cleanup(&manager, &registry);
+            assert!(warnings.is_empty(), "cleanup warnings: {warnings:?}");
+        }
+
+        assert!(!manager.preview_path(&abandoned.id).exists());
+        assert!(manager.preview_path(&fresh.id).exists());
+        assert!(manager.preview_path(&interrupted.id).exists());
+        assert!(interrupted_path.exists());
+        assert!(manager.preview_path(&retryable.id).exists());
+        assert!(retryable_path.exists());
+        assert!(!manager.preview_path(&finalized_pending.id).exists());
+        assert!(
+            !finalized_pending_path.exists(),
+            "a finished permanent failure with pending work should expire"
+        );
+        assert!(!manager.preview_path(&terminal.id).exists());
+        assert!(!terminal_path.exists());
+        assert_eq!(fs::read(&media_path).unwrap(), b"permanent media fixture");
+        assert_eq!(
+            fs::read(&partial_download_path).unwrap(),
+            b"user download fragment",
+            "operation-state cleanup must not remove download fragments"
+        );
+
+        for preview in [
+            &abandoned,
+            &fresh,
+            &interrupted,
+            &retryable,
+            &finalized_pending,
+            &terminal,
+        ] {
+            release_preview_anchors(&preview.id);
+        }
+    }
+
+    #[test]
+    fn operation_state_cleanup_rechecks_age_and_associated_batch_before_removal() {
+        let root = TemporaryRoot::new("operation-state-recheck");
+        fs::write(root.path().join("clip.mp4"), b"media fixture").expect("media should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        let old_age = Duration::from_secs(9 * 24 * 60 * 60);
+
+        let refreshed = cleanup_preview(&manager, &item_id);
+        let refreshed_path = manager.preview_path(&refreshed.id);
+        set_operation_state_age(&refreshed_path, old_age);
+        let refreshed_candidate = cleanup_preview_candidate(&manager, &refreshed);
+        assert!(operation_state_is_expired(
+            refreshed_candidate.modified_seconds,
+            SystemTime::now(),
+            ABANDONED_PREVIEW_TTL
+        ));
+        let refreshed_removed = manager
+            .remove_operation_state_candidate_with_hook(
+                &refreshed_candidate,
+                PREVIEW_LIMIT,
+                OperationStateFileKind::Preview,
+                &refreshed.id,
+                ABANDONED_PREVIEW_TTL,
+                || set_operation_state_age(&refreshed_path, Duration::from_secs(1)),
+            )
+            .expect("a refreshed preview should be retained safely");
+        assert!(!refreshed_removed);
+        assert!(refreshed_path.exists());
+
+        let batch_appeared = cleanup_preview(&manager, &item_id);
+        let batch_appeared_path = manager.preview_path(&batch_appeared.id);
+        set_operation_state_age(&batch_appeared_path, old_age);
+        let batch_candidate = cleanup_preview_candidate(&manager, &batch_appeared);
+        let batch_path = manager.batch_path(&batch_appeared.id);
+        let batch_removed = manager
+            .remove_operation_state_candidate_with_hook(
+                &batch_candidate,
+                PREVIEW_LIMIT,
+                OperationStateFileKind::Preview,
+                &batch_appeared.id,
+                ABANDONED_PREVIEW_TTL,
+                || {
+                    manager
+                        .write_batch_manifest(
+                            &batch_path,
+                            &cleanup_batch(&batch_appeared, false, false, true),
+                        )
+                        .expect("concurrent recovery state should persist");
+                },
+            )
+            .expect("a preview with a newly appeared batch should be retained safely");
+        assert!(!batch_removed);
+        assert!(batch_appeared_path.exists());
+        assert!(batch_path.exists());
+
+        release_preview_anchors(&refreshed.id);
+        release_preview_anchors(&batch_appeared.id);
+    }
+
+    #[test]
+    fn operation_state_cleanup_cursor_progress_survives_manager_reopen() {
+        const PREVIEW_COUNT: usize = 80;
+        let root = TemporaryRoot::new("operation-state-cursor-reopen");
+        fs::write(root.path().join("clip.mp4"), b"media fixture").expect("media should write");
+        let first_manager = manager(&root);
+        let snapshot = first_manager
+            .scan(&[])
+            .expect("initial scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        let base_preview = cleanup_preview(&first_manager, &item_id);
+        let base_persisted: PersistedPreview = serde_json::from_slice(
+            &first_manager
+                .read_private_file(&first_manager.preview_path(&base_preview.id), PREVIEW_LIMIT)
+                .unwrap()
+                .unwrap(),
+        )
+        .expect("base preview should parse");
+
+        let mut preview_paths = vec![first_manager.preview_path(&base_preview.id)];
+        for index in 0..PREVIEW_COUNT {
+            let id = format!("preview-{index:024x}");
+            let mut persisted = base_persisted.clone();
+            persisted.preview.id = id.clone();
+            let path = first_manager.preview_path(&id);
+            first_manager
+                .write_private_file(
+                    &path,
+                    &serde_json::to_vec(&persisted).expect("preview fixture should encode"),
+                )
+                .expect("preview fixture should persist");
+            preview_paths.push(path);
+        }
+
+        let directory_names = fs::read_dir(&first_manager.library_dir)
+            .expect("private state directory should enumerate")
+            .map(|entry| {
+                entry
+                    .expect("state directory entry should read")
+                    .file_name()
+                    .into_string()
+                    .expect("state directory names should be UTF-8")
+            })
+            .collect::<Vec<_>>();
+        let first_page_names = directory_names
+            .iter()
+            .take(MAX_OPERATION_STATE_DIRECTORY_NAMES_PER_PASS)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let old_age = Duration::from_secs(9 * 24 * 60 * 60);
+        let mut protected_paths = Vec::new();
+        let mut later_expired_count = 0usize;
+        for path in &preview_paths {
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("preview name should be UTF-8");
+            if first_page_names.contains(name) {
+                set_operation_state_age(path, Duration::from_secs(1));
+                protected_paths.push(path.clone());
+            } else {
+                set_operation_state_age(path, old_age);
+                later_expired_count += 1;
+            }
+        }
+        assert!(
+            protected_paths.len() >= 20,
+            "first directory page should contain preview states"
+        );
+        assert!(
+            later_expired_count > 32,
+            "expired previews should remain beyond the first page"
+        );
+
+        let registry = Mutex::new(OperationStateCleanupCursorRegistry::default());
+        let first_warnings = run_operation_state_cleanup(&first_manager, &registry);
+        assert!(
+            first_warnings.is_empty(),
+            "cleanup warnings: {first_warnings:?}"
+        );
+        assert!(protected_paths.iter().all(|path| path.exists()));
+        let remaining_after_first = preview_paths.iter().filter(|path| path.exists()).count();
+        assert!(remaining_after_first > 0);
+
+        let key_before_reopen = OperationStateCleanupCursorKey {
+            canonical_root: first_manager.root.root_path().to_path_buf(),
+            library_device: first_manager.library_dir_identity.device(),
+            library_inode: first_manager.library_dir_identity.inode(),
+        };
+        let cursor_before_reopen = registry
+            .lock()
+            .unwrap()
+            .cursor_for(key_before_reopen.clone());
+        assert!(cursor_before_reopen.lock().unwrap().is_some());
+        drop(first_manager);
+
+        let reopened = manager(&root);
+        let key_after_reopen = OperationStateCleanupCursorKey {
+            canonical_root: reopened.root.root_path().to_path_buf(),
+            library_device: reopened.library_dir_identity.device(),
+            library_inode: reopened.library_dir_identity.inode(),
+        };
+        let cursor_after_reopen = registry.lock().unwrap().cursor_for(key_after_reopen);
+        assert!(Arc::ptr_eq(&cursor_before_reopen, &cursor_after_reopen));
+
+        let second_warnings = run_operation_state_cleanup(&reopened, &registry);
+        assert!(
+            second_warnings.is_empty(),
+            "cleanup warnings: {second_warnings:?}"
+        );
+        let remaining_after_second = preview_paths.iter().filter(|path| path.exists()).count();
+        assert!(
+            remaining_after_second < remaining_after_first,
+            "a reopened manager should continue beyond protected entries"
+        );
+        assert!(protected_paths.iter().all(|path| path.exists()));
+
+        release_preview_anchors(&base_preview.id);
+    }
+
+    #[test]
+    fn operation_state_cleanup_cursor_registry_is_bounded_lru() {
+        let mut registry = OperationStateCleanupCursorRegistry::default();
+        let make_key = |index: usize| OperationStateCleanupCursorKey {
+            canonical_root: PathBuf::from(format!("/isolated/cleanup-root-{index}")),
+            library_device: index as u64,
+            library_inode: (index + 100) as u64,
+        };
+        let mut original_cursors = Vec::new();
+        for index in 0..MAX_OPERATION_STATE_CLEANUP_ROOTS {
+            original_cursors.push(registry.cursor_for(make_key(index)));
+        }
+        let first = registry.cursor_for(make_key(0));
+        assert!(Arc::ptr_eq(&first, &original_cursors[0]));
+        registry.cursor_for(make_key(MAX_OPERATION_STATE_CLEANUP_ROOTS));
+        assert_eq!(registry.entries.len(), MAX_OPERATION_STATE_CLEANUP_ROOTS);
+
+        let retained_first = registry.cursor_for(make_key(0));
+        assert!(Arc::ptr_eq(&retained_first, &original_cursors[0]));
+        let reinserted_second = registry.cursor_for(make_key(1));
+        assert!(!Arc::ptr_eq(&reinserted_second, &original_cursors[1]));
     }
 
     #[test]

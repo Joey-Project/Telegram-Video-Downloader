@@ -11804,19 +11804,21 @@ mod tests {
 
         for ordinal in 0..101 {
             let id = format!("cloud-task-summary-{ordinal:03}");
+            let mut task = TaskRecord::new(
+                id,
+                ordinal,
+                ordinal,
+                123_456_789,
+                Some(123_456_789),
+                ordinal as usize,
+                JobRequest::Youtube {
+                    url: format!("https://example.invalid/watch/{ordinal}"),
+                },
+            );
+            task.updated_at = 1_700_000_000 + ordinal as u64;
             assert!(
                 queue
-                    .create(TaskRecord::new(
-                        id,
-                        ordinal,
-                        ordinal,
-                        123_456_789,
-                        Some(123_456_789),
-                        ordinal as usize,
-                        JobRequest::Youtube {
-                            url: format!("https://example.invalid/watch/{ordinal}"),
-                        },
-                    ))
+                    .create(task)
                     .expect("summary fixture task should persist")
             );
         }

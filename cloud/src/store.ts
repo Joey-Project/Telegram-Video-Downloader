@@ -46,6 +46,33 @@ const MAX_SNAPSHOT_CHUNKS = 24;
 const MAX_SNAPSHOT_CANONICAL_JSON_NODES = 1_000_000;
 const HEARTBEAT_WRITE_INTERVAL_MS = 30_000;
 const SNAPSHOT_STALE_AFTER_MS = 10 * 60_000;
+// Keep acknowledged idempotency keys reserved for a bounded replay window.
+export const ACKED_INBOX_REPLAY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+export const ACKED_INBOX_PRUNE_BATCH_SIZE = 100;
+
+async function pruneAcknowledgedInbox(db: D1Database, now = Date.now()): Promise<number> {
+  const cutoff = now - ACKED_INBOX_REPLAY_RETENTION_MS;
+  const result = await db.prepare(
+    `DELETE FROM inbox
+     WHERE seq IN (
+       SELECT seq FROM inbox
+       WHERE acked_at IS NOT NULL AND acked_at < ?
+       ORDER BY acked_at ASC, seq ASC
+       LIMIT ?
+     )`,
+  ).bind(cutoff, ACKED_INBOX_PRUNE_BATCH_SIZE).run();
+  if (!result.success) throw new Error("D1 acknowledged inbox retention failed");
+  return result.meta.changes;
+}
+
+async function pruneAcknowledgedInboxBestEffort(db: D1Database): Promise<void> {
+  try {
+    await pruneAcknowledgedInbox(db);
+  } catch {
+    // Retention is maintenance; it must not change the result of a durable inbox operation.
+    console.warn(JSON.stringify({ event: "inbox_retention_prune_failed" }));
+  }
+}
 
 export async function enqueue(
   db: D1Database,
@@ -93,6 +120,7 @@ export async function enqueue(
 }
 
 export async function getPending(db: D1Database, limit: number): Promise<InboxEnvelope[]> {
+  await pruneAcknowledgedInboxBestEffort(db);
   const result = await db.prepare(
     "SELECT seq, kind, payload_json, created_at FROM inbox WHERE acked_at IS NULL ORDER BY seq ASC LIMIT ?",
   ).bind(limit).all<Omit<InboxRow, "acked_at" | "payload_hash">>();
@@ -137,6 +165,8 @@ export async function acknowledge(db: D1Database, seqs: number[]): Promise<numbe
   }
   const results = await db.batch(statements);
   if (results.some((result) => !result.success)) throw new Error("D1 inbox acknowledgement failed");
+  // The ACK is committed before best-effort cleanup; failures cannot make it appear uncommitted.
+  await pruneAcknowledgedInboxBestEffort(db);
   return results.reduce((total, result) => total + result.meta.changes, 0);
 }
 

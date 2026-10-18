@@ -12,6 +12,7 @@ import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDisp
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
 import { canonicalJson, MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS, MAX_STATE_BODY_BYTES } from "../src/validation";
+import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue } from "../src/store";
 import worker from "../src/index";
 
 const testEnv = env as typeof env & { TEST_MIGRATIONS: D1Migration[] };
@@ -602,6 +603,66 @@ describe("local client API and state snapshots", () => {
     expect(response.status).toBe(200);
     expect((await responseJson<{ acked: number }>(response)).acked).toBe(count);
     expect((await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox WHERE acked_at IS NOT NULL").first<{ count: number }>())?.count).toBe(count);
+  });
+
+  it("prunes only aged acknowledged replay keys in bounded passes during authenticated polling", async () => {
+    const expiredAt = Date.now() - ACKED_INBOX_REPLAY_RETENTION_MS - 60_000;
+    const expiredRows = Array.from({ length: ACKED_INBOX_PRUNE_BATCH_SIZE + 3 }, (_, index) =>
+      testEnv.DB.prepare("INSERT INTO inbox (dedup_key, payload_hash, kind, payload_json, created_at, acked_at) VALUES (?, ?, 'library_scan', '{}', ?, ?)")
+        .bind(`expired:${index}`, `hash-expired-${index}`, expiredAt, expiredAt),
+    );
+    await testEnv.DB.batch(expiredRows);
+    const recentAt = Date.now() - ACKED_INBOX_REPLAY_RETENTION_MS + 60_000;
+    await testEnv.DB.prepare(
+      "INSERT INTO inbox (dedup_key, payload_hash, kind, payload_json, created_at, acked_at) VALUES ('recent:1', 'hash-recent', 'library_scan', '{}', ?, ?)",
+    ).bind(expiredAt, recentAt).run();
+    await testEnv.DB.prepare(
+      "INSERT INTO inbox (dedup_key, payload_hash, kind, payload_json, created_at) VALUES ('pending:1', 'hash-pending', 'library_scan', '{}', ?)",
+    ).bind(expiredAt).run();
+
+    const firstPoll = await localRequests();
+    expect(firstPoll.status).toBe(200);
+    expect((await responseJson<{ requests: Array<{ seq: number }> }>(firstPoll)).requests).toHaveLength(1);
+    expect((await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox WHERE dedup_key LIKE 'expired:%'").first<{ count: number }>())?.count)
+      .toBe(3);
+    expect((await testEnv.DB.prepare("SELECT acked_at FROM inbox WHERE dedup_key = 'recent:1'").first<{ acked_at: number | null }>())?.acked_at)
+      .toBe(recentAt);
+    expect((await testEnv.DB.prepare("SELECT acked_at FROM inbox WHERE dedup_key = 'pending:1'").first<{ acked_at: number | null }>())?.acked_at)
+      .toBeNull();
+
+    const secondPoll = await localRequests();
+    expect(secondPoll.status).toBe(200);
+    expect((await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox WHERE dedup_key LIKE 'expired:%'").first<{ count: number }>())?.count)
+      .toBe(0);
+    const reused = await enqueue(testEnv.DB, "expired:0", "library_scan", {});
+    expect(reused.duplicate).toBe(false);
+  });
+
+  it("keeps a durable ACK successful when best-effort retention cleanup fails", async () => {
+    const expiredAt = Date.now() - ACKED_INBOX_REPLAY_RETENTION_MS - 60_000;
+    await testEnv.DB.prepare(
+      "INSERT INTO inbox (dedup_key, payload_hash, kind, payload_json, created_at, acked_at) VALUES ('expired:blocked', 'hash-expired', 'library_scan', '{}', ?, ?)",
+    ).bind(expiredAt, expiredAt).run();
+    await testEnv.DB.prepare(
+      "INSERT INTO inbox (dedup_key, payload_hash, kind, payload_json, created_at) VALUES ('pending:ack', 'hash-pending', 'library_scan', '{}', ?)",
+    ).bind(Date.now()).run();
+    await testEnv.DB.prepare(
+      "CREATE TRIGGER fail_inbox_retention_delete BEFORE DELETE ON inbox WHEN OLD.dedup_key = 'expired:blocked' BEGIN SELECT RAISE(ABORT, 'retention unavailable'); END",
+    ).run();
+    const pending = await testEnv.DB.prepare("SELECT seq FROM inbox WHERE dedup_key = 'pending:ack'").first<{ seq: number }>();
+    expect(pending).not.toBeNull();
+
+    const response = await SELF.fetch(new Request(`${workerUrl}/api/local/ack`, {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ seqs: [pending!.seq] }),
+    }));
+    expect(response.status).toBe(200);
+    expect(await responseJson<{ acked: number }>(response)).toEqual({ acked: 1 });
+    expect((await testEnv.DB.prepare("SELECT acked_at FROM inbox WHERE dedup_key = 'pending:ack'").first<{ acked_at: number | null }>())?.acked_at)
+      .not.toBeNull();
+    expect((await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox WHERE dedup_key = 'expired:blocked'").first<{ count: number }>())?.count)
+      .toBe(1);
   });
 
   it("serves the static Mini App at the stable /file/ path", async () => {
