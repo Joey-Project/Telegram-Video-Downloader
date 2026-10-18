@@ -4,6 +4,7 @@ import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetai
 import { HttpResponseError } from "./http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limit.js";
+import { submitLegacyFileImport } from "./legacy-file-import.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
 import { sourceIdUrl } from "./source-links.js";
 
@@ -719,7 +720,14 @@ function bindEvents() {
   byId("import-legacy").addEventListener("click", async () => {
     let text = byId("legacy-text").value;
     const fileInput = byId("legacy-file");
-    if (!text && fileInput?.files?.[0]) text = await fileInput.files[0].text();
+    if (!text && fileInput?.files?.[0]) {
+      return submitLegacyFileImport(
+        fileInput.files[0],
+        (value) => submitAction("legacy_import", { text: value }),
+        showToast,
+        MAX_LEGACY_BYTES,
+      );
+    }
     const bytes = new TextEncoder().encode(text).byteLength;
     if (bytes === 0) return showToast("Paste legacy text or choose a text file first.");
     if (bytes > MAX_LEGACY_BYTES) return showToast("Legacy text exceeds the 256 KB limit.");

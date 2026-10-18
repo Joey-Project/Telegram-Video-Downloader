@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -10,7 +11,10 @@ use crate::config::CloudConfig;
 use crate::file_provider::{
     QueueFileProvider, classify_deadlock_error, is_deadlock_error, platform_queue_file_provider,
 };
-use crate::safe_fs::{BoundFile, EntryIdentity, RootedFs};
+use crate::safe_fs::{
+    BoundDirectoryCursor, BoundDirectoryCursorEntry, BoundDirectoryEntrySetStamp, BoundEntry,
+    BoundFile, EntryIdentity, RootedFs,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -36,6 +40,11 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_LEGACY_IMPORT_BYTES: usize = 256 * 1024;
 const MAX_MANAGEMENT_STATE_RECORDS: usize = 100;
 pub(crate) const CLOUD_REQUEST_PAGE_SIZE: usize = 100;
+// Keep terminal local receipts through the same replay window as D1 ACK tombstones.
+const CLOUD_INBOX_TERMINAL_REPLAY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+// Each inbox API call makes bounded recovery/cleanup progress instead of draining history at once.
+const CLOUD_INBOX_SCAN_MAX_NAMES: usize = 32;
+const CLOUD_INBOX_SCAN_MAX_BYTES: usize = 8 * 1024 * 1024;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type CloudWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -387,6 +396,11 @@ impl InboxStateIndex {
         }
     }
 
+    fn forget(&mut self, seq: u64) {
+        self.recent_management.remove(&seq);
+        self.awaiting_previews.remove(&seq);
+    }
+
     fn sequences_bounded(&self, max_awaiting_previews: usize) -> (BTreeSet<u64>, usize) {
         let omitted_previews = self
             .awaiting_previews
@@ -414,6 +428,45 @@ fn set_pending_sequence(index: &mut BTreeSet<u64>, seq: u64, status: InboxStatus
     } else {
         index.remove(&seq);
     }
+}
+
+fn cloud_request_sequence_from_name(name: &OsStr) -> Result<Option<u64>> {
+    let Some(name) = name.to_str() else {
+        if name.to_string_lossy().starts_with(CLOUD_REQUEST_PREFIX) {
+            bail!("cloud inbox request filename is not valid UTF-8; entry was retained");
+        }
+        return Ok(None);
+    };
+    let Some(encoded_sequence) = name.strip_prefix(CLOUD_REQUEST_PREFIX) else {
+        return Ok(None);
+    };
+    let Some(digits) = encoded_sequence.strip_suffix(CLOUD_REQUEST_SUFFIX) else {
+        bail!("cloud inbox request filename has an invalid suffix; entry was retained");
+    };
+    if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("cloud inbox request filename has an invalid sequence; entry was retained");
+    }
+    let seq = digits
+        .parse::<u64>()
+        .context("cloud inbox request filename sequence is not representable")?;
+    if seq == 0 || seq > MAX_JS_SAFE_INTEGER {
+        bail!("cloud inbox request filename sequence is outside the supported range");
+    }
+    let expected = format!("{CLOUD_REQUEST_PREFIX}{seq:020}{CLOUD_REQUEST_SUFFIX}");
+    if name != expected {
+        bail!("cloud inbox request filename is not canonical; entry was retained");
+    }
+    Ok(Some(seq))
+}
+
+fn inbox_terminal_record_expired(record: &InboxRecord, now: u64) -> bool {
+    let terminal = matches!(
+        record.status,
+        InboxStatus::Completed | InboxStatus::Failed | InboxStatus::Uncertain | InboxStatus::Stale
+    );
+    terminal
+        && record.updated_at <= now
+        && now.saturating_sub(record.updated_at) >= CLOUD_INBOX_TERMINAL_REPLAY_RETENTION.as_secs()
 }
 
 impl InboxRecord {
@@ -452,6 +505,28 @@ struct PersistedStateVersion {
     state_version: u64,
 }
 
+struct InboxRecoveryScan {
+    cursor: Option<BoundDirectoryCursor>,
+    initial_complete: bool,
+    // A completed read-only pass may still be followed by bounded Processing rewrites.
+    indexing_complete: bool,
+    processing_recovery: BTreeSet<u64>,
+    // Only a rescan hint for directory-entry churn; identity and access policy are checked apart.
+    directory_entry_set_stamp: Option<BoundDirectoryEntrySetStamp>,
+}
+
+enum InboxRecordRead {
+    Missing,
+    Deferred,
+    Present {
+        record: Box<InboxRecord>,
+        entry: BoundEntry,
+        identity: EntryIdentity,
+        file: BoundFile,
+        bytes: Vec<u8>,
+    },
+}
+
 #[derive(Clone)]
 pub struct CloudInbox {
     root: RootedFs,
@@ -462,6 +537,7 @@ pub struct CloudInbox {
     operation_lock: Arc<Mutex<()>>,
     pending_sequences: Arc<Mutex<BTreeSet<u64>>>,
     state_index: Arc<Mutex<InboxStateIndex>>,
+    recovery_scan: Arc<Mutex<InboxRecoveryScan>>,
 }
 
 impl CloudInbox {
@@ -477,9 +553,9 @@ impl CloudInbox {
         let directory = root.logical_root_path().join(CLOUD_INBOX_DIRECTORY);
         coordinate_private_directory_creation(file_provider.as_ref(), &root, &directory)?;
         let (directory, directory_identity) =
-            coordinate_bound_directory_listing(file_provider.as_ref(), &root, &directory)?;
+            coordinate_bound_directory(file_provider.as_ref(), &root, &directory)?;
         let owner_lock = create_owner_lock(&directory, &directory, &root, &file_provider)?;
-        let mut inbox = Self {
+        let inbox = Self {
             root,
             file_provider,
             directory,
@@ -488,11 +564,16 @@ impl CloudInbox {
             operation_lock: Arc::new(Mutex::new(())),
             pending_sequences: Arc::new(Mutex::new(BTreeSet::new())),
             state_index: Arc::new(Mutex::new(InboxStateIndex::default())),
+            recovery_scan: Arc::new(Mutex::new(InboxRecoveryScan {
+                cursor: None,
+                initial_complete: false,
+                indexing_complete: false,
+                processing_recovery: BTreeSet::new(),
+                directory_entry_set_stamp: None,
+            })),
         };
-        // A single local process owns the inbox. Recover unfinished management operations, which
-        // are idempotent by cloud sequence and (for confirmed moves) by the file manager's
-        // persistent preview manifest. A Telegram update interrupted mid-command is surfaced as
-        // uncertain because some commands have external side effects without a durable receipt.
+        // The first recovery page is bounded; pending() continues the scan before any dispatch.
+        // This avoids loading the complete request history into memory during startup.
         inbox.recover_interrupted_requests()?;
         Ok(inbox)
     }
@@ -532,17 +613,17 @@ impl CloudInbox {
             error: None,
             result: None,
         };
-        let mut pending = self
-            .pending_sequences
-            .lock()
-            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?;
-        let mut state_index = self
-            .state_index
-            .lock()
-            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
         self.write_record_path(&path, &record)?;
-        pending.insert(record.request.seq);
-        state_index.record(&record);
+        if !self.restart_incomplete_recovery_after_directory_write()? {
+            self.pending_sequences
+                .lock()
+                .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?
+                .insert(record.request.seq);
+            self.state_index
+                .lock()
+                .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
+                .record(&record);
+        }
         Ok(true)
     }
 
@@ -551,6 +632,9 @@ impl CloudInbox {
             .operation_lock
             .lock()
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        if !self.recover_interrupted_requests()? {
+            bail!("cloud inbox startup recovery is still in progress");
+        }
         let paths = self.list_record_paths()?;
         paths
             .into_iter()
@@ -579,6 +663,9 @@ impl CloudInbox {
             .operation_lock
             .lock()
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        if !self.recover_interrupted_requests()? {
+            bail!("cloud inbox startup recovery is still in progress");
+        }
         let (sequences, omitted_previews) = self
             .state_index
             .lock()
@@ -607,6 +694,9 @@ impl CloudInbox {
             .operation_lock
             .lock()
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        if !self.recover_interrupted_requests()? {
+            return Ok(Vec::new());
+        }
         let sequences = self
             .pending_sequences
             .lock()
@@ -669,17 +759,19 @@ impl CloudInbox {
             .ok_or_else(|| anyhow!("cloud inbox request {seq} is missing"))?;
         update(&mut record)?;
         record.updated_at = now_seconds();
-        let mut pending = self
-            .pending_sequences
-            .lock()
-            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?;
-        let mut state_index = self
-            .state_index
-            .lock()
-            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
         self.write_record_path(&path, &record)?;
-        set_pending_sequence(&mut pending, seq, record.status);
-        state_index.record(&record);
+        if !self.restart_incomplete_recovery_after_directory_write()? {
+            let mut pending = self
+                .pending_sequences
+                .lock()
+                .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?;
+            let mut state_index = self
+                .state_index
+                .lock()
+                .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
+            set_pending_sequence(&mut pending, seq, record.status);
+            state_index.record(&record);
+        }
         Ok(record)
     }
 
@@ -705,6 +797,7 @@ impl CloudInbox {
             return Err(CloudStateVersionExhausted.into());
         }
         self.write_state_version(&path, next)?;
+        self.restart_incomplete_recovery_after_directory_write()?;
         Ok(next)
     }
 
@@ -735,20 +828,19 @@ impl CloudInbox {
             .map_err(|error| classify_deadlock_error(&self.directory, "read", error))?;
         let entries =
             entries.ok_or_else(|| anyhow!("File Provider did not provide cloud inbox listing"))?;
-        let mut paths = entries
-            .into_iter()
-            .filter_map(|(name, identity)| {
-                if !identity.is_file() {
-                    return None;
-                }
-                let name = name.to_string_lossy();
-                if name.starts_with(CLOUD_REQUEST_PREFIX) && name.ends_with(CLOUD_REQUEST_SUFFIX) {
-                    Some(self.directory.join(name.as_ref()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        for (name, identity) in entries {
+            let Some(seq) = cloud_request_sequence_from_name(&name)? else {
+                continue;
+            };
+            if !identity.is_file() {
+                bail!(
+                    "cloud inbox request path is not a regular file: {}",
+                    name.to_string_lossy()
+                );
+            }
+            paths.push(self.record_path(seq));
+        }
         paths.sort();
         Ok(paths)
     }
@@ -793,6 +885,72 @@ impl CloudInbox {
             .coordinate_read(path, &mut read)
             .map_err(|error| classify_deadlock_error(path, "read", error))?;
         Ok(record)
+    }
+
+    fn read_recovery_record(
+        &self,
+        path: &Path,
+        expected: EntryIdentity,
+        remaining_bytes: usize,
+    ) -> Result<InboxRecordRead> {
+        let mut result = None;
+        let mut read = |coordinated_path: &Path| -> Result<()> {
+            let coordinated = coordinated_path_under_root(&self.root, coordinated_path)?;
+            if coordinated != path {
+                bail!("File Provider changed a cloud inbox record path");
+            }
+            self.validate_directory()?;
+            let entry = self.root.bind_entry(path, false)?;
+            match self.root.bound_entry_identity(&entry)? {
+                None => {
+                    result = Some(InboxRecordRead::Missing);
+                    return Ok(());
+                }
+                Some(identity) if identity != expected => {
+                    bail!("cloud inbox request path was replaced during recovery")
+                }
+                Some(_) => {}
+            }
+            let file = self.root.open_bound_file_if_identity(&entry, expected)?;
+            file.validate_private_single_link(0o600)
+                .context("cloud inbox record is not owner-private")?;
+            let byte_len = usize::try_from(file.byte_len()?)
+                .context("cloud inbox record length is not representable")?;
+            if byte_len > MAX_REQUEST_BYTES + 64 * 1024 {
+                bail!("cloud inbox record exceeds the local persistence limit");
+            }
+            if byte_len.saturating_add(1) > remaining_bytes {
+                result = Some(InboxRecordRead::Deferred);
+                return Ok(());
+            }
+            let bytes = file.read_limited(byte_len)?;
+            if bytes.len() != byte_len || usize::try_from(file.byte_len()?)? != byte_len {
+                bail!("cloud inbox record changed length while being read");
+            }
+            file.validate_private_single_link(0o600)
+                .context("cloud inbox record access policy changed while being read")?;
+            if self.root.bound_entry_identity(&entry)? != Some(expected) {
+                bail!("cloud inbox request path was replaced while being read");
+            }
+            let record: InboxRecord =
+                serde_json::from_slice(&bytes).context("cloud inbox record is invalid")?;
+            if record.schema_version != INBOX_RECORD_VERSION {
+                bail!("unsupported cloud inbox record version");
+            }
+            record.request.validate()?;
+            result = Some(InboxRecordRead::Present {
+                record: Box::new(record),
+                entry,
+                identity: expected,
+                file,
+                bytes,
+            });
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(path, &mut read)
+            .map_err(|error| classify_deadlock_error(path, "read", error))?;
+        result.ok_or_else(|| anyhow!("File Provider did not provide cloud inbox record access"))
     }
 
     fn read_state_version(&self, path: &Path) -> Result<Option<u64>> {
@@ -910,46 +1068,498 @@ impl CloudInbox {
             .context("cloud inbox directory is not owner-private")
     }
 
-    fn recover_interrupted_requests(&mut self) -> Result<()> {
-        let mut pending = BTreeSet::new();
-        let mut state_index = InboxStateIndex::default();
-        for mut record in self.records()? {
-            if record.status != InboxStatus::Processing {
-                if matches!(record.status, InboxStatus::Pending | InboxStatus::Retryable) {
-                    pending.insert(record.request.seq);
-                }
-                state_index.record(&record);
-                continue;
-            }
-            if record.request.kind == "telegram" {
-                record.status = InboxStatus::Uncertain;
-                record.error = Some(
-                    "The bot stopped during this Telegram command. Check the task queue before resending.".to_string(),
-                );
-            } else {
-                record.status = InboxStatus::Pending;
-                record.attempts = record.attempts.saturating_add(1);
-                record.next_attempt_at = 0;
-                record.error = Some(
-                    "Recovered an interrupted local operation; retrying from its durable request."
-                        .to_string(),
-                );
-            }
-            self.write_record_path(&self.record_path(record.request.seq), &record)?;
-            if matches!(record.status, InboxStatus::Pending | InboxStatus::Retryable) {
-                pending.insert(record.request.seq);
-            }
-            state_index.record(&record);
+    fn recover_interrupted_requests(&self) -> Result<bool> {
+        let mut scan = self
+            .recovery_scan
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox recovery cursor lock was poisoned"))?;
+        if scan.initial_complete {
+            // Retention runs only after the startup index is complete. Deletions can perturb the
+            // cursor, so later bounded calls resume with fresh passes until it reaches every row.
+            self.prune_terminal_receipts_page(&mut scan)?;
+            return Ok(true);
         }
-        *self
+
+        if !scan.indexing_complete {
+            if !self.index_initial_recovery_page(&mut scan)? {
+                return Ok(false);
+            }
+            if scan.processing_recovery.is_empty() {
+                scan.initial_complete = true;
+                return Ok(true);
+            }
+            // Processing rewrites use temporary siblings, so start them after this cursor closes.
+            return Ok(false);
+        }
+
+        self.recover_processing_records_page(&mut scan)?;
+        if scan.processing_recovery.is_empty() {
+            // Rebuild the index after the bounded rewrites, using a clean read-only pass.
+            self.reset_incomplete_recovery(&mut scan)?;
+        }
+        Ok(false)
+    }
+
+    fn index_initial_recovery_page(&self, scan: &mut InboxRecoveryScan) -> Result<bool> {
+        let mut names_read = 0usize;
+        let mut bytes_read = 0usize;
+
+        loop {
+            let names_left = CLOUD_INBOX_SCAN_MAX_NAMES.saturating_sub(names_read);
+            let page = self.peek_recovery_cursor(scan, names_left)?;
+            names_read = names_read.saturating_add(page.names_read);
+            let Some(entry) = page.entry else {
+                if page.exhausted {
+                    if self.initial_enumeration_changed(scan)? {
+                        self.reset_incomplete_recovery(scan)?;
+                        return Ok(false);
+                    }
+                    scan.cursor = None;
+                    scan.directory_entry_set_stamp = None;
+                    scan.indexing_complete = true;
+                    return Ok(true);
+                }
+                if names_read >= CLOUD_INBOX_SCAN_MAX_NAMES || page.names_read == 0 {
+                    break;
+                }
+                continue;
+            };
+
+            match entry {
+                BoundDirectoryCursorEntry::Unreadable { name, error } => {
+                    bail!(
+                        "cloud inbox directory entry is unreadable and was retained: {}: {error}",
+                        name.to_string_lossy()
+                    );
+                }
+                BoundDirectoryCursorEntry::Present { name, identity } => {
+                    let Some(seq) = cloud_request_sequence_from_name(&name)? else {
+                        self.root.consume_bound_directory_cursor_entry(
+                            scan.cursor
+                                .as_mut()
+                                .ok_or_else(|| anyhow!("cloud inbox recovery cursor is missing"))?,
+                        );
+                        continue;
+                    };
+                    if !identity.is_file() {
+                        bail!(
+                            "cloud inbox request path is not a regular file: {}",
+                            name.to_string_lossy()
+                        );
+                    }
+                    let path = self.record_path(seq);
+                    let remaining_bytes = CLOUD_INBOX_SCAN_MAX_BYTES.saturating_sub(bytes_read);
+                    match self.read_recovery_record(&path, identity, remaining_bytes)? {
+                        InboxRecordRead::Missing => {
+                            bail!(
+                                "cloud inbox request disappeared during recovery: {}",
+                                path.display()
+                            );
+                        }
+                        InboxRecordRead::Deferred => break,
+                        InboxRecordRead::Present { record, bytes, .. } => {
+                            bytes_read = bytes_read.saturating_add(bytes.len().saturating_add(1));
+                            if record.request.seq != seq {
+                                bail!(
+                                    "cloud inbox request sequence does not match its filename: {}",
+                                    path.display()
+                                );
+                            }
+                            if record.status == InboxStatus::Processing {
+                                scan.processing_recovery.insert(seq);
+                            }
+                            self.index_record(&record)?;
+                            self.root.consume_bound_directory_cursor_entry(
+                                scan.cursor.as_mut().ok_or_else(|| {
+                                    anyhow!("cloud inbox recovery cursor is missing")
+                                })?,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(scan.indexing_complete)
+    }
+
+    fn recover_processing_records_page(&self, scan: &mut InboxRecoveryScan) -> Result<()> {
+        let mut names_read = 0usize;
+        let mut bytes_read = 0usize;
+        while names_read < CLOUD_INBOX_SCAN_MAX_NAMES {
+            let Some(seq) = scan.processing_recovery.iter().next().copied() else {
+                break;
+            };
+            let path = self.record_path(seq);
+            let entry = self.root.bind_entry(&path, false)?;
+            let identity = self.root.bound_entry_identity(&entry)?.ok_or_else(|| {
+                anyhow!(
+                    "cloud inbox request disappeared during recovery: {}",
+                    path.display()
+                )
+            })?;
+            if !identity.is_file() {
+                bail!(
+                    "cloud inbox request path is not a regular file: {}",
+                    path.display()
+                );
+            }
+            let remaining_bytes = CLOUD_INBOX_SCAN_MAX_BYTES.saturating_sub(bytes_read);
+            match self.read_recovery_record(&path, identity, remaining_bytes)? {
+                InboxRecordRead::Missing => {
+                    bail!(
+                        "cloud inbox request disappeared during recovery: {}",
+                        path.display()
+                    );
+                }
+                InboxRecordRead::Deferred => break,
+                InboxRecordRead::Present {
+                    mut record, bytes, ..
+                } => {
+                    bytes_read = bytes_read.saturating_add(bytes.len().saturating_add(1));
+                    if record.request.seq != seq {
+                        bail!(
+                            "cloud inbox request sequence does not match its filename: {}",
+                            path.display()
+                        );
+                    }
+                    if record.status == InboxStatus::Processing {
+                        if record.request.kind == "telegram" {
+                            record.status = InboxStatus::Uncertain;
+                            record.error = Some(
+                                "The bot stopped during this Telegram command. Check the task queue before resending."
+                                    .to_string(),
+                            );
+                        } else {
+                            record.status = InboxStatus::Pending;
+                            record.attempts = record.attempts.saturating_add(1);
+                            record.next_attempt_at = 0;
+                            record.error = Some(
+                                "Recovered an interrupted local operation; retrying from its durable request."
+                                    .to_string(),
+                            );
+                        }
+                        record.updated_at = now_seconds();
+                        self.write_record_path(&path, &record)?;
+                    }
+                    self.index_record(&record)?;
+                    scan.processing_recovery.remove(&seq);
+                    names_read = names_read.saturating_add(1);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn initial_enumeration_changed(&self, scan: &InboxRecoveryScan) -> Result<bool> {
+        let expected = scan
+            .directory_entry_set_stamp
+            .ok_or_else(|| anyhow!("cloud inbox initial enumeration stamp is missing"))?;
+        let mut current = None;
+        let mut read = |coordinated_path: &Path| -> Result<()> {
+            let coordinated = coordinated_path_under_root(&self.root, coordinated_path)?;
+            if coordinated != self.directory {
+                bail!("File Provider changed the cloud inbox directory path");
+            }
+            self.validate_directory()?;
+            let entry = self.root.bind_entry(&self.directory, false)?;
+            current = Some(self.root.bound_directory_entry_set_stamp(
+                &entry,
+                self.directory_identity,
+                0o700,
+            )?);
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(&self.directory, &mut read)
+            .map_err(|error| classify_deadlock_error(&self.directory, "read", error))?;
+        let current = current.ok_or_else(|| {
+            anyhow!("File Provider did not provide cloud inbox enumeration revalidation")
+        })?;
+        Ok(current != expected)
+    }
+
+    fn prune_terminal_receipts_page(&self, scan: &mut InboxRecoveryScan) -> Result<()> {
+        let mut names_read = 0usize;
+        let mut bytes_read = 0usize;
+
+        loop {
+            let names_left = CLOUD_INBOX_SCAN_MAX_NAMES.saturating_sub(names_read);
+            let page = self.peek_recovery_cursor(scan, names_left)?;
+            names_read = names_read.saturating_add(page.names_read);
+            let Some(entry) = page.entry else {
+                if page.exhausted {
+                    scan.cursor = None;
+                }
+                if page.exhausted || names_read >= CLOUD_INBOX_SCAN_MAX_NAMES {
+                    break;
+                }
+                if page.names_read == 0 {
+                    break;
+                }
+                continue;
+            };
+
+            match entry {
+                BoundDirectoryCursorEntry::Unreadable { name, error } => {
+                    bail!(
+                        "cloud inbox directory entry is unreadable and was retained: {}: {error}",
+                        name.to_string_lossy()
+                    );
+                }
+                BoundDirectoryCursorEntry::Present { name, identity } => {
+                    let Some(seq) = cloud_request_sequence_from_name(&name)? else {
+                        self.root.consume_bound_directory_cursor_entry(
+                            scan.cursor
+                                .as_mut()
+                                .ok_or_else(|| anyhow!("cloud inbox recovery cursor is missing"))?,
+                        );
+                        continue;
+                    };
+                    if !identity.is_file() {
+                        bail!(
+                            "cloud inbox request path is not a regular file: {}",
+                            name.to_string_lossy()
+                        );
+                    }
+                    let path = self.record_path(seq);
+                    let remaining_bytes = CLOUD_INBOX_SCAN_MAX_BYTES.saturating_sub(bytes_read);
+                    match self.read_recovery_record(&path, identity, remaining_bytes)? {
+                        InboxRecordRead::Missing => {
+                            bail!(
+                                "cloud inbox request disappeared during recovery: {}",
+                                path.display()
+                            );
+                        }
+                        InboxRecordRead::Deferred => break,
+                        InboxRecordRead::Present {
+                            record,
+                            entry,
+                            identity,
+                            file,
+                            bytes,
+                        } => {
+                            let content_read_budget = bytes.len().saturating_add(1);
+                            bytes_read = bytes_read.saturating_add(content_read_budget);
+                            if record.request.seq != seq {
+                                bail!(
+                                    "cloud inbox request sequence does not match its filename: {}",
+                                    path.display()
+                                );
+                            }
+
+                            if inbox_terminal_record_expired(&record, now_seconds())
+                                && content_read_budget
+                                    <= CLOUD_INBOX_SCAN_MAX_BYTES.saturating_sub(bytes_read)
+                                && self.remove_expired_terminal_record(
+                                    seq, &entry, identity, &file, &bytes, &record,
+                                )?
+                            {
+                                // Removal revalidates the serialized envelope after quarantine.
+                                bytes_read = bytes_read.saturating_add(content_read_budget);
+                                self.forget_indexed_record(seq)?;
+                                self.root.consume_bound_directory_cursor_entry(
+                                    scan.cursor.as_mut().ok_or_else(|| {
+                                        anyhow!("cloud inbox recovery cursor is missing")
+                                    })?,
+                                );
+                                continue;
+                            } else if inbox_terminal_record_expired(&record, now_seconds())
+                                && content_read_budget
+                                    <= CLOUD_INBOX_SCAN_MAX_BYTES.saturating_sub(bytes_read)
+                            {
+                                // Even a declined cleanup performs a second bounded content read.
+                                bytes_read = bytes_read.saturating_add(content_read_budget);
+                            }
+
+                            self.index_record(&record)?;
+                            self.root.consume_bound_directory_cursor_entry(
+                                scan.cursor.as_mut().ok_or_else(|| {
+                                    anyhow!("cloud inbox recovery cursor is missing")
+                                })?,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn peek_recovery_cursor(
+        &self,
+        scan: &mut InboxRecoveryScan,
+        max_names: usize,
+    ) -> Result<crate::safe_fs::BoundDirectoryCursorPage> {
+        let mut page = None;
+        let mut read = |coordinated_path: &Path| -> Result<()> {
+            let coordinated = coordinated_path_under_root(&self.root, coordinated_path)?;
+            if coordinated != self.directory {
+                bail!("File Provider changed the cloud inbox directory path");
+            }
+            self.validate_directory()?;
+            let directory = self.root.bind_entry(&self.directory, false)?;
+            if self.root.bound_entry_identity(&directory)? != Some(self.directory_identity) {
+                bail!("cloud inbox directory was replaced during recovery");
+            }
+            if scan.cursor.is_none() {
+                if !scan.indexing_complete && !scan.initial_complete {
+                    scan.directory_entry_set_stamp =
+                        Some(self.root.bound_directory_entry_set_stamp(
+                            &directory,
+                            self.directory_identity,
+                            0o700,
+                        )?);
+                }
+                scan.cursor = Some(self.root.start_bound_directory_cursor(
+                    &directory,
+                    self.directory_identity,
+                    0o700,
+                )?);
+            }
+            let cursor = scan
+                .cursor
+                .as_mut()
+                .ok_or_else(|| anyhow!("cloud inbox recovery cursor was not initialized"))?;
+            page = Some(
+                self.root
+                    .peek_bound_directory_cursor(cursor, max_names, 0o700)?,
+            );
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_read(&self.directory, &mut read)
+            .map_err(|error| classify_deadlock_error(&self.directory, "read", error))?;
+        page.ok_or_else(|| anyhow!("File Provider did not provide cloud inbox recovery access"))
+    }
+
+    fn index_record(&self, record: &InboxRecord) -> Result<()> {
+        let mut pending = self
             .pending_sequences
             .lock()
-            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))? = pending;
+            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?;
+        let mut state_index = self
+            .state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
+        set_pending_sequence(&mut pending, record.request.seq, record.status);
+        state_index.record(record);
+        Ok(())
+    }
+
+    fn forget_indexed_record(&self, seq: u64) -> Result<()> {
+        self.pending_sequences
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?
+            .remove(&seq);
+        self.state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
+            .forget(seq);
+        Ok(())
+    }
+
+    fn restart_incomplete_recovery_after_directory_write(&self) -> Result<bool> {
+        let mut scan = self
+            .recovery_scan
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox recovery cursor lock was poisoned"))?;
+        if scan.initial_complete {
+            return Ok(false);
+        }
+        self.reset_incomplete_recovery(&mut scan)?;
+        Ok(true)
+    }
+
+    fn reset_incomplete_recovery(&self, scan: &mut InboxRecoveryScan) -> Result<()> {
+        scan.cursor = None;
+        scan.initial_complete = false;
+        scan.indexing_complete = false;
+        scan.processing_recovery.clear();
+        scan.directory_entry_set_stamp = None;
+        self.pending_sequences
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?
+            .clear();
         *self
             .state_index
             .lock()
-            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))? = state_index;
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))? =
+            InboxStateIndex::default();
         Ok(())
+    }
+
+    fn remove_expired_terminal_record(
+        &self,
+        seq: u64,
+        entry: &BoundEntry,
+        identity: EntryIdentity,
+        file: &BoundFile,
+        bytes: &[u8],
+        record: &InboxRecord,
+    ) -> Result<bool> {
+        if !inbox_terminal_record_expired(record, now_seconds()) {
+            return Ok(false);
+        }
+        let path = self.record_path(seq);
+        let mut removed_result = None;
+        let mut remove = |coordinated_path: &Path| -> Result<()> {
+            let coordinated = coordinated_path_under_root(&self.root, coordinated_path)?;
+            if coordinated != path {
+                bail!("File Provider changed a cloud inbox cleanup path");
+            }
+            if !inbox_terminal_record_expired(record, now_seconds()) {
+                removed_result = Some(false);
+                return Ok(());
+            }
+            // Preserve object identity, exact envelope bytes, and private access policy through
+            // quarantine. Modification times are intentionally not treated as content changes.
+            self.validate_directory()?;
+            file.validate_private_single_link(0o600)
+                .context("cloud inbox record access policy changed before cleanup")?;
+            let mut no_longer_eligible = false;
+            let removed =
+                self.root
+                    .remove_bound_file_if_identity_with_validation(entry, identity, || {
+                        self.validate_directory()?;
+                        file.validate_private_single_link(0o600)
+                            .context("cloud inbox record access policy changed during cleanup")?;
+                        if usize::try_from(file.byte_len()?)? != bytes.len() {
+                            bail!("cloud inbox record length changed before cleanup");
+                        }
+                        let current_bytes = file.read_limited(bytes.len())?;
+                        if current_bytes != bytes
+                            || usize::try_from(file.byte_len()?)? != bytes.len()
+                        {
+                            bail!("cloud inbox record content changed before cleanup");
+                        }
+                        let current: InboxRecord = serde_json::from_slice(&current_bytes)
+                            .context("cloud inbox record became unreadable before cleanup")?;
+                        if current.schema_version != INBOX_RECORD_VERSION
+                            || current.request.seq != seq
+                            || !inbox_terminal_record_expired(&current, now_seconds())
+                        {
+                            no_longer_eligible = true;
+                            bail!("cloud inbox record is no longer eligible for cleanup");
+                        }
+                        current.request.validate()?;
+                        file.validate_private_single_link(0o600)
+                            .context("cloud inbox record access policy changed before unlink")?;
+                        self.validate_directory()
+                    });
+            match removed {
+                Ok(()) => removed_result = Some(true),
+                Err(_) if no_longer_eligible => removed_result = Some(false),
+                Err(error) => {
+                    return Err(error.context("failed to safely prune expired cloud inbox record"));
+                }
+            }
+            Ok(())
+        };
+        self.file_provider
+            .coordinate_write(&path, &mut remove)
+            .map_err(|error| classify_deadlock_error(&path, "write", error))?;
+        removed_result
+            .ok_or_else(|| anyhow!("File Provider did not provide cloud inbox cleanup access"))
     }
 }
 
@@ -1041,7 +1651,7 @@ fn coordinate_private_directory_creation(
     Ok(())
 }
 
-fn coordinate_bound_directory_listing(
+fn coordinate_bound_directory(
     file_provider: &dyn QueueFileProvider,
     root: &RootedFs,
     path: &Path,
@@ -1057,15 +1667,13 @@ fn coordinate_bound_directory_listing(
             .bound_entry_identity(&entry)?
             .ok_or_else(|| anyhow!("coordinated cloud inbox directory disappeared"))?;
         root.validate_private_bound_directory(&entry, identity, 0o700)?;
-        let _ = root.list_bound_directory(&entry, identity)?;
-        root.validate_private_bound_directory(&entry, identity, 0o700)?;
         result = Some((accessor, identity));
         Ok(())
     };
     file_provider
         .coordinate_read(path, &mut read)
         .map_err(|error| classify_deadlock_error(path, "read", error))?;
-    result.ok_or_else(|| anyhow!("File Provider did not provide cloud inbox listing"))
+    result.ok_or_else(|| anyhow!("File Provider did not provide cloud inbox directory access"))
 }
 
 fn coordinated_path_under_root(root: &RootedFs, coordinated_path: &Path) -> Result<PathBuf> {
@@ -1208,6 +1816,97 @@ mod tests {
         assert!(sequences.contains(&120));
         assert!(sequences.contains(&121));
         assert!(sequences.contains(&220));
+    }
+
+    #[test]
+    fn recovery_only_accepts_canonical_request_filenames() {
+        let path = PathBuf::from(format!(
+            "{CLOUD_REQUEST_PREFIX}{:020}{CLOUD_REQUEST_SUFFIX}",
+            42
+        ));
+        assert_eq!(
+            cloud_request_sequence_from_name(path.file_name().unwrap())
+                .expect("generated request path should parse"),
+            Some(42)
+        );
+        assert_eq!(
+            cloud_request_sequence_from_name(OsStr::new(CLOUD_STATE_VERSION_FILE))
+                .expect("state version control file should be ignored"),
+            None
+        );
+        assert_eq!(
+            cloud_request_sequence_from_name(OsStr::new(CLOUD_INBOX_OWNER_LOCK))
+                .expect("owner lock should be ignored"),
+            None
+        );
+        for malformed in [
+            "request-1.json",
+            "request-00000000000000000000.json",
+            "request-00000000000000000001.txt",
+            "request-9007199254740992.json",
+        ] {
+            assert!(
+                cloud_request_sequence_from_name(OsStr::new(malformed)).is_err(),
+                "malformed generated-looking name should be retained and rejected: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_retains_and_distinguishes_malformed_or_unknown_request_files() {
+        let root = temp_root("inbox-unknown-record");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        drop(inbox);
+
+        let directory = root.join(CLOUD_INBOX_DIRECTORY);
+        let malformed = directory.join("request-1.json");
+        let unknown = directory.join(format!(
+            "{CLOUD_REQUEST_PREFIX}{:020}{CLOUD_REQUEST_SUFFIX}",
+            900
+        ));
+        let rooted = RootedFs::new(&root).expect("root should bind");
+        rooted
+            .create_new_bound_file(&malformed, b"{}", 0o600)
+            .expect("malformed fixture should be private");
+        let unknown_record = InboxRecord {
+            schema_version: INBOX_RECORD_VERSION + 1,
+            request: request(900, "unknown schema"),
+            status: InboxStatus::Pending,
+            attempts: 0,
+            updated_at: now_seconds(),
+            next_attempt_at: 0,
+            error: None,
+            result: None,
+        };
+        rooted
+            .create_new_bound_file(
+                &unknown,
+                &serde_json::to_vec(&unknown_record).expect("unknown record should encode"),
+                0o600,
+            )
+            .expect("unknown schema fixture should be private");
+
+        let malformed_error = CloudInbox::open(&root)
+            .err()
+            .expect("malformed request filename should stop recovery");
+        assert!(format!("{malformed_error:#}").contains("invalid sequence"));
+        assert!(malformed.exists(), "malformed file must remain untouched");
+        assert!(
+            unknown.exists(),
+            "unreached unknown file must remain untouched"
+        );
+
+        fs::remove_file(&malformed).expect("test should remove malformed fixture");
+        let schema_error = CloudInbox::open(&root)
+            .err()
+            .expect("unknown request schema should stop recovery");
+        assert!(format!("{schema_error:#}").contains("unsupported cloud inbox record version"));
+        assert!(
+            unknown.exists(),
+            "unknown schema file must remain untouched"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1443,6 +2142,245 @@ mod tests {
             !reopened
                 .persist(request(9, "/queue"))
                 .expect("terminal duplicate should deduplicate after restart")
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_terminal_receipts_are_pruned_incrementally_and_active_records_recover() {
+        let root = temp_root("inbox-terminal-retention");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let old = now_seconds().saturating_sub(
+            CLOUD_INBOX_TERMINAL_REPLAY_RETENTION
+                .as_secs()
+                .saturating_add(1),
+        );
+
+        let write_fixture = |seq: u64, status: InboxStatus, kind: &str, updated_at: u64| {
+            let mut cloud_request = request(seq, "fixture");
+            cloud_request.kind = kind.to_string();
+            let record = InboxRecord {
+                schema_version: INBOX_RECORD_VERSION,
+                request: cloud_request,
+                status,
+                attempts: 0,
+                updated_at,
+                next_attempt_at: 0,
+                error: None,
+                result: None,
+            };
+            inbox.write_record_path(&inbox.record_path(seq), &record)
+        };
+
+        for seq in 1..=120 {
+            let terminal_status = match seq % 4 {
+                0 => InboxStatus::Failed,
+                1 => InboxStatus::Completed,
+                2 => InboxStatus::Uncertain,
+                _ => InboxStatus::Stale,
+            };
+            write_fixture(seq, terminal_status, "completed", old)
+                .expect("expired terminal fixture should persist with its original age");
+            match seq {
+                24 => write_fixture(121, InboxStatus::Pending, "library_scan", old)
+                    .expect("pending fixture should persist"),
+                48 => write_fixture(122, InboxStatus::Retryable, "library_scan", old)
+                    .expect("retryable fixture should persist"),
+                72 => write_fixture(123, InboxStatus::AwaitingConfirmation, "file_preview", old)
+                    .expect("awaiting preview fixture should persist"),
+                96 => write_fixture(124, InboxStatus::Processing, "library_scan", old)
+                    .expect("processing fixture should persist"),
+                _ => {}
+            }
+        }
+        let mut recent_terminal = request(125, "recent terminal");
+        recent_terminal.kind = "library_scan".to_string();
+        inbox
+            .persist(recent_terminal)
+            .expect("recent terminal fixture should persist");
+        inbox
+            .update(125, |record| record.status = InboxStatus::Completed)
+            .expect("recent terminal fixture should be terminal");
+        assert_eq!(
+            inbox
+                .next_state_version()
+                .expect("control state should persist"),
+            1
+        );
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        assert!(
+            !reopened
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available")
+                .initial_complete,
+            "large history must not be fully scanned in one open call"
+        );
+        assert!(
+            reopened
+                .pending()
+                .expect("incomplete recovery should be safe")
+                .is_empty(),
+            "pending dispatch must wait for the complete initial scan"
+        );
+        assert!(
+            reopened.state_records_bounded(10).is_err(),
+            "partial indexes must not be published as complete history"
+        );
+
+        assert!(
+            reopened
+                .persist(request(126, "arrived during startup recovery"))
+                .expect("new durable request should persist during bounded recovery"),
+            "a new sequence should be durably added"
+        );
+        assert!(
+            reopened
+                .pending()
+                .expect("recovery should restart after a new directory entry")
+                .is_empty(),
+            "dispatch must remain blocked while the restarted index is partial"
+        );
+
+        let mut externally_materialized = InboxRecord {
+            schema_version: INBOX_RECORD_VERSION,
+            request: request(127, "materialized during startup recovery"),
+            status: InboxStatus::Pending,
+            attempts: 0,
+            updated_at: now_seconds(),
+            next_attempt_at: 0,
+            error: None,
+            result: None,
+        };
+        externally_materialized.request.kind = "library_scan".to_string();
+        reopened
+            .write_record_path(&reopened.record_path(127), &externally_materialized)
+            .expect("external child-entry churn should be representable in the fixture");
+        assert!(
+            reopened.state_records_bounded(10).is_err(),
+            "directory churn during enumeration must not publish a partial index"
+        );
+
+        let pending = (0..32)
+            .find_map(|_| {
+                let pending = reopened
+                    .pending()
+                    .expect("bounded recovery pass should succeed");
+                let initial_complete = reopened
+                    .recovery_scan
+                    .lock()
+                    .expect("recovery scan lock should be available")
+                    .initial_complete;
+                if initial_complete {
+                    (!pending.is_empty()).then_some(pending)
+                } else {
+                    assert!(
+                        pending.is_empty(),
+                        "partial startup indexes must not dispatch active records"
+                    );
+                    None
+                }
+            })
+            .expect("recovery should make bounded progress through history");
+        assert_eq!(
+            pending
+                .iter()
+                .map(|record| record.request.seq)
+                .collect::<Vec<_>>(),
+            vec![121, 122, 124, 126, 127],
+            "pending, retryable, and recovered processing records must remain dispatchable"
+        );
+        assert!(
+            reopened
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available")
+                .initial_complete
+        );
+
+        for seq in [1, 120] {
+            let record = reopened
+                .record(seq)
+                .expect("expired fixture should be readable before cleanup")
+                .expect("expired fixture should exist before cleanup");
+            assert_eq!(record.updated_at, old);
+            assert!(
+                inbox_terminal_record_expired(&record, now_seconds()),
+                "terminal fixture {seq} should be expired before cleanup starts"
+            );
+        }
+
+        for _ in 0..16 {
+            let pending = reopened
+                .pending()
+                .expect("terminal cleanup should make bounded progress");
+            assert_eq!(
+                pending
+                    .iter()
+                    .map(|record| record.request.seq)
+                    .collect::<Vec<_>>(),
+                vec![121, 122, 124, 126, 127],
+                "terminal cleanup must preserve active requests"
+            );
+        }
+        for seq in 1..=120 {
+            assert!(
+                reopened
+                    .record(seq)
+                    .expect("record read should succeed")
+                    .is_none(),
+                "expired terminal record {seq} should be removed from disk"
+            );
+        }
+        assert_eq!(
+            reopened
+                .record(123)
+                .expect("awaiting preview should be readable")
+                .expect("awaiting preview should be retained")
+                .status,
+            InboxStatus::AwaitingConfirmation
+        );
+        assert_eq!(
+            reopened
+                .record(124)
+                .expect("recovered processing record should be readable")
+                .expect("recovered processing record should be retained")
+                .status,
+            InboxStatus::Pending
+        );
+        assert_eq!(
+            reopened
+                .record(125)
+                .expect("recent terminal record should be readable")
+                .expect("recent terminal record should be retained")
+                .status,
+            InboxStatus::Completed
+        );
+        assert_eq!(
+            reopened
+                .record(127)
+                .expect("materialized request should be readable")
+                .expect("materialized request should be indexed")
+                .request
+                .seq,
+            127
+        );
+        let (state_records, omitted) = reopened
+            .state_records_bounded(10)
+            .expect("complete state history should be published");
+        assert_eq!(omitted, 0);
+        assert!(state_records.iter().all(|record| record.request.seq > 120));
+        assert!(state_records.iter().any(|record| record.request.seq == 123));
+        assert!(state_records.iter().any(|record| record.request.seq == 125));
+        assert_eq!(
+            reopened
+                .next_state_version()
+                .expect("state version control file must remain available"),
+            2
         );
         drop(reopened);
         let _ = fs::remove_dir_all(root);

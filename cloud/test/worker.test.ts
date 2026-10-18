@@ -1,11 +1,12 @@
 import { listDurableObjectIds, SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials";
 import { ACTION_QUEUE_LIMIT, appendAction, removeQueuedAction, shouldRetryActionFailure } from "../public/file/action-queue.js";
 import { HttpResponseError } from "../public/file/http-error.js";
 import { getOrCreateLegacySelection, updateLegacySelection } from "../public/file/legacy-mapping-state.js";
+import { submitLegacyFileImport } from "../public/file/legacy-file-import.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "../public/file/metadata-preview.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "../public/file/selection-limit.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
@@ -70,6 +71,44 @@ describe("selection limit", () => {
     expect(removed.ids).toHaveLength(MAX_SELECTED_ITEMS - 1);
     expect(removed.ids[0]).toBe("item-0");
     expect(removed.omittedCount).toBe(0);
+  });
+});
+
+describe("legacy file import bounds", () => {
+  it("rejects oversized files before reading or submitting them", async () => {
+    const file = { size: 256 * 1024 + 1, text: vi.fn() };
+    const submit = vi.fn();
+    const reject = vi.fn();
+
+    await submitLegacyFileImport(file, submit, reject, 256 * 1024);
+
+    expect(file.text).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+    expect(reject).toHaveBeenCalledWith("Legacy text exceeds the 256 KiB limit.");
+  });
+
+  it("accepts the exact file-size boundary and still checks decoded UTF-8 size", async () => {
+    const limit = 256 * 1024;
+    const submit = vi.fn();
+    const reject = vi.fn();
+    const file = { size: limit, text: vi.fn().mockResolvedValue("x".repeat(limit)) };
+
+    await submitLegacyFileImport(file, submit, reject, limit);
+
+    expect(file.text).toHaveBeenCalledOnce();
+    expect(submit).toHaveBeenCalledWith("x".repeat(limit));
+    expect(reject).not.toHaveBeenCalled();
+
+    const decodedOversize = {
+      size: limit,
+      text: vi.fn().mockResolvedValue("é".repeat(limit / 2 + 1)),
+    };
+    const decodedSubmit = vi.fn();
+    const decodedReject = vi.fn();
+    await submitLegacyFileImport(decodedOversize, decodedSubmit, decodedReject, limit);
+    expect(decodedOversize.text).toHaveBeenCalledOnce();
+    expect(decodedSubmit).not.toHaveBeenCalled();
+    expect(decodedReject).toHaveBeenCalledWith("Legacy text exceeds the 256 KiB limit.");
   });
 });
 

@@ -16,6 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const REMOVE_QUARANTINE_PREFIX: &str = ".telegram-video-downloader-remove";
 const REMOVE_QUARANTINE_MANIFEST_NAME: &str = "manifest.json";
@@ -87,6 +88,39 @@ pub(crate) struct BoundFile {
     identity: EntryIdentity,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BoundFileAccessPolicy {
+    owner: u32,
+    group: u32,
+    mode: u32,
+    // Link count is part of file access policy because another writable alias can mutate the
+    // same inode. It is not used as a generic content or directory-metadata change signal.
+    link_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Directory access policy deliberately excludes timestamps and link count: creating or removing
+// sibling entries changes those metadata without replacing the bound directory or its policy.
+struct BoundDirectoryAccessPolicy {
+    owner: u32,
+    group: u32,
+    mode: u32,
+}
+
+struct AtomicBoundFileCheckpointState {
+    max_verify_bytes: usize,
+    parent_access: BoundDirectoryAccessPolicy,
+    target_file: BoundFile,
+    target_sha256: [u8; 32],
+    target_access: BoundFileAccessPolicy,
+    staged_file: BoundFile,
+    staged_sha256: [u8; 32],
+    staged_access: BoundFileAccessPolicy,
+}
+
+type AtomicBoundFileCheckpoint<'a> =
+    dyn FnMut(&BoundEntry, &BoundFile, EntryIdentity) -> Result<()> + 'a;
+
 #[derive(Clone)]
 pub(crate) struct BoundDirectory {
     fd: Arc<OwnedFd>,
@@ -119,6 +153,17 @@ pub(crate) struct BoundDirectoryCursorPage {
     pub(crate) entry: Option<BoundDirectoryCursorEntry>,
     pub(crate) names_read: usize,
     pub(crate) exhausted: bool,
+}
+
+// These timestamps are conservative hints that directory entries may have changed during a
+// readdir pass. They do not prove replacement, content mutation, or tampering; object identity
+// and private access policy are checked independently by the bound-directory APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BoundDirectoryEntrySetStamp {
+    mtime_seconds: i64,
+    mtime_nanoseconds: i64,
+    ctime_seconds: i64,
+    ctime_nanoseconds: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,6 +295,58 @@ impl BoundFile {
             bail!("bound file descriptor identity changed");
         }
         Ok(())
+    }
+
+    fn access_policy_snapshot(&self) -> Result<BoundFileAccessPolicy> {
+        self.validate_identity()?;
+        let stat = rustix::fs::fstat(self.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to inspect bound file access policy")?;
+        if identity_from_stat(&stat) != self.identity {
+            bail!("bound file descriptor identity changed while reading access policy");
+        }
+        let policy = BoundFileAccessPolicy {
+            owner: stat.st_uid,
+            group: stat.st_gid,
+            mode: (stat.st_mode & 0o7777) as u32,
+            link_count: stat.st_nlink as u64,
+        };
+        self.validate_identity()?;
+        Ok(policy)
+    }
+
+    fn sha256_limited(&self, limit: usize) -> Result<[u8; 32]> {
+        let initial_len = self.byte_len()?;
+        if initial_len > u64::try_from(limit).unwrap_or(u64::MAX) {
+            bail!("bound file exceeds the {limit}-byte checkpoint verification limit");
+        }
+
+        let mut file = self.duplicate_std_file()?;
+        file.seek(SeekFrom::Start(0))
+            .context("failed to seek bound file for checkpoint verification")?;
+        let mut hasher = Sha256::new();
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 16 * 1024];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .context("failed to read bound file for checkpoint verification")?;
+            if count == 0 {
+                break;
+            }
+            total = total.checked_add(count as u64).ok_or_else(|| {
+                anyhow!("bound file size overflow during checkpoint verification")
+            })?;
+            if total > u64::try_from(limit).unwrap_or(u64::MAX) {
+                bail!("bound file exceeds the {limit}-byte checkpoint verification limit");
+            }
+            hasher.update(&buffer[..count]);
+        }
+        self.validate_identity()?;
+        if total != initial_len || self.byte_len()? != initial_len {
+            bail!("bound file length changed during checkpoint verification");
+        }
+        Ok(hasher.finalize().into())
     }
 
     pub(crate) fn content_stamp(&self) -> Result<(u64, i64, i64, i64, i64)> {
@@ -951,16 +1048,44 @@ impl RootedFs {
         contents: &[u8],
         mode: u16,
     ) -> Result<(BoundEntry, EntryIdentity)> {
-        self.replace_bound_file_atomically_if_identity_with_hook(
+        self.replace_bound_file_atomically_if_identity_with_callbacks(
             entry,
             expected,
             temp_path,
             contents,
             mode,
+            None,
             &mut |_| Ok(()),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn replace_bound_file_atomically_if_identity_with_checkpoint(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        temp_path: &Path,
+        contents: &[u8],
+        mode: u16,
+        max_verify_bytes: usize,
+        checkpoint: &mut impl FnMut(&BoundEntry, &BoundFile, EntryIdentity) -> Result<()>,
+    ) -> Result<(BoundEntry, EntryIdentity)> {
+        if contents.len() > max_verify_bytes {
+            bail!("staged file exceeds the {max_verify_bytes}-byte checkpoint verification limit");
+        }
+        let checkpoint: &mut AtomicBoundFileCheckpoint<'_> = checkpoint;
+        self.replace_bound_file_atomically_if_identity_with_callbacks(
+            entry,
+            expected,
+            temp_path,
+            contents,
+            mode,
+            Some((max_verify_bytes, checkpoint)),
+            &mut |_| Ok(()),
+        )
+    }
+
+    #[cfg(test)]
     fn replace_bound_file_atomically_if_identity_with_hook<F>(
         &self,
         entry: &BoundEntry,
@@ -968,6 +1093,25 @@ impl RootedFs {
         temp_path: &Path,
         contents: &[u8],
         mode: u16,
+        hook: &mut F,
+    ) -> Result<(BoundEntry, EntryIdentity)>
+    where
+        F: FnMut(AtomicBoundFileReplaceCheckpoint) -> Result<()>,
+    {
+        self.replace_bound_file_atomically_if_identity_with_callbacks(
+            entry, expected, temp_path, contents, mode, None, hook,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_bound_file_atomically_if_identity_with_callbacks<F>(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        temp_path: &Path,
+        contents: &[u8],
+        mode: u16,
+        mut checkpoint: Option<(usize, &mut AtomicBoundFileCheckpoint<'_>)>,
         hook: &mut F,
     ) -> Result<(BoundEntry, EntryIdentity)>
     where
@@ -993,6 +1137,58 @@ impl RootedFs {
                 "atomic replacement temp cleanup",
             ));
         }
+
+        let checkpoint_state = if let Some((limit, _)) = checkpoint.as_ref() {
+            let result = (|| -> Result<AtomicBoundFileCheckpointState> {
+                let target_file = self.open_bound_file_if_identity(entry, expected)?;
+                let staged_file = self.open_bound_file_if_identity(&temp_entry, temp_identity)?;
+                let parent_access = self.bound_directory_access_policy(&entry.parent)?;
+                let target_sha256 = target_file.sha256_limited(*limit)?;
+                let staged_sha256 = staged_file.sha256_limited(*limit)?;
+                let expected_staged_sha256: [u8; 32] = Sha256::digest(contents).into();
+                if staged_sha256 != expected_staged_sha256 {
+                    bail!("staged file content changed before checkpoint callback");
+                }
+                Ok(AtomicBoundFileCheckpointState {
+                    max_verify_bytes: *limit,
+                    parent_access,
+                    target_access: target_file.access_policy_snapshot()?,
+                    staged_access: staged_file.access_policy_snapshot()?,
+                    target_file,
+                    target_sha256,
+                    staged_file,
+                    staged_sha256,
+                })
+            })();
+            match result {
+                Ok(state) => Some(state),
+                Err(err) => {
+                    let cleanup = self.remove_bound_file_if_identity(&temp_entry, temp_identity);
+                    return Err(with_cleanup_error(
+                        err.context("failed to capture atomic replacement checkpoint state"),
+                        cleanup,
+                        "atomic replacement temp cleanup",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some((_, callback)) = checkpoint.as_mut() {
+            let state = checkpoint_state
+                .as_ref()
+                .expect("checkpoint state must exist when a callback is supplied");
+            if let Err(err) = callback(&temp_entry, &state.staged_file, temp_identity) {
+                let cleanup = self.remove_bound_file_if_identity(&temp_entry, temp_identity);
+                return Err(with_cleanup_error(
+                    err.context("atomic replacement stopped by checkpoint callback"),
+                    cleanup,
+                    "atomic replacement temp cleanup",
+                ));
+            }
+        }
+
         if let Err(err) = hook(AtomicBoundFileReplaceCheckpoint::BeforeExchange) {
             let cleanup = self.remove_bound_file_if_identity(&temp_entry, temp_identity);
             return Err(with_cleanup_error(
@@ -1001,13 +1197,28 @@ impl RootedFs {
                 "atomic replacement temp cleanup",
             ));
         }
-        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected) {
-            let cleanup = self.remove_bound_file_if_identity(&temp_entry, temp_identity);
-            return Err(with_cleanup_error(
-                anyhow!(
+
+        let pre_exchange_validation = (|| -> Result<()> {
+            if let Some(state) = checkpoint_state.as_ref() {
+                self.validate_atomic_checkpoint_state(
+                    entry,
+                    expected,
+                    &temp_entry,
+                    temp_identity,
+                    state,
+                )?;
+            } else if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected) {
+                bail!(
                     "bound file identities changed during atomic replacement: {}",
                     entry.path.display()
-                ),
+                );
+            }
+            Ok(())
+        })();
+        if let Err(err) = pre_exchange_validation {
+            let cleanup = self.remove_bound_file_if_identity(&temp_entry, temp_identity);
+            return Err(with_cleanup_error(
+                err,
                 cleanup,
                 "atomic replacement temp cleanup",
             ));
@@ -1084,6 +1295,60 @@ impl RootedFs {
         sync_directory(entry.parent.fd.as_ref())?;
         self.remove_bound_file_if_identity(&temp_entry, expected)?;
         Ok((entry.clone(), temp_identity))
+    }
+
+    fn validate_atomic_checkpoint_state(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        staged_entry: &BoundEntry,
+        staged_identity: EntryIdentity,
+        state: &AtomicBoundFileCheckpointState,
+    ) -> Result<()> {
+        self.validate_bound_parent(&entry.parent)?;
+        self.validate_bound_parent(&staged_entry.parent)?;
+        if entry.parent.identity != staged_entry.parent.identity
+            || state.target_file.identity() != expected
+            || state.staged_file.identity() != staged_identity
+            || identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+            || identity_at(staged_entry.parent.fd.as_ref(), &staged_entry.leaf)?
+                != Some(staged_identity)
+        {
+            bail!(
+                "bound file identities changed during atomic replacement: {}",
+                entry.path.display()
+            );
+        }
+
+        let target_sha256 = state.target_file.sha256_limited(state.max_verify_bytes)?;
+        if target_sha256 != state.target_sha256
+            || state.target_file.access_policy_snapshot()? != state.target_access
+        {
+            bail!("target file content or access policy changed during checkpoint callback");
+        }
+
+        let staged_sha256 = state.staged_file.sha256_limited(state.max_verify_bytes)?;
+        if staged_sha256 != state.staged_sha256
+            || state.staged_file.access_policy_snapshot()? != state.staged_access
+        {
+            bail!("staged file content or access policy changed during checkpoint callback");
+        }
+
+        if self.bound_directory_access_policy(&entry.parent)? != state.parent_access {
+            bail!("bound output parent access policy changed during checkpoint callback");
+        }
+        self.validate_bound_parent(&entry.parent)?;
+        self.validate_bound_parent(&staged_entry.parent)?;
+        if identity_at(entry.parent.fd.as_ref(), &entry.leaf)? != Some(expected)
+            || identity_at(staged_entry.parent.fd.as_ref(), &staged_entry.leaf)?
+                != Some(staged_identity)
+        {
+            bail!(
+                "bound file identities changed during atomic replacement: {}",
+                entry.path.display()
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn hard_link_via_bound_parents_noreplace_if_identity(
@@ -1366,6 +1631,34 @@ impl RootedFs {
             );
         }
         self.validate_bound_parent(&entry.parent)
+    }
+
+    pub(crate) fn bound_directory_entry_set_stamp(
+        &self,
+        entry: &BoundEntry,
+        expected: EntryIdentity,
+        mode: u16,
+    ) -> Result<BoundDirectoryEntrySetStamp> {
+        use std::os::unix::fs::MetadataExt;
+
+        self.validate_private_bound_directory(entry, expected, mode)?;
+        let directory = self.open_bound_directory(entry, expected)?;
+        directory.validate_identity()?;
+        let duplicate = rustix::io::dup(directory.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to duplicate private directory for enumeration stamp")?;
+        let metadata = File::from(duplicate)
+            .metadata()
+            .context("failed to inspect private directory enumeration stamp")?;
+        let stamp = BoundDirectoryEntrySetStamp {
+            mtime_seconds: metadata.mtime(),
+            mtime_nanoseconds: metadata.mtime_nsec(),
+            ctime_seconds: metadata.ctime(),
+            ctime_nanoseconds: metadata.ctime_nsec(),
+        };
+        directory.validate_identity()?;
+        self.validate_private_bound_directory(entry, expected, mode)?;
+        Ok(stamp)
     }
 
     pub(crate) fn rename_via_bound_parents_noreplace_if_identity(
@@ -1958,6 +2251,26 @@ impl RootedFs {
             bail!("bound output parent directory identity changed");
         }
         Ok(())
+    }
+
+    fn bound_directory_access_policy(
+        &self,
+        parent: &BoundParent,
+    ) -> Result<BoundDirectoryAccessPolicy> {
+        self.validate_bound_parent(parent)?;
+        let stat = rustix::fs::fstat(parent.fd.as_ref())
+            .map_err(errno_to_io)
+            .context("failed to inspect bound output parent access policy")?;
+        if identity_from_stat(&stat) != parent.identity {
+            bail!("bound output parent directory identity changed while reading access policy");
+        }
+        let policy = BoundDirectoryAccessPolicy {
+            owner: stat.st_uid,
+            group: stat.st_gid,
+            mode: (stat.st_mode & 0o7777) as u32,
+        };
+        self.validate_bound_parent(parent)?;
+        Ok(policy)
     }
 
     fn validate_parent(&self, parent: &BoundParent) -> Result<()> {
@@ -3466,6 +3779,8 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -3670,6 +3985,420 @@ mod tests {
             rooted.entry_identity(&manifest).unwrap(),
             Some(new_identity)
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn round6_atomic_checkpoint_persists_staged_binding_and_allows_child_churn() {
+        let root = temp_dir("atomic-checkpoint-child-churn");
+        fs::create_dir_all(&root).expect("root should create");
+        let target = root.join("manifest.json");
+        let staged = root.join("manifest.next.json");
+        let checkpoint = root.join("batch-checkpoint.json");
+        fs::write(&target, b"old-complete-manifest").expect("target should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&target, false)
+            .expect("target should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("target identity should read")
+            .expect("target should exist");
+        let mut callback_called = false;
+
+        let (_, new_identity) = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                old_identity,
+                &staged,
+                b"new-complete-manifest",
+                0o600,
+                1024,
+                &mut |staged_entry, staged_file, staged_identity| {
+                    callback_called = true;
+                    assert_eq!(staged_entry.path(), staged);
+                    assert_eq!(staged_file.identity(), staged_identity);
+                    assert_eq!(
+                        staged_identity,
+                        rooted.bound_entry_identity(staged_entry)?.unwrap()
+                    );
+                    assert_eq!(staged_file.read_limited(1024)?, b"new-complete-manifest");
+                    assert_eq!(fs::read(&target)?, b"old-complete-manifest");
+                    fs::write(&checkpoint, b"durable staged path and identity")?;
+                    Ok(())
+                },
+            )
+            .expect("checkpoint should allow replacement after child churn");
+
+        assert!(callback_called);
+        assert_eq!(fs::read(&target).unwrap(), b"new-complete-manifest");
+        assert_eq!(
+            fs::read(&checkpoint).unwrap(),
+            b"durable staged path and identity"
+        );
+        assert!(!staged.exists());
+        assert_eq!(rooted.entry_identity(&target).unwrap(), Some(new_identity));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn round6_atomic_checkpoint_callback_failure_leaves_target_and_cleans_owned_stage() {
+        let root = temp_dir("atomic-checkpoint-failure");
+        fs::create_dir_all(&root).expect("root should create");
+        let target = root.join("manifest.json");
+        let staged = root.join("manifest.next.json");
+        fs::write(&target, b"old-complete-manifest").expect("target should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&target, false)
+            .expect("target should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("target identity should read")
+            .expect("target should exist");
+
+        let error = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                old_identity,
+                &staged,
+                b"new-complete-manifest",
+                0o600,
+                1024,
+                &mut |_, _, _| bail!("injected checkpoint persistence failure"),
+            )
+            .expect_err("a failed durable checkpoint must stop before exchange");
+
+        assert!(format!("{error:#}").contains("injected checkpoint persistence failure"));
+        assert_eq!(fs::read(&target).unwrap(), b"old-complete-manifest");
+        assert_eq!(rooted.entry_identity(&target).unwrap(), Some(old_identity));
+        assert!(
+            !staged.exists(),
+            "only the owned staged inode should be cleaned"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn round6_atomic_checkpoint_rejects_target_content_change() {
+        let root = temp_dir("atomic-checkpoint-target-content");
+        fs::create_dir_all(&root).expect("root should create");
+        let target = root.join("manifest.json");
+        let staged = root.join("manifest.next.json");
+        fs::write(&target, b"old-complete-manifest").expect("target should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&target, false)
+            .expect("target should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("target identity should read")
+            .expect("target should exist");
+
+        let error = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                old_identity,
+                &staged,
+                b"new-complete-manifest",
+                0o600,
+                1024,
+                &mut |_, _, _| {
+                    fs::write(&target, b"callback changed the target")?;
+                    Ok(())
+                },
+            )
+            .expect_err("same-inode target content changes must block exchange");
+
+        assert!(format!("{error:#}").contains("target file content or access policy changed"));
+        assert_eq!(fs::read(&target).unwrap(), b"callback changed the target");
+        assert!(!staged.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn round6_atomic_checkpoint_rejects_target_replacement() {
+        let root = temp_dir("atomic-checkpoint-target-replacement");
+        fs::create_dir_all(&root).expect("root should create");
+        let target = root.join("manifest.json");
+        let saved = root.join("manifest.saved.json");
+        let staged = root.join("manifest.next.json");
+        fs::write(&target, b"old-complete-manifest").expect("target should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&target, false)
+            .expect("target should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("target identity should read")
+            .expect("target should exist");
+
+        let error = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                old_identity,
+                &staged,
+                b"new-complete-manifest",
+                0o600,
+                1024,
+                &mut |_, _, _| {
+                    fs::rename(&target, &saved)?;
+                    fs::write(&target, b"replacement target")?;
+                    Ok(())
+                },
+            )
+            .expect_err("a replaced target must not be exchanged with the stage");
+
+        assert!(
+            format!("{error:#}")
+                .contains("bound file identities changed during atomic replacement")
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"replacement target");
+        assert_eq!(fs::read(&saved).unwrap(), b"old-complete-manifest");
+        assert!(!staged.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn round6_atomic_checkpoint_never_cleans_a_replaced_stage_path() {
+        let root = temp_dir("atomic-checkpoint-stage-replacement");
+        fs::create_dir_all(&root).expect("root should create");
+        let target = root.join("manifest.json");
+        let staged = root.join("manifest.next.json");
+        let displaced_stage = root.join("manifest.displaced.json");
+        fs::write(&target, b"old-complete-manifest").expect("target should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&target, false)
+            .expect("target should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("target identity should read")
+            .expect("target should exist");
+
+        let error = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                old_identity,
+                &staged,
+                b"new-complete-manifest",
+                0o600,
+                1024,
+                &mut |staged_entry, _, _| {
+                    fs::rename(staged_entry.path(), &displaced_stage)?;
+                    fs::write(staged_entry.path(), b"foreign staged-path replacement")?;
+                    Ok(())
+                },
+            )
+            .expect_err("replacing the staged pathname must block exchange");
+
+        assert!(
+            format!("{error:#}")
+                .contains("bound file identities changed during atomic replacement")
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"old-complete-manifest");
+        assert_eq!(
+            fs::read(&staged).unwrap(),
+            b"foreign staged-path replacement"
+        );
+        assert_eq!(
+            fs::read(&displaced_stage).unwrap(),
+            b"new-complete-manifest"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn round6_atomic_checkpoint_rejects_target_permission_change() {
+        let root = temp_dir("atomic-checkpoint-target-mode");
+        fs::create_dir_all(&root).expect("root should create");
+        let target = root.join("manifest.json");
+        let staged = root.join("manifest.next.json");
+        fs::write(&target, b"old-complete-manifest").expect("target should write");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644))
+            .expect("target mode should be deterministic");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&target, false)
+            .expect("target should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("target identity should read")
+            .expect("target should exist");
+
+        let error = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                old_identity,
+                &staged,
+                b"new-complete-manifest",
+                0o600,
+                1024,
+                &mut |_, _, _| {
+                    fs::set_permissions(&target, fs::Permissions::from_mode(0o640))?;
+                    Ok(())
+                },
+            )
+            .expect_err("same-inode target access-policy changes must block exchange");
+
+        assert!(format!("{error:#}").contains("target file content or access policy changed"));
+        assert_eq!(fs::read(&target).unwrap(), b"old-complete-manifest");
+        assert!(!staged.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn round6_atomic_checkpoint_rejects_parent_access_change_after_directory_churn() {
+        let root = temp_dir("atomic-checkpoint-parent-mode");
+        fs::create_dir_all(&root).expect("root should create");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("parent mode should be deterministic");
+        let target = root.join("manifest.json");
+        let staged = root.join("manifest.next.json");
+        fs::write(&target, b"old-complete-manifest").expect("target should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&target, false)
+            .expect("target should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("target identity should read")
+            .expect("target should exist");
+
+        let error = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                old_identity,
+                &staged,
+                b"new-complete-manifest",
+                0o600,
+                1024,
+                &mut |_, _, _| {
+                    fs::write(root.join("checkpoint-entry"), b"child churn")?;
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o750))?;
+                    Ok(())
+                },
+            )
+            .expect_err("parent access-policy changes must block exchange");
+
+        assert!(format!("{error:#}").contains("parent access policy changed"));
+        assert_eq!(fs::read(&target).unwrap(), b"old-complete-manifest");
+        assert!(!staged.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn round6_atomic_checkpoint_rejects_staged_content_or_permission_change() {
+        let root = temp_dir("atomic-checkpoint-stage-change");
+        fs::create_dir_all(&root).expect("root should create");
+        let target = root.join("manifest.json");
+        let staged = root.join("manifest.next.json");
+        fs::write(&target, b"old-complete-manifest").expect("target should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&target, false)
+            .expect("target should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("target identity should read")
+            .expect("target should exist");
+
+        let content_error = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                old_identity,
+                &staged,
+                b"new-complete-manifest",
+                0o600,
+                1024,
+                &mut |staged_entry, _, _| {
+                    fs::write(staged_entry.path(), b"callback changed staged bytes")?;
+                    Ok(())
+                },
+            )
+            .expect_err("same-inode staged content changes must block exchange");
+        assert!(
+            format!("{content_error:#}").contains("staged file content or access policy changed")
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"old-complete-manifest");
+        assert!(!staged.exists());
+
+        let permission_error = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                old_identity,
+                &staged,
+                b"new-complete-manifest",
+                0o600,
+                1024,
+                &mut |_, staged_file, _| staged_file.set_mode(0o640),
+            )
+            .expect_err("staged access-policy changes must block exchange");
+        assert!(
+            format!("{permission_error:#}")
+                .contains("staged file content or access policy changed")
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"old-complete-manifest");
+        assert!(!staged.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn round6_atomic_checkpoint_rejects_content_larger_than_verification_budget() {
+        let root = temp_dir("atomic-checkpoint-read-budget");
+        fs::create_dir_all(&root).expect("root should create");
+        let target = root.join("manifest.json");
+        let staged = root.join("manifest.next.json");
+        fs::write(&target, b"old-content").expect("target should write");
+        let rooted = RootedFs::new(&root).expect("root should open");
+        let entry = rooted
+            .bind_entry(&target, false)
+            .expect("target should bind");
+        let old_identity = rooted
+            .bound_entry_identity(&entry)
+            .expect("target identity should read")
+            .expect("target should exist");
+        let mut callback_called = false;
+
+        let staged_error = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                old_identity,
+                &staged,
+                b"new-content",
+                0o600,
+                4,
+                &mut |_, _, _| {
+                    callback_called = true;
+                    Ok(())
+                },
+            )
+            .expect_err("oversized staged contents should fail before file creation");
+        assert!(format!("{staged_error:#}").contains("staged file exceeds"));
+        assert_eq!(fs::read(&target).unwrap(), b"old-content");
+        assert!(!staged.exists());
+        assert!(!callback_called);
+
+        fs::write(&target, b"target-too-large").expect("oversized target should write");
+        let current_identity = rooted.entry_identity(&target).unwrap().unwrap();
+        let target_error = rooted
+            .replace_bound_file_atomically_if_identity_with_checkpoint(
+                &entry,
+                current_identity,
+                &staged,
+                b"ok",
+                0o600,
+                4,
+                &mut |_, _, _| {
+                    callback_called = true;
+                    Ok(())
+                },
+            )
+            .expect_err("oversized target should fail within the bounded hash");
+        assert!(format!("{target_error:#}").contains("checkpoint verification limit"));
+        assert_eq!(fs::read(&target).unwrap(), b"target-too-large");
+        assert!(!staged.exists());
+        assert!(!callback_called);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4647,6 +5376,21 @@ mod tests {
                 .start_bound_directory_cursor(&self.entry, self.identity, 0o700)
                 .expect("private directory cursor should start")
         }
+
+        fn entry_set_stamp(&self) -> BoundDirectoryEntrySetStamp {
+            self.rooted
+                .bound_directory_entry_set_stamp(&self.entry, self.identity, 0o700)
+                .expect("private directory entry-set stamp should read")
+        }
+
+        fn set_old_directory_mtime(&self) {
+            let directory = File::open(&self.directory)
+                .expect("private test directory should open for timestamp setup");
+            let times = fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1));
+            directory
+                .set_times(times)
+                .expect("private test directory timestamp should be deterministic");
+        }
     }
 
     #[cfg(unix)]
@@ -4868,5 +5612,110 @@ mod tests {
             .peek_bound_directory_cursor(&mut cursor, 32, 0o700)
             .expect_err("a directory permission change must invalidate the private cursor");
         assert!(format!("{error:#}").contains("ownership or permissions changed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round6_private_directory_entry_set_stamp_is_stable_without_child_churn() {
+        let fixture = Round5BoundDirectoryCursorFixture::new("entry-set-stamp-stable", 2);
+
+        let first = fixture.entry_set_stamp();
+        let second = fixture.entry_set_stamp();
+
+        assert_eq!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round6_private_directory_entry_set_stamp_changes_for_child_entry_churn() {
+        let fixture = Round5BoundDirectoryCursorFixture::new("entry-set-stamp-churn", 1);
+        let child = fixture.directory.join("entry-000.txt");
+        let added = fixture.directory.join("added.txt");
+        let renamed = fixture.directory.join("renamed.txt");
+
+        fixture.set_old_directory_mtime();
+        let before_add = fixture.entry_set_stamp();
+        fixture.create_private_file("added.txt");
+        assert_ne!(
+            before_add,
+            fixture.entry_set_stamp(),
+            "addition should change the entry-set stamp"
+        );
+
+        fixture.set_old_directory_mtime();
+        let before_rename = fixture.entry_set_stamp();
+        fs::rename(&added, &renamed).expect("child should rename within the directory");
+        assert_ne!(
+            before_rename,
+            fixture.entry_set_stamp(),
+            "rename should change the entry-set stamp"
+        );
+
+        fixture.set_old_directory_mtime();
+        let before_remove = fixture.entry_set_stamp();
+        fs::remove_file(&renamed).expect("renamed child should remove");
+        assert_ne!(
+            before_remove,
+            fixture.entry_set_stamp(),
+            "removal should change the entry-set stamp"
+        );
+
+        assert!(child.exists(), "the original fixture child should remain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round6_private_directory_entry_set_stamp_ignores_child_content_and_metadata() {
+        let fixture = Round5BoundDirectoryCursorFixture::new("entry-set-stamp-child-data", 1);
+        let child = fixture.directory.join("entry-000.txt");
+        let before = fixture.entry_set_stamp();
+
+        fs::write(&child, b"updated child contents")
+            .expect("child content should update without changing directory entries");
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o640))
+            .expect("child access policy should update independently");
+
+        assert_eq!(before, fixture.entry_set_stamp());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round6_private_directory_entry_set_stamp_rejects_policy_and_identity_changes() {
+        let policy_fixture = Round5BoundDirectoryCursorFixture::new("entry-set-stamp-policy", 1);
+        fs::set_permissions(&policy_fixture.directory, fs::Permissions::from_mode(0o750))
+            .expect("private directory access policy should change");
+        assert!(
+            policy_fixture
+                .rooted
+                .bound_directory_entry_set_stamp(
+                    &policy_fixture.entry,
+                    policy_fixture.identity,
+                    0o700,
+                )
+                .is_err()
+        );
+
+        let replacement_fixture =
+            Round5BoundDirectoryCursorFixture::new("entry-set-stamp-replacement", 1);
+        let displaced = replacement_fixture.root.join("private-state-displaced");
+        fs::rename(&replacement_fixture.directory, &displaced)
+            .expect("original directory should remain available under another name");
+        fs::create_dir(&replacement_fixture.directory)
+            .expect("replacement directory should create");
+        fs::set_permissions(
+            &replacement_fixture.directory,
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("replacement directory should be private");
+        assert!(
+            replacement_fixture
+                .rooted
+                .bound_directory_entry_set_stamp(
+                    &replacement_fixture.entry,
+                    replacement_fixture.identity,
+                    0o700,
+                )
+                .is_err()
+        );
     }
 }

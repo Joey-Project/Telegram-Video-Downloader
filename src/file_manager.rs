@@ -758,7 +758,15 @@ struct PreparedNfoPatch {
     expected_mode: Option<u16>,
     after_sha256: String,
     replacement: Vec<u8>,
+    #[serde(default)]
+    replacement_checkpoint: Option<NfoReplacementCheckpoint>,
     state: ManifestPatchState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NfoReplacementCheckpoint {
+    staged_path: String,
+    after_identity: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1141,6 +1149,36 @@ impl LibraryManager {
             .iter()
             .map(|item| (item.item_id.as_str(), item))
             .collect::<HashMap<_, _>>();
+        let mut move_file_owners = HashMap::new();
+        for item in move_items
+            .iter()
+            .filter(|item| item.outcome == MoveOutcome::Move)
+        {
+            for file in &item.files {
+                let key = reserved_targets.key_for(&self.root, &file.target_path)?;
+                if let Some(previous_owner) = move_file_owners.insert(key, item.item_id.as_str())
+                    && previous_owner != item.item_id
+                {
+                    bail!("move preview contains an ambiguous destination name");
+                }
+            }
+        }
+        let mut source_nfo_owners: HashMap<TargetReservationKey, Vec<&str>> = HashMap::new();
+        if !patches.is_empty() {
+            for source_item in &snapshot.items {
+                let source_media = self.absolute_path(&source_item.relative_path)?;
+                let source_nfo = with_extension(&source_media, "nfo");
+                let source_nfo_relative = path_to_relative_string(
+                    source_nfo.strip_prefix(self.root.logical_root_path())?,
+                )?;
+                let key = reserved_targets.key_for(&self.root, &source_nfo_relative)?;
+                source_nfo_owners
+                    .entry(key)
+                    .or_default()
+                    .push(source_item.id.as_str());
+            }
+        }
+        let mut patch_target_owners: HashMap<TargetReservationKey, &str> = HashMap::new();
         let mut patch_previews = Vec::new();
         for patch in patches {
             if !patch_ids.insert(patch.item_id.as_str()) {
@@ -1174,6 +1212,31 @@ impl LibraryManager {
             let target_nfo = with_extension(&self.absolute_path(target_media)?, "nfo");
             let target_nfo_relative =
                 path_to_relative_string(target_nfo.strip_prefix(self.root.logical_root_path())?)?;
+            let target_nfo_key = reserved_targets.key_for(&self.root, &target_nfo_relative)?;
+            if source_nfo_owners
+                .get(&target_nfo_key)
+                .is_some_and(|owners| owners.iter().any(|owner| *owner != item.id.as_str()))
+            {
+                bail!(
+                    "metadata patch destination is also a source sidecar candidate for another media item: {target_nfo_relative}"
+                );
+            }
+            if move_file_owners
+                .get(&target_nfo_key)
+                .is_some_and(|owner| *owner != item.id.as_str())
+            {
+                bail!(
+                    "metadata patch destination conflicts with another media item's move target: {target_nfo_relative}"
+                );
+            }
+            if patch_target_owners
+                .insert(target_nfo_key, item.id.as_str())
+                .is_some()
+            {
+                bail!(
+                    "multiple metadata patches resolve to the same NFO target: {target_nfo_relative}"
+                );
+            }
             let existing =
                 self.read_file_with_token_and_handle(&source_nfo, Some(SIDE_CAR_LIMIT))?;
             let (expected_identity, expected_sha256, expected_mode, original) = match existing {
@@ -1244,6 +1307,7 @@ impl LibraryManager {
                 expected_mode,
                 after_sha256,
                 replacement: new_contents,
+                replacement_checkpoint: None,
                 state: ManifestPatchState::Pending,
             });
         }
@@ -1630,7 +1694,17 @@ impl LibraryManager {
             if !item_group_ready(&manifest, &item_id) {
                 continue;
             }
-            match self.execute_nfo_patch(&manifest.preview.id, &manifest.patches[patch_index]) {
+            let preview_id = manifest.preview.id.clone();
+            let patch = manifest.patches[patch_index].clone();
+            let patch_result = self.execute_nfo_patch_with_checkpoint(
+                &preview_id,
+                &patch,
+                &mut |replacement_checkpoint| {
+                    manifest.patches[patch_index].replacement_checkpoint = replacement_checkpoint;
+                    self.write_batch_manifest(&batch_path, &manifest)
+                },
+            );
+            match patch_result {
                 Ok(()) => {
                     manifest.patches[patch_index].state = ManifestPatchState::Applied;
                     if let Some(result) = manifest
@@ -1834,10 +1908,27 @@ impl LibraryManager {
         Ok(())
     }
 
+    #[cfg(test)]
     fn execute_nfo_patch(&self, preview_id: &str, patch: &PreparedNfoPatch) -> Result<()> {
+        self.execute_nfo_patch_with_checkpoint(preview_id, patch, &mut |_| Ok(()))
+    }
+
+    fn execute_nfo_patch_with_checkpoint(
+        &self,
+        preview_id: &str,
+        patch: &PreparedNfoPatch,
+        persist_checkpoint: &mut dyn FnMut(Option<NfoReplacementCheckpoint>) -> Result<()>,
+    ) -> Result<()> {
         let media = self.absolute_path(&patch.media_target_path)?;
         let target = self.absolute_path(&patch.target_path)?;
         let media_anchor = self.preview_anchor(preview_id, &patch.media_identity)?;
+        let content_limit = SIDE_CAR_LIMIT.max(patch.replacement.len());
+        let mut checkpoint_for_execution = patch.replacement_checkpoint.clone();
+        let checkpoint_stage = patch
+            .replacement_checkpoint
+            .as_ref()
+            .map(|checkpoint| self.nfo_checkpoint_stage_path(patch, checkpoint))
+            .transpose()?;
         self.coordinate_read(&media, |coordinated_media| {
             if coordinated_media != media {
                 bail!("coordinated media path changed during confirmed metadata patch");
@@ -1857,9 +1948,35 @@ impl LibraryManager {
             }
 
             if let Some(file) = self.root.open_bound_file(&target)? {
+                if file.byte_len()? > content_limit as u64 {
+                    bail!("NFO exceeds its bounded patch verification limit");
+                }
                 let (token, digest) = token_for_bound_file(&file)?;
+                let path_identity = self.root.entry_identity(&target)?;
+                if let (Some(checkpoint), Some(stage_path)) =
+                    (patch.replacement_checkpoint.as_ref(), checkpoint_stage.as_deref())
+                    && digest == patch.after_sha256
+                {
+                    if self.nfo_checkpoint_matches_file(
+                        patch,
+                        checkpoint,
+                        &target,
+                        &file,
+                        &token,
+                        &digest,
+                    )? && path_identity == Some(file.identity())
+                    {
+                        self.remove_checkpointed_displaced_nfo(
+                            preview_id,
+                            patch,
+                            checkpoint,
+                            stage_path,
+                        )?;
+                        return Ok(());
+                    }
+                    bail!("NFO has the prepared bytes but does not match its journaled replacement object");
+                }
                 if digest == patch.after_sha256 {
-                    let path_identity = self.root.entry_identity(&target)?;
                     if let Some(expected) = patch.expected_identity.as_deref() {
                         let nfo_anchor = self.preview_anchor(preview_id, expected)?;
                         if identity_tokens_match_with_pinned_file(
@@ -1887,7 +2004,7 @@ impl LibraryManager {
                 }
                 let expected = patch.expected_identity.as_deref()
                     .ok_or_else(|| anyhow!("NFO destination appeared after preview; leaving it untouched"))?;
-                let nfo_path_identity = self.root.entry_identity(&target)?;
+                let nfo_path_identity = path_identity;
                 let nfo_anchor = self.preview_anchor(preview_id, expected)?;
                 if !identity_tokens_match_with_pinned_file(
                     expected,
@@ -1898,14 +2015,97 @@ impl LibraryManager {
                 )? || digest != patch.expected_sha256.as_deref().unwrap_or_default() {
                     bail!("NFO changed after preview; leaving the current NFO untouched");
                 }
+                if let (Some(checkpoint), Some(stage_path)) =
+                    (patch.replacement_checkpoint.as_ref(), checkpoint_stage.as_deref())
+                {
+                    self.remove_checkpointed_staged_nfo(patch, checkpoint, stage_path)?;
+                    persist_checkpoint(None)?;
+                    checkpoint_for_execution = None;
+                }
                 let entry = self.root.bind_entry(&target, false)?;
                 let temporary = private_temp_sibling(&target);
-                self.root.replace_bound_file_atomically_if_identity(
+                let mut replacement_checkpoint = None;
+                let (_, replacement_identity) = self
+                    .root
+                    .replace_bound_file_atomically_if_identity_with_checkpoint(
                     &entry,
                     file.identity(),
                     &temporary,
                     &patch.replacement,
                     patch.expected_mode.unwrap_or(0o644),
+                    content_limit,
+                    &mut |staged_entry, staged_file, staged_identity| {
+                        if staged_entry.path() != temporary
+                            || staged_identity != staged_file.identity()
+                            || !staged_identity.is_file()
+                            || self.root.entry_identity(staged_entry.path())?
+                                != Some(staged_identity)
+                        {
+                            bail!("staged NFO replacement path or identity changed before checkpoint");
+                        }
+
+                        let current_before = self.root.entry_identity(&target)?;
+                        let (before_token, before_digest) = token_for_bound_file(&file)?;
+                        let before_bytes = file.read_limited(content_limit)?;
+                        if current_before != Some(file.identity())
+                            || before_digest != patch.expected_sha256.as_deref().unwrap_or_default()
+                            || sha256_bytes(&before_bytes) != before_digest
+                            || !identity_tokens_match_with_pinned_file(
+                                expected,
+                                &before_token,
+                                &file,
+                                current_before,
+                                nfo_anchor.as_ref(),
+                            )?
+                        {
+                            bail!("NFO changed while its replacement was being staged");
+                        }
+
+                        let staged_bytes = staged_file.read_limited(content_limit)?;
+                        let (after_identity, staged_digest) = token_for_bound_file(staged_file)?;
+                        let after_token = decode_identity_token(&after_identity)?;
+                        let expected_token = decode_identity_token(expected)?;
+                        let expected_mode = patch.expected_mode.unwrap_or(0o644);
+                        if staged_bytes != patch.replacement
+                            || staged_digest != patch.after_sha256
+                            || after_token.size != patch.replacement.len() as u64
+                            || after_token.uid != expected_token.uid
+                            || after_token.gid != expected_token.gid
+                            || after_token.mode & 0o777 != u32::from(expected_mode)
+                            || after_token.mode & 0o7000 != 0
+                        {
+                            bail!("staged NFO replacement content or access policy changed before checkpoint");
+                        }
+                        let staged_path = path_to_relative_string(
+                            staged_entry
+                                .path()
+                                .strip_prefix(self.root.logical_root_path())?,
+                        )?;
+                        let checkpoint = NfoReplacementCheckpoint {
+                            staged_path,
+                            after_identity,
+                        };
+                        persist_checkpoint(Some(checkpoint.clone()))?;
+                        replacement_checkpoint = Some(checkpoint);
+                        Ok(())
+                    },
+                )?;
+                let checkpoint = replacement_checkpoint.as_ref().ok_or_else(|| {
+                    anyhow!("atomic NFO replacement completed without a persisted identity checkpoint")
+                })?;
+                if replacement_identity.device()
+                    != decode_identity_token(&checkpoint.after_identity)?.device
+                    || replacement_identity.inode()
+                        != decode_identity_token(&checkpoint.after_identity)?.inode
+                {
+                    bail!("atomic NFO replacement returned an unexpected object identity");
+                }
+                checkpoint_for_execution = Some(checkpoint.clone());
+                self.remove_checkpointed_displaced_nfo(
+                    preview_id,
+                    patch,
+                    checkpoint,
+                    &temporary,
                 )?;
             } else {
                 if patch.expected_sha256.is_some() {
@@ -1915,15 +2115,35 @@ impl LibraryManager {
             }
             let updated = self.root.open_bound_file(&target)?
                 .ok_or_else(|| anyhow!("confirmed NFO patch disappeared"))?;
+            if updated.byte_len()? > content_limit as u64 {
+                bail!("confirmed NFO exceeds its bounded patch verification limit");
+            }
             let (token, digest) = token_for_bound_file(&updated)?;
             if digest != patch.after_sha256 {
                 bail!("confirmed NFO patch did not match its prepared content");
             }
-            if patch.expected_identity.is_none()
-                && !self.created_nfo_matches_prepared(
-                    &target, &updated, &token, &digest, patch,
-                )?
-            {
+            if patch.expected_identity.is_some() {
+                let checkpoint = checkpoint_for_execution.as_ref().ok_or_else(|| {
+                    anyhow!("original NFO replacement has no persisted identity checkpoint")
+                })?;
+                if !self.nfo_checkpoint_matches_file(
+                    patch,
+                    checkpoint,
+                    &target,
+                    &updated,
+                    &token,
+                    &digest,
+                )? || self.root.entry_identity(&target)? != Some(updated.identity())
+                {
+                    bail!("confirmed NFO replacement does not match its journaled object identity");
+                }
+            } else if !self.created_nfo_matches_prepared(
+                &target,
+                &updated,
+                &token,
+                &digest,
+                patch,
+            )? {
                 bail!("created NFO does not match its expected access policy");
             }
             let (media_after, _) = token_for_bound_file(&media_file)?;
@@ -1939,6 +2159,128 @@ impl LibraryManager {
             }
             Ok(())
         })
+    }
+
+    fn nfo_checkpoint_stage_path(
+        &self,
+        patch: &PreparedNfoPatch,
+        checkpoint: &NfoReplacementCheckpoint,
+    ) -> Result<PathBuf> {
+        validate_nfo_checkpoint_stage_path(&patch.target_path, &checkpoint.staged_path)?;
+        let token = decode_identity_token(&checkpoint.after_identity)?;
+        let expected = patch
+            .expected_identity
+            .as_deref()
+            .ok_or_else(|| anyhow!("NFO replacement checkpoint has no approved before object"))?;
+        let before = decode_identity_token(expected)?;
+        let digest = checkpoint
+            .after_identity
+            .rsplit(':')
+            .next()
+            .ok_or_else(|| anyhow!("NFO replacement checkpoint digest is missing"))?;
+        let requested_mode = patch.expected_mode.unwrap_or(0o644);
+        if digest != patch.after_sha256
+            || token.size != patch.replacement.len() as u64
+            || token.uid != before.uid
+            || token.gid != before.gid
+            || token.mode & 0o777 != u32::from(requested_mode)
+            || token.mode & 0o7000 != 0
+            || before.uid != unsafe { libc::geteuid() as u32 }
+            || before.gid != unsafe { libc::getegid() as u32 }
+        {
+            bail!(
+                "NFO replacement checkpoint does not match its prepared content or access policy"
+            );
+        }
+        self.absolute_path(&checkpoint.staged_path)
+    }
+
+    fn nfo_checkpoint_matches_file(
+        &self,
+        patch: &PreparedNfoPatch,
+        checkpoint: &NfoReplacementCheckpoint,
+        path: &Path,
+        file: &BoundFile,
+        token: &str,
+        digest: &str,
+    ) -> Result<bool> {
+        let _ = self.nfo_checkpoint_stage_path(patch, checkpoint)?;
+        let expected = decode_identity_token(&checkpoint.after_identity)?;
+        let current = decode_identity_token(token)?;
+        let path_identity = self.root.entry_identity(path)?;
+        Ok(token == checkpoint.after_identity
+            && digest == patch.after_sha256
+            && current.device == expected.device
+            && current.inode == expected.inode
+            && current.size == expected.size
+            && current.uid == expected.uid
+            && current.gid == expected.gid
+            && current.mode == expected.mode
+            && path_identity == Some(file.identity())
+            && file.identity().is_file())
+    }
+
+    fn remove_checkpointed_staged_nfo(
+        &self,
+        patch: &PreparedNfoPatch,
+        checkpoint: &NfoReplacementCheckpoint,
+        stage_path: &Path,
+    ) -> Result<()> {
+        let Some(file) = self.root.open_bound_file(stage_path)? else {
+            return Ok(());
+        };
+        if file.byte_len()? > SIDE_CAR_LIMIT.max(patch.replacement.len()) as u64 {
+            bail!("staged NFO replacement exceeds its bounded recovery limit");
+        }
+        let (token, digest) = token_for_bound_file(&file)?;
+        if !self
+            .nfo_checkpoint_matches_file(patch, checkpoint, stage_path, &file, &token, &digest)?
+        {
+            bail!("staged NFO replacement no longer matches its journaled identity");
+        }
+        let entry = self.root.bind_entry(stage_path, false)?;
+        self.root
+            .remove_bound_file_if_identity(&entry, file.identity())
+    }
+
+    fn remove_checkpointed_displaced_nfo(
+        &self,
+        preview_id: &str,
+        patch: &PreparedNfoPatch,
+        checkpoint: &NfoReplacementCheckpoint,
+        stage_path: &Path,
+    ) -> Result<()> {
+        let expected_stage = self.nfo_checkpoint_stage_path(patch, checkpoint)?;
+        if expected_stage != stage_path {
+            bail!("journaled NFO replacement stage path changed");
+        }
+        let Some(file) = self.root.open_bound_file(stage_path)? else {
+            return Ok(());
+        };
+        if file.byte_len()? > SIDE_CAR_LIMIT as u64 {
+            bail!("displaced NFO exceeds its bounded recovery limit");
+        }
+        let expected = patch
+            .expected_identity
+            .as_deref()
+            .ok_or_else(|| anyhow!("NFO replacement checkpoint has no approved before object"))?;
+        let (token, digest) = token_for_bound_file(&file)?;
+        let path_identity = self.root.entry_identity(stage_path)?;
+        let anchor = self.preview_anchor(preview_id, expected)?;
+        if digest != patch.expected_sha256.as_deref().unwrap_or_default()
+            || !identity_tokens_match_with_pinned_file(
+                expected,
+                &token,
+                &file,
+                path_identity,
+                anchor.as_ref(),
+            )?
+        {
+            bail!("displaced NFO at the journaled stage path is not the approved before object");
+        }
+        let entry = self.root.bind_entry(stage_path, false)?;
+        self.root
+            .remove_bound_file_if_identity(&entry, file.identity())
     }
 
     fn created_nfo_matches_prepared(
@@ -4505,6 +4847,37 @@ fn private_temp_sibling(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.next-{}-{serial}", std::process::id()))
 }
 
+fn validate_nfo_checkpoint_stage_path(target: &str, staged: &str) -> Result<()> {
+    let target_path = Path::new(target);
+    let staged_path = Path::new(staged);
+    if target_path.parent() != staged_path.parent() {
+        bail!("NFO replacement checkpoint is not a sibling of its target");
+    }
+    let target_name = target_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("NFO target filename is invalid"))?;
+    let staged_name = staged_path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("NFO checkpoint filename is invalid"))?;
+    let prefix = format!(".{target_name}.next-");
+    let suffix = staged_name
+        .strip_prefix(&prefix)
+        .ok_or_else(|| anyhow!("NFO replacement checkpoint has an unexpected filename"))?;
+    let (process_id, serial) = suffix
+        .split_once('-')
+        .ok_or_else(|| anyhow!("NFO replacement checkpoint filename is malformed"))?;
+    if process_id.is_empty()
+        || serial.is_empty()
+        || !process_id.bytes().all(|byte| byte.is_ascii_digit())
+        || !serial.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        bail!("NFO replacement checkpoint filename is malformed");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct MediaSpecs {
     width: Option<u32>,
@@ -5198,12 +5571,88 @@ fn xml_text_content(value: &str) -> String {
 }
 
 fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+    let mut result = String::with_capacity(value.len());
+    let mut cursor = 0;
+
+    while let Some(relative_ampersand) = value[cursor..].find('&') {
+        let ampersand = cursor + relative_ampersand;
+        result.push_str(&value[cursor..ampersand]);
+
+        let mut end = ampersand + 1;
+        let mut terminated = false;
+        while end < value.len() {
+            match value.as_bytes()[end] {
+                b'&' => break,
+                b';' => {
+                    end += 1;
+                    terminated = true;
+                    break;
+                }
+                _ => {
+                    let character = value[end..]
+                        .chars()
+                        .next()
+                        .expect("end is a character boundary before the string end");
+                    end += character.len_utf8();
+                }
+            }
+        }
+
+        let reference = &value[ampersand..end];
+        if terminated {
+            if let Some(character) = decode_xml_reference(reference) {
+                result.push(character);
+            } else {
+                result.push_str(reference);
+            }
+        } else {
+            result.push_str(reference);
+        }
+        cursor = end;
+    }
+
+    result.push_str(&value[cursor..]);
+    result
+}
+
+fn decode_xml_reference(reference: &str) -> Option<char> {
+    match reference {
+        "&lt;" => return Some('<'),
+        "&gt;" => return Some('>'),
+        "&quot;" => return Some('"'),
+        "&apos;" => return Some('\''),
+        "&amp;" => return Some('&'),
+        _ => {}
+    }
+
+    let body = reference.strip_prefix("&#")?.strip_suffix(';')?;
+    let (digits, radix) = if let Some(hex) = body.strip_prefix('x') {
+        (hex, 16)
+    } else {
+        (body, 10)
+    };
+    if digits.is_empty()
+        || !digits.bytes().all(|byte| match radix {
+            10 => byte.is_ascii_digit(),
+            16 => byte.is_ascii_hexdigit(),
+            _ => false,
+        })
+    {
+        return None;
+    }
+
+    let codepoint = u32::from_str_radix(digits, radix).ok()?;
+    if !is_xml_10_character(codepoint) {
+        return None;
+    }
+    char::from_u32(codepoint)
+}
+
+fn is_xml_10_character(codepoint: u32) -> bool {
+    matches!(
+        codepoint,
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+    )
 }
 
 fn xml_escape(value: &str) -> String {
@@ -6399,6 +6848,26 @@ mod tests {
     }
 
     #[test]
+    fn round6_xml_unescape_decodes_valid_decimal_and_hex_character_references() {
+        assert_eq!(xml_unescape("&#65;&#xDF;&#x1F600; &lt;&amp;"), "Aß😀 <&");
+    }
+
+    #[test]
+    fn round6_xml_unescape_preserves_invalid_character_references() {
+        let references = "&#;|&#x;|&#xZZ;|&#4294967296;|&#x110000;|&#xD800;|&#1;|&#65|&unknown;";
+        assert_eq!(xml_unescape(references), references);
+    }
+
+    #[test]
+    fn round6_xml_unescape_decodes_once_and_keeps_cdata_literal() {
+        assert_eq!(xml_unescape("&amp;#38; &amp;amp;"), "&#38; &amp;");
+        assert_eq!(
+            xml_text_content("<title><![CDATA[&#38; &amp;]]></title>"),
+            "&#38; &amp;"
+        );
+    }
+
+    #[test]
     fn round5_legacy_index_records_default_queue_provenance_to_unknown() {
         let value = serde_json::json!({
             "item": index_fixture_item("legacy", "clip.mp4", Presence::Present),
@@ -7452,6 +7921,453 @@ mod tests {
             fs::read(root.path().join("clip.nfo")).unwrap(),
             created_content,
             "retry must not rewrite a digest-matched NFO with a changed access policy"
+        );
+    }
+
+    #[derive(Default)]
+    struct FailAppliedBatchManifestWriteProvider {
+        batch_manifest_writes: AtomicUsize,
+    }
+
+    impl QueueFileProvider for FailAppliedBatchManifestWriteProvider {
+        fn coordinate_read(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(path)
+        }
+
+        fn coordinate_write(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            let is_batch_manifest = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| name.starts_with(BATCH_PREFIX));
+            if is_batch_manifest && self.batch_manifest_writes.fetch_add(1, Ordering::SeqCst) == 2 {
+                bail!("injected manifest write failure after NFO replacement");
+            }
+            accessor(path)
+        }
+
+        fn coordinate_move(
+            &self,
+            source: &Path,
+            destination: &Path,
+            accessor: &mut dyn FnMut(&Path, &Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(source, destination)
+        }
+    }
+
+    fn existing_nfo_manifest_failure_fixture(
+        label: &str,
+    ) -> (TemporaryRoot, LibraryManager, MovePreview) {
+        let root = TemporaryRoot::new(label);
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        fs::write(
+            root.path().join("clip.nfo"),
+            "<movie><title>Before</title><future>keep</future></movie>",
+        )
+        .expect("NFO fixture should write");
+        fs::set_permissions(
+            root.path().join("clip.nfo"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("NFO fixture should become private");
+        let provider_impl = Arc::new(FailAppliedBatchManifestWriteProvider::default());
+        let provider: Arc<dyn QueueFileProvider> = provider_impl;
+        let manager = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should open");
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let patch = MetadataPatch {
+            item_id: item_at(&snapshot, "clip.mp4").id.clone(),
+            title: Some("After".to_string()),
+            source_ids: vec!["youtube:abcdefghijk".to_string()],
+            collection: None,
+        };
+        let preview = manager
+            .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
+            .expect("existing NFO patch should preview");
+        assert!(
+            manager
+                .execute_preview(&preview.id, &preview.revision)
+                .is_err(),
+            "the injected third manifest write should fail after replacement"
+        );
+        let bytes = manager
+            .read_private_file(&manager.batch_path(&preview.id), MANIFEST_LIMIT)
+            .expect("interrupted batch manifest should read")
+            .expect("interrupted batch manifest should exist");
+        let manifest: BatchManifest =
+            serde_json::from_slice(&bytes).expect("interrupted manifest should decode");
+        assert_eq!(manifest.patches[0].state, ManifestPatchState::Pending);
+        assert!(manifest.patches[0].replacement_checkpoint.is_some());
+        assert!(
+            fs::read_to_string(root.path().join("clip.nfo"))
+                .unwrap()
+                .contains("<title>After</title>"),
+            "the NFO replacement should have happened before the injected manifest failure"
+        );
+        (root, manager, preview)
+    }
+
+    fn release_nfo_preview_anchors_if_restart_proof_is_persistent(
+        manager: &LibraryManager,
+        preview: &MovePreview,
+    ) {
+        let persisted = manager
+            .read_persisted_preview(&preview.id)
+            .expect("prepared NFO preview should read");
+        let persistent_birth_time = persisted
+            .preview
+            .items
+            .iter()
+            .flat_map(|item| &item.files)
+            .filter(|file| !file.identity.is_empty())
+            .all(|file| {
+                decode_identity_token(&file.identity)
+                    .expect("move identity should decode")
+                    .birth_seconds
+                    .is_some()
+            })
+            && persisted.patches.iter().all(|patch| {
+                decode_identity_token(&patch.media_identity)
+                    .expect("media identity should decode")
+                    .birth_seconds
+                    .is_some()
+                    && patch.expected_identity.as_deref().is_none_or(|identity| {
+                        decode_identity_token(identity)
+                            .expect("NFO identity should decode")
+                            .birth_seconds
+                            .is_some()
+                    })
+            });
+        if persistent_birth_time {
+            release_preview_anchors(&preview.id);
+        }
+    }
+
+    #[test]
+    fn existing_nfo_replacement_checkpoint_recovers_after_restart() {
+        let (root, current_manager, preview) =
+            existing_nfo_manifest_failure_fixture("nfo-checkpoint-restart");
+        release_nfo_preview_anchors_if_restart_proof_is_persistent(&current_manager, &preview);
+        drop(current_manager);
+
+        let reopened = manager(&root);
+        let result = reopened
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("journaled replacement should complete after reopening");
+        assert_eq!(result.status, BatchStatus::Complete);
+        let updated_nfo = fs::read_to_string(root.path().join("clip.nfo")).unwrap();
+        assert!(updated_nfo.contains("<title>After</title>"));
+        assert!(updated_nfo.contains("<future>keep</future>"));
+        assert!(updated_nfo.contains("<uniqueid type=\"youtube\">abcdefghijk</uniqueid>"));
+        assert_eq!(
+            updated_nfo.matches("<uniqueid type=\"youtube\">").count(),
+            1,
+            "restart recovery must not duplicate the NFO source ID"
+        );
+        let batch = reopened
+            .read_private_file(&reopened.batch_path(&preview.id), MANIFEST_LIMIT)
+            .expect("completed batch should read")
+            .expect("completed batch should remain recoverable");
+        let manifest: BatchManifest =
+            serde_json::from_slice(&batch).expect("completed manifest should decode");
+        assert_eq!(manifest.patches[0].state, ManifestPatchState::Applied);
+        assert!(manifest.patches[0].replacement_checkpoint.is_some());
+    }
+
+    #[test]
+    fn nfo_replacement_checkpoint_rejects_same_content_object_replacement() {
+        let (root, current_manager, preview) =
+            existing_nfo_manifest_failure_fixture("nfo-checkpoint-replaced");
+        let current = root.path().join("clip.nfo");
+        let replacement = root.path().join("external-copy.nfo");
+        let bytes = fs::read(&current).expect("patched NFO should read");
+        fs::write(&replacement, &bytes).expect("same-content external NFO should write");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))
+            .expect("external NFO should use the approved access mode");
+        fs::rename(&replacement, &current)
+            .expect("same-content external NFO should replace the checkpointed object");
+        release_nfo_preview_anchors_if_restart_proof_is_persistent(&current_manager, &preview);
+        drop(current_manager);
+
+        let reopened = manager(&root);
+        let result = reopened
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("mismatched checkpoint should become a failed batch result");
+        assert_eq!(result.status, BatchStatus::Failed);
+        assert_eq!(fs::read(current).unwrap(), bytes);
+    }
+
+    #[test]
+    fn nfo_replacement_checkpoint_rejects_access_policy_change() {
+        let (root, current_manager, preview) =
+            existing_nfo_manifest_failure_fixture("nfo-checkpoint-permissions");
+        let current = root.path().join("clip.nfo");
+        let bytes = fs::read(&current).expect("patched NFO should read");
+        fs::set_permissions(&current, fs::Permissions::from_mode(0o644))
+            .expect("NFO access policy should change for the regression case");
+        release_nfo_preview_anchors_if_restart_proof_is_persistent(&current_manager, &preview);
+        drop(current_manager);
+
+        let reopened = manager(&root);
+        let result = reopened
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("mismatched checkpoint should become a failed batch result");
+        assert_eq!(result.status, BatchStatus::Failed);
+        assert_eq!(fs::read(&current).unwrap(), bytes);
+        assert_eq!(fs::metadata(current).unwrap().mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn legacy_nfo_manifest_without_replacement_checkpoint_fails_closed() {
+        let (root, current_manager, preview) =
+            existing_nfo_manifest_failure_fixture("nfo-checkpoint-legacy");
+        for path in [
+            current_manager.batch_path(&preview.id),
+            current_manager.preview_path(&preview.id),
+        ] {
+            let bytes = current_manager
+                .read_private_file(&path, MANIFEST_LIMIT.max(PREVIEW_LIMIT))
+                .expect("legacy operation state should read")
+                .expect("legacy operation state should exist");
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("operation state should decode");
+            if let Some(patches) = value
+                .get_mut("patches")
+                .and_then(serde_json::Value::as_array_mut)
+                && let Some(patch) = patches
+                    .first_mut()
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                patch.remove("replacement_checkpoint");
+            }
+            current_manager
+                .write_private_file(&path, &serde_json::to_vec(&value).unwrap())
+                .expect("checkpoint field should be removed to simulate an old manifest");
+        }
+        release_nfo_preview_anchors_if_restart_proof_is_persistent(&current_manager, &preview);
+        drop(current_manager);
+
+        let reopened = manager(&root);
+        let result = reopened
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("legacy after-state should be reported as a failed batch");
+        assert_eq!(result.status, BatchStatus::Failed);
+        assert!(
+            fs::read_to_string(root.path().join("clip.nfo"))
+                .unwrap()
+                .contains("<title>After</title>")
+        );
+    }
+
+    #[test]
+    fn metadata_patch_rejects_shared_nfo_targets_with_or_without_existing_sidecar() {
+        let root = TemporaryRoot::new("shared-nfo-target");
+        fs::write(root.path().join("clip.mp4"), b"video-mp4").unwrap();
+        fs::write(root.path().join("clip.mkv"), b"video-mkv").unwrap();
+        let manager = manager(&root);
+        let snapshot = manager
+            .scan(&[])
+            .expect("scan should find both media items");
+        let mp4 = item_at(&snapshot, "clip.mp4");
+        let patch_for = |item_id: &str, title: &str| MetadataPatch {
+            item_id: item_id.to_string(),
+            title: Some(title.to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+        };
+
+        assert!(
+            manager
+                .preview_with_patches(
+                    &[],
+                    None,
+                    false,
+                    ConflictPolicy::Skip,
+                    &[patch_for(&mp4.id, "MP4 title")],
+                )
+                .is_err(),
+            "a single patch must not claim an NFO candidate shared with another media item"
+        );
+
+        fs::write(
+            root.path().join("clip.nfo"),
+            "<movie><title>Shared title</title></movie>",
+        )
+        .expect("shared NFO should write");
+        let snapshot = manager
+            .scan(&[])
+            .expect("scan with shared NFO should complete");
+        let mp4 = item_at(&snapshot, "clip.mp4");
+        let mkv = item_at(&snapshot, "clip.mkv");
+        assert!(
+            manager
+                .preview_with_patches(
+                    &[],
+                    None,
+                    false,
+                    ConflictPolicy::Skip,
+                    &[patch_for(&mp4.id, "MP4 title")],
+                )
+                .is_err(),
+            "an existing shared NFO must not silently attach to one of its media candidates"
+        );
+        assert!(
+            manager
+                .preview_with_patches(
+                    &[],
+                    None,
+                    false,
+                    ConflictPolicy::Skip,
+                    &[
+                        patch_for(&mp4.id, "MP4 title"),
+                        patch_for(&mkv.id, "MKV title"),
+                    ],
+                )
+                .is_err(),
+            "two patches must be rejected when their filesystem target keys are shared"
+        );
+    }
+
+    #[test]
+    fn metadata_patch_target_reservation_uses_case_and_normalization_aliases() {
+        fn check_alias_pair(label: &str, first: &str, second: &str) {
+            let root = TemporaryRoot::new(label);
+            fs::write(root.path().join(first), b"first-video").unwrap();
+            fs::write(root.path().join(second), b"second-video").unwrap();
+            let manager = manager(&root);
+            let snapshot = manager.scan(&[]).expect("alias scan should complete");
+            assert_eq!(
+                snapshot.items.len(),
+                2,
+                "both extension-distinct media should scan"
+            );
+            let mut keys = TargetReservationSet {
+                private_library_identity: Some(manager.library_dir_identity),
+                ..TargetReservationSet::default()
+            };
+            let first_nfo = with_extension(Path::new(first), "nfo");
+            let second_nfo = with_extension(Path::new(second), "nfo");
+            let first_key = keys
+                .key_for(&manager.root, &path_to_relative_string(&first_nfo).unwrap())
+                .unwrap();
+            let second_key = keys
+                .key_for(
+                    &manager.root,
+                    &path_to_relative_string(&second_nfo).unwrap(),
+                )
+                .unwrap();
+            let aliased = first_key == second_key;
+            let patch = MetadataPatch {
+                item_id: snapshot.items[0].id.clone(),
+                title: Some("Alias title".to_string()),
+                source_ids: Vec::new(),
+                collection: None,
+            };
+            let result =
+                manager.preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch]);
+            assert_eq!(
+                result.is_err(),
+                aliased,
+                "preview should follow the rooted filesystem's NFO target-name equivalence"
+            );
+        }
+
+        check_alias_pair("nfo-case-alias", "Clip.mp4", "clip.mkv");
+        check_alias_pair("nfo-normalization-alias", "Cafe\u{301}.mp4", "Café.mkv");
+    }
+
+    #[test]
+    fn metadata_patch_reservation_allows_distinct_targets_and_same_item_move() {
+        let root = TemporaryRoot::new("nfo-distinct-and-move");
+        fs::write(root.path().join("one.mp4"), b"first-video").unwrap();
+        fs::write(
+            root.path().join("one.nfo"),
+            "<movie><title>One</title></movie>",
+        )
+        .unwrap();
+        fs::write(root.path().join("two.mkv"), b"second-video").unwrap();
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let one = item_at(&snapshot, "one.mp4");
+        let two = item_at(&snapshot, "two.mkv");
+        let patch_for = |item_id: &str, title: &str| MetadataPatch {
+            item_id: item_id.to_string(),
+            title: Some(title.to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+        };
+
+        let distinct = manager
+            .preview_with_patches(
+                &[],
+                None,
+                false,
+                ConflictPolicy::KeepBoth,
+                &[
+                    patch_for(&one.id, "One updated"),
+                    patch_for(&two.id, "Two updated"),
+                ],
+            )
+            .expect("distinct NFO targets should remain legal");
+        assert_eq!(distinct.metadata_patches.len(), 2);
+
+        let same_item_move = manager
+            .preview_with_hints_and_patches(
+                std::slice::from_ref(&one.id),
+                Some("Moved"),
+                false,
+                ConflictPolicy::KeepBoth,
+                &[],
+                &[patch_for(&one.id, "One moved")],
+            )
+            .expect("a patch may share its own item's planned NFO move target");
+        assert_eq!(same_item_move.items[0].files.len(), 2);
+        assert_eq!(same_item_move.metadata_patches[0].nfo_path, "Moved/one.nfo");
+    }
+
+    #[test]
+    fn metadata_patch_target_conflicts_with_another_items_planned_nfo_move() {
+        let root = TemporaryRoot::new("nfo-cross-item-move");
+        fs::create_dir_all(root.path().join("A")).unwrap();
+        fs::create_dir_all(root.path().join("B")).unwrap();
+        fs::write(root.path().join("A/clip.mp4"), b"first-video").unwrap();
+        fs::write(
+            root.path().join("A/clip.nfo"),
+            "<movie><title>First</title></movie>",
+        )
+        .unwrap();
+        fs::write(root.path().join("B/clip.mkv"), b"second-video").unwrap();
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let first = item_at(&snapshot, "A/clip.mp4");
+        let second = item_at(&snapshot, "B/clip.mkv");
+        let patch = MetadataPatch {
+            item_id: second.id.clone(),
+            title: Some("Second updated".to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+        };
+        assert!(
+            manager
+                .preview_with_hints_and_patches(
+                    &[first.id.clone(), second.id.clone()],
+                    Some("Moved"),
+                    false,
+                    ConflictPolicy::KeepBoth,
+                    &[],
+                    &[patch],
+                )
+                .is_err(),
+            "another item's planned NFO attachment move must reserve the shared target"
         );
     }
 
