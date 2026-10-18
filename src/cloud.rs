@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -32,6 +33,7 @@ const INBOX_RECORD_VERSION: u32 = 1;
 const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_LEGACY_IMPORT_BYTES: usize = 256 * 1024;
+const MAX_MANAGEMENT_STATE_RECORDS: usize = 100;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type CloudWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -110,6 +112,40 @@ pub struct CloudClient {
     client: Client,
     authorization: HeaderValue,
 }
+
+#[derive(Debug)]
+pub enum CloudStatePostError {
+    Transport(anyhow::Error),
+    HttpStatus(reqwest::StatusCode),
+}
+
+impl CloudStatePostError {
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport(_) => true,
+            Self::HttpStatus(status) => {
+                *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+            }
+        }
+    }
+
+    pub fn is_payload_too_large(&self) -> bool {
+        matches!(self, Self::HttpStatus(status) if *status == reqwest::StatusCode::PAYLOAD_TOO_LARGE)
+    }
+}
+
+impl std::fmt::Display for CloudStatePostError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) => write!(formatter, "{error:#}"),
+            Self::HttpStatus(status) => write!(formatter, "HTTP {status}"),
+        }
+    }
+}
+
+impl std::error::Error for CloudStatePostError {}
 
 impl CloudClient {
     pub fn new(config: &CloudConfig) -> Result<Self> {
@@ -192,17 +228,31 @@ impl CloudClient {
         Ok(())
     }
 
-    pub async fn post_state(&self, state: &CloudState<'_>) -> Result<()> {
-        self.client
-            .post(self.api_url("api/local/state")?)
+    pub async fn post_state(
+        &self,
+        state: &CloudState<'_>,
+    ) -> std::result::Result<(), CloudStatePostError> {
+        let url = self
+            .api_url("api/local/state")
+            .map_err(CloudStatePostError::Transport)?;
+        let response = self
+            .client
+            .post(url)
             .header(AUTHORIZATION, self.authorization.clone())
             .json(state)
             .send()
             .await
-            .context("failed to publish local cloud state")?
-            .error_for_status()
-            .context("local cloud state update returned HTTP error")?;
-        Ok(())
+            .map_err(|error| {
+                CloudStatePostError::Transport(
+                    anyhow!(error).context("failed to publish local cloud state"),
+                )
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(CloudStatePostError::HttpStatus(status))
+        }
     }
 
     pub async fn connect_websocket(&self) -> Result<CloudWebSocket> {
@@ -259,6 +309,77 @@ pub struct InboxRecord {
     pub result: Option<Value>,
 }
 
+#[derive(Default)]
+struct InboxStateIndex {
+    recent_management: BTreeSet<u64>,
+    awaiting_previews: BTreeSet<u64>,
+}
+
+impl InboxStateIndex {
+    fn record(&mut self, record: &InboxRecord) {
+        if record.request.kind != "telegram" {
+            self.recent_management.insert(record.request.seq);
+            while self.recent_management.len() > MAX_MANAGEMENT_STATE_RECORDS {
+                if let Some(oldest) = self.recent_management.first().copied() {
+                    self.recent_management.remove(&oldest);
+                }
+            }
+        }
+        if record.request.kind == "file_preview" {
+            if record.status == InboxStatus::AwaitingConfirmation {
+                self.awaiting_previews.insert(record.request.seq);
+            } else {
+                self.awaiting_previews.remove(&record.request.seq);
+            }
+        }
+    }
+
+    fn sequences(&self) -> BTreeSet<u64> {
+        self.recent_management
+            .union(&self.awaiting_previews)
+            .copied()
+            .collect()
+    }
+}
+
+fn set_pending_sequence(index: &mut BTreeSet<u64>, seq: u64, status: InboxStatus) {
+    if matches!(status, InboxStatus::Pending | InboxStatus::Retryable) {
+        index.insert(seq);
+    } else {
+        index.remove(&seq);
+    }
+}
+
+impl InboxRecord {
+    /// Replace an oversized generated result before it can leave a durable request stuck in
+    /// `Processing`. The original request remains available for exact-sequence deduplication.
+    pub(crate) fn compact_oversized_result(&mut self) -> Result<bool> {
+        let limit = MAX_REQUEST_BYTES + 64 * 1024;
+        let safety_margin = 512;
+        if serde_json::to_vec(self)?
+            .len()
+            .saturating_add(safety_margin)
+            <= limit
+        {
+            return Ok(false);
+        }
+
+        self.status = InboxStatus::Failed;
+        self.result = Some(serde_json::json!({
+            "error": "The local operation result exceeded the receipt size limit."
+        }));
+        self.error = Some(
+            "The operation result was too large to save; submit a smaller request if needed."
+                .to_string(),
+        );
+        self.next_attempt_at = 0;
+        if serde_json::to_vec(self)?.len() > limit {
+            bail!("cloud inbox request cannot fit a compact terminal receipt");
+        }
+        Ok(true)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedStateVersion {
     schema_version: u32,
@@ -273,6 +394,8 @@ pub struct CloudInbox {
     directory_identity: EntryIdentity,
     _owner_lock: BoundFile,
     operation_lock: Arc<Mutex<()>>,
+    pending_sequences: Arc<Mutex<BTreeSet<u64>>>,
+    state_index: Arc<Mutex<InboxStateIndex>>,
 }
 
 impl CloudInbox {
@@ -297,6 +420,8 @@ impl CloudInbox {
             directory_identity,
             _owner_lock: owner_lock,
             operation_lock: Arc::new(Mutex::new(())),
+            pending_sequences: Arc::new(Mutex::new(BTreeSet::new())),
+            state_index: Arc::new(Mutex::new(InboxStateIndex::default())),
         };
         // A single local process owns the inbox. Recover unfinished management operations, which
         // are idempotent by cloud sequence and (for confirmed moves) by the file manager's
@@ -315,6 +440,15 @@ impl CloudInbox {
         let path = self.record_path(request.seq);
         if let Some(existing) = self.read_record_path(&path)? {
             if existing.request == request {
+                let mut pending = self
+                    .pending_sequences
+                    .lock()
+                    .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?;
+                set_pending_sequence(&mut pending, request.seq, existing.status);
+                self.state_index
+                    .lock()
+                    .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
+                    .record(&existing);
                 return Ok(false);
             }
             bail!(
@@ -332,7 +466,17 @@ impl CloudInbox {
             error: None,
             result: None,
         };
+        let mut pending = self
+            .pending_sequences
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?;
+        let mut state_index = self
+            .state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
         self.write_record_path(&path, &record)?;
+        pending.insert(record.request.seq);
+        state_index.record(&record);
         Ok(true)
     }
 
@@ -351,20 +495,92 @@ impl CloudInbox {
             .collect()
     }
 
-    pub fn pending(&self) -> Result<Vec<InboxRecord>> {
-        let mut pending = self
-            .records()?
+    /// Return the recent management history and every preview still awaiting confirmation.
+    /// The index stores sequence numbers only; each selected durable record is revalidated/read.
+    pub fn state_records(&self) -> Result<Vec<InboxRecord>> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        let sequences = self
+            .state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
+            .sequences();
+        sequences
             .into_iter()
-            .filter(|record| {
-                matches!(record.status, InboxStatus::Pending | InboxStatus::Retryable)
-                    && record.next_attempt_at <= now_seconds()
+            .map(|seq| {
+                self.read_record_path(&self.record_path(seq))?
+                    .ok_or_else(|| anyhow!("indexed cloud state request {seq} is missing"))
             })
+            .collect()
+    }
+
+    pub fn record(&self, seq: u64) -> Result<Option<InboxRecord>> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        self.read_record_path(&self.record_path(seq))
+    }
+
+    pub fn pending(&self) -> Result<Vec<InboxRecord>> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        let sequences = self
+            .pending_sequences
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?
+            .iter()
+            .copied()
             .collect::<Vec<_>>();
+        let now = now_seconds();
+        let mut pending = Vec::with_capacity(sequences.len());
+        for seq in sequences {
+            let record = self
+                .read_record_path(&self.record_path(seq))?
+                .ok_or_else(|| anyhow!("indexed cloud inbox request {seq} is missing"))?;
+            if matches!(record.status, InboxStatus::Pending | InboxStatus::Retryable)
+                && record.next_attempt_at <= now
+            {
+                pending.push(record);
+            }
+        }
         pending.sort_by_key(|record| record.request.seq);
         Ok(pending)
     }
 
     pub fn update(&self, seq: u64, update: impl FnOnce(&mut InboxRecord)) -> Result<InboxRecord> {
+        self.update_checked(seq, |record| {
+            update(record);
+            Ok(())
+        })
+    }
+
+    pub(crate) fn persist_dispatch_result(
+        &self,
+        seq: u64,
+        status: InboxStatus,
+        result: Option<Value>,
+        error: Option<String>,
+    ) -> Result<InboxRecord> {
+        self.update_checked(seq, |record| {
+            record.status = status;
+            record.result = result;
+            record.error = error;
+            record.next_attempt_at = 0;
+            record.compact_oversized_result()?;
+            Ok(())
+        })
+    }
+
+    fn update_checked(
+        &self,
+        seq: u64,
+        update: impl FnOnce(&mut InboxRecord) -> Result<()>,
+    ) -> Result<InboxRecord> {
         let _guard = self
             .operation_lock
             .lock()
@@ -373,9 +589,19 @@ impl CloudInbox {
         let mut record = self
             .read_record_path(&path)?
             .ok_or_else(|| anyhow!("cloud inbox request {seq} is missing"))?;
-        update(&mut record);
+        update(&mut record)?;
         record.updated_at = now_seconds();
+        let mut pending = self
+            .pending_sequences
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?;
+        let mut state_index = self
+            .state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
         self.write_record_path(&path, &record)?;
+        set_pending_sequence(&mut pending, seq, record.status);
+        state_index.record(&record);
         Ok(record)
     }
 
@@ -599,8 +825,14 @@ impl CloudInbox {
     }
 
     fn recover_interrupted_requests(&mut self) -> Result<()> {
+        let mut pending = BTreeSet::new();
+        let mut state_index = InboxStateIndex::default();
         for mut record in self.records()? {
             if record.status != InboxStatus::Processing {
+                if matches!(record.status, InboxStatus::Pending | InboxStatus::Retryable) {
+                    pending.insert(record.request.seq);
+                }
+                state_index.record(&record);
                 continue;
             }
             if record.request.kind == "telegram" {
@@ -618,7 +850,19 @@ impl CloudInbox {
                 );
             }
             self.write_record_path(&self.record_path(record.request.seq), &record)?;
+            if matches!(record.status, InboxStatus::Pending | InboxStatus::Retryable) {
+                pending.insert(record.request.seq);
+            }
+            state_index.record(&record);
         }
+        *self
+            .pending_sequences
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))? = pending;
+        *self
+            .state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))? = state_index;
         Ok(())
     }
 }
@@ -944,6 +1188,173 @@ mod tests {
         assert_eq!(inbox.pending().expect("due retry should load").len(), 1);
         drop(inbox);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_receipts_stay_deduplicated_without_entering_pending_index() {
+        let root = temp_root("terminal-dedup");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let lower = request(2, "/help");
+        let higher = request(9, "/queue");
+        assert!(
+            inbox
+                .persist(lower.clone())
+                .expect("lower request should persist")
+        );
+        assert!(
+            inbox
+                .persist(higher.clone())
+                .expect("higher request should persist")
+        );
+        inbox
+            .persist_dispatch_result(9, InboxStatus::Completed, None, None)
+            .expect("terminal receipt should persist");
+        assert_eq!(
+            inbox
+                .pending()
+                .expect("pending should retain lower unseen sequence")
+                .iter()
+                .map(|record| record.request.seq)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(
+            !inbox
+                .persist(higher)
+                .expect("terminal duplicate should remain deduplicated")
+        );
+        assert_eq!(
+            inbox
+                .pending()
+                .expect("pending should remain indexed")
+                .len(),
+            1
+        );
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        assert_eq!(reopened.pending().expect("pending should recover").len(), 1);
+        assert!(
+            !reopened
+                .persist(request(9, "/queue"))
+                .expect("terminal duplicate should deduplicate after restart")
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn management_state_index_is_bounded_and_keeps_awaiting_previews() {
+        let mut index = InboxStateIndex::default();
+        let mut preview = InboxRecord {
+            schema_version: INBOX_RECORD_VERSION,
+            request: CloudRequest {
+                seq: 1,
+                kind: "file_preview".to_string(),
+                payload: json!({}),
+                created_at: 1,
+                extra: serde_json::Map::new(),
+            },
+            status: InboxStatus::AwaitingConfirmation,
+            attempts: 1,
+            updated_at: 1,
+            next_attempt_at: 0,
+            error: None,
+            result: Some(json!({"preview": {"id": "preview-a"}})),
+        };
+        index.record(&preview);
+        for seq in 2..=105 {
+            let mut management = request(seq, "/queue");
+            management.kind = "library_scan".to_string();
+            let record = InboxRecord {
+                schema_version: INBOX_RECORD_VERSION,
+                request: management,
+                status: InboxStatus::Completed,
+                attempts: 1,
+                updated_at: seq,
+                next_attempt_at: 0,
+                error: None,
+                result: None,
+            };
+            index.record(&record);
+        }
+        let sequences = index.sequences().into_iter().collect::<Vec<_>>();
+        assert_eq!(sequences.len(), MAX_MANAGEMENT_STATE_RECORDS + 1);
+        assert_eq!(sequences[0], 1, "awaiting preview should remain visible");
+        assert_eq!(
+            sequences[1], 6,
+            "only the latest 100 management items remain"
+        );
+        assert_eq!(sequences.last(), Some(&105));
+
+        preview.status = InboxStatus::Stale;
+        index.record(&preview);
+        assert_eq!(index.sequences().len(), MAX_MANAGEMENT_STATE_RECORDS);
+        assert!(!index.sequences().contains(&1));
+    }
+
+    #[test]
+    fn oversized_generated_result_becomes_a_compact_terminal_receipt() {
+        let root = temp_root("oversized-result");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        inbox
+            .persist(request(5, "/queue"))
+            .expect("request should persist");
+        let receipt = inbox
+            .persist_dispatch_result(
+                5,
+                InboxStatus::Completed,
+                Some(json!({"large": "x".repeat(MAX_REQUEST_BYTES + 128 * 1024)})),
+                None,
+            )
+            .expect("oversized result should become a compact receipt");
+        assert_eq!(receipt.status, InboxStatus::Failed);
+        assert!(
+            receipt
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("too large"))
+        );
+        assert_eq!(
+            receipt
+                .result
+                .as_ref()
+                .and_then(|value| value["error"].as_str()),
+            Some("The local operation result exceeded the receipt size limit.")
+        );
+        assert!(
+            serde_json::to_vec(&receipt)
+                .expect("compact receipt should serialize")
+                .len()
+                <= MAX_REQUEST_BYTES + 64 * 1024
+        );
+        assert!(
+            inbox
+                .pending()
+                .expect("terminal receipt is not pending")
+                .is_empty()
+        );
+        drop(inbox);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloud_state_post_errors_classify_transient_and_payload_rejections() {
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(CloudStatePostError::HttpStatus(status).is_retryable());
+        }
+        assert!(!CloudStatePostError::HttpStatus(reqwest::StatusCode::BAD_REQUEST).is_retryable());
+        assert!(
+            CloudStatePostError::HttpStatus(reqwest::StatusCode::PAYLOAD_TOO_LARGE)
+                .is_payload_too_large()
+        );
+        assert!(CloudStatePostError::Transport(anyhow!("connection reset")).is_retryable());
     }
 
     #[test]

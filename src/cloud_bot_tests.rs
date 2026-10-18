@@ -6,11 +6,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::cloud::TEST_CLOUD_SECRET;
 use anyhow::{Context, Result};
 use futures_util::SinkExt;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+use crate::library::{Confidence, IntegrityStatus, LibraryItem, MetadataStatus, Presence};
 
 use super::*;
 
@@ -28,6 +31,8 @@ struct FakeCloudApiState {
     fail_first_ack: AtomicBool,
     durable_before_ack: AtomicBool,
     inbox_root: PathBuf,
+    state_posts: StdMutex<Vec<serde_json::Value>>,
+    state_post_statuses: StdMutex<Vec<u16>>,
 }
 
 async fn spawn_fake_telegram_api() -> (
@@ -202,6 +207,8 @@ async fn spawn_fake_cloud_api(
         fail_first_ack: AtomicBool::new(true),
         durable_before_ack: AtomicBool::new(false),
         inbox_root,
+        state_posts: StdMutex::new(Vec::new()),
+        state_post_statuses: StdMutex::new(Vec::new()),
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let task_state = Arc::clone(&state);
@@ -251,6 +258,54 @@ async fn spawn_fake_cloud_api(
                                 (200, serde_json::json!({"ok":true}))
                             }
                         }
+                        "state" => {
+                            let library = &request.body["library"];
+                            let mut content = request.body.clone();
+                            if let Some(content) = content.as_object_mut() {
+                                content.remove("reported_at");
+                                content.remove("state_version");
+                            }
+                            let content_hash = format!(
+                                "{:x}",
+                                Sha256::digest(
+                                    serde_json::to_vec(&content)
+                                        .context("fake state content should serialize")?
+                                )
+                            );
+                            let library_hash = format!("{:x}", Sha256::digest(
+                                serde_json::to_vec(library).context("fake state library should serialize")?
+                            ));
+                            let tasks = request.body["tasks"].clone();
+                            let status = {
+                                let mut statuses = task_state.state_post_statuses
+                                    .lock()
+                                    .expect("fake state status lock should not poison");
+                                if statuses.is_empty() { 200 } else { statuses.remove(0) }
+                            };
+                            let summary = serde_json::json!({
+                                "status": status,
+                                "state_version": request.body["state_version"],
+                                "reported_at": request.body["reported_at"],
+                                "revision": request.body["revision"],
+                                "content_hash": content_hash,
+                                "library_hash": library_hash,
+                                "library_ready": library["ready"],
+                                "library_incomplete": library["incomplete"],
+                                "library_warnings": library["warnings"],
+                                "library_item_count": library["items"].as_array().map_or(0, Vec::len),
+                                "tasks": tasks,
+                            });
+                            task_state.state_posts
+                                .lock()
+                                .expect("fake state post lock should not poison")
+                                .push(summary);
+                            let payload = if (200..300).contains(&status) {
+                                serde_json::json!({"ok":true})
+                            } else {
+                                serde_json::json!({"error":"simulated state post failure"})
+                            };
+                            (status, payload)
+                        }
                         _ => (404, serde_json::json!({"error":"not found"})),
                     };
                     stream.write_all(fake_http_response(status, &payload).as_bytes()).await
@@ -269,6 +324,9 @@ fn fake_http_response(status: u16, payload: &serde_json::Value) -> String {
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Error",
     };
@@ -290,6 +348,38 @@ async fn stop_fake_cloud_api(
         .expect("fake cloud API should stop within timeout")
         .expect("fake cloud API task should not panic")
         .expect("fake cloud API should not fail");
+}
+
+async fn wait_for_state_posts(
+    state: &Arc<FakeCloudApiState>,
+    count: usize,
+) -> Vec<serde_json::Value> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let posts = state
+                .state_posts
+                .lock()
+                .expect("fake state post lock should not poison")
+                .clone();
+            if posts.len() >= count {
+                return posts;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("fake cloud API should receive the expected state posts")
+}
+
+fn empty_cloud_test_library_snapshot(revision: &str) -> LibrarySnapshot {
+    LibrarySnapshot {
+        revision: revision.to_string(),
+        scanned_at: 1_790_000_000,
+        root_label: "videos".to_string(),
+        items: Vec::new(),
+        categories: Vec::new(),
+        warnings: Vec::new(),
+    }
 }
 
 fn temp_cloud_bot_dir(label: &str) -> PathBuf {
@@ -607,6 +697,293 @@ fn local_transient_retries_back_off_to_one_minute() {
     assert_eq!(cloud_retry_delay_seconds(4), 40);
     assert_eq!(cloud_retry_delay_seconds(5), 60);
     assert_eq!(cloud_retry_delay_seconds(u32::MAX), 60);
+}
+
+#[tokio::test]
+async fn cloud_request_dispatcher_leaves_management_request_pending_while_busy() {
+    let root = temp_cloud_bot_dir("dispatcher-semaphore");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let request = CloudRequest {
+        seq: 81,
+        kind: "unsupported-management-operation".to_string(),
+        payload: serde_json::json!({}),
+        created_at: now_millis(),
+        extra: serde_json::Map::new(),
+    };
+    inbox
+        .persist(request)
+        .expect("management request should persist");
+    let occupied = runtime
+        .management_dispatch
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("management semaphore should remain available");
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    runtime.request_notify.notify_one();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let waiting = inbox
+        .record(81)
+        .expect("request record should load")
+        .expect("request should remain present");
+    assert_eq!(waiting.status, InboxStatus::Pending);
+    assert_eq!(waiting.attempts, 0);
+
+    drop(occupied);
+    runtime.request_notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let record = inbox
+                .record(81)
+                .expect("request record should load")
+                .expect("request should remain present");
+            if record.status == InboxStatus::Failed {
+                assert_eq!(record.attempts, 1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("released semaphore should allow the pending request to dispatch");
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn oversized_dispatch_result_stays_terminal_and_is_not_redispatched() {
+    let root = temp_cloud_bot_dir("oversized-dispatch-result");
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let request = cloud_telegram_update(82, 820);
+    inbox
+        .persist(request.clone())
+        .expect("Telegram request should persist");
+    let terminal = inbox
+        .persist_dispatch_result(
+            82,
+            InboxStatus::Completed,
+            Some(serde_json::json!({
+                "large": "x".repeat(1024 * 1024 + 128 * 1024)
+            })),
+            None,
+        )
+        .expect("oversized generated result should become a compact receipt");
+    assert_eq!(terminal.status, InboxStatus::Failed);
+    assert!(
+        terminal
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("too large"))
+    );
+    assert!(
+        inbox
+            .pending()
+            .expect("pending requests should load")
+            .is_empty()
+    );
+
+    drop(inbox);
+    let inbox = Arc::new(
+        CloudInbox::open(&config.downloads.video_dir).expect("terminal inbox should reopen"),
+    );
+    assert_eq!(
+        inbox
+            .record(82)
+            .expect("terminal receipt should load")
+            .expect("terminal request should remain durable")
+            .status,
+        InboxStatus::Failed
+    );
+    assert!(
+        !inbox
+            .persist(request)
+            .expect("duplicate sequence should deduplicate after restart")
+    );
+    assert!(
+        inbox
+            .pending()
+            .expect("terminal request is not pending")
+            .is_empty()
+    );
+
+    let runtime = make_runtime(telegram, config, Arc::clone(&queue), Arc::clone(&inbox));
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    runtime.request_notify.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        requests.try_recv().is_err(),
+        "a compact terminal receipt must not trigger another Telegram request"
+    );
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn retryable_file_confirmation_receipt_keeps_preview_available() {
+    let root = temp_cloud_bot_dir("retryable-file-confirmation");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let preview = MovePreview {
+        id: "retryable-preview".to_string(),
+        revision: "revision-retryable".to_string(),
+        target_relative_dir: Some("organized".to_string()),
+        rename: false,
+        conflict: ConflictPolicy::Skip,
+        items: Vec::new(),
+        metadata_patches: Vec::new(),
+    };
+    inbox
+        .persist(CloudRequest {
+            seq: 83,
+            kind: "file_preview".to_string(),
+            payload: serde_json::json!({"item_ids": ["item-a"]}),
+            created_at: 100,
+            extra: serde_json::Map::new(),
+        })
+        .expect("preview request should persist");
+    inbox
+        .update(83, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+            record.result = Some(serde_json::json!({
+                "preview_id": "retryable-preview",
+                "revision": "revision-retryable",
+                "preview": preview,
+            }));
+        })
+        .expect("preview should await confirmation");
+    inbox
+        .persist(CloudRequest {
+            seq: 84,
+            kind: "file_confirm".to_string(),
+            payload: serde_json::json!({
+                "preview_id": "retryable-preview",
+                "revision": "revision-retryable"
+            }),
+            created_at: 101,
+            extra: serde_json::Map::new(),
+        })
+        .expect("confirmation request should persist");
+    inbox
+        .update(84, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("confirmation should enter processing");
+    let runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+
+    persist_cloud_retry_receipt(
+        &runtime,
+        84,
+        "retryable-preview",
+        "revision-retryable",
+        None,
+    )
+    .await
+    .expect("transient confirmation should persist a retry receipt");
+    let retry_at = now_seconds().saturating_add(cloud_retry_delay_seconds(1));
+    inbox
+        .update(84, |record| {
+            record.status = InboxStatus::Retryable;
+            record.error = Some("temporary file-provider access failure".to_string());
+            record.next_attempt_at = retry_at;
+        })
+        .expect("transient confirmation should remain retryable");
+
+    let confirmation = inbox
+        .record(84)
+        .expect("confirmation receipt should load")
+        .expect("confirmation receipt should remain present");
+    assert_eq!(confirmation.status, InboxStatus::Retryable);
+    assert_eq!(confirmation.next_attempt_at, retry_at);
+    assert_eq!(
+        confirmation
+            .result
+            .as_ref()
+            .and_then(|value| value["status"].as_str()),
+        Some("retrying")
+    );
+    let preview_record = inbox
+        .record(83)
+        .expect("preview receipt should load")
+        .expect("preview receipt should remain present");
+    assert_eq!(preview_record.status, InboxStatus::AwaitingConfirmation);
+    assert!(
+        inbox
+            .pending()
+            .expect("pending inbox should load")
+            .iter()
+            .all(|record| record.request.seq != 84),
+        "retry backoff should defer the transient confirmation"
+    );
+    inbox
+        .update(84, |record| record.next_attempt_at = 0)
+        .expect("due retry should persist");
+    assert!(
+        inbox
+            .pending()
+            .expect("due retries should load")
+            .iter()
+            .any(|record| record.request.seq == 84),
+        "a due transient confirmation should be dispatched again"
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn cloud_telegram_update(seq: u64, update_id: i64) -> CloudRequest {
@@ -1041,10 +1418,8 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
             }));
         })
         .expect("preview confirmation receipt should persist");
-    let runtime = make_runtime(telegram, config, queue, Arc::clone(&inbox));
-    let outcome = dispatch_cloud_management(
-        &runtime,
-        &CloudRequest {
+    inbox
+        .persist(CloudRequest {
             seq: 42,
             kind: "file_confirm".to_string(),
             payload: serde_json::json!({
@@ -1053,18 +1428,42 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
             }),
             created_at: 101,
             extra: serde_json::Map::new(),
-        },
-    )
+        })
+        .expect("confirmation request should persist");
+    let runtime = make_runtime(telegram, config, Arc::clone(&queue), Arc::clone(&inbox));
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    runtime.request_notify.notify_one();
+    let finished_confirmation = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let confirmation = inbox
+                .record(42)
+                .expect("confirmation receipt should load")
+                .expect("confirmation receipt should remain present");
+            let preview = inbox
+                .record(41)
+                .expect("preview receipt should load")
+                .expect("preview receipt should remain present");
+            if confirmation.status == InboxStatus::Failed && preview.status == InboxStatus::Stale {
+                break confirmation;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
     .await
-    .expect("permanent confirmation errors should become a visible failed outcome");
-    assert_eq!(outcome.status, InboxStatus::Failed);
+    .expect("permanently rejected confirmation should finish and stale its preview");
+    assert_eq!(finished_confirmation.status, InboxStatus::Failed);
     assert!(
-        outcome
+        finished_confirmation
             .error
             .as_deref()
             .is_some_and(|error| error.contains("preview")),
-        "failed operation result should explain that confirmation could not execute"
+        "failed operation receipt should explain why confirmation could not execute"
     );
+    let preview_record = inbox
+        .record(41)
+        .expect("preview receipt should load")
+        .expect("preview receipt should remain present");
+    assert_eq!(preview_record.status, InboxStatus::Stale);
 
     let mut recorded = Vec::new();
     while let Ok(request) = requests.try_recv() {
@@ -1084,9 +1483,119 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
             .is_some_and(|text| text.contains("failed before it could complete"))
     );
 
+    dispatcher.abort();
+    let _ = dispatcher.await;
     drop(runtime);
     drop(inbox);
     stop_fake_telegram_api(shutdown, server).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn coalesced_queue_progress_publishes_final_state_without_library_rescan() {
+    let root = temp_cloud_bot_dir("coalesced-progress");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    let runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let mut runtime = runtime;
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    let task_id = "coalesced-cloud-progress";
+    queue
+        .create(TaskRecord::new(
+            task_id.to_string(),
+            1,
+            1,
+            123_456_789,
+            Some(123_456_789),
+            0,
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            },
+        ))
+        .expect("progress task should persist");
+    let queue_changes = queue.state_change_notify();
+    queue_changes.notified().await;
+    *runtime.library_snapshot.lock().await =
+        Some(empty_cloud_test_library_snapshot("stable-library-revision"));
+
+    let publication_watcher = tokio::spawn(cloud_library_publication_watcher(runtime.clone()));
+    let queue_state_watcher = tokio::spawn(cloud_queue_state_watcher_with_debounce(
+        runtime.clone(),
+        Duration::from_millis(75),
+    ));
+    let state_reporter = tokio::spawn(cloud_state_reporter(runtime.clone()));
+    for completed in 1..=8 {
+        queue
+            .set_collection_progress(task_id, 10, completed, 2)
+            .expect("progress update should persist");
+    }
+
+    let posts = wait_for_state_posts(&cloud_state, 1).await;
+    let tasks = posts[0]["tasks"]
+        .as_array()
+        .expect("reported task summaries should be an array");
+    let task = tasks
+        .iter()
+        .find(|task| task["id"].as_str() == Some(task_id))
+        .expect("final coalesced state should include the progress task");
+    assert_eq!(task["media_entries_total"].as_u64(), Some(10));
+    assert_eq!(task["media_entries_completed"].as_u64(), Some(8));
+    assert_eq!(task["media_entries_failed"].as_u64(), Some(2));
+
+    tokio::time::sleep(Duration::from_millis(2_200)).await;
+    let posts = cloud_state
+        .state_posts
+        .lock()
+        .expect("fake state post lock should not poison")
+        .clone();
+    assert_eq!(
+        posts.len(),
+        1,
+        "progress burst should publish one coalesced state"
+    );
+    assert_eq!(
+        posts[0]["revision"].as_str(),
+        Some("stable-library-revision")
+    );
+    assert_eq!(
+        runtime
+            .library_snapshot
+            .lock()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.revision.as_str()),
+        Some("stable-library-revision"),
+        "queue progress must not request a media-library rescan"
+    );
+
+    state_reporter.abort();
+    queue_state_watcher.abort();
+    publication_watcher.abort();
+    let _ = state_reporter.await;
+    let _ = queue_state_watcher.await;
+    let _ = publication_watcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1226,3 +1735,5 @@ async fn cloud_websocket_stays_connected_through_long_idle_and_acks_durable_requ
     stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
     let _ = std::fs::remove_dir_all(root);
 }
+
+include!("cloud_state_http_tests.rs");

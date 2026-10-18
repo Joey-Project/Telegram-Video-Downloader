@@ -3,7 +3,7 @@ id: 20261007-fmm01
 title: 文件管理 Mini App 设计与实施计划
 status: active
 created: 2026-10-07
-updated: 2026-10-16
+updated: 2026-10-18
 branch: "wip/file-management-cloud"
 pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/32"
 supersedes: []
@@ -23,9 +23,18 @@ superseded_by: ""
 - 当前接受的架构大方向是公开托管的静态界面自动加载文件库并提交操作；Telegram webhook 进入 Cloudflare Worker，再进入 D1 持久收件箱。本机 Rust bot 主动领取操作，并由本机通过同一 Telegram bot 发送或编辑进度消息。本机没有公网入站接口。偏好使用 Cloudflare Free；达到额度限制时暂停操作并提示用户。
 - Rust 通过固定 Worker API 补领、确认和回写状态；Mini App 验证 Telegram initData。休眠 WebSocket 推送完整请求，固定共享密钥鉴权，本机落盘后才确认接收。状态通过持久递增版本防止旧回写覆盖新快照。
 - 第一至第四阶段的本地代码已落在隔离分支：Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段 `/settings` 与新下载位置选择仍延期。
-- Cloudflare 等待卡片重复问题已修复。2026-10-16 同步后的类型检查、23 项 Cloud 测试及 Wrangler dry-run 通过；Rust 完整测试为 798 项通过、0 项失败、15 项忽略，包含 mock Telegram/cloud、文件管理和新单集发布记录覆盖。
+- Cloudflare 等待卡片重复问题已修复。2026-10-18 的类型检查、33 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 830 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理和单集发布记录覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
-- 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `6a7184b9fcd67ca5a1aec95dcbca8a2e4578268c` 的 master 修复。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
+- 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `fefdfcb3cd03a5e153e9e02fd8f9bdf6c727e5b0` 的 master 修复，包含 ASS 弹幕显示默认值及恢复工作流收尾。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
+
+### 2026-10-18 审查修复
+
+- Mini App 在当前 owner 身份验证成功后才显示私有文件库；授权失败隐藏私有内容并暂停发送。永久拒绝的动作不再阻塞后续队列，网络、限流和服务端错误沿用原请求 ID 重试。
+- 失败预览保留在操作历史，不可用媒体不可选，手动关联单个元数据字段可以进入确认流程，移动预览按实际元数据变化显示标题。
+- Telegram 更新取得执行许可后才标记处理中；本地收件保留持久去重记录，待处理及状态摘要使用独立索引。任务状态与进度触发合并后的状态同步，单集发布仍单独触发文件库扫描。
+- 超大状态上传和生成结果有独立失败恢复；永久失效的确认会关闭旧预览并要求重新预览。活动任务摘要覆盖多页，元数据字段限制与 Worker 对齐。
+- 文件冲突跳过不再计为成功；NFO 完整度按字段判断，YouTube 来源及合集 ID/类型可以往返保存，同一物理对象移动后的队列元数据可以跨重启保留。旧记录关联使用同一次带队列线索的扫描；已确认缺失的历史索引有数量及体积上限。
+- HTTP 模拟覆盖 503 同版本重试、413 后的部分快照上传、裁剪成功后的心跳续期及后续状态更新。暂态确认测试覆盖重试收据、退避和预览保留，未注入真实 File Provider callback 错误贯穿 dispatcher；永久失效确认已覆盖实际 dispatcher 路径。生产休眠、真实配额与 webhook 切换仍留待部署验证。
 
 ## 已确认的产品与交互
 

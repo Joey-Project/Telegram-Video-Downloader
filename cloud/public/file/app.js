@@ -1,7 +1,10 @@
-import { appendAction, removeQueuedAction } from "./action-queue.js";
+import { appendAction, removeQueuedAction, shouldRetryActionFailure } from "./action-queue.js";
 import { getOrCreateLegacySelection, updateLegacySelection } from "./legacy-mapping-state.js";
-import { metadataPreviewDetails } from "./metadata-preview.js";
-import { buildWaitingEntries } from "./state-view.js";
+import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
+import { HttpResponseError } from "./http-error.js";
+import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
+import { buildWaitingEntries, isPresentMedia, isReviewablePreviewStatus, operationHistoryEntries, presentMediaItems } from "./state-view.js";
+import { sourceIdUrl } from "./source-links.js";
 
 const API = "/api";
 const CACHE_KEY = "file-manager.snapshot.v1";
@@ -11,7 +14,7 @@ const POLL_MS = 12_000;
 
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
-const state = { snapshot: null, selected: new Set(), view: "library", query: "", detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, selected: new Set(), quarantinedActionIds: new Set(), view: "library", query: "", detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false };
 
 const byId = (id) => document.getElementById(id);
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/gu, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
@@ -70,12 +73,44 @@ function setConnection(mode, label) {
   byId("connection-label").textContent = label;
 }
 
-function cachedSnapshot() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(CACHE_KEY) ?? "null");
-    if (parsed && typeof parsed === "object") return parsed;
-  } catch { /* Ignore an unreadable cache and wait for a fresh state. */ }
-  return null;
+function clearCachedSnapshot() {
+  try { localStorage.removeItem(CACHE_KEY); } catch { /* Private content remains hidden if storage is unavailable. */ }
+}
+
+function showPrivateAccessGate(message) {
+  state.detailId = null;
+  state.selected.clear();
+  state.legacyOperation = null;
+  state.legacyOperationKey = null;
+  state.legacySelection.clear();
+  document.querySelector(".detail-panel")?.remove();
+  byId("app-content").classList.add("hidden");
+  byId("auth-gate").classList.remove("hidden");
+  byId("auth-message").textContent = message;
+  setConnection("", "Owner verification required");
+}
+
+function acceptFreshSnapshot(snapshot) {
+  Object.assign(state, acceptOwnerSnapshot(snapshot));
+  byId("auth-gate").classList.add("hidden");
+  byId("app-content").classList.remove("hidden");
+}
+
+function applySnapshotFailure(status) {
+  const transition = failOwnerSnapshot(state, status, Date.now());
+  Object.assign(state, transition);
+  if (transition.clearCache) clearCachedSnapshot();
+  if (transition.authorizationRejected) {
+    state.refreshAfterDrain = false;
+    if (state.retryTimer) window.clearTimeout(state.retryTimer);
+    state.retryTimer = 0;
+  }
+  return transition;
+}
+
+function handleAuthorizationFailure(error) {
+  applySnapshotFailure(error?.status);
+  showPrivateAccessGate("Owner access could not be verified. Reopen this Mini App from the owner's private chat.");
 }
 
 async function api(path, options = {}) {
@@ -85,7 +120,7 @@ async function api(path, options = {}) {
   const response = await fetch(`${API}${path}`, { ...options, headers, cache: "no-store" });
   let data;
   try { data = await response.json(); } catch { data = {}; }
-  if (!response.ok) throw new Error(typeof data?.error === "string" ? data.error : `Request failed (${response.status})`);
+  if (!response.ok) throw new HttpResponseError(response.status, typeof data?.error === "string" ? data.error : `Request failed (${response.status})`);
   return data;
 }
 
@@ -94,21 +129,21 @@ async function refreshState({ quiet = false } = {}) {
   state.loading = true;
   try {
     const fresh = await api("/state");
-    state.snapshot = fresh;
-    try { localStorage.setItem(CACHE_KEY, JSON.stringify(fresh)); } catch { /* Browsing remains available without cache. */ }
+    acceptFreshSnapshot(fresh);
     setConnection(fresh.synced ? (fresh.stale ? "stale" : "live") : "", fresh.synced ? (fresh.stale ? "Contact is overdue" : "Computer connected") : "Waiting for computer");
     render();
     if (!quiet) await drainActionQueue();
   } catch (error) {
-    const cached = state.snapshot ?? cachedSnapshot();
-    if (cached) {
-      state.snapshot = { ...cached, stale: true, cached_at: Date.now() };
+    const transition = applySnapshotFailure(error?.status);
+    if (mayUsePrivateSnapshot(state)) {
       setConnection("stale", "Showing saved library");
       render();
     } else {
-      setConnection("", "Waiting for connection");
+      showPrivateAccessGate(transition.authorizationRejected
+        ? "Owner access could not be verified. Reopen this Mini App from the owner's private chat."
+        : "The private library stays hidden until its owner is verified. Check the connection and retry.");
     }
-    if (!quiet && navigator.onLine) showToast(error.message);
+    if (!quiet && navigator.onLine && mayUsePrivateSnapshot(state)) showToast(error.message);
   } finally {
     state.loading = false;
     if (state.refreshAfterDrain) {
@@ -133,17 +168,20 @@ function writeActionQueue(actions) {
 }
 
 function renderQueueCount() {
-  const count = readActionQueue().length;
+  const count = readActionQueue().filter((action) => !state.quarantinedActionIds.has(action.request_id)).length;
   byId("queued-actions").textContent = count ? `${count} action${count === 1 ? "" : "s"} waiting to send` : "";
 }
 
 async function drainActionQueue() {
-  if (!initData || !navigator.onLine) return false;
+  if (!initData || !mayDispatchActions(state) || !navigator.onLine) return false;
   if (state.draining) return state.draining;
   state.draining = (async () => {
     let sentAny = false;
+    let connectionInterrupted = false;
+    let removalFailed = false;
+    const permanentRejections = [];
     while (navigator.onLine) {
-      const action = readActionQueue()[0];
+      const action = readActionQueue().find((entry) => !state.quarantinedActionIds.has(entry.request_id));
       if (!action) break;
       try {
         await api("/actions", { method: "POST", body: JSON.stringify({ request_id: action.request_id, kind: action.kind, payload: action.payload }) });
@@ -153,7 +191,18 @@ async function drainActionQueue() {
           break;
         }
         sentAny = true;
-      } catch {
+      } catch (error) {
+        if (error?.status === 401 || error?.status === 403) {
+          handleAuthorizationFailure(error);
+          break;
+        }
+        if (!shouldRetryActionFailure(error)) {
+          state.quarantinedActionIds.add(action.request_id);
+          const latestQueue = readActionQueue();
+          if (!writeActionQueue(removeQueuedAction(latestQueue, action.request_id))) removalFailed = true;
+          permanentRejections.push(typeof error?.message === "string" ? error.message : "Request rejected");
+          continue;
+        }
         if (!state.retryTimer) {
           const delay = state.retryDelay;
           state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
@@ -162,17 +211,26 @@ async function drainActionQueue() {
             drainActionQueue();
           }, delay);
         }
-        showToast("Connection interrupted. The request remains queued with the same ID.");
+        connectionInterrupted = true;
         break;
       }
     }
     if (sentAny) state.retryDelay = 1500;
+    if (permanentRejections.length) {
+      const count = permanentRejections.length;
+      const details = [...new Set(permanentRejections)].slice(0, 2).join(" · ");
+      const remainder = connectionInterrupted ? " Other saved requests remain queued while the connection recovers." : "";
+      const storageNote = removalFailed ? " One rejected request could not be removed from browser storage and will stay quarantined for this session." : "";
+      showToast(`${count} rejected request${count === 1 ? " was" : "s were"} removed from the retry queue: ${details}.${remainder}${storageNote}`);
+    } else if (connectionInterrupted) {
+      showToast("Connection interrupted. The request remains queued with the same ID.");
+    }
     return sentAny;
   })();
   let sentAny = false;
   try { sentAny = await state.draining; }
   finally { state.draining = null; }
-  if (sentAny) {
+  if (sentAny && state.ownerVerified) {
     if (state.loading) state.refreshAfterDrain = true;
     else await refreshState({ quiet: true });
   }
@@ -180,6 +238,7 @@ async function drainActionQueue() {
 }
 
 async function submitAction(kind, payload) {
+  if (!mayDispatchActions(state)) return false;
   const action = { request_id: crypto.randomUUID(), kind, payload };
   const queued = appendAction(readActionQueue(), action);
   if (!queued.ok) {
@@ -232,7 +291,7 @@ function itemRow(item) {
   const dims = item.width && item.height ? `${escapeHtml(item.width)} × ${escapeHtml(item.height)}` : "";
   const codec = item.codec ? escapeHtml(item.codec) : "";
   return `<article class="library-row${selected ? " selected" : ""}" data-item-row="${escapeHtml(id)}">
-    <input class="row-check" type="checkbox" aria-label="Select ${escapeHtml(item.title ?? item.relative_path)}" data-select-item="${escapeHtml(id)}" ${selected ? "checked" : ""}>
+    <input class="row-check" type="checkbox" aria-label="Select ${escapeHtml(item.title ?? item.relative_path)}" data-select-item="${escapeHtml(id)}" ${selected ? "checked" : ""} ${isPresentMedia(item) ? "" : "disabled"}>
     <div class="media-icon" aria-hidden="true">▣</div>
     <div class="media-main"><div class="media-title"><span>${escapeHtml(item.title || item.relative_path || "Untitled video")}</span></div><div class="media-path">${escapeHtml(item.relative_path || "Path unavailable")}</div></div>
     <div class="media-meta"><span><i class="status-dot ${escapeHtml(presence)}"></i>${displayStatus}</span><span>${formatBytes(item.bytes)}</span>${dims ? `<span>${dims}</span>` : ""}${codec ? `<span>${codec}</span>` : ""}<button class="details-button" type="button" data-details="${escapeHtml(id)}">Details</button></div>
@@ -248,11 +307,12 @@ function renderGroupedItems(container, items) {
     groups.get(key).push(item);
   }
   container.innerHTML = [...groups.entries()].map(([title, entries], index) => {
-    const groupIds = entries.map((item) => String(item.id));
+    const selectableEntries = presentMediaItems(entries);
+    const groupIds = selectableEntries.map((item) => String(item.id));
     const allSelected = groupIds.length > 0 && groupIds.every((id) => state.selected.has(id));
     const someSelected = groupIds.some((id) => state.selected.has(id));
     return `<details class="collection-group" ${index < 3 ? "open" : ""}>
-      <summary><input class="group-check" type="checkbox" aria-label="Select all ${escapeHtml(title)} items" data-select-group="${escapeHtml(title)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""}><span>${escapeHtml(title)}</span><span class="group-count">${entries.length} file${entries.length === 1 ? "" : "s"}</span></summary>
+      <summary><input class="group-check" type="checkbox" aria-label="Select all available ${escapeHtml(title)} items" data-select-group="${escapeHtml(title)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${selectableEntries.length ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count">${entries.length} file${entries.length === 1 ? "" : "s"}</span></summary>
       <div class="collection-items">${entries.map(itemRow).join("")}</div>
     </details>`;
   }).join("");
@@ -260,6 +320,8 @@ function renderGroupedItems(container, items) {
 }
 
 function renderLibrary() {
+  const availableIds = new Set(presentMediaItems(libraryItems()).map((item) => String(item.id)));
+  for (const id of state.selected) if (!availableIds.has(id)) state.selected.delete(id);
   renderFilters();
   const items = filteredItems();
   const list = byId("library-list");
@@ -373,11 +435,13 @@ function describePreview(preview) {
 }
 
 function renderPreviews() {
-  const pending = previews().filter((entry) => !["confirmed", "completed", "cancelled", "expired"].includes(String(entry.status ?? "").toLowerCase()));
+  const pending = previews().filter((entry) => isReviewablePreviewStatus(entry.status));
   byId("organizing-count").textContent = String(pending.length);
   byId("preview-list").innerHTML = pending.map((entry) => {
     const preview = entry.preview;
-    const title = Array.isArray(preview.metadata_patches) && preview.items?.length ? "Move and update metadata" : Array.isArray(preview.metadata_patches) ? "Update metadata" : "Move files";
+    const hasMetadataChanges = hasMetadataPreviewChanges(preview);
+    const hasMoveItems = Array.isArray(preview.items) && preview.items.length > 0;
+    const title = hasMetadataChanges && hasMoveItems ? "Move and update metadata" : hasMetadataChanges ? "Update metadata" : "Move files";
     return `<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(preview.target_relative_dir ?? "Metadata only · file locations stay the same")} · Conflict: ${escapeHtml(preview.conflict ?? "skip")}</p></div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${describePreview(preview)}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}">Confirm changes</button></div></article>`;
   }).join("");
   if (!pending.length) byId("preview-list").innerHTML = "";
@@ -430,7 +494,7 @@ function renderLegacyMappings() {
 
 function renderOperations() {
   const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
-  const visible = operations.filter((entry) => entry?.kind !== "file_preview");
+  const visible = operationHistoryEntries(operations);
   byId("operation-list").innerHTML = visible.slice(-12).reverse().map((entry) => {
     const result = entry.result && typeof entry.result === "object" ? entry.result : {};
     const outcome = result.operation && typeof result.operation === "object" ? result.operation : result;
@@ -517,7 +581,7 @@ function renderDetail() {
         <div class="detail-stat"><span>Media + related files</span><strong>${1 + attachments.length} files</strong></div>
       </div>
       ${collection ? `<section class="detail-section"><h3>Collection</h3><div class="attachment">${escapeHtml(collection)}</div></section>` : ""}
-      <section class="detail-section"><h3>Source links (${sourceIds.length})</h3>${sourceIds.length ? sourceIds.map((source) => `<div class="attachment">${escapeHtml(source)}</div>`).join("") : `<div class="attachment">No source links recorded.</div>`}<p class="field-hint">Remote source availability has not been checked.</p></section>
+      <section class="detail-section"><h3>Source links (${sourceIds.length})</h3>${sourceIds.length ? sourceIds.map((source) => { const url = sourceIdUrl(source); return `<div class="attachment">${url ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${escapeHtml(source)}</a>` : escapeHtml(source)}</div>`; }).join("") : `<div class="attachment">No source links recorded.</div>`}<p class="field-hint">Remote source availability has not been checked.</p></section>
       <section class="detail-section"><h3>Related files (${attachments.length})</h3>${attachments.length ? attachments.map((attachment) => { const rel = attachment.relative_path ?? attachment.path ?? "Related file"; const absolute = pathJoin(rel); return `<div class="attachment"><div class="copy-row"><code>${escapeHtml(rel)}</code><button class="small-button" type="button" data-copy="${escapeHtml(rel)}">Copy relative</button></div>${absolute ? `<div class="copy-row"><code>${escapeHtml(absolute)}</code><button class="small-button" type="button" data-copy="${escapeHtml(absolute)}">Copy full</button></div>` : ""}<span>${escapeHtml(attachment.kind ?? "attachment")}</span></div>`; }).join("") : `<div class="attachment">No attachments found.</div>`}</section>
     </aside>`;
   document.body.append(panel);
@@ -525,6 +589,7 @@ function renderDetail() {
 }
 
 function render() {
+  if (!mayUsePrivateSnapshot(state)) return;
   renderSync();
   renderLibrary();
   renderWaiting();
@@ -565,7 +630,7 @@ function previewSelectedLegacy() {
     if (selection.title && hint.title) patch.title = hint.title;
     if (selection.source_ids && Array.isArray(hint.source_ids) && hint.source_ids.length) patch.source_ids = hint.source_ids;
     if (selection.collection && hint.collection) patch.collection = hint.collection;
-    if (Object.keys(patch).length > 2) patches.push(patch);
+    if (hasMetadataPatchFields(patch)) patches.push(patch);
   }
   if (!patches.length) return showToast("Choose at least one metadata field to apply.");
   submitAction("file_preview", { metadata_patches: patches, rename: false, conflict: "skip" });
@@ -573,7 +638,7 @@ function previewSelectedLegacy() {
 
 function selectVisible() {
   const filtered = filteredItems();
-  const visible = state.view === "needs" ? filtered.filter(needsOrganizing) : filtered;
+  const visible = presentMediaItems(state.view === "needs" ? filtered.filter(needsOrganizing) : filtered);
   const allSelected = visible.length > 0 && visible.every((item) => state.selected.has(String(item.id)));
   for (const item of visible) {
     const id = String(item.id);
@@ -628,7 +693,7 @@ function bindEvents() {
     if (groupCheckbox) {
       const groupTitle = groupCheckbox.dataset.selectGroup;
       const filtered = filteredItems();
-      const visibleItems = state.view === "needs" ? filtered.filter(needsOrganizing) : filtered;
+      const visibleItems = presentMediaItems(state.view === "needs" ? filtered.filter(needsOrganizing) : filtered);
       const groupItems = visibleItems.filter((item) => (item.collection?.title ?? item.collection ?? "Uncollected") === groupTitle);
       for (const item of groupItems) {
         const id = String(item.id);
@@ -639,7 +704,14 @@ function bindEvents() {
     }
     const checkbox = event.target.closest("[data-select-item]");
     if (!checkbox) return;
-    if (checkbox.checked) state.selected.add(checkbox.dataset.selectItem); else state.selected.delete(checkbox.dataset.selectItem);
+    const itemId = checkbox.dataset.selectItem;
+    const item = libraryItems().find((entry) => String(entry.id) === String(itemId));
+    if (!isPresentMedia(item)) {
+      state.selected.delete(itemId);
+      renderLibrary();
+      return;
+    }
+    if (checkbox.checked) state.selected.add(itemId); else state.selected.delete(itemId);
     const row = checkbox.closest(".library-row");
     row?.classList.toggle("selected", checkbox.checked);
     byId("library-summary").textContent = `${filteredItems().length.toLocaleString()} shown of ${libraryItems().length.toLocaleString()} item${libraryItems().length === 1 ? "" : "s"}${state.selected.size ? ` · ${state.selected.size} selected` : ""}`;
@@ -675,14 +747,15 @@ function start() {
   telegram?.ready?.();
   telegram?.expand?.();
   bindEvents();
+  Object.assign(state, beginOwnerVerification());
+  clearCachedSnapshot();
   if (!initData) {
     byId("auth-gate").classList.remove("hidden");
     return;
   }
-  byId("app-content").classList.remove("hidden");
-  const cached = cachedSnapshot();
-  if (cached) { state.snapshot = { ...cached, stale: true, cached_at: Date.now() }; render(); setConnection("stale", "Showing saved library"); }
-  else render();
+  byId("auth-message").textContent = "Verifying access to the private library…";
+  byId("auth-gate").classList.remove("hidden");
+  setConnection("", "Verifying owner access");
   refreshState();
   window.setInterval(() => refreshState({ quiet: true }), POLL_MS);
 }

@@ -2231,13 +2231,16 @@ fn bilibili_group_media_profile(
     config: &AppConfig,
 ) -> String {
     format!(
-        "v2;mode={:?};video_quality={:?};audio_quality={:?};audio_language={:?};danmaku_enabled={};danmaku_formats={:?};write_nfo={};keep_sidecars={}",
+        "v3;mode={:?};video_quality={:?};audio_quality={:?};audio_language={:?};danmaku_enabled={};danmaku_formats={:?};danmaku_font_scale={};danmaku_opacity={};danmaku_display_area={};write_nfo={};keep_sidecars={}",
         options.mode,
         options.stream_selection.video_quality,
         options.stream_selection.audio_quality,
         options.stream_selection.audio_language,
         config.bilibili.danmaku.enabled,
         config.bilibili.danmaku_formats,
+        config.bilibili.danmaku.font_scale,
+        config.bilibili.danmaku.opacity,
+        config.bilibili.danmaku.display_area,
         config.video.write_nfo,
         config.video.keep_sidecars,
     )
@@ -8598,6 +8601,7 @@ async fn run_bilibili_job_locked(
         .download_plan_with_progress(&core_plan, options, &progress_reporter)
         .await?;
     let mut report = BilibiliDownloadReport::from(&core_report);
+    style_bilibili_danmaku_report(config, root, &report)?;
     mark_bilibili_core_download_completed(root, Some(worker_context.request))?;
     let output_dir = bilibili_core::output_dir(config);
     if mux_locally {
@@ -11160,6 +11164,24 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.contains(&path) {
         paths.push(path);
     }
+}
+
+fn style_bilibili_danmaku_report(
+    config: &AppConfig,
+    root: &RootedFs,
+    report: &BilibiliDownloadReport,
+) -> Result<()> {
+    if !config.bilibili.danmaku.enabled {
+        return Ok(());
+    }
+    for file in report.entries.iter().flat_map(|entry| &entry.files) {
+        if file.kind == "danmaku_ass" {
+            let path = resolve_command_output_path(&bilibili_core::output_dir(config), &file.path);
+            crate::bilibili_danmaku::style_file(root, &path, &config.bilibili.danmaku)
+                .with_context(|| format!("failed to style downloaded ASS {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 fn bilibili_file_kind(kind: &DownloadFileKind) -> &'static str {
@@ -21940,6 +21962,59 @@ mod tests {
     }
 
     #[test]
+    fn downloaded_ass_is_styled_before_publication_without_changing_xml_or_subtitles() {
+        let directory = temp_test_dir("danmaku-styling");
+        fs::create_dir_all(&directory).unwrap();
+        let mut config = test_config();
+        config.downloads.video_dir = directory.clone();
+        let ass = directory.join("episode.ass");
+        let xml = directory.join("episode.xml");
+        let subtitle = directory.join("subtitle.ass");
+        let input = include_str!("../tests/fixtures/bilibili-danmaku.ass");
+        fs::write(&ass, input).unwrap();
+        fs::write(&xml, "original XML").unwrap();
+        fs::write(&subtitle, "unrelated subtitle").unwrap();
+        let root = RootedFs::new(&directory).unwrap();
+        let report = BilibiliDownloadReport {
+            entries: vec![BilibiliEntryDownloadReport {
+                files: vec![
+                    BilibiliDownloadedFile {
+                        kind: "danmaku_ass".into(),
+                        path: PathBuf::from("episode.ass"),
+                    },
+                    BilibiliDownloadedFile {
+                        kind: "danmaku".into(),
+                        path: xml.clone(),
+                    },
+                    BilibiliDownloadedFile {
+                        kind: "subtitle".into(),
+                        path: subtitle.clone(),
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        style_bilibili_danmaku_report(&config, &root, &report).unwrap();
+        let styled = fs::read(&ass).unwrap();
+        assert!(String::from_utf8_lossy(&styled).contains("\\fs75"));
+        assert!(String::from_utf8_lossy(&styled).contains("\\clip(0,0,1920,540)"));
+        style_bilibili_danmaku_report(&config, &root, &report).unwrap();
+        assert_eq!(fs::read(&ass).unwrap(), styled);
+        assert_eq!(fs::read_to_string(&xml).unwrap(), "original XML");
+        assert_eq!(fs::read_to_string(&subtitle).unwrap(), "unrelated subtitle");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 3);
+
+        fs::write(&ass, "unsupported layout").unwrap();
+        assert!(style_bilibili_danmaku_report(&config, &root, &report).is_err());
+        assert_eq!(fs::read_to_string(&ass).unwrap(), "unsupported layout");
+        config.bilibili.danmaku.enabled = false;
+        style_bilibili_danmaku_report(&config, &root, &report).unwrap();
+        assert_eq!(fs::read_to_string(&ass).unwrap(), "unsupported layout");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn group_artifact_requirement_changes_block_plan_reuse() {
         let original = test_config();
         let inventory = test_group_inventory(2);
@@ -21950,6 +22025,12 @@ mod tests {
         let mut formats = original.clone();
         assert!(formats.bilibili.danmaku_formats.len() > 1);
         formats.bilibili.danmaku_formats.truncate(1);
+        let mut font_scale = original.clone();
+        font_scale.bilibili.danmaku.font_scale = 2.0;
+        let mut opacity = original.clone();
+        opacity.bilibili.danmaku.opacity = 1.0;
+        let mut display_area = original.clone();
+        display_area.bilibili.danmaku.display_area = 1.0;
         let mut nfo = original.clone();
         nfo.video.write_nfo = !nfo.video.write_nfo;
         let mut sidecars = original.clone();
@@ -21958,6 +22039,9 @@ mod tests {
         for (setting, config) in [
             ("danmaku enabled", enabled),
             ("danmaku formats", formats),
+            ("danmaku font scale", font_scale),
+            ("danmaku opacity", opacity),
+            ("danmaku display area", display_area),
             ("NFO output", nfo),
             ("sidecar retention", sidecars),
         ] {

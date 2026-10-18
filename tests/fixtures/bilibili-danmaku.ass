@@ -1,0 +1,17 @@
+[Script Info]
+ScriptType: v4.00+
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+PlayResX: 1920
+PlayResY: 1080
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Danmaku,Arial,42,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,7,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:08.00,Danmaku,,0,0,0,,{\move(2120,40,-200,40)\fs25\c&HFFFFFF&}Right to left
+Dialogue: 0,0:00:00.00,0:00:08.00,Danmaku,,0,0,0,,{\move(-200,92,2120,92)\fs25\c&HFFFFFF&}Left to right
+Dialogue: 0,0:00:00.00,0:00:04.00,Danmaku,,0,0,0,,{\an2\pos(960,936)\fs25\c&HFFFFFF&}Bottom, fixed
+Dialogue: 0,0:00:00.00,0:00:04.00,Danmaku,,0,0,0,,{\an8\pos(960,196)\fs25\c&HFFFFFF&}Top fixed

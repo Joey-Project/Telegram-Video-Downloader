@@ -359,6 +359,7 @@ struct DownloadStore {
     queue_identity: EntryIdentity,
     operation_lock_path: PathBuf,
     file_provider: Arc<dyn QueueFileProvider>,
+    state_change_notify: Arc<Notify>,
 }
 
 struct QueueOperationLock {
@@ -377,6 +378,7 @@ pub struct QueueManager {
     operation_lock: Mutex<()>,
     cancellations: Mutex<HashMap<String, CancellationRegistration>>,
     publication_notify: Arc<Notify>,
+    state_change_notify: Arc<Notify>,
     #[cfg(test)]
     interrupt_after_sidecar_move: AtomicBool,
 }
@@ -663,7 +665,12 @@ impl QueueManager {
             coordinate_directory_root(file_provider.as_ref(), &config.downloads.video_dir)?;
         let pdf_root =
             coordinate_directory_root(file_provider.as_ref(), &config.downloads.pdf_dir)?;
-        let mut video = DownloadStore::from_root(video_root, Arc::clone(&file_provider))?;
+        let state_change_notify = Arc::new(Notify::new());
+        let mut video = DownloadStore::from_root(
+            video_root,
+            Arc::clone(&file_provider),
+            Arc::clone(&state_change_notify),
+        )?;
         let pdf = if video.root.root_identity() == pdf_root.root_identity() {
             let pdf_alias = pdf_root.logical_root_path().to_path_buf();
             if !video.root_aliases.contains(&pdf_alias) {
@@ -671,7 +678,7 @@ impl QueueManager {
             }
             video.clone()
         } else {
-            DownloadStore::from_root(pdf_root, file_provider)?
+            DownloadStore::from_root(pdf_root, file_provider, Arc::clone(&state_change_notify))?
         };
         // Protected property: a live queue manager exclusively owns each backing download root,
         // so no second process can mutate its task index or recover its running tasks. The
@@ -690,6 +697,7 @@ impl QueueManager {
             operation_lock: Mutex::new(()),
             cancellations: Mutex::new(HashMap::new()),
             publication_notify: Arc::new(Notify::new()),
+            state_change_notify,
             #[cfg(test)]
             interrupt_after_sidecar_move: AtomicBool::new(false),
         };
@@ -716,6 +724,11 @@ impl QueueManager {
         Arc::clone(&self.publication_notify)
     }
 
+    /// Subscribe to durable queue status or progress changes without requesting a library scan.
+    pub fn state_change_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.state_change_notify)
+    }
+
     pub fn create(&self, mut task: TaskRecord) -> Result<bool> {
         if let Some(snapshot) = task.bilibili_attempt.as_mut() {
             snapshot.sanitize_errors();
@@ -732,6 +745,7 @@ impl QueueManager {
         }
         let store = self.store_for_job(&task.job);
         store.create_task(&mut task)?;
+        self.state_change_notify.notify_one();
         Ok(true)
     }
 
@@ -2534,7 +2548,11 @@ fn coordinated_path_under_root(root: &RootedFs, coordinated_path: &Path) -> Resu
 }
 
 impl DownloadStore {
-    fn from_root(root: RootedFs, file_provider: Arc<dyn QueueFileProvider>) -> Result<Self> {
+    fn from_root(
+        root: RootedFs,
+        file_provider: Arc<dyn QueueFileProvider>,
+        state_change_notify: Arc<Notify>,
+    ) -> Result<Self> {
         let requested_queue_dir = root.logical_root_path().join(QUEUE_DIRECTORY);
         coordinate_private_directory_creation(
             file_provider.as_ref(),
@@ -2561,6 +2579,7 @@ impl DownloadStore {
             queue_dir,
             queue_identity,
             file_provider,
+            state_change_notify,
         };
         store.ensure_operation_lock_file()?;
         Ok(store)
@@ -3161,6 +3180,7 @@ impl DownloadStore {
         }
         index.tasks.insert(record.id.clone(), entry);
         self.write_index(&index)?;
+        self.state_change_notify.notify_one();
         self.cleanup_terminal_bilibili_group_receipts(&record);
         Ok(record)
     }
@@ -8576,5 +8596,53 @@ mod tests {
 
         drop(queue);
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn queue_progress_notifies_state_without_requesting_library_publication() {
+        let directory = temp_queue_root("state-notify");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let state_changed = queue.state_change_notify();
+        let published = queue.publication_notify();
+        let id = "state-notify-task";
+
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        tokio::time::timeout(Duration::from_secs(1), state_changed.notified())
+            .await
+            .expect("task creation should notify cloud state");
+
+        queue
+            .set_status(id, TaskStatus::Running, None)
+            .expect("task status should persist");
+        tokio::time::timeout(Duration::from_secs(1), state_changed.notified())
+            .await
+            .expect("status change should notify cloud state");
+
+        let progress = queue
+            .set_collection_progress(id, 5, 3, 1)
+            .expect("task progress should persist");
+        assert_eq!(progress.media_entries_completed, 3);
+        tokio::time::timeout(Duration::from_secs(1), state_changed.notified())
+            .await
+            .expect("progress change should notify cloud state");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), published.notified())
+                .await
+                .is_err(),
+            "ordinary queue progress must not request a library publication scan"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
     }
 }

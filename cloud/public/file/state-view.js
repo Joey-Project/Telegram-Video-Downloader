@@ -21,3 +21,42 @@ export function buildWaitingEntries(pendingRequests, tasks, operations) {
     local,
   };
 }
+
+const TERMINAL_PREVIEW_STATUSES = new Set([
+  "confirmed",
+  "completed",
+  "cancelled",
+  "expired",
+  "failed",
+  "partial_failure",
+  "stale",
+  "rejected",
+]);
+
+export function isPresentMedia(item) {
+  return String(item?.presence ?? "unknown").toLowerCase() === "present";
+}
+
+export function presentMediaItems(items) {
+  return Array.isArray(items) ? items.filter(isPresentMedia) : [];
+}
+
+export function isReviewablePreviewStatus(status) {
+  return !TERMINAL_PREVIEW_STATUSES.has(String(status ?? "").toLowerCase());
+}
+
+function hasPreviewPayload(entry) {
+  return Boolean(
+    (entry?.preview && typeof entry.preview === "object")
+    || (entry?.result?.preview && typeof entry.result.preview === "object"),
+  );
+}
+
+export function operationHistoryEntries(operations) {
+  const entries = Array.isArray(operations) ? operations : [];
+  return entries.filter((entry) => (
+    entry?.kind !== "file_preview"
+    || !hasPreviewPayload(entry)
+    || !isReviewablePreviewStatus(entry.status)
+  ));
+}

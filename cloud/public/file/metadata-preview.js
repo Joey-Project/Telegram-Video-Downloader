@@ -23,3 +23,22 @@ export function metadataPreviewDetails(patch) {
   if (sourceIds.length) details.push({ kind: "change", label: "Source IDs to add", before: null, after: sourceIds.join(", ") });
   return details;
 }
+
+const METADATA_PATCH_FIELDS = ["title", "source_ids", "collection", "order", "part_id"];
+
+function hasMetadataValue(value) {
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (value && typeof value === "object") return Object.values(value).some(hasMetadataValue);
+  return value !== undefined && value !== null && value !== false;
+}
+
+export function hasMetadataPatchFields(patch) {
+  return Boolean(patch && typeof patch === "object"
+    && METADATA_PATCH_FIELDS.some((field) => hasMetadataValue(patch[field])));
+}
+
+export function hasMetadataPreviewChanges(preview) {
+  const patches = Array.isArray(preview?.metadata_patches) ? preview.metadata_patches : [];
+  return patches.some((patch) => metadataPreviewDetails(patch).some((detail) => detail.kind === "change"));
+}

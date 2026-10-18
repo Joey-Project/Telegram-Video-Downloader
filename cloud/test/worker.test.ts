@@ -3,10 +3,13 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials";
-import { ACTION_QUEUE_LIMIT, appendAction, removeQueuedAction } from "../public/file/action-queue.js";
+import { ACTION_QUEUE_LIMIT, appendAction, removeQueuedAction, shouldRetryActionFailure } from "../public/file/action-queue.js";
+import { HttpResponseError } from "../public/file/http-error.js";
 import { getOrCreateLegacySelection, updateLegacySelection } from "../public/file/legacy-mapping-state.js";
-import { metadataPreviewDetails } from "../public/file/metadata-preview.js";
-import { buildWaitingEntries, mergeRequestEntries } from "../public/file/state-view.js";
+import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "../public/file/metadata-preview.js";
+import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
+import { sourceIdUrl } from "../public/file/source-links.js";
+import { buildWaitingEntries, isPresentMedia, isReviewablePreviewStatus, mergeRequestEntries, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
 
 const testEnv = env as typeof env & { TEST_MIGRATIONS: D1Migration[] };
 const ownerId = 123456789;
@@ -33,6 +36,73 @@ describe("metadata preview details", () => {
       { kind: "change", label: "Order", before: "1", after: "2" },
       { kind: "change", label: "Source IDs to add", before: null, after: "BV1abcdefgh, cid11" },
     ]);
+  });
+
+  it("recognizes one actual metadata field without counting item identity fields", () => {
+    expect(hasMetadataPatchFields({ item_id: "video", source_ids: ["youtube:dQw4w9WgXcQ"] })).toBe(true);
+    expect(hasMetadataPatchFields({ item_id: "video", hint_index: 3 })).toBe(false);
+  });
+
+  it("detects actual metadata changes instead of treating an empty patch list as an update", () => {
+    expect(hasMetadataPreviewChanges({ items: [{ item_id: "video" }], metadata_patches: [] })).toBe(false);
+    expect(hasMetadataPreviewChanges({ metadata_patches: [{ changes: [{ field: "title", before: "Old", after: "New" }] }] })).toBe(true);
+  });
+});
+
+describe("owner snapshot session", () => {
+  it("keeps private UI and queued actions gated until a successful owner response", () => {
+    const startup = beginOwnerVerification();
+    expect(startup).toMatchObject({
+      ownerVerified: false,
+      snapshot: null,
+      privateUiVisible: false,
+      canDispatchActions: false,
+      clearCache: true,
+    });
+    expect(mayUsePrivateSnapshot(startup)).toBe(false);
+    expect(mayDispatchActions(startup)).toBe(false);
+
+    expect(mayUsePrivateSnapshot({ ...startup, snapshot: { library: { items: ["private"] } } })).toBe(false);
+    const accepted = acceptOwnerSnapshot({ synced: true, library: { items: ["private"] } });
+    expect(mayUsePrivateSnapshot(accepted)).toBe(true);
+    expect(mayDispatchActions(accepted)).toBe(true);
+  });
+
+  it.each([401, 403])("clears private state and pauses use after HTTP %i", (status) => {
+    const accepted = acceptOwnerSnapshot({ synced: true, library: { items: ["private"] } });
+    const failed = failOwnerSnapshot(accepted, status, 1234);
+    expect(failed).toEqual({
+      ownerVerified: false,
+      snapshot: null,
+      privateUiVisible: false,
+      canDispatchActions: false,
+      clearCache: true,
+      authorizationRejected: true,
+    });
+    expect(mayUsePrivateSnapshot(failed)).toBe(false);
+    expect(mayDispatchActions(failed)).toBe(false);
+  });
+
+  it("uses only the in-memory owner-verified snapshot after a temporary failure", () => {
+    const accepted = acceptOwnerSnapshot({ synced: true, library: { items: ["private"] } });
+    const stale = failOwnerSnapshot(accepted, 503, 1234);
+    expect(stale.ownerVerified).toBe(true);
+    expect(mayUsePrivateSnapshot(stale)).toBe(true);
+    expect(mayDispatchActions(stale)).toBe(true);
+    expect(stale.snapshot).toMatchObject({ stale: true, cached_at: 1234 });
+
+    const firstLoadFailure = failOwnerSnapshot(beginOwnerVerification(), 503, 1234);
+    expect(firstLoadFailure.snapshot).toBeNull();
+    expect(mayUsePrivateSnapshot(firstLoadFailure)).toBe(false);
+    expect(mayDispatchActions(firstLoadFailure)).toBe(false);
+  });
+});
+
+describe("Mini App source links", () => {
+  it("links canonical YouTube IDs and leaves other IDs unchanged", () => {
+    expect(sourceIdUrl("youtube:dQw4w9WgXcQ")).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    expect(sourceIdUrl("BV17x411w7KC")).toBeNull();
+    expect(sourceIdUrl("youtube:bad/id")).toBeNull();
   });
 });
 
@@ -369,6 +439,18 @@ describe("offline action queue helpers", () => {
     expect(removeQueuedAction(queue, first.request_id)).toEqual([concurrent]);
   });
 
+  it("retries network, timeout, throttling, and server failures but not permanent 4xx responses", () => {
+    expect(shouldRetryActionFailure(new TypeError("Failed to fetch"))).toBe(true);
+    for (const status of [408, 429, 500, 503]) {
+      const error = new HttpResponseError(status, "Temporary failure");
+      expect(error.status).toBe(status);
+      expect(shouldRetryActionFailure(error)).toBe(true);
+    }
+    for (const status of [400, 401, 403, 404, 413, 422, 600]) {
+      expect(shouldRetryActionFailure(new HttpResponseError(status, "Rejected"))).toBe(false);
+    }
+  });
+
   it("keeps mapping choices across repeated legacy operation renders", () => {
     const selections = new Map();
     const initial = getOrCreateLegacySelection(selections, "legacy:4:manual:0", {
@@ -421,5 +503,31 @@ describe("offline action queue helpers", () => {
     expect(alreadyReceived.cloud).toHaveLength(0);
     expect(alreadyReceived.local).toHaveLength(1);
     expect(alreadyReceived.local[0]?.status).toBe("partial_failure");
+  });
+
+  it("limits move selections to present media", () => {
+    const items = [
+      { id: "present", presence: "present" },
+      { id: "missing", presence: "missing" },
+      { id: "unavailable", presence: "unavailable" },
+      { id: "unknown" },
+    ];
+    expect(isPresentMedia(items[0])).toBe(true);
+    expect(isPresentMedia(items[1])).toBe(false);
+    expect(presentMediaItems(items).map((item) => item.id)).toEqual(["present"]);
+  });
+
+  it("keeps failed file previews in history while hiding active previews already shown for confirmation", () => {
+    const active = { seq: 1, kind: "file_preview", status: "awaiting_confirmation", result: { preview: { revision: 1 } } };
+    const failedWithoutPreview = { seq: 2, kind: "file_preview", status: "failed", error: "Selected item is missing" };
+    const failedWithPreview = { seq: 3, kind: "file_preview", status: "failed", result: { preview: { revision: 2 } }, error: "Preview became stale" };
+    const other = { seq: 4, kind: "library_scan", status: "completed" };
+    expect(isReviewablePreviewStatus(active.status)).toBe(true);
+    expect(isReviewablePreviewStatus(failedWithPreview.status)).toBe(false);
+    expect(operationHistoryEntries([active, failedWithoutPreview, failedWithPreview, other])).toEqual([
+      failedWithoutPreview,
+      failedWithPreview,
+      other,
+    ]);
   });
 });

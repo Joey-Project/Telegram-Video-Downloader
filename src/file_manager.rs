@@ -36,6 +36,7 @@ const PREVIEW_PREFIX: &str = "preview-";
 const BATCH_PREFIX: &str = "batch-";
 const INDEX_VERSION: u32 = 1;
 const INDEX_LIMIT: usize = 16 * 1024 * 1024;
+const MAX_MISSING_INDEX_RECORDS: usize = 1024;
 const PREVIEW_LIMIT: usize = 4 * 1024 * 1024;
 const MANIFEST_LIMIT: usize = 16 * 1024 * 1024;
 const SIDE_CAR_LIMIT: usize = 1024 * 1024;
@@ -87,6 +88,8 @@ struct IndexRecord {
     birth_seconds: Option<i64>,
     #[serde(default)]
     birth_nanoseconds: Option<i64>,
+    #[serde(default)]
+    missing_since: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -261,12 +264,21 @@ impl LibraryManager {
         self.scan_locked(hints)
     }
 
+    #[cfg(test)]
     pub fn import_legacy(&self, input: &str) -> Result<LegacyImportReport> {
+        self.import_legacy_with_hints(input, &[])
+    }
+
+    pub fn import_legacy_with_hints(
+        &self,
+        input: &str,
+        hints: &[SourceHint],
+    ) -> Result<LegacyImportReport> {
         if input.len() > LEGACY_INPUT_LIMIT {
             bail!("legacy import text exceeds the 1 MiB limit");
         }
         let mut report = parse_legacy_import(input);
-        let snapshot = self.scan(&[])?;
+        let snapshot = self.scan(hints)?;
         report.revision = Some(snapshot.revision.clone());
         report.candidates = legacy_candidates(&report.hints, &snapshot.items);
         Ok(report)
@@ -348,7 +360,12 @@ impl LibraryManager {
             if manifest.preview.id != preview_id || manifest.preview.revision != revision {
                 bail!("persistent move batch does not match the submitted preview");
             }
-            if manifest.status == BatchStatus::Complete {
+            if manifest.status == BatchStatus::Complete
+                && !manifest
+                    .items
+                    .iter()
+                    .any(|item| item.outcome == MoveOutcome::Skip)
+            {
                 release_preview_anchors(preview_id);
                 return Ok(batch_result(&manifest));
             }
@@ -781,7 +798,12 @@ impl LibraryManager {
                 {
                     bail!("persistent move batch does not match the confirmed preview");
                 }
-                if manifest.status == BatchStatus::Complete {
+                if manifest.status == BatchStatus::Complete
+                    && !manifest
+                        .items
+                        .iter()
+                        .any(|item| item.outcome == MoveOutcome::Skip)
+                {
                     return Ok(batch_result(&manifest));
                 }
                 manifest
@@ -940,7 +962,17 @@ impl LibraryManager {
             self.write_batch_manifest(&batch_path, &manifest)?;
         }
 
+        for item in &mut manifest.items {
+            if item.outcome == MoveOutcome::Skip && item.error.is_none() {
+                item.error = Some(skipped_move_error(&manifest.preview, &item.item_id));
+            }
+        }
+
         let has_errors = manifest.items.iter().any(|item| item.error.is_some())
+            || manifest
+                .items
+                .iter()
+                .any(|item| item.outcome == MoveOutcome::Skip)
             || manifest
                 .files
                 .iter()
@@ -1110,22 +1142,27 @@ impl LibraryManager {
             if let Some(file) = self.root.open_bound_file(&target)? {
                 let (token, digest) = token_for_bound_file(&file)?;
                 if digest == patch.after_sha256 {
-                    let expected = patch.expected_identity.as_deref().ok_or_else(|| {
-                        anyhow!("NFO destination appeared after preview; leaving it untouched")
-                    })?;
                     let path_identity = self.root.entry_identity(&target)?;
-                    let nfo_anchor = self.preview_anchor(preview_id, expected)?;
-                    if identity_tokens_match_with_pinned_file(
-                        expected,
-                        &token,
-                        &file,
-                        path_identity,
-                        nfo_anchor.as_ref(),
-                    )? && digest == patch.expected_sha256.as_deref().unwrap_or_default()
-                    {
+                    if let Some(expected) = patch.expected_identity.as_deref() {
+                        let nfo_anchor = self.preview_anchor(preview_id, expected)?;
+                        if identity_tokens_match_with_pinned_file(
+                            expected,
+                            &token,
+                            &file,
+                            path_identity,
+                            nfo_anchor.as_ref(),
+                        )? && digest == patch.expected_sha256.as_deref().unwrap_or_default()
+                        {
+                            return Ok(());
+                        }
+                        bail!("NFO already has the prepared content but its approved object identity cannot be verified");
+                    }
+                    if self.created_nfo_matches_prepared(
+                        &target, &file, &token, &digest, patch,
+                    )? {
                         return Ok(());
                     }
-                    bail!("NFO already has the prepared content but its approved object identity cannot be verified");
+                    bail!("NFO already has the prepared content but its create identity or access policy cannot be verified");
                 }
                 let contents = file.read_limited(SIDE_CAR_LIMIT)?;
                 if sha256_bytes(&contents) != digest {
@@ -1161,9 +1198,16 @@ impl LibraryManager {
             }
             let updated = self.root.open_bound_file(&target)?
                 .ok_or_else(|| anyhow!("confirmed NFO patch disappeared"))?;
-            let (_, digest) = token_for_bound_file(&updated)?;
+            let (token, digest) = token_for_bound_file(&updated)?;
             if digest != patch.after_sha256 {
                 bail!("confirmed NFO patch did not match its prepared content");
+            }
+            if patch.expected_identity.is_none()
+                && !self.created_nfo_matches_prepared(
+                    &target, &updated, &token, &digest, patch,
+                )?
+            {
+                bail!("created NFO does not match its expected access policy");
             }
             let (media_after, _) = token_for_bound_file(&media_file)?;
             let media_path_identity = self.root.entry_identity(&media)?;
@@ -1178,6 +1222,41 @@ impl LibraryManager {
             }
             Ok(())
         })
+    }
+
+    fn created_nfo_matches_prepared(
+        &self,
+        target: &Path,
+        file: &BoundFile,
+        token: &str,
+        digest: &str,
+        patch: &PreparedNfoPatch,
+    ) -> Result<bool> {
+        if digest != patch.after_sha256 {
+            return Ok(false);
+        }
+        let identity = file.identity();
+        let path_identity = self.root.entry_identity(target)?;
+        let fingerprint = fingerprint(file)?;
+        let token_identity = decode_identity_token(token)?;
+        let permissions = (fingerprint.mode & 0o777) as u16;
+        let requested_permissions = patch.expected_mode.unwrap_or(0o644);
+
+        // The preview had no NFO object to pin. Recovery therefore binds to the current rooted
+        // path, exact prepared bytes, the creating user, and a non-executable mode no broader
+        // than the requested 0644 policy. Timestamps and link count are not identity or content
+        // signals here and may change independently.
+        Ok(identity.is_file()
+            && path_identity == Some(identity)
+            && token_identity.device == identity.device()
+            && token_identity.inode == identity.inode()
+            && token_identity.size == patch.replacement.len() as u64
+            && token_identity.uid == unsafe { libc::geteuid() as u32 }
+            && fingerprint.uid == token_identity.uid
+            && fingerprint.gid == token_identity.gid
+            && permissions & 0o600 == 0o600
+            && permissions & !requested_permissions == 0
+            && fingerprint.mode & 0o7000 == 0)
     }
 
     fn write_batch_manifest(&self, path: &Path, manifest: &BatchManifest) -> Result<()> {
@@ -1319,10 +1398,15 @@ impl LibraryManager {
             } else {
                 None
             };
-            let stable_id = exact
-                .or(unique_rename)
+            let prior = exact.or(unique_rename);
+            let stable_id = prior
                 .map(|(id, _)| id.clone())
                 .unwrap_or_else(|| physical_item_id(fingerprint, &item.relative_path));
+            if let Some((_, record)) = prior {
+                // Queue metadata follows a physical item only after the index's object identity
+                // signals match. The current path alone never carries an old association.
+                preserve_indexed_metadata(item, &record.item);
+            }
             used_ids.insert(stable_id.clone());
             item.id = stable_id.clone();
             index.records.insert(
@@ -1334,6 +1418,7 @@ impl LibraryManager {
                     file_type: "regular_file".to_string(),
                     birth_seconds: fingerprint.birth_seconds,
                     birth_nanoseconds: fingerprint.birth_nanoseconds,
+                    missing_since: None,
                 },
             );
         }
@@ -1351,6 +1436,9 @@ impl LibraryManager {
                 unobserved_record_status(&record.item.relative_path, &walk, unreadable_status)
             {
                 record.item.presence = status.presence;
+                if status.presence == Presence::Missing {
+                    record.missing_since.get_or_insert_with(unix_now);
+                }
                 if let Some(metadata_status) = status.metadata_status {
                     record.item.metadata_status = metadata_status;
                 }
@@ -1367,6 +1455,18 @@ impl LibraryManager {
                 }
                 videos.push(record.item.clone());
             }
+        }
+
+        let pruned_missing =
+            prune_missing_index_records(&mut index, MAX_MISSING_INDEX_RECORDS, INDEX_LIMIT)?;
+        if !pruned_missing.is_empty() {
+            let pruned_count = pruned_missing.len();
+            let pruned_ids = pruned_missing.into_iter().collect::<HashSet<_>>();
+            videos.retain(|item| !pruned_ids.contains(&item.id));
+            walk.warnings.push(format!(
+                "pruned {} oldest missing media records from the library index",
+                pruned_count
+            ));
         }
 
         videos.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -1559,6 +1659,8 @@ impl LibraryManager {
         let mut title = title_from_name;
         let mut source_ids = ids_from_path(&media.relative_path);
         let mut collection = None;
+        let mut nfo_title_present = false;
+        let mut nfo_source_id_present = false;
         let mut metadata_status = if presence == Presence::Missing {
             MetadataStatus::ProviderUnavailable
         } else {
@@ -1578,19 +1680,25 @@ impl LibraryManager {
                 match self.read_file(&path, SIDE_CAR_LIMIT) {
                     Ok(Some(contents)) => match String::from_utf8(contents) {
                         Ok(text) => {
-                            if let Some(value) = xml_tag_text(&text, "title")
-                                && !value.trim().is_empty()
-                            {
+                            let nfo_title = xml_tag_text(&text, "title")
+                                .filter(|value| !value.trim().is_empty());
+                            let nfo_ids = nfo_source_ids(&text);
+                            if let Some(value) = &nfo_title {
                                 title = value.trim().to_string();
                             }
-                            source_ids.extend(nfo_source_ids(&text));
+                            nfo_title_present |= nfo_title.is_some();
+                            nfo_source_id_present |= !nfo_ids.is_empty();
+                            source_ids.extend(nfo_ids);
                             if let Some(value) = xml_tag_text(&text, "set")
                                 && !value.trim().is_empty()
                             {
                                 collection = Some(CollectionMetadata {
-                                    id: None,
+                                    id: xml_tag_text(&text, "setid")
+                                        .filter(|value| !value.trim().is_empty()),
                                     title: value.trim().to_string(),
-                                    kind: "nfo_set".to_string(),
+                                    kind: xml_tag_text(&text, "settype")
+                                        .filter(|value| !value.trim().is_empty())
+                                        .unwrap_or_else(|| "nfo_set".to_string()),
                                     order: xml_tag_text(&text, "episode")
                                         .and_then(|value| value.parse().ok()),
                                     part_id: xml_tag_text(&text, "partid"),
@@ -1665,6 +1773,8 @@ impl LibraryManager {
         source_ids = normalize_source_ids(source_ids);
         if sidecar_unreadable {
             metadata_status = MetadataStatus::Unreadable;
+        } else if nfo_title_present && nfo_source_id_present {
+            metadata_status = MetadataStatus::Complete;
         } else if metadata_status == MetadataStatus::Unknown && !source_ids.is_empty() {
             metadata_status = MetadataStatus::Partial;
         }
@@ -2457,6 +2567,15 @@ fn item_group_ready(manifest: &BatchManifest, item_id: &str) -> bool {
         })
 }
 
+fn skipped_move_error(preview: &MovePreview, item_id: &str) -> String {
+    preview
+        .items
+        .iter()
+        .find(|item| item.item_id == item_id && item.outcome == MoveOutcome::Skip)
+        .and_then(|item| item.reason.clone())
+        .unwrap_or_else(|| "selected media item was skipped because of a move conflict".to_string())
+}
+
 fn batch_result(manifest: &BatchManifest) -> BatchMoveResult {
     BatchMoveResult {
         id: manifest.preview.id.clone(),
@@ -2623,6 +2742,140 @@ fn index_record_matches(record: &IndexRecord, fingerprint: &FileFingerprint) -> 
         && record.file_type == "regular_file"
         && record.birth_seconds == fingerprint.birth_seconds
         && record.birth_nanoseconds == fingerprint.birth_nanoseconds
+}
+
+fn preserve_indexed_metadata(item: &mut LibraryItem, previous: &LibraryItem) {
+    let current_name_title = title_from_path(&item.relative_path);
+    let previous_name_title = title_from_path(&previous.relative_path);
+    let previous_has_queue_title = previous.title != previous_name_title;
+    if item.title == current_name_title
+        && previous_has_queue_title
+        && !previous.title.trim().is_empty()
+    {
+        item.title = previous.title.clone();
+    }
+
+    item.source_ids.extend(previous.source_ids.iter().cloned());
+    item.source_ids = normalize_source_ids(std::mem::take(&mut item.source_ids));
+
+    if let Some(previous_collection) = &previous.collection {
+        match item.collection.as_mut() {
+            Some(collection) => {
+                if collection.id.is_none() {
+                    collection.id = previous_collection.id.clone();
+                }
+                if collection.kind.trim().is_empty() || collection.kind == "nfo_set" {
+                    collection.kind = previous_collection.kind.clone();
+                }
+                if collection.title.trim().is_empty() {
+                    collection.title = previous_collection.title.clone();
+                }
+                if collection.order.is_none() {
+                    collection.order = previous_collection.order;
+                }
+                if collection.part_id.is_none() {
+                    collection.part_id = previous_collection.part_id.clone();
+                }
+            }
+            None => item.collection = Some(previous_collection.clone()),
+        }
+    }
+
+    if item.confidence == Confidence::Low && previous.confidence != Confidence::Low {
+        item.confidence = previous.confidence;
+    }
+    if item.metadata_status == MetadataStatus::Unknown
+        && (previous_has_queue_title
+            || !previous.source_ids.is_empty()
+            || previous.collection.is_some())
+    {
+        // The cached association restores useful metadata, but does not prove the current NFO
+        // still contains a complete record.
+        item.metadata_status = MetadataStatus::Partial;
+    }
+}
+
+fn prune_missing_index_records(
+    index: &mut LibraryIndex,
+    max_missing_records: usize,
+    max_serialized_bytes: usize,
+) -> Result<Vec<String>> {
+    let mut removed = BTreeSet::new();
+    let mut missing = index
+        .records
+        .iter()
+        .filter(|(_, record)| record.item.presence == Presence::Missing)
+        .map(|(id, record)| (id.clone(), record.missing_since.unwrap_or_default()))
+        .collect::<Vec<_>>();
+    missing.sort_by(|(left_id, left_since), (right_id, right_since)| {
+        left_since
+            .cmp(right_since)
+            .then_with(|| left_id.cmp(right_id))
+    });
+
+    let excess = missing.len().saturating_sub(max_missing_records);
+    for (id, _) in missing.iter().take(excess) {
+        index.records.remove(id);
+        removed.insert(id.clone());
+    }
+
+    let encoded = serde_json::to_vec(index).context("failed to size the media-library index")?;
+    if encoded.len() <= max_serialized_bytes {
+        return Ok(removed.into_iter().collect());
+    }
+
+    let mut remaining = index
+        .records
+        .iter()
+        .filter(|(_, record)| record.item.presence == Presence::Missing)
+        .map(|(id, record)| (id.clone(), record.missing_since.unwrap_or_default()))
+        .collect::<Vec<_>>();
+    remaining.sort_by(|(left_id, left_since), (right_id, right_since)| {
+        right_since
+            .cmp(left_since)
+            .then_with(|| left_id.cmp(right_id))
+    });
+
+    let mut without_missing = index.clone();
+    without_missing
+        .records
+        .retain(|_, record| record.item.presence != Presence::Missing);
+    let base_size = serde_json::to_vec(&without_missing)
+        .context("failed to size the media-library index without missing records")?
+        .len();
+    if base_size > max_serialized_bytes {
+        for (id, _) in remaining {
+            index.records.remove(&id);
+            removed.insert(id);
+        }
+        return Ok(removed.into_iter().collect());
+    }
+
+    let mut low = 0;
+    let mut high = remaining.len() + 1;
+    while low + 1 < high {
+        let keep_count = low + (high - low) / 2;
+        let mut candidate = without_missing.clone();
+        for (id, _) in remaining.iter().take(keep_count) {
+            if let Some(record) = index.records.get(id) {
+                candidate.records.insert(id.clone(), record.clone());
+            }
+        }
+        let size = serde_json::to_vec(&candidate)
+            .context("failed to size the bounded media-library index")?
+            .len();
+        if size <= max_serialized_bytes {
+            low = keep_count;
+        } else {
+            high = keep_count;
+        }
+    }
+
+    for (id, _) in remaining.iter().skip(low) {
+        index.records.remove(id);
+        removed.insert(id.clone());
+    }
+    Ok(removed.into_iter().collect())
 }
 
 fn physical_item_id(fingerprint: &FileFingerprint, relative_path: &str) -> String {
@@ -3009,26 +3262,41 @@ fn normalize_source_ids(ids: Vec<String>) -> Vec<String> {
         if value.is_empty() || value.len() > 128 {
             continue;
         }
+        let lower = value.to_ascii_lowercase();
         let canonical = if value.len() >= 8
             && value.starts_with("BV")
             && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
         {
             value.to_string()
-        } else {
-            let lower = value.to_ascii_lowercase();
-            if ["av", "cid", "ep"].iter().any(|prefix| {
-                lower.strip_prefix(prefix).is_some_and(|digits| {
-                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-                })
-            }) {
-                lower
+        } else if ["av", "cid", "ep"].iter().any(|prefix| {
+            lower.strip_prefix(prefix).is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        }) {
+            lower
+        } else if let Some((prefix, youtube_id)) = value.split_once(':')
+            && (prefix.eq_ignore_ascii_case("youtube") || prefix.eq_ignore_ascii_case("yt"))
+        {
+            if is_youtube_video_id(youtube_id) {
+                format!("youtube:{youtube_id}")
             } else {
                 continue;
             }
+        } else if is_youtube_video_id(value) {
+            format!("youtube:{value}")
+        } else {
+            continue;
         };
         normalized.insert(canonical);
     }
     normalized.into_iter().collect()
+}
+
+fn is_youtube_video_id(value: &str) -> bool {
+    value.len() == 11
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn nfo_source_ids(content: &str) -> Vec<String> {
@@ -3069,6 +3337,9 @@ fn nfo_source_ids(content: &str) -> Vec<String> {
                 } else {
                     format!("ep{raw_id}")
                 }
+            }
+            "youtube" | "youtube-video" | "youtube_video" => {
+                format!("youtube:{raw_id}")
             }
             _ => {
                 cursor = close + "</uniqueid>".len();
@@ -3154,6 +3425,8 @@ fn metadata_field_changes(before: Option<&str>, after: &str) -> Vec<MetadataFiel
     [
         ("title", "title"),
         ("collection", "set"),
+        ("collection_id", "setid"),
+        ("collection_kind", "settype"),
         ("order", "episode"),
         ("part_id", "partid"),
     ]
@@ -3212,6 +3485,18 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
                 output = replace_xml_element(&output, "episode", &order.to_string())?;
             } else {
                 nodes.push(format!("  <episode>{order}</episode>"));
+            }
+        }
+        for (tag, value) in [
+            ("setid", collection.id.as_deref()),
+            ("settype", Some(collection.kind.as_str())),
+        ] {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                if xml_tag_text(&output, tag).is_some() {
+                    output = replace_xml_element(&output, tag, value.trim())?;
+                } else {
+                    nodes.push(format!("  <{tag}>{}</{tag}>", xml_escape(value.trim())));
+                }
             }
         }
         if let Some(part_id) = collection
@@ -3301,6 +3586,19 @@ fn new_nfo(title: &str, patch: &MetadataPatch) -> String {
         if let Some(order) = collection.order {
             content.push_str(&format!("  <episode>{order}</episode>\n"));
         }
+        if let Some(id) = collection
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            content.push_str(&format!("  <setid>{}</setid>\n", xml_escape(id.trim())));
+        }
+        if !collection.kind.trim().is_empty() {
+            content.push_str(&format!(
+                "  <settype>{}</settype>\n",
+                xml_escape(collection.kind.trim())
+            ));
+        }
         if let Some(part_id) = collection
             .part_id
             .as_deref()
@@ -3359,6 +3657,9 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str, from: usize) -> Opt
 }
 
 fn source_id_nfo_value(id: &str) -> Option<(&'static str, String)> {
+    if let Some(value) = id.strip_prefix("youtube:") {
+        return is_youtube_video_id(value).then(|| ("youtube", value.to_string()));
+    }
     if id.starts_with("BV") {
         return Some(("bilibili", id.to_string()));
     }
@@ -3600,7 +3901,9 @@ fn attach_matching_hints(items: &mut [LibraryItem], hints: &[SourceHint]) {
             } else if item.confidence == Confidence::Low {
                 item.confidence = Confidence::Medium;
             }
-            item.metadata_status = MetadataStatus::Partial;
+            if item.metadata_status != MetadataStatus::Complete {
+                item.metadata_status = MetadataStatus::Partial;
+            }
         }
         item.source_ids = normalize_source_ids(std::mem::take(&mut item.source_ids));
     }
@@ -3832,6 +4135,64 @@ mod tests {
         }
     }
 
+    fn index_fixture_item(id: &str, relative_path: &str, presence: Presence) -> LibraryItem {
+        LibraryItem {
+            id: id.to_string(),
+            title: relative_path.to_string(),
+            relative_path: relative_path.to_string(),
+            bytes: 123,
+            width: None,
+            height: None,
+            codec: None,
+            source_ids: Vec::new(),
+            collection: None,
+            attachments: Vec::new(),
+            confidence: Confidence::Low,
+            metadata_status: MetadataStatus::Unknown,
+            integrity_status: IntegrityStatus::Unverified,
+            presence,
+        }
+    }
+
+    fn index_fixture_record(
+        id: &str,
+        relative_path: &str,
+        presence: Presence,
+        device: u64,
+        inode: u64,
+        missing_since: Option<u64>,
+    ) -> IndexRecord {
+        IndexRecord {
+            item: index_fixture_item(id, relative_path, presence),
+            device,
+            inode,
+            file_type: "regular_file".to_string(),
+            birth_seconds: Some(inode as i64),
+            birth_nanoseconds: Some(0),
+            missing_since,
+        }
+    }
+
+    #[test]
+    fn source_id_normalization_keeps_numeric_bilibili_prefixes_ahead_of_bare_youtube_ids() {
+        assert_eq!(
+            normalize_source_ids(vec!["cid12345678".to_string()]),
+            vec!["cid12345678".to_string()]
+        );
+        assert_eq!(
+            normalize_source_ids(vec!["av123456789".to_string()]),
+            vec!["av123456789".to_string()]
+        );
+        assert_eq!(
+            normalize_source_ids(vec!["ep123456789".to_string()]),
+            vec!["ep123456789".to_string()]
+        );
+        assert_eq!(
+            normalize_source_ids(vec!["youtube:cid12345678".to_string()]),
+            vec!["youtube:cid12345678".to_string()]
+        );
+    }
+
     #[test]
     fn first_scan_assigns_ids_to_media_without_prior_identity_candidates() {
         let root = TemporaryRoot::new("first-media-scan");
@@ -3882,6 +4243,100 @@ mod tests {
             }),
             "only a complete scan may mark an unobserved item missing"
         );
+    }
+
+    #[test]
+    fn missing_index_records_are_count_bounded_and_keep_recent_identity() {
+        let root = TemporaryRoot::new("missing-index-bound");
+        let manager = manager(&root);
+        let mut index = LibraryIndex {
+            version: INDEX_VERSION,
+            records: BTreeMap::new(),
+        };
+        for number in 0..=MAX_MISSING_INDEX_RECORDS {
+            let id = format!("missing-{number:04}");
+            index.records.insert(
+                id.clone(),
+                index_fixture_record(
+                    &id,
+                    &format!("deleted-{number:04}.mp4"),
+                    Presence::Missing,
+                    number as u64 + 10,
+                    number as u64 + 20,
+                    Some(number as u64 + 1),
+                ),
+            );
+        }
+        manager
+            .write_index(&index)
+            .expect("large but bounded fixture index should persist");
+
+        let snapshot = manager
+            .scan(&[])
+            .expect("scan should prune tombstones before the index size limit");
+        let updated = manager.read_index().expect("pruned index should read");
+        assert_eq!(updated.records.len(), MAX_MISSING_INDEX_RECORDS);
+        assert_eq!(snapshot.items.len(), MAX_MISSING_INDEX_RECORDS);
+        assert!(!updated.records.contains_key("missing-0000"));
+        assert!(!snapshot.items.iter().any(|item| item.id == "missing-0000"));
+        let newest = updated
+            .records
+            .get(&format!("missing-{:04}", MAX_MISSING_INDEX_RECORDS))
+            .expect("newest missing identity should remain recoverable");
+        assert_eq!(newest.device, MAX_MISSING_INDEX_RECORDS as u64 + 10);
+        assert_eq!(newest.inode, MAX_MISSING_INDEX_RECORDS as u64 + 20);
+        assert_eq!(
+            newest.missing_since,
+            Some(MAX_MISSING_INDEX_RECORDS as u64 + 1)
+        );
+    }
+
+    #[test]
+    fn missing_index_byte_budget_prunes_oldest_records_and_preserves_old_schema() {
+        let mut index = LibraryIndex {
+            version: INDEX_VERSION,
+            records: BTreeMap::new(),
+        };
+        index.records.insert(
+            "old".to_string(),
+            index_fixture_record("old", "old-deleted.mp4", Presence::Missing, 2, 20, Some(1)),
+        );
+        index.records.insert(
+            "new".to_string(),
+            index_fixture_record("new", "new-deleted.mp4", Presence::Missing, 3, 30, Some(2)),
+        );
+        index.records.insert(
+            "unavailable".to_string(),
+            index_fixture_record(
+                "unavailable",
+                "unavailable.mp4",
+                Presence::Unavailable,
+                4,
+                40,
+                None,
+            ),
+        );
+        let mut fits_with_newest = index.clone();
+        fits_with_newest.records.remove("old");
+        let byte_budget = serde_json::to_vec(&fits_with_newest).unwrap().len();
+
+        let pruned = prune_missing_index_records(&mut index, 10, byte_budget)
+            .expect("index should fit by pruning missing records");
+        assert_eq!(pruned, vec!["old".to_string()]);
+        assert!(index.records.contains_key("new"));
+        assert!(index.records.contains_key("unavailable"));
+        assert!(serde_json::to_vec(&index).unwrap().len() <= byte_budget);
+        assert_eq!(index.records["new"].device, 3);
+        assert_eq!(index.records["new"].inode, 30);
+
+        let mut old_schema = serde_json::to_value(index).unwrap();
+        old_schema["records"]["new"]
+            .as_object_mut()
+            .unwrap()
+            .remove("missing_since");
+        let decoded: LibraryIndex = serde_json::from_value(old_schema)
+            .expect("index records without missing_since must remain readable");
+        assert_eq!(decoded.records["new"].missing_since, None);
     }
 
     #[test]
@@ -3978,6 +4433,128 @@ mod tests {
     }
 
     #[test]
+    fn queue_only_metadata_survives_move_reopen_and_rescan_but_not_path_replacement() {
+        let root = TemporaryRoot::new("queue-metadata-move");
+        fs::create_dir(root.path().join("Before")).expect("source directory should create");
+        fs::write(root.path().join("Before/clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let hint = SourceHint {
+            source_ids: vec!["abcdefghijk".to_string()],
+            title: Some("Queue title".to_string()),
+            relative_path: Some("Before/clip.mp4".to_string()),
+            collection: Some(CollectionMetadata {
+                id: Some("playlist-7".to_string()),
+                title: "Queue collection".to_string(),
+                kind: "youtube_playlist".to_string(),
+                order: Some(7),
+                part_id: None,
+            }),
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let initial_manager = manager(&root);
+        let before = initial_manager
+            .scan(std::slice::from_ref(&hint))
+            .expect("queue-aware initial scan should complete");
+        let original = item_at(&before, "Before/clip.mp4").clone();
+        assert_eq!(original.source_ids, vec!["youtube:abcdefghijk".to_string()]);
+
+        let preview = initial_manager
+            .preview(
+                std::slice::from_ref(&original.id),
+                "Moved",
+                false,
+                ConflictPolicy::KeepBoth,
+            )
+            .expect("move should preview");
+        let moved_relative_path = preview.items[0].target_path.clone();
+        assert_eq!(
+            initial_manager
+                .execute_preview(&preview.id, &preview.revision)
+                .expect("media move should complete")
+                .status,
+            BatchStatus::Complete
+        );
+        drop(initial_manager);
+
+        let reopened = manager(&root);
+        let moved = reopened
+            .scan(std::slice::from_ref(&hint))
+            .expect("reopened manager should recover metadata by object identity");
+        let moved_item = item_at(&moved, &moved_relative_path);
+        assert_eq!(moved_item.id, original.id);
+        assert_eq!(moved_item.title, "Queue title");
+        assert_eq!(moved_item.source_ids, original.source_ids);
+        assert_eq!(moved_item.collection, original.collection);
+
+        let rescanned = reopened
+            .scan(&[])
+            .expect("subsequent scan should retain persisted queue metadata");
+        let rescanned_item = item_at(&rescanned, &moved_relative_path);
+        assert_eq!(rescanned_item.id, original.id);
+        assert_eq!(rescanned_item.title, "Queue title");
+        assert_eq!(rescanned_item.source_ids, original.source_ids);
+        assert_eq!(rescanned_item.collection, original.collection);
+
+        let moved_absolute_path = root.path().join(&moved_relative_path);
+        let replacement = moved_absolute_path
+            .parent()
+            .expect("target should have a parent folder")
+            .join(".replacement");
+        fs::write(&replacement, b"replacement-video")
+            .expect("replacement media should write while original still exists");
+        fs::rename(&replacement, &moved_absolute_path)
+            .expect("replacement media should atomically reuse the old path");
+        let after_replacement = reopened
+            .scan(std::slice::from_ref(&hint))
+            .expect("replacement path should scan");
+        let replacement_item = after_replacement
+            .items
+            .iter()
+            .find(|item| {
+                item.relative_path == moved_relative_path && item.presence == Presence::Present
+            })
+            .expect("replacement media should be present");
+        assert_ne!(replacement_item.id, original.id);
+        assert_eq!(replacement_item.title, "clip");
+        assert!(replacement_item.source_ids.is_empty());
+        assert_eq!(replacement_item.collection, None);
+    }
+
+    #[test]
+    fn legacy_import_candidates_include_queue_hinted_snapshot_metadata() {
+        let root = TemporaryRoot::new("legacy-import-queue-snapshot");
+        fs::write(root.path().join("episode.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let manager = manager(&root);
+        let hint = SourceHint {
+            source_ids: vec!["BV1abcdefgh".to_string()],
+            title: Some("Queued episode".to_string()),
+            relative_path: Some("episode.mp4".to_string()),
+            collection: None,
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+
+        let report = manager
+            .import_legacy_with_hints(
+                "Episode One - https://www.bilibili.com/video/BV1abcdefgh",
+                &[hint],
+            )
+            .expect("queue-aware legacy import should use the same scan snapshot");
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].match_kind, "source_id");
+        assert_eq!(
+            report.candidates[0].item_id,
+            item_at(
+                &manager.scan(&[]).expect("follow-up scan should complete"),
+                "episode.mp4"
+            )
+            .id
+        );
+    }
+
+    #[test]
     fn preview_has_no_media_side_effects_and_conflicts_are_explicit() {
         let root = TemporaryRoot::new("preview-conflicts");
         fs::write(root.path().join("clip.mp4"), b"fixture-video")
@@ -4001,6 +4578,26 @@ mod tests {
             )
             .expect("skip preview should be available");
         assert_eq!(skip.items[0].outcome, MoveOutcome::Skip);
+        let skipped = manager
+            .execute_preview(&skip.id, &skip.revision)
+            .expect("a skipped batch should persist its conflict");
+        assert_eq!(skipped.status, BatchStatus::Failed);
+        assert!(skipped.items[0].error.is_some());
+
+        let batch_path = manager.batch_path(&skip.id);
+        let mut old_manifest: BatchManifest = serde_json::from_slice(
+            &fs::read(&batch_path).expect("persisted skip manifest should read"),
+        )
+        .expect("persisted skip manifest should parse");
+        old_manifest.status = BatchStatus::Complete;
+        manager
+            .write_batch_manifest(&batch_path, &old_manifest)
+            .expect("legacy false-complete manifest should be restorable");
+        let retried = manager
+            .execute_preview(&skip.id, &skip.revision)
+            .expect("a legacy false-complete skip must be re-evaluated");
+        assert_eq!(retried.status, BatchStatus::Failed);
+        assert!(retried.items[0].error.is_some());
         assert_eq!(
             fs::read(root.path().join("clip.mp4")).unwrap(),
             source_before
@@ -4019,6 +4616,52 @@ mod tests {
         assert!(!root.path().join("Existing/clip (2).mp4").exists());
         release_preview_anchors(&skip.id);
         release_preview_anchors(&keep_both.id);
+    }
+
+    #[test]
+    fn skipped_conflict_is_partial_when_another_selected_item_moves() {
+        let root = TemporaryRoot::new("skip-partial-batch");
+        fs::write(root.path().join("clip.mp4"), b"conflicted source")
+            .expect("conflicted media should write");
+        fs::write(root.path().join("move.mp4"), b"movable source")
+            .expect("movable media should write");
+        fs::create_dir(root.path().join("Existing")).expect("target directory should create");
+        fs::write(root.path().join("Existing/clip.mp4"), b"keep target")
+            .expect("conflict target should write");
+
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let ids = [
+            item_at(&snapshot, "clip.mp4").id.clone(),
+            item_at(&snapshot, "move.mp4").id.clone(),
+        ];
+        let preview = manager
+            .preview(&ids, "Existing", false, ConflictPolicy::Skip)
+            .expect("mixed move and conflict should preview");
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("mixed batch should complete with an explicit partial result");
+
+        assert_eq!(result.status, BatchStatus::Partial);
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .find(|item| item.item_id == ids[0])
+                .unwrap()
+                .outcome,
+            MoveOutcome::Skip
+        );
+        assert!(
+            result
+                .items
+                .iter()
+                .find(|item| item.item_id == ids[0])
+                .unwrap()
+                .error
+                .is_some()
+        );
+        assert!(root.path().join("Existing/move.mp4").exists());
     }
 
     #[test]
@@ -4041,9 +4684,9 @@ mod tests {
             title: Some("Confirmed title".to_string()),
             source_ids: vec!["BV1abcdefgh".to_string()],
             collection: Some(CollectionMetadata {
-                id: None,
+                id: Some("collection-123".to_string()),
                 title: "Series & More".to_string(),
-                kind: "user".to_string(),
+                kind: "bilibili_collection".to_string(),
                 order: Some(2),
                 part_id: Some("Part-A".to_string()),
             }),
@@ -4064,6 +4707,16 @@ mod tests {
                     field: "collection".to_string(),
                     before: None,
                     after: "Series & More".to_string(),
+                },
+                MetadataFieldChange {
+                    field: "collection_id".to_string(),
+                    before: None,
+                    after: "collection-123".to_string(),
+                },
+                MetadataFieldChange {
+                    field: "collection_kind".to_string(),
+                    before: None,
+                    after: "bilibili_collection".to_string(),
                 },
                 MetadataFieldChange {
                     field: "order".to_string(),
@@ -4097,6 +4750,8 @@ mod tests {
         assert!(patched.contains("<futureField key=\"x\">keep &amp; opaque</futureField>"));
         assert!(patched.contains("<uniqueid type=\"bilibili\">BV1abcdefgh</uniqueid>"));
         assert!(patched.contains("<set>Series &amp; More</set>"));
+        assert!(patched.contains("<setid>collection-123</setid>"));
+        assert!(patched.contains("<settype>bilibili_collection</settype>"));
         assert!(patched.contains("<episode>2</episode>"));
         assert!(patched.contains("<partid>Part-A</partid>"));
         assert_eq!(
@@ -4104,12 +4759,124 @@ mod tests {
             0o600,
             "confirmed NFO patch must preserve private file permissions"
         );
+        let rescanned = manager
+            .scan(&[])
+            .expect("patched NFO should parse on rescan");
+        assert_eq!(
+            item_at(&rescanned, "clip.mp4").collection,
+            Some(CollectionMetadata {
+                id: Some("collection-123".to_string()),
+                title: "Series & More".to_string(),
+                kind: "bilibili_collection".to_string(),
+                order: Some(2),
+                part_id: Some("Part-A".to_string()),
+            })
+        );
         assert_eq!(
             manager
                 .execute_preview(&preview.id, &preview.revision)
                 .expect("completed batch retry should be idempotent")
                 .status,
             BatchStatus::Complete
+        );
+    }
+
+    #[test]
+    fn complete_nfo_metadata_is_recognized_and_collection_identity_round_trips() {
+        let root = TemporaryRoot::new("complete-nfo");
+        fs::write(root.path().join("complete.mp4"), b"fixture-video")
+            .expect("complete media should write");
+        fs::write(
+            root.path().join("complete.nfo"),
+            "<movie><title>Complete episode</title><uniqueid type=\"youtube\">abcdefghijk</uniqueid><set>Collection</set><setid>collection-42</setid><settype>youtube_playlist</settype></movie>",
+        )
+        .expect("complete NFO should write");
+        fs::write(root.path().join("partial.mp4"), b"fixture-video")
+            .expect("partial media should write");
+        fs::write(
+            root.path().join("partial.nfo"),
+            "<movie><title>Partial episode</title></movie>",
+        )
+        .expect("partial NFO should write");
+
+        let snapshot = manager(&root)
+            .scan(&[SourceHint {
+                source_ids: vec!["abcdefghijk".to_string()],
+                title: None,
+                relative_path: None,
+                collection: None,
+                origin: HintOrigin::Queue,
+                requires_confirmation: false,
+            }])
+            .expect("metadata scan should complete");
+        let complete = item_at(&snapshot, "complete.mp4");
+        assert_eq!(complete.metadata_status, MetadataStatus::Complete);
+        assert_eq!(complete.source_ids, vec!["youtube:abcdefghijk".to_string()]);
+        assert_eq!(
+            complete.collection,
+            Some(CollectionMetadata {
+                id: Some("collection-42".to_string()),
+                title: "Collection".to_string(),
+                kind: "youtube_playlist".to_string(),
+                order: None,
+                part_id: None,
+            })
+        );
+        assert_eq!(
+            item_at(&snapshot, "partial.mp4").metadata_status,
+            MetadataStatus::Partial
+        );
+    }
+
+    #[test]
+    fn newly_created_nfo_retries_by_digest_and_rejects_broader_access() {
+        let root = TemporaryRoot::new("nfo-create-restart");
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let patch = MetadataPatch {
+            item_id: item_at(&snapshot, "clip.mp4").id.clone(),
+            title: Some("Created title".to_string()),
+            source_ids: vec!["youtube:abcdefghijk".to_string()],
+            collection: None,
+        };
+        let preview = manager
+            .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
+            .expect("new NFO preview should prepare");
+        let persisted = manager
+            .read_persisted_preview(&preview.id)
+            .expect("prepared NFO should be persisted");
+        let prepared_patch = &persisted.patches[0];
+
+        manager
+            .execute_nfo_patch(&preview.id, prepared_patch)
+            .expect("first attempt should create the NFO before its manifest update");
+        let created_content =
+            fs::read(root.path().join("clip.nfo")).expect("created NFO should read");
+        let retried = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("digest-matched creation should resume after interruption");
+        assert_eq!(retried.status, BatchStatus::Complete);
+        assert_eq!(
+            fs::read(root.path().join("clip.nfo")).unwrap(),
+            created_content
+        );
+
+        fs::set_permissions(
+            root.path().join("clip.nfo"),
+            fs::Permissions::from_mode(0o666),
+        )
+        .expect("broader access policy should be applied for the regression case");
+        assert!(
+            manager
+                .execute_nfo_patch(&preview.id, prepared_patch)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(root.path().join("clip.nfo")).unwrap(),
+            created_content,
+            "retry must not rewrite a digest-matched NFO with a changed access policy"
         );
     }
 
@@ -4722,5 +5489,11 @@ mod tests {
             ..item
         };
         assert!(!standard_media_stem(&independent).contains("P03"));
+
+        let youtube = LibraryItem {
+            source_ids: vec!["youtube:abcdefghijk".to_string()],
+            ..independent
+        };
+        assert!(standard_media_stem(&youtube).contains("[youtube_abcdefghijk]"));
     }
 }

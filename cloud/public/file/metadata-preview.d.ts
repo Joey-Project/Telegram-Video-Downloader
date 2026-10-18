@@ -7,3 +7,5 @@ export interface MetadataPreviewDetail {
 }
 
 export function metadataPreviewDetails(patch: unknown): MetadataPreviewDetail[];
+export function hasMetadataPatchFields(patch: unknown): boolean;
+export function hasMetadataPreviewChanges(preview: unknown): boolean;
