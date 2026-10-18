@@ -1,7 +1,9 @@
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Barrier, Mutex as StdMutex};
+use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::cloud::TEST_CLOUD_SECRET;
@@ -15,7 +17,9 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::library::{Confidence, IntegrityStatus, LibraryItem, MetadataStatus, Presence};
+use crate::library::{
+    Confidence, IntegrityStatus, LibraryItem, LibrarySnapshot, MetadataStatus, Presence,
+};
 
 use super::*;
 
@@ -604,6 +608,7 @@ fn make_runtime(
         state_notify: Arc::new(Notify::new()),
         library_snapshot: Arc::new(Mutex::new(None)),
         library_scan_warning: Arc::new(Mutex::new(None)),
+        library_scan_publication_gate: Arc::new(Mutex::new(())),
         telegram_dispatch: Arc::new(Semaphore::new(1)),
         management_dispatch: Arc::new(Semaphore::new(1)),
         backlog_sync_gate: Arc::new(Mutex::new(())),
@@ -2423,6 +2428,178 @@ async fn local_dispatch_waits_for_initial_authoritative_reconciliation() {
     drop(queue);
     stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
     stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+fn scan_order_test_snapshot(revision: &str) -> LibrarySnapshot {
+    LibrarySnapshot {
+        revision: revision.to_string(),
+        scanned_at: 0,
+        root_label: "scan-order-test".to_string(),
+        items: Vec::new(),
+        categories: Vec::new(),
+        warnings: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
+    let root = temp_cloud_bot_dir("library-publication-order");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+
+    let older_started = Arc::new(Barrier::new(2));
+    let release_older = Arc::new(Barrier::new(2));
+    let older_started_worker = Arc::clone(&older_started);
+    let release_older_worker = Arc::clone(&release_older);
+    let older_runtime = runtime.clone();
+    let older = tokio::spawn(async move {
+        run_cloud_library_operation(&older_runtime, "older fixture scan failed", move |_| {
+            let _ = older_started_worker.wait();
+            let _ = release_older_worker.wait();
+            Ok(((), scan_order_test_snapshot("older")))
+        })
+        .await
+    });
+    let older_started_waiter = Arc::clone(&older_started);
+    tokio::task::spawn_blocking(move || {
+        let _ = older_started_waiter.wait();
+    })
+    .await
+    .expect("older scan start barrier should complete");
+
+    let older_holds_publication_gate = runtime.library_scan_publication_gate.try_lock().is_err();
+    let newer_runtime = runtime.clone();
+    let mut newer_future = Box::pin(async move {
+        run_cloud_library_operation(&newer_runtime, "newer fixture scan failed", move |_| {
+            Ok(((), scan_order_test_snapshot("newer")))
+        })
+        .await
+    });
+    let newer_waits_on_gate = std::future::poll_fn(|context| {
+        Poll::Ready(Future::poll(newer_future.as_mut(), context).is_pending())
+    })
+    .await;
+    let newer = tokio::spawn(newer_future);
+    let release_older_waiter = Arc::clone(&release_older);
+    tokio::task::spawn_blocking(move || {
+        let _ = release_older_waiter.wait();
+    })
+    .await
+    .expect("older scan release barrier should complete");
+    older
+        .await
+        .expect("older scan task should join")
+        .expect("older scan should publish");
+    newer
+        .await
+        .expect("newer scan task should join")
+        .expect("newer scan should publish");
+    assert!(
+        older_holds_publication_gate && newer_waits_on_gate,
+        "the older scan should hold the gate and a newer operation should poll to Pending"
+    );
+    assert_eq!(
+        runtime
+            .library_snapshot
+            .lock()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.revision.as_str()),
+        Some("newer"),
+        "the later serialized scan should be the published snapshot"
+    );
+
+    let failing_started = Arc::new(Barrier::new(2));
+    let release_failing = Arc::new(Barrier::new(2));
+    let failing_started_worker = Arc::clone(&failing_started);
+    let release_failing_worker = Arc::clone(&release_failing);
+    let failing_runtime = runtime.clone();
+    let failing = tokio::spawn(async move {
+        run_cloud_library_operation::<()>(&failing_runtime, "older failure fixture", move |_| {
+            let _ = failing_started_worker.wait();
+            let _ = release_failing_worker.wait();
+            Err(anyhow::anyhow!("older scan failed"))
+        })
+        .await
+    });
+    let failing_started_waiter = Arc::clone(&failing_started);
+    tokio::task::spawn_blocking(move || {
+        let _ = failing_started_waiter.wait();
+    })
+    .await
+    .expect("failing scan start barrier should complete");
+
+    let failing_holds_publication_gate = runtime.library_scan_publication_gate.try_lock().is_err();
+    let recovery_runtime = runtime.clone();
+    let mut recovery_future = Box::pin(async move {
+        run_cloud_library_operation(
+            &recovery_runtime,
+            "recovery fixture scan failed",
+            move |_| Ok(((), scan_order_test_snapshot("recovered"))),
+        )
+        .await
+    });
+    let recovery_waits_on_gate = std::future::poll_fn(|context| {
+        Poll::Ready(Future::poll(recovery_future.as_mut(), context).is_pending())
+    })
+    .await;
+    let recovery = tokio::spawn(recovery_future);
+    let release_failing_waiter = Arc::clone(&release_failing);
+    tokio::task::spawn_blocking(move || {
+        let _ = release_failing_waiter.wait();
+    })
+    .await
+    .expect("failing scan release barrier should complete");
+    assert!(
+        failing
+            .await
+            .expect("failing scan task should join")
+            .is_err(),
+        "the older scan should report its fixture failure"
+    );
+    recovery
+        .await
+        .expect("recovery task should join")
+        .expect("recovery scan should publish");
+    assert!(
+        failing_holds_publication_gate && recovery_waits_on_gate,
+        "the failing scan should hold the gate and recovery should poll to Pending"
+    );
+    assert_eq!(
+        runtime
+            .library_snapshot
+            .lock()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.revision.as_str()),
+        Some("recovered"),
+        "a later successful scan should publish after the older failure"
+    );
+    assert!(
+        runtime.library_scan_warning.lock().await.is_none(),
+        "a stale failure warning must not overwrite a newer successful scan"
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
     let _ = fs::remove_dir_all(root);
 }
 

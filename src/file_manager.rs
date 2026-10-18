@@ -8,6 +8,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -718,6 +720,14 @@ struct ScanTestHooks {
     incomplete_directories: BTreeSet<String>,
     expire_after_built_item: bool,
     index_budget: Option<usize>,
+    identity_reconciliation_steps: Option<Arc<AtomicUsize>>,
+}
+
+#[cfg(test)]
+fn count_identity_reconciliation_step(steps: Option<&Arc<AtomicUsize>>) {
+    if let Some(steps) = steps {
+        steps.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -975,6 +985,16 @@ impl LibraryManager {
             .lock()
             .expect("scan test-hook lock should remain healthy")
             .index_budget = Some(bytes);
+    }
+
+    #[cfg(test)]
+    fn track_next_scan_identity_reconciliation(&self) -> Arc<AtomicUsize> {
+        let steps = Arc::new(AtomicUsize::new(0));
+        self.scan_test_hooks
+            .lock()
+            .expect("scan test-hook lock should remain healthy")
+            .identity_reconciliation_steps = Some(Arc::clone(&steps));
+        steps
     }
 
     #[cfg(test)]
@@ -2822,6 +2842,8 @@ impl LibraryManager {
             std::mem::take(&mut *hooks)
         };
         #[cfg(test)]
+        let identity_reconciliation_steps = test_hooks.identity_reconciliation_steps.as_ref();
+        #[cfg(test)]
         let index_budget = test_hooks.index_budget.unwrap_or(INDEX_LIMIT);
         #[cfg(not(test))]
         let index_budget = INDEX_LIMIT;
@@ -2975,14 +2997,35 @@ impl LibraryManager {
                 .entry((file.identity.device(), file.identity.inode()))
                 .or_default() += 1;
         }
+        let scanned_primary_identities = walk
+            .files
+            .iter()
+            .filter(|file| is_primary_media(&file.relative_path))
+            .map(|file| (file.relative_path.clone(), file.identity))
+            .collect::<HashMap<_, _>>();
         let old_records = index.records.clone();
         let mut old_by_identity: HashMap<IndexObjectKey, Vec<String>> = HashMap::new();
         let mut old_by_path_and_identity: HashMap<(String, IndexObjectKey), Vec<String>> =
+            HashMap::new();
+        let mut old_by_walk_identity: HashMap<(u64, u64), Vec<String>> = HashMap::new();
+        let mut old_by_path_and_walk_identity: HashMap<(String, u64, u64), Vec<String>> =
             HashMap::new();
         for (id, record) in &old_records {
             if record.file_type != "regular_file" {
                 continue;
             }
+            old_by_walk_identity
+                .entry((record.device, record.inode))
+                .or_default()
+                .push(id.clone());
+            old_by_path_and_walk_identity
+                .entry((
+                    record.item.relative_path.clone(),
+                    record.device,
+                    record.inode,
+                ))
+                .or_default()
+                .push(id.clone());
             let key = (
                 record.device,
                 record.inode,
@@ -3000,9 +3043,70 @@ impl LibraryManager {
         let can_match_unique_rename = walk.incomplete_directories.is_empty();
         let mut used_ids = HashSet::new();
         let mut deferred_identity_ids = HashSet::new();
+        let mut deferred_walk_identity_keys = HashSet::new();
+        let mut deferred_identity_keys = HashSet::new();
+        let mut deferred_identity_candidates: HashMap<IndexObjectKey, HashSet<String>> =
+            HashMap::new();
         let mut deferred_identity_items = 0usize;
+        let mut unreadable_identity_items = 0usize;
+        let mut unavailable_records_to_publish = HashMap::new();
+        let mut suppressed_unavailable_paths = HashSet::new();
         for (item_index, item) in videos.iter_mut().enumerate() {
             let Some(fingerprint) = fingerprints.get(&item.relative_path) else {
+                if item.presence == Presence::Unavailable
+                    && matches!(
+                        item.metadata_status,
+                        MetadataStatus::ProviderUnavailable | MetadataStatus::Unreadable
+                    )
+                    && let Some(identity) = scanned_primary_identities.get(&item.relative_path)
+                    && identity.is_file()
+                {
+                    let walk_identity = (identity.device(), identity.inode());
+                    let exact_ids = old_by_path_and_walk_identity
+                        .get(&(item.relative_path.clone(), walk_identity.0, walk_identity.1))
+                        .into_iter()
+                        .flatten()
+                        .filter(|id| !used_ids.contains(*id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if exact_ids.len() == 1 {
+                        let stable_id = exact_ids[0].clone();
+                        suppressed_unavailable_paths.insert(item.relative_path.clone());
+                        unavailable_records_to_publish
+                            .insert(stable_id.clone(), item.metadata_status);
+                        deferred_identity_ids.insert(stable_id);
+                    } else if !exact_ids.is_empty() {
+                        // Duplicate prior rows at the same path cannot be selected safely while
+                        // the current media descriptor is unavailable. Keep all history in the
+                        // index and suppress the path-derived row until a later readable scan.
+                        suppressed_unavailable_paths.insert(item.relative_path.clone());
+                        if deferred_walk_identity_keys.insert(walk_identity)
+                            && let Some(candidates) = old_by_walk_identity.get(&walk_identity)
+                        {
+                            for id in candidates {
+                                #[cfg(test)]
+                                count_identity_reconciliation_step(identity_reconciliation_steps);
+                                deferred_identity_ids.insert(id.clone());
+                            }
+                        }
+                        unreadable_identity_items = unreadable_identity_items.saturating_add(1);
+                    } else if let Some(candidates) = old_by_walk_identity.get(&walk_identity) {
+                        // A walk identity without the opened descriptor cannot prove a rename.
+                        // Defer prior history without transferring its ID or queue metadata.
+                        if !candidates.is_empty() {
+                            if deferred_walk_identity_keys.insert(walk_identity) {
+                                for id in candidates {
+                                    #[cfg(test)]
+                                    count_identity_reconciliation_step(
+                                        identity_reconciliation_steps,
+                                    );
+                                    deferred_identity_ids.insert(id.clone());
+                                }
+                            }
+                            unreadable_identity_items = unreadable_identity_items.saturating_add(1);
+                        }
+                    }
+                }
                 continue;
             };
             let mut item_queue_metadata = queue_metadata[item_index].clone();
@@ -3016,24 +3120,63 @@ impl LibraryManager {
                             .then_some((id, record))
                     })
                 });
-            let identity_candidates = old_by_identity
-                .get(&key)
-                .into_iter()
-                .flatten()
-                .filter_map(|id| {
-                    let record = old_records.get(id)?;
-                    (!used_ids.contains(id) && index_record_matches(record, fingerprint))
-                        .then_some((id, record))
-                })
-                .collect::<Vec<_>>();
             let current_identity_count =
                 (fingerprint.identity.device(), fingerprint.identity.inode());
+            if exact.is_none() && !can_match_unique_rename {
+                // Partial scans must preserve every still-unused prior ID for this identity,
+                // but matching and deferred registration are performed only once per key.
+                let identity_candidates =
+                    deferred_identity_candidates.entry(key).or_insert_with(|| {
+                        old_by_identity
+                            .get(&key)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|id| {
+                                #[cfg(test)]
+                                count_identity_reconciliation_step(identity_reconciliation_steps);
+                                let record = old_records.get(id)?;
+                                (!used_ids.contains(id)
+                                    && index_record_matches(record, fingerprint))
+                                .then(|| id.clone())
+                            })
+                            .collect()
+                    });
+                if !identity_candidates.is_empty() {
+                    if deferred_identity_keys.insert(key) {
+                        for id in identity_candidates.iter() {
+                            #[cfg(test)]
+                            count_identity_reconciliation_step(identity_reconciliation_steps);
+                            deferred_identity_ids.insert(id.clone());
+                        }
+                    }
+                    deferred_identity_items = deferred_identity_items.saturating_add(1);
+                    item.presence = Presence::Unavailable;
+                    item.id = physical_item_id(fingerprint, &item.relative_path);
+                    queue_metadata[item_index] = item_queue_metadata;
+                    continue;
+                }
+            }
             let unique_rename = if exact.is_none()
                 && can_match_unique_rename
                 && scanned_primary_identity_counts.get(&current_identity_count) == Some(&1)
             {
+                let identity_candidates = old_by_identity
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| {
+                        #[cfg(test)]
+                        count_identity_reconciliation_step(identity_reconciliation_steps);
+                        let record = old_records.get(id)?;
+                        (!used_ids.contains(id) && index_record_matches(record, fingerprint))
+                            .then(|| id.clone())
+                    })
+                    .collect::<HashSet<_>>();
                 if identity_candidates.len() == 1 {
-                    identity_candidates.first().copied()
+                    identity_candidates
+                        .iter()
+                        .next()
+                        .and_then(|id| old_records.get_key_value(id))
                 } else {
                     None
                 }
@@ -3041,22 +3184,14 @@ impl LibraryManager {
                 None
             };
             let prior = exact.or(unique_rename);
-            if exact.is_none() && !can_match_unique_rename && !identity_candidates.is_empty() {
-                // An incomplete directory may hide another hard-link name, so do not publish a
-                // path-derived ID over an older identity that cannot yet be matched safely.
-                // Keep the older records untouched until a complete scan can prove uniqueness.
-                for (id, _) in &identity_candidates {
-                    deferred_identity_ids.insert((*id).clone());
-                }
-                deferred_identity_items = deferred_identity_items.saturating_add(1);
-                item.presence = Presence::Unavailable;
-                item.id = physical_item_id(fingerprint, &item.relative_path);
-                queue_metadata[item_index] = item_queue_metadata;
-                continue;
-            }
             let stable_id = prior
                 .map(|(id, _)| id.clone())
                 .unwrap_or_else(|| physical_item_id(fingerprint, &item.relative_path));
+            if let Some((prior_id, _)) = prior
+                && let Some(candidates) = deferred_identity_candidates.get_mut(&key)
+            {
+                candidates.remove(prior_id);
+            }
             if let Some((_, record)) = prior {
                 // Queue metadata follows a physical item only after the index's object identity
                 // signals match. The current path alone never carries an old association.
@@ -3089,6 +3224,14 @@ impl LibraryManager {
                 "{deferred_identity_items} media item(s) with an existing object identity are unavailable until a complete scan can confirm a unique move; previous identity and queue metadata were preserved"
             ));
         }
+        if unreadable_identity_items > 0 {
+            walk.warnings.push(format!(
+                "{unreadable_identity_items} unreadable media item(s) have prior identity history retained as unavailable until a readable descriptor can confirm it"
+            ));
+        }
+        if !suppressed_unavailable_paths.is_empty() {
+            videos.retain(|item| !suppressed_unavailable_paths.contains(&item.relative_path));
+        }
 
         let observed = videos
             .iter()
@@ -3096,6 +3239,13 @@ impl LibraryManager {
             .collect::<HashSet<_>>();
         for (id, record) in &mut index.records {
             if observed.contains(id) {
+                continue;
+            }
+            if let Some(metadata_status) = unavailable_records_to_publish.get(id) {
+                record.item.presence = Presence::Unavailable;
+                record.item.metadata_status = *metadata_status;
+                record.missing_since = None;
+                videos.push(record.item.clone());
                 continue;
             }
             if deferred_identity_ids.contains(id) {
@@ -3278,7 +3428,7 @@ impl LibraryManager {
             .flatten()
             .filter_map(|file| {
                 if file.identity != identity
-                    || !case_only_path_alias(
+                    || !filesystem_equivalent_path_alias(
                         path,
                         &file.relative_path,
                         &walk.directory_name_semantics,
@@ -6700,11 +6850,29 @@ fn extract_source_ids(text: &str) -> Vec<String> {
     deduplicate(result)
 }
 
-fn case_only_path_alias(
+fn filesystem_equivalent_path_alias(
     hint_path: &str,
     scanned_path: &str,
     directory_semantics: &HashMap<String, TargetNameSemantics>,
 ) -> bool {
+    filesystem_equivalent_path_alias_with(
+        hint_path,
+        scanned_path,
+        directory_semantics,
+        &platform_case_fold,
+    )
+    .unwrap_or(false)
+}
+
+fn filesystem_equivalent_path_alias_with<F>(
+    hint_path: &str,
+    scanned_path: &str,
+    directory_semantics: &HashMap<String, TargetNameSemantics>,
+    case_fold: &F,
+) -> Result<bool>
+where
+    F: Fn(&str) -> Result<String>,
+{
     let hint_components = Path::new(hint_path)
         .components()
         .filter_map(|component| match component {
@@ -6720,37 +6888,32 @@ fn case_only_path_alias(
         })
         .collect::<Vec<_>>();
     if hint_components.len() != scanned_components.len() {
-        return false;
+        return Ok(false);
     }
 
     let mut parent = PathBuf::new();
-    let mut differs_only_by_case = false;
+    let mut differs_from_scanned_spelling = false;
     for (hint_component, scanned_component) in hint_components.iter().zip(scanned_components.iter())
     {
         if hint_component != scanned_component {
             let parent_key = parent
                 .to_string_lossy()
                 .replace(std::path::MAIN_SEPARATOR, "/");
-            if !directory_semantics
-                .get(&parent_key)
-                .is_some_and(|semantics| semantics.case_insensitive)
-                || !same_unicode_text_ignoring_case(hint_component, scanned_component)
-            {
-                return false;
+            let Some(semantics) = directory_semantics.get(&parent_key).copied() else {
+                return Ok(false);
+            };
+            let hint_key =
+                target_component_key_with(hint_component, semantics, |value| case_fold(value))?;
+            let scanned_key =
+                target_component_key_with(scanned_component, semantics, |value| case_fold(value))?;
+            if hint_key != scanned_key {
+                return Ok(false);
             }
-            differs_only_by_case = true;
+            differs_from_scanned_spelling = true;
         }
         parent.push(scanned_component);
     }
-    differs_only_by_case
-}
-
-fn same_unicode_text_ignoring_case(left: &str, right: &str) -> bool {
-    left != right
-        && left
-            .chars()
-            .flat_map(char::to_lowercase)
-            .eq(right.chars().flat_map(char::to_lowercase))
+    Ok(differs_from_scanned_spelling)
 }
 
 fn matching_hint_indices_for_items(
@@ -7126,7 +7289,7 @@ mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::file_provider::{MockQueueFileProvider, QueueFileProvider};
+    use crate::file_provider::{FileProviderAccessError, MockQueueFileProvider, QueueFileProvider};
 
     use super::*;
 
@@ -7252,6 +7415,71 @@ mod tests {
     fn manager(root: &TemporaryRoot) -> LibraryManager {
         LibraryManager::open_with_provider(root.path(), Arc::new(MockQueueFileProvider::default()))
             .expect("library manager should open against the isolated fixture")
+    }
+
+    struct FailOneMediaReadProvider {
+        target: PathBuf,
+        armed: std::sync::Mutex<HashSet<PathBuf>>,
+    }
+
+    impl FailOneMediaReadProvider {
+        fn new(target: PathBuf) -> Self {
+            Self {
+                target,
+                armed: std::sync::Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn fail_next_media_read(&self) {
+            self.fail_next_media_read_at(&self.target);
+        }
+
+        fn fail_next_media_read_at(&self, path: &Path) {
+            self.armed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(path.to_path_buf());
+        }
+    }
+
+    impl QueueFileProvider for FailOneMediaReadProvider {
+        fn coordinate_read(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            let fail = self
+                .armed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(path);
+            if fail {
+                return Err(FileProviderAccessError::new(
+                    path,
+                    "read",
+                    "injected transient media access error",
+                )
+                .into());
+            }
+            accessor(path)
+        }
+
+        fn coordinate_write(
+            &self,
+            path: &Path,
+            accessor: &mut dyn FnMut(&Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(path)
+        }
+
+        fn coordinate_move(
+            &self,
+            source: &Path,
+            destination: &Path,
+            accessor: &mut dyn FnMut(&Path, &Path) -> Result<()>,
+        ) -> Result<()> {
+            accessor(source, destination)
+        }
     }
 
     fn cleanup_preview(manager: &LibraryManager, item_id: &str) -> MovePreview {
@@ -7793,12 +8021,246 @@ mod tests {
     }
 
     #[test]
-    fn round5_case_only_hint_alias_requires_case_insensitive_directory_semantics() {
-        let insensitive = HashMap::from([(String::new(), round5_semantics(true, false))]);
-        let sensitive = HashMap::from([(String::new(), round5_semantics(false, false))]);
-        assert!(case_only_path_alias("clip.mp4", "Clip.mp4", &insensitive));
-        assert!(!case_only_path_alias("clip.mp4", "Clip.mp4", &sensitive));
-        assert!(!case_only_path_alias("alias.mp4", "Clip.mp4", &insensitive));
+    fn round10_hint_path_alias_uses_each_scanned_parent_filesystem_policy() {
+        let normalization_insensitive =
+            HashMap::from([(String::new(), round5_semantics(false, true))]);
+        let normalization_sensitive =
+            HashMap::from([(String::new(), round5_semantics(false, false))]);
+        let case_insensitive = HashMap::from([(String::new(), round5_semantics(true, false))]);
+        let case_sensitive = HashMap::from([(String::new(), round5_semantics(false, false))]);
+        let hfs_ignorable = HashMap::from([(
+            String::new(),
+            TargetNameSemantics {
+                hfs_ignorable: true,
+                ..round5_semantics(false, true)
+            },
+        )]);
+
+        assert!(
+            filesystem_equivalent_path_alias_with(
+                "e\u{301}.mp4",
+                "é.mp4",
+                &normalization_insensitive,
+                &round5_full_fold_for_test,
+            )
+            .unwrap()
+        );
+        assert!(
+            !filesystem_equivalent_path_alias_with(
+                "e\u{301}.mp4",
+                "é.mp4",
+                &normalization_sensitive,
+                &round5_full_fold_for_test,
+            )
+            .unwrap()
+        );
+        assert!(
+            filesystem_equivalent_path_alias_with(
+                "clip.mp4",
+                "Clip.mp4",
+                &case_insensitive,
+                &round5_full_fold_for_test,
+            )
+            .unwrap()
+        );
+        assert!(
+            !filesystem_equivalent_path_alias_with(
+                "clip.mp4",
+                "Clip.mp4",
+                &case_sensitive,
+                &round5_full_fold_for_test,
+            )
+            .unwrap()
+        );
+        assert!(
+            filesystem_equivalent_path_alias_with(
+                "clip\u{200d}.mp4",
+                "clip.mp4",
+                &hfs_ignorable,
+                &round5_full_fold_for_test,
+            )
+            .unwrap()
+        );
+        assert!(
+            !filesystem_equivalent_path_alias_with(
+                "alias.mp4",
+                "Clip.mp4",
+                &case_insensitive,
+                &round5_full_fold_for_test,
+            )
+            .unwrap()
+        );
+
+        let nested_policies = HashMap::from([
+            (
+                String::new(),
+                TargetNameSemantics {
+                    normalization_insensitive: true,
+                    case_insensitive: false,
+                    hfs_ignorable: false,
+                },
+            ),
+            (
+                "Épisode".to_string(),
+                TargetNameSemantics {
+                    normalization_insensitive: true,
+                    case_insensitive: true,
+                    hfs_ignorable: true,
+                },
+            ),
+        ]);
+        assert!(
+            filesystem_equivalent_path_alias_with(
+                "E\u{301}pisode/CLIP-e\u{301}.mp4\u{200d}",
+                "Épisode/clip-é.mp4",
+                &nested_policies,
+                &round5_full_fold_for_test,
+            )
+            .unwrap()
+        );
+        assert!(
+            !filesystem_equivalent_path_alias_with(
+                "e\u{301}pisode/CLIP-e\u{301}.mp4\u{200d}",
+                "Épisode/clip-é.mp4",
+                &nested_policies,
+                &round5_full_fold_for_test,
+            )
+            .unwrap(),
+            "the root's case-sensitive policy must apply to its child directory"
+        );
+        let policies_keyed_by_hint_spelling = HashMap::from([
+            (
+                String::new(),
+                TargetNameSemantics {
+                    normalization_insensitive: true,
+                    case_insensitive: false,
+                    hfs_ignorable: false,
+                },
+            ),
+            (
+                "E\u{301}pisode".to_string(),
+                TargetNameSemantics {
+                    normalization_insensitive: true,
+                    case_insensitive: true,
+                    hfs_ignorable: true,
+                },
+            ),
+        ]);
+        assert!(
+            !filesystem_equivalent_path_alias_with(
+                "E\u{301}pisode/CLIP-e\u{301}.mp4\u{200d}",
+                "Épisode/clip-é.mp4",
+                &policies_keyed_by_hint_spelling,
+                &round5_full_fold_for_test,
+            )
+            .unwrap(),
+            "nested policy lookup must use the actual scanned parent spelling"
+        );
+    }
+
+    #[test]
+    fn round10_queue_hint_metadata_restores_through_normalized_path_alias() {
+        let root = TemporaryRoot::new("round10-normalized-queue-hint");
+        let scanned_relative = "Épisode/clip-é.mp4";
+        let hint_relative = "E\u{301}pisode/clip-e\u{301}.mp4\u{200d}";
+        let scanned_path = root.path().join(scanned_relative);
+        let hint_path = root.path().join(hint_relative);
+        fs::create_dir_all(scanned_path.parent().expect("scanned path has parent"))
+            .expect("scanned parent should be created");
+        fs::create_dir_all(hint_path.parent().expect("hint path has parent"))
+            .expect("hint parent should be created");
+        fs::write(&scanned_path, b"fixture media").expect("scanned media should be written");
+        if let Err(error) = fs::hard_link(&scanned_path, &hint_path) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "distinct portable aliases should be hard-linked"
+            );
+        }
+
+        let manager = manager(&root);
+        let identity = manager
+            .root
+            .entry_identity(&scanned_path)
+            .expect("scanned path identity should be readable")
+            .expect("scanned media should exist");
+        let scanned_files = vec![ScannedFile {
+            relative_path: scanned_relative.to_string(),
+            identity,
+        }];
+        let mut item = index_fixture_item("physical-item", scanned_relative, Presence::Present);
+        item.title = title_from_path(scanned_relative);
+        let items = vec![item];
+        let collection = CollectionMetadata {
+            id: Some("queue-season".to_string()),
+            title: "Queue Season".to_string(),
+            kind: "queue".to_string(),
+            order: Some(2),
+            part_id: None,
+        };
+        let hint = SourceHint {
+            source_ids: vec!["av123456789".to_string()],
+            title: Some("Queue title".to_string()),
+            relative_path: Some(hint_relative.to_string()),
+            collection: Some(collection.clone()),
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let mut walk = ScanWalk::default();
+        walk.directory_name_semantics.insert(
+            String::new(),
+            TargetNameSemantics {
+                normalization_insensitive: true,
+                case_insensitive: false,
+                hfs_ignorable: false,
+            },
+        );
+        walk.directory_name_semantics.insert(
+            "Épisode".to_string(),
+            TargetNameSemantics {
+                normalization_insensitive: true,
+                case_insensitive: true,
+                hfs_ignorable: true,
+            },
+        );
+
+        let (resolutions, unresolved) = manager.resolve_hint_paths_for_scan(
+            std::slice::from_ref(&hint),
+            &scanned_files,
+            &items,
+            &walk,
+        );
+        assert_eq!(unresolved, 0);
+        assert_eq!(
+            resolutions.get(hint_relative),
+            Some(&HintPathResolution::Item(0)),
+            "the rooted hint lookup and scan entry should resolve to one physical object"
+        );
+
+        let matches = matching_hint_indices_for_items(
+            &items,
+            std::slice::from_ref(&hint),
+            &resolutions,
+            &walk,
+        );
+        assert_eq!(matches, vec![vec![0]]);
+        let mut attached_items = items;
+        let provenance = attach_matching_hints(
+            &mut attached_items,
+            std::slice::from_ref(&hint),
+            &matches,
+            &HashSet::new(),
+        );
+        assert_eq!(attached_items[0].title, "Queue title");
+        assert!(
+            attached_items[0]
+                .source_ids
+                .contains(&"av123456789".to_string())
+        );
+        assert_eq!(attached_items[0].collection.as_ref(), Some(&collection));
+        assert_eq!(provenance[0].title.as_deref(), Some("Queue title"));
+        assert_eq!(provenance[0].source_ids, vec!["av123456789".to_string()]);
+        assert_eq!(provenance[0].collection.as_ref(), Some(&collection));
     }
 
     #[test]
@@ -8000,6 +8462,272 @@ mod tests {
             item_at(&snapshot, "new-video.mp4").presence,
             Presence::Present
         );
+    }
+
+    #[test]
+    fn round10_unavailable_exact_path_preserves_stable_record_until_reopened_scan() {
+        let root = TemporaryRoot::new("round10-unavailable-exact-path");
+        let before = root.path().join("Before");
+        let after = root.path().join("After");
+        fs::create_dir(&before).expect("source directory should create");
+        fs::create_dir(&after).expect("destination directory should create");
+        fs::write(before.join("clip.mp4"), b"stable-media-object")
+            .expect("media fixture should write");
+        let media_path = after.join("clip.mp4");
+        let provider_impl = Arc::new(FailOneMediaReadProvider::new(media_path.clone()));
+        let provider: Arc<dyn QueueFileProvider> = provider_impl.clone();
+        let manager = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should open against the injected provider");
+        let hint = SourceHint {
+            source_ids: vec!["youtube:abcdefghijk".to_string()],
+            title: Some("Queue title".to_string()),
+            relative_path: Some("Before/clip.mp4".to_string()),
+            collection: None,
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let initial = manager
+            .scan(&[hint])
+            .expect("initial queue-aware scan should complete");
+        let stable_id = item_at(&initial, "Before/clip.mp4").id.clone();
+
+        fs::rename(before.join("clip.mp4"), &media_path)
+            .expect("manual media rename should complete");
+        let renamed = manager
+            .scan(&[])
+            .expect("renamed media should reconcile before the injected error");
+        let renamed_item = item_at(&renamed, "After/clip.mp4");
+        assert_eq!(renamed_item.id, stable_id);
+        assert_eq!(renamed_item.title, "Queue title");
+
+        provider_impl.fail_next_media_read();
+        let unavailable = manager
+            .scan(&[])
+            .expect("a transient provider read error should keep the scan usable");
+        assert_eq!(unavailable.items.len(), 1);
+        let retained = item_at(&unavailable, "After/clip.mp4");
+        assert_eq!(retained.id, stable_id);
+        assert_eq!(retained.presence, Presence::Unavailable);
+        assert_eq!(
+            retained.metadata_status,
+            MetadataStatus::ProviderUnavailable
+        );
+        assert_eq!(retained.title, "Queue title");
+        assert_eq!(retained.source_ids, vec!["youtube:abcdefghijk"]);
+        let unavailable_index = manager
+            .read_index()
+            .expect("unavailable stable record should remain indexed");
+        assert_eq!(unavailable_index.records.len(), 1);
+        let record = &unavailable_index.records[&stable_id];
+        assert_eq!(record.item.relative_path, "After/clip.mp4");
+        assert_eq!(record.item.presence, Presence::Unavailable);
+        assert_eq!(record.missing_since, None);
+        assert_eq!(record.queue_metadata.title.as_deref(), Some("Queue title"));
+        drop(manager);
+
+        let reopened_provider: Arc<dyn QueueFileProvider> = provider_impl;
+        let reopened = LibraryManager::open_with_provider(root.path(), reopened_provider)
+            .expect("library manager should reopen against the same provider");
+        let recovered = reopened
+            .scan(&[])
+            .expect("a readable retry should restore the stable item");
+        assert_eq!(recovered.items.len(), 1);
+        let recovered_item = item_at(&recovered, "After/clip.mp4");
+        assert_eq!(recovered_item.id, stable_id);
+        assert_eq!(recovered_item.presence, Presence::Present);
+        assert_eq!(recovered_item.title, "Queue title");
+        assert_eq!(recovered_item.source_ids, vec!["youtube:abcdefghijk"]);
+    }
+
+    #[test]
+    fn round10_unavailable_renamed_path_defers_history_without_binding_metadata() {
+        let root = TemporaryRoot::new("round10-unavailable-renamed-path");
+        let before = root.path().join("Before");
+        let after = root.path().join("After");
+        fs::create_dir(&before).expect("source directory should create");
+        fs::create_dir(&after).expect("destination directory should create");
+        fs::write(before.join("clip.mp4"), b"stable-media-object")
+            .expect("media fixture should write");
+        let media_path = after.join("clip.mp4");
+        let provider_impl = Arc::new(FailOneMediaReadProvider::new(media_path.clone()));
+        let provider: Arc<dyn QueueFileProvider> = provider_impl.clone();
+        let manager = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should open against the injected provider");
+        let hint = SourceHint {
+            source_ids: vec!["youtube:abcdefghijk".to_string()],
+            title: Some("Queue title".to_string()),
+            relative_path: Some("Before/clip.mp4".to_string()),
+            collection: None,
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let initial = manager
+            .scan(&[hint])
+            .expect("initial queue-aware scan should complete");
+        let stable_id = item_at(&initial, "Before/clip.mp4").id.clone();
+        fs::rename(before.join("clip.mp4"), &media_path)
+            .expect("manual media rename should complete");
+
+        provider_impl.fail_next_media_read();
+        let unavailable = manager
+            .scan(&[])
+            .expect("an unreadable renamed item should defer old identity history");
+        assert_eq!(unavailable.items.len(), 1);
+        let provisional = item_at(&unavailable, "After/clip.mp4");
+        assert_ne!(provisional.id, stable_id);
+        assert_eq!(provisional.presence, Presence::Unavailable);
+        assert_ne!(provisional.title, "Queue title");
+        assert!(provisional.source_ids.is_empty());
+        assert!(
+            unavailable.warnings.iter().any(|warning| {
+                warning.contains("prior identity history retained as unavailable")
+            })
+        );
+
+        let deferred_index = manager
+            .read_index()
+            .expect("deferred prior identity should remain indexed");
+        assert_eq!(deferred_index.records.len(), 1);
+        let prior = &deferred_index.records[&stable_id];
+        assert_eq!(prior.item.relative_path, "Before/clip.mp4");
+        assert_eq!(prior.item.presence, Presence::Unavailable);
+        assert_eq!(prior.missing_since, None);
+        assert_eq!(prior.queue_metadata.title.as_deref(), Some("Queue title"));
+        assert!(!deferred_index.records.contains_key(&provisional.id));
+        drop(manager);
+
+        let reopened_provider: Arc<dyn QueueFileProvider> = provider_impl;
+        let reopened = LibraryManager::open_with_provider(root.path(), reopened_provider)
+            .expect("library manager should reopen against the same provider");
+        let recovered = reopened
+            .scan(&[])
+            .expect("a readable retry should reconcile the deferred identity");
+        assert_eq!(recovered.items.len(), 1);
+        let recovered_item = item_at(&recovered, "After/clip.mp4");
+        assert_eq!(recovered_item.id, stable_id);
+        assert_eq!(recovered_item.presence, Presence::Present);
+        assert_eq!(recovered_item.title, "Queue title");
+        assert_eq!(recovered_item.source_ids, vec!["youtube:abcdefghijk"]);
+    }
+
+    #[test]
+    fn round10_unavailable_hardlink_aliases_defer_old_candidates_once_per_identity() {
+        let root = TemporaryRoot::new("round10-unavailable-hardlink-aliases");
+        let original_path = root.path().join("alias-a.mp4");
+        fs::write(&original_path, b"stable-hardlink-object")
+            .expect("primary hard-link fixture should write");
+        for name in ["alias-b.mp4", "alias-c.mp4"] {
+            fs::hard_link(&original_path, root.path().join(name))
+                .expect("hard-link alias should create");
+        }
+        let provider_impl = Arc::new(FailOneMediaReadProvider::new(
+            root.path().join("no-default-failure.mp4"),
+        ));
+        let provider: Arc<dyn QueueFileProvider> = provider_impl.clone();
+        let manager = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should open against the injected provider");
+        let initial = manager
+            .scan(&[])
+            .expect("initial hard-link scan should complete");
+        let old_ids = ["alias-a.mp4", "alias-b.mp4", "alias-c.mp4"]
+            .map(|path| item_at(&initial, path).id.clone());
+
+        let old_names = ["alias-a.mp4", "alias-b.mp4", "alias-c.mp4"];
+        let new_names = ["renamed-a.mp4", "renamed-b.mp4", "renamed-c.mp4"];
+        for (old_name, new_name) in old_names.into_iter().zip(new_names) {
+            fs::rename(root.path().join(old_name), root.path().join(new_name))
+                .expect("hard-link alias rename should complete");
+            provider_impl.fail_next_media_read_at(&root.path().join(new_name));
+        }
+
+        let steps = manager.track_next_scan_identity_reconciliation();
+        let unavailable = manager
+            .scan(&[])
+            .expect("unreadable hard-link aliases should defer identity history");
+        assert_eq!(unavailable.items.len(), 3);
+        for name in new_names {
+            let item = item_at(&unavailable, name);
+            assert_eq!(item.presence, Presence::Unavailable);
+            assert!(!old_ids.contains(&item.id));
+        }
+        assert_eq!(
+            steps.load(Ordering::Relaxed),
+            3,
+            "the old candidate list should be traversed once for the shared inode, not once per alias"
+        );
+
+        let index = manager
+            .read_index()
+            .expect("prior hard-link identity history should remain indexed");
+        assert_eq!(index.records.len(), 3);
+        for old_id in old_ids {
+            assert_eq!(index.records[&old_id].item.presence, Presence::Unavailable);
+            assert_eq!(index.records[&old_id].missing_since, None);
+        }
+    }
+
+    #[test]
+    fn round10_unavailable_replacement_does_not_inherit_old_identity_or_queue_metadata() {
+        let root = TemporaryRoot::new("round10-unavailable-replacement");
+        let media_path = root.path().join("clip.mp4");
+        let retained_old_object = root.path().join("old-object.bin");
+        fs::write(&media_path, b"old-media-object").expect("media fixture should write");
+        let provider_impl = Arc::new(FailOneMediaReadProvider::new(media_path.clone()));
+        let provider: Arc<dyn QueueFileProvider> = provider_impl.clone();
+        let manager = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should open against the injected provider");
+        let hint = SourceHint {
+            source_ids: vec!["youtube:abcdefghijk".to_string()],
+            title: Some("Old queue title".to_string()),
+            relative_path: Some("clip.mp4".to_string()),
+            collection: None,
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let initial = manager
+            .scan(&[hint])
+            .expect("initial queue-aware scan should complete");
+        let old_id = item_at(&initial, "clip.mp4").id.clone();
+
+        fs::rename(&media_path, &retained_old_object)
+            .expect("old object should remain allocated outside the media scan");
+        fs::write(
+            root.path().join("replacement.tmp"),
+            b"replacement-media-object",
+        )
+        .expect("replacement object should write");
+        fs::rename(root.path().join("replacement.tmp"), &media_path)
+            .expect("replacement object should take the old path");
+        provider_impl.fail_next_media_read();
+
+        let snapshot = manager
+            .scan(&[])
+            .expect("an unreadable replacement should remain distinguishable");
+        let old_record = snapshot
+            .items
+            .iter()
+            .find(|item| item.id == old_id)
+            .expect("old object history should remain visible");
+        assert_eq!(old_record.presence, Presence::Missing);
+        assert_eq!(old_record.title, "Old queue title");
+        let replacement = snapshot
+            .items
+            .iter()
+            .find(|item| item.relative_path == "clip.mp4" && item.id != old_id)
+            .expect("replacement object should remain a separate unavailable item");
+        assert_eq!(replacement.presence, Presence::Unavailable);
+        assert_eq!(replacement.title, "clip");
+        assert!(replacement.source_ids.is_empty());
+        assert_ne!(replacement.id, old_id);
+        let index = manager
+            .read_index()
+            .expect("old object identity should remain indexed");
+        assert_eq!(index.records[&old_id].item.presence, Presence::Missing);
+        assert_eq!(
+            index.records[&old_id].queue_metadata.title.as_deref(),
+            Some("Old queue title")
+        );
+        assert!(!index.records.contains_key(&replacement.id));
     }
 
     #[test]
@@ -8294,6 +9022,113 @@ mod tests {
             .expect("partial alias scan should persist readable index state");
         assert_eq!(index.records[&stable_id].item.relative_path, "clip.mp4");
         assert_eq!(index.records[&stable_id].item.presence, Presence::Present);
+    }
+
+    #[test]
+    fn round9_complete_exact_hardlink_aliases_skip_identity_candidate_walk() {
+        let root = TemporaryRoot::new("round9-exact-alias-candidate-walk");
+        let primary_path = root.path().join("alias-a.mp4");
+        fs::write(&primary_path, b"stable-hardlink-object")
+            .expect("primary hard-link fixture should write");
+        for name in ["alias-b.mp4", "alias-c.mp4"] {
+            fs::hard_link(&primary_path, root.path().join(name))
+                .expect("hard-link alias should create");
+        }
+
+        let manager = manager(&root);
+        let initial = manager.scan(&[]).expect("initial scan should complete");
+        let initial_ids = ["alias-a.mp4", "alias-b.mp4", "alias-c.mp4"]
+            .map(|path| item_at(&initial, path).id.clone());
+
+        let steps = manager.track_next_scan_identity_reconciliation();
+        let rescanned = manager
+            .scan(&[])
+            .expect("complete exact-alias scan should succeed");
+
+        assert_eq!(
+            steps.load(Ordering::Relaxed),
+            0,
+            "exact path-and-identity matches must not traverse the identity candidate list"
+        );
+        for (index, path) in ["alias-a.mp4", "alias-b.mp4", "alias-c.mp4"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(item_at(&rescanned, path).id, initial_ids[index]);
+            assert_eq!(item_at(&rescanned, path).presence, Presence::Present);
+        }
+    }
+
+    #[test]
+    fn round9_partial_hardlink_alias_candidates_are_walked_and_deferred_once() {
+        const ALIAS_COUNT: usize = 3;
+
+        let root = TemporaryRoot::new("round9-partial-alias-candidate-cache");
+        fs::create_dir(root.path().join("Interrupted"))
+            .expect("incomplete directory fixture should create");
+        let primary_path = root.path().join("old-alias-a.mp4");
+        fs::write(&primary_path, b"stable-hardlink-object")
+            .expect("primary hard-link fixture should write");
+        for name in ["old-alias-b.mp4", "old-alias-c.mp4"] {
+            fs::hard_link(&primary_path, root.path().join(name))
+                .expect("hard-link alias should create");
+        }
+
+        let hint = SourceHint {
+            source_ids: vec!["youtube:abcdefghijk".to_string()],
+            title: Some("Queue-only title".to_string()),
+            relative_path: Some("old-alias-a.mp4".to_string()),
+            collection: None,
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+        let manager = manager(&root);
+        let initial = manager
+            .scan(&[hint])
+            .expect("initial queue-aware hard-link scan should complete");
+        let original_ids = ["old-alias-a.mp4", "old-alias-b.mp4", "old-alias-c.mp4"]
+            .map(|path| item_at(&initial, path).id.clone());
+
+        for (old_name, new_name) in [
+            ("old-alias-a.mp4", "new-alias-a.mp4"),
+            ("old-alias-b.mp4", "new-alias-b.mp4"),
+            ("old-alias-c.mp4", "new-alias-c.mp4"),
+        ] {
+            fs::rename(root.path().join(old_name), root.path().join(new_name))
+                .expect("hard-link alias rename should complete");
+        }
+        manager.mark_next_scan_directory_incomplete("Interrupted");
+        let steps = manager.track_next_scan_identity_reconciliation();
+
+        let partial = manager
+            .scan(&[])
+            .expect("partial hard-link scan should remain usable");
+
+        assert_eq!(partial.items.len(), ALIAS_COUNT);
+        for path in ["new-alias-a.mp4", "new-alias-b.mp4", "new-alias-c.mp4"] {
+            assert_eq!(item_at(&partial, path).presence, Presence::Unavailable);
+        }
+        assert_eq!(
+            steps.load(Ordering::Relaxed),
+            2 * ALIAS_COUNT,
+            "the old candidate list and deferred IDs should each be processed once per identity"
+        );
+
+        let index = manager
+            .read_index()
+            .expect("partial alias index should remain readable");
+        assert_eq!(index.records.len(), ALIAS_COUNT);
+        assert_eq!(
+            index.records[&original_ids[0]]
+                .queue_metadata
+                .title
+                .as_deref(),
+            Some("Queue-only title"),
+            "deferred identity reconciliation must preserve queue provenance"
+        );
+        for id in &original_ids {
+            assert_eq!(index.records[id].item.presence, Presence::Unavailable);
+        }
     }
 
     #[test]

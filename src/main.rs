@@ -413,6 +413,7 @@ struct CloudBotRuntime {
     state_notify: Arc<Notify>,
     library_snapshot: Arc<Mutex<Option<LibrarySnapshot>>>,
     library_scan_warning: Arc<Mutex<Option<String>>>,
+    library_scan_publication_gate: Arc<Mutex<()>>,
     telegram_dispatch: Arc<Semaphore>,
     management_dispatch: Arc<Semaphore>,
     backlog_sync_gate: Arc<Mutex<()>>,
@@ -429,6 +430,44 @@ struct CloudStateSnapshot {
     operations: Vec<serde_json::Value>,
     tasks: Vec<serde_json::Value>,
     download_dir: String,
+}
+
+/// Serializes each library scan through publishing its snapshot or failure warning.
+/// The scan itself runs on a blocking thread, but the async guard stays held until the
+/// result is visible to the cloud state reporter.
+async fn run_cloud_library_operation<T>(
+    runtime: &CloudBotRuntime,
+    failure_context: &'static str,
+    operation: impl FnOnce(BotContext) -> Result<(T, LibrarySnapshot)> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    let _publication_guard = runtime.library_scan_publication_gate.lock().await;
+    let context = runtime.bot.clone();
+    let worker = tokio::task::spawn_blocking(move || operation(context))
+        .await
+        .with_context(|| failure_context);
+    match worker {
+        Ok(Ok((value, snapshot))) => {
+            *runtime.library_snapshot.lock().await = Some(snapshot);
+            *runtime.library_scan_warning.lock().await = None;
+            runtime.state_notify.notify_one();
+            Ok(value)
+        }
+        Ok(Err(error)) => {
+            *runtime.library_scan_warning.lock().await =
+                Some(redact_sensitive_text(&format!("{error:#}")));
+            runtime.state_notify.notify_one();
+            Err(error).with_context(|| failure_context)
+        }
+        Err(error) => {
+            *runtime.library_scan_warning.lock().await =
+                Some(redact_sensitive_text(&format!("{error:#}")));
+            runtime.state_notify.notify_one();
+            Err(error)
+        }
+    }
 }
 
 impl CloudStateSnapshot {
@@ -601,6 +640,7 @@ async fn run_cloud_bot(
         state_notify: Arc::new(Notify::new()),
         library_snapshot: Arc::new(Mutex::new(None)),
         library_scan_warning: Arc::new(Mutex::new(None)),
+        library_scan_publication_gate: Arc::new(Mutex::new(())),
         telegram_dispatch: Arc::new(Semaphore::new(1)),
         management_dispatch: Arc::new(Semaphore::new(1)),
         backlog_sync_gate: Arc::new(Mutex::new(())),
@@ -631,25 +671,14 @@ async fn run_cloud_bot(
 }
 
 async fn cloud_initial_library_scan(runtime: CloudBotRuntime) {
-    let context = runtime.bot.clone();
-    match tokio::task::spawn_blocking(move || scan_cloud_library(&context)).await {
-        Ok(Ok(snapshot)) => {
-            *runtime.library_snapshot.lock().await = Some(snapshot);
-            *runtime.library_scan_warning.lock().await = None;
-            runtime.state_notify.notify_one();
-        }
-        Ok(Err(error)) => {
-            warn!(error = %format!("{error:#}"), "initial media-library scan failed");
-            *runtime.library_scan_warning.lock().await =
-                Some(redact_sensitive_text(&format!("{error:#}")));
-            runtime.state_notify.notify_one();
-        }
-        Err(error) => {
-            warn!(error = %error, "initial media-library worker failed");
-            *runtime.library_scan_warning.lock().await =
-                Some(redact_sensitive_text(&error.to_string()));
-            runtime.state_notify.notify_one();
-        }
+    if let Err(error) = run_cloud_library_operation(
+        &runtime,
+        "initial media-library scan worker failed",
+        |context| Ok(((), scan_cloud_library(&context)?)),
+    )
+    .await
+    {
+        warn!(error = %format!("{error:#}"), "initial media-library scan failed");
     }
 }
 
@@ -661,27 +690,14 @@ async fn cloud_library_publication_watcher(runtime: CloudBotRuntime) {
         // publication records have settled. The scan reads the existing library and queue hints;
         // it does not change download scheduling or block Telegram dispatch.
         sleep(Duration::from_secs(2)).await;
-        let context = runtime.bot.clone();
-        let scan = tokio::task::spawn_blocking(move || scan_cloud_library(&context)).await;
-        match scan {
-            Ok(Ok(snapshot)) => {
-                *runtime.library_snapshot.lock().await = Some(snapshot);
-                *runtime.library_scan_warning.lock().await = None;
-                runtime.state_notify.notify_one();
-            }
-            Ok(Err(error)) => {
-                warn!(error = %format!("{error:#}"), "media-library refresh after published output failed");
-                *runtime.library_scan_warning.lock().await =
-                    Some(redact_sensitive_text(&format!("{error:#}")));
-                // Keep the previous snapshot visible while exposing the latest scan failure.
-                runtime.state_notify.notify_one();
-            }
-            Err(error) => {
-                warn!(error = %error, "media-library refresh worker failed");
-                *runtime.library_scan_warning.lock().await =
-                    Some(redact_sensitive_text(&error.to_string()));
-                runtime.state_notify.notify_one();
-            }
+        if let Err(error) = run_cloud_library_operation(
+            &runtime,
+            "media-library refresh worker failed",
+            |context| Ok(((), scan_cloud_library(&context)?)),
+        )
+        .await
+        {
+            warn!(error = %format!("{error:#}"), "media-library refresh after published output failed");
         }
     }
 }
@@ -1554,14 +1570,19 @@ async fn dispatch_cloud_management(
             {
                 return Ok(cloud_dispatch_failure("library_scan payload must be empty"));
             }
-            let context = runtime.bot.clone();
-            let snapshot = tokio::task::spawn_blocking(move || scan_cloud_library(&context))
-                .await
-                .context("media-library scan worker failed")??;
-            *runtime.library_snapshot.lock().await = Some(snapshot.clone());
+            let snapshot = run_cloud_library_operation(
+                runtime,
+                "media-library scan worker failed",
+                |context| {
+                    let snapshot = scan_cloud_library(&context)?;
+                    let response = serde_json::to_value(&snapshot)?;
+                    Ok((response, snapshot))
+                },
+            )
+            .await?;
             Ok(CloudDispatchOutcome {
                 status: InboxStatus::Completed,
-                result: Some(serde_json::to_value(snapshot)?),
+                result: Some(snapshot),
                 error: None,
                 related_preview: None,
             })
@@ -1580,14 +1601,13 @@ async fn dispatch_cloud_management(
                 Ok(parsed) => parsed,
                 Err(error) => return Ok(cloud_dispatch_failure(error)),
             };
-            let context = runtime.bot.clone();
             let records = cloud_state_records(runtime).await?;
-            let (preview, snapshot) = tokio::task::spawn_blocking(move || {
-                create_cloud_file_preview(&context, parsed, &records)
-            })
-            .await
-            .context("file preview worker failed")??;
-            *runtime.library_snapshot.lock().await = Some(snapshot);
+            let preview = run_cloud_library_operation(
+                runtime,
+                "file preview worker failed",
+                move |context| create_cloud_file_preview(&context, parsed, &records),
+            )
+            .await?;
             let preview_id = preview.id.clone();
             let revision = preview.revision.clone();
             Ok(CloudDispatchOutcome {
@@ -1658,23 +1678,26 @@ async fn dispatch_cloud_management(
             let confirm_revision = payload.revision.clone();
             let preview_id_for_execution = confirm_preview_id.clone();
             let revision_for_execution = confirm_revision.clone();
-            let context = runtime.bot.clone();
             #[cfg(test)]
             let file_provider = runtime.test_file_provider.clone();
             #[cfg(not(test))]
             let file_provider = None;
-            let execution = tokio::task::spawn_blocking(move || {
-                execute_cloud_file_preview_with_provider(
-                    &context,
-                    &preview_id_for_execution,
-                    &revision_for_execution,
-                    file_provider,
-                )
-            })
-            .await;
-            let (result, snapshot) = match execution {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) if is_file_provider_access_error(&error) => {
+            let result = match run_cloud_library_operation(
+                runtime,
+                "file confirmation worker failed",
+                move |context| {
+                    execute_cloud_file_preview_with_provider(
+                        &context,
+                        &preview_id_for_execution,
+                        &revision_for_execution,
+                        file_provider,
+                    )
+                },
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(error) if is_file_provider_access_error(&error) => {
                     let warning = edit_cloud_batch_message(
                         runtime,
                         preview_seq,
@@ -1698,7 +1721,7 @@ async fn dispatch_cloud_management(
                     return Err(error)
                         .context("file confirmation could not access the local file provider");
                 }
-                Ok(Err(error)) => {
+                Err(error) => {
                     let message = redact_sensitive_text(&format!("{error:#}"));
                     let edit_warning = edit_cloud_batch_message(
                         runtime,
@@ -1718,29 +1741,7 @@ async fn dispatch_cloud_management(
                         telegram_progress_warning,
                     ));
                 }
-                Err(error) => {
-                    let message =
-                        redact_sensitive_text(&format!("file confirmation worker failed: {error}"));
-                    let edit_warning = edit_cloud_batch_message(
-                        runtime,
-                        preview_seq,
-                        format!(
-                            "File batch {} stopped because its local worker failed. Run a fresh preview before confirming again.",
-                            confirm_preview_id
-                        ),
-                    )
-                    .await;
-                    let telegram_progress_warning = edit_warning.or(start_message_warning);
-                    return Ok(cloud_file_confirm_failure(
-                        preview_seq,
-                        &confirm_preview_id,
-                        &confirm_revision,
-                        message,
-                        telegram_progress_warning,
-                    ));
-                }
             };
-            *runtime.library_snapshot.lock().await = Some(snapshot);
             let final_message_warning =
                 edit_cloud_batch_message(runtime, preview_seq, render_cloud_batch_result(&result))
                     .await;
@@ -1790,13 +1791,16 @@ async fn dispatch_cloud_management(
                     "legacy_import payload exceeds the 256 KiB limit",
                 ));
             }
-            let context = runtime.bot.clone();
-            let (report, snapshot) = tokio::task::spawn_blocking(move || {
-                import_cloud_legacy_metadata(&context, &payload.text)
-            })
-            .await
-            .context("legacy import worker failed")??;
-            *runtime.library_snapshot.lock().await = Some(snapshot.clone());
+            let text = payload.text;
+            let (report, library_revision) = run_cloud_library_operation(
+                runtime,
+                "legacy import worker failed",
+                move |context| {
+                    let (report, snapshot) = import_cloud_legacy_metadata(&context, &text)?;
+                    Ok(((report, snapshot.revision.clone()), snapshot))
+                },
+            )
+            .await?;
             Ok(CloudDispatchOutcome {
                 status: InboxStatus::Completed,
                 result: Some(serde_json::json!({
@@ -1805,7 +1809,7 @@ async fn dispatch_cloud_management(
                     "warnings": report.warnings,
                     "needs_confirmation": report.needs_confirmation,
                     "candidates": report.candidates,
-                    "library_revision": snapshot.revision,
+                    "library_revision": library_revision,
                 })),
                 error: None,
                 related_preview: None,
