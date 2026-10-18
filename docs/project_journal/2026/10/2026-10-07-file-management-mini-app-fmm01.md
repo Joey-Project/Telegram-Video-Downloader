@@ -23,7 +23,7 @@ superseded_by: ""
 - 当前接受的架构大方向是公开托管的静态界面自动加载文件库并提交操作；Telegram webhook 进入 Cloudflare Worker，再进入 D1 持久收件箱。本机 Rust bot 主动领取操作，并由本机通过同一 Telegram bot 发送或编辑进度消息。本机没有公网入站接口。偏好使用 Cloudflare Free；达到额度限制时暂停操作并提示用户。
 - Rust 通过固定 Worker API 补领、确认和回写状态；Mini App 验证 Telegram initData。休眠 WebSocket 推送完整请求，固定共享密钥鉴权，本机落盘后才确认接收。状态通过持久递增版本防止旧回写覆盖新快照。
 - 第一至第四阶段的本地代码已落在隔离分支：Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段 `/settings` 与新下载位置选择仍延期。
-- Cloudflare 等待卡片重复问题已修复。2026-10-18 的类型检查、48 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 927 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录及来源匹配和有界状态清理覆盖。
+- Cloudflare 等待卡片重复问题已修复。2026-10-18 的类型检查、49 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 932 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录及来源匹配和有界状态清理覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
 - 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `fefdfcb3cd03a5e153e9e02fd8f9bdf6c727e5b0` 的 master 修复，包含 ASS 弹幕显示默认值及恢复工作流收尾。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
 
@@ -47,6 +47,9 @@ superseded_by: ""
 - 旧内容导入在调用 `File.text()` 前先检查文件体积，读取后仍检查 UTF-8 编码体积，避免超大本地导出文件占满 Mini App 内存。
 - NFO 元素读取、替换及根节点插入共用真实 XML 标签范围，跳过注释、CDATA、处理指令、声明及带引号属性内的伪标签，原有注释及未知字段保持原样。旧 JSON 文本收集改为单次累计字节预算并跳过空字符串，避免反复扫描已收集字符串。
 - 导入标题、metadata patch 标题及合集标题在 Worker 和 Rust 各层统一为 trim 后最多 500 个 Unicode 码点，中文及补充平面 emoji 使用相同计数；Worker 在入队前拒绝孤立 surrogate。长度回归覆盖 500/501 边界，避免云端已接受后才在本机因计量单位不同而失败。
+- 自闭合 NFO 标签展开时保留原始 opening name 的大小写，避免兼容读取后生成不匹配的 closing tag。旧消息的来源 ID 及标题自动候选均仅匹配当前 `Present` 媒体；Mini App 的历史候选也按当前文件库复验，不可用的旧候选保留为可手动关联的提示。
+- 附件所在目录未完整枚举时，其中媒体暂不可移动，避免只移动视频却留下 NFO、字幕或封面；完整且无关的目录继续可管理。扫描超时及索引恢复不把未观察完整的路径误判为缺失。
+- 扫描条目携带同一次 descriptor 读取的 fingerprint 用于稳定 ID 与旧索引关联，取消第二轮路径重开及其超时后留下的 provisional 条目；旧记录按路径及对象身份预建查找索引，未构建完媒体详情的已观察 alias 也参与歧义计数。此快照身份不替代预览与执行时的重新验证。
 
 ## 已确认的产品与交互
 

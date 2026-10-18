@@ -17,3 +17,11 @@ export function updateLegacySelection<T extends LegacyMappingSelection>(
   key: string,
   patch: Partial<T>,
 ): boolean;
+
+export type LegacyCandidateLike = { item_id?: unknown };
+export type PresentMediaLike = { id?: unknown; presence?: unknown };
+
+export function filterPresentLegacyCandidates<T extends LegacyCandidateLike>(
+  candidates: readonly T[] | null | undefined,
+  items: readonly PresentMediaLike[] | null | undefined,
+): T[];

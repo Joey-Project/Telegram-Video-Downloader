@@ -670,6 +670,8 @@ pub struct LibraryManager {
     in_process_lock: Arc<Mutex<()>>,
     last_snapshot: Arc<Mutex<Option<LibrarySnapshot>>>,
     process_nonce: String,
+    #[cfg(test)]
+    scan_test_hooks: Arc<Mutex<ScanTestHooks>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -707,6 +709,14 @@ struct QueueMetadataProvenance {
 struct BuiltLibraryItem {
     item: LibraryItem,
     sidecar_title_present: bool,
+    fingerprint: Option<FileFingerprint>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ScanTestHooks {
+    incomplete_directories: BTreeSet<String>,
+    expire_after_built_item: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,6 +934,8 @@ impl LibraryManager {
             process_nonce: PROCESS_NONCE
                 .get_or_init(|| new_operation_id("process"))
                 .clone(),
+            #[cfg(test)]
+            scan_test_hooks: Arc::new(Mutex::new(ScanTestHooks::default())),
         };
         manager.ensure_lock_file()?;
         manager.ensure_output_lock_file()?;
@@ -937,6 +949,23 @@ impl LibraryManager {
             .map_err(|_| anyhow!("media-library lock is poisoned"))?;
         let _disk_guard = self.lock_store()?;
         self.scan_locked(hints)
+    }
+
+    #[cfg(test)]
+    fn mark_next_scan_directory_incomplete(&self, directory: &str) {
+        self.scan_test_hooks
+            .lock()
+            .expect("scan test-hook lock should remain healthy")
+            .incomplete_directories
+            .insert(directory.to_string());
+    }
+
+    #[cfg(test)]
+    fn expire_next_scan_after_built_item(&self) {
+        self.scan_test_hooks
+            .lock()
+            .expect("scan test-hook lock should remain healthy")
+            .expire_after_built_item = true;
     }
 
     #[cfg(test)]
@@ -2775,11 +2804,28 @@ impl LibraryManager {
         let operation_state_warnings = self.prune_persisted_operation_states();
         let (mut index, index_warning) = self.read_index_with_recovery()?;
         let mut walk = ScanWalk::default();
+        #[cfg(test)]
+        let test_hooks = {
+            let mut hooks = self
+                .scan_test_hooks
+                .lock()
+                .map_err(|_| anyhow!("scan test-hook lock is poisoned"))?;
+            std::mem::take(&mut *hooks)
+        };
         walk.warnings.extend(operation_state_warnings);
         if let Some(warning) = index_warning {
             walk.warnings.push(warning);
         }
         self.walk_directory(Path::new(""), 0, &mut walk)?;
+        #[cfg(test)]
+        for directory in &test_hooks.incomplete_directories {
+            if walk.complete_directories.contains(directory) {
+                walk.incomplete_directories.insert(directory.clone());
+                walk.warnings.push(format!(
+                    "scan was interrupted while enumerating directory {directory}"
+                ));
+            }
+        }
         walk.files
             .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         if walk.files.len() > MAX_ENTRIES {
@@ -2812,6 +2858,10 @@ impl LibraryManager {
         let mut videos = Vec::new();
         let mut sidecar_title_paths = HashSet::new();
         let mut unreadable_media = HashMap::new();
+        let mut fingerprints = BTreeMap::new();
+        let mut incomplete_attachment_media = 0usize;
+        #[cfg(test)]
+        let mut expire_after_built_item = test_hooks.expire_after_built_item;
         for file in walk
             .files
             .iter()
@@ -2835,18 +2885,40 @@ impl LibraryManager {
                 ));
                 break;
             }
+            let attachments_complete = !walk
+                .incomplete_directories
+                .contains(parent_relative(&file.relative_path));
             match self.build_item(
                 file,
                 &sidecars,
+                attachments_complete,
                 walk.started_at,
                 &mut walk.timed_out,
                 &mut walk.warnings,
             ) {
                 Ok(built) => {
+                    if !attachments_complete {
+                        incomplete_attachment_media = incomplete_attachment_media.saturating_add(1);
+                    }
                     if built.sidecar_title_present {
                         sidecar_title_paths.insert(built.item.relative_path.clone());
                     }
+                    if let Some(fingerprint) = &built.fingerprint {
+                        fingerprints.insert(built.item.relative_path.clone(), fingerprint.clone());
+                    }
                     videos.push(built.item);
+                    #[cfg(test)]
+                    if expire_after_built_item {
+                        expire_after_built_item = false;
+                        walk.timed_out = true;
+                        if !walk
+                            .warnings
+                            .iter()
+                            .any(|warning| warning.contains("120-second scan budget"))
+                        {
+                            walk.warnings.push("scan stopped at the 120-second scan budget; unvisited paths were not marked missing".to_string());
+                        }
+                    }
                 }
                 Err(error) => {
                     let metadata_status = if is_file_provider_access_error(&error) {
@@ -2862,6 +2934,11 @@ impl LibraryManager {
                 }
             }
         }
+        if incomplete_attachment_media > 0 {
+            walk.warnings.push(format!(
+                "{incomplete_attachment_media} media item(s) are unavailable because their containing directory was not fully enumerated; attachments were not asserted"
+            ));
+        }
 
         let (hint_path_resolutions, unresolved_hint_paths) =
             self.resolve_hint_paths_for_scan(hints, &walk.files, &videos, &walk);
@@ -2875,28 +2952,39 @@ impl LibraryManager {
             matching_hint_indices_for_items(&videos, hints, &hint_path_resolutions, &walk);
         let mut queue_metadata =
             attach_matching_hints(&mut videos, hints, &hint_matches, &sidecar_title_paths);
-        let mut fingerprints = BTreeMap::new();
-        let mut current_object_counts: HashMap<(u64, u64, Option<i64>, Option<i64>), usize> =
-            HashMap::new();
-        for item in &videos {
-            if walk.started_at.elapsed() >= SCAN_TIMEOUT {
-                walk.timed_out = true;
-                walk.warnings.push("scan stopped at the 120-second scan budget; unvisited paths were not marked missing".to_string());
-                break;
-            }
-            if item.presence != Presence::Present {
-                continue;
-            }
-            if let Some(fingerprint) =
-                self.file_fingerprint(&self.absolute_path(&item.relative_path)?)?
-            {
-                *current_object_counts
-                    .entry(index_object_key(&fingerprint))
-                    .or_default() += 1;
-                fingerprints.insert(item.relative_path.clone(), fingerprint);
-            }
+        let mut scanned_primary_identity_counts: HashMap<(u64, u64), usize> = HashMap::new();
+        for file in walk
+            .files
+            .iter()
+            .filter(|file| is_primary_media(&file.relative_path))
+        {
+            *scanned_primary_identity_counts
+                .entry((file.identity.device(), file.identity.inode()))
+                .or_default() += 1;
         }
         let old_records = index.records.clone();
+        let mut old_by_identity: HashMap<IndexObjectKey, Vec<String>> = HashMap::new();
+        let mut old_by_path_and_identity: HashMap<(String, IndexObjectKey), Vec<String>> =
+            HashMap::new();
+        for (id, record) in &old_records {
+            if record.file_type != "regular_file" {
+                continue;
+            }
+            let key = (
+                record.device,
+                record.inode,
+                record.birth_seconds,
+                record.birth_nanoseconds,
+            );
+            old_by_identity.entry(key).or_default().push(id.clone());
+            old_by_path_and_identity
+                .entry((record.item.relative_path.clone(), key))
+                .or_default()
+                .push(id.clone());
+        }
+        // Unknown entries in an incompletely enumerated directory could be hard links to any
+        // scanned item, so they prevent a unique-rename inference for this scan.
+        let can_match_unique_rename = walk.incomplete_directories.is_empty();
         let mut used_ids = HashSet::new();
         for (item_index, item) in videos.iter_mut().enumerate() {
             let Some(fingerprint) = fingerprints.get(&item.relative_path) else {
@@ -2904,16 +2992,29 @@ impl LibraryManager {
             };
             let mut item_queue_metadata = queue_metadata[item_index].clone();
             let key = index_object_key(fingerprint);
-            let exact = old_records.iter().find(|(id, record)| {
-                !used_ids.contains(*id)
-                    && record.item.relative_path == item.relative_path
-                    && index_record_matches(record, fingerprint)
-            });
-            let unique_rename = if exact.is_none() && current_object_counts.get(&key) == Some(&1) {
-                let candidates = old_records
-                    .iter()
-                    .filter(|(id, record)| {
-                        !used_ids.contains(*id) && index_record_matches(record, fingerprint)
+            let exact = old_by_path_and_identity
+                .get(&(item.relative_path.clone(), key))
+                .and_then(|candidate_ids| {
+                    candidate_ids.iter().find_map(|id| {
+                        let record = old_records.get(id)?;
+                        (!used_ids.contains(id) && index_record_matches(record, fingerprint))
+                            .then_some((id, record))
+                    })
+                });
+            let current_identity_count =
+                (fingerprint.identity.device(), fingerprint.identity.inode());
+            let unique_rename = if exact.is_none()
+                && can_match_unique_rename
+                && scanned_primary_identity_counts.get(&current_identity_count) == Some(&1)
+            {
+                let candidates = old_by_identity
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|id| {
+                        let record = old_records.get(id)?;
+                        (!used_ids.contains(id) && index_record_matches(record, fingerprint))
+                            .then_some((id, record))
                     })
                     .collect::<Vec<_>>();
                 if candidates.len() == 1 {
@@ -3302,6 +3403,7 @@ impl LibraryManager {
         &self,
         media: &ScannedFile,
         sidecars: &SidecarIndex,
+        attachments_complete: bool,
         scan_started_at: Instant,
         scan_timed_out: &mut bool,
         warnings: &mut Vec<String>,
@@ -3339,12 +3441,18 @@ impl LibraryManager {
                         presence: Presence::Unavailable,
                     },
                     sidecar_title_present: false,
+                    fingerprint: None,
                 });
             }
         };
-        let (fingerprint, presence) = match opened_file.as_ref() {
+        let (fingerprint, opened_presence) = match opened_file.as_ref() {
             Some(file) => (Some(fingerprint(file)?), Presence::Present),
             None => (None, Presence::Missing),
+        };
+        let presence = if attachments_complete {
+            opened_presence
+        } else {
+            Presence::Unavailable
         };
         let item_identity = fingerprint
             .as_ref()
@@ -3361,7 +3469,7 @@ impl LibraryManager {
         let mut nfo_title_present = false;
         let mut nfo_source_id_present = false;
         let mut sidecar_title_present = false;
-        let mut metadata_status = if presence == Presence::Missing {
+        let mut metadata_status = if opened_presence == Presence::Missing {
             MetadataStatus::ProviderUnavailable
         } else {
             MetadataStatus::Unknown
@@ -3463,7 +3571,7 @@ impl LibraryManager {
         }
 
         let media_specs =
-            if presence == Presence::Present && scan_started_at.elapsed() < SCAN_TIMEOUT {
+            if opened_presence == Presence::Present && scan_started_at.elapsed() < SCAN_TIMEOUT {
                 opened_file
                     .as_ref()
                     .ok_or_else(|| anyhow!("media descriptor disappeared during scan"))
@@ -3507,6 +3615,7 @@ impl LibraryManager {
                 presence,
             },
             sidecar_title_present,
+            fingerprint,
         })
     }
 
@@ -4597,7 +4706,9 @@ fn hex_digest(bytes: &[u8]) -> String {
     output
 }
 
-fn index_object_key(fingerprint: &FileFingerprint) -> (u64, u64, Option<i64>, Option<i64>) {
+type IndexObjectKey = (u64, u64, Option<i64>, Option<i64>);
+
+fn index_object_key(fingerprint: &FileFingerprint) -> IndexObjectKey {
     (
         fingerprint.identity.device(),
         fingerprint.identity.inode(),
@@ -6062,12 +6173,19 @@ fn replace_xml_element(content: &str, name: &str, value: &str) -> Result<String>
     if element.self_closing {
         let slash = self_closing_xml_tag_slash(content, element.open_start, element.open_end - 1)
             .ok_or_else(|| anyhow!("NFO self-closing element has no closing slash"))?;
-        let mut output = String::with_capacity(content.len() + value.len() + name.len() + 3);
+        let opening = xml_next_markup(content, element.open_start)
+            .filter(|markup| {
+                markup.start == element.open_start && markup.kind == XmlMarkupKind::Start
+            })
+            .ok_or_else(|| anyhow!("NFO self-closing element opening tag could not be reread"))?;
+        let opening_name = opening.name;
+        let mut output =
+            String::with_capacity(content.len() + value.len() + opening_name.len() + 3);
         output.push_str(&content[..slash]);
         output.push_str(&content[slash + 1..element.open_end]);
         output.push_str(&xml_escape(value));
         output.push_str("</");
-        output.push_str(name);
+        output.push_str(opening_name);
         output.push('>');
         output.push_str(&content[element.open_end..]);
         return Ok(output);
@@ -6687,7 +6805,10 @@ fn legacy_candidates(hints: &[SourceHint], items: &[LibraryItem]) -> Vec<LegacyC
             .collect::<HashSet<_>>();
         let direct = items
             .iter()
-            .filter(|item| item.source_ids.iter().any(|id| hint_ids.contains(id)))
+            .filter(|item| {
+                item.presence == Presence::Present
+                    && item.source_ids.iter().any(|id| hint_ids.contains(id))
+            })
             .collect::<Vec<_>>();
         let (matches, match_kind) = if !direct.is_empty() {
             (direct, "source_id")
@@ -6695,7 +6816,9 @@ fn legacy_candidates(hints: &[SourceHint], items: &[LibraryItem]) -> Vec<LegacyC
             let normalized = normalize_title(title);
             let title_matches = items
                 .iter()
-                .filter(|item| normalize_title(&item.title) == normalized)
+                .filter(|item| {
+                    item.presence == Presence::Present && normalize_title(&item.title) == normalized
+                })
                 .collect::<Vec<_>>();
             (title_matches, "title")
         } else {
@@ -7233,6 +7356,69 @@ mod tests {
     }
 
     #[test]
+    fn round8_xml_self_closing_expansion_preserves_opening_name_spelling() {
+        let cases = [
+            ("<title/>", "title", "<title>", "</title>"),
+            (
+                "<TITLE attr='keep' />",
+                "title",
+                "<TITLE attr='keep' >",
+                "</TITLE>",
+            ),
+            (
+                "<TiTlE data=\"x\"/>",
+                "title",
+                "<TiTlE data=\"x\">",
+                "</TiTlE>",
+            ),
+            ("<SeT />", "set", "<SeT >", "</SeT>"),
+        ];
+        let comment = "<!-- <title>comment title</title><set>comment set</set> -->";
+
+        for (opening_tag, lookup, expanded_open, expected_close) in cases {
+            let original = format!("<movie>{comment}{opening_tag}<future>opaque</future></movie>");
+            let patch = MetadataPatch {
+                item_id: "item".to_string(),
+                title: (lookup == "title").then(|| "Updated & value".to_string()),
+                source_ids: Vec::new(),
+                collection: (lookup == "set").then(|| CollectionMetadata {
+                    id: None,
+                    title: "Updated & value".to_string(),
+                    kind: "series".to_string(),
+                    order: None,
+                    part_id: None,
+                }),
+            };
+
+            let patched = append_metadata_patch(&original, &patch)
+                .expect("metadata patch should expand a real self-closing element");
+            let expected_expansion = format!("{expanded_open}Updated &amp; value{expected_close}");
+            assert!(patched.contains(expected_expansion.as_str()));
+            assert_eq!(
+                xml_tag_text(&patched, lookup).as_deref(),
+                Some("Updated & value")
+            );
+            assert!(patched.contains(comment));
+            assert!(patched.contains("<future>opaque</future>"));
+
+            let span = xml_element_span(&patched, lookup, 0)
+                .expect("expanded element should remain readable");
+            assert!(!span.self_closing);
+            let opening = xml_next_markup(&patched, span.open_start)
+                .expect("expanded opening tag should parse");
+            let closing = xml_next_markup(&patched, span.close_start)
+                .expect("expanded closing tag should parse");
+            assert_eq!(opening.kind, XmlMarkupKind::Start);
+            assert_eq!(closing.kind, XmlMarkupKind::End);
+            assert_eq!(opening.name, closing.name);
+
+            let repeated = append_metadata_patch(&patched, &patch)
+                .expect("reapplying the same patch should remain compatible");
+            assert_eq!(repeated, patched);
+        }
+    }
+
+    #[test]
     fn round5_legacy_index_records_default_queue_provenance_to_unknown() {
         let value = serde_json::json!({
             "item": index_fixture_item("legacy", "clip.mp4", Presence::Present),
@@ -7592,6 +7778,174 @@ mod tests {
     }
 
     #[test]
+    fn round8_incomplete_directory_keeps_media_unavailable_and_complete_sibling_moves_sidecars() {
+        let root = TemporaryRoot::new("round8-incomplete-attachments");
+        let incomplete = root.path().join("Incomplete");
+        let complete = root.path().join("Complete");
+        fs::create_dir(&incomplete).expect("incomplete fixture directory should create");
+        fs::create_dir(&complete).expect("complete fixture directory should create");
+        fs::write(incomplete.join("old.mp4"), b"old-video")
+            .expect("old media fixture should write");
+        fs::write(incomplete.join("clip.mp4"), b"incomplete-video")
+            .expect("incomplete media fixture should write");
+        fs::write(
+            incomplete.join("clip.nfo"),
+            "<movie><title>Incomplete</title></movie>",
+        )
+        .expect("incomplete NFO fixture should write");
+        fs::write(
+            incomplete.join("clip.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\ntext\n",
+        )
+        .expect("incomplete subtitle fixture should write");
+        fs::write(complete.join("clip.mp4"), b"complete-video")
+            .expect("complete media fixture should write");
+        fs::write(
+            complete.join("clip.nfo"),
+            "<movie><title>Complete</title></movie>",
+        )
+        .expect("complete NFO fixture should write");
+        fs::write(
+            complete.join("clip.srt"),
+            "1\n00:00:00,000 --> 00:00:01,000\ntext\n",
+        )
+        .expect("complete subtitle fixture should write");
+
+        let manager = manager(&root);
+        let initial = manager
+            .scan(&[])
+            .expect("initial complete scan should record both media items");
+        let old_id = item_at(&initial, "Incomplete/old.mp4").id.clone();
+        fs::remove_file(incomplete.join("old.mp4"))
+            .expect("old media fixture should be absent from the next scan");
+        manager.mark_next_scan_directory_incomplete("Incomplete");
+
+        let snapshot = manager
+            .scan(&[])
+            .expect("partial directory scan should retain its known entries");
+        let incomplete_item = item_at(&snapshot, "Incomplete/clip.mp4");
+        assert_eq!(incomplete_item.presence, Presence::Unavailable);
+        assert!(incomplete_item.attachments.is_empty());
+        assert_eq!(item_at(&snapshot, "Incomplete/old.mp4").id, old_id);
+        assert_eq!(
+            item_at(&snapshot, "Incomplete/old.mp4").presence,
+            Presence::Unavailable
+        );
+        assert!(
+            snapshot
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("attachments were not asserted")),
+            "the scan should explain why media in a partial directory is unavailable"
+        );
+
+        let unavailable_preview = manager.build_and_persist_preview(
+            &snapshot,
+            std::slice::from_ref(&incomplete_item.id),
+            Some("Moved"),
+            false,
+            ConflictPolicy::Skip,
+            &[],
+        );
+        assert!(
+            unavailable_preview.is_err(),
+            "media from an incompletely enumerated attachment directory cannot be previewed"
+        );
+
+        let complete_item = item_at(&snapshot, "Complete/clip.mp4");
+        assert_eq!(complete_item.presence, Presence::Present);
+        assert_eq!(complete_item.attachments.len(), 2);
+        let complete_preview = manager
+            .build_and_persist_preview(
+                &snapshot,
+                std::slice::from_ref(&complete_item.id),
+                Some("Moved"),
+                false,
+                ConflictPolicy::Skip,
+                &[],
+            )
+            .expect("complete sibling directory should remain movable");
+        assert_eq!(complete_preview.items[0].files.len(), 3);
+        let moved_paths = complete_preview.items[0]
+            .files
+            .iter()
+            .map(|file| file.target_path.clone())
+            .collect::<Vec<_>>();
+        let result = manager
+            .execute_preview(&complete_preview.id, &complete_preview.revision)
+            .expect("complete sibling move should execute");
+        assert_eq!(result.status, BatchStatus::Complete);
+        assert!(
+            moved_paths
+                .iter()
+                .all(|path| root.path().join(path).is_file()),
+            "the complete media, NFO, and subtitle should all move together"
+        );
+    }
+
+    #[test]
+    fn round8_timeout_after_build_reuses_rename_identity_without_duplicate_history() {
+        let root = TemporaryRoot::new("round8-timeout-after-build");
+        let original_path = root.path().join("old-name.mp4");
+        let renamed_path = root.path().join("new-name.mp4");
+        fs::write(&original_path, b"same-media-object").expect("media fixture should write");
+        let manager = manager(&root);
+        let initial = manager.scan(&[]).expect("initial scan should complete");
+        let stable_id = item_at(&initial, "old-name.mp4").id.clone();
+        fs::rename(&original_path, &renamed_path).expect("manual rename should complete");
+        manager.expire_next_scan_after_built_item();
+
+        let after_timeout = manager
+            .scan(&[])
+            .expect("a timeout after building the descriptor should still reconcile it");
+        assert_eq!(after_timeout.items.len(), 1);
+        let renamed = item_at(&after_timeout, "new-name.mp4");
+        assert_eq!(renamed.id, stable_id);
+        assert_eq!(renamed.presence, Presence::Present);
+
+        let rescanned = manager
+            .scan(&[])
+            .expect("subsequent complete scan should keep the reconciled identity");
+        assert_eq!(rescanned.items.len(), 1);
+        assert_eq!(item_at(&rescanned, "new-name.mp4").id, stable_id);
+    }
+
+    #[test]
+    fn round8_timeout_hardlink_alias_in_unbuilt_tail_prevents_unique_rename_match() {
+        let root = TemporaryRoot::new("round8-timeout-hardlink-tail");
+        let old_path = root.path().join("old-name.mp4");
+        let renamed_path = root.path().join("a-renamed.mp4");
+        let alias_path = root.path().join("z-alias.mp4");
+        fs::write(&old_path, b"same-media-object").expect("media fixture should write");
+        let manager = manager(&root);
+        let initial = manager.scan(&[]).expect("initial scan should complete");
+        let old_id = item_at(&initial, "old-name.mp4").id.clone();
+        fs::rename(&old_path, &renamed_path).expect("manual rename should complete");
+        fs::hard_link(&renamed_path, &alias_path).expect("hardlink alias should create");
+        manager.expire_next_scan_after_built_item();
+
+        let partial = manager
+            .scan(&[])
+            .expect("partial scan should reconcile only its built item");
+        let renamed = item_at(&partial, "a-renamed.mp4");
+        assert_ne!(renamed.id, old_id);
+        assert_eq!(renamed.presence, Presence::Present);
+        let old_record = partial
+            .items
+            .iter()
+            .find(|item| item.id == old_id)
+            .expect("unreconciled old identity should remain in history");
+        assert_eq!(old_record.presence, Presence::Unavailable);
+        assert!(
+            !partial
+                .items
+                .iter()
+                .any(|item| item.relative_path == "z-alias.mp4"),
+            "the unbuilt tail must not be published as a confirmed media item"
+        );
+    }
+
+    #[test]
     fn unobserved_records_are_unavailable_for_incomplete_or_unreadable_scans() {
         let mut walk = ScanWalk::default();
         walk.complete_directories.insert(String::new());
@@ -7932,6 +8286,103 @@ mod tests {
                 "episode.mp4"
             )
             .id
+        );
+    }
+
+    #[test]
+    fn legacy_candidates_only_match_present_items_by_source_id_or_title() {
+        let mut present_direct =
+            index_fixture_item("present-direct", "direct.mp4", Presence::Present);
+        present_direct.title = "Direct title".to_string();
+        present_direct.source_ids = vec!["BV1abcdefgh".to_string(), "BV1abcdefgh".to_string()];
+
+        let mut missing_direct =
+            index_fixture_item("missing-direct", "missing-direct.mp4", Presence::Missing);
+        missing_direct.source_ids = vec!["BV1abcdefgh".to_string()];
+        let mut unavailable_direct = index_fixture_item(
+            "unavailable-direct",
+            "unavailable-direct.mp4",
+            Presence::Unavailable,
+        );
+        unavailable_direct.source_ids = vec!["BV1abcdefgh".to_string()];
+
+        let mut missing_title =
+            index_fixture_item("missing-title", "missing-title.mp4", Presence::Missing);
+        missing_title.title = "Fallback title".to_string();
+        missing_title.source_ids = vec!["cid1234".to_string()];
+        let mut unavailable_title = index_fixture_item(
+            "unavailable-title",
+            "unavailable-title.mp4",
+            Presence::Unavailable,
+        );
+        unavailable_title.title = "Fallback title".to_string();
+        unavailable_title.source_ids = vec!["cid1234".to_string()];
+        let mut present_title =
+            index_fixture_item("present-title", "present-title.mp4", Presence::Present);
+        present_title.title = "Fallback title".to_string();
+
+        let mut missing_only_title =
+            index_fixture_item("missing-only-title", "missing-only.mp4", Presence::Missing);
+        missing_only_title.title = "Stale title".to_string();
+        let mut unavailable_only_title = index_fixture_item(
+            "unavailable-only-title",
+            "unavailable-only.mp4",
+            Presence::Unavailable,
+        );
+        unavailable_only_title.title = "Stale title".to_string();
+
+        let items = vec![
+            present_direct,
+            missing_direct,
+            unavailable_direct,
+            missing_title,
+            unavailable_title,
+            present_title,
+            missing_only_title,
+            unavailable_only_title,
+        ];
+        let hints = vec![
+            SourceHint {
+                source_ids: vec!["BV1abcdefgh".to_string()],
+                title: Some("Does not match the direct item".to_string()),
+                relative_path: None,
+                collection: None,
+                origin: HintOrigin::LegacyText,
+                requires_confirmation: true,
+            },
+            SourceHint {
+                source_ids: vec!["cid1234".to_string()],
+                title: Some("Fallback title".to_string()),
+                relative_path: None,
+                collection: None,
+                origin: HintOrigin::LegacyText,
+                requires_confirmation: true,
+            },
+            SourceHint {
+                source_ids: Vec::new(),
+                title: Some("Stale title".to_string()),
+                relative_path: None,
+                collection: None,
+                origin: HintOrigin::LegacyText,
+                requires_confirmation: true,
+            },
+        ];
+
+        let candidates = legacy_candidates(&hints, &items);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.hint_index,
+                    candidate.item_id.as_str(),
+                    candidate.match_kind.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "present-direct", "source_id"),
+                (1, "present-title", "title"),
+            ],
+            "non-present records must neither become candidates nor shadow a present title fallback"
         );
     }
 

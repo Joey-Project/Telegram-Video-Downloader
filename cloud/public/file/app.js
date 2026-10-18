@@ -1,5 +1,5 @@
 import { appendAction, removeQueuedAction, shouldRetryActionFailure } from "./action-queue.js";
-import { getOrCreateLegacySelection, updateLegacySelection } from "./legacy-mapping-state.js";
+import { filterPresentLegacyCandidates, getOrCreateLegacySelection, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
@@ -512,7 +512,7 @@ function renderLegacyMappings() {
     state.legacySelection = new Map();
   }
   const hints = operation.result.hints;
-  const candidates = operation.result.candidates;
+  const candidates = filterPresentLegacyCandidates(operation.result.candidates, libraryItems());
   const warnings = Array.isArray(operation.result.warnings) ? operation.result.warnings : [];
   const matchedHintIndexes = new Set(candidates.map((candidate) => Number(candidate.hint_index)));
   const manualHints = hints.map((hint, hintIndex) => ({ hint, hintIndex })).filter(({ hintIndex }) => !matchedHintIndexes.has(hintIndex));
@@ -677,6 +677,9 @@ function previewSelectedLegacy() {
     const hint = hints[hintIndex];
     if (selected.dataset.manual === "true" && !itemId) return showToast("Choose a present video for every manual match.");
     if (!hint || !itemId) continue;
+    if (!libraryItems().some((item) => String(item?.id ?? "") === String(itemId) && statusOf(item) === "present")) {
+      return showToast("This video is no longer present. Choose a current video manually.");
+    }
     if (usedItems.has(itemId)) return showToast("Choose each video once; combine its changes in one mapping.");
     usedItems.add(itemId);
     if (!selection) continue;

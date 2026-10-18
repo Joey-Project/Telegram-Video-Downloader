@@ -5,7 +5,7 @@ import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials";
 import { ACTION_QUEUE_LIMIT, appendAction, removeQueuedAction, shouldRetryActionFailure } from "../public/file/action-queue.js";
 import { HttpResponseError } from "../public/file/http-error.js";
-import { getOrCreateLegacySelection, updateLegacySelection } from "../public/file/legacy-mapping-state.js";
+import { filterPresentLegacyCandidates, getOrCreateLegacySelection, updateLegacySelection } from "../public/file/legacy-mapping-state.js";
 import { submitLegacyFileImport } from "../public/file/legacy-file-import.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "../public/file/metadata-preview.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "../public/file/selection-limit.js";
@@ -809,6 +809,23 @@ describe("offline action queue helpers", () => {
     });
     expect(afterRender).toBe(initial);
     expect(afterRender).toEqual({ selected: true, item_id: "present-video", title: true, source_ids: true, collection: true });
+  });
+
+  it("filters saved legacy candidates against current present media", () => {
+    const candidates = [
+      { item_id: "present-video", hint_index: 0 },
+      { item_id: "missing-video", hint_index: 1 },
+      { item_id: "unavailable-video", hint_index: 2 },
+      { item_id: "deleted-video", hint_index: 3 },
+    ];
+    const currentItems = [
+      { id: "present-video", presence: "present" },
+      { id: "missing-video", presence: "missing" },
+      { id: "unavailable-video", presence: "unavailable" },
+    ];
+
+    expect(filterPresentLegacyCandidates(candidates, currentItems)).toEqual([candidates[0]]);
+    expect(filterPresentLegacyCandidates(candidates, null)).toEqual([]);
   });
 
   it("deduplicates waiting entries by sequence and keeps the richest local operation", () => {
