@@ -37530,17 +37530,15 @@ mv video.original video.m4s || exit 46
             inherited_fd_base: None,
         };
         let task = tokio::spawn(async move { run_command(&config, &spec, None).await });
-        for _ in 0..50 {
-            if pid_file.is_file() {
-                break;
+        let pid = match wait_for_complete_pid_line(&pid_file, Duration::from_secs(2)).await {
+            Ok(pid) => pid,
+            Err(error) => {
+                task.abort();
+                let _ = task.await;
+                let _ = fs::remove_dir_all(&root);
+                panic!("child pid should be fully written before cancellation: {error}");
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let pid = fs::read_to_string(&pid_file)
-            .expect("child pid should be written before cancellation")
-            .trim()
-            .parse::<libc::pid_t>()
-            .expect("child pid should parse");
+        };
 
         task.abort();
         let _ = task.await;
@@ -37626,6 +37624,98 @@ mv video.original video.m4s || exit 46
     fn process_exists(pid: libc::pid_t) -> bool {
         (unsafe { libc::kill(pid, 0) == 0 })
             || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[cfg(unix)]
+    fn try_read_complete_pid_line(path: &std::path::Path) -> std::io::Result<Option<libc::pid_t>> {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let Some(record) = contents.strip_suffix('\n') else {
+            return Ok(None);
+        };
+        let record = record.strip_suffix('\r').unwrap_or(record);
+        let pid = record.parse::<libc::pid_t>().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "PID fixture contains a malformed complete record",
+            )
+        })?;
+        if pid <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "PID fixture must contain a positive process ID",
+            ));
+        }
+        Ok(Some(pid))
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_complete_pid_line(
+        path: &std::path::Path,
+        timeout: Duration,
+    ) -> std::io::Result<libc::pid_t> {
+        match tokio::time::timeout(timeout, async {
+            loop {
+                if let Some(pid) = try_read_complete_pid_line(path)? {
+                    return Ok(pid);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for a complete PID fixture record",
+            )),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round7_pid_readiness_requires_complete_positive_record_and_preserves_read_errors() {
+        let root = temp_test_dir("pid-readiness-record");
+        let pid_file = root.join("child.pid");
+        assert_eq!(
+            try_read_complete_pid_line(&pid_file).expect("missing PID file should be pending"),
+            None
+        );
+
+        fs::write(&pid_file, b"").expect("empty PID file should be written");
+        assert_eq!(
+            try_read_complete_pid_line(&pid_file).expect("empty PID file should be pending"),
+            None
+        );
+        fs::write(&pid_file, b"2468").expect("partial PID record should be written");
+        assert_eq!(
+            try_read_complete_pid_line(&pid_file)
+                .expect("unterminated PID record should remain pending"),
+            None
+        );
+        fs::write(&pid_file, b"2468\n").expect("complete PID line should be written");
+        assert_eq!(
+            try_read_complete_pid_line(&pid_file).expect("complete PID line should parse"),
+            Some(2468)
+        );
+
+        fs::write(&pid_file, b"0\n").expect("invalid non-positive PID should be written");
+        assert_eq!(
+            try_read_complete_pid_line(&pid_file)
+                .expect_err("non-positive PID should be rejected")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let directory_path = root.join("directory");
+        fs::create_dir(&directory_path).expect("directory fixture should create");
+        let error = try_read_complete_pid_line(&directory_path)
+            .expect_err("directory read failure should not be treated as a missing file");
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
