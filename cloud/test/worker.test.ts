@@ -500,6 +500,47 @@ describe("Mini App identity and actions", () => {
     expect(tooManyPatches.status).toBe(400);
   });
 
+  it("rejects case-insensitive private directory aliases before enqueueing", async () => {
+    const initData = await signInitData();
+    const aliases = [
+      ".TELEGRAM-VIDEO-DOWNLOADER-LIBRARY",
+      "nested/.TeLeGrAm-ViDeO-DoWnLoAdEr-LiBrArY-cache",
+      ".TELEGRAM-VIDEO-DOWNLOADER-STATE",
+      "nested/.tElEgRaM-vIdEo-dOwNlOaDeR-staging",
+    ];
+    const beforeRows = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    const beforeNotifierIds = await listDurableObjectIds(testEnv.NOTIFIER);
+
+    for (const [index, targetRelativeDir] of aliases.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: `00000000-0000-4000-8000-00000000030${index + 1}`,
+          kind: "file_preview",
+          payload: { item_ids: ["item-a"], target_relative_dir: targetRelativeDir },
+        }),
+      });
+      expect(response.status).toBe(400);
+    }
+
+    const afterRejectedRows = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(afterRejectedRows?.count).toBe(beforeRows?.count);
+    expect(await listDurableObjectIds(testEnv.NOTIFIER)).toEqual(beforeNotifierIds);
+
+    const accepted = await ownerRequest("/api/actions", initData, {
+      method: "POST",
+      body: JSON.stringify({
+        request_id: "00000000-0000-4000-8000-00000000030f",
+        kind: "file_preview",
+        payload: { item_ids: ["item-a"], target_relative_dir: "Normal/Target" },
+      }),
+    });
+    expect(accepted.status).toBe(202);
+
+    const afterAcceptedRows = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(afterAcceptedRows?.count).toBe((beforeRows?.count ?? 0) + 1);
+  });
+
   it("bounds collection order to Rust u32 before enqueueing", async () => {
     const initData = await signInitData();
     const orderCases: Array<{ requestId: string; order: unknown; expectedStatus: number }> = [

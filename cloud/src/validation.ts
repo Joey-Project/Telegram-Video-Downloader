@@ -229,8 +229,12 @@ function parseRelativeDirectory(value: unknown): string {
     throw new HttpError(400, "target_relative_dir must be a safe relative path");
   }
   const segments = directory.split("/");
-  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === ".." ||
-    segment.startsWith(".telegram-video-downloader-library") || segment.startsWith(".telegram-video-downloader-"))) {
+  if (segments.some((segment) => {
+    const lowercaseSegment = segment.toLowerCase();
+    return segment.length === 0 || segment === "." || segment === ".." ||
+      lowercaseSegment.startsWith(".telegram-video-downloader-library") ||
+      lowercaseSegment.startsWith(".telegram-video-downloader-");
+  })) {
     throw new HttpError(400, "target_relative_dir must be a safe relative path");
   }
   return directory;

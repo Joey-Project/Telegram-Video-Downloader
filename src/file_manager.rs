@@ -7283,7 +7283,44 @@ fn extract_source_ids(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut result = Vec::new();
     let mut index = 0;
+    let mut next_url_scan_index = 0;
     while index < bytes.len() {
+        let youtube_url_prefix_len = if index >= next_url_scan_index
+            && bytes
+                .get(index..index + 8)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"))
+        {
+            Some(8)
+        } else if index >= next_url_scan_index
+            && bytes
+                .get(index..index + 7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"http://"))
+        {
+            Some(7)
+        } else {
+            None
+        };
+        if let Some(prefix_len) = youtube_url_prefix_len
+            && (index == 0 || !bytes[index - 1].is_ascii_alphanumeric())
+        {
+            let mut end = index + prefix_len;
+            while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+                end += 1;
+            }
+            // Parse at most one apparent URL per whitespace-delimited token.
+            next_url_scan_index = end;
+            let candidate = text[index..end].trim_end_matches(is_legacy_url_terminal_punctuation);
+            if let Some(video_id) =
+                crate::youtube_video_id(candidate).filter(|video_id| is_youtube_video_id(video_id))
+            {
+                result.push(format!("youtube:{video_id}"));
+            }
+            // Continue scanning the URL body so Bilibili IDs, or other IDs after the URL,
+            // retain the existing extraction behavior.
+            index += prefix_len;
+            continue;
+        }
+
         let (prefix_len, is_bvid) = if bytes
             .get(index..index + 2)
             .is_some_and(|pair| pair.eq_ignore_ascii_case(b"BV"))
@@ -7321,6 +7358,40 @@ fn extract_source_ids(text: &str) -> Vec<String> {
         index = end.max(index + prefix_len);
     }
     deduplicate(result)
+}
+
+fn is_legacy_url_terminal_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        '.' | ','
+            | '!'
+            | '?'
+            | ';'
+            | ':'
+            | ')'
+            | ']'
+            | '}'
+            | '>'
+            | '`'
+            | '\''
+            | '"'
+            | '。'
+            | '，'
+            | '！'
+            | '？'
+            | '；'
+            | '：'
+            | '）'
+            | '】'
+            | '》'
+            | '」'
+            | '』'
+            | '〉'
+            | '〕'
+            | '｝'
+            | '”'
+            | '’'
+    )
 }
 
 fn filesystem_equivalent_path_alias(
@@ -7881,7 +7952,7 @@ fn parse_legacy_import(input: &str) -> LegacyImportReport {
             });
         } else {
             warnings.push(
-                "no Bilibili BV/av/cid/ep identifiers were found in the supplied text".to_string(),
+                "no Bilibili BV/av/cid/ep identifiers or supported YouTube video URLs were found in the supplied text".to_string(),
             );
         }
     }
@@ -8363,6 +8434,73 @@ mod tests {
             normalize_source_ids(vec!["bv1AbCdEfG".to_string()]),
             vec!["BV1AbCdEfG".to_string()]
         );
+    }
+
+    #[test]
+    fn extracts_youtube_ids_from_supported_legacy_urls() {
+        let ids = extract_source_ids(
+            "Watch https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=share#t=30). \
+             Rewatch https://youtu.be/PHH1wTDF-1M?si=share#t=10! \
+             Again `https://youtu.be/PHH1wTDF-1M?si=share#t=10`。）",
+        );
+        assert_eq!(
+            ids,
+            vec![
+                "youtube:dQw4w9WgXcQ".to_string(),
+                "youtube:PHH1wTDF-1M".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn youtube_url_extraction_preserves_bilibili_ids_and_later_tokens() {
+        let ids = extract_source_ids(
+            "https://www.bilibili.com/video/BV1AbCdEfG https://youtu.be/PHH1wTDF-1M). cid12345678 av123456789",
+        );
+        assert_eq!(
+            ids,
+            vec![
+                "BV1AbCdEfG".to_string(),
+                "youtube:PHH1wTDF-1M".to_string(),
+                "cid12345678".to_string(),
+                "av123456789".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn youtube_url_extraction_rejects_invalid_hosts_ids_and_bare_text() {
+        let text = concat!(
+            "https://youtube.com.evil/watch?v=dQw4w9WgXcQ ",
+            "https://www.youtube.com.evil/watch?v=dQw4w9WgXcQ ",
+            "https://youtu.be.evil/PHH1wTDF-1M ",
+            "https://www.youtube.com/watch?v=short ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQx ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ%2F ",
+            "prefixhttps://youtu.be/PHH1wTDF-1M ",
+            "PHH1wTDF-1M",
+        );
+        assert!(extract_source_ids(text).is_empty());
+    }
+
+    #[test]
+    fn dense_unspaced_url_text_is_scanned_once_per_token() {
+        let mut text = String::new();
+        for _ in 0..256 {
+            text.push_str("!https://invalid.example/path");
+        }
+        text.push_str(" cid12345678");
+
+        assert_eq!(extract_source_ids(&text), vec!["cid12345678"]);
+    }
+
+    #[test]
+    fn legacy_import_creates_a_confirmation_hint_from_a_youtube_url() {
+        let report = parse_legacy_import("https://youtu.be/PHH1wTDF-1M");
+        assert!(report.needs_confirmation);
+        assert_eq!(report.hints.len(), 1);
+        assert_eq!(report.hints[0].source_ids, vec!["youtube:PHH1wTDF-1M"]);
+        assert!(report.warnings.is_empty());
     }
 
     #[test]

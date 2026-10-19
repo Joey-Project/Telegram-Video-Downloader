@@ -2230,7 +2230,7 @@ async fn dispatch_cloud_management(
                     if retryable_access_error {
                         "Some files could not be accessed temporarily. The preview remains available; confirm it again after local file access recovers.".to_string()
                     } else {
-                        "The confirmed operation completed with skipped or failed items; review the per-item result before retrying.".to_string()
+                        "This preview cannot be retried. Review the per-item result, then run a fresh preview before confirming again.".to_string()
                     }
                 }),
                 related_preview: Some((
@@ -2841,10 +2841,15 @@ fn render_cloud_batch_result(result: &crate::library::BatchMoveResult) -> String
         crate::library::BatchStatus::Partial => "partially completed",
         crate::library::BatchStatus::Failed => "failed",
     };
-    let retry = if result.status == crate::library::BatchStatus::Complete {
-        String::new()
-    } else {
-        " Review the per-item result in /file; retry the same confirmation after resolving the issue.".to_string()
+    let retry = match (result.status, result.retryable_access_error) {
+        (crate::library::BatchStatus::Complete, _) => String::new(),
+        (_, true) => {
+            " Retry the same confirmation after local file access recovers.".to_string()
+        }
+        (_, false) => {
+            " Review the per-item result in /file, then run a fresh preview before confirming again."
+                .to_string()
+        }
     };
     format!(
         "File batch {} {summary}: {moved_files} file(s) moved, {patched} metadata item(s) updated, {failed} item(s) need review.{retry}",

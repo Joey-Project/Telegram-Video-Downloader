@@ -32,6 +32,16 @@ struct FakeTelegramRequest {
     authorization: Option<String>,
 }
 
+fn take_cloud_test_telegram_requests(
+    requests: &mut mpsc::UnboundedReceiver<FakeTelegramRequest>,
+) -> Vec<FakeTelegramRequest> {
+    let mut recorded = Vec::new();
+    while let Ok(request) = requests.try_recv() {
+        recorded.push(request);
+    }
+    recorded
+}
+
 struct FakeCloudApiState {
     pending: StdMutex<Vec<CloudRequest>>,
     fetch_count: AtomicUsize,
@@ -1824,7 +1834,7 @@ async fn expired_preview_manifests_follow_terminal_and_unknown_confirmation_stat
 #[tokio::test]
 async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
     let root = temp_cloud_bot_dir("retryable-provider-confirmation");
-    let (telegram, _telegram_requests, telegram_shutdown, telegram_server) =
+    let (telegram, mut telegram_requests, telegram_shutdown, telegram_server) =
         spawn_fake_telegram_api().await;
     let mut config = AppConfig::for_test();
     config.downloads.video_dir = root.join("videos");
@@ -1921,6 +1931,14 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
         );
         dispatch_cloud_record(runtime.clone(), record).await;
 
+        let recorded = take_cloud_test_telegram_requests(&mut telegram_requests);
+        let final_message = recorded
+            .iter()
+            .rev()
+            .find(|request| request.method == "editMessageText")
+            .and_then(|request| request.body["text"].as_str())
+            .expect("the batch summary should update its Telegram progress message");
+
         let preview_record = inbox
             .record(83)
             .expect("preview receipt should load")
@@ -1932,6 +1950,15 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
         if seq == 84 {
             assert_eq!(confirmation.status, InboxStatus::Failed);
             assert_eq!(preview_record.status, InboxStatus::AwaitingConfirmation);
+            assert!(
+                final_message
+                    .contains("Retry the same confirmation after local file access recovers.")
+            );
+            assert!(!final_message.contains("fresh preview"));
+            assert!(confirmation.error.as_deref().is_some_and(|error| {
+                error.contains("preview remains available")
+                    && error.contains("after local file access recovers")
+            }));
             assert_eq!(
                 confirmation
                     .result
@@ -1954,6 +1981,8 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
         } else {
             assert_eq!(confirmation.status, InboxStatus::Completed);
             assert_eq!(preview_record.status, InboxStatus::Completed);
+            assert!(!final_message.contains("confirmation"));
+            assert!(!final_message.contains("fresh preview"));
             assert_eq!(
                 confirmation
                     .result
@@ -1972,6 +2001,180 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
             assert_eq!(file_provider.move_paths().len(), 2);
         }
     }
+
+    drop(runtime);
+    drop(library);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn nonretryable_skipped_confirmation_requires_fresh_preview() {
+    let root = temp_cloud_bot_dir("nonretryable-skipped-confirmation");
+    let (telegram, mut telegram_requests, telegram_shutdown, telegram_server) =
+        spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    fs::write(
+        config.downloads.video_dir.join("clip.mp4"),
+        b"fixture-video",
+    )
+    .expect("source media should write");
+    fs::create_dir(config.downloads.video_dir.join("Existing"))
+        .expect("existing target directory should create");
+    fs::write(
+        config.downloads.video_dir.join("Existing/clip.mp4"),
+        b"existing-target",
+    )
+    .expect("conflicting target should write");
+
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let file_provider = Arc::new(MockQueueFileProvider::default());
+    let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+    let library = LibraryManager::open_with_provider_and_preview_cleanup_gate(
+        &config.downloads.video_dir,
+        Arc::clone(&provider),
+        inbox.clone(),
+    )
+    .expect("cloud library manager should open with the mock provider");
+    let snapshot = library.scan(&[]).expect("library scan should complete");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4")
+        .expect("source media should appear in the library")
+        .id
+        .clone();
+    let preview = library
+        .preview(
+            std::slice::from_ref(&item_id),
+            "Existing",
+            false,
+            ConflictPolicy::Skip,
+        )
+        .expect("skip policy should create a conflict preview");
+    assert_eq!(preview.items[0].outcome, crate::library::MoveOutcome::Skip);
+    let preview_id = preview.id.clone();
+    let preview_revision = preview.revision.clone();
+    inbox
+        .persist(CloudRequest {
+            seq: 83,
+            kind: "file_preview".to_string(),
+            payload: serde_json::json!({"item_ids": [item_id], "target_relative_dir": "Existing"}),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("preview request should persist");
+    inbox
+        .update(83, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+            record.result = Some(serde_json::json!({
+                "preview_id": preview_id.clone(),
+                "revision": preview_revision.clone(),
+                "preview": preview,
+            }));
+        })
+        .expect("preview should await confirmation");
+
+    let mut runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.test_file_provider = Some(Arc::clone(&provider));
+    let confirmation_created_at = now_millis();
+    inbox
+        .persist(CloudRequest {
+            seq: 84,
+            kind: "file_confirm".to_string(),
+            payload: serde_json::json!({
+                "preview_id": preview_id.clone(),
+                "revision": preview_revision.clone(),
+            }),
+            created_at: confirmation_created_at,
+            extra: serde_json::Map::new(),
+        })
+        .expect("confirmation request should persist");
+    let confirmation = inbox
+        .update(84, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("confirmation should enter processing");
+    dispatch_cloud_record(runtime.clone(), confirmation).await;
+
+    let first_confirmation = inbox
+        .record(84)
+        .expect("confirmation receipt should load")
+        .expect("confirmation receipt should remain present");
+    let stale_preview = inbox
+        .record(83)
+        .expect("preview receipt should load")
+        .expect("preview receipt should remain present");
+    assert_eq!(first_confirmation.status, InboxStatus::Failed);
+    assert_eq!(stale_preview.status, InboxStatus::Stale);
+    assert!(first_confirmation.error.as_deref().is_some_and(|error| {
+        error.contains("cannot be retried") && error.contains("fresh preview")
+    }));
+    assert_eq!(
+        first_confirmation
+            .result
+            .as_ref()
+            .and_then(|value| value["operation"]["retryable_access_error"].as_bool()),
+        Some(false)
+    );
+    let recorded = take_cloud_test_telegram_requests(&mut telegram_requests);
+    let final_message = recorded
+        .iter()
+        .rev()
+        .find(|request| request.method == "editMessageText")
+        .and_then(|request| request.body["text"].as_str())
+        .expect("the failed batch summary should update its Telegram progress message");
+    assert!(final_message.contains("run a fresh preview before confirming again"));
+    assert!(!final_message.contains("retry the same confirmation"));
+    assert!(file_provider.move_paths().is_empty());
+
+    inbox
+        .persist(CloudRequest {
+            seq: 85,
+            kind: "file_confirm".to_string(),
+            payload: serde_json::json!({
+                "preview_id": preview_id,
+                "revision": preview_revision,
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("duplicate confirmation request should persist");
+    let stale_retry = inbox
+        .update(85, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("duplicate confirmation should enter processing");
+    dispatch_cloud_record(runtime.clone(), stale_retry).await;
+    let rejected_confirmation = inbox
+        .record(85)
+        .expect("stale retry receipt should load")
+        .expect("stale retry receipt should remain present");
+    assert_eq!(rejected_confirmation.status, InboxStatus::Failed);
+    assert!(rejected_confirmation.error.as_deref().is_some_and(|error| {
+        error.contains("no longer awaiting confirmation") && error.contains("fresh preview")
+    }));
+    assert!(
+        take_cloud_test_telegram_requests(&mut telegram_requests).is_empty(),
+        "a stale confirmation must be rejected before sending another batch progress message"
+    );
+    assert!(file_provider.move_paths().is_empty());
 
     drop(runtime);
     drop(library);
@@ -2291,7 +2494,83 @@ fn refresh_warning_does_not_change_a_partial_batch_summary() {
 
     assert!(message.contains("File batch partial-batch partially completed"));
     assert!(message.contains("Library refresh warning"));
+    assert!(message.contains("run a fresh preview before confirming again"));
+    assert!(!message.contains("retry the same confirmation"));
     assert!(!message.contains("the file batch completed"));
+}
+
+#[test]
+fn cloud_batch_result_retry_advice_matches_confirmation_availability() {
+    let cases = [
+        (
+            crate::library::BatchStatus::Complete,
+            false,
+            None,
+            Some("fresh preview"),
+        ),
+        (
+            crate::library::BatchStatus::Complete,
+            true,
+            None,
+            Some("fresh preview"),
+        ),
+        (
+            crate::library::BatchStatus::Partial,
+            true,
+            Some("Retry the same confirmation after local file access recovers."),
+            Some("fresh preview"),
+        ),
+        (
+            crate::library::BatchStatus::Partial,
+            false,
+            Some("run a fresh preview before confirming again"),
+            Some("retry the same confirmation"),
+        ),
+        (
+            crate::library::BatchStatus::Failed,
+            true,
+            Some("Retry the same confirmation after local file access recovers."),
+            Some("fresh preview"),
+        ),
+        (
+            crate::library::BatchStatus::Failed,
+            false,
+            Some("run a fresh preview before confirming again"),
+            Some("retry the same confirmation"),
+        ),
+    ];
+
+    for (status, retryable_access_error, expected, unexpected) in cases {
+        let result = crate::library::BatchMoveResult {
+            id: "advice-matrix".to_string(),
+            revision: "revision-a".to_string(),
+            status,
+            retryable_access_error,
+            items: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let message = render_cloud_batch_result(&result);
+        if let Some(expected) = expected {
+            assert!(
+                message.contains(expected),
+                "{status:?} with retryable_access_error={retryable_access_error} should contain {expected:?}: {message}"
+            );
+        } else {
+            let lowercase_message = message.to_ascii_lowercase();
+            assert!(
+                !lowercase_message.contains("confirmation")
+                    && !lowercase_message.contains("fresh preview"),
+                "completed batches should not include retry advice: {message}"
+            );
+        }
+        if let Some(unexpected) = unexpected {
+            let lowercase_message = message.to_ascii_lowercase();
+            assert!(
+                !lowercase_message.contains(unexpected),
+                "{status:?} with retryable_access_error={retryable_access_error} should not contain {unexpected:?}: {message}"
+            );
+        }
+    }
 }
 
 fn cloud_telegram_update(seq: u64, update_id: i64) -> CloudRequest {
