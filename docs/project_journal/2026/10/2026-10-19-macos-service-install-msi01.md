@@ -45,7 +45,7 @@ superseded_by:
   with warnings denied and formatting passed.
 - Before switching, both media indexes parse and all 19 indexed video records
   are readable: 14 completed and 5 cancelled. PDF has no indexed tasks.
-- Installer: 62 fake-HOME regression tests, shell integration, Bash syntax,
+- Installer: 77 fake-HOME regression tests, shell integration, Bash syntax,
   ShellCheck, Ruff 0.15.13 lint and formatting pass. Coverage includes a
   temporary build artifact inheriting group `wheel`, strict state backup
   metadata, startup PID visibility, partial-stop failures, and both rollback
@@ -64,6 +64,10 @@ superseded_by:
   aliases followed by `..`. Authentication paths are validated before stopping.
   Stderr must be an observable regular log, and readiness requires distinct
   `poll=1` and `poll=2` markers even when log paths share a hardlink.
+- Additional compatibility checks preserve configuration and working-directory
+  aliases while binding their physical targets, fail incomplete metadata walks,
+  isolate process checks by user, scan verbose logs incrementally, and restore
+  validated .NET-root discovery for first installs.
 - Existing main-checkout changes and divergent local history remain untouched.
 
 ## Controlled Cutover and Current Runtime

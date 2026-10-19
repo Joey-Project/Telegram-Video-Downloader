@@ -122,17 +122,130 @@ def validate_stderr_path(path):
         raise InstallError("StandardErrorPath must be readable and writable to observe readiness")
 
 
+def traversal_error(error):
+    raise InstallError("runtime state directory could not be completely enumerated") from error
+
+
+def strict_walk(path):
+    return os.walk(path, followlinks=False, onerror=traversal_error)
+
+
+def file_binding(configured, capture=False):
+    """Bind a read-only alias to stable file identity and bytes, allowing symlinks."""
+    configured = Path(configured)
+    try:
+        physical = configured.resolve(strict=True)
+        preliminary = physical.stat()
+        if not stat.S_ISREG(preliminary.st_mode) or preliminary.st_size > SNAPSHOT_BYTES:
+            raise InstallError("read-only service input is not a supported regular file")
+        descriptor = os.open(physical, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > SNAPSHOT_BYTES:
+                raise InstallError("read-only service input is not a supported regular file")
+            digest, chunks, total = hashlib.sha256(), [], 0
+            while chunk := stream.read(65536):
+                total += len(chunk)
+                if total > SNAPSHOT_BYTES:
+                    raise InstallError("read-only service input exceeded its size budget")
+                digest.update(chunk)
+                if capture:
+                    chunks.append(chunk)
+            stream.seek(0)
+            second, second_total = hashlib.sha256(), 0
+            while chunk := stream.read(65536):
+                second_total += len(chunk)
+                if second_total > SNAPSHOT_BYTES:
+                    raise InstallError("read-only service input exceeded its size budget")
+                second.update(chunk)
+            if digest.hexdigest() != second.hexdigest():
+                raise InstallError("read-only service input changed while being read")
+        current = physical.stat()
+        if configured.resolve(strict=True) != physical or (current.st_dev, current.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            raise InstallError("read-only service input binding changed while being read")
+    except (OSError, RuntimeError):
+        raise InstallError(f"read-only service input cannot be bound: {configured}") from None
+    return {
+        "configured": str(configured),
+        "physical": str(physical),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "sha256": digest.hexdigest(),
+    }, b"".join(chunks) if capture else None
+
+
+def directory_binding(configured):
+    try:
+        physical = Path(configured).resolve(strict=True)
+        metadata = physical.stat()
+    except (OSError, RuntimeError):
+        raise InstallError(f"working directory cannot be bound: {configured}") from None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise InstallError("working directory must resolve to a directory")
+    return {
+        "configured": str(configured),
+        "physical": str(physical),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+    }
+
+
+def detect_dotnet_root(explicit=None, home=None):
+    def valid(candidate):
+        return (candidate / "shared/Microsoft.NETCore.App").is_dir() or (
+            candidate / "host/fxr"
+        ).is_dir()
+
+    if explicit:
+        candidate = absolute(explicit, Path.cwd())
+        if not valid(candidate):
+            raise InstallError("BOT_DOTNET_ROOT does not identify a .NET runtime root")
+        return candidate.resolve(strict=True)
+    if shutil.which("dotnet"):
+        try:
+            result = run(["dotnet", "--list-runtimes"], check=False, timeout=10)
+            for line in result.stdout.splitlines():
+                match = re.search(r"\[(.+)/shared/[^\]]+\]", line)
+                if match and valid(Path(match.group(1))):
+                    return Path(match.group(1)).resolve(strict=True)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    for candidate in [
+        Path(home or Path.home()) / ".dotnet",
+        Path("/usr/local/share/dotnet"),
+        Path("/opt/homebrew/share/dotnet"),
+    ]:
+        if valid(candidate):
+            return candidate.resolve(strict=True)
+    return None
+
+
 def check_tree(path):
     no_symlinks(path)
-    if Path(path).exists() and not (Path(path).is_file() or Path(path).is_dir()):
+    try:
+        metadata = Path(path).lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise InstallError(f"runtime state entry cannot be inspected: {path}") from None
+    if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)):
         raise InstallError(f"unsupported filesystem entry: {path}")
-    if Path(path).is_dir():
-        for root, dirs, files in os.walk(path, followlinks=False):
+    required_access = os.R_OK | os.X_OK if stat.S_ISDIR(metadata.st_mode) else os.R_OK
+    if not os.access(path, required_access):
+        raise InstallError(f"runtime state entry is not readable: {path}")
+    if stat.S_ISDIR(metadata.st_mode):
+        for root, dirs, files in strict_walk(path):
             for name in dirs + files:
                 child = Path(root) / name
                 mode = child.lstat().st_mode
                 if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
                     raise InstallError(f"unsupported state entry: {child}")
+                required_access = os.R_OK | os.X_OK if stat.S_ISDIR(mode) else os.R_OK
+                if not os.access(child, required_access):
+                    raise InstallError(f"runtime state entry is not readable: {child}")
 
 
 def preserve_copy(source, destination):
@@ -147,7 +260,7 @@ def preserve_copy(source, destination):
     entries = [source]
     if source.is_dir():
         entries.extend(
-            Path(root) / name for root, dirs, files in os.walk(source) for name in dirs + files
+            Path(root) / name for root, dirs, files in strict_walk(source) for name in dirs + files
         )
     for old in entries:
         new = destination / old.relative_to(source) if source.is_dir() else destination
@@ -273,21 +386,24 @@ def stop_services(targets):
 
 
 def process_inventory():
-    """Read executable paths, not macOS's truncated names or process arguments."""
-    result = run(["/bin/ps", "-axww", "-o", "pid=,ppid=,comm="], check=False)
+    """Read this user's executable paths without truncated names or arguments."""
+    result = run(["/bin/ps", "-axww", "-o", "pid=,ppid=,uid=,comm="], check=False)
     if result.returncode:
         raise InstallError("cannot inspect downloader processes")
     inventory = {}
     for line in result.stdout.splitlines():
         if not line.strip():
             continue
-        fields = line.strip().split(None, 2)
-        if len(fields) != 3 or not all(re.fullmatch(r"[0-9]+", value) for value in fields[:2]):
+        fields = line.strip().split(None, 3)
+        if len(fields) != 4 or not all(re.fullmatch(r"[0-9]+", value) for value in fields[:3]):
             raise InstallError("unexpected downloader process inventory")
-        pid, parent, executable = int(fields[0]), int(fields[1]), Path(fields[2])
+        pid, parent, uid = (int(value) for value in fields[:3])
+        if uid != os.geteuid():
+            continue
+        executable = Path(fields[3])
         if pid in inventory:
             raise InstallError("duplicate PID in downloader process inventory")
-        inventory[pid] = {"parent": parent, "executable": executable}
+        inventory[pid] = {"parent": parent, "uid": uid, "executable": executable}
     return inventory
 
 
@@ -459,7 +575,9 @@ def build_release(repo, backup):
 def file_manifest(root, budget=SNAPSHOT_BYTES, deadline=None):
     files = [Path(root)]
     if Path(root).is_dir():
-        files = [Path(directory) / name for directory, _, names in os.walk(root) for name in names]
+        files = [
+            Path(directory) / name for directory, _, names in strict_walk(root) for name in names
+        ]
     entries = []
     total = 0
     for path in sorted(files):
@@ -621,6 +739,149 @@ def validate_transaction(transaction, label=None):
     return copy.deepcopy(transaction)
 
 
+def capture_log_offsets(paths):
+    """Bind pre-bootstrap log objects and their append boundary, without contents."""
+    offsets = {}
+    for path in paths:
+        try:
+            metadata = path.stat()
+        except FileNotFoundError:
+            offsets[str(path)] = {"offset": 0, "device": None, "inode": None}
+            continue
+        except OSError:
+            raise InstallError("cannot inspect the startup log boundary") from None
+        if not stat.S_ISREG(metadata.st_mode):
+            continue
+        offsets[str(path)] = {
+            "offset": metadata.st_size,
+            "device": metadata.st_dev,
+            "inode": metadata.st_ino,
+        }
+    return offsets
+
+
+class _ReadinessLogScanner:
+    """Scan only appended bytes, keeping bounded parser state for each log object."""
+
+    CHUNK_BYTES = 256 * 1024
+    STARTED = b"telegram local downloader started"
+    POLLS = {b"telegram polling completed poll=1", b"telegram polling completed poll=2"}
+    STARTED_PREFIX = STARTED + b" concurrency="
+    LINE_BYTES = len(STARTED_PREFIX) + 20 + 1
+
+    def __init__(self, paths, offsets):
+        self.paths = list(dict.fromkeys(paths))
+        self.boundaries = {}
+        self.streams = {}
+        for path in self.paths:
+            boundary = offsets.get(str(path), 0)
+            if isinstance(boundary, int):
+                # Retain the small direct-call interface; deployments capture object identity.
+                boundary = {"offset": boundary, "device": None, "inode": None}
+            self.boundaries[path] = dict(boundary)
+
+    def scan(self):
+        opened = []
+        try:
+            for path in self.paths:
+                boundary = self.boundaries[path]
+                try:
+                    metadata = path.stat()
+                    if not stat.S_ISREG(metadata.st_mode):
+                        if boundary["device"] is not None:
+                            raise InstallError("startup log changed during readiness verification")
+                        continue
+                    stream = path.open("rb")
+                except FileNotFoundError:
+                    if boundary["device"] is not None:
+                        raise InstallError(
+                            "startup log changed during readiness verification"
+                        ) from None
+                    continue
+                except OSError:
+                    raise InstallError(
+                        "startup log cannot be read for readiness verification"
+                    ) from None
+                opened.append((path, stream))
+                metadata = os.fstat(stream.fileno())
+                identity = (metadata.st_dev, metadata.st_ino)
+                if boundary["device"] is not None and identity != (
+                    boundary["device"],
+                    boundary["inode"],
+                ):
+                    raise InstallError("startup log changed during readiness verification")
+                boundary["device"], boundary["inode"] = identity
+                state = self.streams.get(identity)
+                if state is None:
+                    state = {
+                        "offset": boundary["offset"],
+                        "line": b"",
+                        "overflow": False,
+                        "started": False,
+                        "polls": set(),
+                        "initialized": False,
+                    }
+                    self.streams[identity] = state
+                elif not state["initialized"]:
+                    # Aliases to one log object share the furthest captured boundary.
+                    state["offset"] = max(state["offset"], boundary["offset"])
+            scanned = set()
+            for _, stream in opened:
+                metadata = os.fstat(stream.fileno())
+                identity = (metadata.st_dev, metadata.st_ino)
+                if identity in scanned:
+                    continue
+                scanned.add(identity)
+                state = self.streams[identity]
+                # Device/inode protects the object; size protects the append boundary.
+                # Normal appends may change all timestamps and are deliberately allowed.
+                if metadata.st_size < state["offset"]:
+                    raise InstallError("startup log changed during readiness verification")
+                if not state["initialized"]:
+                    if state["offset"]:
+                        stream.seek(state["offset"] - 1)
+                        state["overflow"] = stream.read(1) != b"\n"
+                    state["initialized"] = True
+                stream.seek(state["offset"])
+                data = stream.read(self.CHUNK_BYTES)
+                state["offset"] += len(data)
+                fragments = data.split(b"\n")
+                for index, fragment in enumerate(fragments):
+                    line = state["line"] + fragment
+                    if index < len(fragments) - 1:
+                        if not state["overflow"] and len(line) <= self.LINE_BYTES:
+                            line = line.removesuffix(b"\r")
+                            state["started"] |= line == self.STARTED or (
+                                line.startswith(self.STARTED_PREFIX)
+                                and line[len(self.STARTED_PREFIX) :].isdigit()
+                            )
+                            if line in self.POLLS:
+                                state["polls"].add(line)
+                        state["line"], state["overflow"] = b"", False
+                    else:
+                        state["overflow"] |= len(line) > self.LINE_BYTES
+                        state["line"] = line[-self.LINE_BYTES :]
+            for path, stream in opened:
+                try:
+                    current = path.stat()
+                except OSError:
+                    raise InstallError(
+                        "startup log changed during readiness verification"
+                    ) from None
+                opened_metadata = os.fstat(stream.fileno())
+                if (current.st_dev, current.st_ino) != (
+                    opened_metadata.st_dev,
+                    opened_metadata.st_ino,
+                ) or current.st_size < self.streams[(current.st_dev, current.st_ino)]["offset"]:
+                    raise InstallError("startup log changed during readiness verification")
+        finally:
+            for _, stream in opened:
+                stream.close()
+        started = any(state["started"] for state in self.streams.values())
+        polls = set().union(*(state["polls"] for state in self.streams.values()))
+        return started and self.POLLS.issubset(polls)
+
+
 class Deployment:
     def __init__(self, args):
         self.args = args
@@ -644,7 +905,10 @@ class Deployment:
         if args.legacy_domain and args.legacy_domain != args.domain:
             self.targets.append(f"{args.legacy_domain}/{args.label}")
         no_symlinks(self.plist_path)
-        self.old_plist_bytes = self.plist_path.read_bytes() if self.plist_path.exists() else None
+        if self.plist_path.exists():
+            self.plist_binding, self.old_plist_bytes = file_binding(self.plist_path, capture=True)
+        else:
+            self.plist_binding, self.old_plist_bytes = None, None
         self.old_plist = plistlib.loads(self.old_plist_bytes) if self.old_plist_bytes else None
         environment = self.old_plist.get("EnvironmentVariables", {}) if self.old_plist else {}
         if not isinstance(environment, dict) or (
@@ -714,18 +978,14 @@ class Deployment:
         for path in [
             self.binary,
             self.backups,
-            self.config,
-            self.old_binary,
-            self.workdir,
             *self.log_paths,
         ]:
             no_symlinks(path)
-        if not self.config.is_file():
-            raise InstallError(f"configuration is missing: {self.config}")
-        # Runtime reads this same path, then canonicalizes its parent for relative fields.
-        self.config_parent = self.config.resolve(strict=True).parent
+        self.workdir_binding = directory_binding(self.workdir)
+        self.config_binding, contents = file_binding(self.config, capture=True)
+        self.config_parent = Path(self.config_binding["physical"]).parent
         try:
-            self.document = tomllib.loads(self.config.read_text())
+            self.document = tomllib.loads(contents.decode("utf-8"))
         except (UnicodeError, tomllib.TOMLDecodeError):
             raise InstallError("configuration is not valid UTF-8 TOML") from None
         auth = self.document.get("bilibili", {}).get("auth", {})
@@ -769,9 +1029,15 @@ class Deployment:
             kind: media_binding(directory) for kind, directory in self.media.items()
         }
         if self.old_plist or self.old_binary.exists():
-            self.requirement, self.identity = signature(self.old_binary)
+            self.old_binary_binding, _ = file_binding(self.old_binary)
+            self.requirement, self.identity = signature(Path(self.old_binary_binding["physical"]))
         else:
+            self.old_binary_binding = None
             self.requirement, self.identity = initial_identity()
+        self.dotnet_root = (
+            detect_dotnet_root(self.args.dotnet_root, self.home) if not self.old_plist else None
+        )
+        self.state_inventory()
         registered = [info for target in self.targets if (info := service_info(target))]
         if len({info["pid"] for info in registered if info["pid"]}) > 1:
             raise InstallError(
@@ -811,10 +1077,11 @@ class Deployment:
                 "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
             ),
         }
-        if self.args.dotnet_root:
+        if self.dotnet_root:
             environment.update(
-                {"DOTNET_ROOT": self.args.dotnet_root, "DOTNET_ROOT_ARM64": self.args.dotnet_root}
+                {"DOTNET_ROOT": str(self.dotnet_root), "DOTNET_ROOT_ARM64": str(self.dotnet_root)}
             )
+            environment["PATH"] = f"{self.dotnet_root}:{environment['PATH']}"
         return plistlib.dumps(
             {
                 "Label": self.args.label,
@@ -833,24 +1100,53 @@ class Deployment:
             if media_binding(directory) != self.media_bindings[kind]:
                 raise InstallError(f"media root binding changed: {directory}")
 
-    def snapshot_state(self, backup):
-        """Back up config/auth/queue and recovery metadata, never media payloads.
+    def revalidate_runtime_bindings(self):
+        if directory_binding(self.workdir) != self.workdir_binding:
+            raise InstallError("working directory binding changed after audit")
+        current, _ = file_binding(self.config)
+        if current != self.config_binding:
+            raise InstallError("configuration binding or content changed after audit")
+        if self.old_binary_binding is not None:
+            current, _ = file_binding(self.old_binary)
+            if current != self.old_binary_binding:
+                raise InstallError("trusted executable binding or content changed after audit")
+        if self.plist_binding is None:
+            if self.plist_path.exists() or self.plist_path.is_symlink():
+                raise InstallError("LaunchAgent plist appeared after audit")
+        else:
+            no_symlinks(self.plist_path)
+            current, _ = file_binding(self.plist_path)
+            if current != self.plist_binding:
+                raise InstallError("LaunchAgent plist binding or content changed after audit")
 
-        Original lock inode identities are in the manifest. Copies are forensic
-        evidence, not valid replacements for inode-bound lock/owner records.
-        """
-        deadline = time.monotonic() + SNAPSHOT_SECONDS
+    def state_inventory(self, deadline=None):
+        """Require complete enumeration before stopping and again before copying."""
+        deadline = deadline or time.monotonic() + SNAPSHOT_SECONDS
+        self.revalidate_runtime_bindings()
         self.revalidate_media_bindings()
-        candidates = {self.config}
+        candidates = {Path(self.config_binding["physical"])}
         anchors = {}
         for source in self.auth_paths.values():
             no_symlinks(source)
-            if source.parent.exists():
-                candidates.update(source.parent.glob(source.name + "*"))
+            try:
+                with os.scandir(source.parent) as entries:
+                    candidates.update(
+                        Path(entry.path) for entry in entries if entry.name.startswith(source.name)
+                    )
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise InstallError(
+                    "auth state directory could not be completely enumerated"
+                ) from None
         physical_roots = {Path(binding["physical"]) for binding in self.media_bindings.values()}
         for directory in physical_roots:
-            if not directory.exists():
+            try:
+                directory.stat()
+            except FileNotFoundError:
                 continue
+            except OSError:
+                raise InstallError("media state directory cannot be inspected") from None
             for name in [
                 ".telegram-video-downloader-queue",
                 ".telegram-video-downloader.lock",
@@ -858,7 +1154,7 @@ class Deployment:
             ]:
                 candidates.add(directory / name)
             visited = 0
-            for root, dirs, files in os.walk(directory, followlinks=False):
+            for root, dirs, files in strict_walk(directory):
                 if time.monotonic() >= deadline:
                     raise InstallError("media metadata inventory exceeded its two-minute budget")
                 visited += len(dirs) + len(files)
@@ -902,9 +1198,21 @@ class Deployment:
         selected = []
         for path in sorted(candidates, key=lambda entry: (len(entry.parts), str(entry))):
             no_symlinks(path)
-            if path.exists() and not any(parent in selected for parent in path.parents):
+            try:
+                path.stat()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise InstallError("runtime state entry cannot be inspected") from None
+            if not any(parent in selected for parent in path.parents):
                 check_tree(path)
                 selected.append(path)
+        return selected, anchors
+
+    def snapshot_state(self, backup):
+        """Copy state metadata; media payload anchors remain inode evidence only."""
+        deadline = time.monotonic() + SNAPSHOT_SECONDS
+        selected, anchors = self.state_inventory(deadline)
         manifest = []
         hardlinks = {}
         total = 0
@@ -934,6 +1242,7 @@ class Deployment:
             if (current["device"], current["inode"]) != (evidence["device"], evidence["inode"]):
                 raise InstallError(f"media anchor identity changed: {path}")
         self.revalidate_media_bindings()
+        self.revalidate_runtime_bindings()
         atomic_bytes(
             backup / "state-manifest.json",
             json.dumps(
@@ -942,6 +1251,11 @@ class Deployment:
                     "entries": manifest,
                     "media_roots": self.media_bindings,
                     "anchors": list(anchors.values()),
+                    "runtime_bindings": {
+                        "config": self.config_binding,
+                        "working_directory": self.workdir_binding,
+                        "previous_binary": self.old_binary_binding,
+                    },
                 },
                 indent=2,
             ).encode(),
@@ -951,6 +1265,7 @@ class Deployment:
     def wait_ready(self, offsets):
         deadline = time.monotonic() + self.args.ready_timeout
         observed_pid = None
+        logs = _ReadinessLogScanner(self.log_paths, offsets)
         while time.monotonic() < deadline:
             current = service_info(self.targets[0])
             if current and current["pid"]:
@@ -970,16 +1285,7 @@ class Deployment:
                         "expected exactly one downloader process after bootstrap: "
                         f"expected PID {current['pid']}, observed PIDs {sorted(processes)}"
                     )
-                output = ""
-                for path in self.log_paths:
-                    if path.is_file():
-                        with path.open("rb") as stream:
-                            stream.seek(offsets.get(str(path), 0))
-                            output += stream.read(2 * 1024 * 1024).decode(errors="replace")
-                if "telegram local downloader started" in output and {
-                    "telegram polling completed poll=1",
-                    "telegram polling completed poll=2",
-                }.issubset(output.splitlines()):
+                if logs.scan():
                     listing = run(
                         ["lsof", "-nP", "-a", "-p", str(current["pid"]), "-d", "cwd,txt", "-Ffn"]
                     ).stdout
@@ -989,10 +1295,29 @@ class Deployment:
                             descriptor = line[1:]
                         elif line.startswith("n") and descriptor in names:
                             names[descriptor].add(line[1:])
-                    if (
-                        str(self.binary) not in names["txt"]
-                        or str(self.workdir) not in names["cwd"]
-                    ):
+                    binding = getattr(self, "workdir_binding", None)
+                    try:
+                        configured = self.workdir.stat()
+                        expected = (
+                            (binding["device"], binding["inode"])
+                            if binding
+                            else (configured.st_dev, configured.st_ino)
+                        )
+                        valid_cwd = (
+                            stat.S_ISDIR(configured.st_mode)
+                            and (configured.st_dev, configured.st_ino) == expected
+                            and any(
+                                stat.S_ISDIR(metadata.st_mode)
+                                and (metadata.st_dev, metadata.st_ino) == expected
+                                for path in names["cwd"]
+                                for metadata in [Path(path).stat()]
+                            )
+                        )
+                    except OSError:
+                        raise InstallError(
+                            "running working directory cannot be inspected"
+                        ) from None
+                    if str(self.binary) not in names["txt"] or not valid_cwd:
                         raise InstallError(
                             "running executable or working directory "
                             "differs from the installed plist"
@@ -1005,13 +1330,14 @@ class Deployment:
         )
 
     def deploy(self):
+        self.revalidate_runtime_bindings()
         stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S.%fZ")
         backup = self.backups / stamp
         no_symlinks(backup)
         backup.mkdir(parents=True, mode=0o700)
         # Capture trusted executable and exact plist before Cargo runs.
-        if self.old_binary.exists():
-            preserve_copy(self.old_binary, backup / "previous-binary")
+        if self.old_binary_binding is not None:
+            preserve_copy(Path(self.old_binary_binding["physical"]), backup / "previous-binary")
         if self.old_plist_bytes:
             preserve_copy(self.plist_path, backup / "previous.plist")
         atomic_bytes(backup / "designated-requirement.txt", self.requirement.encode())
@@ -1034,6 +1360,7 @@ class Deployment:
         # Prove the retained fallback is usable before building or stopping the service.
         transaction = validate_transaction(transaction, self.args.label)
         validate_saved_plist(backup, transaction)
+        self.revalidate_runtime_bindings()
         staged = backup / "staged-binary"
         source = self.input_binary or self.repo / "target/release" / EXECUTABLE
         try:
@@ -1043,7 +1370,12 @@ class Deployment:
                     source = built_source
             if not source.is_file() or not os.access(source, os.X_OK):
                 raise InstallError(f"input artifact is not executable: {source}")
-            stage_artifact(source, staged, self.old_binary)
+            trusted = (
+                Path(self.old_binary_binding["physical"])
+                if self.old_binary_binding
+                else self.old_binary
+            )
+            stage_artifact(source, staged, trusted)
             run(
                 ["codesign", "--force", "--sign", self.identity, "--identifier", IDENTIFIER, staged]
             )
@@ -1070,14 +1402,13 @@ class Deployment:
         stopped = False
         try:
             validate_stderr_path(self.stderr_path)
+            self.state_inventory()
             # Set this before bootout: a later domain may fail after the first stopped.
             stopped = True
             stop_services(self.targets)
             wait_for_no_bot_processes()
             state_entries = self.snapshot_state(backup)
-            offsets = {
-                str(path): path.stat().st_size if path.exists() else 0 for path in self.log_paths
-            }
+            offsets = capture_log_offsets(self.log_paths)
             atomic_install(staged, self.binary)
             run(
                 [
@@ -1215,8 +1546,9 @@ def validate_original_entrypoint(backup, transaction, saved=None):
     original = absolute(arguments[0], previous.get("WorkingDirectory", Path.home()))
     if original != Path(transaction["previous_binary"]):
         raise InstallError("saved original entrypoint does not match the backup transaction")
-    no_symlinks(original)
-    if not original.is_file() or not os.access(original, os.X_OK):
+    binding, _ = file_binding(original)
+    physical = Path(binding["physical"])
+    if not os.access(physical, os.X_OK):
         raise InstallError(f"original entrypoint is missing or not executable: {original}")
     run(
         [
@@ -1225,15 +1557,18 @@ def validate_original_entrypoint(backup, transaction, saved=None):
             "--strict",
             "--test-requirement",
             "=" + transaction["requirement"],
-            original,
+            physical,
         ]
     )
-    with original.open("rb") as current, (backup / "previous-binary").open("rb") as saved:
+    with physical.open("rb") as current, (backup / "previous-binary").open("rb") as saved:
         if (
             hashlib.file_digest(current, "sha256").digest()
             != hashlib.file_digest(saved, "sha256").digest()
         ):
             raise InstallError("original entrypoint differs from the saved previous executable")
+    current_binding, _ = file_binding(original)
+    if current_binding != binding:
+        raise InstallError("original entrypoint changed during rollback preflight")
     return original, previous_plist
 
 

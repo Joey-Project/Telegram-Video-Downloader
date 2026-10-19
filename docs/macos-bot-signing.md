@@ -42,9 +42,12 @@ Application Support or remove it as part of Cargo cache cleanup. Copied lock
 backups are recovery evidence; they cannot be blindly substituted for original
 inode-bound objects.
 
-Configured media aliases remain unchanged. Snapshotting resolves and binds the
-physical root, then rejects alias retargeting or root replacement while allowing
-ordinary child-entry changes. Unrelated symlinked media subdirectories are
+Configured configuration, working-directory and media aliases remain unchanged.
+The installer binds their physical targets and configuration content, rejecting
+retargeting, replacement or configuration edits across the build and snapshot.
+Ordinary directory child-entry changes remain allowed. Metadata traversal errors
+abort deployment instead of silently omitting unreadable state. Unrelated
+symlinked media subdirectories are
 skipped; links selected as transactional metadata still fail validation.
 Media hardlink anchors such as `output.anchor`
 and committed overwrite anchors are recorded by device/inode, size, and link
@@ -84,6 +87,16 @@ with distinct `poll=1` and `poll=2` markers for its first two successful polls;
 these logs contain no token, URL, or message
 payload. Check queue/completion readability and preserved ownership/permissions.
 Do not use a second `getUpdates` consumer to test polling.
+
+Process checks cover this user's service and download workers, independently of
+other users' installations. Working-directory checks compare directory identity.
+Readiness scanning advances through bounded log chunks so verbose output does
+not hide later markers; observed rotation or truncation fails verification.
+
+For a first installation, the installer validates an explicit .NET root or
+discovers the runtime through `dotnet --list-runtimes` and the standard private
+and system locations. It sets the runtime-root variables for BBDown apphosts
+when a root is found. Existing LaunchAgent environments are preserved.
 
 The installer's retained backup path is its rollback handle:
 

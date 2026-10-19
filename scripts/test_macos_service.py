@@ -521,6 +521,193 @@ class InstallationTest(unittest.TestCase):
         self.assertFalse((self.home / ".local/lib/telegram-video-downloader/backups").exists())
         self.external.assert_not_called()
 
+    def test_config_leaf_and_parent_aliases_preserve_argv_and_snapshot_the_canonical_target(self):
+        physical = self.root / "physical-config"
+        physical.mkdir()
+        source = physical / "config.toml"
+        source.write_bytes(self.config.read_bytes())
+        source.chmod(0o600)
+        shutil.copytree(self.repo / "media", physical / "media")
+        shutil.copytree(self.repo / "auth", physical / "auth")
+        self.config.unlink()
+        self.config.symlink_to(source)
+        parent_alias = self.root / "config-directory-alias"
+        parent_alias.symlink_to(physical, target_is_directory=True)
+        for label, configured in [("leaf", self.config), ("parent", parent_alias / "config.toml")]:
+            with self.subTest(config_alias=label):
+                original = {
+                    **self.original_plist,
+                    "ProgramArguments": [str(self.old_binary), str(configured)],
+                }
+                self.plist.write_bytes(plistlib.dumps(original))
+                deployment = self.deployment()
+                plan = self.audit(deployment)
+                self.assertEqual(deployment.config, configured)
+                self.assertEqual(plan["config"], str(configured))
+                self.assertEqual(deployment.media["video"], physical / "media/videos")
+                self.assertEqual(deployment.auth_paths["state_path"], physical / "auth/state.json")
+                backup = self.root / f"config-alias-snapshot-{label}"
+                backup.mkdir()
+                with self.snapshot_runner():
+                    deployment.snapshot_state(backup)
+                manifest = json.loads((backup / "state-manifest.json").read_text())
+                sources = {Path(entry["source"]) for entry in manifest["entries"]}
+                self.assertIn(source, sources)
+                self.assertNotIn(configured, sources)
+                self.assertIn(physical / "auth/credentials.json", sources)
+                expected = {
+                    **original,
+                    "ProgramArguments": [str(deployment.binary), str(configured)],
+                }
+                self.assertEqual(plistlib.loads(deployment.new_plist()), expected)
+
+    def test_read_only_input_changes_after_audit_fail_before_build_or_stopping(self):
+        original_bytes = self.config.read_bytes()
+        for index, mutation in enumerate(["retarget", "replace", "content", "plist", "workdir"]):
+            with self.subTest(input_change=mutation):
+                physical = self.root / f"bound-config-{index}.toml"
+                physical.write_bytes(original_bytes)
+                if self.config.exists() or self.config.is_symlink():
+                    self.config.unlink()
+                self.config.symlink_to(physical)
+                workdir = self.root / f"bound-workdir-{index}"
+                workdir.mkdir()
+                original = {**self.original_plist, "WorkingDirectory": str(workdir)}
+                self.plist.write_bytes(plistlib.dumps(original))
+                deployment = self.deployment("deploy")
+                _, registry = self.transaction_environment(deployment)
+                deployment.audit()
+                if mutation in {"retarget", "replace"}:
+                    replacement = self.root / f"replacement-config-{index}.toml"
+                    replacement.write_bytes(original_bytes)
+                    if mutation == "retarget":
+                        self.config.unlink()
+                        self.config.symlink_to(replacement)
+                    else:
+                        os.replace(replacement, physical)
+                elif mutation == "content":
+                    physical.write_bytes(original_bytes + b"\n# changed after audit\n")
+                elif mutation == "plist":
+                    self.plist.write_bytes(plistlib.dumps({**original, "ChangedAfterAudit": True}))
+                else:
+                    workdir.rename(self.root / f"old-workdir-{index}")
+                    workdir.mkdir()
+                expected = self.state_snapshot()
+                with (
+                    mock.patch.object(service, "stop_services") as stop,
+                    mock.patch.object(service, "build_release") as build,
+                    mock.patch.object(service, "atomic_install") as install,
+                    self.assertRaises(service.InstallError),
+                ):
+                    deployment.deploy()
+                stop.assert_not_called()
+                build.assert_not_called()
+                install.assert_not_called()
+                self.assertEqual(registry, {self.gui: 101, self.legacy: None})
+                self.assertEqual(self.state_snapshot(), expected)
+
+    def traversal_failure(self, denied, *, when=None):
+        original_walk = os.walk
+
+        def failed(top, *args, **kwargs):
+            if Path(top) == denied and (when is None or when()):
+                error = PermissionError(f"simulated unreadable metadata directory: {denied}")
+                if kwargs.get("onerror"):
+                    kwargs["onerror"](error)
+                return iter(())
+            return original_walk(top, *args, **kwargs)
+
+        return mock.patch.object(service.os, "walk", side_effect=failed)
+
+    def test_unreadable_media_inventory_fails_during_audit_before_service_stop(self):
+        deployment = self.deployment("deploy")
+        with (
+            self.traversal_failure(self.repo / "media/videos"),
+            self.assertRaises((service.InstallError, OSError)),
+        ):
+            self.audit(deployment)
+        self.assertFalse(deployment.backups.exists())
+        self.assertEqual(self.state_snapshot(), self.before_state)
+        self.external.assert_not_called()
+
+    def test_unreadable_state_directory_never_becomes_a_partial_successful_manifest(self):
+        queue = self.repo / "media/videos/.telegram-video-downloader-queue"
+        for operation in [service.check_tree, service.file_manifest]:
+            with (
+                self.subTest(operation=operation.__name__),
+                self.traversal_failure(queue),
+                self.assertRaises((service.InstallError, OSError)),
+            ):
+                operation(queue)
+
+    def test_snapshot_traversal_error_after_stop_does_not_install_the_new_binary(self):
+        deployment = self.deployment("deploy", "--no-build", "--binary", str(self.artifact))
+        _, registry = self.transaction_environment(deployment)
+        deployment.audit()
+        install = service.atomic_install
+        with (
+            self.traversal_failure(self.repo / "media/videos", when=lambda: not registry),
+            mock.patch.object(service, "atomic_install", wraps=install) as installed,
+            self.assertRaises((service.InstallError, OSError)),
+        ):
+            deployment.deploy()
+        self.assertFalse(
+            any(Path(call.args[0]).name == "staged-binary" for call in installed.call_args_list)
+        )
+        self.assertEqual(deployment.binary.read_bytes(), b"old signed executable")
+        self.assertEqual(registry, {self.gui: 303})
+        self.assertEqual(self.state_snapshot(), self.before_state)
+
+    def test_first_install_discovers_private_dotnet_and_preserves_existing_service_environment(
+        self,
+    ):
+        previous = self.plist.read_bytes()
+        self.plist.unlink()
+        private = self.home / ".dotnet"
+        (private / "shared/Microsoft.NETCore.App/8.0.0").mkdir(parents=True)
+        deployment = self.deployment("plan")
+        with (
+            mock.patch.object(service.shutil, "which", return_value=None),
+            mock.patch.object(service, "initial_identity", return_value=(REQUIREMENT, FINGERPRINT)),
+        ):
+            self.audit(deployment)
+        environment = plistlib.loads(deployment.new_plist())["EnvironmentVariables"]
+        self.assertEqual(environment["DOTNET_ROOT"], str(private))
+        self.assertEqual(environment["DOTNET_ROOT_ARM64"], str(private))
+        self.assertTrue(environment["PATH"].startswith(str(private) + ":"))
+        self.plist.write_bytes(previous)
+        existing = self.deployment("plan", "--dotnet-root", str(self.root / "invalid-runtime"))
+        with mock.patch.object(
+            service,
+            "detect_dotnet_root",
+            side_effect=AssertionError("existing environment must be preserved"),
+        ):
+            self.audit(existing)
+        self.assertEqual(
+            plistlib.loads(existing.new_plist())["EnvironmentVariables"],
+            self.original_plist["EnvironmentVariables"],
+        )
+
+    def test_first_install_validates_an_explicit_dotnet_runtime_before_deployment(self):
+        self.plist.unlink()
+        explicit = self.root / "explicit runtime"
+        (explicit / "host/fxr/8.0.0").mkdir(parents=True)
+        deployment = self.deployment("plan", "--dotnet-root", str(explicit))
+        with mock.patch.object(
+            service, "initial_identity", return_value=(REQUIREMENT, FINGERPRINT)
+        ):
+            self.audit(deployment)
+        environment = plistlib.loads(deployment.new_plist())["EnvironmentVariables"]
+        self.assertEqual(environment["DOTNET_ROOT"], str(explicit))
+        invalid = self.deployment("deploy", "--dotnet-root", str(self.root / "missing-runtime"))
+        with (
+            mock.patch.object(service, "initial_identity", return_value=(REQUIREMENT, FINGERPRINT)),
+            self.assertRaises(service.InstallError),
+        ):
+            self.audit(invalid)
+        self.assertFalse(invalid.backups.exists())
+        self.external.assert_not_called()
+
     def snapshot_runner(self, *, on_copy=None, forbidden=()):
         def copied(argv, **_):
             self.assertEqual(argv[0], "ditto")
@@ -635,34 +822,29 @@ class InstallationTest(unittest.TestCase):
         self.assertEqual(outside_metadata.read_bytes(), b"outside configured media inventory")
         self.assertEqual(self.state_snapshot(), self.before_state)
 
-    def test_snapshot_rejects_symlink_for_selected_control_metadata(self):
+    def test_audit_rejects_symlink_for_selected_control_metadata(self):
         selected = self.repo / "media/videos/.telegram-video-downloader-control/owner.json"
         outside = self.root / "external-owner.json"
         outside.write_bytes(b"external control metadata must not be followed")
         selected.unlink()
         selected.symlink_to(outside)
         deployment = self.deployment()
-        self.audit(deployment)
-        backup = self.root / "selected-symlink-snapshot"
-        backup.mkdir()
-        with self.snapshot_runner(forbidden={outside}), self.assertRaises(service.InstallError):
-            deployment.snapshot_state(backup)
+        with self.assertRaises(service.InstallError):
+            self.audit(deployment)
+        self.assertFalse(deployment.backups.exists())
         self.assertEqual(outside.read_bytes(), b"external control metadata must not be followed")
+        self.external.assert_not_called()
 
-    def test_snapshot_rejects_symlink_for_selected_control_directory(self):
+    def test_audit_rejects_symlink_for_selected_control_directory(self):
         selected = self.repo / "media/videos/.telegram-video-downloader-control"
         outside = self.root / "external-control-directory"
         selected.rename(outside)
         selected.symlink_to(outside, target_is_directory=True)
         deployment = self.deployment()
-        self.audit(deployment)
-        backup = self.root / "selected-directory-symlink-snapshot"
-        backup.mkdir()
-        with (
-            self.snapshot_runner(forbidden={outside / "owner.json"}),
-            self.assertRaises(service.InstallError),
-        ):
-            deployment.snapshot_state(backup)
+        with self.assertRaises(service.InstallError):
+            self.audit(deployment)
+        self.assertFalse(deployment.backups.exists())
+        self.external.assert_not_called()
 
     def test_sparse_media_anchors_are_metadata_only_and_do_not_consume_snapshot_budget(self):
         media = self.repo / "media/videos"
@@ -710,12 +892,20 @@ class InstallationTest(unittest.TestCase):
         self.assertTrue(copied_paths.isdisjoint(protected))
         self.assertEqual(self.state_snapshot(), self.before_state)
 
-    def test_symlink_source_binary_is_rejected_before_external_commands(self):
+    def test_trusted_binary_alias_is_bound_and_retargeting_is_rejected(self):
         actual = self.repo / "actual-binary"
         self.old_binary.rename(actual)
         self.old_binary.symlink_to(actual)
+        deployment = self.deployment()
+        self.audit(deployment)
+        self.assertEqual(deployment.old_binary, self.old_binary)
+        self.assertEqual(deployment.old_binary_binding["physical"], str(actual))
+        replacement = self.root / "replacement-binary"
+        shutil.copy2(actual, replacement)
+        self.old_binary.unlink()
+        self.old_binary.symlink_to(replacement)
         with self.assertRaises(service.InstallError):
-            self.audit(self.deployment())
+            deployment.revalidate_runtime_bindings()
         self.external.assert_not_called()
 
     def test_unmanaged_process_rejects_migration_before_state_changes(self):
@@ -1270,6 +1460,7 @@ class InstallationTest(unittest.TestCase):
             mock.patch.object(
                 service, "signature", side_effect=AssertionError("input artifact is unsigned")
             ),
+            mock.patch.object(service, "detect_dotnet_root", return_value=None),
         ):
             deployment.audit()
         identity.assert_called_once_with()
@@ -1343,6 +1534,46 @@ class InstallationTest(unittest.TestCase):
         ):
             self.assertEqual(deployment.wait_ready({str(stdout): 0}), 303)
 
+    def test_stderr_readiness_remains_observable_with_stdout_dev_null(self):
+        self.plist.write_bytes(
+            plistlib.dumps(
+                {
+                    **self.original_plist,
+                    "StandardOutPath": "/dev/null",
+                }
+            )
+        )
+        deployment = self.deployment()
+        self.audit(deployment)
+        stderr = Path(self.original_plist["StandardErrorPath"])
+        stderr.parent.mkdir(parents=True)
+        stderr.write_bytes(b"previous service transcript\n")
+        original_open = Path.open
+
+        def do_not_open_stdout_device(path, *args, **kwargs):
+            self.assertNotEqual(Path(path), Path("/dev/null"))
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", do_not_open_stdout_device):
+            offsets = service.capture_log_offsets(deployment.log_paths)
+        self.assertNotIn("/dev/null", offsets)
+        with stderr.open("ab") as stream:
+            stream.write(
+                b"telegram local downloader started concurrency=1\n"
+                b"telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+            )
+        info = {"target": self.gui, "pid": 303}
+        listing = f"p303\nfcwd\nn{deployment.workdir}\nftxt\nn{deployment.binary}\n"
+        with (
+            mock.patch.object(Path, "open", do_not_open_stdout_device),
+            mock.patch.object(service, "service_info", return_value=info),
+            mock.patch.object(service, "bot_processes", return_value=[303]),
+            mock.patch.object(
+                service, "run", return_value=subprocess.CompletedProcess([], 0, listing, "")
+            ),
+        ):
+            self.assertEqual(deployment.wait_ready(offsets), 303)
+
     def startup_fixture(self):
         deployment = self.deployment()
         self.audit(deployment)
@@ -1403,13 +1634,138 @@ class InstallationTest(unittest.TestCase):
         ):
             self.assertEqual(deployment.wait_ready(offsets), 303)
 
+    def test_incremental_log_scanning_reaches_markers_after_two_megabytes_with_bounded_state(self):
+        deployment, _, _, _ = self.startup_fixture()
+        stdout = deployment.log_paths[0]
+        contents = (
+            b"x" * (2 * 1024 * 1024 + 123)
+            + b"\ntelegram local downloader started\n"
+            + b"telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+        )
+        stdout.write_bytes(contents)
+        scanner = service._ReadinessLogScanner(deployment.log_paths, {str(stdout): 0})
+        previous_offset = 0
+        for _ in range(len(contents) // scanner.CHUNK_BYTES + 2):
+            ready = scanner.scan()
+            self.assertEqual(len(scanner.streams), 1)
+            state = next(iter(scanner.streams.values()))
+            self.assertLessEqual(state["offset"] - previous_offset, scanner.CHUNK_BYTES)
+            self.assertLessEqual(len(state["line"]), scanner.LINE_BYTES)
+            previous_offset = state["offset"]
+            if ready:
+                break
+        self.assertTrue(ready)
+        self.assertEqual(previous_offset, len(contents))
+
+    def test_incremental_log_markers_may_cross_a_chunk_boundary(self):
+        deployment, _, _, _ = self.startup_fixture()
+        stdout = deployment.log_paths[0]
+        chunk = service._ReadinessLogScanner.CHUNK_BYTES
+        stdout.write_bytes(
+            b"x" * (chunk - 11)
+            + b"\ntelegram local downloader started\n"
+            + b"telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+        )
+        scanner = service._ReadinessLogScanner(deployment.log_paths, {str(stdout): 0})
+        self.assertFalse(scanner.scan())
+        self.assertTrue(scanner.scan())
+
+    def test_giant_payload_line_suffixes_cannot_forge_polling_cycles(self):
+        deployment, _, _, _ = self.startup_fixture()
+        stdout = deployment.log_paths[0]
+        chunk = service._ReadinessLogScanner.CHUNK_BYTES
+        contents = (
+            b"telegram local downloader started concurrency=1\n"
+            + b"x" * (chunk + 123)
+            + b"telegram polling completed poll=1\n"
+            + b"y" * (chunk + 321)
+            + b"telegram polling completed poll=2\n"
+        )
+        stdout.write_bytes(contents)
+        scanner = service._ReadinessLogScanner(deployment.log_paths, {str(stdout): 0})
+        for _ in range(len(contents) // chunk + 2):
+            self.assertFalse(scanner.scan())
+            self.assertLessEqual(
+                len(next(iter(scanner.streams.values()))["line"]), scanner.LINE_BYTES
+            )
+        self.assertEqual(next(iter(scanner.streams.values()))["polls"], set())
+        with stdout.open("ab") as stream:
+            stream.write(b"telegram polling completed poll=1\ntelegram polling completed poll=2\n")
+        self.assertTrue(scanner.scan())
+
+    def test_payload_startup_substring_does_not_satisfy_startup_readiness(self):
+        deployment, _, _, _ = self.startup_fixture()
+        stdout = deployment.log_paths[0]
+        stdout.write_bytes(
+            b"payload telegram local downloader started\n"
+            b"telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+        )
+        scanner = service._ReadinessLogScanner(deployment.log_paths, {str(stdout): 0})
+        self.assertFalse(scanner.scan())
+        with stdout.open("ab") as stream:
+            stream.write(b"telegram local downloader started concurrency=1\n")
+        self.assertTrue(scanner.scan())
+
+    def test_log_rotation_or_truncation_rejects_cold_historical_readiness_markers(self):
+        deployment, _, _, _ = self.startup_fixture()
+        stdout = deployment.log_paths[0]
+        historical = (
+            b"telegram local downloader started\n"
+            b"telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+        )
+        for change in ["rotation", "truncation"]:
+            with self.subTest(log_change=change):
+                stdout.write_bytes(b"old transcript\n" * 100)
+                offsets = service.capture_log_offsets(deployment.log_paths)
+                scanner = service._ReadinessLogScanner(deployment.log_paths, offsets)
+                self.assertFalse(scanner.scan())
+                if change == "rotation":
+                    stdout.rename(self.root / "rotated-readiness.log")
+                stdout.write_bytes(historical)
+                with self.assertRaises(service.InstallError) as failure:
+                    scanner.scan()
+                self.assertIn("log changed", str(failure.exception))
+
+    def test_readiness_uses_the_physical_working_directory_without_rewriting_its_alias(self):
+        external = self.root / "workdir-physical"
+        nested = external / "Nested"
+        nested.mkdir(parents=True)
+        alias = self.repo / "working-directory-alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        configured = self.repo / "working-directory-alias/.."
+        original = {**self.original_plist, "WorkingDirectory": str(configured)}
+        self.plist.write_bytes(plistlib.dumps(original))
+        deployment = self.deployment()
+        self.audit(deployment)
+        stdout = deployment.log_paths[0]
+        stdout.parent.mkdir(parents=True)
+        stdout.write_text(
+            "telegram local downloader started\n"
+            "telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+        )
+        info = {"target": self.gui, "pid": 303}
+        listing = f"p303\nfcwd\nn{external}\nftxt\nn{deployment.binary}\n"
+        with (
+            mock.patch.object(service, "service_info", return_value=info),
+            mock.patch.object(service, "bot_processes", return_value=[303]),
+            mock.patch.object(
+                service, "run", return_value=subprocess.CompletedProcess([], 0, listing, "")
+            ),
+        ):
+            self.assertEqual(deployment.wait_ready({str(stdout): 0}), 303)
+        expected = {**original, "ProgramArguments": [str(deployment.binary), str(self.config)]}
+        self.assertEqual(plistlib.loads(deployment.new_plist()), expected)
+        self.assertEqual(deployment.workdir, configured)
+
     def test_audit_and_readiness_allow_same_executable_bilibili_worker_descendants(self):
         deployment, offsets, info, listing = self.startup_fixture()
+        uid = os.geteuid()
         processes = (
-            f"303 1 {deployment.binary}\n"
-            f"304 303 {deployment.binary}\n"
-            "305 304 /usr/bin/intermediate-child\n"
-            f"306 305 {deployment.binary}\n"
+            f"303 1 {uid} {deployment.binary}\n"
+            f"304 303 {uid} {deployment.binary}\n"
+            f"305 304 {uid} /usr/bin/intermediate-child\n"
+            f"306 305 {uid} {deployment.binary}\n"
+            f"414 1 {uid + 1} {deployment.binary}\n"
         )
 
         def command(argv, **_):
@@ -1473,51 +1829,70 @@ class InstallationTest(unittest.TestCase):
 
 class ProcessInventoryTest(unittest.TestCase):
     def test_full_executable_paths_identify_long_names_and_preserve_spaces(self):
+        uid = os.geteuid()
         full_path = Path("/fixture/path with spaces/bin") / service.EXECUTABLE
         second_path = Path("/fixture/other/bin") / service.EXECUTABLE
         result = subprocess.CompletedProcess(
             [],
             0,
             (
-                f"  303 1 {full_path}\n"
-                f"  101 1 {second_path}\n"
-                "  404 1 /fixture/bin/telegram-video-\n"
-                "  405 1 /fixture/bin/telegram-video-downloader-helper\n"
-                "  406 1 /usr/bin/python3\n"
-                "    0 0 kernel_task\n"
+                f"  303 1 {uid} {full_path}\n"
+                f"  101 1 {uid} {second_path}\n"
+                f"  404 1 {uid} /fixture/bin/telegram-video-\n"
+                f"  405 1 {uid} /fixture/bin/telegram-video-downloader-helper\n"
+                f"  406 1 {uid} /usr/bin/python3\n"
+                "    0 0 0 kernel_task\n"
             ),
             "",
         )
         with mock.patch.object(service, "run", return_value=result) as run:
             inventory = service.process_inventory()
             self.assertEqual(service.bot_processes(), [101, 303])
-        self.assertEqual(inventory[303], {"parent": 1, "executable": full_path})
-        self.assertEqual(inventory[101], {"parent": 1, "executable": second_path})
+        self.assertEqual(inventory[303], {"parent": 1, "uid": uid, "executable": full_path})
+        self.assertEqual(inventory[101], {"parent": 1, "uid": uid, "executable": second_path})
         for call in run.call_args_list:
-            self.assertEqual(call.args[0], ["/bin/ps", "-axww", "-o", "pid=,ppid=,comm="])
+            self.assertEqual(call.args[0], ["/bin/ps", "-axww", "-o", "pid=,ppid=,uid=,comm="])
 
     def test_worker_ancestry_preserves_independent_and_orphan_root_detection(self):
+        uid = os.geteuid()
         executable = Path("/fixture/bin") / service.EXECUTABLE
         output = (
-            f"303 1 {executable}\n"
-            f"304 303 {executable}\n"
-            "305 304 /usr/bin/intermediate-child\n"
-            f"306 305 {executable}\n"
-            f"404 1 {executable}\n"
+            f"303 1 {uid} {executable}\n"
+            f"304 303 {uid} {executable}\n"
+            f"305 304 {uid} /usr/bin/intermediate-child\n"
+            f"306 305 {uid} {executable}\n"
+            f"404 1 {uid} {executable}\n"
         )
         result = subprocess.CompletedProcess([], 0, output, "")
         with mock.patch.object(service, "run", return_value=result):
             self.assertEqual(service.bot_processes(), [303, 404])
             self.assertEqual(service.bot_processes(include_workers=True), [303, 304, 306, 404])
-        result.stdout = f"304 1 {executable}\n"
+        result.stdout = f"304 1 {uid} {executable}\n"
         with mock.patch.object(service, "run", return_value=result):
             self.assertEqual(service.bot_processes(), [304])
 
+    def test_foreign_user_roots_and_workers_do_not_enter_this_users_inventory(self):
+        uid = os.geteuid()
+        executable = Path("/fixture/bin") / service.EXECUTABLE
+        output = (
+            f"303 1 {uid} {executable}\n"
+            f"304 303 {uid} {executable}\n"
+            f"404 1 {uid + 1} {executable}\n"
+            f"405 404 {uid + 1} {executable}\n"
+        )
+        result = subprocess.CompletedProcess([], 0, output, "")
+        with mock.patch.object(service, "run", return_value=result):
+            inventory = service.process_inventory()
+            self.assertEqual(service.bot_processes(), [303])
+            self.assertEqual(service.bot_processes(include_workers=True), [303, 304])
+        self.assertEqual(set(inventory), {303, 304})
+
     def test_process_inventory_errors_are_closed_and_do_not_expose_external_output(self):
+        uid = os.geteuid()
         for status, output in [
             (1, PRIVATE_MARKER),
-            (0, "invalid-pid 1 /fixture/executable\n"),
-            (0, "303 1 /fixture/first\n303 2 /fixture/different\n"),
+            (0, f"invalid-pid 1 {uid} /fixture/executable\n"),
+            (0, f"303 1 {uid} /fixture/first\n303 2 {uid} /fixture/different\n"),
         ]:
             with self.subTest(status=status, output=output):
                 result = subprocess.CompletedProcess([], status, output, PRIVATE_MARKER)
