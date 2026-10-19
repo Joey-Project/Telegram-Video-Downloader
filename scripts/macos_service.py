@@ -26,6 +26,7 @@ from pathlib import Path
 
 IDENTIFIER = "io.github.telegram-local-downloader.bot"
 EXECUTABLE = "telegram-video-downloader"
+LAUNCHD_CLOUD_SHARED_SECRET = "TELEGRAM_VIDEO_DOWNLOADER_CLOUD_SHARED_SECRET"
 STOP_TIMEOUT = 15
 SNAPSHOT_SECONDS = 120
 SNAPSHOT_BYTES = 256 * 1024 * 1024
@@ -1064,6 +1065,7 @@ class Deployment:
         self.home = Path.home()
         self.repo = absolute(args.repo, Path.cwd())
         self.readiness_mode = "telegram"
+        self.launchd_cloud_shared_secret = None
         self.input_binary = absolute(args.binary, Path.cwd()) if args.binary else None
         self.binary = self.home / ".local/lib/telegram-video-downloader/bin" / EXECUTABLE
         self.backups = self.home / ".local/lib/telegram-video-downloader/backups"
@@ -1164,6 +1166,13 @@ class Deployment:
         if cloud_config is not None and not isinstance(cloud_config, dict):
             raise InstallError("cloud configuration must be a TOML table")
         self.readiness_mode = "cloud" if cloud_config is not None else "telegram"
+        self.launchd_cloud_shared_secret = None
+        if self.readiness_mode == "cloud":
+            shared_secret = os.environ.get(LAUNCHD_CLOUD_SHARED_SECRET)
+            # Match the runtime's non-empty bearer requirement without replacing a
+            # valid value already saved in an existing plist with an empty override.
+            if shared_secret is not None and shared_secret.strip():
+                self.launchd_cloud_shared_secret = shared_secret
         auth = self.document.get("bilibili", {}).get("auth", {})
         self.auth_paths = {}
         for key, default in [
@@ -1244,6 +1253,10 @@ class Deployment:
         if self.old_plist:
             document = copy.deepcopy(self.old_plist)
             document["ProgramArguments"][0] = str(self.binary)
+            if self.launchd_cloud_shared_secret is not None:
+                environment = dict(document.get("EnvironmentVariables", {}))
+                environment[LAUNCHD_CLOUD_SHARED_SECRET] = self.launchd_cloud_shared_secret
+                document["EnvironmentVariables"] = environment
             return plistlib.dumps(document)
         environment = {
             "HOME": str(self.home),
@@ -1259,6 +1272,8 @@ class Deployment:
                 {"DOTNET_ROOT": str(self.dotnet_root), "DOTNET_ROOT_ARM64": str(self.dotnet_root)}
             )
             environment["PATH"] = f"{self.dotnet_root}:{environment['PATH']}"
+        if self.launchd_cloud_shared_secret is not None:
+            environment[LAUNCHD_CLOUD_SHARED_SECRET] = self.launchd_cloud_shared_secret
         return plistlib.dumps(
             {
                 "Label": self.args.label,
@@ -1271,6 +1286,12 @@ class Deployment:
                 "StandardErrorPath": str(self.log_paths[1]),
             }
         )
+
+    def plist_contains_cloud_shared_secret(self):
+        if self.launchd_cloud_shared_secret is not None:
+            return True
+        environment = self.old_plist.get("EnvironmentVariables", {}) if self.old_plist else {}
+        return LAUNCHD_CLOUD_SHARED_SECRET in environment
 
     def revalidate_media_bindings(self):
         for kind, directory in self.media.items():
@@ -1611,7 +1632,10 @@ class Deployment:
             mode = (
                 stat.S_IMODE(self.plist_path.stat().st_mode) if self.plist_path.exists() else 0o644
             )
-            atomic_bytes(self.plist_path, self.new_plist(), mode)
+            plist_bytes = self.new_plist()
+            if self.plist_contains_cloud_shared_secret():
+                mode = 0o600
+            atomic_bytes(self.plist_path, plist_bytes, mode)
             for path in self.log_paths:
                 path.resolve(strict=False).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             run(["launchctl", "bootstrap", self.args.domain, self.plist_path])

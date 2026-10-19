@@ -15,12 +15,14 @@ const MAX_ACTION_BODY_ENVELOPE_BYTES = 4 * 1024;
 export const MAX_ACTION_BODY_BYTES = MAX_LEGACY_TEXT_BYTES * 6 + MAX_ACTION_BODY_ENVELOPE_BYTES;
 export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
 export const MAX_TARGET_RELATIVE_DIR_BYTES = 1_024;
+export const MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES = 255;
 export const MAX_SELECTED_ITEMS = 100;
 const MAX_COLLECTION_ORDER = 0xffff_ffff;
 const MAX_LEGACY_HINTS = 10_000;
 const MAX_LEGACY_HINT_INDEX = MAX_LEGACY_HINTS - 1;
 const MAX_TITLE_SCALAR_VALUES = 500;
 const MAX_TITLE_CODE_UNITS = MAX_TITLE_SCALAR_VALUES * 2;
+const UTF8_ENCODER = new TextEncoder();
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -266,7 +268,7 @@ function parseRelativeDirectory(value: unknown): string {
   if (hasUnpairedSurrogate(directory)) {
     throw new HttpError(400, "target_relative_dir contains an unpaired surrogate");
   }
-  if (new TextEncoder().encode(directory).byteLength > MAX_TARGET_RELATIVE_DIR_BYTES) {
+  if (UTF8_ENCODER.encode(directory).byteLength > MAX_TARGET_RELATIVE_DIR_BYTES) {
     throw new HttpError(400, `target_relative_dir must not exceed ${MAX_TARGET_RELATIVE_DIR_BYTES} UTF-8 bytes`);
   }
   if (directory === "") return "";
@@ -274,6 +276,12 @@ function parseRelativeDirectory(value: unknown): string {
     throw new HttpError(400, "target_relative_dir must be a safe relative path");
   }
   const segments = directory.split("/");
+  if (segments.some((segment) => UTF8_ENCODER.encode(segment).byteLength > MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES)) {
+    throw new HttpError(
+      400,
+      `target_relative_dir components must not exceed ${MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES} UTF-8 bytes`,
+    );
+  }
   if (segments.some((segment) => {
     const lowercaseSegment = segment.toLowerCase();
     return segment.length === 0 || segment === "." || segment === ".." ||

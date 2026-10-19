@@ -9,12 +9,25 @@ import { filterPresentLegacyCandidates, getOrCreateLegacySelection, updateLegacy
 import { submitLegacyFileImport } from "../public/file/legacy-file-import.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "../public/file/metadata-preview.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "../public/file/selection-limit.js";
-import { MAX_TARGET_RELATIVE_DIR_BYTES as CLIENT_MAX_TARGET_RELATIVE_DIR_BYTES, validateTargetRelativeDirectory } from "../public/file/target-directory.js";
+import {
+  MAX_TARGET_RELATIVE_DIR_BYTES as CLIENT_MAX_TARGET_RELATIVE_DIR_BYTES,
+  MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES as CLIENT_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES,
+  validateTargetRelativeDirectory,
+} from "../public/file/target-directory.js";
 import { renderMovePreviewItems } from "../public/file/preview-rendering.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
-import { canonicalJson, MAX_ACTION_BODY_BYTES, MAX_LEGACY_TEXT_BYTES, MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS, MAX_STATE_BODY_BYTES, MAX_TARGET_RELATIVE_DIR_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_BYTES, readJsonBody } from "../src/validation";
+import {
+  canonicalJson,
+  MAX_ACTION_BODY_BYTES,
+  MAX_LEGACY_TEXT_BYTES,
+  MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS,
+  MAX_STATE_BODY_BYTES,
+  MAX_TARGET_RELATIVE_DIR_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_BYTES,
+  MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES,
+  readJsonBody,
+} from "../src/validation";
 import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue, storeSnapshot } from "../src/store";
 import type { LocalSnapshot } from "../src/types";
 import worker from "../src/index";
@@ -113,6 +126,28 @@ describe("target directory validation", () => {
     const sixLevelSeventyCjk = Array.from({ length: 6 }, () => cjkSegment).join("/");
     expect(textEncoder.encode(sixLevelSeventyCjk).byteLength).toBe(1265);
     expect(validateTargetRelativeDirectory(sixLevelSeventyCjk).error).toContain("1,024 UTF-8 bytes");
+  });
+
+  it("matches the 255-byte component limit for ASCII, CJK, emoji, and a valid 1,023-byte path", () => {
+    expect(CLIENT_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES).toBe(
+      WORKER_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES,
+    );
+
+    const componentCases = [
+      ["x".repeat(255), "x".repeat(256)],
+      ["界".repeat(85), `${"界".repeat(85)}a`],
+      [`${"😀".repeat(63)}abc`, `${"😀".repeat(63)}abcd`],
+    ];
+    for (const [accepted, rejected] of componentCases) {
+      expect(textEncoder.encode(accepted).byteLength).toBe(255);
+      expect(validateTargetRelativeDirectory(accepted)).toEqual({ directory: accepted, error: null });
+      expect(textEncoder.encode(rejected).byteLength).toBe(256);
+      expect(validateTargetRelativeDirectory(rejected).error).toContain("255 UTF-8 bytes");
+    }
+
+    const maxComponentsPath = Array.from({ length: 4 }, () => "x".repeat(255)).join("/");
+    expect(textEncoder.encode(maxComponentsPath).byteLength).toBe(1_023);
+    expect(validateTargetRelativeDirectory(maxComponentsPath)).toEqual({ directory: maxComponentsPath, error: null });
   });
 
   it("keeps control, malformed Unicode, and private path checks in the browser validator", () => {
@@ -711,19 +746,37 @@ describe("Mini App identity and actions", () => {
     expect(tooManyPatches.status).toBe(400);
   });
 
-  it("accepts only target folders within the 1,024-byte UTF-8 contract before enqueueing", async () => {
+  it("accepts only target folders within both UTF-8 path limits before enqueueing", async () => {
     const initData = await signInitData();
     const cjkSegment = "界".repeat(70);
     const exact = [cjkSegment, cjkSegment, cjkSegment, cjkSegment, "x".repeat(180)].join("/");
     const oversized = [cjkSegment, cjkSegment, cjkSegment, cjkSegment, "x".repeat(181)].join("/");
     const sixLevelSeventyCjk = Array.from({ length: 6 }, () => cjkSegment).join("/");
+    const acceptedComponents = [
+      "x".repeat(255),
+      "界".repeat(85),
+      `${"😀".repeat(63)}abc`,
+    ];
+    const rejectedComponents = [
+      "x".repeat(256),
+      `${"界".repeat(85)}a`,
+      `${"😀".repeat(63)}abcd`,
+    ];
+    const maxComponentsPath = Array.from({ length: 4 }, () => "x".repeat(255)).join("/");
     expect(textEncoder.encode(exact).byteLength).toBe(1_024);
     expect(textEncoder.encode(oversized).byteLength).toBe(1_025);
     expect(textEncoder.encode(sixLevelSeventyCjk).byteLength).toBe(1_265);
+    expect(CLIENT_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES).toBe(
+      WORKER_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES,
+    );
+    expect(acceptedComponents.map((segment) => textEncoder.encode(segment).byteLength)).toEqual([255, 255, 255]);
+    expect(rejectedComponents.map((segment) => textEncoder.encode(segment).byteLength)).toEqual([256, 256, 256]);
+    expect(textEncoder.encode(maxComponentsPath).byteLength).toBe(1_023);
 
     const invalidPaths = [
       oversized,
       sixLevelSeventyCjk,
+      ...rejectedComponents,
       "Movies/Part\nTwo",
       "Movies/\uD800",
       "Movies/.TELEGRAM-VIDEO-DOWNLOADER-LIBRARY/cache",
@@ -761,10 +814,30 @@ describe("Mini App identity and actions", () => {
         payload: { item_ids: ["item-a"], target_relative_dir: exact },
       }),
     });
+    const componentAccepted = await Promise.all(acceptedComponents.map((targetRelativeDir, index) =>
+      ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: `00000000-0000-4000-8000-${String(942 + index).padStart(12, "0")}`,
+          kind: "file_preview",
+          payload: { item_ids: ["item-a"], target_relative_dir: targetRelativeDir },
+        }),
+      }),
+    ));
+    const maxPathAccepted = await ownerRequest("/api/actions", initData, {
+      method: "POST",
+      body: JSON.stringify({
+        request_id: "00000000-0000-4000-8000-000000000945",
+        kind: "file_preview",
+        payload: { item_ids: ["item-a"], target_relative_dir: maxComponentsPath },
+      }),
+    });
     expect(rootAccepted.status).toBe(202);
     expect(exactAccepted.status).toBe(202);
+    expect(componentAccepted.map((response) => response.status)).toEqual([202, 202, 202]);
+    expect(maxPathAccepted.status).toBe(202);
     const afterAccepted = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
-    expect(afterAccepted?.count).toBe((before?.count ?? 0) + 2);
+    expect(afterAccepted?.count).toBe((before?.count ?? 0) + 6);
   });
 
   it("rejects case-insensitive private directory aliases before enqueueing", async () => {

@@ -23,10 +23,10 @@ superseded_by: ""
 - 当前接受的架构大方向是公开托管的静态界面自动加载文件库并提交操作；Telegram webhook 进入 Cloudflare Worker，再进入 D1 持久收件箱。本机 Rust bot 主动领取操作，并由本机通过同一 Telegram bot 发送或编辑进度消息。本机没有公网入站接口。偏好使用 Cloudflare Free；达到额度限制时暂停操作并提示用户。
 - Rust 通过固定 Worker API 补领、确认和回写状态；Mini App 验证 Telegram initData。休眠 WebSocket 推送完整请求，固定共享密钥鉴权，本机落盘后才确认接收。状态通过持久递增版本防止旧回写覆盖新快照。
 - 第一至第四阶段的本地代码已落在隔离分支：Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段 `/settings` 与新下载位置选择仍延期。
-- Cloudflare 等待卡片重复问题已修复。2026-10-19 的类型检查、70 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 1011 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录、来源匹配和有界状态清理，以及 YouTube legacy 提取、纯标题导入、目标目录深度、确认恢复提示、导入来源恢复、队列快照、hint 唯一映射和长附件名改名覆盖。
+- Cloudflare 等待卡片重复问题已修复。2026-10-19 的类型检查、71 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 1018 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录、来源匹配和有界状态清理，以及 YouTube legacy 提取、纯标题导入、目标目录深度、确认恢复提示、导入来源恢复、队列快照、hint 唯一映射、长附件名改名、零条目上传缩减和预览 anchor 可用性覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
 - 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `afbf09300bf5ac7c0dbdc11ac5d1e10f934336fb` 的 master 更新，包含 ASS 弹幕显示默认值、恢复工作流收尾、Cargo 输出目录之外的签名服务安装流程及切换记录，并补齐 Cloud 模式的服务就绪兼容。本分支未安装或重启 bot，也未修改其他 worktree；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
-- Python 3.14.5 的 93 项服务单测、隔离 shell 集成测试、shell 语法检查和 ShellCheck 均通过；测试使用临时 HOME 和模拟系统命令，不安装或重启实际服务。CI 已纳入 Python 与 shell 服务测试。
+- Python 3.14.5 的 98 项服务单测、隔离 shell 集成测试、shell 语法检查和 ShellCheck 均通过，覆盖私有 shared secret 传递和回滚；测试使用临时 HOME 和模拟系统命令，不安装或重启实际服务。CI 已纳入 Python 与 shell 服务测试。
 
 ### 2026-10-18 审查修复
 
@@ -203,6 +203,7 @@ superseded_by: ""
 - 关闭 Mini App 不会取消已收件的批次。File Provider 暂时不可访问使用持久 backoff；仅此类可重试批次的 Telegram 结果提示复用原确认，永久或 stale preview 明确提示重新预览。错误与 restart recovery 场景已纳入通过的本地测试。
 - 云端在入队前逐段拦截内部私有目录前缀及其大小写变体，避免请求已被接收后才被本地文件系统语义拒绝；本地仍执行最终路径校验。
 - 校验分别保护对象身份、内容稳定性和 POSIX 访问策略。创建时间单独变化时，仅在同进程仍持有原文件 descriptor、当前路径仍指向同一对象且类型、体积、SHA-256、owner/group/mode 全部匹配时允许继续；重启或缓存淘汰后没有该证明则要求重新预览。不把 mtime、ctime 或 link count 的任意差异当作内容变更。
+- 缺少 creation time 的预览必须保有原始 live descriptors；anchor 过期、被淘汰或因重启丢失后，云端不再显示为可确认。只读可用性检查不续期；具备完整持久 token 的预览保留原有跨重启校验流程。
 
 ### 第四阶段：旧内容补齐与迁移
 
@@ -215,6 +216,7 @@ superseded_by: ""
 - 云端任务摘要在队列操作锁内一次读取和选择最多 100 条活跃任务，保留允许聊天范围及稳定排序，进度更新不会在分页之间造成重复或遗漏。
 - 纯标题旧记录也会生成 hints，沿用标题候选和显式手工关联；空行及没有受支持来源 ID 的纯 HTTP(S) URL 不生成标题线索。
 - 目标目录在浏览器、Worker 和 Rust 都按 1,024 个 UTF-8 bytes 校验；确认页列出媒体及附件各自的源路径与目标路径。组织后最终父目录最多 48 层，超出扫描范围的目标在写入 preview 或创建目录前拒绝。
+- 目标路径每个分量另有 255 个 UTF-8 bytes 上限，超长名称在产生可确认 preview 前拒绝。单个媒体条目过大时，上传副本可以省略全部 items 并报告遗漏数量和 incomplete 状态；本地完整索引保留，成功缩减后仍可继续心跳及更新状态。
 - 整组改名按最长附件 qualifier 和扩展名为共同媒体 stem 预留空间，保证每个分量最多 255 个 UTF-8 bytes；保留两份时同样计入冲突编号。仅在 Unicode 字符边界缩短 stem，保留附件后缀；无法表示的名称在确认前明确拒绝。
 - legacy text 复用现有 YouTube URL 识别规则，校验 host 和十一字符 video ID 后生成 `youtube:<id>` 来源线索，不把任意裸字符串当作视频 ID。
 - 确认批次可同时移动和补 metadata；patch 仅对可核验字段生成 NFO 更新，逐字段显示原值与新值及实际加入的来源 ID，保留未知 XML 字段和普通 POSIX 权限。组织路径支持合集目录与多 P 排序信息。

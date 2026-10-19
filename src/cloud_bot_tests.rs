@@ -3400,26 +3400,40 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
     config
         .ensure_runtime_dirs()
         .expect("test download roots should create");
+    let source_path = config.downloads.video_dir.join("clip.mp4");
+    fs::write(&source_path, b"original media contents").expect("media fixture should write");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
     let inbox =
         Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
-    let preview = MovePreview {
-        id: "missing-persisted-preview".to_string(),
-        revision: "revision-a".to_string(),
-        target_relative_dir: Some(String::new()),
-        rename: false,
-        conflict: ConflictPolicy::Skip,
-        items: Vec::new(),
-        metadata_patches: Vec::new(),
-    };
+    let library =
+        LibraryManager::open_with_preview_cleanup_gate(&config.downloads.video_dir, inbox.clone())
+            .expect("library manager should open with inbox cleanup coordination");
+    let snapshot = library
+        .scan(&[])
+        .expect("library scan should find the media fixture");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4")
+        .expect("media fixture should appear in the library")
+        .id
+        .clone();
+    let preview = library
+        .preview(
+            std::slice::from_ref(&item_id),
+            "organized",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("valid media should produce a persistent move preview");
     let preview_id = preview.id.clone();
     let preview_revision = preview.revision.clone();
     inbox
         .persist(CloudRequest {
             seq: 41,
             kind: "file_preview".to_string(),
-            payload: serde_json::json!({"item_ids": ["item-a"], "target_relative_dir": ""}),
-            created_at: 100,
+            payload: serde_json::json!({"item_ids": [item_id], "target_relative_dir": "organized"}),
+            created_at: now_millis(),
             extra: serde_json::Map::new(),
         })
         .expect("preview request should persist");
@@ -3433,13 +3447,15 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
             }));
         })
         .expect("preview confirmation receipt should persist");
+    let changed_contents = b"media contents changed after preview";
+    fs::write(&source_path, changed_contents).expect("source should change after preview creation");
     inbox
         .persist(CloudRequest {
             seq: 42,
             kind: "file_confirm".to_string(),
             payload: serde_json::json!({
-                "preview_id": "missing-persisted-preview",
-                "revision": "revision-a"
+                "preview_id": preview_id,
+                "revision": preview_revision
             }),
             created_at: now_millis(),
             extra: serde_json::Map::new(),
@@ -3492,16 +3508,27 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
         vec!["sendMessage", "editMessageText"]
     );
     assert_eq!(recorded[1].body["message_id"].as_i64(), Some(1_000));
-    assert!(
-        recorded[1].body["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("failed before it could complete"))
-    );
+    let failure_message = recorded[1].body["text"]
+        .as_str()
+        .expect("failed batch edit should include rendered status text");
+    assert!(failure_message.contains(" failed: 0 file(s) moved"));
+    assert!(failure_message.contains("1 item(s) need review"));
+    assert!(failure_message.contains("run a fresh preview before confirming again"));
 
     dispatcher.abort();
     let _ = dispatcher.await;
     drop(runtime);
     drop(inbox);
+    drop(library);
+    assert_eq!(
+        fs::read(&source_path).expect("changed source media should remain readable"),
+        changed_contents,
+        "revalidation must preserve the changed source object without moving it"
+    );
+    assert!(
+        !root.join("videos/organized/clip.mp4").exists(),
+        "revalidation must not publish the changed media at the preview target"
+    );
     stop_fake_telegram_api(shutdown, server).await;
     let _ = std::fs::remove_dir_all(root);
 }
@@ -4591,5 +4618,186 @@ async fn completed_file_move_retries_primary_and_preview_receipts_without_repeat
     drop(inbox);
     drop(queue);
     stop_fake_telegram_api(shutdown, server).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
+    let root = temp_cloud_bot_dir("cloud-preview-anchor-projection");
+    let (telegram, mut telegram_requests, telegram_shutdown, telegram_server) =
+        spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let source_path = config.downloads.video_dir.join("clip.mp4");
+    fs::write(&source_path, b"fixture-video").expect("media fixture should write");
+
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let provider = Arc::new(MockQueueFileProvider::default());
+    let provider_trait: Arc<dyn QueueFileProvider> = provider.clone();
+    let library = LibraryManager::open_with_provider_and_preview_cleanup_gate(
+        &config.downloads.video_dir,
+        Arc::clone(&provider_trait),
+        inbox.clone(),
+    )
+    .expect("cloud library manager should open with mock file access");
+    let snapshot = library
+        .scan(&[])
+        .expect("library scan should find the fixture");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4")
+        .expect("media fixture should appear in the snapshot")
+        .id
+        .clone();
+    library.make_preview_creation_time_unavailable_for_test();
+    let preview = library
+        .preview(
+            std::slice::from_ref(&item_id),
+            "organized",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("file move should produce a persistent preview");
+    let preview_id = preview.id.clone();
+    let preview_revision = preview.revision.clone();
+    let preview_seq = 981;
+    let confirmation_seq = 982;
+    inbox
+        .persist(CloudRequest {
+            seq: preview_seq,
+            kind: "file_preview".to_string(),
+            payload: serde_json::json!({
+                "item_ids": [item_id],
+                "target_relative_dir": "organized"
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("preview request should persist");
+    inbox
+        .update(preview_seq, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+            record.result = Some(serde_json::json!({
+                "preview_id": preview_id.clone(),
+                "revision": preview_revision.clone(),
+                "preview": preview,
+            }));
+        })
+        .expect("preview should await confirmation");
+
+    let mut runtime = make_runtime(telegram, config.clone(), queue.clone(), inbox.clone());
+    *runtime.library_snapshot.lock().await = Some(snapshot);
+    runtime.test_file_provider = Some(Arc::clone(&provider_trait));
+
+    provider.fail_next_read("simulated transient preview receipt read failure");
+    let transient_state = build_cloud_state_snapshot(&runtime)
+        .await
+        .expect("transient preview read failure should not fail state publication")
+        .expect("state should be available");
+    let transient_operation = transient_state
+        .operations
+        .iter()
+        .find(|operation| operation["seq"] == preview_seq)
+        .expect("preview operation should remain visible during a transient check failure");
+    assert_eq!(transient_operation["status"], "awaiting_confirmation");
+    assert_eq!(transient_state.library["incomplete"], true);
+    assert!(
+        transient_state.library["warnings"]
+            .as_array()
+            .is_some_and(|warnings| {
+                warnings.iter().any(|warning| {
+                    warning.as_str().is_some_and(|message| {
+                        message.contains("could not verify whether a pending preview")
+                    })
+                })
+            })
+    );
+
+    let confirmable_state = build_cloud_state_snapshot(&runtime)
+        .await
+        .expect("a later anchor check should recover")
+        .expect("state should remain available");
+    let confirmable_operation = confirmable_state
+        .operations
+        .iter()
+        .find(|operation| operation["seq"] == preview_seq)
+        .expect("preview operation should remain visible while its live anchor exists");
+    assert_eq!(confirmable_operation["status"], "awaiting_confirmation");
+    assert!(confirmable_state.previews.iter().any(|entry| {
+        entry["preview_id"] == preview_id && entry["revision"] == preview_revision
+    }));
+
+    release_preview_anchors(&preview_id);
+    let stale_state = build_cloud_state_snapshot(&runtime)
+        .await
+        .expect("a missing live anchor should be projected as stale")
+        .expect("state should remain available");
+    let stale_operation = stale_state
+        .operations
+        .iter()
+        .find(|operation| operation["seq"] == preview_seq)
+        .expect("stale preview operation should remain in history");
+    assert_eq!(stale_operation["status"], "stale");
+    assert!(
+        stale_state
+            .previews
+            .iter()
+            .all(|entry| entry["preview_id"] != preview_id)
+    );
+
+    let confirm_request = CloudRequest {
+        seq: confirmation_seq,
+        kind: "file_confirm".to_string(),
+        payload: serde_json::json!({
+            "preview_id": preview_id,
+            "revision": preview_revision,
+        }),
+        created_at: now_millis(),
+        extra: serde_json::Map::new(),
+    };
+    inbox
+        .persist(confirm_request.clone())
+        .expect("confirmation request should persist");
+    let processing = inbox
+        .update(confirmation_seq, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("confirmation should enter processing");
+    dispatch_cloud_record(runtime.clone(), processing).await;
+
+    assert_eq!(
+        inbox
+            .record(confirmation_seq)
+            .expect("confirmation receipt should load")
+            .expect("confirmation receipt should remain durable")
+            .status,
+        InboxStatus::Failed,
+        "stale anchor should reject confirmation before any operation starts"
+    );
+    assert_eq!(
+        inbox
+            .record(preview_seq)
+            .expect("preview receipt should load")
+            .expect("preview receipt should remain durable")
+            .status,
+        InboxStatus::Stale
+    );
+    assert!(provider.move_paths().is_empty());
+    assert!(telegram_requests.try_recv().is_err());
+    assert!(source_path.exists());
+
+    drop(library);
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
     let _ = std::fs::remove_dir_all(root);
 }

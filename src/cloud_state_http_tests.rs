@@ -598,8 +598,8 @@ async fn cloud_state_reporter_compacts_operation_receipts_before_library_and_kee
 }
 
 #[tokio::test]
-async fn cloud_state_reporter_stops_retrying_413_when_no_smaller_snapshot_is_possible() {
-    let root = temp_cloud_bot_dir("state-reporter-413-no-progress");
+async fn cloud_state_reporter_omits_oversized_items_and_recovers_full_source_after_413() {
+    let root = temp_cloud_bot_dir("state-reporter-413-zero-prefix-recovery");
     let mut config = AppConfig::for_test();
     config.downloads.video_dir = root.join("videos");
     config.downloads.pdf_dir = root.join("pdfs");
@@ -615,7 +615,7 @@ async fn cloud_state_reporter_stops_retrying_413_when_no_smaller_snapshot_is_pos
         .state_post_statuses
         .lock()
         .expect("fake state status lock should not poison")
-        .push(413);
+        .extend([413, 200, 200, 200, 200]);
 
     let mut runtime = make_runtime(
         TelegramClient::with_test_api_base_url(
@@ -628,11 +628,11 @@ async fn cloud_state_reporter_stops_retrying_413_when_no_smaller_snapshot_is_pos
     );
     runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("test cloud client should use localhost");
-    let mut library = empty_cloud_test_library_snapshot("single-large-item");
+    let mut library = empty_cloud_test_library_snapshot("full-source");
     library.items.push(LibraryItem {
-        id: "only-item".to_string(),
+        id: "oversized-first-item".to_string(),
         title: "x".repeat(128 * 1024),
-        relative_path: "only-item.mp4".to_string(),
+        relative_path: "oversized-first-item.mp4".to_string(),
         bytes: 1,
         width: None,
         height: None,
@@ -646,35 +646,96 @@ async fn cloud_state_reporter_stops_retrying_413_when_no_smaller_snapshot_is_pos
         integrity_status: IntegrityStatus::Verified,
         presence: Presence::Present,
     });
-    *runtime.library_snapshot.lock().await = Some(library);
+    library.items.push(LibraryItem {
+        id: "small-later-item".to_string(),
+        title: "small item".to_string(),
+        relative_path: "small-later-item.mp4".to_string(),
+        bytes: 2,
+        width: None,
+        height: None,
+        codec: None,
+        source_ids: Vec::new(),
+        collection: None,
+        attachments: Vec::new(),
+        authoritative_nfo_path: None,
+        confidence: Confidence::High,
+        metadata_status: MetadataStatus::Complete,
+        integrity_status: IntegrityStatus::Verified,
+        presence: Presence::Present,
+    });
+    let original_library = library.clone();
+    *runtime.library_snapshot.lock().await = Some(original_library.clone());
     let reporter = tokio::spawn(cloud_state_reporter_with_heartbeat(
         runtime.clone(),
-        Duration::from_millis(100),
+        Duration::from_millis(500),
     ));
     runtime.state_notify.notify_one();
 
-    let posts = wait_for_state_posts(&cloud_state, 1).await;
+    let posts = wait_for_state_posts(&cloud_state, 3).await;
     assert_eq!(posts[0]["status"], 413);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let posts = cloud_state
-        .state_posts
-        .lock()
-        .expect("fake state post lock should not poison")
-        .clone();
-    assert_eq!(posts.len(), 1, "an unreducible source must not be retried");
-
-    let version_path = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud")
-        .join(".state-version.json");
-    let version: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(version_path).expect("state version should persist"))
-            .expect("state version should be valid JSON");
-    assert_eq!(
-        version["state_version"], 1,
-        "no retry version should be allocated"
+    assert_eq!(posts[1]["status"], 200);
+    assert!(posts[1]["state_version"].as_u64() > posts[0]["state_version"].as_u64());
+    assert_ne!(posts[1]["library_ready"].as_bool(), Some(false));
+    assert_eq!(posts[1]["library_incomplete"], true);
+    assert_eq!(posts[1]["library_item_count"], 0);
+    assert!(posts[1]["library_warning_count"].as_u64().unwrap_or(0) > 0);
+    assert!(
+        posts[1]["library_warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| {
+                warning
+                    .as_str()
+                    .is_some_and(|text| text.contains("omitted 2 library item(s)"))
+            }))
     );
+    assert_eq!(posts[2]["status"], 200);
+    assert_eq!(posts[2]["state_version"], posts[1]["state_version"]);
+    assert_eq!(posts[2]["content_hash"], posts[1]["content_hash"]);
+    assert_eq!(posts[2]["library_item_count"], 0);
+
+    let mut changed_library = empty_cloud_test_library_snapshot("changed-source");
+    changed_library.items.push(LibraryItem {
+        id: "changed-item".to_string(),
+        title: "changed source item".to_string(),
+        relative_path: "changed-item.mp4".to_string(),
+        bytes: 3,
+        width: None,
+        height: None,
+        codec: None,
+        source_ids: Vec::new(),
+        collection: None,
+        attachments: Vec::new(),
+        authoritative_nfo_path: None,
+        confidence: Confidence::High,
+        metadata_status: MetadataStatus::Complete,
+        integrity_status: IntegrityStatus::Verified,
+        presence: Presence::Present,
+    });
+    *runtime.library_snapshot.lock().await = Some(changed_library);
+    runtime.state_notify.notify_one();
+    let posts = wait_for_state_posts(&cloud_state, 4).await;
+    assert_eq!(posts[3]["status"], 200);
+    assert_eq!(posts[3]["revision"], "changed-source");
+    assert_eq!(posts[3]["library_item_count"], 1);
+
+    *runtime.library_snapshot.lock().await = Some(original_library.clone());
+    runtime.state_notify.notify_one();
+    let posts = wait_for_state_posts(&cloud_state, 5).await;
+    assert_eq!(posts[4]["status"], 200);
+    assert_eq!(posts[4]["revision"], "full-source");
+    assert_eq!(posts[4]["library_item_count"], 2);
+    assert!(posts[4]["state_version"].as_u64() > posts[3]["state_version"].as_u64());
+    {
+        let cached_library = runtime.library_snapshot.lock().await;
+        let cached_library = cached_library
+            .as_ref()
+            .expect("full local library should remain cached");
+        assert_eq!(cached_library.items.len(), original_library.items.len());
+        assert_eq!(
+            cached_library.items[0].title,
+            original_library.items[0].title
+        );
+    }
 
     reporter.abort();
     let _ = reporter.await;

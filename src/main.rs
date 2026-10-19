@@ -107,6 +107,9 @@ const CLOUD_QUEUE_STATE_COALESCE: Duration = Duration::from_secs(2);
 const CLOUD_LIBRARY_WARNING_COUNT_LIMIT: usize = 64;
 const CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES: usize = 1024;
 const CLOUD_LIBRARY_WARNING_JSON_LIMIT_BYTES: usize = 24 * 1024;
+const CLOUD_LIBRARY_ITEM_OMISSION_WARNING_PREFIX: &str = "Cloud snapshot omitted ";
+const CLOUD_LIBRARY_ITEM_OMISSION_WARNING_SUFFIX: &str =
+    " library item(s) from the complete source view to fit the upload budget.";
 const CLOUD_LIBRARY_CATEGORY_COUNT_LIMIT: usize = 128;
 const CLOUD_LIBRARY_CATEGORY_PATH_LIMIT_BYTES: usize = 512;
 const CLOUD_LIBRARY_CATEGORY_JSON_LIMIT_BYTES: usize = 32 * 1024;
@@ -535,6 +538,36 @@ fn truncate_cloud_warning(text: &str, max_bytes: usize) -> String {
     format!("{}{}", &text[..end], suffix)
 }
 
+fn cloud_library_omission_warning_count(warning: &serde_json::Value) -> Option<usize> {
+    let text = warning.as_str()?;
+    text.strip_prefix(CLOUD_LIBRARY_ITEM_OMISSION_WARNING_PREFIX)?
+        .strip_suffix(CLOUD_LIBRARY_ITEM_OMISSION_WARNING_SUFFIX)?
+        .parse()
+        .ok()
+}
+
+fn cloud_library_omitted_item_count(library: &serde_json::Value) -> usize {
+    library
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(cloud_library_omission_warning_count)
+        .fold(0_usize, usize::saturating_add)
+}
+
+fn set_cloud_library_omission_warning(warnings: &mut Vec<serde_json::Value>, omitted_count: usize) {
+    warnings.retain(|warning| cloud_library_omission_warning_count(warning).is_none());
+    if omitted_count > 0 {
+        warnings.insert(
+            0,
+            serde_json::Value::String(format!(
+                "{CLOUD_LIBRARY_ITEM_OMISSION_WARNING_PREFIX}{omitted_count}{CLOUD_LIBRARY_ITEM_OMISSION_WARNING_SUFFIX}"
+            )),
+        );
+    }
+}
+
 fn compact_cloud_library_warnings(
     warnings: &mut Vec<serde_json::Value>,
 ) -> Result<(bool, usize, usize)> {
@@ -750,6 +783,7 @@ impl CloudStateSnapshot {
             .get("items")
             .and_then(serde_json::Value::as_array)
             .cloned();
+        let previously_omitted_items = cloud_library_omitted_item_count(&self.library);
         let Some(library) = self.library.as_object_mut() else {
             return Ok(false);
         };
@@ -801,11 +835,26 @@ impl CloudStateSnapshot {
         let Some(original_items) = original_items else {
             return Ok(metadata_size < original_size);
         };
-        if metadata_size.saturating_add(1024) <= max_bytes || original_items.len() <= 1 {
+        if metadata_size.saturating_add(1024) <= max_bytes {
             return Ok(metadata_size < original_size);
         }
 
-        let mut low = 1_usize;
+        // Reserve space for the largest possible omission count while searching. The exact
+        // count added after the search can only be shorter, and the 1 KiB margin keeps the
+        // warning itself within the upload budget.
+        if let Some(warnings) = self
+            .library
+            .get_mut("warnings")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            set_cloud_library_omission_warning(
+                warnings,
+                previously_omitted_items.saturating_add(original_items.len()),
+            );
+            compact_cloud_library_warnings(warnings)?;
+        }
+
+        let mut low = 0_usize;
         let mut high = original_items.len();
         let mut fitting_count = None;
         while low <= high {
@@ -822,6 +871,9 @@ impl CloudStateSnapshot {
                 fitting_count = Some(candidate_count);
                 low = candidate_count.saturating_add(1);
             } else {
+                if candidate_count == 0 {
+                    break;
+                }
                 high = candidate_count.saturating_sub(1);
             }
         }
@@ -831,7 +883,15 @@ impl CloudStateSnapshot {
                 .get_mut("items")
                 .and_then(serde_json::Value::as_array_mut)
             {
-                *items = original_items;
+                *items = original_items.clone();
+            }
+            if let Some(warnings) = self
+                .library
+                .get_mut("warnings")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                set_cloud_library_omission_warning(warnings, previously_omitted_items);
+                compact_cloud_library_warnings(warnings)?;
             }
             return Ok(self.encoded_size(state_version)? < original_size);
         };
@@ -841,6 +901,17 @@ impl CloudStateSnapshot {
             .and_then(serde_json::Value::as_array_mut)
         {
             *items = original_items[..fitting_count].to_vec();
+        }
+        if let Some(warnings) = self
+            .library
+            .get_mut("warnings")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            set_cloud_library_omission_warning(
+                warnings,
+                previously_omitted_items.saturating_add(original_items.len() - fitting_count),
+            );
+            compact_cloud_library_warnings(warnings)?;
         }
         Ok(self.encoded_size(state_version)? < original_size)
     }
@@ -1339,13 +1410,71 @@ fn merge_cloud_library_scan_warning(library: &mut serde_json::Value, warning: &s
     }
 }
 
+fn merge_cloud_library_preview_check_warning(library: &mut serde_json::Value) {
+    let message = "The computer could not verify whether a pending preview is still confirmable. Its status is retained and will be checked again.";
+    let Some(object) = library.as_object_mut() else {
+        return;
+    };
+    object.insert("incomplete".to_string(), serde_json::Value::Bool(true));
+    let warnings = object
+        .entry("warnings".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !warnings.is_array() {
+        *warnings = serde_json::json!([]);
+    }
+    if let Some(warnings) = warnings.as_array_mut()
+        && !warnings.iter().any(|entry| entry.as_str() == Some(message))
+    {
+        warnings.insert(0, serde_json::Value::String(message.to_string()));
+    }
+}
+
 async fn build_cloud_state_snapshot(
     runtime: &CloudBotRuntime,
 ) -> Result<Option<CloudStateSnapshot>> {
     let library = runtime.library_snapshot.lock().await.clone();
     let scan_warning = runtime.library_scan_warning.lock().await.clone();
-    let (records, omitted_preview_count) =
+    let (mut records, omitted_preview_count) =
         cloud_state_records_bounded(runtime, CLOUD_STATE_PREVIEW_ENTRY_LIMIT).await?;
+    let preview_keys = records
+        .iter()
+        .filter(|record| {
+            record.request.kind == "file_preview"
+                && record.status == InboxStatus::AwaitingConfirmation
+        })
+        .filter_map(cloud_preview_identity)
+        .collect::<Vec<_>>();
+    let (unconfirmable_preview_ids, preview_check_failed) = match cloud_unconfirmable_preview_ids(
+        runtime,
+        &preview_keys,
+    )
+    .await
+    {
+        Ok(ids) => (ids, false),
+        Err(error) => {
+            warn!(
+                error = %redact_sensitive_text(&format!("{error:#}")),
+                "could not verify active cloud preview anchors; retaining their current statuses"
+            );
+            (HashSet::new(), true)
+        }
+    };
+    for record in &mut records {
+        if record.request.kind != "file_preview"
+            || record.status != InboxStatus::AwaitingConfirmation
+        {
+            continue;
+        }
+        if cloud_preview_identity(record)
+            .is_some_and(|(preview_id, _)| unconfirmable_preview_ids.contains(&preview_id))
+        {
+            record.status = InboxStatus::Stale;
+            record.error = Some(
+                "This preview is no longer confirmable in the current local file session. Run a fresh preview."
+                    .to_string(),
+            );
+        }
+    }
     let mut management_records = records
         .iter()
         .filter(|record| record.request.kind != "telegram")
@@ -1404,6 +1533,9 @@ async fn build_cloud_state_snapshot(
             != Some(false)
     {
         merge_cloud_library_scan_warning(&mut library_value, warning);
+    }
+    if preview_check_failed {
+        merge_cloud_library_preview_check_warning(&mut library_value);
     }
     Ok(Some(CloudStateSnapshot {
         revision,
@@ -2126,6 +2258,19 @@ async fn dispatch_cloud_management(
                 ));
             }
             let preview_seq = preview_record.request.seq;
+            let preview_key = (payload.preview_id.clone(), payload.revision.clone());
+            let unconfirmable =
+                cloud_unconfirmable_preview_ids(runtime, std::slice::from_ref(&preview_key))
+                    .await?;
+            if unconfirmable.contains(&payload.preview_id) {
+                return Ok(cloud_file_confirm_failure(
+                    preview_seq,
+                    &payload.preview_id,
+                    &payload.revision,
+                    "This preview is no longer confirmable in the current local file session. Run a fresh preview.".to_string(),
+                    None,
+                ));
+            }
             let status_message_id =
                 begin_cloud_batch_message(runtime, preview_seq, &payload.preview_id).await?;
             let start_message_warning = status_message_id.is_none().then(|| {
@@ -2621,6 +2766,35 @@ async fn cloud_state_records_bounded(
     tokio::task::spawn_blocking(move || inbox.state_records_bounded(max_awaiting_previews))
         .await
         .context("cloud inbox bounded state listing worker failed")?
+}
+
+fn cloud_preview_identity(record: &InboxRecord) -> Option<(String, String)> {
+    let result = record.result.as_ref()?;
+    let preview_id = result.get("preview_id")?.as_str()?.to_string();
+    let revision = result.get("revision")?.as_str()?.to_string();
+    Some((preview_id, revision))
+}
+
+async fn cloud_unconfirmable_preview_ids(
+    runtime: &CloudBotRuntime,
+    preview_keys: &[(String, String)],
+) -> Result<HashSet<String>> {
+    if preview_keys.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let bot = runtime.bot.clone();
+    let inbox = Arc::clone(&runtime.inbox);
+    let preview_keys = preview_keys.to_vec();
+    #[cfg(test)]
+    let file_provider = runtime.test_file_provider.clone();
+    #[cfg(not(test))]
+    let file_provider = None;
+    tokio::task::spawn_blocking(move || {
+        let manager = open_cloud_library_manager(&bot, inbox, file_provider)?;
+        manager.unconfirmable_preview_ids(&preview_keys)
+    })
+    .await
+    .context("cloud preview confirmability worker failed")?
 }
 
 async fn cloud_awaiting_confirmation_record(
@@ -12677,12 +12851,119 @@ mod tests {
                 .as_array()
                 .is_some_and(|warnings| !warnings.is_empty())
         );
+        let omitted_warning = format!(
+            "Cloud snapshot omitted {} library item(s) from the complete source view to fit the upload budget.",
+            12 - items.len()
+        );
+        assert!(
+            snapshot.library["warnings"]
+                .as_array()
+                .is_some_and(|warnings| warnings
+                    .iter()
+                    .any(|warning| warning.as_str() == Some(&omitted_warning)))
+        );
         assert!(
             snapshot
                 .encoded_size(state_version)
                 .expect("trimmed snapshot should encode")
                 .saturating_add(1024)
                 <= budget
+        );
+    }
+
+    #[test]
+    fn oversized_leading_library_items_can_be_omitted_with_an_exact_warning() {
+        let cases = [
+            vec![serde_json::json!({
+                "id": "only-large-item",
+                "title": "x".repeat(128 * 1024),
+            })],
+            vec![
+                serde_json::json!({
+                    "id": "large-first-item",
+                    "title": "x".repeat(128 * 1024),
+                }),
+                serde_json::json!({ "id": "small-later-item", "title": "small" }),
+            ],
+        ];
+
+        for original_items in cases {
+            let omitted_count = original_items.len();
+            let mut snapshot = CloudStateSnapshot {
+                revision: "oversized-leading-item".to_string(),
+                library: serde_json::json!({
+                    "items": original_items,
+                    "warnings": [],
+                    "ready": true,
+                }),
+                previews: Vec::new(),
+                operations: Vec::new(),
+                tasks: Vec::new(),
+                download_dir: "/tmp/downloads".to_string(),
+            };
+            let state_version = 9;
+            let budget = 4 * 1024;
+
+            assert!(
+                snapshot
+                    .trim_library_for_upload(state_version, budget)
+                    .expect("oversized leading items should be reducible")
+            );
+            assert_eq!(snapshot.library["items"].as_array().map(Vec::len), Some(0));
+            assert_eq!(snapshot.library["ready"].as_bool(), Some(true));
+            assert_eq!(snapshot.library["incomplete"].as_bool(), Some(true));
+            let warning = format!(
+                "Cloud snapshot omitted {omitted_count} library item(s) from the complete source view to fit the upload budget."
+            );
+            assert!(
+                snapshot.library["warnings"]
+                    .as_array()
+                    .is_some_and(|warnings| warnings
+                        .iter()
+                        .any(|value| value.as_str() == Some(&warning)))
+            );
+            assert!(
+                snapshot
+                    .encoded_size(state_version)
+                    .expect("reduced snapshot should encode")
+                    .saturating_add(1024)
+                    <= budget
+            );
+        }
+    }
+
+    #[test]
+    fn irreducible_non_library_metadata_does_not_claim_a_successful_trim() {
+        let original_items = vec![serde_json::json!({
+            "id": "large-item",
+            "title": "x".repeat(8 * 1024),
+        })];
+        let mut snapshot = CloudStateSnapshot {
+            revision: "irreducible-metadata".to_string(),
+            library: serde_json::json!({
+                "items": original_items,
+                "warnings": [],
+                "ready": true,
+            }),
+            previews: Vec::new(),
+            operations: Vec::new(),
+            tasks: vec![serde_json::json!({ "opaque": "y".repeat(16 * 1024) })],
+            download_dir: "/tmp/downloads".to_string(),
+        };
+        let state_version = 10;
+        let original_items = snapshot.library["items"].clone();
+
+        assert!(
+            !snapshot
+                .trim_library_for_upload(state_version, 4 * 1024)
+                .expect("irreducible metadata should be handled without error")
+        );
+        assert_eq!(snapshot.library["items"], original_items);
+        assert!(
+            snapshot
+                .encoded_size(state_version)
+                .expect("irreducible snapshot should encode")
+                > 4 * 1024
         );
     }
 

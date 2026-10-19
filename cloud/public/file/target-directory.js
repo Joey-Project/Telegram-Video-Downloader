@@ -1,4 +1,6 @@
 export const MAX_TARGET_RELATIVE_DIR_BYTES = 1024;
+export const MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES = 255;
+const utf8Encoder = new TextEncoder();
 
 function hasUnpairedSurrogate(value) {
   for (let index = 0; index < value.length; index += 1) {
@@ -19,7 +21,7 @@ export function validateTargetRelativeDirectory(value) {
   if (hasUnpairedSurrogate(directory)) {
     return { directory, error: "Destination folder must contain valid Unicode text." };
   }
-  if (new TextEncoder().encode(directory).byteLength > MAX_TARGET_RELATIVE_DIR_BYTES) {
+  if (utf8Encoder.encode(directory).byteLength > MAX_TARGET_RELATIVE_DIR_BYTES) {
     return { directory, error: "Destination folder must not exceed 1,024 UTF-8 bytes." };
   }
   if (/[\u0000-\u001f\u007f]/u.test(directory)) {
@@ -28,6 +30,12 @@ export function validateTargetRelativeDirectory(value) {
   if (directory === "") return { directory, error: null };
 
   const segments = directory.split("/");
+  if (segments.some((segment) => utf8Encoder.encode(segment).byteLength > MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES)) {
+    return {
+      directory,
+      error: `Each destination folder component must not exceed ${MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES} UTF-8 bytes.`,
+    };
+  }
   if (directory.startsWith("/") || /^[A-Za-z]:/u.test(directory) || segments.some((segment) => {
     const lowercaseSegment = segment.toLowerCase();
     return segment.length === 0 || segment === "." || segment === ".." ||

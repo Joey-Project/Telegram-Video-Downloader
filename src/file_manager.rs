@@ -9,7 +9,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -62,6 +62,7 @@ pub(crate) const MAX_METADATA_TITLE_CHARS: usize = 500;
 const MAX_METADATA_TITLE_BYTES: usize = 4096;
 const MAX_DEPTH: usize = 48;
 const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
+const MAX_PATH_COMPONENT_BYTES: usize = MAX_FILENAME_COMPONENT_BYTES;
 const MAX_ENTRIES: usize = 200_000;
 const MAX_MEDIA_ITEMS: usize = 50_000;
 const MAX_PINNED_PREVIEWS: usize = 64;
@@ -693,6 +694,33 @@ impl PreviewAnchorStore {
         self.by_preview.get(preview_id).map(|entry| &entry.anchors)
     }
 
+    fn matches_required_anchors(
+        &self,
+        preview_id: &str,
+        required: &HashSet<String>,
+    ) -> Result<bool> {
+        if required.is_empty() {
+            return Ok(true);
+        }
+        let Some(entry) = self.by_preview.get(preview_id) else {
+            return Ok(false);
+        };
+        for token in required {
+            let Some(anchor) = entry.anchors.get(token) else {
+                return Ok(false);
+            };
+            let expected = decode_identity_token(token)?;
+            let actual = anchor.identity();
+            if actual.device() != expected.device
+                || actual.inode() != expected.inode
+                || !actual.is_file()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn make_room_for(&mut self, preview_id: &str, file_count: usize) -> Result<()> {
         self.remove(preview_id);
         if file_count > MAX_PINNED_FILES_PER_PREVIEW || file_count > MAX_PINNED_FILES_TOTAL {
@@ -730,6 +758,8 @@ pub struct LibraryManager {
     process_nonce: String,
     #[cfg(test)]
     scan_test_hooks: Arc<Mutex<ScanTestHooks>>,
+    #[cfg(test)]
+    preview_creation_time_unavailable: AtomicBool,
     #[cfg(test)]
     scan_attempts: AtomicUsize,
 }
@@ -1051,6 +1081,8 @@ impl LibraryManager {
             #[cfg(test)]
             scan_test_hooks: Arc::new(Mutex::new(ScanTestHooks::default())),
             #[cfg(test)]
+            preview_creation_time_unavailable: AtomicBool::new(false),
+            #[cfg(test)]
             scan_attempts: AtomicUsize::new(0),
         };
         manager.ensure_lock_file()?;
@@ -1065,6 +1097,75 @@ impl LibraryManager {
             .map_err(|_| anyhow!("media-library lock is poisoned"))?;
         let _disk_guard = self.lock_store()?;
         self.scan_locked(hints)
+    }
+
+    /// Returns active previews whose persisted identity requires a live descriptor that is no
+    /// longer available. Callers should pass only their bounded active-confirmation page.
+    /// The check does not extend anchor TTLs or change persisted preview state.
+    pub(crate) fn unconfirmable_preview_ids(
+        &self,
+        preview_keys: &[(String, String)],
+    ) -> Result<HashSet<String>> {
+        let mut unconfirmable = HashSet::new();
+        if preview_keys.is_empty() {
+            return Ok(unconfirmable);
+        }
+
+        let _process_guard = self
+            .in_process_lock
+            .lock()
+            .map_err(|_| anyhow!("media-library lock is poisoned"))?;
+        let _disk_guard = self.lock_store()?;
+        let mut required_previews = Vec::new();
+        let mut seen_ids = HashSet::new();
+        for (preview_id, revision) in preview_keys {
+            validate_identifier(preview_id)?;
+            if !seen_ids.insert(preview_id.as_str()) {
+                bail!("preview confirmability request contains a duplicate ID");
+            }
+            let Some(bytes) =
+                self.read_private_file(&self.preview_path(preview_id), PREVIEW_LIMIT)?
+            else {
+                unconfirmable.insert(preview_id.clone());
+                continue;
+            };
+            let persisted: PersistedPreview =
+                serde_json::from_slice(&bytes).context("failed to parse persisted move preview")?;
+            if persisted.version != 1 || persisted.preview.id != *preview_id {
+                bail!("persisted preview identity is invalid");
+            }
+            if persisted.preview.revision != *revision {
+                unconfirmable.insert(preview_id.clone());
+                continue;
+            }
+            let required = required_preview_anchor_tokens(&persisted)?;
+            if required.is_empty() {
+                continue;
+            }
+            if persisted.process_nonce != self.process_nonce {
+                unconfirmable.insert(preview_id.clone());
+                continue;
+            }
+            required_previews.push((preview_id.clone(), required));
+        }
+
+        if required_previews.is_empty() {
+            return Ok(unconfirmable);
+        }
+        let Some(cache) = LIVE_PREVIEW_ANCHORS.get() else {
+            unconfirmable.extend(required_previews.into_iter().map(|(id, _)| id));
+            return Ok(unconfirmable);
+        };
+        let mut cache = cache
+            .lock()
+            .map_err(|_| anyhow!("preview identity-anchor cache is poisoned"))?;
+        cache.prune_expired(Instant::now());
+        for (preview_id, required) in required_previews {
+            if !cache.matches_required_anchors(&preview_id, &required)? {
+                unconfirmable.insert(preview_id);
+            }
+        }
+        Ok(unconfirmable)
     }
 
     #[cfg(test)]
@@ -1100,6 +1201,12 @@ impl LibraryManager {
             .expect("scan test-hook lock should remain healthy")
             .identity_reconciliation_steps = Some(Arc::clone(&steps));
         steps
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_preview_creation_time_unavailable_for_test(&self) {
+        self.preview_creation_time_unavailable
+            .store(true, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -4242,6 +4349,15 @@ impl LibraryManager {
                 return Ok(None);
             };
             let (token, digest) = token_for_bound_file(&file)?;
+            #[cfg(test)]
+            let token = if self
+                .preview_creation_time_unavailable
+                .load(Ordering::Relaxed)
+            {
+                identity_token_without_creation_time_for_test(&token)?
+            } else {
+                token
+            };
             let contents = match content_limit {
                 Some(limit) => {
                     if file.byte_len()? > limit as u64 {
@@ -4681,8 +4797,14 @@ fn safe_relative_path(value: &str, allow_empty: bool) -> Result<PathBuf> {
         let Component::Normal(name) = component else {
             bail!("relative path must not contain root, current, or parent components");
         };
-        name.to_str()
+        let name = name
+            .to_str()
             .ok_or_else(|| anyhow!("relative path is not UTF-8"))?;
+        if name.len() > MAX_PATH_COMPONENT_BYTES {
+            bail!(
+                "relative path component exceeds the {MAX_PATH_COMPONENT_BYTES}-byte filesystem limit"
+            );
+        }
         normalized.push(name);
     }
     if normalized.as_os_str().is_empty() && !allow_empty {
@@ -5141,6 +5263,33 @@ fn decode_identity_token(token: &str) -> Result<IdentityToken> {
     })
 }
 
+#[cfg(test)]
+fn identity_token_without_creation_time_for_test(token: &str) -> Result<String> {
+    let mut fields = token.split(':').map(str::to_owned).collect::<Vec<_>>();
+    if fields.len() != 10 || fields[2] != "f" {
+        bail!("move preview file identity token is invalid");
+    }
+    fields[7] = "-".to_string();
+    fields[8] = "-".to_string();
+    Ok(fields.join(":"))
+}
+
+#[cfg(test)]
+fn identity_token_with_creation_time_for_test(
+    token: &str,
+    seconds: i64,
+    nanoseconds: i64,
+) -> Result<String> {
+    let mut fields = token.split(':').map(str::to_owned).collect::<Vec<_>>();
+    if fields.len() != 10 || fields[2] != "f" {
+        bail!("move preview file identity token is invalid");
+    }
+    fields[7] = seconds.to_string();
+    fields[8] = nanoseconds.to_string();
+    decode_identity_token(&fields.join(":"))?;
+    Ok(fields.join(":"))
+}
+
 fn identity_tokens_equal_except_birth_time(left: &str, right: &str) -> Result<bool> {
     if left == right {
         return Ok(true);
@@ -5304,7 +5453,7 @@ fn start_preview_anchor_reaper() -> Result<()> {
         .map_err(|error| anyhow!("failed to start preview identity-anchor reaper: {error}"))
 }
 
-fn require_preview_anchors(persisted: &PersistedPreview, process_nonce: &str) -> Result<()> {
+fn required_preview_anchor_tokens(persisted: &PersistedPreview) -> Result<HashSet<String>> {
     let mut required = HashSet::new();
     for file in persisted.preview.items.iter().flat_map(|item| &item.files) {
         if !file.identity.is_empty()
@@ -5312,7 +5461,7 @@ fn require_preview_anchors(persisted: &PersistedPreview, process_nonce: &str) ->
                 .birth_seconds
                 .is_none()
         {
-            required.insert(file.identity.as_str());
+            required.insert(file.identity.clone());
         }
     }
     for patch in &persisted.patches {
@@ -5320,14 +5469,38 @@ fn require_preview_anchors(persisted: &PersistedPreview, process_nonce: &str) ->
             .birth_seconds
             .is_none()
         {
-            required.insert(patch.media_identity.as_str());
+            required.insert(patch.media_identity.clone());
         }
         if let Some(identity) = patch.expected_identity.as_deref()
             && decode_identity_token(identity)?.birth_seconds.is_none()
         {
-            required.insert(identity);
+            required.insert(identity.to_string());
         }
     }
+    Ok(required)
+}
+
+#[cfg(test)]
+fn preview_has_required_anchors(
+    persisted: &PersistedPreview,
+    process_nonce: &str,
+    cache: Option<&PreviewAnchorStore>,
+) -> Result<bool> {
+    let required = required_preview_anchor_tokens(persisted)?;
+    if required.is_empty() {
+        return Ok(true);
+    }
+    if persisted.process_nonce != process_nonce {
+        return Ok(false);
+    }
+    let Some(cache) = cache else {
+        return Ok(false);
+    };
+    cache.matches_required_anchors(&persisted.preview.id, &required)
+}
+
+fn require_preview_anchors(persisted: &PersistedPreview, process_nonce: &str) -> Result<()> {
+    let required = required_preview_anchor_tokens(persisted)?;
     if required.is_empty() {
         return Ok(());
     }
@@ -5342,23 +5515,13 @@ fn require_preview_anchors(persisted: &PersistedPreview, process_nonce: &str) ->
         .map_err(|_| anyhow!("preview identity-anchor cache is poisoned"))?;
     let now = Instant::now();
     cache.prune_expired(now);
-    let anchors = cache.touch(&persisted.preview.id, now).ok_or_else(|| {
-        anyhow!("selected object lost its in-process descriptor anchor; create a new preview")
-    })?;
-    for token in required {
-        let anchor = anchors.get(token).ok_or_else(|| {
-            anyhow!("selected object lost its in-process descriptor anchor; create a new preview")
-        })?;
-        let expected = decode_identity_token(token)?;
-        let actual = anchor.identity();
-        if actual.device() != expected.device
-            || actual.inode() != expected.inode
-            || !actual.is_file()
-        {
-            bail!(
-                "in-process descriptor anchor no longer matches the approved object; create a new preview"
-            );
-        }
+    if cache.touch(&persisted.preview.id, now).is_none() {
+        bail!("selected object lost its in-process descriptor anchor; create a new preview");
+    }
+    if !cache.matches_required_anchors(&persisted.preview.id, &required)? {
+        bail!(
+            "in-process descriptor anchor no longer matches the approved object; create a new preview"
+        );
     }
     Ok(())
 }
@@ -11617,6 +11780,56 @@ mod tests {
     }
 
     #[test]
+    fn final_destination_path_components_obey_filesystem_byte_limit() {
+        let ascii_at_limit = "a".repeat(MAX_PATH_COMPONENT_BYTES);
+        let ascii_over_limit = "a".repeat(MAX_PATH_COMPONENT_BYTES + 1);
+        assert!(safe_relative_path(&ascii_at_limit, false).is_ok());
+        assert!(safe_relative_path(&ascii_over_limit, false).is_err());
+
+        let cjk_at_limit = "界".repeat(MAX_PATH_COMPONENT_BYTES / "界".len());
+        let emoji_at_limit = "😀".repeat(MAX_PATH_COMPONENT_BYTES / "😀".len());
+        let emoji_over_limit = format!("{emoji_at_limit}😀");
+        assert_eq!(cjk_at_limit.len(), MAX_PATH_COMPONENT_BYTES);
+        assert_eq!(emoji_at_limit.len(), 252);
+        assert_eq!(emoji_over_limit.len(), 256);
+        assert!(safe_relative_path(&cjk_at_limit, false).is_ok());
+        assert!(safe_relative_path(&emoji_at_limit, false).is_ok());
+        assert!(safe_relative_path(&emoji_over_limit, false).is_err());
+
+        let root = TemporaryRoot::new("overlong-final-target-component");
+        let source_path = root.path().join("clip.mp4");
+        fs::write(&source_path, b"fixture-video").expect("source media should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        let source_before = fs::read(&source_path).expect("source media should read");
+        let source_identity_before = fs::metadata(&source_path).expect("source should stat");
+        let previews_before = persisted_preview_count(&manager);
+        let target_relative_dir = format!("d/{ascii_over_limit}");
+
+        let error = manager
+            .build_and_persist_preview(
+                &snapshot,
+                PreviewBuildRequest {
+                    item_ids: std::slice::from_ref(&item_id),
+                    target_relative_dir: Some(&target_relative_dir),
+                    rename: false,
+                    conflict: ConflictPolicy::KeepBoth,
+                    patches: &[],
+                },
+                &mut |target_path| manager.target_parent_device(target_path),
+            )
+            .expect_err("an overlong target component must fail before preview persistence");
+        assert!(error.to_string().contains("255-byte filesystem limit"));
+        assert_eq!(fs::read(&source_path).unwrap(), source_before);
+        let source_identity_after = fs::metadata(&source_path).expect("source should still stat");
+        assert_eq!(source_identity_before.dev(), source_identity_after.dev());
+        assert_eq!(source_identity_before.ino(), source_identity_after.ino());
+        assert!(!root.path().join("d").exists());
+        assert_eq!(persisted_preview_count(&manager), previews_before);
+    }
+
+    #[test]
     fn preview_validator_and_result_share_a_single_locked_scan() {
         let root = TemporaryRoot::new("preview-single-authoritative-scan");
         fs::write(root.path().join("clip.mp4"), b"fixture-video")
@@ -14988,6 +15201,237 @@ mod tests {
         assert!(store.by_preview.is_empty());
         assert!(store.order.is_empty());
         assert_eq!(store.file_count, 0);
+    }
+
+    #[test]
+    fn active_preview_confirmability_requires_creation_time_or_live_anchor() {
+        let root = TemporaryRoot::new("preview-confirmability-missing-created");
+        fs::write(root.path().join("clip.mp4"), b"confirmation fixture")
+            .expect("media fixture should write");
+        let library = manager(&root);
+        let snapshot = library.scan(&[]).expect("initial scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        library.make_preview_creation_time_unavailable_for_test();
+        let preview = library
+            .preview(&[item_id], "Moved", true, ConflictPolicy::KeepBoth)
+            .expect("preview with unavailable creation metadata should persist");
+        let key = (preview.id.clone(), preview.revision.clone());
+        let persisted = library
+            .read_persisted_preview(&preview.id)
+            .expect("persisted preview should read");
+        let required = required_preview_anchor_tokens(&persisted)
+            .expect("preview identity tokens should be valid");
+        assert_eq!(required.len(), 1);
+        assert!(required.iter().all(|token| {
+            decode_identity_token(token)
+                .expect("fixture identity should decode")
+                .birth_seconds
+                .is_none()
+        }));
+
+        let expires_at_before = {
+            let cache = LIVE_PREVIEW_ANCHORS
+                .get()
+                .expect("preview should store live anchors")
+                .lock()
+                .expect("anchor cache should remain healthy");
+            cache.by_preview[&preview.id].expires_at
+        };
+        assert!(
+            library
+                .unconfirmable_preview_ids(std::slice::from_ref(&key))
+                .expect("live preview anchors should be inspectable")
+                .is_empty(),
+            "an active descriptor anchor should keep this preview confirmable"
+        );
+        let expires_at_after = {
+            let cache = LIVE_PREVIEW_ANCHORS
+                .get()
+                .expect("anchor cache should remain initialized")
+                .lock()
+                .expect("anchor cache should remain healthy");
+            cache.by_preview[&preview.id].expires_at
+        };
+        assert_eq!(
+            expires_at_before, expires_at_after,
+            "publishing state must not refresh the one-hour anchor TTL"
+        );
+
+        {
+            let mut cache = LIVE_PREVIEW_ANCHORS
+                .get()
+                .expect("preview anchor cache should remain initialized")
+                .lock()
+                .expect("anchor cache should remain healthy");
+            cache.by_preview.get_mut(&preview.id).unwrap().expires_at =
+                Instant::now() - Duration::from_secs(1);
+        }
+        assert!(
+            library
+                .unconfirmable_preview_ids(std::slice::from_ref(&key))
+                .expect("expired anchor should be a normal stale-preview state")
+                .contains(&preview.id),
+            "the state check should enforce anchor expiry without waiting in real time"
+        );
+
+        let mut reopened = manager(&root);
+        reopened.process_nonce = "simulated-new-process".to_string();
+        assert!(
+            reopened
+                .unconfirmable_preview_ids(std::slice::from_ref(&key))
+                .expect("restart should be distinguishable from a read failure")
+                .contains(&preview.id),
+            "a token without persistent creation time cannot survive a process restart"
+        );
+
+        release_preview_anchors(&preview.id);
+        assert!(
+            library
+                .unconfirmable_preview_ids(std::slice::from_ref(&key))
+                .expect("an evicted anchor should be reported as unavailable")
+                .contains(&preview.id),
+            "a persisted preview remains present but is no longer confirmable without its anchor"
+        );
+
+        let mut persistent = persisted;
+        persistent.process_nonce = "simulated-new-process".to_string();
+        for file in persistent
+            .preview
+            .items
+            .iter_mut()
+            .flat_map(|item| &mut item.files)
+        {
+            if !file.identity.is_empty() {
+                file.identity = identity_token_with_creation_time_for_test(&file.identity, 1, 0)
+                    .expect("test token should encode persistent creation time");
+            }
+        }
+        assert!(
+            preview_has_required_anchors(&persistent, "simulated-new-process", None)
+                .expect("persistent identity tokens should be valid"),
+            "a preview carrying persistent creation-time evidence should survive reopen without descriptor anchors"
+        );
+
+        let wrong_revision = (preview.id.clone(), "stale-revision".to_string());
+        assert!(
+            library
+                .unconfirmable_preview_ids(&[wrong_revision])
+                .expect("revision mismatch should be a normal stale-preview state")
+                .contains(&preview.id)
+        );
+        let missing_id = new_operation_id("missing-confirmability-preview");
+        assert!(
+            library
+                .unconfirmable_preview_ids(&[(missing_id.clone(), "revision".to_string())])
+                .expect("missing preview should be a normal stale-preview state")
+                .contains(&missing_id)
+        );
+    }
+
+    #[test]
+    fn preview_confirmability_preserves_transient_file_provider_errors() {
+        let root = TemporaryRoot::new("preview-confirmability-provider-error");
+        let media_path = root.path().join("clip.mp4");
+        fs::write(&media_path, b"provider error fixture").expect("media fixture should write");
+        let provider = Arc::new(FailOneMediaReadProvider::new(media_path.clone()));
+        let provider_for_manager: Arc<dyn QueueFileProvider> = provider.clone();
+        let library = LibraryManager::open_with_provider(root.path(), provider_for_manager)
+            .expect("library manager should open against the injected provider");
+        let snapshot = library.scan(&[]).expect("initial scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        library.make_preview_creation_time_unavailable_for_test();
+        let preview = library
+            .preview(&[item_id], "Moved", true, ConflictPolicy::KeepBoth)
+            .expect("preview with unavailable creation metadata should persist");
+        provider.fail_next_media_read_at(&library.preview_path(&preview.id));
+
+        let error = library
+            .unconfirmable_preview_ids(&[(preview.id.clone(), preview.revision.clone())])
+            .expect_err("a transient private-preview read failure must remain an error");
+        assert!(
+            is_file_provider_access_error(&error),
+            "transient provider failure must not be misreported as an unavailable anchor: {error:#}"
+        );
+        release_preview_anchors(&preview.id);
+    }
+
+    #[test]
+    fn missing_creation_time_confirmability_expires_and_obeys_lru_eviction() {
+        let root = TemporaryRoot::new("preview-confirmability-anchor-retention");
+        let media_path = root.path().join("clip.mp4");
+        fs::write(&media_path, b"anchor retention fixture").expect("media fixture should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        manager.make_preview_creation_time_unavailable_for_test();
+        let preview = manager
+            .preview(&[item_id], "Moved", true, ConflictPolicy::KeepBoth)
+            .expect("preview with unavailable creation metadata should persist");
+        let persisted = manager
+            .read_persisted_preview(&preview.id)
+            .expect("persisted preview should read");
+        let read = manager
+            .read_file_with_token_and_handle(&media_path, None)
+            .expect("same media object should remain readable")
+            .expect("media fixture should remain present");
+        let now = Instant::now();
+        let mut anchors = HashMap::new();
+        anchors.insert(read.token.clone(), read.file.clone());
+        let mut cache = PreviewAnchorStore {
+            file_count: anchors.len(),
+            ..PreviewAnchorStore::default()
+        };
+        cache.order.push_back(preview.id.clone());
+        cache.by_preview.insert(
+            preview.id.clone(),
+            PreviewAnchorEntry {
+                anchors,
+                expires_at: now + PREVIEW_ANCHOR_TTL,
+            },
+        );
+        assert!(
+            preview_has_required_anchors(&persisted, &manager.process_nonce, Some(&cache))
+                .expect("live anchor should match the persisted object identity")
+        );
+
+        cache.prune_expired(now + PREVIEW_ANCHOR_TTL);
+        assert!(
+            !preview_has_required_anchors(&persisted, &manager.process_nonce, Some(&cache))
+                .expect("expired anchor should be a normal unavailable state")
+        );
+
+        let mut cache = PreviewAnchorStore::default();
+        let mut anchors = HashMap::new();
+        anchors.insert(read.token.clone(), read.file.clone());
+        cache.file_count = anchors.len();
+        cache.order.push_back(preview.id.clone());
+        cache.by_preview.insert(
+            preview.id.clone(),
+            PreviewAnchorEntry {
+                anchors,
+                expires_at: now + PREVIEW_ANCHOR_TTL,
+            },
+        );
+        for index in 0..MAX_PINNED_PREVIEWS {
+            let preview_id = format!("preview-confirmability-lru-{index}");
+            cache
+                .make_room_for(&preview_id, 0)
+                .expect("LRU store should admit bounded empty preview entries");
+            cache.order.push_back(preview_id.clone());
+            cache.by_preview.insert(
+                preview_id,
+                PreviewAnchorEntry {
+                    anchors: HashMap::new(),
+                    expires_at: now + PREVIEW_ANCHOR_TTL,
+                },
+            );
+        }
+        assert!(!cache.by_preview.contains_key(&preview.id));
+        assert!(
+            !preview_has_required_anchors(&persisted, &manager.process_nonce, Some(&cache))
+                .expect("LRU eviction should be a normal unavailable state")
+        );
+        release_preview_anchors(&preview.id);
     }
 
     #[test]

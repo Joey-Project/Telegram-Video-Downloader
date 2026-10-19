@@ -27,6 +27,9 @@ REQUIREMENT = f'identifier "{service.IDENTIFIER}" and certificate leaf = H"{FING
 PRIVATE_MARKER = "private-configuration-must-not-be-printed"
 # Synthetic-token catalog joey-private-v3: access-a, active access role.
 SYNTHETIC_ACCESS_TOKEN = "codex_synth_v1_access_a"
+# Synthetic-token catalog joey-private-v3: bearer-a/b, active bearer roles.
+SYNTHETIC_CLOUD_SECRET_OLD = "codex_synth_v1_bearer_a"
+SYNTHETIC_CLOUD_SECRET_NEW = "JoeyPrivateV3BearerSlotB7Q9M3X5"
 
 
 class InstallationTest(unittest.TestCase):
@@ -1808,6 +1811,208 @@ class InstallationTest(unittest.TestCase):
             service.InstallError, "cloud configuration must be a TOML table"
         ):
             self.audit(invalid_cloud_deployment)
+
+    def test_cloud_environment_secret_is_forwarded_only_for_cloud_and_not_in_audit(self):
+        self.config.write_text("[cloud]\n", encoding="utf-8")
+        self.config.chmod(0o600)
+        with mock.patch.dict(
+            os.environ,
+            {service.LAUNCHD_CLOUD_SHARED_SECRET: SYNTHETIC_CLOUD_SECRET_NEW},
+        ):
+            cloud = self.deployment()
+            plan = self.audit(cloud)
+            plist = plistlib.loads(cloud.new_plist())
+            self.assertEqual(cloud.readiness_mode, "cloud")
+            self.assertEqual(
+                plist["EnvironmentVariables"][service.LAUNCHD_CLOUD_SHARED_SECRET],
+                SYNTHETIC_CLOUD_SECRET_NEW,
+            )
+            self.assertEqual(
+                plist["EnvironmentVariables"]["PATH"],
+                self.original_plist["EnvironmentVariables"]["PATH"],
+            )
+            self.assertEqual(plist["CustomRetainedProperty"], ["preserve", {"nested": True}])
+            self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(plan))
+
+            self.config.write_text("[telegram]\n", encoding="utf-8")
+            self.config.chmod(0o600)
+            telegram = self.deployment()
+            telegram_plan = self.audit(telegram)
+            telegram_plist = plistlib.loads(telegram.new_plist())
+            self.assertEqual(telegram.readiness_mode, "telegram")
+            self.assertNotIn(
+                service.LAUNCHD_CLOUD_SHARED_SECRET,
+                telegram_plist["EnvironmentVariables"],
+            )
+            self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(telegram_plan))
+
+    def test_missing_or_blank_cloud_environment_preserves_existing_plist_secret(self):
+        self.config.write_text("[cloud]\n", encoding="utf-8")
+        self.config.chmod(0o600)
+        old_environment = {
+            **self.original_plist["EnvironmentVariables"],
+            service.LAUNCHD_CLOUD_SHARED_SECRET: SYNTHETIC_CLOUD_SECRET_OLD,
+        }
+        self.plist.write_bytes(
+            plistlib.dumps({**self.original_plist, "EnvironmentVariables": old_environment})
+        )
+        cases = [
+            ("unset", None),
+            ("empty", ""),
+            ("whitespace", " \t\n "),
+        ]
+        for label, value in cases:
+            with self.subTest(environment=label):
+                if value is None:
+                    with mock.patch.dict(os.environ):
+                        os.environ.pop(service.LAUNCHD_CLOUD_SHARED_SECRET, None)
+                        deployment = self.deployment()
+                        plan = self.audit(deployment)
+                        environment = plistlib.loads(deployment.new_plist())[
+                            "EnvironmentVariables"
+                        ]
+                else:
+                    with mock.patch.dict(
+                        os.environ, {service.LAUNCHD_CLOUD_SHARED_SECRET: value}
+                    ):
+                        deployment = self.deployment()
+                        plan = self.audit(deployment)
+                        environment = plistlib.loads(deployment.new_plist())[
+                            "EnvironmentVariables"
+                        ]
+                self.assertEqual(
+                    environment[service.LAUNCHD_CLOUD_SHARED_SECRET],
+                    SYNTHETIC_CLOUD_SECRET_OLD,
+                )
+                self.assertNotIn(SYNTHETIC_CLOUD_SECRET_OLD, json.dumps(plan))
+
+    def test_first_cloud_install_writes_environment_secret_to_private_new_plist(self):
+        self.plist.unlink()
+        self.config.write_text("[cloud]\n", encoding="utf-8")
+        self.config.chmod(0o600)
+        with mock.patch.dict(
+            os.environ,
+            {service.LAUNCHD_CLOUD_SHARED_SECRET: SYNTHETIC_CLOUD_SECRET_NEW},
+        ):
+            deployment = self.deployment(
+                "deploy", "--no-build", "--binary", str(self.artifact)
+            )
+            self.assertFalse(deployment.binary.exists())
+            events, registry = self.transaction_environment(deployment)
+            registry.clear()
+            with (
+                mock.patch.object(
+                    service, "initial_identity", return_value=(REQUIREMENT, FINGERPRINT)
+                ),
+                mock.patch.object(service, "detect_dotnet_root", return_value=None),
+            ):
+                plan = self.audit(deployment)
+                before_state = self.state_snapshot()
+                with mock.patch.object(deployment, "wait_ready", return_value=303):
+                    result = deployment.deploy()
+
+        document = plistlib.loads(self.plist.read_bytes())
+        environment = document["EnvironmentVariables"]
+        self.assertEqual(
+            environment[service.LAUNCHD_CLOUD_SHARED_SECRET], SYNTHETIC_CLOUD_SECRET_NEW
+        )
+        self.assertEqual(stat.S_IMODE(self.plist.stat().st_mode), 0o600)
+        self.assertEqual(result["readiness_mode"], "cloud")
+        self.assertTrue(result["cloud_ingress_reconciled"])
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(plan))
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(result))
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(events))
+        backup = Path(result["backup"])
+        self.assertNotIn(
+            SYNTHETIC_CLOUD_SECRET_NEW, (backup / "transaction.json").read_text()
+        )
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, (backup / "complete.json").read_text())
+        self.assertEqual(self.state_snapshot(), before_state)
+
+    def test_cloud_secret_deploy_uses_private_plist_and_keeps_secret_out_of_diagnostics(self):
+        self.config.write_text("[cloud]\n", encoding="utf-8")
+        self.config.chmod(0o600)
+        self.plist.chmod(0o644)
+        original_plist = self.plist.read_bytes()
+        with mock.patch.dict(
+            os.environ,
+            {service.LAUNCHD_CLOUD_SHARED_SECRET: SYNTHETIC_CLOUD_SECRET_NEW},
+        ):
+            deployment = self.deployment(
+                "deploy", "--no-build", "--binary", str(self.artifact)
+            )
+            events, _ = self.transaction_environment(deployment)
+            plan = self.audit(deployment)
+            before_state = self.state_snapshot()
+            with mock.patch.object(deployment, "wait_ready", return_value=303):
+                result = deployment.deploy()
+
+        document = plistlib.loads(self.plist.read_bytes())
+        self.assertEqual(stat.S_IMODE(self.plist.stat().st_mode), 0o600)
+        self.assertEqual(
+            document["EnvironmentVariables"][service.LAUNCHD_CLOUD_SHARED_SECRET],
+            SYNTHETIC_CLOUD_SECRET_NEW,
+        )
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(plan))
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(result))
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(events))
+        self.assertEqual(self.state_snapshot(), before_state)
+        backup = Path(result["backup"])
+        previous_plist = backup / "previous.plist"
+        self.assertEqual(previous_plist.read_bytes(), original_plist)
+        self.assertEqual(stat.S_IMODE(previous_plist.stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o700)
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, (backup / "transaction.json").read_text())
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, (backup / "complete.json").read_text())
+
+    def test_cloud_secret_readiness_failure_restores_old_plist_mode_and_environment(self):
+        self.config.write_text("[cloud]\n", encoding="utf-8")
+        self.config.chmod(0o600)
+        self.plist.chmod(0o644)
+        original_plist = self.plist.read_bytes()
+        before_state = self.state_snapshot()
+        with mock.patch.dict(
+            os.environ,
+            {service.LAUNCHD_CLOUD_SHARED_SECRET: SYNTHETIC_CLOUD_SECRET_NEW},
+        ):
+            deployment = self.deployment(
+                "deploy", "--no-build", "--binary", str(self.artifact)
+            )
+            events, _ = self.transaction_environment(deployment)
+            self.audit(deployment)
+
+            def fail_after_private_plist_is_installed(_offsets):
+                self.assertEqual(stat.S_IMODE(self.plist.stat().st_mode), 0o600)
+                current = plistlib.loads(self.plist.read_bytes())
+                self.assertEqual(
+                    current["EnvironmentVariables"][service.LAUNCHD_CLOUD_SHARED_SECRET],
+                    SYNTHETIC_CLOUD_SECRET_NEW,
+                )
+                raise service.InstallError("simulated cloud readiness failure")
+
+            with (
+                mock.patch.object(
+                    deployment, "wait_ready", side_effect=fail_after_private_plist_is_installed
+                ),
+                self.assertRaises(service.InstallError) as raised,
+            ):
+                deployment.deploy()
+
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, str(raised.exception))
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(events))
+        restored = plistlib.loads(self.plist.read_bytes())
+        self.assertEqual(
+            restored["EnvironmentVariables"], self.original_plist["EnvironmentVariables"]
+        )
+        self.assertEqual(
+            restored["ProgramArguments"], [str(deployment.binary), str(self.config)]
+        )
+        self.assertEqual(stat.S_IMODE(self.plist.stat().st_mode), 0o644)
+        self.assertEqual(self.old_binary.read_bytes(), b"old signed executable")
+        self.assertEqual(self.state_snapshot(), before_state)
+        backup = Path(str(raised.exception).split("durable backup: ", 1)[1])
+        self.assertEqual((backup / "previous.plist").read_bytes(), original_plist)
+        self.assertEqual(stat.S_IMODE((backup / "previous.plist").stat().st_mode), 0o644)
 
     def test_readiness_protocols_are_separate_and_bind_the_observed_pid(self):
         log = self.root / "readiness-protocols.log"
