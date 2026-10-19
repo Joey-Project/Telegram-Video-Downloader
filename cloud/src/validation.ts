@@ -12,6 +12,7 @@ export const MAX_WEBHOOK_BODY_BYTES = 1_000_000;
 export const MAX_ACTION_BODY_BYTES = 320_000;
 export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
 export const MAX_LEGACY_TEXT_BYTES = 256 * 1024;
+export const MAX_TARGET_RELATIVE_DIR_BYTES = 1_024;
 export const MAX_SELECTED_ITEMS = 100;
 const MAX_COLLECTION_ORDER = 0xffff_ffff;
 const MAX_LEGACY_HINTS = 10_000;
@@ -241,7 +242,13 @@ function parseMetadataPatches(value: unknown): MetadataPatch[] {
 }
 
 function parseRelativeDirectory(value: unknown): string {
-  const directory = boundedString(value, "target_relative_dir", 512, { allowEmpty: true });
+  const directory = boundedString(value, "target_relative_dir", MAX_TARGET_RELATIVE_DIR_BYTES, { allowEmpty: true });
+  if (hasUnpairedSurrogate(directory)) {
+    throw new HttpError(400, "target_relative_dir contains an unpaired surrogate");
+  }
+  if (new TextEncoder().encode(directory).byteLength > MAX_TARGET_RELATIVE_DIR_BYTES) {
+    throw new HttpError(400, `target_relative_dir must not exceed ${MAX_TARGET_RELATIVE_DIR_BYTES} UTF-8 bytes`);
+  }
   if (directory === "") return "";
   if (directory.startsWith("/") || directory.includes("\\") || directory.endsWith("/") || /^[A-Za-z]:/u.test(directory)) {
     throw new HttpError(400, "target_relative_dir must be a safe relative path");

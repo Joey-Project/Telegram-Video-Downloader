@@ -9,10 +9,12 @@ import { filterPresentLegacyCandidates, getOrCreateLegacySelection, updateLegacy
 import { submitLegacyFileImport } from "../public/file/legacy-file-import.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "../public/file/metadata-preview.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "../public/file/selection-limit.js";
+import { MAX_TARGET_RELATIVE_DIR_BYTES as CLIENT_MAX_TARGET_RELATIVE_DIR_BYTES, validateTargetRelativeDirectory } from "../public/file/target-directory.js";
+import { renderMovePreviewItems } from "../public/file/preview-rendering.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
-import { canonicalJson, MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS, MAX_STATE_BODY_BYTES } from "../src/validation";
+import { canonicalJson, MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS, MAX_STATE_BODY_BYTES, MAX_TARGET_RELATIVE_DIR_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_BYTES } from "../src/validation";
 import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue, storeSnapshot } from "../src/store";
 import type { LocalSnapshot } from "../src/types";
 import worker from "../src/index";
@@ -52,6 +54,72 @@ describe("metadata preview details", () => {
   it("detects actual metadata changes instead of treating an empty patch list as an update", () => {
     expect(hasMetadataPreviewChanges({ items: [{ item_id: "video" }], metadata_patches: [] })).toBe(false);
     expect(hasMetadataPreviewChanges({ metadata_patches: [{ changes: [{ field: "title", before: "Old", after: "New" }] }] })).toBe(true);
+  });
+});
+
+describe("move preview rendering", () => {
+  it("renders every media and related-file source-to-destination path in the confirmation preview", () => {
+    const rendered = renderMovePreviewItems([{
+      item_id: "movie",
+      source_path: "Inbox/movie.mkv",
+      target_path: "Library/movie.mkv",
+      outcome: "move",
+      files: [
+        { source_path: "Inbox/movie.mkv", target_path: "Library/movie.mkv" },
+        { source_path: "Inbox/movie.en.srt", target_path: "Library/movie.en.srt" },
+        { source_path: "Inbox/movie-poster.jpg", target_path: "Library/movie-poster.jpg" },
+        { source_path: "Inbox/movie.nfo", target_path: "Library/movie.nfo" },
+      ],
+    }]);
+
+    expect(rendered).toContain('<details class="preview-file-details" open>');
+    expect(rendered).toContain("Review 4 exact source → destination paths");
+    for (const [source, target] of [
+      ["Inbox/movie.mkv", "Library/movie.mkv"],
+      ["Inbox/movie.en.srt", "Library/movie.en.srt"],
+      ["Inbox/movie-poster.jpg", "Library/movie-poster.jpg"],
+      ["Inbox/movie.nfo", "Library/movie.nfo"],
+    ]) {
+      expect(rendered).toContain(`${source} → ${target}`);
+    }
+  });
+
+  it("HTML-escapes item and file paths before placing them in preview markup", () => {
+    const hostile = '<img src=x onerror="alert(1)"> & movie.mkv';
+    const rendered = renderMovePreviewItems([{
+      source_path: hostile,
+      target_path: hostile,
+      files: [{ source_path: hostile, target_path: hostile }],
+    }]);
+
+    expect(rendered).not.toContain("<img");
+    expect(rendered).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt; &amp; movie.mkv");
+  });
+});
+
+describe("target directory validation", () => {
+  it("matches the Worker UTF-8 byte limit and keeps the root destination valid", () => {
+    expect(CLIENT_MAX_TARGET_RELATIVE_DIR_BYTES).toBe(WORKER_MAX_TARGET_RELATIVE_DIR_BYTES);
+    expect(validateTargetRelativeDirectory("")).toEqual({ directory: "", error: null });
+
+    const cjkSegment = "界".repeat(70);
+    const exact = [cjkSegment, cjkSegment, cjkSegment, cjkSegment, "x".repeat(180)].join("/");
+    const oversized = [cjkSegment, cjkSegment, cjkSegment, cjkSegment, "x".repeat(181)].join("/");
+    expect(textEncoder.encode(exact).byteLength).toBe(1024);
+    expect(textEncoder.encode(oversized).byteLength).toBe(1025);
+    expect(validateTargetRelativeDirectory(exact)).toEqual({ directory: exact, error: null });
+    expect(validateTargetRelativeDirectory(oversized).error).toContain("1,024 UTF-8 bytes");
+
+    const sixLevelSeventyCjk = Array.from({ length: 6 }, () => cjkSegment).join("/");
+    expect(textEncoder.encode(sixLevelSeventyCjk).byteLength).toBe(1265);
+    expect(validateTargetRelativeDirectory(sixLevelSeventyCjk).error).toContain("1,024 UTF-8 bytes");
+  });
+
+  it("keeps control, malformed Unicode, and private path checks in the browser validator", () => {
+    expect(validateTargetRelativeDirectory("Movies/Title\nPart").error).toContain("control characters");
+    expect(validateTargetRelativeDirectory("Movies/\uD800").error).toContain("valid Unicode");
+    expect(validateTargetRelativeDirectory("Movies/.TELEGRAM-VIDEO-DOWNLOADER-LIBRARY/cache").error).toContain("safe relative folder path");
+    expect(validateTargetRelativeDirectory("Movies/../private").error).toContain("safe relative folder path");
   });
 });
 
@@ -498,6 +566,62 @@ describe("Mini App identity and actions", () => {
     expect(maxPatches.status).toBe(202);
     expect(tooManyItems.status).toBe(400);
     expect(tooManyPatches.status).toBe(400);
+  });
+
+  it("accepts only target folders within the 1,024-byte UTF-8 contract before enqueueing", async () => {
+    const initData = await signInitData();
+    const cjkSegment = "界".repeat(70);
+    const exact = [cjkSegment, cjkSegment, cjkSegment, cjkSegment, "x".repeat(180)].join("/");
+    const oversized = [cjkSegment, cjkSegment, cjkSegment, cjkSegment, "x".repeat(181)].join("/");
+    const sixLevelSeventyCjk = Array.from({ length: 6 }, () => cjkSegment).join("/");
+    expect(textEncoder.encode(exact).byteLength).toBe(1_024);
+    expect(textEncoder.encode(oversized).byteLength).toBe(1_025);
+    expect(textEncoder.encode(sixLevelSeventyCjk).byteLength).toBe(1_265);
+
+    const invalidPaths = [
+      oversized,
+      sixLevelSeventyCjk,
+      "Movies/Part\nTwo",
+      "Movies/\uD800",
+      "Movies/.TELEGRAM-VIDEO-DOWNLOADER-LIBRARY/cache",
+    ];
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    const notifierIdsBefore = await listDurableObjectIds(testEnv.NOTIFIER);
+    for (const [index, targetRelativeDir] of invalidPaths.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: `00000000-0000-4000-8000-${String(930 + index).padStart(12, "0")}`,
+          kind: "file_preview",
+          payload: { item_ids: ["item-a"], target_relative_dir: targetRelativeDir },
+        }),
+      });
+      expect(response.status, `target path ${index}`).toBe(400);
+    }
+    const afterInvalid = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(afterInvalid?.count).toBe(before?.count);
+    expect(await listDurableObjectIds(testEnv.NOTIFIER)).toEqual(notifierIdsBefore);
+
+    const rootAccepted = await ownerRequest("/api/actions", initData, {
+      method: "POST",
+      body: JSON.stringify({
+        request_id: "00000000-0000-4000-8000-000000000940",
+        kind: "file_preview",
+        payload: { item_ids: ["item-a"], target_relative_dir: "" },
+      }),
+    });
+    const exactAccepted = await ownerRequest("/api/actions", initData, {
+      method: "POST",
+      body: JSON.stringify({
+        request_id: "00000000-0000-4000-8000-000000000941",
+        kind: "file_preview",
+        payload: { item_ids: ["item-a"], target_relative_dir: exact },
+      }),
+    });
+    expect(rootAccepted.status).toBe(202);
+    expect(exactAccepted.status).toBe(202);
+    const afterAccepted = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(afterAccepted?.count).toBe((before?.count ?? 0) + 2);
   });
 
   it("rejects case-insensitive private directory aliases before enqueueing", async () => {

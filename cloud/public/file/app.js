@@ -7,6 +7,8 @@ import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limi
 import { submitLegacyFileImport } from "./legacy-file-import.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
 import { sourceIdUrl } from "./source-links.js";
+import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
+import { validateTargetRelativeDirectory } from "./target-directory.js";
 
 const API = "/api";
 const CACHE_KEY = "file-manager.snapshot.v1";
@@ -19,7 +21,6 @@ const initData = telegram?.initData ?? "";
 const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, selected: new Set(), quarantinedActionIds: new Set(), view: "library", query: "", detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false };
 
 const byId = (id) => document.getElementById(id);
-const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/gu, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]);
 const formatBytes = (value) => {
   const bytes = Number(value);
   if (!Number.isFinite(bytes) || bytes < 0) return "Size unavailable";
@@ -457,11 +458,8 @@ function describePreview(preview) {
   const moveItems = Array.isArray(preview.items) ? preview.items : [];
   const patchItems = Array.isArray(preview.metadata_patches) ? preview.metadata_patches : [];
   const lines = [];
-  for (const item of moveItems) {
-    const outcome = String(item.outcome ?? "move");
-    const label = outcome === "skip" ? "Skipped" : outcome === "no_op" ? "No change" : "Move";
-    lines.push(`<div class="preview-line"><span>${escapeHtml(item.source_path ?? item.item_id ?? "Selected file")} → ${escapeHtml(item.target_path ?? "Library root")}${item.files?.length ? ` <span class="field-hint">(${item.files.length} files including attachments)</span>` : ""}${item.reason ? `<br><span class="preview-reason">${escapeHtml(item.reason)}</span>` : ""}</span><strong class="${outcome === "skip" ? "skip" : "move"}">${label}</strong></div>`);
-  }
+  const moveRows = renderMovePreviewItems(moveItems);
+  if (moveRows) lines.push(moveRows);
   for (const patch of patchItems) {
     const details = metadataPreviewDetails(patch).map((detail) => detail.kind === "status"
       ? escapeHtml(detail.text)
@@ -719,9 +717,9 @@ function bindEvents() {
   byId("root-target").addEventListener("click", () => { byId("target-dir").value = ""; byId("target-dir").focus(); });
   byId("preview-move").addEventListener("click", () => {
     if (state.selected.size > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} videos per request.`);
-    const target = byId("target-dir").value.trim().replaceAll("\\", "/");
-    if (target.startsWith("/") || target.split("/").some((part) => part === ".." || part === "." || part === "" && target !== "")) return showToast("Use a safe relative folder path without empty segments.");
-    submitAction("file_preview", { item_ids: [...state.selected], target_relative_dir: target, rename: byId("rename-toggle").checked, conflict: byId("conflict-select").value });
+    const { directory, error } = validateTargetRelativeDirectory(byId("target-dir").value);
+    if (error) return showToast(error);
+    submitAction("file_preview", { item_ids: [...state.selected], target_relative_dir: directory, rename: byId("rename-toggle").checked, conflict: byId("conflict-select").value });
   });
   byId("legacy-text").addEventListener("input", (event) => { byId("legacy-size").textContent = `${new TextEncoder().encode(event.target.value).byteLength.toLocaleString()} / 256 KB`; });
   byId("import-legacy").addEventListener("click", async () => {

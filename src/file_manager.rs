@@ -1380,6 +1380,12 @@ impl LibraryManager {
                 .get(&item.id)
                 .cloned()
                 .ok_or_else(|| anyhow!("selected media item has no organized target directory"))?;
+            let target_depth = item_target_dir.components().count();
+            if target_depth > MAX_DEPTH {
+                bail!(
+                    "move target directory exceeds the scan depth limit of {MAX_DEPTH} components"
+                );
+            }
             let (files, anchors) = self.preview_files_for_item(
                 item,
                 &item_target_dir,
@@ -7924,10 +7930,10 @@ fn parse_legacy_import(input: &str) -> LegacyImportReport {
         // unique-hint allowance.
         for line in block.lines() {
             let ids = extract_source_ids(line);
-            if ids.is_empty() {
+            let title = title_hint_from_line(line);
+            if ids.is_empty() && title.is_none() {
                 continue;
             }
-            let title = title_hint_from_line(line);
             if !seen.insert((ids.clone(), title.clone())) {
                 continue;
             }
@@ -8522,6 +8528,91 @@ mod tests {
         assert_eq!(report.hints.len(), 1);
         assert_eq!(report.hints[0].source_ids, vec!["youtube:PHH1wTDF-1M"]);
         assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn legacy_import_retains_title_only_hints_and_ignores_noise() {
+        let plain = parse_legacy_import(
+            "TITLE: Inception\nTitle： Inception\nhttps://youtube.com.evil/watch?v=dQw4w9WgXcQ",
+        );
+        assert!(plain.needs_confirmation);
+        assert_eq!(
+            plain.hints.len(),
+            1,
+            "duplicate title hints should deduplicate"
+        );
+        assert!(plain.hints[0].source_ids.is_empty());
+        assert_eq!(plain.hints[0].title.as_deref(), Some("Inception"));
+        assert_eq!(plain.hints[0].origin, HintOrigin::LegacyText);
+        assert!(plain.hints[0].requires_confirmation);
+        assert!(plain.warnings.is_empty());
+
+        let telegram_json = serde_json::json!({
+            "messages": [
+                { "text": "Title: Inception" },
+                { "text": "Title: Interstellar" },
+                { "text": "https://youtube.com.evil/watch?v=dQw4w9WgXcQ" },
+            ]
+        })
+        .to_string();
+        let json_report = parse_legacy_import(&telegram_json);
+        assert_eq!(
+            json_report
+                .hints
+                .iter()
+                .map(|hint| (hint.source_ids.clone(), hint.title.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Vec::new(), Some("Inception")),
+                (Vec::new(), Some("Interstellar")),
+            ]
+        );
+        assert_eq!(json_report.hints[0].origin, HintOrigin::LegacyTelegramJson);
+
+        let noise = parse_legacy_import(
+            "\nTitle: \nhttps://youtube.com.evil/watch?v=dQw4w9WgXcQ\nhttps://example.invalid/video",
+        );
+        assert!(noise.hints.is_empty());
+        assert!(!noise.needs_confirmation);
+        assert_eq!(
+            noise.warnings,
+            vec![
+                "no Bilibili BV/av/cid/ep identifiers or supported YouTube video URLs were found in the supplied text"
+                    .to_string()
+            ]
+        );
+
+        let id_only = parse_legacy_import("BV1abcdefgh");
+        assert_eq!(id_only.hints.len(), 1);
+        assert_eq!(id_only.hints[0].source_ids, vec!["BV1abcdefgh".to_string()]);
+        assert_eq!(id_only.hints[0].title, None);
+    }
+
+    #[test]
+    fn legacy_import_applies_the_global_hint_limit_to_title_only_rows() {
+        let mut input = unique_legacy_hint_lines(0, MAX_LEGACY_HINTS - 1);
+        input.push_str(&format!(
+            "\nTitle: Inception\nBV1{:010}",
+            MAX_LEGACY_HINTS + 1
+        ));
+
+        let report = parse_legacy_import(&input);
+
+        assert_eq!(report.hints.len(), MAX_LEGACY_HINTS);
+        assert_eq!(
+            report.hints[MAX_LEGACY_HINTS - 1].source_ids,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            report.hints[MAX_LEGACY_HINTS - 1].title.as_deref(),
+            Some("Inception")
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("10,000 unique-hint limit") })
+        );
     }
 
     #[test]
@@ -10564,6 +10655,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_import_title_only_hint_can_be_manually_matched_to_a_local_item() {
+        let root = TemporaryRoot::new("legacy-title-only-candidate");
+        fs::write(root.path().join("Inception.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let manager = manager(&root);
+
+        let report = manager
+            .import_legacy("Title: Inception")
+            .expect("title-only legacy text should parse and match against the scan snapshot");
+
+        assert_eq!(report.hints.len(), 1);
+        assert!(report.hints[0].source_ids.is_empty());
+        assert_eq!(report.hints[0].title.as_deref(), Some("Inception"));
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].hint_index, 0);
+        assert_eq!(report.candidates[0].match_kind, "title");
+        assert!(report.candidates[0].requires_confirmation);
+        assert_eq!(
+            report.candidates[0].item_id,
+            item_at(
+                &manager.scan(&[]).expect("follow-up scan should complete"),
+                "Inception.mp4"
+            )
+            .id
+        );
+    }
+
+    #[test]
     fn legacy_candidates_only_match_present_items_by_source_id_or_title() {
         let mut present_direct =
             index_fixture_item("present-direct", "direct.mp4", Presence::Present);
@@ -11300,6 +11419,135 @@ mod tests {
         assert!(!root.path().join("Existing/clip (2).mp4").exists());
         release_preview_anchors(&skip.id);
         release_preview_anchors(&keep_both.id);
+    }
+
+    #[test]
+    fn move_target_at_scan_depth_limit_remains_visible_and_deeper_target_is_rejected() {
+        let root = TemporaryRoot::new("move-target-scan-depth");
+        let source_path = root.path().join("clip.mp4");
+        fs::write(&source_path, b"fixture-video").expect("source media should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        let source_before = fs::read(&source_path).expect("source media should read");
+        let source_identity_before = fs::metadata(&source_path).expect("source should stat");
+        let previews_before = persisted_preview_count(&manager);
+        let directory_at_limit = (0..MAX_DEPTH).map(|_| "d").collect::<Vec<_>>().join("/");
+        let too_deep_directory = (0..=MAX_DEPTH).map(|_| "d").collect::<Vec<_>>().join("/");
+
+        let rejected = manager.preview(
+            std::slice::from_ref(&item_id),
+            &too_deep_directory,
+            false,
+            ConflictPolicy::KeepBoth,
+        );
+        let error = rejected.expect_err("a target beyond scanner depth must be rejected");
+        assert!(error.to_string().contains("scan depth limit"));
+        assert_eq!(fs::read(&source_path).unwrap(), source_before);
+        let source_identity_after = fs::metadata(&source_path).expect("source should still stat");
+        assert_eq!(source_identity_before.dev(), source_identity_after.dev());
+        assert_eq!(source_identity_before.ino(), source_identity_after.ino());
+        assert!(!root.path().join(&too_deep_directory).exists());
+        assert!(!root.path().join("d").exists());
+        let previews_after = persisted_preview_count(&manager);
+        assert_eq!(previews_after, previews_before);
+
+        let preview = manager
+            .preview(
+                &[item_id],
+                &directory_at_limit,
+                false,
+                ConflictPolicy::KeepBoth,
+            )
+            .expect("a target directory at the scan limit should be allowed");
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("the boundary move should execute");
+        assert_eq!(result.status, BatchStatus::Complete);
+        let moved_path = format!("{directory_at_limit}/clip.mp4");
+        let rescanned = manager
+            .scan(&[])
+            .expect("the boundary target should remain reachable by the scanner");
+        let moved_item = item_at(&rescanned, &moved_path);
+        assert_eq!(moved_item.presence, Presence::Present);
+        release_preview_anchors(&preview.id);
+    }
+
+    #[test]
+    fn organized_move_target_depth_includes_the_collection_folder() {
+        let root = TemporaryRoot::new("organized-move-target-scan-depth");
+        let source_path = root.path().join("clip.mp4");
+        fs::write(&source_path, b"fixture-video").expect("source media should write");
+        let manager = manager(&root);
+        let mut snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let item = snapshot
+            .items
+            .iter_mut()
+            .find(|item| item.relative_path == "clip.mp4")
+            .expect("source media should be indexed");
+        item.collection = Some(CollectionMetadata {
+            id: Some("series-1".to_string()),
+            title: "Collection".to_string(),
+            kind: "series".to_string(),
+            order: None,
+            part_id: None,
+        });
+        let item_id = item.id.clone();
+        let source_before = fs::read(&source_path).expect("source media should read");
+        let source_identity_before = fs::metadata(&source_path).expect("source should stat");
+        let previews_before = persisted_preview_count(&manager);
+        let base_at_limit = (0..MAX_DEPTH).map(|_| "d").collect::<Vec<_>>().join("/");
+        let base_before_limit = (0..MAX_DEPTH - 1)
+            .map(|_| "d")
+            .collect::<Vec<_>>()
+            .join("/");
+
+        let rejected = manager.build_and_persist_preview(
+            &snapshot,
+            PreviewBuildRequest {
+                item_ids: std::slice::from_ref(&item_id),
+                target_relative_dir: Some(&base_at_limit),
+                rename: false,
+                conflict: ConflictPolicy::KeepBoth,
+                patches: &[],
+            },
+            &mut |target_path| manager.target_parent_device(target_path),
+        );
+        let error = rejected.expect_err("the collection folder must count toward target depth");
+        assert!(error.to_string().contains("scan depth limit"));
+        assert_eq!(fs::read(&source_path).unwrap(), source_before);
+        assert!(!root.path().join(&base_at_limit).exists());
+        assert!(!root.path().join("d").exists());
+        let source_identity_after = fs::metadata(&source_path).expect("source should still stat");
+        assert_eq!(source_identity_before.dev(), source_identity_after.dev());
+        assert_eq!(source_identity_before.ino(), source_identity_after.ino());
+        let previews_after = persisted_preview_count(&manager);
+        assert_eq!(previews_after, previews_before);
+
+        let preview = manager
+            .build_and_persist_preview(
+                &snapshot,
+                PreviewBuildRequest {
+                    item_ids: std::slice::from_ref(&item_id),
+                    target_relative_dir: Some(&base_before_limit),
+                    rename: false,
+                    conflict: ConflictPolicy::KeepBoth,
+                    patches: &[],
+                },
+                &mut |target_path| manager.target_parent_device(target_path),
+            )
+            .expect("a collection folder bringing the final target to depth 48 is allowed");
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("the organized boundary move should execute");
+        assert_eq!(result.status, BatchStatus::Complete);
+        let moved_path = format!("{base_before_limit}/Collection/clip.mp4");
+        let rescanned = manager
+            .scan(&[])
+            .expect("the organized boundary target should remain reachable");
+        let moved_item = item_at(&rescanned, &moved_path);
+        assert_eq!(moved_item.presence, Presence::Present);
+        release_preview_anchors(&preview.id);
     }
 
     #[test]
