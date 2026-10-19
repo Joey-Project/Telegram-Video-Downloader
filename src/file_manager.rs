@@ -61,6 +61,7 @@ const LEGACY_INPUT_LIMIT: usize = 1024 * 1024;
 pub(crate) const MAX_METADATA_TITLE_CHARS: usize = 500;
 const MAX_METADATA_TITLE_BYTES: usize = 4096;
 const MAX_DEPTH: usize = 48;
+const MAX_FILENAME_COMPONENT_BYTES: usize = 255;
 const MAX_ENTRIES: usize = 200_000;
 const MAX_MEDIA_ITEMS: usize = 50_000;
 const MAX_PINNED_PREVIEWS: usize = 64;
@@ -1720,61 +1721,66 @@ impl LibraryManager {
             target_name_semantics(&directory)
                 .context("filesystem name semantics unavailable for attachment matching")
         })?;
-        let target_stem = if rename {
+        let requested_stem = if rename {
             standard_media_stem(item)
         } else {
             primary_stem.to_string()
         };
-        let base_target = target_dir.join(file_name_with_stem(&primary, &target_stem)?);
-        let target_for = |source_rel: &str, primary_target: &Path| -> Result<String> {
+        let mut planned_sources = Vec::with_capacity(source_paths.len());
+        let mut longest_filename_tail = 0;
+        for source_rel in &source_paths {
             let source_abs = self.absolute_path(source_rel)?;
             let source_stem = source_abs
                 .file_stem()
                 .and_then(OsStr::to_str)
                 .ok_or_else(|| anyhow!("attached media has a non-UTF-8 filename"))?;
-            let suffix = matching_sidecar_suffix_with(
-                source_stem,
-                primary_stem,
-                name_semantics,
-                platform_case_fold,
-            )?
-            .unwrap_or_default();
+            let suffix = if source_rel == &item.relative_path {
+                String::new()
+            } else {
+                matching_sidecar_suffix_with(
+                    source_stem,
+                    primary_stem,
+                    name_semantics,
+                    platform_case_fold,
+                )?
+                .unwrap_or_default()
+            };
+            let tail_bytes = filename_tail_bytes(&source_abs, &suffix)?;
+            longest_filename_tail = longest_filename_tail.max(tail_bytes);
+            planned_sources.push((source_abs, suffix));
+        }
+        let target_stem = budgeted_group_stem(&requested_stem, longest_filename_tail, "", rename)?;
+        let base_target = target_dir.join(file_name_with_stem(&primary, &target_stem, "")?);
+        let targets_for = |primary_target: &Path| -> Result<Vec<String>> {
             let target_primary_stem = primary_target
                 .file_stem()
                 .and_then(OsStr::to_str)
                 .ok_or_else(|| anyhow!("target media filename is invalid"))?;
-            let target_name =
-                file_name_with_stem(&source_abs, &format!("{target_primary_stem}{suffix}"))?;
-            path_to_relative_string(&target_dir.join(target_name))
+            planned_sources
+                .iter()
+                .map(|(source_abs, suffix)| {
+                    let target_name = file_name_with_stem(source_abs, target_primary_stem, suffix)?;
+                    path_to_relative_string(&target_dir.join(target_name))
+                })
+                .collect()
         };
         let mut candidate = base_target.clone();
-        let mut targets = source_paths
-            .iter()
-            .map(|source| target_for(source, &candidate))
-            .collect::<Result<Vec<_>>>()?;
+        let mut targets = targets_for(&candidate)?;
         let conflicts = self.has_move_conflicts(&source_paths, &targets, reserved_targets)?;
         if conflicts && conflict == ConflictPolicy::KeepBoth {
             let parent = base_target.parent().unwrap_or_else(|| Path::new(""));
-            let base_stem = base_target
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .ok_or_else(|| anyhow!("target media filename is invalid"))?;
-            let extension = base_target
-                .extension()
-                .and_then(OsStr::to_str)
-                .unwrap_or("");
             let mut found = false;
             for suffix in 2..=10_000 {
-                let name = if extension.is_empty() {
-                    format!("{base_stem} ({suffix})")
-                } else {
-                    format!("{base_stem} ({suffix}).{extension}")
-                };
+                let keep_both_suffix = format!(" ({suffix})");
+                let candidate_stem = budgeted_group_stem(
+                    &requested_stem,
+                    longest_filename_tail,
+                    &keep_both_suffix,
+                    true,
+                )?;
+                let name = file_name_with_stem(&primary, &candidate_stem, "")?;
                 candidate = parent.join(name);
-                targets = source_paths
-                    .iter()
-                    .map(|source| target_for(source, &candidate))
-                    .collect::<Result<Vec<_>>>()?;
+                targets = targets_for(&candidate)?;
                 if !self.has_move_conflicts(&source_paths, &targets, reserved_targets)? {
                     found = true;
                     break;
@@ -4927,12 +4933,72 @@ fn collection_directory_discriminator(identity: &[u8], round: u32) -> Result<Str
     Ok(format!("{:x}", Sha256::digest(encoded_identity)))
 }
 
-fn file_name_with_stem(source: &Path, stem: &str) -> Result<String> {
-    let extension = source.extension().and_then(OsStr::to_str);
-    let file_name = match extension {
-        Some(extension) if !extension.is_empty() => format!("{stem}.{extension}"),
-        _ => stem.to_string(),
+fn filename_tail_bytes(source: &Path, suffix: &str) -> Result<usize> {
+    let extension = source
+        .extension()
+        .and_then(OsStr::to_str)
+        .filter(|extension| !extension.is_empty());
+    let extension_bytes = extension.map_or(0, |extension| extension.len() + 1);
+    suffix
+        .len()
+        .checked_add(extension_bytes)
+        .ok_or_else(|| anyhow!("filename suffix length overflowed"))
+}
+
+fn budgeted_group_stem(
+    requested_stem: &str,
+    longest_filename_tail: usize,
+    keep_both_suffix: &str,
+    allow_truncation: bool,
+) -> Result<String> {
+    let reserved_bytes = longest_filename_tail
+        .checked_add(keep_both_suffix.len())
+        .ok_or_else(|| anyhow!("filename component length overflowed"))?;
+    let stem_budget = MAX_FILENAME_COMPONENT_BYTES
+        .checked_sub(reserved_bytes)
+        .ok_or_else(|| {
+            anyhow!(
+                "attachment suffix and extension exceed the {MAX_FILENAME_COMPONENT_BYTES}-byte filename component limit"
+            )
+        })?;
+
+    let mut fitted = String::new();
+    for character in requested_stem.chars() {
+        if fitted.len() + character.len_utf8() > stem_budget {
+            break;
+        }
+        fitted.push(character);
+    }
+    if fitted.len() < requested_stem.len() && !allow_truncation {
+        bail!(
+            "the existing media stem cannot fit its attached filenames within the {MAX_FILENAME_COMPONENT_BYTES}-byte component limit"
+        );
+    }
+    let fitted = if allow_truncation {
+        fitted.trim_end().trim_end_matches('.')
+    } else {
+        fitted.as_str()
     };
+    if fitted.is_empty() {
+        bail!(
+            "attachment suffixes leave no complete media-stem character within the {MAX_FILENAME_COMPONENT_BYTES}-byte component limit"
+        );
+    }
+    Ok(format!("{fitted}{keep_both_suffix}"))
+}
+
+fn file_name_with_stem(source: &Path, stem: &str, suffix: &str) -> Result<String> {
+    let extension = source.extension().and_then(OsStr::to_str);
+    let mut file_name = format!("{stem}{suffix}");
+    if let Some(extension) = extension.filter(|extension| !extension.is_empty()) {
+        file_name.push('.');
+        file_name.push_str(extension);
+    }
+    if file_name.len() > MAX_FILENAME_COMPONENT_BYTES {
+        bail!(
+            "generated filename component exceeds the {MAX_FILENAME_COMPONENT_BYTES}-byte filesystem limit"
+        );
+    }
     Ok(file_name)
 }
 
@@ -13991,6 +14057,214 @@ mod tests {
             files
                 .iter()
                 .all(|file| root.path().join(&file.target_path).exists())
+        );
+    }
+
+    #[test]
+    fn long_attachment_qualifiers_fit_renamed_groups_and_keep_both_targets() {
+        let root = TemporaryRoot::new("long-attachment-qualifier-budget");
+        let clip_qualifier = "q".repeat(245);
+        let episode_qualifier = "r".repeat(242);
+        let unicode_title = "界😀".repeat(50);
+        let ascii_title = "b".repeat(150);
+
+        fs::write(root.path().join("clip.mp4"), b"clip media").expect("clip media should write");
+        fs::write(
+            root.path().join("clip.nfo"),
+            format!("<movie><title>{unicode_title}</title></movie>\n"),
+        )
+        .expect("clip NFO should write");
+        let clip_subtitle = format!("clip.{clip_qualifier}.srt");
+        fs::write(root.path().join(&clip_subtitle), b"clip subtitle")
+            .expect("long clip subtitle should write");
+
+        fs::write(root.path().join("episode.mp4"), b"episode media")
+            .expect("episode media should write");
+        fs::write(
+            root.path().join("episode.nfo"),
+            format!("<movie><title>{ascii_title}</title></movie>\n"),
+        )
+        .expect("episode NFO should write");
+        let episode_subtitle = format!("episode.{episode_qualifier}.srt");
+        fs::write(root.path().join(&episode_subtitle), b"episode subtitle")
+            .expect("long episode subtitle should write");
+
+        fs::create_dir(root.path().join("Moved")).expect("target directory should create");
+        fs::write(root.path().join("Moved/bbbbbbbb.mp4"), b"existing target")
+            .expect("keep-both conflict target should write");
+
+        let source_paths = [
+            "clip.mp4",
+            "clip.nfo",
+            clip_subtitle.as_str(),
+            "episode.mp4",
+            "episode.nfo",
+            episode_subtitle.as_str(),
+        ];
+        let original_files = source_paths
+            .iter()
+            .map(|relative| {
+                let path = root.path().join(relative);
+                let metadata = fs::metadata(&path).expect("source fixture should stat");
+                (
+                    (*relative).to_string(),
+                    (
+                        fs::read(&path).expect("source fixture should read"),
+                        metadata.dev(),
+                        metadata.ino(),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("source library should scan");
+        let clip_id = item_at(&snapshot, "clip.mp4").id.clone();
+        let episode_id = item_at(&snapshot, "episode.mp4").id.clone();
+        let preview = manager
+            .preview(
+                &[clip_id.clone(), episode_id.clone()],
+                "Moved",
+                true,
+                ConflictPolicy::KeepBoth,
+            )
+            .expect("long attachment groups should fit their destination components");
+
+        let clip_preview = preview
+            .items
+            .iter()
+            .find(|item| item.item_id == clip_id)
+            .expect("clip should have a preview");
+        let episode_preview = preview
+            .items
+            .iter()
+            .find(|item| item.item_id == episode_id)
+            .expect("episode should have a preview");
+        for (preview_item, expected_targets) in [
+            (
+                clip_preview,
+                [
+                    "Moved/界.mp4".to_string(),
+                    "Moved/界.nfo".to_string(),
+                    format!("Moved/界.{clip_qualifier}.srt"),
+                ],
+            ),
+            (
+                episode_preview,
+                [
+                    "Moved/bbbb (2).mp4".to_string(),
+                    "Moved/bbbb (2).nfo".to_string(),
+                    format!("Moved/bbbb (2).{episode_qualifier}.srt"),
+                ],
+            ),
+        ] {
+            assert_eq!(preview_item.files.len(), expected_targets.len());
+            let mut actual_targets = preview_item
+                .files
+                .iter()
+                .map(|file| file.target_path.clone())
+                .collect::<Vec<_>>();
+            actual_targets.sort();
+            let mut expected_targets = expected_targets.to_vec();
+            expected_targets.sort();
+            assert_eq!(actual_targets, expected_targets);
+            assert!(preview_item.files.iter().all(|file| {
+                Path::new(&file.target_path)
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.len() <= MAX_FILENAME_COMPONENT_BYTES)
+            }));
+        }
+        assert_eq!(
+            Path::new(&format!("Moved/bbbb (2).{episode_qualifier}.srt"))
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .len(),
+            MAX_FILENAME_COMPONENT_BYTES,
+            "KeepBoth should reserve its suffix and use the full valid component budget"
+        );
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("the complete attachment groups should move");
+        assert_eq!(result.status, BatchStatus::Complete);
+        for preview_item in &preview.items {
+            for file in &preview_item.files {
+                let (contents, device, inode) = &original_files[&file.source_path];
+                let target = root.path().join(&file.target_path);
+                let metadata = fs::metadata(&target).expect("moved group member should stat");
+                assert_eq!(fs::read(&target).unwrap().as_slice(), contents.as_slice());
+                assert_eq!(
+                    metadata.dev(),
+                    *device,
+                    "rename should keep the source device"
+                );
+                assert_eq!(
+                    metadata.ino(),
+                    *inode,
+                    "rename should keep the source object"
+                );
+                assert!(!root.path().join(&file.source_path).exists());
+            }
+        }
+        assert_eq!(
+            fs::read(root.path().join("Moved/bbbbbbbb.mp4")).unwrap(),
+            b"existing target",
+            "KeepBoth must leave the existing destination untouched"
+        );
+
+        let rescanned = manager
+            .scan(&[])
+            .expect("renamed media and long sidecars should remain scannable");
+        for (media_path, expected_attachments) in [
+            (
+                "Moved/界.mp4",
+                [
+                    "Moved/界.nfo".to_string(),
+                    format!("Moved/界.{clip_qualifier}.srt"),
+                ],
+            ),
+            (
+                "Moved/bbbb (2).mp4",
+                [
+                    "Moved/bbbb (2).nfo".to_string(),
+                    format!("Moved/bbbb (2).{episode_qualifier}.srt"),
+                ],
+            ),
+        ] {
+            let item = item_at(&rescanned, media_path);
+            assert_eq!(item.presence, Presence::Present);
+            let actual_attachments = item
+                .attachments
+                .iter()
+                .map(|attachment| attachment.relative_path.clone())
+                .collect::<HashSet<_>>();
+            assert_eq!(
+                actual_attachments,
+                expected_attachments.into_iter().collect::<HashSet<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn group_filename_budget_rejects_suffixes_that_leave_no_room_for_a_stem() {
+        let no_complete_stem = budgeted_group_stem("title", MAX_FILENAME_COMPONENT_BYTES, "", true)
+            .expect_err("a zero-byte stem budget should reject the candidate");
+        assert!(
+            no_complete_stem
+                .to_string()
+                .contains("no complete media-stem character")
+        );
+
+        let no_keep_both_room =
+            budgeted_group_stem("title", MAX_FILENAME_COMPONENT_BYTES - 3, " (2)", true)
+                .expect_err("KeepBoth suffix must fit alongside at least one stem character");
+        assert!(
+            no_keep_both_room
+                .to_string()
+                .contains("filename component limit")
         );
     }
 

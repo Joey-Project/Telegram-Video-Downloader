@@ -14,7 +14,7 @@ import { renderMovePreviewItems } from "../public/file/preview-rendering.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
-import { canonicalJson, MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS, MAX_STATE_BODY_BYTES, MAX_TARGET_RELATIVE_DIR_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_BYTES } from "../src/validation";
+import { canonicalJson, MAX_ACTION_BODY_BYTES, MAX_LEGACY_TEXT_BYTES, MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS, MAX_STATE_BODY_BYTES, MAX_TARGET_RELATIVE_DIR_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_BYTES, readJsonBody } from "../src/validation";
 import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue, storeSnapshot } from "../src/store";
 import type { LocalSnapshot } from "../src/types";
 import worker from "../src/index";
@@ -178,6 +178,31 @@ describe("legacy file import bounds", () => {
     expect(decodedOversize.text).toHaveBeenCalledOnce();
     expect(decodedSubmit).not.toHaveBeenCalled();
     expect(decodedReject).toHaveBeenCalledWith("Legacy text exceeds the 256 KiB limit.");
+  });
+
+  it("reads the maximum decoded legacy text at six-byte JSON escape expansion within the fixed action envelope", async () => {
+    const escapedText = "\\u0078".repeat(MAX_LEGACY_TEXT_BYTES);
+    const unpaddedBody = `{"request_id":"00000000-0000-4000-8000-000000009301","kind":"legacy_import","payload":{"text":"${escapedText}"}}`;
+    const unpaddedBytes = textEncoder.encode(unpaddedBody).byteLength;
+    expect(MAX_ACTION_BODY_BYTES).toBe(MAX_LEGACY_TEXT_BYTES * 6 + 4_096);
+    expect(unpaddedBytes).toBeGreaterThan(MAX_LEGACY_TEXT_BYTES * 6);
+    expect(unpaddedBytes).toBeLessThanOrEqual(MAX_ACTION_BODY_BYTES);
+
+    const bodyAtLimit = unpaddedBody + " ".repeat(MAX_ACTION_BODY_BYTES - unpaddedBytes);
+    expect(textEncoder.encode(bodyAtLimit).byteLength).toBe(MAX_ACTION_BODY_BYTES);
+    const parsed = await readJsonBody(new Request(workerUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: bodyAtLimit,
+    }), MAX_ACTION_BODY_BYTES) as { payload: { text: string } };
+    expect(parsed.payload.text).toHaveLength(MAX_LEGACY_TEXT_BYTES);
+    expect(parsed.payload.text[0]).toBe("x");
+
+    await expect(readJsonBody(new Request(workerUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: `${bodyAtLimit} `,
+    }), MAX_ACTION_BODY_BYTES)).rejects.toMatchObject({ status: 413 });
   });
 });
 
@@ -549,6 +574,124 @@ describe("Mini App identity and actions", () => {
 
     const desktopBacklog = await responseJson<{ requests: Array<{ payload: { item_ids: string[] } }> }>(await localRequests());
     expect(desktopBacklog.requests[0]?.payload.item_ids).toEqual(["private-item"]);
+  });
+
+  it("preserves legacy line separators while enforcing decoded UTF-8 text bounds before enqueueing", async () => {
+    const initData = await signInitData();
+    const separatorText = "Line 1\r\n\tLine 2\n";
+    const exactUtf8Limit = `${"界".repeat(87_381)}x`;
+    const oversizedUtf8 = `${exactUtf8Limit}x`;
+    expect(textEncoder.encode(exactUtf8Limit).byteLength).toBe(MAX_LEGACY_TEXT_BYTES);
+    expect(textEncoder.encode(oversizedUtf8).byteLength).toBe(MAX_LEGACY_TEXT_BYTES + 1);
+
+    const cases = [
+      { requestId: "00000000-0000-4000-8000-000000009302", text: separatorText, expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000009303", text: exactUtf8Limit, expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000009304", text: oversizedUtf8, expectedStatus: 413 },
+      { requestId: "00000000-0000-4000-8000-000000009305", text: "Unsafe\u0001control", expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000009306", text: "Unsafe\u007fcontrol", expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000009307", text: "Unsafe\u0085control", expectedStatus: 400 },
+      { requestId: "00000000-0000-4000-8000-000000009308", text: "Malformed\uD800text", expectedStatus: 400 },
+    ];
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+
+    for (const testCase of cases) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: testCase.requestId,
+          kind: "legacy_import",
+          payload: { text: testCase.text },
+        }),
+      });
+      expect(response.status, testCase.requestId).toBe(testCase.expectedStatus);
+    }
+
+    const after = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(after?.count).toBe((before?.count ?? 0) + 2);
+    const backlog = await responseJson<{ requests: Array<{ kind: string; payload: { text?: string } }> }>(await localRequests());
+    expect(backlog.requests.some((request) => request.kind === "legacy_import" && request.payload.text === separatorText)).toBe(true);
+    expect(backlog.requests.some((request) => request.kind === "legacy_import" && request.payload.text === exactUtf8Limit)).toBe(true);
+  });
+
+  it("accepts near-two-times JSON.stringify legacy bodies and bounds excess JSON whitespace", async () => {
+    const initData = await signInitData();
+    const lineText = "\n".repeat(MAX_LEGACY_TEXT_BYTES);
+    const acceptedBody = JSON.stringify({
+      request_id: "00000000-0000-4000-8000-000000009309",
+      kind: "legacy_import",
+      payload: { text: lineText },
+    });
+    const acceptedBytes = textEncoder.encode(acceptedBody).byteLength;
+    expect(acceptedBytes).toBeGreaterThan(320_000);
+    expect(acceptedBytes).toBeLessThanOrEqual(MAX_ACTION_BODY_BYTES);
+
+    const paddingBase = JSON.stringify({
+      request_id: "00000000-0000-4000-8000-000000009310",
+      kind: "library_scan",
+      payload: {},
+    });
+    const oversizedBody = `${paddingBase}${" ".repeat(MAX_ACTION_BODY_BYTES - textEncoder.encode(paddingBase).byteLength + 1)}`;
+    expect(textEncoder.encode(oversizedBody).byteLength).toBe(MAX_ACTION_BODY_BYTES + 1);
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+
+    const accepted = await ownerRequest("/api/actions", initData, { method: "POST", body: acceptedBody });
+    const oversized = await ownerRequest("/api/actions", initData, { method: "POST", body: oversizedBody });
+    expect(accepted.status).toBe(202);
+    expect(oversized.status).toBe(413);
+
+    const after = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(after?.count).toBe((before?.count ?? 0) + 1);
+  });
+
+  it("allows each legacy hint to appear in only one metadata patch", async () => {
+    const initData = await signInitData();
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    const duplicateHint = await ownerRequest("/api/actions", initData, {
+      method: "POST",
+      body: JSON.stringify({
+        request_id: "00000000-0000-4000-8000-000000009311",
+        kind: "file_preview",
+        payload: {
+          metadata_patches: [
+            { item_id: "item-a", hint_index: 7, source_ids: ["source-a"] },
+            { item_id: "item-b", hint_index: 7, source_ids: ["source-b"] },
+          ],
+        },
+      }),
+    });
+    const noHints = await ownerRequest("/api/actions", initData, {
+      method: "POST",
+      body: JSON.stringify({
+        request_id: "00000000-0000-4000-8000-000000009312",
+        kind: "file_preview",
+        payload: {
+          metadata_patches: [
+            { item_id: "item-a", title: "Manual A" },
+            { item_id: "item-b", title: "Manual B" },
+          ],
+        },
+      }),
+    });
+    const oneHint = await ownerRequest("/api/actions", initData, {
+      method: "POST",
+      body: JSON.stringify({
+        request_id: "00000000-0000-4000-8000-000000009313",
+        kind: "file_preview",
+        payload: {
+          metadata_patches: [
+            { item_id: "item-a", hint_index: 7, source_ids: ["source-a"] },
+            { item_id: "item-b", title: "Manual B" },
+          ],
+        },
+      }),
+    });
+    expect(duplicateHint.status).toBe(400);
+    expect(noHints.status).toBe(202);
+    expect(oneHint.status).toBe(202);
+
+    const after = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(after?.count).toBe((before?.count ?? 0) + 2);
   });
 
   it("rejects unsafe destinations and malformed or oversized metadata patches", async () => {

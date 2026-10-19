@@ -21,7 +21,7 @@ mod router;
 mod safe_fs;
 mod telegram;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -2349,12 +2349,16 @@ fn validate_file_preview_payload(
     payload: FilePreviewPayload,
 ) -> std::result::Result<PreparedFilePreview, String> {
     let patch_inputs = payload.metadata_patches;
-    if patch_inputs.iter().any(|patch| {
-        patch
-            .hint_index
-            .is_some_and(|index| index >= crate::library::MAX_LEGACY_HINTS)
-    }) {
-        return Err("A metadata hint index is outside the allowed range.".to_string());
+    let mut selected_hint_indexes = HashSet::new();
+    for patch in &patch_inputs {
+        if let Some(index) = patch.hint_index {
+            if index >= crate::library::MAX_LEGACY_HINTS {
+                return Err("A metadata hint index is outside the allowed range.".to_string());
+            }
+            if !selected_hint_indexes.insert(index) {
+                return Err("A legacy hint can be mapped to at most one video.".to_string());
+            }
+        }
     }
     let patches = patch_inputs
         .iter()
@@ -12491,6 +12495,61 @@ mod tests {
             .err()
             .expect("the first index outside the imported hint cap must be rejected");
         assert!(error.contains("hint index is outside the allowed range"));
+    }
+
+    #[test]
+    fn cloud_file_preview_allows_only_one_explicit_patch_per_legacy_hint() {
+        let payload_for = |hint_indexes: &[Option<usize>]| {
+            serde_json::json!({
+                "metadata_patches": hint_indexes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, hint_index)| {
+                        let mut patch = serde_json::json!({
+                            "item_id": format!("library-item-{index}"),
+                            "title": format!("Imported title {index}"),
+                        });
+                        if let Some(hint_index) = hint_index {
+                            patch["hint_index"] = serde_json::json!(hint_index);
+                        }
+                        patch
+                    })
+                    .collect::<Vec<_>>(),
+            })
+        };
+
+        let distinct =
+            serde_json::from_value::<FilePreviewPayload>(payload_for(&[Some(4), Some(5)]))
+                .expect("distinct explicit hint indexes should deserialize");
+        let prepared = validate_file_preview_payload(distinct)
+            .expect("distinct hints may map to distinct videos");
+        assert_eq!(
+            prepared.hint_indices,
+            vec![
+                ("library-item-0".to_string(), Some(4)),
+                ("library-item-1".to_string(), Some(5)),
+            ]
+        );
+
+        let duplicate =
+            serde_json::from_value::<FilePreviewPayload>(payload_for(&[Some(4), Some(4)]))
+                .expect("duplicate hint indexes should deserialize before validation");
+        let error = validate_file_preview_payload(duplicate)
+            .err()
+            .expect("one hint must not be assigned to two videos");
+        assert!(error.contains("at most one video"));
+
+        let manual = serde_json::from_value::<FilePreviewPayload>(payload_for(&[None, None]))
+            .expect("manual patches without hint indexes should deserialize");
+        let prepared = validate_file_preview_payload(manual)
+            .expect("manual edits without hint indexes keep their existing semantics");
+        assert_eq!(
+            prepared.hint_indices,
+            vec![
+                ("library-item-0".to_string(), None),
+                ("library-item-1".to_string(), None),
+            ]
+        );
     }
 
     #[test]

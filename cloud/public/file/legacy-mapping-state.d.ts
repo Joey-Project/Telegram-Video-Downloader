@@ -18,6 +18,15 @@ export function updateLegacySelection<T extends LegacyMappingSelection>(
   patch: Partial<T>,
 ): boolean;
 
+export type LegacyHintSelectionLike = {
+  hintIndex?: unknown;
+  dataset?: { hintIndex?: unknown } | null;
+} | null | undefined;
+
+export function hasDuplicateLegacyHintSelection(
+  selections: readonly LegacyHintSelectionLike[] | null | undefined,
+): boolean;
+
 export type LegacyCandidateLike = { item_id?: unknown };
 export type PresentMediaLike = { id?: unknown; presence?: unknown };
 

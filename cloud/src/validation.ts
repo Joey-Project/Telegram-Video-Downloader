@@ -9,9 +9,11 @@ import type {
 } from "./types";
 
 export const MAX_WEBHOOK_BODY_BYTES = 1_000_000;
-export const MAX_ACTION_BODY_BYTES = 320_000;
-export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
 export const MAX_LEGACY_TEXT_BYTES = 256 * 1024;
+const MAX_ACTION_BODY_ENVELOPE_BYTES = 4 * 1024;
+// JSON may represent each ASCII code unit as a six-byte \\uXXXX escape.
+export const MAX_ACTION_BODY_BYTES = MAX_LEGACY_TEXT_BYTES * 6 + MAX_ACTION_BODY_ENVELOPE_BYTES;
+export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
 export const MAX_TARGET_RELATIVE_DIR_BYTES = 1_024;
 export const MAX_SELECTED_ITEMS = 100;
 const MAX_COLLECTION_ORDER = 0xffff_ffff;
@@ -152,6 +154,20 @@ function boundedUtf8String(value: unknown, field: string, maxBytes: number): str
   return normalized;
 }
 
+function boundedLegacyText(value: unknown): string {
+  if (typeof value !== "string") throw new HttpError(400, "text must be a string");
+  if (hasUnpairedSurrogate(value)) {
+    throw new HttpError(400, "text contains an unpaired surrogate");
+  }
+  if (new TextEncoder().encode(value).byteLength > MAX_LEGACY_TEXT_BYTES) {
+    throw new HttpError(413, "Legacy import text is too large");
+  }
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(value)) {
+    throw new HttpError(400, "text contains control characters");
+  }
+  return value;
+}
+
 function hasUnpairedSurrogate(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const codeUnit = value.charCodeAt(index);
@@ -237,6 +253,10 @@ function parseMetadataPatches(value: unknown): MetadataPatch[] {
   });
   if (new Set(patches.map((patch) => patch.item_id)).size !== patches.length) {
     throw new HttpError(400, "metadata_patches contains duplicate item IDs");
+  }
+  const hintIndexes = patches.flatMap((patch) => patch.hint_index === undefined ? [] : [patch.hint_index]);
+  if (new Set(hintIndexes).size !== hintIndexes.length) {
+    throw new HttpError(400, "metadata_patches contains duplicate hint indexes");
   }
   return patches;
 }
@@ -354,10 +374,7 @@ export function validateActionRequest(value: unknown): ActionRequest {
       break;
     case "legacy_import": {
       if (!onlyKeys(value.payload, ["text"])) throw new HttpError(400, "legacy_import payload has an invalid shape");
-      const text = boundedString(value.payload.text, "text", MAX_LEGACY_TEXT_BYTES, { allowEmpty: true });
-      if (new TextEncoder().encode(text).byteLength > MAX_LEGACY_TEXT_BYTES) {
-        throw new HttpError(413, "Legacy import text is too large");
-      }
+      const text = boundedLegacyText(value.payload.text);
       payload = { text };
       break;
     }

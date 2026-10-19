@@ -1,5 +1,5 @@
 import { appendAction, removeQueuedAction, shouldRetryActionFailure } from "./action-queue.js";
-import { filterPresentLegacyCandidates, getOrCreateLegacySelection, updateLegacySelection } from "./legacy-mapping-state.js";
+import { filterPresentLegacyCandidates, getOrCreateLegacySelection, hasDuplicateLegacyHintSelection, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
@@ -669,6 +669,11 @@ function previewSelectedLegacy() {
   const selections = [...document.querySelectorAll("[data-map-select]:checked")];
   if (!selections.length) return showToast("Select at least one explicit hint-to-video match.");
   if (selections.length > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} metadata matches per request.`);
+  if (hasDuplicateLegacyHintSelection(
+    selections.map((selected) => ({ hintIndex: selected.dataset.hintIndex })),
+  )) {
+    return showToast("Choose at most one video for each legacy hint. Uncheck the current match before choosing another.");
+  }
   const patches = [];
   const usedItems = new Set();
   for (const selected of selections) {
@@ -752,6 +757,14 @@ function bindEvents() {
     if (mapCheckbox || mapField || manualTarget) {
       const key = mapCheckbox?.dataset.mapSelect ?? mapField?.dataset.mapKey ?? manualTarget?.dataset.manualTarget;
       if (mapCheckbox?.checked) {
+        const selectedHints = [...document.querySelectorAll("[data-map-select]:checked")]
+          .filter((checkbox) => checkbox !== mapCheckbox)
+          .map((checkbox) => ({ hintIndex: checkbox.dataset.hintIndex }));
+        if (hasDuplicateLegacyHintSelection([...selectedHints, { hintIndex: mapCheckbox.dataset.hintIndex }])) {
+          mapCheckbox.checked = false;
+          showToast("Choose at most one video for each legacy hint. Uncheck the current match before choosing another.");
+          return;
+        }
         const existingKeys = [...document.querySelectorAll("[data-map-select]:checked")]
           .filter((checkbox) => checkbox !== mapCheckbox)
           .map((checkbox) => checkbox.dataset.mapSelect);

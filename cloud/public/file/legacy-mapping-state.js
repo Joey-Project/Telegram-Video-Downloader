@@ -13,6 +13,17 @@ export function updateLegacySelection(selections, key, patch) {
   return true;
 }
 
+export function hasDuplicateLegacyHintSelection(selections) {
+  const seen = new Set();
+  for (const selection of Array.isArray(selections) ? selections : []) {
+    const rawHintIndex = selection?.hintIndex ?? selection?.dataset?.hintIndex;
+    const hintIndex = typeof rawHintIndex === "number" ? rawHintIndex : Number(rawHintIndex);
+    if (!Number.isSafeInteger(hintIndex) || hintIndex < 0 || seen.has(hintIndex)) return true;
+    seen.add(hintIndex);
+  }
+  return false;
+}
+
 export function filterPresentLegacyCandidates(candidates, items) {
   const presentItemIds = new Set(
     (Array.isArray(items) ? items : [])
