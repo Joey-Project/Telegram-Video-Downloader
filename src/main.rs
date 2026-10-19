@@ -2678,7 +2678,10 @@ fn validate_legacy_metadata_patches(
         })
         .cloned()
         .collect::<Vec<_>>();
-    if imports.is_empty() {
+    let requires_legacy_import = hint_indices
+        .iter()
+        .any(|(_, hint_index)| hint_index.is_some());
+    if requires_legacy_import && imports.is_empty() {
         bail!("metadata patches must come from a completed legacy import");
     }
     for patch in patches {

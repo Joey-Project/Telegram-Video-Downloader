@@ -2392,6 +2392,169 @@ async fn completed_file_confirmation_is_preserved_when_library_refresh_fails() {
 }
 
 #[tokio::test]
+async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
+    let root = temp_cloud_bot_dir("manual-metadata-patch-without-import");
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let source_path = config.downloads.video_dir.join("clip.mp4");
+    let source_nfo = config.downloads.video_dir.join("clip.nfo");
+    fs::write(&source_path, b"fixture-video").expect("media fixture should write");
+    let original_nfo = "<movie><title>Original title</title><future>keep this</future></movie>";
+    fs::write(&source_nfo, original_nfo).expect("NFO fixture should write");
+
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let library =
+        LibraryManager::open(&config.downloads.video_dir).expect("library manager should open");
+    let snapshot = library
+        .scan(&[])
+        .expect("library scan should find the fixture");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4")
+        .expect("media fixture should appear in the snapshot")
+        .id
+        .clone();
+    drop(library);
+
+    let runtime = make_runtime(telegram, config, Arc::clone(&queue), Arc::clone(&inbox));
+
+    inbox
+        .persist(CloudRequest {
+            seq: 1,
+            kind: "file_preview".to_string(),
+            payload: serde_json::json!({
+                "metadata_patches": [{
+                    "item_id": item_id,
+                    "title": "Must require a completed import",
+                    "hint_index": 0,
+                }]
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("explicit-hint preview should persist");
+    let explicit_hint = inbox
+        .update(1, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("explicit-hint preview should enter processing");
+    dispatch_cloud_record(runtime.clone(), explicit_hint).await;
+    let rejected_hint = inbox
+        .record(1)
+        .expect("explicit-hint receipt should load")
+        .expect("explicit-hint receipt should remain present");
+    assert_eq!(rejected_hint.status, InboxStatus::Failed);
+    assert!(rejected_hint.error.as_deref().is_some_and(|error| {
+        error.contains("metadata patches must come from a completed legacy import")
+    }));
+    assert_eq!(
+        fs::read_to_string(&source_nfo).expect("original NFO should remain readable"),
+        original_nfo,
+        "an unvalidated explicit hint must not change the NFO"
+    );
+
+    inbox
+        .persist(CloudRequest {
+            seq: 2,
+            kind: "file_preview".to_string(),
+            payload: serde_json::json!({
+                "metadata_patches": [{
+                    "item_id": item_id,
+                    "title": "Manual title",
+                }]
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("manual preview should persist");
+    let manual_preview = inbox
+        .update(2, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("manual preview should enter processing");
+    dispatch_cloud_record(runtime.clone(), manual_preview).await;
+    let preview_receipt = inbox
+        .record(2)
+        .expect("manual preview receipt should load")
+        .expect("manual preview receipt should remain present");
+    assert_eq!(preview_receipt.status, InboxStatus::AwaitingConfirmation);
+    assert!(preview_receipt.error.is_none());
+    let preview_result = preview_receipt
+        .result
+        .as_ref()
+        .expect("manual preview should store its result");
+    let preview_id = preview_result["preview_id"]
+        .as_str()
+        .expect("manual preview should include an id")
+        .to_string();
+    let revision = preview_result["revision"]
+        .as_str()
+        .expect("manual preview should include a revision")
+        .to_string();
+
+    inbox
+        .persist(CloudRequest {
+            seq: 3,
+            kind: "file_confirm".to_string(),
+            payload: serde_json::json!({"preview_id": preview_id, "revision": revision}),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("manual confirmation should persist");
+    let confirmation = inbox
+        .update(3, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("manual confirmation should enter processing");
+    dispatch_cloud_record(runtime.clone(), confirmation).await;
+
+    let completed = inbox
+        .record(3)
+        .expect("manual confirmation receipt should load")
+        .expect("manual confirmation receipt should remain present");
+    assert_eq!(completed.status, InboxStatus::Completed);
+    assert!(completed.error.is_none());
+    let operation: crate::library::BatchMoveResult = serde_json::from_value(
+        completed
+            .result
+            .as_ref()
+            .expect("completed confirmation should store its result")["operation"]
+            .clone(),
+    )
+    .expect("manual metadata operation should deserialize");
+    assert_eq!(operation.status, crate::library::BatchStatus::Complete);
+    assert_eq!(operation.items.len(), 1);
+    assert!(operation.items[0].metadata_patched);
+    assert!(operation.items[0].error.is_none());
+
+    let completed_preview = inbox
+        .record(2)
+        .expect("manual preview receipt should reload")
+        .expect("manual preview receipt should remain present");
+    assert_eq!(completed_preview.status, InboxStatus::Completed);
+    let updated_nfo = fs::read_to_string(&source_nfo).expect("patched NFO should remain readable");
+    assert!(updated_nfo.contains("<title>Manual title</title>"));
+    assert!(updated_nfo.contains("<future>keep this</future>"));
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn missing_related_preview_does_not_retry_a_durable_primary_outcome() {
     const PRIMARY_SEQ: u64 = 861;
     const MISSING_PREVIEW_SEQ: u64 = 862;
