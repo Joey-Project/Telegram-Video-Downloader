@@ -45,7 +45,7 @@ superseded_by:
   with warnings denied and formatting passed.
 - Before switching, both media indexes parse and all 19 indexed video records
   are readable: 14 completed and 5 cancelled. PDF has no indexed tasks.
-- Installer: 51 fake-HOME regression tests, shell integration, Bash syntax,
+- Installer: 62 fake-HOME regression tests, shell integration, Bash syntax,
   ShellCheck, Ruff 0.15.13 lint and formatting pass. Coverage includes a
   temporary build artifact inheriting group `wheel`, strict state backup
   metadata, startup PID visibility, partial-stop failures, and both rollback
@@ -59,6 +59,11 @@ superseded_by:
   download-worker ancestry and shutdown, stderr preflight, unrelated media
   symlinks, role-specific executable/cwd checks, and rollback transaction
   validation before any stop or replacement.
+- Configuration path resolution follows the preserved service HOME, exact Rust
+  expansion forms, physical configuration parent, and filesystem handling of
+  aliases followed by `..`. Authentication paths are validated before stopping.
+  Stderr must be an observable regular log, and readiness requires distinct
+  `poll=1` and `poll=2` markers even when log paths share a hardlink.
 - Existing main-checkout changes and divergent local history remain untouched.
 
 ## Controlled Cutover and Current Runtime

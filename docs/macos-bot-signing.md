@@ -18,12 +18,21 @@ Existing configuration, authentication files, working directory, environment,
 and log paths are preserved when installing over an existing LaunchAgent. They
 are outside Cargo output and do not need relocation for `cargo clean -p`.
 An existing plist must configure an absolute `StandardErrorPath` so the
-installer can observe readiness. A missing, empty or relative destination fails
-preflight before the running service is stopped; choose its log destination
-separately instead of silently changing existing paths during deployment.
+installer can observe readiness. Missing, relative, special-file or inaccessible
+destinations fail preflight before the running service is stopped; choose its
+log destination separately instead of silently changing existing paths during
+deployment.
 For a first installation, choose a configuration outside Cargo output. Its
 relative paths retain their existing meaning; the PDF helper also needs the
 Python project and helper resources beside that configuration.
+
+The configuration argument is relative to the LaunchAgent working directory.
+Media, authentication and PDF-helper paths are relative to the configuration's
+physical parent directory. Configuration HOME expansion follows the preserved
+service environment and supports `~`, `$HOME` and `${HOME}`; aliases followed by
+`..` retain filesystem resolution semantics. Bare tool names still use the
+preserved PATH, while relative command paths retain their task-specific working
+directories. The installer does not verify external tool availability.
 
 Queue, completion records, staging, publication locks, receipts, and recovery
 metadata intentionally live in the configured media roots. Media paths remain
@@ -71,7 +80,8 @@ Require a single registered/running service, the installed executable and
 expected working directory, the startup-ready marker, and two successful
 Telegram polls from the new process. Startup writes its ready marker and
 `telegram polling completed` directly to stderr, independently of `RUST_LOG`,
-for its first two successful polls; these logs contain no token, URL, or message
+with distinct `poll=1` and `poll=2` markers for its first two successful polls;
+these logs contain no token, URL, or message
 payload. Check queue/completion readability and preserved ownership/permissions.
 Do not use a second `getUpdates` consumer to test polling.
 

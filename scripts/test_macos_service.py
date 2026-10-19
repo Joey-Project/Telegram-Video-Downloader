@@ -176,6 +176,351 @@ class InstallationTest(unittest.TestCase):
         self.assertEqual(self.state_snapshot(), self.before_state)
         self.external.assert_not_called()
 
+    def test_unobservable_stderr_targets_are_rejected_without_opening_them(self):
+        fifo = self.root / "readiness.pipe"
+        os.mkfifo(fifo, 0o600)
+        directory = self.root / "readiness-directory"
+        directory.mkdir()
+        regular = self.root / "symlink-target.log"
+        regular.write_bytes(b"existing log")
+        alias = self.root / "stderr-alias.log"
+        alias.symlink_to(regular)
+        unusable = {Path("/dev/null"), fifo, directory, alias}
+        original_open = Path.open
+
+        def never_open_special(path, *args, **kwargs):
+            self.assertNotIn(
+                Path(path), unusable, "special log paths must be classified without open"
+            )
+            return original_open(path, *args, **kwargs)
+
+        for target in unusable:
+            with self.subTest(stderr=target):
+                self.plist.write_bytes(
+                    plistlib.dumps(
+                        {
+                            **self.original_plist,
+                            "StandardErrorPath": str(target),
+                        }
+                    )
+                )
+                plist_bytes = self.plist.read_bytes()
+                with (
+                    mock.patch.object(Path, "open", never_open_special),
+                    self.assertRaises(service.InstallError),
+                ):
+                    self.audit(self.deployment())
+                self.assertEqual(self.plist.read_bytes(), plist_bytes)
+                self.assertEqual(self.state_snapshot(), self.before_state)
+                self.assertFalse(
+                    (self.home / ".local/lib/telegram-video-downloader/backups").exists()
+                )
+        self.external.assert_not_called()
+
+    def test_regular_or_creatable_stderr_is_allowed_when_stdout_is_dev_null(self):
+        existing = self.root / "readiness-regular.log"
+        existing.write_bytes(b"retained existing log")
+        existing.chmod(0o600)
+        absent = self.root / "creatable-parent/new/logs/stderr.log"
+        for target in [existing, absent]:
+            with self.subTest(stderr=target):
+                self.plist.write_bytes(
+                    plistlib.dumps(
+                        {
+                            **self.original_plist,
+                            "StandardOutPath": "/dev/null",
+                            "StandardErrorPath": str(target),
+                        }
+                    )
+                )
+                deployment = self.deployment()
+                self.audit(deployment)
+                self.assertIn(target, deployment.log_paths)
+                self.assertIn(Path("/dev/null"), deployment.log_paths)
+                self.assertEqual(existing.read_bytes(), b"retained existing log")
+                self.assertFalse(absent.parent.exists())
+                self.assertEqual(self.state_snapshot(), self.before_state)
+        self.external.assert_not_called()
+
+    def test_stderr_access_denials_are_rejected_before_backups_are_created(self):
+        existing = self.root / "unreadable-stderr.log"
+        existing.write_bytes(b"existing log")
+        parent = self.root / "unwritable-log-parent"
+        parent.mkdir()
+        absent = parent / "new/subdirectory/stderr.log"
+        original_access = os.access
+        for target, denied in [(existing, existing), (absent, parent)]:
+            with self.subTest(stderr=target):
+                self.plist.write_bytes(
+                    plistlib.dumps(
+                        {
+                            **self.original_plist,
+                            "StandardErrorPath": str(target),
+                        }
+                    )
+                )
+
+                def no_log_access(path, mode, *args, _denied=denied, **kwargs):
+                    if Path(path) == _denied and mode & (os.R_OK | os.W_OK | os.X_OK):
+                        return False
+                    return original_access(path, mode, *args, **kwargs)
+
+                with (
+                    mock.patch.object(service.os, "access", side_effect=no_log_access),
+                    self.assertRaises(service.InstallError),
+                ):
+                    self.audit(self.deployment())
+                self.assertFalse(
+                    (self.home / ".local/lib/telegram-video-downloader/backups").exists()
+                )
+                self.assertFalse(absent.parent.exists())
+                self.assertEqual(self.state_snapshot(), self.before_state)
+        self.external.assert_not_called()
+
+    def test_config_home_path_expansion_matches_runtime_boundaries(self):
+        base = self.root / "config-parent"
+        for value in ["~", "$HOME", "${HOME}"]:
+            with self.subTest(path=value):
+                self.assertEqual(service.config_path(value, base, self.home), self.home)
+                self.assertEqual(
+                    service.config_path(value + "/media", base, self.home), self.home / "media"
+                )
+        self.assertEqual(
+            service.config_path("relative/state", base, self.home), base / "relative/state"
+        )
+        for literal in [
+            "~root/state",
+            "$HOME_SECRET/state",
+            "${HOME_SECRET}/state",
+            "${OTHER}/state",
+        ]:
+            with self.subTest(literal=literal):
+                self.assertEqual(service.config_path(literal, base, self.home), base / literal)
+        self.assertEqual(service.config_path("${HOME}/media", base, None), base / "${HOME}/media")
+
+    def test_home_media_and_auth_aliases_snapshot_real_paths_relative_to_config_parent(self):
+        video = self.home / "fixture-videos"
+        queue = video / ".telegram-video-downloader-queue"
+        queue.mkdir(parents=True)
+        (queue / "index.json").write_text('{"version":2,"tasks":{}}\n')
+        pdf = self.repo / "relative-pdfs"
+        pdf.mkdir()
+        auth_state = self.home / "fixture-auth/state.json"
+        auth_state.parent.mkdir()
+        auth_state.write_bytes(b"private authentication state fixture")
+        credentials = self.repo / "relative-auth/credentials.json"
+        credentials.parent.mkdir()
+        credentials.write_bytes(b"private credential store fixture")
+        for path in [auth_state, credentials]:
+            path.chmod(0o600)
+        workdir = self.root / "other-working-directory"
+        workdir.mkdir()
+        self.plist.write_bytes(
+            plistlib.dumps(
+                {
+                    **self.original_plist,
+                    "WorkingDirectory": str(workdir),
+                }
+            )
+        )
+        original_config = self.config.read_text()
+        source_state = {
+            path: (path.read_bytes(), path.stat()) for path in [auth_state, credentials]
+        }
+        for prefix in ["${HOME}", "$HOME"]:
+            with self.subTest(home_prefix=prefix):
+                updated = (
+                    original_config.replace(
+                        'video_dir = "media/videos"', f'video_dir = "{prefix}/fixture-videos"'
+                    )
+                    .replace('pdf_dir = "media/pdfs"', 'pdf_dir = "relative-pdfs"')
+                    .replace(
+                        'state_path = "auth/state.json"',
+                        f'state_path = "{prefix}/fixture-auth/state.json"',
+                    )
+                    .replace(
+                        'credential_file = "auth/credentials.json"',
+                        'credential_file = "relative-auth/credentials.json"',
+                    )
+                )
+                self.config.write_text(updated)
+                expected_state = self.state_snapshot()
+                deployment = self.deployment()
+                plan = self.audit(deployment)
+                self.assertEqual(plan["media"], {"video": str(video), "pdf": str(pdf)})
+                self.assertEqual(plan["working_directory"], str(workdir))
+                backup = self.root / ("braced-home-snapshot" if "{" in prefix else "home-snapshot")
+                backup.mkdir()
+                with self.snapshot_runner():
+                    deployment.snapshot_state(backup)
+                manifest = json.loads((backup / "state-manifest.json").read_text())
+                sources = {Path(entry["source"]) for entry in manifest["entries"]}
+                self.assertIn(auth_state, sources)
+                self.assertIn(credentials, sources)
+                self.assertTrue(any(path.is_relative_to(video) for path in sources))
+                self.assertFalse(
+                    any("$HOME" in str(path) or "${HOME}" in str(path) for path in sources)
+                )
+                self.assertEqual(self.state_snapshot(), expected_state)
+                for path, (contents, before) in source_state.items():
+                    self.assertEqual(path.read_bytes(), contents)
+                    after = path.stat()
+                    self.assertEqual(
+                        (after.st_uid, after.st_gid, after.st_mode, after.st_ino),
+                        (before.st_uid, before.st_gid, before.st_mode, before.st_ino),
+                    )
+
+    def test_service_home_defaults_support_custom_and_empty_home_without_moving_install_root(self):
+        self.config.write_text(f'[telegram]\ntoken = "{SYNTHETIC_ACCESS_TOKEN}"\n')
+        for label, runtime_home in [("custom", self.root / "service-home"), ("empty", None)]:
+            with self.subTest(service_home=label):
+                environment = {
+                    **self.original_plist["EnvironmentVariables"],
+                    "HOME": str(runtime_home) if runtime_home is not None else "",
+                }
+                self.plist.write_bytes(
+                    plistlib.dumps(
+                        {
+                            **self.original_plist,
+                            "EnvironmentVariables": environment,
+                        }
+                    )
+                )
+                if runtime_home is not None:
+                    media = {
+                        "video": runtime_home / "Movies/Downloads",
+                        "pdf": runtime_home / "Documents/Downloads",
+                    }
+                    auth_root = runtime_home / ".local/state/telegram-video-downloader"
+                else:
+                    media = {
+                        "video": self.repo / "video-downloads",
+                        "pdf": self.repo / "pdf-downloads",
+                    }
+                    auth_root = self.repo
+                auth = {
+                    "state_path": auth_root / "bilibili-auth.json",
+                    "credential_file": auth_root / "bbdown-credentials.json",
+                }
+                for directory in media.values():
+                    directory.mkdir(parents=True)
+                queue = media["video"] / ".telegram-video-downloader-queue"
+                queue.mkdir(mode=0o700)
+                (queue / "index.json").write_text('{"version":2,"tasks":{}}\n')
+                for source in auth.values():
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_bytes(b"existing default authentication state")
+                    source.chmod(0o600)
+                expected = self.state_snapshot()
+                deployment = self.deployment()
+                self.audit(deployment)
+                self.assertEqual(deployment.runtime_home, runtime_home)
+                self.assertEqual(deployment.media, media)
+                self.assertEqual(deployment.auth_paths, auth)
+                self.assertEqual(
+                    deployment.binary,
+                    self.home / ".local/lib/telegram-video-downloader/bin" / service.EXECUTABLE,
+                )
+                self.assertEqual(
+                    deployment.backups, self.home / ".local/lib/telegram-video-downloader/backups"
+                )
+                self.assertEqual(
+                    plistlib.loads(deployment.new_plist())["EnvironmentVariables"], environment
+                )
+                backup = self.root / f"service-home-snapshot-{label}"
+                backup.mkdir()
+                with self.snapshot_runner():
+                    deployment.snapshot_state(backup)
+                manifest = json.loads((backup / "state-manifest.json").read_text())
+                sources = {Path(entry["source"]) for entry in manifest["entries"]}
+                self.assertTrue(set(auth.values()).issubset(sources))
+                self.assertIn(queue, sources)
+                self.assertEqual(self.state_snapshot(), expected)
+
+    def test_media_alias_parent_component_is_resolved_before_snapshot_root_selection(self):
+        external = self.root / "external-media"
+        nested = external / "Nested"
+        nested.mkdir(parents=True)
+        physical = external / "Downloads"
+        queue = physical / ".telegram-video-downloader-queue"
+        queue.mkdir(parents=True)
+        (queue / "index.json").write_text('{"version":2,"tasks":{}}\n')
+        alias = self.repo / "media-alias"
+        alias.symlink_to(nested, target_is_directory=True)
+        decoy = self.repo / "Downloads/.telegram-video-downloader-queue"
+        decoy.mkdir(parents=True)
+        decoy_index = decoy / "index.json"
+        decoy_index.write_bytes(b"wrong directory must never be snapshotted")
+        self.config.write_text(
+            self.config.read_text().replace(
+                'video_dir = "media/videos"', 'video_dir = "media-alias/../Downloads"'
+            )
+        )
+        expected = self.state_snapshot()
+        deployment = self.deployment()
+        self.audit(deployment)
+        self.assertEqual(deployment.media["video"], self.repo / "media-alias/../Downloads")
+        backup = self.root / "alias-parent-snapshot"
+        backup.mkdir()
+        with self.snapshot_runner(forbidden={decoy_index}):
+            deployment.snapshot_state(backup)
+        manifest = json.loads((backup / "state-manifest.json").read_text())
+        self.assertEqual(manifest["media_roots"]["video"]["physical"], str(physical))
+        sources = {Path(entry["source"]) for entry in manifest["entries"]}
+        self.assertIn(queue, sources)
+        self.assertNotIn(decoy, sources)
+        self.assertEqual(self.state_snapshot(), expected)
+
+    def test_literal_auth_paths_are_audited_and_snapshots_use_the_cached_paths(self):
+        original = self.config.read_text()
+        for index, (key, old, value) in enumerate(
+            [
+                ("state_path", "auth/state.json", "$HOME_SECRET/state.json"),
+                ("credential_file", "auth/credentials.json", "${HOME_SECRET}/credentials.json"),
+                ("state_path", "auth/state.json", "~root/state.json"),
+                ("state_path", "auth/state.json", "${OTHER}/state.json"),
+            ]
+        ):
+            with self.subTest(auth_key=key):
+                self.config.write_text(original.replace(f'"{old}"', json.dumps(value)))
+                source = self.repo / value
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_bytes(b"literal configured authentication state")
+                source.chmod(0o600)
+                before = source.stat()
+                expected = self.state_snapshot()
+                deployment = self.deployment()
+                self.audit(deployment)
+                self.assertEqual(deployment.auth_paths[key], source)
+                unexpected = self.home / "unexpected-auth" / f"{index}.json"
+                unexpected.parent.mkdir(exist_ok=True)
+                unexpected.write_bytes(b"must not be rediscovered after audit")
+                deployment.document["bilibili"]["auth"][key] = str(unexpected)
+                backup = self.root / f"literal-auth-snapshot-{index}"
+                backup.mkdir()
+                with self.snapshot_runner(forbidden={unexpected}):
+                    deployment.snapshot_state(backup)
+                manifest = json.loads((backup / "state-manifest.json").read_text())
+                sources = {Path(entry["source"]) for entry in manifest["entries"]}
+                self.assertIn(source, sources)
+                self.assertNotIn(unexpected, sources)
+                self.assertEqual(self.state_snapshot(), expected)
+                self.assertEqual(source.read_bytes(), b"literal configured authentication state")
+                self.assertEqual(source.stat().st_ino, before.st_ino)
+                self.assertFalse(Path(str(self.home) + "_SECRET").exists())
+        self.external.assert_not_called()
+
+    def test_auth_symlinks_are_rejected_during_audit_before_any_backup(self):
+        source = self.repo / "auth/state.json"
+        outside = self.root / "external-auth-state.json"
+        outside.write_bytes(b"external auth fixture must not be read")
+        source.unlink()
+        source.symlink_to(outside)
+        with self.assertRaises(service.InstallError):
+            self.audit(self.deployment())
+        self.assertFalse((self.home / ".local/lib/telegram-video-downloader/backups").exists())
+        self.external.assert_not_called()
+
     def snapshot_runner(self, *, on_copy=None, forbidden=()):
         def copied(argv, **_):
             self.assertEqual(argv[0], "ditto")
@@ -507,6 +852,37 @@ class InstallationTest(unittest.TestCase):
         self.assertIn(old_signature, events[:build_index])
         self.assertEqual(self.old_binary.read_bytes(), b"old signed executable")
         self.assertEqual(self.state_snapshot(), self.before_state)
+
+    def test_invalid_captured_old_plist_is_rejected_before_build_stop_or_install(self):
+        invalid_environment = {
+            **self.original_plist["EnvironmentVariables"],
+            "CUSTOM_BOOLEAN": True,
+        }
+        for label, override in [
+            ("boolean_environment", {"EnvironmentVariables": invalid_environment}),
+            ("non_string_stdout", {"StandardOutPath": 123}),
+        ]:
+            with self.subTest(old_plist=label):
+                previous = plistlib.dumps({**self.original_plist, **override})
+                self.plist.write_bytes(previous)
+                deployment = self.deployment("deploy")
+                _, registry = self.transaction_environment(deployment)
+                with (
+                    mock.patch.object(service, "build_release") as build,
+                    mock.patch.object(service, "stop_services") as stop,
+                    mock.patch.object(service, "atomic_install") as install,
+                    self.assertRaises(service.InstallError),
+                ):
+                    deployment.audit()
+                    deployment.deploy()
+                build.assert_not_called()
+                stop.assert_not_called()
+                install.assert_not_called()
+                self.assertEqual(registry, {self.gui: 101, self.legacy: None})
+                self.assertEqual(self.plist.read_bytes(), previous)
+                self.assertEqual(self.old_binary.read_bytes(), b"old signed executable")
+                self.assertFalse(deployment.binary.exists())
+                self.assertEqual(self.state_snapshot(), self.before_state)
 
     def test_failed_readiness_restores_binary_and_plist_without_reverting_runtime(self):
         deployment = self.deployment("deploy", "--no-build", "--binary", str(self.artifact))
@@ -944,7 +1320,7 @@ class InstallationTest(unittest.TestCase):
         stdout.parent.mkdir(parents=True)
         ready_log = (
             "telegram local downloader started\n"
-            "telegram polling completed\ntelegram polling completed\n"
+            "telegram polling completed poll=1\ntelegram polling completed poll=2\n"
         )
         stdout.write_text(ready_log)
         info = {"target": self.gui, "pid": 303}
@@ -976,7 +1352,7 @@ class InstallationTest(unittest.TestCase):
         stdout.write_text(
             old_log
             + "telegram local downloader started\n"
-            + "telegram polling completed\ntelegram polling completed\n"
+            + "telegram polling completed poll=1\ntelegram polling completed poll=2\n"
         )
         offsets = {str(stdout): len(old_log.encode())}
         info = {"target": self.gui, "pid": 303}
@@ -996,6 +1372,36 @@ class InstallationTest(unittest.TestCase):
             self.assertEqual(deployment.wait_ready(offsets), 303)
         self.assertEqual(inventory.call_count, 2)
         sleep.assert_called_once()
+
+    def test_hardlinked_logs_with_duplicate_first_poll_do_not_count_as_two_cycles(self):
+        deployment, offsets, info, listing = self.startup_fixture()
+        stdout, stderr = deployment.log_paths
+        stdout.write_text(
+            "records from the previous service instance\n"
+            "telegram local downloader started\n"
+            "telegram polling completed poll=1\n"
+        )
+        os.link(stdout, stderr)
+        self.assertEqual(stdout.stat().st_ino, stderr.stat().st_ino)
+        with (
+            mock.patch.object(service, "service_info", return_value=info),
+            mock.patch.object(service, "bot_processes", return_value=[303]),
+            mock.patch.object(service.time, "monotonic", side_effect=[0, 0, 999]),
+            mock.patch.object(service.time, "sleep"),
+            self.assertRaises(service.InstallError),
+        ):
+            deployment.wait_ready(offsets)
+        self.external.assert_not_called()
+        with stdout.open("a") as stream:
+            stream.write("telegram polling completed poll=2\n")
+        with (
+            mock.patch.object(service, "service_info", return_value=info),
+            mock.patch.object(service, "bot_processes", return_value=[303]),
+            mock.patch.object(
+                service, "run", return_value=subprocess.CompletedProcess([], 0, listing, "")
+            ),
+        ):
+            self.assertEqual(deployment.wait_ready(offsets), 303)
 
     def test_audit_and_readiness_allow_same_executable_bilibili_worker_descendants(self):
         deployment, offsets, info, listing = self.startup_fixture()

@@ -51,12 +51,39 @@ def run(argv, *, check=True, capture=True, **kwargs):
 
 def absolute(path, base):
     value = str(path)
-    if value == "$HOME" or value.startswith("$HOME/"):
-        value = str(Path.home()) + value[5:]
-    value = os.path.expanduser(value)
+    for marker in ("~", "$HOME", "${HOME}"):
+        if value == marker:
+            value = str(Path.home())
+            break
+        prefix = marker + "/"
+        if value.startswith(prefix):
+            value = str(Path.home() / value[len(prefix) :])
+            break
     if "$" in value:
         raise InstallError("unsupported variable in a configured path")
-    return Path(os.path.abspath(Path(base) / value))
+    if "\0" in value:
+        raise InstallError("invalid configured path")
+    expanded = Path(value)
+    absolute_base = Path(base) if Path(base).is_absolute() else Path.cwd() / base
+    return expanded if expanded.is_absolute() else absolute_base / expanded
+
+
+def config_path(value, config_parent, runtime_home):
+    """Match Rust's config expansion without changing filesystem '..' semantics."""
+    value = str(value)
+    if "\0" in value:
+        raise InstallError("invalid configured path")
+    expanded = Path(value)
+    if runtime_home is not None:
+        for marker in ("~", "$HOME", "${HOME}"):
+            if value == marker:
+                expanded = runtime_home
+                break
+            prefix = marker + "/"
+            if value.startswith(prefix):
+                expanded = runtime_home / value[len(prefix) :]
+                break
+    return expanded if expanded.is_absolute() else Path(config_parent) / expanded
 
 
 def no_symlinks(path):
@@ -64,6 +91,35 @@ def no_symlinks(path):
     for entry in [Path(path), *Path(path).parents]:
         if entry.is_symlink():
             raise InstallError(f"symbolic link is unsupported: {entry}")
+
+
+def validate_stderr_path(path):
+    """Require observable stderr without opening special files or changing logs."""
+    path = Path(path)
+    no_symlinks(path)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        parent = path.parent
+        while True:
+            try:
+                metadata = parent.stat()
+                break
+            except FileNotFoundError:
+                parent = parent.parent
+            except OSError:
+                raise InstallError("StandardErrorPath parent cannot be inspected") from None
+        if not stat.S_ISDIR(metadata.st_mode) or not os.access(parent, os.W_OK | os.X_OK):
+            raise InstallError(
+                "StandardErrorPath requires a writable and searchable directory"
+            ) from None
+        return
+    except OSError:
+        raise InstallError("StandardErrorPath cannot be inspected") from None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise InstallError("StandardErrorPath must be a regular file to observe readiness")
+    if not os.access(path, os.R_OK | os.W_OK):
+        raise InstallError("StandardErrorPath must be readable and writable to observe readiness")
 
 
 def check_tree(path):
@@ -580,6 +636,7 @@ class Deployment:
             raise InstallError("production deployment requires this user's gui or user domain")
         self.home = Path.home()
         self.repo = absolute(args.repo, Path.cwd())
+        self.input_binary = absolute(args.binary, Path.cwd()) if args.binary else None
         self.binary = self.home / ".local/lib/telegram-video-downloader/bin" / EXECUTABLE
         self.backups = self.home / ".local/lib/telegram-video-downloader/backups"
         self.plist_path = self.home / "Library/LaunchAgents" / f"{args.label}.plist"
@@ -589,6 +646,18 @@ class Deployment:
         no_symlinks(self.plist_path)
         self.old_plist_bytes = self.plist_path.read_bytes() if self.plist_path.exists() else None
         self.old_plist = plistlib.loads(self.old_plist_bytes) if self.old_plist_bytes else None
+        environment = self.old_plist.get("EnvironmentVariables", {}) if self.old_plist else {}
+        if not isinstance(environment, dict) or (
+            "HOME" in environment and not isinstance(environment["HOME"], str)
+        ):
+            raise InstallError("existing LaunchAgent HOME must be a string")
+        self.runtime_home = (
+            Path(environment["HOME"])
+            if environment.get("HOME")
+            else None
+            if "HOME" in environment
+            else self.home
+        )
         if self.old_plist and self.old_plist.get("Label") != args.label:
             raise InstallError("existing plist Label does not match the selected service")
         if self.old_plist and "Program" in self.old_plist:
@@ -630,14 +699,18 @@ class Deployment:
                 if self.old_plist.get(key)
             ]
             self.log_paths = list(dict.fromkeys(self.log_paths))
+            self.stderr_path = Path(self.old_plist["StandardErrorPath"])
         else:
             self.workdir = self.config.parent
             logs = absolute(
                 args.log_dir or self.home / "Library/Logs/Telegram-Video-Downloader", self.repo
             )
             self.log_paths = [logs / "stdout.log", logs / "stderr.log"]
+            self.stderr_path = self.log_paths[1]
+        validate_stderr_path(self.stderr_path)
 
     def audit(self):
+        validate_stderr_path(self.stderr_path)
         for path in [
             self.binary,
             self.backups,
@@ -649,15 +722,49 @@ class Deployment:
             no_symlinks(path)
         if not self.config.is_file():
             raise InstallError(f"configuration is missing: {self.config}")
+        # Runtime reads this same path, then canonicalizes its parent for relative fields.
+        self.config_parent = self.config.resolve(strict=True).parent
         try:
             self.document = tomllib.loads(self.config.read_text())
         except (UnicodeError, tomllib.TOMLDecodeError):
             raise InstallError("configuration is not valid UTF-8 TOML") from None
+        auth = self.document.get("bilibili", {}).get("auth", {})
+        self.auth_paths = {}
+        for key, default in [
+            ("state_path", "bilibili-auth.json"),
+            ("credential_file", "bbdown-credentials.json"),
+        ]:
+            if self.runtime_home is not None:
+                default = str(
+                    self.runtime_home / ".local/state/telegram-video-downloader" / default
+                )
+            value = auth.get(key, default)
+            if not isinstance(value, str):
+                raise InstallError("configured auth paths must be strings")
+            source = config_path(value, self.config_parent, self.runtime_home)
+            no_symlinks(source)
+            try:
+                metadata = source.stat()
+            except FileNotFoundError:
+                metadata = None
+            except OSError:
+                raise InstallError("configured auth path cannot be inspected") from None
+            if metadata and not stat.S_ISREG(metadata.st_mode):
+                raise InstallError("configured auth paths must be regular files when present")
+            self.auth_paths[key] = source
         downloads = self.document.get("downloads", {})
-        self.media = {
-            "video": absolute(downloads.get("video_dir", "~/Movies/Downloads"), self.config.parent),
-            "pdf": absolute(downloads.get("pdf_dir", "~/Documents/Downloads"), self.config.parent),
-        }
+        self.media = {}
+        for kind, home_default, fallback in (
+            ("video", "Movies/Downloads", "video-downloads"),
+            ("pdf", "Documents/Downloads", "pdf-downloads"),
+        ):
+            default = (
+                str(self.runtime_home / home_default) if self.runtime_home is not None else fallback
+            )
+            value = downloads.get(f"{kind}_dir", default)
+            if not isinstance(value, str):
+                raise InstallError("configured media paths must be strings")
+            self.media[kind] = config_path(value, self.config_parent, self.runtime_home)
         self.media_bindings = {
             kind: media_binding(directory) for kind, directory in self.media.items()
         }
@@ -736,12 +843,7 @@ class Deployment:
         self.revalidate_media_bindings()
         candidates = {self.config}
         anchors = {}
-        auth = self.document.get("bilibili", {}).get("auth", {})
-        for key, default in [
-            ("state_path", "~/.local/state/telegram-video-downloader/bilibili-auth.json"),
-            ("credential_file", "~/.local/state/telegram-video-downloader/bbdown-credentials.json"),
-        ]:
-            source = absolute(auth.get(key, default), self.config.parent)
+        for source in self.auth_paths.values():
             no_symlinks(source)
             if source.parent.exists():
                 candidates.update(source.parent.glob(source.name + "*"))
@@ -874,10 +976,10 @@ class Deployment:
                         with path.open("rb") as stream:
                             stream.seek(offsets.get(str(path), 0))
                             output += stream.read(2 * 1024 * 1024).decode(errors="replace")
-                if (
-                    "telegram local downloader started" in output
-                    and output.count("telegram polling completed") >= 2
-                ):
+                if "telegram local downloader started" in output and {
+                    "telegram polling completed poll=1",
+                    "telegram polling completed poll=2",
+                }.issubset(output.splitlines()):
                     listing = run(
                         ["lsof", "-nP", "-a", "-p", str(current["pid"]), "-d", "cwd,txt", "-Ffn"]
                     ).stdout
@@ -929,12 +1031,11 @@ class Deployment:
             "requirement": self.requirement,
         }
         atomic_bytes(backup / "transaction.json", json.dumps(transaction, indent=2).encode())
+        # Prove the retained fallback is usable before building or stopping the service.
+        transaction = validate_transaction(transaction, self.args.label)
+        validate_saved_plist(backup, transaction)
         staged = backup / "staged-binary"
-        source = (
-            absolute(self.args.binary, Path.cwd())
-            if self.args.binary
-            else self.repo / "target/release" / EXECUTABLE
-        )
+        source = self.input_binary or self.repo / "target/release" / EXECUTABLE
         try:
             if not self.args.no_build:
                 built_source = build_release(self.repo, backup)
@@ -968,6 +1069,7 @@ class Deployment:
                     shutil.rmtree(generated)
         stopped = False
         try:
+            validate_stderr_path(self.stderr_path)
             # Set this before bootout: a later domain may fail after the first stopped.
             stopped = True
             stop_services(self.targets)
