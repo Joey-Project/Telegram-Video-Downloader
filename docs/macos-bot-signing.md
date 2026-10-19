@@ -156,31 +156,43 @@ logs, and media-associated state. This workflow does not run cache cleanup.
 
 ## Local Cutover Record (2026-10-19)
 
-- Production destination: `/Users/joey/.local/lib/telegram-video-downloader/bin/telegram-video-downloader`.
-- Existing config: `/Users/joey/Program/Codex-workspace/Telegram-Video-Downloader/config.toml`.
-- Existing working directory: `/Users/joey/Program/Codex-workspace/Telegram-Video-Downloader`.
-- Existing logs: `/Users/joey/Library/Logs/TelegramVideoDownloader/`.
+- Joey initially deferred the new-path Documents authorization and requested
+  rollback, then resumed the controlled migration after unlocking the system.
+  At `2026-10-19 18:33:37 UTC`, PID `2221` passed startup and polling verification.
+- Active executable:
+  `/Users/joey/.local/lib/telegram-video-downloader/bin/telegram-video-downloader`.
+  The GUI LaunchAgent is the only running downloader instance; the legacy user
+  service is absent. `lsof` confirms the executable and preserved working directory.
+- Existing config:
+  `/Users/joey/Program/Codex-workspace/Telegram-Video-Downloader/config.toml`.
+  Working directory:
+  `/Users/joey/Program/Codex-workspace/Telegram-Video-Downloader`.
+  Logs remain `/Users/joey/Library/Logs/TelegramVideoDownloader/`.
 - Media roots remain `/Users/joey/Movies/Downloads` and
-  `/Users/joey/Documents/Downloads`; existing authentication state remains in
+  `/Users/joey/Documents/Downloads`; authentication state remains in
   `/Users/joey/.local/state/telegram-video-downloader/`.
-- Retained rollback/state metadata backup:
-  `/Users/joey/.local/lib/telegram-video-downloader/backups/20261019T103210.929774Z`.
-  Payloads in media staging stay in place; the backup contains configuration,
-  authentication, queue, completion, lock, and recovery metadata, not downloaded
-  media payloads. Copied metadata retains owner/group/mode and content hashes;
-  the manifest records original device/inode identities.
-- The fixed-path process requested `kTCCServiceSystemPolicyDocumentsFolder`.
-  Joey declined granting new-path access and requested restoring the original
-  entrypoint. The original executable still matches the saved SHA-256 and
-  designated requirement; the original plist has been restored. New-path
-  activation is deferred and its two successful poll markers were not observed.
-- Original-path startup verification is still pending: the restored process is
-  waiting in `NSFileCoordinator`; no startup-ready/polling claim is made.
-  Both queue indexes remain readable, including all 19 video records (14
-  completed, 5 cancelled), with no missing indexed record.
+- Signing retains `Telegram Video Downloader Local Signing`, fingerprint
+  `C24FE0C91539BD95BA4081CD944A8E17053FB304`, identifier
+  `io.github.telegram-local-downloader.bot`, and the original designated
+  requirement. Installed signature integrity and requirement checks pass.
+- Startup-ready and distinct successful `poll=1` / `poll=2` markers belong to
+  PID `2221`. Both queue indexes parse; all 19 video records remain readable
+  (14 completed, 5 cancelled), with no missing indexed record. PDF has no indexed tasks.
+- All 30 compared configuration/state files retain their hashes, owner, group,
+  mode, device and link count. Twenty-eight retain their inodes; only the two
+  `index.json` inodes changed through the expected atomic rewrite in
+  `QueueManager::open`. Original lock identities remain unchanged. Queue,
+  completion, staging, publication and recovery state remain beside the media.
+- New rollback/state backup:
+  `/Users/joey/.local/lib/telegram-video-downloader/backups/20261019T182920.731238Z`.
+  All 40 backed-up files pass hash, owner, group and mode checks. The earlier
+  `20261019T103210.929774Z` backup is also retained. Manifests record original
+  device/inode identities; media payloads remain in place.
 
-**The current service still depends on the original Cargo release output. Do
-not clean that output until a later authorized cutover passes runtime checks.**
+The active service no longer executes Cargo output. Cargo cache cleanup can be
+performed separately; keep the installed executable, rollback backups,
+configuration, repository resources needed by the PDF helper, authentication
+data, logs and media-associated state. No cache cleanup was performed here.
 
 ## Why Signing Is Required
 
