@@ -1,4 +1,131 @@
-# macOS Bot Signing
+# macOS Bot Deployment and Signing
+
+## Production Layout and Cache Cleanup
+
+The production executable is installed at:
+
+```text
+$HOME/.local/lib/telegram-video-downloader/bin/telegram-video-downloader
+```
+
+This is independent of Cargo's `target-dir` and `build-dir`. Explicit
+`scripts/launch_agent.sh install` / `deploy` commands own deployment; ordinary
+Cargo builds, tests, and cache cleanup do not install or restart the service.
+The installer isolates both Cargo output directories, including when a global
+Cargo configuration redirects intermediate artifacts to a shared cache.
+
+Existing configuration, authentication files, working directory, environment,
+and log paths are preserved when installing over an existing LaunchAgent. They
+are outside Cargo output and do not need relocation for `cargo clean -p`.
+For a first installation, choose a configuration outside Cargo output. Its
+relative paths retain their existing meaning; the PDF helper also needs the
+Python project and helper resources beside that configuration.
+
+Queue, completion records, staging, publication locks, receipts, and recovery
+metadata intentionally live in the configured media roots. Media paths remain
+unchanged. Several locks and recovery records bind device/inode identities and
+publication uses same-filesystem atomic renames. Do not move this state into
+Application Support or remove it as part of Cargo cache cleanup. Copied lock
+backups are recovery evidence; they cannot be blindly substituted for original
+inode-bound objects.
+
+## Explicit Commands
+
+The macOS installer requires `python3` 3.11 or newer, Apple command-line tools
+(`codesign`, `security`, `ditto`, `launchctl`, `lsof`), Cargo for a source build,
+and the existing trusted local signing identity. It uses only Python's standard
+library and does not install Python dependencies during deployment.
+
+```sh
+scripts/launch_agent.sh plan
+scripts/launch_agent.sh install
+scripts/launch_agent.sh deploy --no-build --binary /path/to/release/telegram-video-downloader
+scripts/launch_agent.sh status
+```
+
+`plan` is read-only and emits only necessary paths, signature identity, and
+state locations. `--binary` selects an input artifact, never the
+LaunchAgent execution path. The installer signs a staged copy and leaves the
+input artifact untouched. A release build by itself never deploys.
+
+Before the first controlled switch, retain the old signed executable, its
+designated requirement, the original plist and configuration, and private state
+backups outside Cargo output. Stop both the GUI and legacy user services and
+verify their processes have exited before taking the final snapshot. Install
+the verified executable with a same-directory atomic rename and atomically
+replace the plist. For an existing service, only its executable argument changes.
+
+Require a single registered/running service, the installed executable and
+expected working directory, the startup-ready marker, and two successful
+Telegram polls from the new process. Startup emits `telegram polling completed`
+for its first two successful polls; these logs contain no token, URL, or message
+payload. Check queue/completion readability and preserved ownership/permissions.
+Do not use a second `getUpdates` consumer to test polling.
+
+The installer's retained backup path is its rollback handle:
+
+```sh
+scripts/launch_agent.sh rollback --backup /path/printed/by/the/installer
+```
+
+Rollback restores the previous executable and plist after stopping the current
+service. It preserves current runtime state instead of rewinding queues or
+authentication files that may have advanced since deployment. If state repair
+is needed, stop the service, retain both versions, and perform a separate
+validated repair respecting lock identities.
+
+Default rollback keeps the restored executable at the fixed installation path,
+so it also works after Cargo output has been removed. It does not prove that the
+restored process reached startup-ready. If the new path needs a privacy grant
+that the user declines, explicitly restore the original entrypoint instead:
+
+```sh
+scripts/launch_agent.sh rollback --backup /path/printed/by/the/installer --original-entrypoint
+```
+
+This option requires the original executable to still exist and match the saved
+bytes and designated requirement. It verifies those conditions before stopping
+the service and restores the original plist bytes. It fails before stopping if
+the original executable was cleaned or changed. Runtime state remains in place.
+
+Moving an executable can trigger a fresh macOS Documents request even with the
+same certificate and identifier. Finish that system prompt explicitly. Stopping
+the requesting PID or restoring a signature does not itself finish a pending
+prompt. If the user declines the new grant, restore the original entrypoint,
+check startup-ready again, and report any remaining coordinator/authorization
+blocker without claiming polling resumed. Never reset TCC or broaden access.
+
+After successful validation, Cargo output can be cleaned independently. Keep
+the installed executable, rollback backups, configuration, authentication data,
+logs, and media-associated state. This workflow does not run cache cleanup.
+
+## Local Cutover Record (2026-10-19)
+
+- Production destination: `/Users/joey/.local/lib/telegram-video-downloader/bin/telegram-video-downloader`.
+- Existing config: `/Users/joey/Program/Codex-workspace/Telegram-Video-Downloader/config.toml`.
+- Existing working directory: `/Users/joey/Program/Codex-workspace/Telegram-Video-Downloader`.
+- Existing logs: `/Users/joey/Library/Logs/TelegramVideoDownloader/`.
+- Media roots remain `/Users/joey/Movies/Downloads` and
+  `/Users/joey/Documents/Downloads`; existing authentication state remains in
+  `/Users/joey/.local/state/telegram-video-downloader/`.
+- Retained rollback/state metadata backup:
+  `/Users/joey/.local/lib/telegram-video-downloader/backups/20261019T103210.929774Z`.
+  Payloads in media staging stay in place; the backup contains configuration,
+  authentication, queue, completion, lock, and recovery metadata, not downloaded
+  media payloads. Copied metadata retains owner/group/mode and content hashes;
+  the manifest records original device/inode identities.
+- The fixed-path process requested `kTCCServiceSystemPolicyDocumentsFolder`.
+  Joey declined granting new-path access and requested restoring the original
+  entrypoint. The original executable still matches the saved SHA-256 and
+  designated requirement; the original plist has been restored. New-path
+  activation is deferred and its two successful poll markers were not observed.
+- Original-path startup verification is still pending: the restored process is
+  waiting in `NSFileCoordinator`; no startup-ready/polling claim is made.
+  Both queue indexes remain readable, including all 19 video records (14
+  completed, 5 cancelled), with no missing indexed record.
+
+**The current service still depends on the original Cargo release output. Do
+not clean that output until a later authorized cutover passes runtime checks.**
 
 ## Why Signing Is Required
 

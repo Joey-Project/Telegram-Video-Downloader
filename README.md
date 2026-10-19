@@ -128,11 +128,19 @@ cargo run -- --replay-message config.toml "Title https://b23.tv/..."
 
 ## macOS 自启动
 
-用户级 LaunchAgent 可以让 bot 在当前用户的 launchd session 里自动启动和保活。安装脚本会构建 release binary，并把 plist 写入 `~/Library/LaunchAgents`：
+用户级 LaunchAgent 可以让 bot 在当前用户的 launchd session 里自动启动和保活。先查看只输出路径和签名信息的部署计划，再显式安装：
 
 ```sh
+scripts/launch_agent.sh plan
 scripts/launch_agent.sh install
 ```
+
+正式二进制安装到 `~/.local/lib/telegram-video-downloader/bin/telegram-video-downloader`，
+不再从 Cargo 的 `target` 或共享 `build-dir` 启动。安装命令隔离构建、签名并验证暂存产物，
+停服备份后原子安装；普通 `cargo build`、`cargo test` 不部署。
+已有 LaunchAgent 的配置、工作目录、日志和环境保持原位。
+媒体目录里的队列、完成记录、锁及发布恢复数据也是有意的架构设计，不能当作 Cargo 缓存移动或清理。
+安装、验证和回滚步骤见 [macOS 部署与签名](docs/macos-bot-signing.md)。
 
 常用操作：
 
@@ -146,17 +154,23 @@ scripts/launch_agent.sh uninstall
 脚本默认使用：
 
 - label：`io.github.telegram-local-downloader.bot`
-- config：`./config.toml`
-- binary：`./target/release/telegram-video-downloader`
-- logs：`~/Library/Logs/TelegramVideoDownloader/`
+- config：沿用已有 plist；首次安装使用 `./config.toml`
+- binary：`~/.local/lib/telegram-video-downloader/bin/telegram-video-downloader`
+- logs：沿用已有 plist；首次安装使用 `~/Library/Logs/Telegram-Video-Downloader/`
 - launchd domain：`gui/$(id -u)`（当前登录的图形会话）
 
 未设置 `BOT_DOMAIN` 时，`install` 和 `uninstall` 会清理旧版本留下的 `user/$(id -u)` 服务；`status` 和 `restart` 会在新服务尚未安装时回退到该旧服务。显式设置 `BOT_DOMAIN` 会保持该自定义 domain，不触发兼容迁移。
 
-这些都可以通过环境变量覆盖，例如：
+首次安装可以指定配置和 label，例如：
 
 ```sh
 BOT_LABEL=com.example.telegram-downloader BOT_CONFIG=/path/to/config.toml scripts/launch_agent.sh install
+```
+
+部署已经构建的产物时，`--binary` 仅指定输入文件；脚本复制并签名暂存副本，不会修改该输入：
+
+```sh
+scripts/launch_agent.sh deploy --no-build --binary /path/to/staged/release/telegram-video-downloader
 ```
 
 ## 验证
@@ -166,6 +180,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 scripts/test_launch_agent.sh
+python3 -B scripts/test_macos_service.py
 uv run ruff format --check
 uv run ruff check
 uv run python -m unittest discover -s tests

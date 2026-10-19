@@ -325,6 +325,7 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
     };
     let next_job_id = Arc::new(AtomicU64::new(1));
     let mut offset = None;
+    let mut startup_poll_successes = 0;
 
     info!(
         concurrency = config.bot.concurrency,
@@ -341,6 +342,13 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
             updates = telegram.get_updates(offset, config.bot.poll_timeout_seconds) => {
                 match updates {
                     Ok(updates) => {
+                        if startup_poll_successes < 2 {
+                            startup_poll_successes += 1;
+                            info!(
+                                poll = startup_poll_successes,
+                                "telegram polling completed"
+                            );
+                        }
                         if let Err(err) = process_telegram_updates(
                             &telegram,
                             &config,
