@@ -2640,6 +2640,126 @@ async fn missing_related_preview_does_not_retry_a_durable_primary_outcome() {
     );
 }
 
+#[test]
+fn oversized_legacy_import_receipt_preserves_a_bounded_mapping_prefix() {
+    const SEQ: u64 = 1;
+    const RECEIPT_LIMIT: usize = 1024 * 1024 + 64 * 1024;
+    let hint_count = crate::library::MAX_LEGACY_HINTS;
+    assert_eq!(hint_count, 10_000);
+    let root = temp_cloud_bot_dir("oversized-legacy-import-receipt");
+    fs::create_dir_all(&root).expect("inbox root should create");
+    let inbox = CloudInbox::open(&root).expect("cloud inbox should open");
+
+    let text = (0..hint_count)
+        .map(|index| format!("BV1{index:010}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(text.len(), 139_999);
+    let request = CloudRequest {
+        seq: SEQ,
+        kind: "legacy_import".to_string(),
+        payload: serde_json::json!({"text": text}),
+        created_at: now_millis(),
+        extra: serde_json::Map::new(),
+    };
+    inbox
+        .persist(request)
+        .expect("valid maximum-size legacy input should persist");
+
+    let hints = (0..hint_count)
+        .map(|index| SourceHint {
+            source_ids: vec![format!("BV1{index:010}")],
+            title: Some(format!("Imported title {index}")),
+            relative_path: None,
+            collection: None,
+            origin: HintOrigin::LegacyText,
+            requires_confirmation: true,
+        })
+        .collect::<Vec<_>>();
+    let candidates = (0..hint_count)
+        .map(|index| LegacyCandidate {
+            hint_index: index,
+            item_id: format!("item-{index:05}"),
+            title: format!("Media title {index}"),
+            relative_path: format!("media/{index:05}.mp4"),
+            match_kind: "source_id".to_string(),
+            ambiguous: false,
+            requires_confirmation: true,
+        })
+        .collect::<Vec<_>>();
+    let result = serde_json::json!({
+        "revision": "library-revision",
+        "library_revision": "library-revision",
+        "hints": hints,
+        "warnings": [],
+        "needs_confirmation": true,
+        "candidates": candidates,
+    });
+
+    let receipt = inbox
+        .persist_dispatch_result(SEQ, InboxStatus::Completed, Some(result), None)
+        .expect("oversized legacy import should preserve a useful compact receipt");
+    assert_eq!(receipt.status, InboxStatus::Completed);
+    assert!(receipt.error.is_none());
+    let encoded_len = serde_json::to_vec(&receipt)
+        .expect("complete receipt should serialize")
+        .len();
+    assert!(
+        encoded_len <= RECEIPT_LIMIT,
+        "the full persisted receipt including its request and truncation warning must fit: {encoded_len} bytes"
+    );
+
+    let result = receipt
+        .result
+        .as_ref()
+        .expect("completed import should retain its result");
+    let retained_hints = result["hints"]
+        .as_array()
+        .expect("hints should remain an array");
+    let retained_candidates = result["candidates"]
+        .as_array()
+        .expect("candidates should remain an array");
+    assert!(!retained_hints.is_empty());
+    assert!(retained_hints.len() < hint_count);
+    assert_eq!(retained_candidates.len(), retained_hints.len());
+    let warning = result["warnings"]
+        .as_array()
+        .and_then(|warnings| warnings.iter().find_map(serde_json::Value::as_str))
+        .expect("truncation warning should remain visible");
+    assert!(warning.contains("truncated"));
+    assert!(warning.contains("re-import a smaller selection"));
+
+    for (index, (hint, candidate)) in retained_hints.iter().zip(retained_candidates).enumerate() {
+        assert_eq!(candidate["hint_index"].as_u64(), Some(index as u64));
+        assert_eq!(
+            hint["source_ids"][0].as_str(),
+            Some(format!("BV1{index:010}").as_str())
+        );
+        assert_eq!(
+            candidate["item_id"].as_str(),
+            Some(format!("item-{index:05}").as_str())
+        );
+    }
+
+    drop(inbox);
+    let reopened = CloudInbox::open(&root).expect("cloud inbox should reopen");
+    let reopened_receipt = reopened
+        .record(SEQ)
+        .expect("persisted import receipt should reload")
+        .expect("completed import receipt should remain durable");
+    assert_eq!(reopened_receipt.status, InboxStatus::Completed);
+    assert_eq!(reopened_receipt.result, receipt.result);
+    assert!(
+        serde_json::to_vec(&reopened_receipt)
+            .expect("reopened receipt should serialize")
+            .len()
+            <= RECEIPT_LIMIT
+    );
+
+    drop(reopened);
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reopen() {
     const LEGACY_IMPORT_SEQ: u64 = 1;

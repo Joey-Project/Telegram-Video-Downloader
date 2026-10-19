@@ -661,6 +661,12 @@ impl InboxRecord {
             return Ok(false);
         }
 
+        if self.request.kind == "legacy_import"
+            && self.compact_oversized_legacy_import_result(limit, safety_margin)?
+        {
+            return Ok(true);
+        }
+
         self.status = InboxStatus::Failed;
         self.result = Some(serde_json::json!({
             "error": "The local operation result exceeded the receipt size limit."
@@ -674,6 +680,97 @@ impl InboxRecord {
             bail!("cloud inbox request cannot fit a compact terminal receipt");
         }
         Ok(true)
+    }
+
+    fn compact_oversized_legacy_import_result(
+        &mut self,
+        limit: usize,
+        safety_margin: usize,
+    ) -> Result<bool> {
+        let Some(original_result) = self.result.as_ref() else {
+            return Ok(false);
+        };
+        let Some(hints) = original_result.get("hints").and_then(Value::as_array) else {
+            return Ok(false);
+        };
+        let Some(candidates) = original_result.get("candidates").and_then(Value::as_array) else {
+            return Ok(false);
+        };
+        let hint_count = hints.len();
+        if hint_count == 0 {
+            return Ok(false);
+        }
+
+        let original_result = original_result.clone();
+        let hints = hints.clone();
+        let candidates = candidates.clone();
+        let mut candidate_record = self.clone();
+        let mut best_result = None;
+        let mut low = 0_usize;
+        let mut high = hint_count;
+
+        while low <= high {
+            let retained_hint_count = low + (high - low) / 2;
+            let retained_hints = hints[..retained_hint_count].to_vec();
+            let retained_candidates = candidates
+                .iter()
+                .filter(|candidate| {
+                    candidate
+                        .get("hint_index")
+                        .and_then(Value::as_u64)
+                        .and_then(|index| usize::try_from(index).ok())
+                        .is_some_and(|index| index < retained_hint_count)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut result = original_result.clone();
+            let Some(result_object) = result.as_object_mut() else {
+                return Ok(false);
+            };
+            result_object.insert("hints".to_string(), Value::Array(retained_hints));
+            result_object.insert("candidates".to_string(), Value::Array(retained_candidates));
+
+            if retained_hint_count < hint_count {
+                let warning = format!(
+                    "Legacy import output was truncated to fit the local receipt size limit. The first {retained_hint_count} of {hint_count} hints and their candidates remain available; re-import a smaller selection to access omitted hints."
+                );
+                let warnings = result_object
+                    .entry("warnings".to_string())
+                    .or_insert_with(|| serde_json::json!([]));
+                if !warnings.is_array() {
+                    *warnings = serde_json::json!([]);
+                }
+                if let Some(warnings) = warnings.as_array_mut()
+                    && !warnings
+                        .iter()
+                        .any(|entry| entry.as_str() == Some(warning.as_str()))
+                {
+                    warnings.push(Value::String(warning));
+                }
+            }
+
+            candidate_record.result = Some(result.clone());
+            if retained_hint_count > 0
+                && serde_json::to_vec(&candidate_record)?
+                    .len()
+                    .saturating_add(safety_margin)
+                    <= limit
+            {
+                best_result = Some(result);
+                low = retained_hint_count.saturating_add(1);
+            } else if retained_hint_count == 0 {
+                break;
+            } else {
+                high = retained_hint_count - 1;
+            }
+        }
+
+        if let Some(result) = best_result {
+            self.result = Some(result);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 

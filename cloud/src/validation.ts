@@ -283,7 +283,9 @@ function parseRelativeDirectory(value: unknown): string {
     );
   }
   if (segments.some((segment) => {
-    const lowercaseSegment = segment.toLowerCase();
+    const lowercaseSegment = segment
+      .replace(/[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]/gu, "")
+      .toLowerCase();
     return segment.length === 0 || segment === "." || segment === ".." ||
       lowercaseSegment.startsWith(".telegram-video-downloader-library") ||
       lowercaseSegment.startsWith(".telegram-video-downloader-");

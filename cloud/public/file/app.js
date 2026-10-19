@@ -4,6 +4,7 @@ import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetai
 import { HttpResponseError } from "./http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limit.js";
+import { MAX_MANUAL_TARGET_OPTIONS, searchPresentManualTargets } from "./manual-target-picker.js";
 import { submitLegacyFileImport } from "./legacy-file-import.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
 import { sourceIdUrl } from "./source-links.js";
@@ -18,7 +19,7 @@ const POLL_MS = 12_000;
 
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, selected: new Set(), quarantinedActionIds: new Set(), view: "library", query: "", detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, selected: new Set(), quarantinedActionIds: new Set(), view: "library", query: "", detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false };
 
 const byId = (id) => document.getElementById(id);
 const formatBytes = (value) => {
@@ -493,6 +494,8 @@ function renderLegacyMappings() {
   const container = byId("legacy-mappings");
   if (!operation) {
     container.classList.add("hidden");
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
     return;
   }
   const incompleteWarning = operationDetailsWarning(operation);
@@ -501,24 +504,34 @@ function renderLegacyMappings() {
     state.legacyOperationKey = null;
     container.classList.remove("hidden");
     container.innerHTML = `<p class="warning-text">${escapeHtml(incompleteWarning)}</p>`;
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
     return;
   }
   if (!Array.isArray(operation.result?.hints) || !Array.isArray(operation.result?.candidates)) {
     state.legacyOperation = null;
     container.classList.add("hidden");
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
     return;
   }
   const operationKey = String(operation.seq ?? operation.created_at ?? "legacy-import");
   if (state.legacyOperationKey !== operationKey) {
     state.legacyOperationKey = operationKey;
     state.legacySelection = new Map();
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
   }
   const hints = operation.result.hints;
   const candidates = filterPresentLegacyCandidates(operation.result.candidates, libraryItems());
   const warnings = Array.isArray(operation.result.warnings) ? operation.result.warnings : [];
   const matchedHintIndexes = new Set(candidates.map((candidate) => Number(candidate.hint_index)));
   const manualHints = hints.map((hint, hintIndex) => ({ hint, hintIndex })).filter(({ hintIndex }) => !matchedHintIndexes.has(hintIndex));
-  const manualItems = libraryItems().filter((item) => statusOf(item) === "present");
+  const manualKeys = new Set(manualHints.map(({ hintIndex }) => `${operationKey}:manual:${hintIndex}`));
+  if (state.manualPickerKey && !manualKeys.has(state.manualPickerKey)) {
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
+  }
   container.classList.remove("hidden");
   const candidateKeys = new Set();
   const candidateRows = candidates.map((candidate, index) => {
@@ -537,11 +550,38 @@ function renderLegacyMappings() {
     const sourceIds = Array.isArray(hint.source_ids) ? hint.source_ids : [];
     const collection = hint.collection && typeof hint.collection === "object" ? hint.collection.title : "";
     const selection = getOrCreateLegacySelection(state.legacySelection, manualKey, { selected: false, item_id: "", title: Boolean(hint.title), source_ids: sourceIds.length > 0, collection: Boolean(collection) });
-    const options = manualItems.map((item) => `<option value="${escapeHtml(item.id)}" ${String(item.id) === selection.item_id ? "selected" : ""}>${escapeHtml(item.title || item.relative_path || item.id)} · ${escapeHtml(item.relative_path || "Path unavailable")}</option>`).join("");
-    return `<div class="mapping-row manual-mapping"><div class="mapping-row-head"><input type="checkbox" aria-label="Apply this legacy hint after manually choosing a video" data-map-select="${escapeHtml(manualKey)}" data-manual="true" data-hint-index="${hintIndex}" ${selection.selected ? "checked" : ""}><div><div class="mapping-name">${escapeHtml(hint.title || "Legacy hint without a reliable match")}</div><div class="mapping-path">No reliable automatic match · choose a present video manually</div></div></div><label class="field-label manual-target-label" for="manual-target-${hintIndex}">Match this hint to a video</label><select id="manual-target-${hintIndex}" class="select-control manual-target" data-manual-target="${escapeHtml(manualKey)}"><option value="">Choose a video…</option>${options}</select><div class="mapping-fields"><label><input type="checkbox" data-map-field="title" data-map-key="${escapeHtml(manualKey)}" ${selection.title ? "checked" : ""} ${hint.title ? "" : "disabled"}> Title</label><label><input type="checkbox" data-map-field="source_ids" data-map-key="${escapeHtml(manualKey)}" ${selection.source_ids ? "checked" : ""} ${sourceIds.length ? "" : "disabled"}> ${sourceIds.length} source link${sourceIds.length === 1 ? "" : "s"}</label><label><input type="checkbox" data-map-field="collection" data-map-key="${escapeHtml(manualKey)}" ${selection.collection ? "checked" : ""} ${collection ? "" : "disabled"}> Collection</label></div><p class="mapping-help">This is a manual association. Review the selected path and the generated metadata preview before confirming.</p></div>`;
+    const pickerOpen = state.manualPickerKey === manualKey;
+    const picker = pickerOpen ? manualTargetPickerMarkup(manualKey, selection, hintIndex) : "";
+    const selectedTarget = selection.item_id ? `<p class="mapping-path">Selected video ID: ${escapeHtml(selection.item_id)}</p>` : "";
+    return `<div class="mapping-row manual-mapping"><div class="mapping-row-head"><input type="checkbox" aria-label="Apply this legacy hint after manually choosing a video" data-map-select="${escapeHtml(manualKey)}" data-manual="true" data-hint-index="${hintIndex}" ${selection.selected ? "checked" : ""}><div><div class="mapping-name">${escapeHtml(hint.title || "Legacy hint without a reliable match")}</div><div class="mapping-path">No reliable automatic match · choose a present video manually</div></div></div><button class="small-button" type="button" data-manual-picker-toggle="${escapeHtml(manualKey)}" aria-expanded="${pickerOpen}">${selection.item_id ? "Change selected video" : "Choose a video"}</button>${pickerOpen ? picker : selectedTarget}<div class="mapping-fields"><label><input type="checkbox" data-map-field="title" data-map-key="${escapeHtml(manualKey)}" ${selection.title ? "checked" : ""} ${hint.title ? "" : "disabled"}> Title</label><label><input type="checkbox" data-map-field="source_ids" data-map-key="${escapeHtml(manualKey)}" ${selection.source_ids ? "checked" : ""} ${sourceIds.length ? "" : "disabled"}> ${sourceIds.length} source link${sourceIds.length === 1 ? "" : "s"}</label><label><input type="checkbox" data-map-field="collection" data-map-key="${escapeHtml(manualKey)}" ${selection.collection ? "checked" : ""} ${collection ? "" : "disabled"}> Collection</label></div><p class="mapping-help">This is a manual association. Review the selected path and the generated metadata preview before confirming.</p></div>`;
   });
   container.innerHTML = `<p class="mapping-title">Choose a video for each legacy hint</p>${warnings.length ? `<p class="warning-text">${warnings.map(escapeHtml).join(" · ")}</p>` : ""}${candidateRows.length ? candidateRows.join("") : ""}${manualRows.length ? `<p class="mapping-title manual-heading">No reliable match</p>${manualRows.join("")}` : candidates.length ? "" : `<p class="field-hint">No hints or possible media matches were found.</p>`}<div class="mapping-actions"><button id="preview-metadata" class="primary-button" type="button" ${candidateRows.length || manualRows.length ? "" : "disabled"}>Preview selected updates <span aria-hidden="true">→</span></button></div>`;
   for (const key of state.legacySelection.keys()) if (!candidateKeys.has(key)) state.legacySelection.delete(key);
+}
+
+function manualTargetPickerContents(selection) {
+  const result = searchPresentManualTargets(libraryItems(), state.manualPickerQuery, selection.item_id);
+  const selectedId = String(selection.item_id ?? "");
+  const selectedPresent = selectedId && result.items.some((item) => String(item.id) === selectedId);
+  const options = result.items.map((item) => {
+    const id = String(item.id);
+    const title = item.title || item.relative_path || id;
+    return `<option value="${escapeHtml(id)}" ${id === selectedId ? "selected" : ""}>${escapeHtml(title)} · ${escapeHtml(item.relative_path || "Path unavailable")}</option>`;
+  }).join("");
+  const status = selection.item_id && !selectedPresent
+    ? "The previous video is no longer present. Choose a current video."
+    : result.hasMore
+      ? `Showing up to ${MAX_MANUAL_TARGET_OPTIONS} present matches. Refine the search to narrow the list.`
+      : `${result.items.length} present video${result.items.length === 1 ? "" : "s"} shown.`;
+  return {
+    options: `<option value="" ${selectedPresent ? "" : "selected"}>Choose a present video…</option>${options}`,
+    status,
+  };
+}
+
+function manualTargetPickerMarkup(key, selection, hintIndex) {
+  const contents = manualTargetPickerContents(selection);
+  return `<div class="manual-target-picker"><label class="field-label" for="manual-target-search-${hintIndex}">Search present videos</label><input id="manual-target-search-${hintIndex}" class="text-control" type="search" autocomplete="off" data-manual-picker-search="${escapeHtml(key)}" value="${escapeHtml(state.manualPickerQuery)}" placeholder="Title, path, or ID"><p class="field-hint" data-manual-picker-status="${escapeHtml(key)}">${escapeHtml(contents.status)}</p><select id="manual-target-${hintIndex}" class="select-control manual-target" data-manual-target="${escapeHtml(key)}">${contents.options}</select></div>`;
 }
 
 function renderOperations() {
@@ -750,6 +790,19 @@ function bindEvents() {
       window.setTimeout(() => { byId("legacy-size").textContent = `${new TextEncoder().encode(byId("legacy-text").value).byteLength.toLocaleString()} / 256 KB`; }, 0);
     }
   });
+  document.body.addEventListener("input", (event) => {
+    const search = event.target.closest("[data-manual-picker-search]");
+    if (!search) return;
+    state.manualPickerQuery = search.value;
+    const key = search.dataset.manualPickerSearch;
+    const selection = state.legacySelection.get(key) ?? { item_id: "" };
+    const contents = manualTargetPickerContents(selection);
+    const picker = search.closest(".manual-target-picker");
+    const target = picker?.querySelector("[data-manual-target]");
+    const status = picker?.querySelector("[data-manual-picker-status]");
+    if (target) target.innerHTML = contents.options;
+    if (status) status.textContent = contents.status;
+  });
   document.body.addEventListener("change", (event) => {
     const mapCheckbox = event.target.closest("[data-map-select]");
     const mapField = event.target.closest("[data-map-field]");
@@ -805,6 +858,15 @@ function bindEvents() {
     if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
   });
   document.body.addEventListener("click", (event) => {
+    const manualPickerToggle = event.target.closest("[data-manual-picker-toggle]");
+    if (manualPickerToggle) {
+      const key = manualPickerToggle.dataset.manualPickerToggle;
+      state.manualPickerKey = state.manualPickerKey === key ? null : key;
+      state.manualPickerQuery = "";
+      renderLegacyMappings();
+      if (state.manualPickerKey) byId("legacy-mappings").querySelector("[data-manual-picker-search]")?.focus();
+      return;
+    }
     const groupCheckbox = event.target.closest("[data-select-group]");
     if (groupCheckbox) { event.stopPropagation(); return; }
     const tab = event.target.closest("[data-view]");

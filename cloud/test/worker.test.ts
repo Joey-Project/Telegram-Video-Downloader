@@ -840,11 +840,18 @@ describe("Mini App identity and actions", () => {
     expect(afterAccepted?.count).toBe((before?.count ?? 0) + 6);
   });
 
-  it("rejects case-insensitive private directory aliases before enqueueing", async () => {
+  it("rejects case-insensitive and HFS-ignorable private directory aliases before enqueueing", async () => {
     const initData = await signInitData();
     const aliases = [
       ".TELEGRAM-VIDEO-DOWNLOADER-LIBRARY",
       "nested/.TeLeGrAm-ViDeO-DoWnLoAdEr-LiBrArY-cache",
+      ".telegram-video-down\u200cloader-library-cache",
+      "nested/.telegram-video-down\u200floader-staging",
+      ".telegram-video-down\u202aloader-state",
+      "nested/.telegram-video-down\u202eloader-private",
+      ".telegram-video-down\u206aloader-staging",
+      "nested/.telegram-video-down\u206floader-private",
+      ".telegram-video-down\ufeffloader-library",
       ".TELEGRAM-VIDEO-DOWNLOADER-STATE",
       "nested/.tElEgRaM-vIdEo-dOwNlOaDeR-staging",
     ];
@@ -855,7 +862,7 @@ describe("Mini App identity and actions", () => {
       const response = await ownerRequest("/api/actions", initData, {
         method: "POST",
         body: JSON.stringify({
-          request_id: `00000000-0000-4000-8000-00000000030${index + 1}`,
+          request_id: `00000000-0000-4000-8000-${String(3001 + index).padStart(12, "0")}`,
           kind: "file_preview",
           payload: { item_ids: ["item-a"], target_relative_dir: targetRelativeDir },
         }),
@@ -872,7 +879,7 @@ describe("Mini App identity and actions", () => {
       body: JSON.stringify({
         request_id: "00000000-0000-4000-8000-00000000030f",
         kind: "file_preview",
-        payload: { item_ids: ["item-a"], target_relative_dir: "Normal/Target" },
+        payload: { item_ids: ["item-a"], target_relative_dir: "Normal/With\u200cIgnorable" },
       }),
     });
     expect(accepted.status).toBe(202);
