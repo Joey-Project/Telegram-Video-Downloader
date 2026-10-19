@@ -7,6 +7,7 @@ trap 'rm -rf "${test_root}"' EXIT
 
 fake_bin="${test_root}/bin"
 fake_log="${test_root}/launchctl.log"
+helper_log="${test_root}/helper.log"
 fake_state="${test_root}/launchctl-state"
 test_home="${test_root}/home"
 label="io.github.telegram-local-downloader.migration-probe"
@@ -98,6 +99,14 @@ esac
 EOF
 chmod 700 "${fake_bin}/launchctl"
 
+cat > "${fake_bin}/python3" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > "${FAKE_HELPER_LOG}"
+exit "${FAKE_HELPER_EXIT:-0}"
+EOF
+chmod 700 "${fake_bin}/python3"
+
 state_file() {
   local target="$1"
   target="${target//\//_}"
@@ -119,11 +128,13 @@ run_agent() {
     FAKE_LAUNCHCTL_STATE="${fake_state}" \
     FAKE_LAUNCHCTL_LABEL="${label}" \
     FAKE_LAUNCHCTL_MODE="${FAKE_LAUNCHCTL_MODE:-normal}" \
+    FAKE_HELPER_LOG="${helper_log}" \
+    FAKE_HELPER_EXIT="${FAKE_HELPER_EXIT:-0}" \
     BOT_LABEL="${label}" \
     BOT_CONFIG="${test_root}/config.toml" \
     BOT_BINARY="${test_root}/stub" \
     BOT_LOG_DIR="${test_root}/logs" \
-    "${repo_dir}/scripts/launch_agent.sh" "$@"
+    bash "${repo_dir}/scripts/launch_agent.sh" "$@"
 }
 
 expect_log() {
@@ -144,13 +155,28 @@ empty_log() {
 reset_state "${legacy_service}"
 empty_log
 run_agent install --no-build
-expect_log "bootout ${legacy_service}"
-expect_log "bootstrap gui/$(id -u) ${test_home}/Library/LaunchAgents/${label}.plist"
-expect_log "print ${gui_service}"
-[[ -e "$(state_file "${gui_service}")" ]]
-[[ ! -e "$(state_file "${legacy_service}")" ]]
-if grep -Fq "LimitLoadToSessionType" "${test_home}/Library/LaunchAgents/${label}.plist"; then
-  printf '%s\n' "generated plist retained the invalid session-type restriction" >&2
+grep -Fqx -- "${repo_dir}/scripts/macos_service.py" "${helper_log}"
+grep -Fqx -- "install" "${helper_log}"
+grep -Fqx -- "--no-build" "${helper_log}"
+grep -Fqx -- "--legacy-domain" "${helper_log}"
+grep -Fqx -- "user/$(id -u)" "${helper_log}"
+[[ ! -s "${fake_log}" ]]
+[[ -e "$(state_file "${legacy_service}")" ]]
+
+run_agent deploy --binary "${test_root}/input artifact" --ready-timeout 321
+grep -Fqx -- "deploy" "${helper_log}"
+grep -Fqx -- "${test_root}/input artifact" "${helper_log}"
+grep -Fqx -- "321" "${helper_log}"
+[[ ! -s "${fake_log}" ]]
+
+run_agent rollback --backup "${test_root}/retained backup" --original-entrypoint
+grep -Fqx -- "rollback" "${helper_log}"
+grep -Fqx -- "${test_root}/retained backup" "${helper_log}"
+grep -Fqx -- "--original-entrypoint" "${helper_log}"
+[[ ! -s "${fake_log}" ]]
+
+if FAKE_HELPER_EXIT=37 run_agent install --no-build >/dev/null 2>&1; then
+  printf '%s\n' "install ignored a production helper failure" >&2
   exit 1
 fi
 
@@ -182,6 +208,8 @@ expect_no_log "print ${legacy_service}"
 
 reset_state "${gui_service}" "${legacy_service}"
 empty_log
+mkdir -p "${test_home}/Library/LaunchAgents"
+touch "${test_home}/Library/LaunchAgents/${label}.plist"
 run_agent uninstall
 expect_log "bootout ${gui_service}"
 expect_log "bootout ${legacy_service}"
@@ -195,45 +223,21 @@ fi
 reset_state
 empty_log
 BOT_DOMAIN="custom/123" run_agent install --no-build
-expect_log "bootstrap custom/123 ${test_home}/Library/LaunchAgents/${label}.plist"
-[[ -e "$(state_file "${custom_service}")" ]]
-if grep -Fq "${legacy_service}" "${fake_log}"; then
-  printf '%s\n' "explicit BOT_DOMAIN unexpectedly migrated the legacy domain" >&2
+grep -Fqx -- "custom/123" "${helper_log}"
+if grep -Fqx -- "--legacy-domain" "${helper_log}"; then
+  printf '%s\n' "explicit BOT_DOMAIN unexpectedly requested legacy-domain migration" >&2
   exit 1
 fi
+[[ ! -s "${fake_log}" ]]
 
 empty_log
+reset_state "${custom_service}"
 BOT_DOMAIN="custom/123" run_agent uninstall
 expect_log "bootout ${custom_service}"
 if grep -Fq "${legacy_service}" "${fake_log}"; then
   printf '%s\n' "explicit BOT_DOMAIN unexpectedly cleaned the legacy domain" >&2
   exit 1
 fi
-
-reset_state "${legacy_service}"
-empty_log
-if FAKE_LAUNCHCTL_MODE=legacy-query-fails run_agent install --no-build >/dev/null 2>&1; then
-  printf '%s\n' "install ignored a legacy service query failure" >&2
-  exit 1
-fi
-if grep -Fq "bootstrap gui/$(id -u)" "${fake_log}"; then
-  printf '%s\n' "install started a GUI service after legacy query failure" >&2
-  exit 1
-fi
-[[ -e "$(state_file "${legacy_service}")" ]]
-[[ ! -e "${test_home}/Library/LaunchAgents/${label}.plist" ]]
-
-reset_state "${legacy_service}"
-empty_log
-if FAKE_LAUNCHCTL_MODE=legacy-bootout-fails run_agent install --no-build >/dev/null 2>&1; then
-  printf '%s\n' "install ignored a legacy service cleanup failure" >&2
-  exit 1
-fi
-expect_log "bootstrap gui/$(id -u) ${test_home}/Library/LaunchAgents/${label}.plist"
-expect_log "bootout ${legacy_service}"
-expect_log "bootout ${gui_service}"
-[[ -e "$(state_file "${legacy_service}")" ]]
-[[ ! -e "$(state_file "${gui_service}")" ]]
 
 reset_state "${gui_service}" "${legacy_service}"
 empty_log
