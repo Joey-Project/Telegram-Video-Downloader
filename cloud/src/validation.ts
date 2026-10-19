@@ -14,6 +14,8 @@ export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
 export const MAX_LEGACY_TEXT_BYTES = 256 * 1024;
 export const MAX_SELECTED_ITEMS = 100;
 const MAX_COLLECTION_ORDER = 0xffff_ffff;
+const MAX_LEGACY_HINTS = 10_000;
+const MAX_LEGACY_HINT_INDEX = MAX_LEGACY_HINTS - 1;
 const MAX_TITLE_SCALAR_VALUES = 500;
 const MAX_TITLE_CODE_UNITS = MAX_TITLE_SCALAR_VALUES * 2;
 
@@ -134,6 +136,21 @@ function boundedString(
   return normalized;
 }
 
+function boundedUtf8String(value: unknown, field: string, maxBytes: number): string {
+  if (typeof value !== "string") throw new HttpError(400, `${field} must be a string`);
+  const normalized = value.trim();
+  if (hasUnpairedSurrogate(normalized)) {
+    throw new HttpError(400, `${field} contains an unpaired surrogate`);
+  }
+  if (normalized.length === 0 || new TextEncoder().encode(normalized).byteLength > maxBytes) {
+    throw new HttpError(400, `${field} is empty or too long`);
+  }
+  if (/[\u0000-\u001f\u007f]/u.test(normalized)) {
+    throw new HttpError(400, `${field} contains control characters`);
+  }
+  return normalized;
+}
+
 function hasUnpairedSurrogate(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const codeUnit = value.charCodeAt(index);
@@ -175,13 +192,13 @@ function parseCollection(value: unknown): CollectionMetadata {
     throw new HttpError(400, "metadata_patches.collection has an invalid shape");
   }
   const title = boundedTitle(value.title, "collection.title");
-  const kind = boundedString(value.kind, "collection.kind", 64);
+  const kind = boundedUtf8String(value.kind, "collection.kind", 64);
   const id = value.id === undefined || value.id === null
     ? null
-    : boundedString(value.id, "collection.id", 128);
+    : boundedUtf8String(value.id, "collection.id", 128);
   const partId = value.part_id === undefined || value.part_id === null
     ? null
-    : boundedString(value.part_id, "collection.part_id", 128);
+    : boundedUtf8String(value.part_id, "collection.part_id", 128);
   const order = value.order === undefined || value.order === null
     ? null
     : value.order;
@@ -203,8 +220,9 @@ function parseMetadataPatches(value: unknown): MetadataPatch[] {
     const itemId = boundedString(entry.item_id, `metadata_patches[${index}].item_id`, 128);
     const patch: MetadataPatch = { item_id: itemId };
     if (entry.hint_index !== undefined) {
-      if (!Number.isSafeInteger(entry.hint_index) || (entry.hint_index as number) < 0 || (entry.hint_index as number) > 999) {
-        throw new HttpError(400, `metadata_patches[${index}].hint_index must be an integer from 0 to 999`);
+      if (!Number.isSafeInteger(entry.hint_index) || (entry.hint_index as number) < 0 ||
+        (entry.hint_index as number) > MAX_LEGACY_HINT_INDEX) {
+        throw new HttpError(400, `metadata_patches[${index}].hint_index must be an integer from 0 to ${MAX_LEGACY_HINT_INDEX}`);
       }
       patch.hint_index = entry.hint_index as number;
     }

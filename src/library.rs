@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Maximum number of unique hints retained from a single legacy import.
+pub const MAX_LEGACY_HINTS: usize = 10_000;
+
 /// A rebuildable view of the media reachable under the configured download root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibrarySnapshot {

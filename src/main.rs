@@ -1431,21 +1431,9 @@ fn cloud_task_summaries(
     if config.telegram.allow_all_chats {
         return Ok(Vec::new());
     }
-    let mut records = Vec::<TaskRecord>::new();
-    for chat_id in &config.telegram.allowed_chat_ids {
-        const PAGE_SIZE: usize = 10;
-        const MAX_SUMMARY_TASKS: usize = 100;
-        for page in 0..MAX_SUMMARY_TASKS.div_ceil(PAGE_SIZE) {
-            let page_records = queue.list(*chat_id, false, page)?;
-            let is_last_page = page_records.len() < PAGE_SIZE;
-            records.extend(page_records);
-            if is_last_page {
-                break;
-            }
-        }
-    }
-    records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
-    records.truncate(100);
+    const MAX_SUMMARY_TASKS: usize = 100;
+    let records =
+        queue.active_records_for_chats(&config.telegram.allowed_chat_ids, MAX_SUMMARY_TASKS)?;
     records
         .into_iter()
         .map(|record| {
@@ -2064,11 +2052,21 @@ async fn dispatch_cloud_management(
                 Ok(parsed) => parsed,
                 Err(error) => return Ok(cloud_dispatch_failure(error)),
             };
-            let records = cloud_state_records(runtime).await?;
+            let legacy_imports = if parsed
+                .hint_indices
+                .iter()
+                .any(|(_, hint_index)| hint_index.is_some())
+            {
+                cloud_completed_legacy_import_records(runtime).await?
+            } else {
+                Vec::new()
+            };
             let preview = run_cloud_library_operation(
                 runtime,
                 "file preview worker failed",
-                move |context, inbox| create_cloud_file_preview(&context, parsed, &records, inbox),
+                move |context, inbox| {
+                    create_cloud_file_preview(&context, parsed, &legacy_imports, inbox)
+                },
             )
             .await?;
             let preview_id = preview.id.clone();
@@ -2351,10 +2349,11 @@ fn validate_file_preview_payload(
     payload: FilePreviewPayload,
 ) -> std::result::Result<PreparedFilePreview, String> {
     let patch_inputs = payload.metadata_patches;
-    if patch_inputs
-        .iter()
-        .any(|patch| patch.hint_index.is_some_and(|index| index > 999))
-    {
+    if patch_inputs.iter().any(|patch| {
+        patch
+            .hint_index
+            .is_some_and(|index| index >= crate::library::MAX_LEGACY_HINTS)
+    }) {
         return Err("A metadata hint index is outside the allowed range.".to_string());
     }
     let patches = patch_inputs
@@ -2485,7 +2484,7 @@ struct PreparedFilePreview {
 fn create_cloud_file_preview(
     bot: &BotContext,
     prepared: PreparedFilePreview,
-    records: &[InboxRecord],
+    legacy_imports: &[InboxRecord],
     inbox: Arc<CloudInbox>,
 ) -> Result<(MovePreview, LibrarySnapshot)> {
     let manager = open_cloud_library_manager(bot, inbox, None)?;
@@ -2506,7 +2505,7 @@ fn create_cloud_file_preview(
         |snapshot| {
             validate_legacy_metadata_patches(
                 snapshot,
-                records,
+                legacy_imports,
                 &prepared.patches,
                 &prepared.hint_indices,
             )
@@ -2601,11 +2600,13 @@ fn metadata_patch_matches_legacy_hint(patch: &MetadataPatch, hint: &SourceHint) 
     title_matches && source_ids_match && collection_matches
 }
 
-async fn cloud_state_records(runtime: &CloudBotRuntime) -> Result<Vec<InboxRecord>> {
+async fn cloud_completed_legacy_import_records(
+    runtime: &CloudBotRuntime,
+) -> Result<Vec<InboxRecord>> {
     let inbox = Arc::clone(&runtime.inbox);
-    tokio::task::spawn_blocking(move || inbox.state_records())
+    tokio::task::spawn_blocking(move || inbox.completed_legacy_import_records_bounded())
         .await
-        .context("cloud inbox state listing worker failed")?
+        .context("cloud inbox completed legacy import listing worker failed")?
 }
 
 async fn cloud_state_records_bounded(
@@ -12419,6 +12420,14 @@ mod tests {
             "the summary should include tasks beyond the first ten-item queue page"
         );
 
+        config.telegram.allow_all_chats = true;
+        assert!(
+            cloud_task_summaries(&config, &queue)
+                .expect("allow-all mode should not expose chat summaries")
+                .is_empty(),
+            "allow-all chat mode must keep queue summaries private"
+        );
+
         drop(queue);
         let _ = fs::remove_dir_all(root);
     }
@@ -12452,6 +12461,36 @@ mod tests {
                 .is_err_and(|error| error.contains("field outside its allowed size")),
             "65 source IDs should be rejected at the preview boundary"
         );
+    }
+
+    #[test]
+    fn cloud_file_preview_hint_indexes_match_the_legacy_hint_limit() {
+        let payload_for = |hint_index: usize| {
+            serde_json::json!({
+                "metadata_patches": [{
+                    "item_id": "library-item-1",
+                    "title": "Imported title",
+                    "hint_index": hint_index,
+                }]
+            })
+        };
+
+        for hint_index in [1_000, crate::library::MAX_LEGACY_HINTS - 1] {
+            let payload = serde_json::from_value::<FilePreviewPayload>(payload_for(hint_index))
+                .expect("in-range hint index payload should deserialize");
+            let prepared = validate_file_preview_payload(payload)
+                .expect("every globally bounded legacy hint index should be accepted");
+            assert_eq!(prepared.hint_indices[0].1, Some(hint_index));
+        }
+
+        let payload = serde_json::from_value::<FilePreviewPayload>(payload_for(
+            crate::library::MAX_LEGACY_HINTS,
+        ))
+        .expect("first out-of-range hint index payload should deserialize");
+        let error = validate_file_preview_payload(payload)
+            .err()
+            .expect("the first index outside the imported hint cap must be rejected");
+        assert!(error.contains("hint index is outside the allowed range"));
     }
 
     #[test]

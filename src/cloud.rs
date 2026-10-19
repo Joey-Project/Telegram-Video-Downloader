@@ -40,6 +40,7 @@ pub(crate) const MAX_CLOUD_STATE_VERSION: u64 = MAX_JS_SAFE_INTEGER;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_LEGACY_IMPORT_BYTES: usize = 256 * 1024;
 const MAX_MANAGEMENT_STATE_RECORDS: usize = 100;
+const MAX_COMPLETED_LEGACY_IMPORT_RECORDS: usize = 100;
 pub(crate) const CLOUD_REQUEST_PAGE_SIZE: usize = 100;
 // Keep terminal local receipts through the same replay window as D1 ACK tombstones.
 const CLOUD_INBOX_TERMINAL_REPLAY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -392,6 +393,7 @@ pub struct InboxRecord {
 #[derive(Default)]
 struct InboxStateIndex {
     recent_management: BTreeSet<u64>,
+    completed_legacy_imports: BTreeSet<u64>,
     awaiting_previews: BTreeSet<u64>,
     awaiting_preview_sequences: BTreeMap<String, BTreeSet<u64>>,
     awaiting_preview_id_by_sequence: BTreeMap<u64, String>,
@@ -402,12 +404,21 @@ struct InboxStateIndex {
 
 impl InboxStateIndex {
     fn record(&mut self, record: &InboxRecord) {
+        self.completed_legacy_imports.remove(&record.request.seq);
         self.unindex_preview_associations(record.request.seq);
         if record.request.kind != "telegram" {
             self.recent_management.insert(record.request.seq);
             while self.recent_management.len() > MAX_MANAGEMENT_STATE_RECORDS {
                 if let Some(oldest) = self.recent_management.first().copied() {
                     self.recent_management.remove(&oldest);
+                }
+            }
+        }
+        if record.request.kind == "legacy_import" && record.status == InboxStatus::Completed {
+            self.completed_legacy_imports.insert(record.request.seq);
+            while self.completed_legacy_imports.len() > MAX_COMPLETED_LEGACY_IMPORT_RECORDS {
+                if let Some(oldest) = self.completed_legacy_imports.first().copied() {
+                    self.completed_legacy_imports.remove(&oldest);
                 }
             }
         }
@@ -456,6 +467,7 @@ impl InboxStateIndex {
 
     fn forget(&mut self, seq: u64) {
         self.recent_management.remove(&seq);
+        self.completed_legacy_imports.remove(&seq);
         self.awaiting_previews.remove(&seq);
         self.unindex_preview_associations(seq);
     }
@@ -811,13 +823,6 @@ impl CloudInbox {
             .collect()
     }
 
-    /// Return the recent management history and every preview still awaiting confirmation.
-    /// The index stores sequence numbers only; each selected durable record is revalidated/read.
-    pub fn state_records(&self) -> Result<Vec<InboxRecord>> {
-        self.state_records_bounded(usize::MAX)
-            .map(|(records, _)| records)
-    }
-
     /// Return recent management history and the newest bounded set of active previews.
     /// The omitted count comes from the index, so older preview records are not read merely to
     /// count them for a cloud snapshot.
@@ -853,6 +858,45 @@ impl CloudInbox {
             records.push(record);
         }
         Ok((records, omitted_previews))
+    }
+
+    /// Return the newest completed legacy-import receipts needed to validate visible mappings,
+    /// ordered by sequence from oldest to newest. This private index is separate from the
+    /// management history published to the UI.
+    pub fn completed_legacy_import_records_bounded(&self) -> Result<Vec<InboxRecord>> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        if !self.recover_interrupted_requests()? {
+            bail!("cloud inbox startup recovery is still in progress");
+        }
+        let sequences = self
+            .state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
+            .completed_legacy_imports
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+
+        let mut records = Vec::with_capacity(sequences.len());
+        for seq in sequences {
+            let record = self
+                .read_record_path(&self.record_path(seq))?
+                .ok_or_else(|| anyhow!("indexed completed legacy import {seq} is missing"))?;
+            if record.request.seq != seq
+                || record.request.kind != "legacy_import"
+                || record.status != InboxStatus::Completed
+            {
+                bail!("indexed completed legacy import {seq} changed before it was read");
+            }
+            if self.inbox_record_retention_expired(&record)? {
+                continue;
+            }
+            records.push(record);
+        }
+        Ok(records)
     }
 
     pub fn record(&self, seq: u64) -> Result<Option<InboxRecord>> {
@@ -2044,6 +2088,41 @@ mod tests {
             created_at: 100,
             extra: serde_json::Map::new(),
         }
+    }
+
+    fn legacy_import_request(seq: u64, text: &str) -> CloudRequest {
+        CloudRequest {
+            seq,
+            kind: "legacy_import".to_string(),
+            payload: json!({"text": text}),
+            created_at: 100,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn legacy_import_record(seq: u64, status: InboxStatus, updated_at: u64) -> InboxRecord {
+        InboxRecord {
+            schema_version: INBOX_RECORD_VERSION,
+            request: legacy_import_request(seq, "legacy mappings"),
+            status,
+            attempts: 1,
+            updated_at,
+            next_attempt_at: 0,
+            error: None,
+            result: Some(json!({"hints": [], "candidates": []})),
+        }
+    }
+
+    fn finish_initial_recovery(inbox: &CloudInbox) {
+        for _ in 0..16 {
+            if inbox
+                .recover_interrupted_requests()
+                .expect("bounded startup recovery should progress")
+            {
+                return;
+            }
+        }
+        panic!("bounded startup recovery should complete within the test fixture");
     }
 
     fn preview_inbox_record(seq: u64, preview_id: &str, updated_at: u64) -> InboxRecord {
@@ -3320,6 +3399,190 @@ mod tests {
         assert_eq!(omitted_previews, 0);
         assert_eq!(sequences.len(), MAX_MANAGEMENT_STATE_RECORDS);
         assert!(!sequences.contains(&1));
+    }
+
+    #[test]
+    fn completed_legacy_import_index_is_bounded_and_tracks_status() {
+        let mut index = InboxStateIndex::default();
+        let newest_seq = MAX_COMPLETED_LEGACY_IMPORT_RECORDS as u64 + 1;
+        for seq in 1..=newest_seq {
+            index.record(&legacy_import_record(
+                seq,
+                InboxStatus::Completed,
+                now_seconds(),
+            ));
+        }
+        assert_eq!(
+            index.completed_legacy_imports.len(),
+            MAX_COMPLETED_LEGACY_IMPORT_RECORDS
+        );
+        assert!(!index.completed_legacy_imports.contains(&1));
+        assert!(index.completed_legacy_imports.contains(&newest_seq));
+
+        index.record(&legacy_import_record(
+            newest_seq,
+            InboxStatus::Failed,
+            now_seconds(),
+        ));
+        assert!(!index.completed_legacy_imports.contains(&newest_seq));
+        assert_eq!(index.completed_legacy_imports.len(), 99);
+
+        let pending_seq = newest_seq + 1;
+        index.record(&legacy_import_record(
+            pending_seq,
+            InboxStatus::Pending,
+            now_seconds(),
+        ));
+        assert!(!index.completed_legacy_imports.contains(&pending_seq));
+        index.forget(2);
+        assert!(!index.completed_legacy_imports.contains(&2));
+    }
+
+    #[test]
+    fn completed_legacy_import_survives_management_eviction_and_reopen() {
+        let root = temp_root("legacy-import-index-management-eviction");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let result = json!({
+            "hints": [{"title": "Episode 1", "requires_confirmation": true}],
+            "candidates": [{"hint_index": 0, "item_id": "media-1"}]
+        });
+        inbox
+            .persist(legacy_import_request(
+                1,
+                "Episode 1 https://youtu.be/PHH1wTDF-1M",
+            ))
+            .expect("legacy import should persist as pending");
+        assert!(
+            inbox
+                .completed_legacy_import_records_bounded()
+                .expect("pending imports should be ignored")
+                .is_empty(),
+            "only completed imports may authorize visible mappings"
+        );
+        inbox
+            .persist_dispatch_result(1, InboxStatus::Completed, Some(result.clone()), None)
+            .expect("legacy import result should persist");
+
+        for seq in 2..=100 {
+            let mut management = request(seq, "scan");
+            management.kind = "library_scan".to_string();
+            management.payload = json!({});
+            inbox
+                .persist(management)
+                .expect("management receipt should persist");
+        }
+        let (before_preview, _) = inbox
+            .state_records_bounded(0)
+            .expect("the current management window should be readable");
+        assert!(
+            before_preview.iter().any(|record| record.request.seq == 1),
+            "the source import should be visible as the oldest of 100 management receipts"
+        );
+
+        let mut preview = request(101, "preview");
+        preview.kind = "file_preview".to_string();
+        preview.payload = json!({"preview_id": "preview-101"});
+        inbox.persist(preview).expect("new preview should persist");
+        let (after_preview, _) = inbox
+            .state_records_bounded(0)
+            .expect("the updated management window should be readable");
+        assert_eq!(after_preview.len(), MAX_MANAGEMENT_STATE_RECORDS);
+        assert!(
+            !after_preview.iter().any(|record| record.request.seq == 1),
+            "the UI management history should remain capped at its newest 100 receipts"
+        );
+        let retained = inbox
+            .completed_legacy_import_records_bounded()
+            .expect("the separate import index should retain the visible mapping source");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].request.seq, 1);
+        assert_eq!(retained[0].result, Some(result.clone()));
+
+        drop(inbox);
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        finish_initial_recovery(&reopened);
+        let retained_after_reopen = reopened
+            .completed_legacy_import_records_bounded()
+            .expect("recovery should rebuild the completed-import index");
+        assert_eq!(retained_after_reopen.len(), 1);
+        assert_eq!(retained_after_reopen[0].request.seq, 1);
+        assert_eq!(retained_after_reopen[0].result, Some(result));
+        reopened
+            .persist_dispatch_result(
+                1,
+                InboxStatus::Failed,
+                Some(json!({"error": "fixture failure"})),
+                Some("fixture failure".to_string()),
+            )
+            .expect("failed import status should persist");
+        assert!(
+            reopened
+                .completed_legacy_import_records_bounded()
+                .expect("updated import index should be readable")
+                .is_empty(),
+            "an import that becomes failed must leave the completed-source index"
+        );
+        let (reopened_management, _) = reopened
+            .state_records_bounded(0)
+            .expect("reopened management history should remain bounded");
+        assert_eq!(reopened_management.len(), MAX_MANAGEMENT_STATE_RECORDS);
+        assert!(
+            !reopened_management
+                .iter()
+                .any(|record| record.request.seq == 1),
+            "the private source index must not expand the UI management history"
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_completed_legacy_import_is_not_returned_and_is_pruned() {
+        let root = temp_root("legacy-import-index-expiry");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        inbox
+            .persist(legacy_import_request(1, "legacy mappings"))
+            .expect("legacy import should persist");
+        inbox
+            .persist_dispatch_result(
+                1,
+                InboxStatus::Completed,
+                Some(json!({"hints": [], "candidates": []})),
+                None,
+            )
+            .expect("legacy import should complete");
+
+        let mut expired = inbox
+            .record(1)
+            .expect("legacy receipt should be readable")
+            .expect("legacy receipt should exist");
+        expired.updated_at =
+            now_seconds().saturating_sub(CLOUD_INBOX_TERMINAL_REPLAY_RETENTION.as_secs());
+        inbox
+            .write_record_path(&inbox.record_path(1), &expired)
+            .expect("expired receipt fixture should retain its original age");
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        finish_initial_recovery(&reopened);
+        assert!(
+            reopened
+                .completed_legacy_import_records_bounded()
+                .expect("expiry checks should succeed")
+                .is_empty(),
+            "completed import sources must use the existing seven-day retention"
+        );
+        assert!(
+            reopened
+                .record(1)
+                .expect("expired record lookup should succeed")
+                .is_none(),
+            "the ordinary bounded terminal cleanup should prune the expired source"
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

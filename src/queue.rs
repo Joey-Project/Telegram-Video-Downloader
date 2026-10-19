@@ -793,6 +793,77 @@ impl QueueManager {
             .collect())
     }
 
+    /// Return one stable bounded snapshot of active tasks for explicitly allowed chats.
+    /// The operation lock covers both queue stores and selection so task updates cannot reorder
+    /// records between offset pages. Equal timestamps retain the old per-chat list order.
+    pub fn active_records_for_chats(
+        &self,
+        chat_ids: &[i64],
+        max_records: usize,
+    ) -> Result<Vec<TaskRecord>> {
+        self.active_records_for_chats_with_snapshot_hook(chat_ids, max_records, || {})
+    }
+
+    #[cfg(test)]
+    fn active_records_for_chats_with_test_hook<F>(
+        &self,
+        chat_ids: &[i64],
+        max_records: usize,
+        after_snapshot: F,
+    ) -> Result<Vec<TaskRecord>>
+    where
+        F: FnOnce(),
+    {
+        self.active_records_for_chats_with_snapshot_hook(chat_ids, max_records, after_snapshot)
+    }
+
+    fn active_records_for_chats_with_snapshot_hook<F>(
+        &self,
+        chat_ids: &[i64],
+        max_records: usize,
+        after_snapshot: F,
+    ) -> Result<Vec<TaskRecord>>
+    where
+        F: FnOnce(),
+    {
+        if chat_ids.is_empty() || max_records == 0 {
+            return Ok(Vec::new());
+        }
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let mut records = self.video.list_records()?;
+        if !self.video.shares_root(&self.pdf) {
+            records.extend(self.pdf.list_records()?);
+        }
+        after_snapshot();
+
+        // Match the previous per-chat page concatenation order for stable timestamp ties, while
+        // avoiding duplicate publication if a configured chat ID appears more than once.
+        let mut chat_order = HashMap::with_capacity(chat_ids.len());
+        for (index, chat_id) in chat_ids.iter().enumerate() {
+            chat_order.entry(*chat_id).or_insert(index);
+        }
+        let mut selected = records
+            .into_iter()
+            .enumerate()
+            .filter_map(|(record_order, record)| {
+                if record.status.is_history() {
+                    return None;
+                }
+                let configured_chat_order = *chat_order.get(&record.chat_id)?;
+                Some((configured_chat_order, record_order, record))
+            })
+            .collect::<Vec<_>>();
+        selected.sort_by_key(|(configured_chat_order, record_order, record)| {
+            (
+                std::cmp::Reverse(record.updated_at),
+                *configured_chat_order,
+                *record_order,
+            )
+        });
+        selected.truncate(max_records);
+        Ok(selected.into_iter().map(|(_, _, record)| record).collect())
+    }
+
     /// Return legacy completed records and tasks with verified per-entry output receipts.
     ///
     /// This is used to seed the media library's source hints. It intentionally does not filter
@@ -3817,6 +3888,7 @@ fn poisoned_lock<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
 mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::mpsc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::file_provider::MockQueueFileProvider;
@@ -8641,6 +8713,136 @@ mod tests {
                 .is_err(),
             "ordinary queue progress must not request a library publication scan"
         );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn active_chat_snapshot_sorts_once_across_allowed_chats_and_filters_history() {
+        let directory = temp_queue_root("active-chat-snapshot-order");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let make_task = |id: &str, chat_id: i64, status: TaskStatus, updated_at| {
+            let mut task = TaskRecord::new(
+                id.to_string(),
+                1,
+                2,
+                chat_id,
+                Some(3),
+                0,
+                JobRequest::Youtube {
+                    url: format!("https://example.invalid/{id}"),
+                },
+            );
+            task.status = status;
+            task.updated_at = updated_at;
+            task
+        };
+
+        for task in [
+            make_task("a-video", 10, TaskStatus::Received, 100),
+            make_task("b-video", 20, TaskStatus::Failed, 100),
+            make_task("c-video", 10, TaskStatus::Completed, 200),
+            make_task("d-video", 30, TaskStatus::Running, 300),
+            make_task("e-video", 10, TaskStatus::AwaitingConfirmation, 100),
+        ] {
+            assert!(queue.create(task).expect("fixture task should persist"));
+        }
+
+        let records = queue
+            .active_records_for_chats(&[20, 10, 20], 100)
+            .expect("allowed-chat snapshot should load");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b-video", "a-video", "e-video"],
+            "global timestamp ordering should keep configured-chat stable ties without duplicates"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.chat_id == 10 || record.chat_id == 20)
+        );
+        assert!(records.iter().all(|record| !record.status.is_history()));
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn active_chat_snapshot_keeps_updates_out_until_selection_finishes() {
+        let directory = temp_queue_root("active-chat-snapshot-lock");
+        let config = test_video_config(&directory);
+        let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+        let task_id = "active-chat-snapshot-lock-task";
+        assert!(
+            queue
+                .create(test_task(
+                    task_id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=abcdefghijk".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+
+        let (snapshot_entered_tx, snapshot_entered_rx) = mpsc::sync_channel(0);
+        let (release_snapshot_tx, release_snapshot_rx) = mpsc::sync_channel(0);
+        let snapshot_queue = Arc::clone(&queue);
+        let snapshot = std::thread::spawn(move || {
+            snapshot_queue.active_records_for_chats_with_test_hook(&[123_456_789], 100, || {
+                snapshot_entered_tx
+                    .send(())
+                    .expect("test should observe the held queue snapshot");
+                release_snapshot_rx
+                    .recv()
+                    .expect("test should release the queue snapshot");
+            })
+        });
+
+        let snapshot_reached_selection = snapshot_entered_rx.recv().is_ok();
+        let (writer_lock_state_tx, writer_lock_state_rx) = mpsc::sync_channel(0);
+        let writer_queue = Arc::clone(&queue);
+        let writer = std::thread::spawn(move || {
+            let selection_holds_lock = match writer_queue.operation_lock.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    false
+                }
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(_)) => false,
+            };
+            let _ = writer_lock_state_tx.send(selection_holds_lock);
+            writer_queue.set_status(task_id, TaskStatus::Queued, None)
+        });
+        let update_was_blocked = writer_lock_state_rx.recv().unwrap_or(false);
+
+        // Always release and join both workers before asserting, so a failed lock assertion
+        // cannot strand a thread at the deterministic barrier.
+        let _ = release_snapshot_tx.send(());
+        let snapshot_result = snapshot.join();
+        let writer_result = writer.join();
+
+        assert!(
+            snapshot_reached_selection,
+            "snapshot should reach selection"
+        );
+        assert!(
+            update_was_blocked,
+            "the queue update must wait while the same snapshot lock is held"
+        );
+        let captured = snapshot_result
+            .expect("snapshot worker should join")
+            .expect("active task snapshot should succeed");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].status, TaskStatus::Received);
+        let updated = writer_result
+            .expect("queue update worker should join")
+            .expect("queue update should succeed after selection releases the lock");
+        assert_eq!(updated.status, TaskStatus::Queued);
 
         drop(queue);
         let _ = fs::remove_dir_all(directory);

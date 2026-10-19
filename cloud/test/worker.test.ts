@@ -487,7 +487,7 @@ describe("Mini App identity and actions", () => {
     const initData = await signInitData();
     const base = { request_id: "00000000-0000-4000-8000-000000000002", kind: "file_preview", payload: {} };
     const unsafe = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, payload: { item_ids: ["item-a"], target_relative_dir: "../private" } }) });
-    const invalidPatch = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, payload: { metadata_patches: [{ item_id: "item-a", hint_index: 1000, source_ids: ["source-a"] }] } }) });
+    const invalidPatch = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, payload: { metadata_patches: [{ item_id: "item-a", hint_index: 10000, source_ids: ["source-a"] }] } }) });
     const maxItems = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, request_id: "00000000-0000-4000-8000-000000000022", payload: { item_ids: Array.from({ length: MAX_SELECTED_ITEMS }, (_, index) => `item-${index}`), target_relative_dir: "" } }) });
     const maxPatches = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, request_id: "00000000-0000-4000-8000-000000000023", payload: { metadata_patches: Array.from({ length: MAX_SELECTED_ITEMS }, (_, index) => ({ item_id: `item-${index}`, title: "Selected" })) } }) });
     const tooManyItems = await ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify({ ...base, request_id: "00000000-0000-4000-8000-000000000020", payload: { item_ids: Array.from({ length: MAX_SELECTED_ITEMS + 1 }, (_, index) => `item-${index}`) } }) });
@@ -573,6 +573,133 @@ describe("Mini App identity and actions", () => {
 
     const after = await responseJson<{ requests: unknown[] }>(await localRequests());
     expect(after.requests).toHaveLength(before.requests.length + 2);
+  });
+
+  it("validates collection identifiers against the UTF-8 byte limit before enqueueing", async () => {
+    const initData = await signInitData();
+    const cjk128Bytes = `${"界".repeat(42)}ab`;
+    const cjk129Bytes = `${"界".repeat(42)}abc`;
+    const emoji128Bytes = "😀".repeat(32);
+    const emoji132Bytes = "😀".repeat(33);
+    const values = [
+      { label: "ASCII 128 bytes", value: "a".repeat(128), expectedStatus: 202 },
+      { label: "ASCII 129 bytes", value: "a".repeat(129), expectedStatus: 400 },
+      { label: "CJK 128 bytes", value: cjk128Bytes, expectedStatus: 202 },
+      { label: "CJK 129 bytes", value: cjk129Bytes, expectedStatus: 400 },
+      { label: "emoji 128 bytes", value: emoji128Bytes, expectedStatus: 202 },
+      { label: "emoji 132 bytes", value: emoji132Bytes, expectedStatus: 400 },
+      { label: "unpaired surrogate", value: "\uD800", expectedStatus: 400 },
+    ];
+    expect(textEncoder.encode(cjk128Bytes).byteLength).toBe(128);
+    expect(textEncoder.encode(cjk129Bytes).byteLength).toBe(129);
+    expect(textEncoder.encode(emoji128Bytes).byteLength).toBe(128);
+    expect(textEncoder.encode(emoji132Bytes).byteLength).toBe(132);
+    const identifierCases = (["id", "part_id"] as const).flatMap((field, fieldIndex) =>
+      values.map((valueCase, valueIndex) => ({
+        field,
+        ...valueCase,
+        requestId: `00000000-0000-4000-8000-${String(700 + fieldIndex * values.length + valueIndex).padStart(12, "0")}`,
+      })));
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+
+    for (const identifierCase of identifierCases) {
+      const collection: Record<string, unknown> = {
+        id: null,
+        title: "Series",
+        kind: "series",
+        order: null,
+        part_id: null,
+      };
+      collection[identifierCase.field] = identifierCase.value;
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: identifierCase.requestId,
+          kind: "file_preview",
+          payload: {
+            metadata_patches: [{
+              item_id: "item-a",
+              collection,
+            }],
+          },
+        }),
+      });
+      expect(response.status, `${identifierCase.field}: ${identifierCase.label}`).toBe(identifierCase.expectedStatus);
+    }
+
+    const after = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(after?.count).toBe((before?.count ?? 0) + 6);
+  });
+
+  it("validates collection kinds against the UTF-8 byte limit before enqueueing", async () => {
+    const initData = await signInitData();
+    const cjk64Bytes = `${"界".repeat(21)}a`;
+    const cjk65Bytes = `${"界".repeat(21)}ab`;
+    const emoji64Bytes = "😀".repeat(16);
+    const emoji68Bytes = "😀".repeat(17);
+    const kindCases = [
+      { label: "ASCII 64 bytes", value: "a".repeat(64), expectedStatus: 202 },
+      { label: "ASCII 65 bytes", value: "a".repeat(65), expectedStatus: 400 },
+      { label: "CJK 64 bytes", value: cjk64Bytes, expectedStatus: 202 },
+      { label: "CJK 65 bytes", value: cjk65Bytes, expectedStatus: 400 },
+      { label: "emoji 64 bytes", value: emoji64Bytes, expectedStatus: 202 },
+      { label: "emoji 68 bytes", value: emoji68Bytes, expectedStatus: 400 },
+      { label: "unpaired surrogate", value: "\uD800", expectedStatus: 400 },
+    ];
+    expect(textEncoder.encode(cjk64Bytes).byteLength).toBe(64);
+    expect(textEncoder.encode(cjk65Bytes).byteLength).toBe(65);
+    expect(textEncoder.encode(emoji64Bytes).byteLength).toBe(64);
+    expect(textEncoder.encode(emoji68Bytes).byteLength).toBe(68);
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+
+    for (const [index, kindCase] of kindCases.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: `00000000-0000-4000-8000-${String(800 + index).padStart(12, "0")}`,
+          kind: "file_preview",
+          payload: {
+            metadata_patches: [{
+              item_id: "item-a",
+              collection: { id: null, title: "Series", kind: kindCase.value, order: null, part_id: null },
+            }],
+          },
+        }),
+      });
+      expect(response.status, kindCase.label).toBe(kindCase.expectedStatus);
+    }
+
+    const after = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(after?.count).toBe((before?.count ?? 0) + 3);
+  });
+
+  it("accepts only hint indices in the bounded legacy hint range before enqueueing", async () => {
+    const initData = await signInitData();
+    const hintCases: Array<{ requestId: string; hintIndex: number; expectedStatus: number }> = [
+      { requestId: "00000000-0000-4000-8000-000000000601", hintIndex: 0, expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000602", hintIndex: 999, expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000603", hintIndex: 1000, expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000604", hintIndex: 9999, expectedStatus: 202 },
+      { requestId: "00000000-0000-4000-8000-000000000605", hintIndex: 10000, expectedStatus: 400 },
+    ];
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+
+    for (const hintCase of hintCases) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: hintCase.requestId,
+          kind: "file_preview",
+          payload: {
+            metadata_patches: [{ item_id: "item-a", hint_index: hintCase.hintIndex, source_ids: ["source-a"] }],
+          },
+        }),
+      });
+      expect(response.status, hintCase.requestId).toBe(hintCase.expectedStatus);
+    }
+
+    const after = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(after?.count).toBe((before?.count ?? 0) + 4);
   });
 
   it("validates metadata titles by Unicode scalar count before enqueueing", async () => {

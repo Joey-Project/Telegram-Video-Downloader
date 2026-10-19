@@ -18,7 +18,8 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::library::{
-    Confidence, IntegrityStatus, LibraryItem, LibrarySnapshot, MetadataStatus, Presence,
+    Confidence, HintOrigin, IntegrityStatus, LegacyCandidate, LibraryItem, LibrarySnapshot,
+    MetadataStatus, Presence, SourceHint,
 };
 
 use super::*;
@@ -2474,6 +2475,206 @@ async fn missing_related_preview_does_not_retry_a_durable_primary_outcome() {
         no_telegram_calls,
         "outcome persistence must not repeat Telegram side effects"
     );
+}
+
+#[tokio::test]
+async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reopen() {
+    const LEGACY_IMPORT_SEQ: u64 = 1;
+    const PREVIEW_SEQ: u64 = 101;
+    const SELECTED_HINT_INDEX: usize = 1_000;
+
+    let root = temp_cloud_bot_dir("legacy-mapping-management-eviction");
+    let (telegram, mut telegram_requests, telegram_shutdown, telegram_server) =
+        spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    fs::write(
+        config.downloads.video_dir.join("clip.mp4"),
+        b"fixture-video",
+    )
+    .expect("library media fixture should write");
+
+    let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let library =
+        LibraryManager::open(&config.downloads.video_dir).expect("library manager should open");
+    let snapshot = library
+        .scan(&[])
+        .expect("library scan should find the media fixture");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4")
+        .expect("fixture media should appear in the library")
+        .id
+        .clone();
+    drop(library);
+
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let mut hints = (0..=SELECTED_HINT_INDEX)
+        .map(|index| SourceHint {
+            source_ids: Vec::new(),
+            title: Some(format!("unselected hint {index}")),
+            relative_path: None,
+            collection: None,
+            origin: HintOrigin::LegacyText,
+            requires_confirmation: false,
+        })
+        .collect::<Vec<_>>();
+    hints[SELECTED_HINT_INDEX] = SourceHint {
+        source_ids: vec!["BV1xx411c7mD".to_string()],
+        title: Some("Imported title".to_string()),
+        relative_path: None,
+        collection: None,
+        origin: HintOrigin::LegacyText,
+        requires_confirmation: true,
+    };
+    let candidate = LegacyCandidate {
+        hint_index: SELECTED_HINT_INDEX,
+        item_id: item_id.clone(),
+        title: "clip".to_string(),
+        relative_path: "clip.mp4".to_string(),
+        match_kind: "source_id".to_string(),
+        ambiguous: false,
+        requires_confirmation: true,
+    };
+    inbox
+        .persist(CloudRequest {
+            seq: LEGACY_IMPORT_SEQ,
+            kind: "legacy_import".to_string(),
+            payload: serde_json::json!({"text":"Imported title https://www.bilibili.com/video/BV1xx411c7mD"}),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("legacy source receipt should persist");
+    inbox
+        .update(LEGACY_IMPORT_SEQ, |record| {
+            record.status = InboxStatus::Completed;
+            record.result = Some(serde_json::json!({
+                "hints": hints,
+                "candidates": [candidate],
+            }));
+        })
+        .expect("legacy source receipt should complete");
+
+    for seq in 2..=100_u64 {
+        inbox
+            .persist(CloudRequest {
+                seq,
+                kind: "library_scan".to_string(),
+                payload: serde_json::json!({}),
+                created_at: now_millis(),
+                extra: serde_json::Map::new(),
+            })
+            .expect("management receipt should persist");
+        inbox
+            .update(seq, |record| record.status = InboxStatus::Completed)
+            .expect("management receipt should complete");
+    }
+    let (before_preview, _) = inbox
+        .state_records_bounded(0)
+        .expect("management state should remain readable");
+    assert_eq!(before_preview.len(), 100);
+    assert!(
+        before_preview
+            .iter()
+            .any(|record| record.request.seq == LEGACY_IMPORT_SEQ)
+    );
+
+    drop(inbox);
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should reopen"));
+    let mut recovered_state = None;
+    for _ in 0..16 {
+        if let Ok((records, _)) = inbox.state_records_bounded(0) {
+            recovered_state = Some(records);
+            break;
+        }
+    }
+    let recovered_state = recovered_state.expect("bounded inbox recovery should finish");
+    assert!(
+        recovered_state
+            .iter()
+            .any(|record| record.request.seq == LEGACY_IMPORT_SEQ)
+    );
+    assert_eq!(
+        inbox
+            .completed_legacy_import_records_bounded()
+            .expect("reopened import index should resolve its source")
+            .len(),
+        1
+    );
+
+    let preview_request = CloudRequest {
+        seq: PREVIEW_SEQ,
+        kind: "file_preview".to_string(),
+        payload: serde_json::json!({
+            "metadata_patches": [{
+                "item_id": item_id,
+                "title": "Imported title",
+                "source_ids": ["BV1xx411c7mD"],
+                "hint_index": SELECTED_HINT_INDEX,
+            }]
+        }),
+        created_at: now_millis(),
+        extra: serde_json::Map::new(),
+    };
+    inbox
+        .persist(preview_request)
+        .expect("new file preview should persist");
+    let (after_preview_persist, _) = inbox
+        .state_records_bounded(0)
+        .expect("management history should remain readable after eviction");
+    assert_eq!(after_preview_persist.len(), 100);
+    assert!(
+        !after_preview_persist
+            .iter()
+            .any(|record| record.request.seq == LEGACY_IMPORT_SEQ)
+    );
+    assert_eq!(
+        inbox
+            .completed_legacy_import_records_bounded()
+            .expect("the evicted UI receipt should remain available to validation")
+            .first()
+            .map(|record| record.request.seq),
+        Some(LEGACY_IMPORT_SEQ)
+    );
+    let processing_preview = inbox
+        .update(PREVIEW_SEQ, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("file preview should enter processing");
+
+    let runtime = make_runtime(telegram, config, queue, Arc::clone(&inbox));
+    dispatch_cloud_record(runtime.clone(), processing_preview).await;
+    let preview_receipt = inbox
+        .record(PREVIEW_SEQ)
+        .expect("file preview receipt should load")
+        .expect("file preview receipt should remain present");
+    assert_eq!(preview_receipt.status, InboxStatus::AwaitingConfirmation);
+    let stored_preview = preview_receipt
+        .result
+        .as_ref()
+        .and_then(|result| result.get("preview"))
+        .expect("valid legacy mapping should produce a preview");
+    assert_eq!(
+        stored_preview["metadata_patches"][0]["item_id"].as_str(),
+        Some(item_id.as_str())
+    );
+    assert!(
+        telegram_requests.try_recv().is_err(),
+        "local preview dispatch should not call Telegram APIs"
+    );
+
+    drop(runtime);
+    drop(inbox);
+    stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]

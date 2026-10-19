@@ -30,9 +30,9 @@ use crate::file_provider::{
 use crate::library::{
     BatchMoveResult, BatchStatus, CollectionMetadata, Confidence, ConflictPolicy, FileMovePreview,
     HintOrigin, IntegrityStatus, LegacyCandidate, LegacyImportReport, LibraryAttachment,
-    LibraryItem, LibrarySnapshot, MetadataFieldChange, MetadataPatch, MetadataPatchPreview,
-    MetadataStatus, MoveOutcome, MovePreview, MovePreviewItem, MoveResultItem, Presence,
-    SourceHint,
+    LibraryItem, LibrarySnapshot, MAX_LEGACY_HINTS, MetadataFieldChange, MetadataPatch,
+    MetadataPatchPreview, MetadataStatus, MoveOutcome, MovePreview, MovePreviewItem,
+    MoveResultItem, Presence, SourceHint,
 };
 use crate::safe_fs::{
     BoundDirectoryCursor, BoundDirectoryCursorEntry, BoundFile, EntryIdentity, RootedFs,
@@ -7917,13 +7917,24 @@ fn parse_legacy_import(input: &str) -> LegacyImportReport {
     };
     let mut hints = Vec::new();
     let mut warnings = Vec::new();
-    for block in &text_blocks {
-        for line in block.lines().take(10_000) {
+    let mut seen = HashSet::new();
+    let mut truncated = false;
+    'blocks: for block in &text_blocks {
+        // The import byte limit bounds total scanning, while repeated rows do not consume the
+        // unique-hint allowance.
+        for line in block.lines() {
             let ids = extract_source_ids(line);
             if ids.is_empty() {
                 continue;
             }
             let title = title_hint_from_line(line);
+            if !seen.insert((ids.clone(), title.clone())) {
+                continue;
+            }
+            if hints.len() == MAX_LEGACY_HINTS {
+                truncated = true;
+                break 'blocks;
+            }
             hints.push(SourceHint {
                 source_ids: ids,
                 title,
@@ -7933,6 +7944,11 @@ fn parse_legacy_import(input: &str) -> LegacyImportReport {
                 requires_confirmation: true,
             });
         }
+    }
+    if truncated {
+        warnings.push(
+            "Legacy import hints were truncated at the 10,000 unique-hint limit.".to_string(),
+        );
     }
     if hints.is_empty() {
         let ids = normalize_source_ids(
@@ -7956,8 +7972,6 @@ fn parse_legacy_import(input: &str) -> LegacyImportReport {
             );
         }
     }
-    let mut seen = HashSet::new();
-    hints.retain(|hint| seen.insert((hint.source_ids.clone(), hint.title.clone())));
     LegacyImportReport {
         needs_confirmation: !hints.is_empty(),
         hints,
@@ -8372,6 +8386,13 @@ mod tests {
         }
     }
 
+    fn unique_legacy_hint_lines(start: usize, count: usize) -> String {
+        (start..start + count)
+            .map(|index| format!("BV1{index:010}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn index_fixture_item(id: &str, relative_path: &str, presence: Presence) -> LibraryItem {
         LibraryItem {
             id: id.to_string(),
@@ -8501,6 +8522,75 @@ mod tests {
         assert_eq!(report.hints.len(), 1);
         assert_eq!(report.hints[0].source_ids, vec!["youtube:PHH1wTDF-1M"]);
         assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn legacy_import_keeps_the_exact_global_unique_hint_limit_without_warning() {
+        let report = parse_legacy_import(&unique_legacy_hint_lines(0, MAX_LEGACY_HINTS));
+
+        assert_eq!(report.hints.len(), MAX_LEGACY_HINTS);
+        assert_eq!(
+            report.hints.first().unwrap().source_ids,
+            vec![format!("BV1{:010}", 0)]
+        );
+        assert_eq!(
+            report.hints.last().unwrap().source_ids,
+            vec![format!("BV1{:010}", MAX_LEGACY_HINTS - 1)]
+        );
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn legacy_import_caps_unique_hints_across_json_text_blocks_and_warns() {
+        let first_block = unique_legacy_hint_lines(0, 6_000);
+        let second_block = unique_legacy_hint_lines(6_000, 6_000);
+        let input = serde_json::json!({ "text": [first_block, second_block] }).to_string();
+        let report = parse_legacy_import(&input);
+
+        assert_eq!(report.hints.len(), MAX_LEGACY_HINTS);
+        assert_eq!(
+            report.hints.last().unwrap().source_ids,
+            vec![format!("BV1{:010}", MAX_LEGACY_HINTS - 1)]
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("10,000 unique-hint limit"))
+        );
+    }
+
+    #[test]
+    fn legacy_import_duplicates_do_not_consume_the_unique_hint_limit() {
+        let duplicate_block = vec!["BV1abcdefgh"; MAX_LEGACY_HINTS].join("\n");
+        let unique_block = unique_legacy_hint_lines(0, MAX_LEGACY_HINTS - 1);
+        let input = serde_json::json!({ "text": [duplicate_block, unique_block] }).to_string();
+        let report = parse_legacy_import(&input);
+
+        assert_eq!(report.hints.len(), MAX_LEGACY_HINTS);
+        assert_eq!(report.hints[0].source_ids, vec!["BV1abcdefgh".to_string()]);
+        assert_eq!(
+            report.hints.last().unwrap().source_ids,
+            vec![format!("BV1{:010}", MAX_LEGACY_HINTS - 2)]
+        );
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn legacy_candidate_mapping_accepts_the_last_supported_hint_index() {
+        let mut text = unique_legacy_hint_lines(0, MAX_LEGACY_HINTS - 1);
+        text.push_str("\nBV1abcdefgh");
+        let report = parse_legacy_import(&text);
+        let mut item = index_fixture_item("mapped-item", "mapped.mp4", Presence::Present);
+        item.source_ids = vec!["BV1abcdefgh".to_string()];
+
+        let matches = legacy_candidates(&report.hints, &[item], DEFAULT_LEGACY_CANDIDATE_LIMITS)
+            .expect("last in-range hint should remain available for matching");
+
+        assert_eq!(report.hints.len(), MAX_LEGACY_HINTS);
+        assert!(report.warnings.is_empty());
+        assert_eq!(matches.candidates.len(), 1);
+        assert_eq!(matches.candidates[0].hint_index, MAX_LEGACY_HINTS - 1);
     }
 
     #[test]

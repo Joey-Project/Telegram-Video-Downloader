@@ -23,7 +23,7 @@ superseded_by: ""
 - 当前接受的架构大方向是公开托管的静态界面自动加载文件库并提交操作；Telegram webhook 进入 Cloudflare Worker，再进入 D1 持久收件箱。本机 Rust bot 主动领取操作，并由本机通过同一 Telegram bot 发送或编辑进度消息。本机没有公网入站接口。偏好使用 Cloudflare Free；达到额度限制时暂停操作并提示用户。
 - Rust 通过固定 Worker API 补领、确认和回写状态；Mini App 验证 Telegram initData。休眠 WebSocket 推送完整请求，固定共享密钥鉴权，本机落盘后才确认接收。状态通过持久递增版本防止旧回写覆盖新快照。
 - 第一至第四阶段的本地代码已落在隔离分支：Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段 `/settings` 与新下载位置选择仍延期。
-- Cloudflare 等待卡片重复问题已修复。2026-10-19 的类型检查、55 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 992 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录、来源匹配和有界状态清理，以及 YouTube legacy 提取和确认恢复提示覆盖。
+- Cloudflare 等待卡片重复问题已修复。2026-10-19 的类型检查、58 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 1003 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录、来源匹配和有界状态清理，以及 YouTube legacy 提取、确认恢复提示、导入来源恢复和队列快照覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
 - 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `3b3263eab291158725002b749664096807dcbeeb` 的 master 修复，包含 ASS 弹幕显示默认值、恢复工作流收尾及 Cargo 输出目录之外的签名服务安装流程，并补齐 Cloud 模式的服务就绪兼容。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
 - Python 3.14.5 的 93 项服务单测、隔离 shell 集成测试、shell 语法检查和 ShellCheck 均通过；测试使用临时 HOME 和模拟系统命令，不安装或重启实际服务。CI 已纳入 Python 与 shell 服务测试。
@@ -208,6 +208,9 @@ superseded_by: ""
 
 - 已实现 legacy text 导入报告、hint 和候选项。候选仅作为线索，不会自动改写媒体 metadata。用户选择 hint 与 library item 后，UI 提交 `metadata_patches`，Rust 生成含 NFO 变更摘要的 preview，再由 `file_confirm` 执行；无可靠候选时允许用户手动选择 item，但仍要 preview 与确认。
 - legacy 候选按当前 snapshot 一次建立来源 ID 和规范化标题索引，保留来源 ID 优先、文件顺序和歧义确认语义。匹配工作量、候选条数和编码体积均有上限；截断会明确告知，保留的 hints 仍可手动关联。
+- 所有文本块合计保留最多 10,000 个去重后的 hints，超限明确显示截断 warning；前后端都接受 0–9,999 的 hint 索引，合集 ID 都按 128 个 UTF-8 bytes、kind 按 64 个 UTF-8 bytes 校验。
+- 已完成的 legacy 导入来源使用独立索引保留最新 100 份，不会因为新 preview 挤出管理视图的 100 条记录而立即失效；重开收件箱会重建索引，仍遵循原有七天终态过期策略。
+- 云端任务摘要在队列操作锁内一次读取和选择最多 100 条活跃任务，保留允许聊天范围及稳定排序，进度更新不会在分页之间造成重复或遗漏。
 - legacy text 复用现有 YouTube URL 识别规则，校验 host 和十一字符 video ID 后生成 `youtube:<id>` 来源线索，不把任意裸字符串当作视频 ID。
 - 确认批次可同时移动和补 metadata；patch 仅对可核验字段生成 NFO 更新，逐字段显示原值与新值及实际加入的来源 ID，保留未知 XML 字段和普通 POSIX 权限。组织路径支持合集目录与多 P 排序信息。
 - 历史 Telegram 导出格式、裸附件可靠匹配和其他媒体库 NFO 互操作仍有覆盖边界；这些不是“自动导入/自动覆盖”功能。本地 metadata preview/确认测试已通过，其他媒体库互操作仍需实测。
