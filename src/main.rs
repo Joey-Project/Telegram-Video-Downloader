@@ -99,6 +99,12 @@ static PENDING_COLLECTION_DETAILS: OnceLock<Mutex<HashMap<u64, PendingCollection
 const CLOUD_STATE_UPLOAD_SOFT_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const CLOUD_STATE_PREVIEW_ENTRY_LIMIT: usize = 100;
 const CLOUD_QUEUE_STATE_COALESCE: Duration = Duration::from_secs(2);
+const CLOUD_LIBRARY_WARNING_COUNT_LIMIT: usize = 64;
+const CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES: usize = 1024;
+const CLOUD_LIBRARY_WARNING_JSON_LIMIT_BYTES: usize = 24 * 1024;
+const CLOUD_LIBRARY_CATEGORY_COUNT_LIMIT: usize = 128;
+const CLOUD_LIBRARY_CATEGORY_PATH_LIMIT_BYTES: usize = 512;
+const CLOUD_LIBRARY_CATEGORY_JSON_LIMIT_BYTES: usize = 32 * 1024;
 static PENDING_BILIBILI_ACCESS_KEY_LOGINS: OnceLock<
     Mutex<HashMap<i64, PendingBilibiliAccessKeyLogin>>,
 > = OnceLock::new();
@@ -470,6 +476,171 @@ where
     }
 }
 
+fn truncate_cloud_warning(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let suffix = "…";
+    let mut end = max_bytes.saturating_sub(suffix.len()).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &text[..end], suffix)
+}
+
+fn compact_cloud_library_warnings(
+    warnings: &mut Vec<serde_json::Value>,
+) -> Result<(bool, usize, usize)> {
+    let mut all_bounded = warnings.len() <= CLOUD_LIBRARY_WARNING_COUNT_LIMIT;
+    let mut original_size = 2_usize;
+    if all_bounded {
+        for warning in warnings.iter() {
+            let Some(text) = warning.as_str() else {
+                all_bounded = false;
+                break;
+            };
+            if text.len() > CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES {
+                all_bounded = false;
+                break;
+            }
+            let separator_size = if original_size == 2 { 0 } else { 1 };
+            original_size = original_size
+                .saturating_add(separator_size)
+                .saturating_add(serde_json::to_vec(warning)?.len());
+            if original_size > CLOUD_LIBRARY_WARNING_JSON_LIMIT_BYTES {
+                all_bounded = false;
+                break;
+            }
+        }
+    }
+    if all_bounded {
+        return Ok((false, 0, 0));
+    }
+
+    let mut compacted = Vec::new();
+    let mut encoded_size = 2_usize;
+    let mut omitted_count = 0_usize;
+    let mut shortened_count = 0_usize;
+    const SUMMARY_RESERVE_BYTES: usize = 512;
+    for warning in warnings.iter() {
+        let Some(text) = warning.as_str() else {
+            omitted_count = omitted_count.saturating_add(1);
+            continue;
+        };
+        let bounded = truncate_cloud_warning(text, CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES);
+        let shortened = bounded != text;
+        let bounded_value = serde_json::Value::String(bounded);
+        let value_size = serde_json::to_vec(&bounded_value)?.len();
+        let separator_size = if compacted.is_empty() { 0 } else { 1 };
+        if compacted.len() >= CLOUD_LIBRARY_WARNING_COUNT_LIMIT.saturating_sub(1)
+            || encoded_size
+                .saturating_add(separator_size)
+                .saturating_add(value_size)
+                .saturating_add(SUMMARY_RESERVE_BYTES)
+                > CLOUD_LIBRARY_WARNING_JSON_LIMIT_BYTES
+        {
+            omitted_count = omitted_count.saturating_add(1);
+            continue;
+        }
+        encoded_size = encoded_size
+            .saturating_add(separator_size)
+            .saturating_add(value_size);
+        compacted.push(bounded_value);
+        shortened_count = shortened_count.saturating_add(if shortened { 1 } else { 0 });
+    }
+
+    let mut summary = serde_json::Value::String(format!(
+        "Cloud snapshot shortened {shortened_count} warning(s) and omitted {omitted_count} warning(s) to fit the upload budget."
+    ));
+    let mut summary_size = serde_json::to_vec(&summary)?.len();
+    while encoded_size
+        .saturating_add(if compacted.is_empty() { 0 } else { 1 })
+        .saturating_add(summary_size)
+        > CLOUD_LIBRARY_WARNING_JSON_LIMIT_BYTES
+    {
+        let Some(removed) = compacted.pop() else {
+            break;
+        };
+        encoded_size = encoded_size
+            .saturating_sub(serde_json::to_vec(&removed)?.len())
+            .saturating_sub(if compacted.is_empty() { 0 } else { 1 });
+        omitted_count = omitted_count.saturating_add(1);
+        if removed.as_str().is_some_and(|text| text.ends_with('…')) {
+            shortened_count = shortened_count.saturating_sub(1);
+        }
+        summary = serde_json::Value::String(format!(
+            "Cloud snapshot shortened {shortened_count} warning(s) and omitted {omitted_count} warning(s) to fit the upload budget."
+        ));
+        summary_size = serde_json::to_vec(&summary)?.len();
+    }
+    compacted.push(summary);
+    let changed = compacted != *warnings;
+    *warnings = compacted;
+    Ok((changed, omitted_count, shortened_count))
+}
+
+fn compact_cloud_library_categories(
+    categories: &mut Vec<serde_json::Value>,
+) -> Result<(bool, usize)> {
+    let mut all_bounded = categories.len() <= CLOUD_LIBRARY_CATEGORY_COUNT_LIMIT;
+    let mut original_size = 2_usize;
+    if all_bounded {
+        for category in categories.iter() {
+            let Some(path) = category.as_str() else {
+                all_bounded = false;
+                break;
+            };
+            if path.len() > CLOUD_LIBRARY_CATEGORY_PATH_LIMIT_BYTES {
+                all_bounded = false;
+                break;
+            }
+            let separator_size = if original_size == 2 { 0 } else { 1 };
+            original_size = original_size
+                .saturating_add(separator_size)
+                .saturating_add(serde_json::to_vec(category)?.len());
+            if original_size > CLOUD_LIBRARY_CATEGORY_JSON_LIMIT_BYTES {
+                all_bounded = false;
+                break;
+            }
+        }
+    }
+    if all_bounded {
+        return Ok((false, 0));
+    }
+
+    let mut compacted = Vec::new();
+    let mut encoded_size = 2_usize;
+    let mut omitted_count = 0_usize;
+    for category in categories.iter() {
+        let Some(path) = category.as_str() else {
+            omitted_count = omitted_count.saturating_add(1);
+            continue;
+        };
+        if path.len() > CLOUD_LIBRARY_CATEGORY_PATH_LIMIT_BYTES {
+            omitted_count = omitted_count.saturating_add(1);
+            continue;
+        }
+        let value_size = serde_json::to_vec(category)?.len();
+        let separator_size = if compacted.is_empty() { 0 } else { 1 };
+        if compacted.len() >= CLOUD_LIBRARY_CATEGORY_COUNT_LIMIT
+            || encoded_size
+                .saturating_add(separator_size)
+                .saturating_add(value_size)
+                > CLOUD_LIBRARY_CATEGORY_JSON_LIMIT_BYTES
+        {
+            omitted_count = omitted_count.saturating_add(1);
+            continue;
+        }
+        encoded_size = encoded_size
+            .saturating_add(separator_size)
+            .saturating_add(value_size);
+        compacted.push(category.clone());
+    }
+    let changed = compacted != *categories;
+    *categories = compacted;
+    Ok((changed, omitted_count))
+}
+
 impl CloudStateSnapshot {
     fn fingerprint(&self) -> Result<Vec<u8>> {
         serde_json::to_vec(&serde_json::json!({
@@ -511,7 +682,8 @@ impl CloudStateSnapshot {
         let compacted_operations = self.compact_operation_receipts();
         let compacted_size = self.encoded_size(state_version)?;
         if compacted_size.saturating_add(1024) > max_bytes {
-            return self.trim_library_for_upload(state_version, max_bytes);
+            let library_reduced = self.trim_library_for_upload(state_version, max_bytes)?;
+            return Ok(compacted_operations || library_reduced);
         }
         if compacted_operations {
             return Ok(true);
@@ -525,29 +697,67 @@ impl CloudStateSnapshot {
     }
 
     fn trim_library_for_upload(&mut self, state_version: u64, max_bytes: usize) -> Result<bool> {
-        let Some(items) = self
+        let original_size = self.encoded_size(state_version)?;
+        let original_items = self
             .library
             .get("items")
             .and_then(serde_json::Value::as_array)
-        else {
+            .cloned();
+        let Some(library) = self.library.as_object_mut() else {
             return Ok(false);
         };
-        if items.len() <= 1 {
-            return Ok(false);
+        library.insert("incomplete".to_string(), serde_json::Value::Bool(true));
+        let item_trim_warning = "This library snapshot is incomplete because library data was reduced to fit the cloud upload size limit.";
+        let warnings = library
+            .entry("warnings".to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        if !warnings.is_array() {
+            *warnings = serde_json::json!([]);
         }
-        let original_items = items.clone();
-        let warning = "This library snapshot is incomplete because some items exceeded the cloud upload size limit.";
-        if let Some(warnings) = self
-            .library
+        if let Some(warnings) = warnings.as_array_mut()
+            && !warnings
+                .iter()
+                .any(|entry| entry.as_str() == Some(item_trim_warning))
+        {
+            warnings.insert(0, serde_json::Value::String(item_trim_warning.to_string()));
+        }
+        let mut omitted_categories = 0;
+        if let Some(categories) = library
+            .get_mut("categories")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            let (_, omitted) = compact_cloud_library_categories(categories)?;
+            omitted_categories = omitted;
+        }
+        if omitted_categories > 0 {
+            let category_warning = format!(
+                "Cloud snapshot omitted {omitted_categories} category path(s) to fit the upload budget."
+            );
+            if let Some(warnings) = library
+                .get_mut("warnings")
+                .and_then(serde_json::Value::as_array_mut)
+                && !warnings
+                    .iter()
+                    .any(|entry| entry.as_str() == Some(category_warning.as_str()))
+            {
+                warnings.insert(0, serde_json::Value::String(category_warning));
+            }
+        }
+        if let Some(warnings) = library
             .get_mut("warnings")
             .and_then(serde_json::Value::as_array_mut)
-            && !warnings.iter().any(|entry| entry.as_str() == Some(warning))
         {
-            warnings.push(serde_json::Value::String(warning.to_string()));
+            compact_cloud_library_warnings(warnings)?;
         }
-        if let Some(library) = self.library.as_object_mut() {
-            library.insert("incomplete".to_string(), serde_json::Value::Bool(true));
+
+        let metadata_size = self.encoded_size(state_version)?;
+        let Some(original_items) = original_items else {
+            return Ok(metadata_size < original_size);
+        };
+        if metadata_size.saturating_add(1024) <= max_bytes || original_items.len() <= 1 {
+            return Ok(metadata_size < original_size);
         }
+
         let mut low = 1_usize;
         let mut high = original_items.len();
         let mut fitting_count = None;
@@ -576,7 +786,7 @@ impl CloudStateSnapshot {
             {
                 *items = original_items;
             }
-            return Ok(false);
+            return Ok(self.encoded_size(state_version)? < original_size);
         };
         if let Some(items) = self
             .library
@@ -585,7 +795,7 @@ impl CloudStateSnapshot {
         {
             *items = original_items[..fitting_count].to_vec();
         }
-        Ok(true)
+        Ok(self.encoded_size(state_version)? < original_size)
     }
 
     async fn post(
@@ -1048,10 +1258,39 @@ async fn next_cloud_state_version_after(
         .context("cloud state-version persistence worker failed")?
 }
 
+fn merge_cloud_library_scan_warning(library: &mut serde_json::Value, warning: &str) {
+    let message = format!(
+        "The local media-library scan failed; the last successful snapshot is retained: {}",
+        redact_sensitive_text(warning)
+    );
+    let Some(object) = library.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "scan_warning".to_string(),
+        serde_json::Value::String(message.clone()),
+    );
+    object.insert("incomplete".to_string(), serde_json::Value::Bool(true));
+    let warnings = object
+        .entry("warnings".to_string())
+        .or_insert_with(|| serde_json::json!([]));
+    if !warnings.is_array() {
+        *warnings = serde_json::json!([]);
+    }
+    if let Some(warnings) = warnings.as_array_mut()
+        && !warnings
+            .iter()
+            .any(|entry| entry.as_str() == Some(message.as_str()))
+    {
+        warnings.insert(0, serde_json::Value::String(message));
+    }
+}
+
 async fn build_cloud_state_snapshot(
     runtime: &CloudBotRuntime,
 ) -> Result<Option<CloudStateSnapshot>> {
     let library = runtime.library_snapshot.lock().await.clone();
+    let scan_warning = runtime.library_scan_warning.lock().await.clone();
     let (records, omitted_preview_count) =
         cloud_state_records_bounded(runtime, CLOUD_STATE_PREVIEW_ENTRY_LIMIT).await?;
     let mut management_records = records
@@ -1067,7 +1306,7 @@ async fn build_cloud_state_snapshot(
     let tasks = tokio::task::spawn_blocking(move || cloud_task_summaries(&config, &queue))
         .await
         .context("cloud task summary worker failed")??;
-    let (revision, library_value) = match library {
+    let (revision, mut library_value) = match library {
         Some(library) => (
             library.revision.clone(),
             serde_json::to_value(library).context("failed to serialize local library snapshot")?,
@@ -1082,12 +1321,12 @@ async fn build_cloud_state_snapshot(
                 .and_then(|label| label.to_str())
                 .unwrap_or("Downloads")
                 .to_string();
-            let scan_warning = runtime.library_scan_warning.lock().await.clone();
             let warnings = scan_warning
+                .as_ref()
                 .map(|warning| {
                     format!(
-                        "The local media-library scan failed: {}",
-                        redact_sensitive_text(&warning)
+                        "The local media-library scan failed before a snapshot was available: {}",
+                        redact_sensitive_text(warning)
                     )
                 })
                 .unwrap_or_else(|| "The local media-library scan has not completed.".to_string());
@@ -1105,6 +1344,14 @@ async fn build_cloud_state_snapshot(
             )
         }
     };
+    if let Some(warning) = scan_warning.as_deref()
+        && library_value
+            .get("ready")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+    {
+        merge_cloud_library_scan_warning(&mut library_value, warning);
+    }
     Ok(Some(CloudStateSnapshot {
         revision,
         library: library_value,
@@ -1631,17 +1878,13 @@ async fn dispatch_cloud_management(
                     )));
                 }
             };
-            let records = cloud_inbox_records(runtime).await?;
-            let Some(preview_record) = records.iter().find(|record| {
-                record.status == InboxStatus::AwaitingConfirmation
-                    && record.request.kind == "file_preview"
-                    && record
-                        .result
-                        .as_ref()
-                        .and_then(|value| value.get("preview_id"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(payload.preview_id.as_str())
-            }) else {
+            let Some(preview_record) = cloud_awaiting_confirmation_record(
+                runtime,
+                payload.preview_id.clone(),
+                request.created_at,
+            )
+            .await?
+            else {
                 return Ok(cloud_dispatch_failure(
                     "This preview is no longer awaiting confirmation. Run a fresh preview.",
                 ));
@@ -2127,13 +2370,6 @@ fn metadata_patch_matches_legacy_hint(patch: &MetadataPatch, hint: &SourceHint) 
     title_matches && source_ids_match && collection_matches
 }
 
-async fn cloud_inbox_records(runtime: &CloudBotRuntime) -> Result<Vec<InboxRecord>> {
-    let inbox = Arc::clone(&runtime.inbox);
-    tokio::task::spawn_blocking(move || inbox.records())
-        .await
-        .context("cloud inbox listing worker failed")?
-}
-
 async fn cloud_state_records(runtime: &CloudBotRuntime) -> Result<Vec<InboxRecord>> {
     let inbox = Arc::clone(&runtime.inbox);
     tokio::task::spawn_blocking(move || inbox.state_records())
@@ -2149,6 +2385,19 @@ async fn cloud_state_records_bounded(
     tokio::task::spawn_blocking(move || inbox.state_records_bounded(max_awaiting_previews))
         .await
         .context("cloud inbox bounded state listing worker failed")?
+}
+
+async fn cloud_awaiting_confirmation_record(
+    runtime: &CloudBotRuntime,
+    preview_id: String,
+    confirmation_created_at: u64,
+) -> Result<Option<InboxRecord>> {
+    let inbox = Arc::clone(&runtime.inbox);
+    tokio::task::spawn_blocking(move || {
+        inbox.awaiting_confirmation_record(&preview_id, confirmation_created_at)
+    })
+    .await
+    .context("cloud inbox preview lookup worker failed")?
 }
 
 fn configured_cloud_management_chat_id(config: &AppConfig) -> Option<i64> {

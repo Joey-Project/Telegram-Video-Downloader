@@ -61,6 +61,144 @@ async fn cloud_state_reporter_retries_transient_failure_with_same_content_and_sy
 }
 
 #[tokio::test]
+async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_clears_it() {
+    let root = temp_cloud_bot_dir("state-reporter-scan-warning");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    cloud_state
+        .state_post_statuses
+        .lock()
+        .expect("fake state status lock should not poison")
+        .extend([200, 200, 200]);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    let mut cached_snapshot = empty_cloud_test_library_snapshot("cached-library-revision");
+    cached_snapshot.scanned_at = 1_800_000_123;
+    cached_snapshot.items.push(LibraryItem {
+        id: "cached-item-id".to_string(),
+        title: "cached title".to_string(),
+        relative_path: "cached.mp4".to_string(),
+        bytes: 123,
+        width: Some(1920),
+        height: Some(1080),
+        codec: Some("h264".to_string()),
+        source_ids: Vec::new(),
+        collection: None,
+        attachments: Vec::new(),
+        confidence: Confidence::High,
+        metadata_status: MetadataStatus::Complete,
+        integrity_status: IntegrityStatus::Verified,
+        presence: Presence::Present,
+    });
+    cached_snapshot.warnings = vec!["existing library warning".to_string()];
+    *runtime.library_snapshot.lock().await = Some(cached_snapshot.clone());
+
+    let reporter = tokio::spawn(cloud_state_reporter_with_heartbeat(
+        runtime.clone(),
+        Duration::from_secs(300),
+    ));
+    runtime.state_notify.notify_one();
+    let posts = wait_for_state_posts(&cloud_state, 1).await;
+    assert_eq!(posts[0]["status"], 200);
+    assert_eq!(posts[0]["revision"], "cached-library-revision");
+    assert_eq!(posts[0]["library_scanned_at"], 1_800_000_123_u64);
+    assert_eq!(posts[0]["library_item_count"], 1);
+    assert_eq!(posts[0]["library_warning_count"], 1);
+    assert_eq!(posts[0]["library_scan_warning"], serde_json::Value::Null);
+
+    let scan_result =
+        run_cloud_library_operation::<()>(&runtime, "fixture library scan failed", move |_| {
+            Err(anyhow::anyhow!("temporary provider enumeration failure"))
+        })
+        .await;
+    assert!(scan_result.is_err(), "the simulated scan should fail");
+    let posts = wait_for_state_posts(&cloud_state, 2).await;
+    assert_eq!(posts[1]["status"], 200);
+    assert!(posts[1]["state_version"].as_u64() > posts[0]["state_version"].as_u64());
+    assert_ne!(posts[1]["content_hash"], posts[0]["content_hash"]);
+    assert_eq!(posts[1]["revision"], posts[0]["revision"]);
+    assert_eq!(
+        posts[1]["library_scanned_at"],
+        posts[0]["library_scanned_at"]
+    );
+    assert_eq!(posts[1]["library_item_count"], 1);
+    assert_eq!(
+        posts[1]["library_items_hash"],
+        posts[0]["library_items_hash"]
+    );
+    assert_eq!(posts[1]["library_warning_count"], 2);
+    assert_eq!(posts[1]["library_incomplete"], true);
+    assert!(
+        posts[1]["library_scan_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("temporary provider enumeration failure"))
+    );
+    assert!(
+        posts[1]["library_warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.iter().any(|warning| {
+                warning
+                    .as_str()
+                    .is_some_and(|text| text.contains("last successful snapshot is retained"))
+            }))
+    );
+
+    let recovery_snapshot = cached_snapshot;
+    run_cloud_library_operation::<()>(
+        &runtime,
+        "fixture library scan recovery failed",
+        move |_| Ok(((), recovery_snapshot)),
+    )
+    .await
+    .expect("the simulated recovery scan should publish successfully");
+    let posts = wait_for_state_posts(&cloud_state, 3).await;
+    assert_eq!(posts[2]["status"], 200);
+    assert!(posts[2]["state_version"].as_u64() > posts[1]["state_version"].as_u64());
+    assert_ne!(posts[2]["content_hash"], posts[1]["content_hash"]);
+    assert_eq!(posts[2]["revision"], posts[0]["revision"]);
+    assert_eq!(
+        posts[2]["library_scanned_at"],
+        posts[0]["library_scanned_at"]
+    );
+    assert_eq!(posts[2]["library_item_count"], 1);
+    assert_eq!(
+        posts[2]["library_items_hash"],
+        posts[0]["library_items_hash"]
+    );
+    assert_eq!(posts[2]["library_warning_count"], 1);
+    assert_eq!(posts[2]["library_scan_warning"], serde_json::Value::Null);
+    assert_eq!(posts[2]["library_warnings"][0], "existing library warning");
+    assert_eq!(posts[2]["content_hash"], posts[0]["content_hash"]);
+
+    reporter.abort();
+    let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn cloud_state_reporter_retries_413_with_new_incomplete_snapshot_then_syncs_changes() {
     let root = temp_cloud_bot_dir("state-reporter-413");
     let mut config = AppConfig::for_test();
@@ -170,6 +308,177 @@ async fn cloud_state_reporter_retries_413_with_new_incomplete_snapshot_then_sync
     assert_eq!(posts[4]["revision"], "after-413");
     assert!(posts[4]["state_version"].as_u64() > posts[3]["state_version"].as_u64());
     assert_ne!(posts[4]["content_hash"], posts[3]["content_hash"]);
+
+    reporter.abort();
+    let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cloud_state_reporter_bounds_large_library_warnings_and_categories_with_zero_or_few_items()
+{
+    let root = temp_cloud_bot_dir("state-reporter-library-metadata-budget");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    cloud_state
+        .state_post_statuses
+        .lock()
+        .expect("fake state status lock should not poison")
+        .extend([413, 200, 413, 200, 413, 200, 200]);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    let reporter = tokio::spawn(cloud_state_reporter_with_heartbeat(
+        runtime.clone(),
+        Duration::from_secs(300),
+    ));
+
+    let mut expected_posts = 0;
+    for item_count in [0_usize, 1, 3] {
+        let mut snapshot =
+            empty_cloud_test_library_snapshot(&format!("metadata-budget-items-{item_count}"));
+        snapshot.scanned_at = 1_800_000_456;
+        snapshot.categories = (0..96)
+            .map(|index| format!("category-{index:03}-{}", "x".repeat(499)))
+            .collect();
+        snapshot
+            .categories
+            .push(format!("category-overlong-{}", "z".repeat(600)));
+        snapshot.warnings = (0..96)
+            .map(|index| format!("warning-{index}: {}", "w".repeat(16 * 1024)))
+            .collect();
+        snapshot.items = (0..item_count)
+            .map(|index| LibraryItem {
+                id: format!("metadata-budget-item-{index}"),
+                title: format!("fixture item {index}"),
+                relative_path: format!("fixture-{index}.mp4"),
+                bytes: index as u64 + 1,
+                width: None,
+                height: None,
+                codec: None,
+                source_ids: Vec::new(),
+                collection: None,
+                attachments: Vec::new(),
+                confidence: Confidence::High,
+                metadata_status: MetadataStatus::Complete,
+                integrity_status: IntegrityStatus::Verified,
+                presence: Presence::Present,
+            })
+            .collect();
+        *runtime.library_snapshot.lock().await = Some(snapshot);
+        runtime.state_notify.notify_one();
+
+        let posts = tokio::time::timeout(
+            Duration::from_secs(30),
+            wait_for_state_posts(&cloud_state, expected_posts + 2),
+        )
+        .await
+        .expect("warnings and categories should compact after an oversized-state response");
+        let rejected = &posts[expected_posts];
+        let accepted = &posts[expected_posts + 1];
+        assert_eq!(rejected["status"], 413);
+        assert_eq!(accepted["status"], 200);
+        assert!(accepted["state_version"].as_u64() > rejected["state_version"].as_u64());
+        assert_ne!(accepted["library_hash"], rejected["library_hash"]);
+        assert_eq!(
+            accepted["library_item_count"].as_u64(),
+            Some(item_count as u64)
+        );
+        assert_eq!(
+            accepted["library_items_hash"],
+            rejected["library_items_hash"]
+        );
+        assert_eq!(accepted["library_incomplete"], true);
+        assert!(
+            rejected["library_warning_bytes"]
+                .as_u64()
+                .unwrap_or_default()
+                > 24 * 1024
+        );
+        assert!(
+            rejected["library_category_bytes"]
+                .as_u64()
+                .unwrap_or_default()
+                > 32 * 1024
+        );
+        assert_eq!(rejected["library_category_count"], 97);
+        assert!(
+            accepted["library_warning_count"]
+                .as_u64()
+                .unwrap_or_default()
+                <= 64
+        );
+        assert!(
+            accepted["library_warning_bytes"]
+                .as_u64()
+                .unwrap_or_default()
+                <= 24 * 1024
+        );
+        assert!(
+            accepted["library_category_count"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(
+            accepted["library_category_count"]
+                .as_u64()
+                .unwrap_or_default()
+                < 97
+        );
+        assert!(
+            accepted["library_category_bytes"]
+                .as_u64()
+                .unwrap_or_default()
+                <= 32 * 1024
+        );
+        assert_eq!(accepted["library_categories_are_fixture_paths"], true);
+        assert_eq!(accepted["library_category_omission_summary"], true);
+        assert_eq!(accepted["library_warning_compaction_summary"], true);
+        assert_eq!(accepted["library_scanned_at"], 1_800_000_456_u64);
+        expected_posts += 2;
+    }
+
+    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot(
+        "after-library-metadata-compaction",
+    ));
+    runtime.state_notify.notify_one();
+    let posts = wait_for_state_posts(&cloud_state, expected_posts + 1).await;
+    assert_eq!(posts[expected_posts]["status"], 200);
+    assert_eq!(
+        posts[expected_posts]["revision"],
+        "after-library-metadata-compaction"
+    );
+    assert!(
+        posts[expected_posts]["state_version"].as_u64()
+            > posts[expected_posts - 1]["state_version"].as_u64()
+    );
+    assert_ne!(
+        posts[expected_posts]["content_hash"],
+        posts[expected_posts - 1]["content_hash"]
+    );
 
     reporter.abort();
     let _ = reporter.await;

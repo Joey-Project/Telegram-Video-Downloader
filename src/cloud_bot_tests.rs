@@ -288,6 +288,22 @@ async fn spawn_fake_cloud_api(
                                 .context("fake state operations should serialize")?;
                             let operation_hash = format!("{:x}", Sha256::digest(&operations_bytes));
                             let operation_count = operations.as_array().map_or(0, Vec::len);
+                            let library_items = library["items"].as_array().cloned().unwrap_or_default();
+                            let library_categories = library["categories"].as_array().cloned().unwrap_or_default();
+                            let library_warnings = library["warnings"]
+                                .as_array()
+                                .map(|warnings| warnings.as_slice())
+                                .unwrap_or(&[]);
+                            let library_warning_sample = library_warnings.iter().take(2).cloned().collect::<Vec<_>>();
+                            let library_items_hash = format!("{:x}", Sha256::digest(
+                                serde_json::to_vec(&library_items).context("fake library items should serialize")?
+                            ));
+                            let library_category_bytes = serde_json::to_vec(&library["categories"])
+                                .context("fake library categories should serialize")?
+                                .len();
+                            let library_warning_bytes = serde_json::to_vec(&library["warnings"])
+                                .context("fake library warnings should serialize")?
+                                .len();
                             let tasks = request.body["tasks"].clone();
                             let status = {
                                 let mut statuses = task_state.state_post_statuses
@@ -304,8 +320,30 @@ async fn spawn_fake_cloud_api(
                                 "library_hash": library_hash,
                                 "library_ready": library["ready"],
                                 "library_incomplete": library["incomplete"],
-                                "library_warnings": library["warnings"],
-                                "library_item_count": library["items"].as_array().map_or(0, Vec::len),
+                                "library_warnings": library_warning_sample,
+                                "library_scan_warning": library["scan_warning"],
+                                "library_scanned_at": library["scanned_at"],
+                                "library_item_count": library_items.len(),
+                                "library_items_hash": library_items_hash,
+                                "library_category_count": library_categories.len(),
+                                "library_category_bytes": library_category_bytes,
+                                "library_categories_are_fixture_paths": library_categories.iter().all(|category| {
+                                    category.as_str().is_some_and(|path| {
+                                        path.starts_with("category-")
+                                            && path.len() == 512
+                                            && path.as_bytes().get(13..).is_some_and(|suffix| {
+                                                suffix.iter().all(|byte| *byte == b'x')
+                                            })
+                                    })
+                                }),
+                                "library_warning_count": library_warnings.len(),
+                                "library_warning_bytes": library_warning_bytes,
+                                "library_category_omission_summary": library_warnings.iter().any(|warning| {
+                                    warning.as_str().is_some_and(|text| text.contains("category path(s)"))
+                                }),
+                                "library_warning_compaction_summary": library_warnings.iter().any(|warning| {
+                                    warning.as_str().is_some_and(|text| text.contains("warning(s)"))
+                                }),
                                 "operation_count": operation_count,
                                 "operation_hash": operation_hash,
                                 "operation_bytes": operations_bytes.len(),
@@ -1063,6 +1101,26 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
     let inbox =
         Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    for offset in 0..128_u64 {
+        let seq = 1_000 + offset;
+        inbox
+            .persist(CloudRequest {
+                seq,
+                kind: "legacy_import".to_string(),
+                payload: serde_json::json!({"text":"historical"}),
+                created_at: 100 + seq,
+                extra: serde_json::Map::new(),
+            })
+            .expect("historical management request should persist");
+        inbox
+            .update(seq, |record| {
+                record.status = InboxStatus::Completed;
+                record.result = Some(serde_json::json!({
+                    "receipt": "x".repeat(8 * 1024),
+                }));
+            })
+            .expect("historical terminal receipt should persist");
+    }
     let preview = MovePreview {
         id: "retryable-preview".to_string(),
         revision: "revision-retryable".to_string(),
@@ -1091,6 +1149,7 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
             }));
         })
         .expect("preview should await confirmation");
+    let confirmation_created_at = now_millis();
     inbox
         .persist(CloudRequest {
             seq: 84,
@@ -1099,7 +1158,7 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
                 "preview_id": "retryable-preview",
                 "revision": "revision-retryable"
             }),
-            created_at: 101,
+            created_at: confirmation_created_at,
             extra: serde_json::Map::new(),
         })
         .expect("confirmation request should persist");
@@ -1118,6 +1177,15 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
         Arc::clone(&queue),
         Arc::clone(&inbox),
     );
+    let indexed_preview = cloud_awaiting_confirmation_record(
+        &runtime,
+        "retryable-preview".to_string(),
+        confirmation_created_at,
+    )
+    .await
+    .expect("indexed preview lookup should succeed after terminal history")
+    .expect("the active preview should remain indexed");
+    assert_eq!(indexed_preview.request.seq, 83);
 
     persist_cloud_retry_receipt(
         &runtime,
@@ -1255,6 +1323,7 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
     file_provider.fail_next_move("simulated temporary File Provider access failure");
 
     for seq in [84, 85] {
+        let confirmation_created_at = now_millis();
         inbox
             .persist(CloudRequest {
                 seq,
@@ -1263,7 +1332,7 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
                     "preview_id": preview_id.clone(),
                     "revision": preview_revision.clone(),
                 }),
-                created_at: 100 + seq,
+                created_at: confirmation_created_at,
                 extra: serde_json::Map::new(),
             })
             .expect("confirmation request should persist");
@@ -1273,6 +1342,11 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
                 record.attempts = 1;
             })
             .expect("confirmation should enter processing");
+        assert_eq!(record.request.created_at, confirmation_created_at);
+        assert!(
+            record.request.created_at >= 1_700_000_000_000,
+            "confirmation created_at must use epoch milliseconds"
+        );
         dispatch_cloud_record(runtime.clone(), record).await;
 
         let preview_record = inbox
@@ -1788,7 +1862,7 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
                 "preview_id": "missing-persisted-preview",
                 "revision": "revision-a"
             }),
-            created_at: 101,
+            created_at: now_millis(),
             extra: serde_json::Map::new(),
         })
         .expect("confirmation request should persist");

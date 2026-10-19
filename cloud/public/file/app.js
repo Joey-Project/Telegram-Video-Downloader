@@ -2,7 +2,7 @@ import { appendAction, removeQueuedAction, shouldRetryActionFailure } from "./ac
 import { filterPresentLegacyCandidates, getOrCreateLegacySelection, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
-import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
+import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limit.js";
 import { submitLegacyFileImport } from "./legacy-file-import.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
@@ -134,7 +134,11 @@ async function refreshState({ quiet = false } = {}) {
     acceptFreshSnapshot(fresh);
     setConnection(fresh.synced ? (fresh.stale ? "stale" : "live") : "", fresh.synced ? (fresh.stale ? "Contact is overdue" : "Computer connected") : "Waiting for computer");
     render();
-    if (!quiet) await drainActionQueue();
+    await drainActionsAfterSnapshotRefresh(
+      state,
+      navigator.onLine,
+      () => drainActionQueue({ quiet }),
+    );
   } catch (error) {
     const transition = applySnapshotFailure(error?.status);
     if (mayUsePrivateSnapshot(state)) {
@@ -174,7 +178,7 @@ function renderQueueCount() {
   byId("queued-actions").textContent = count ? `${count} action${count === 1 ? "" : "s"} waiting to send` : "";
 }
 
-async function drainActionQueue() {
+async function drainActionQueue({ quiet = false } = {}) {
   if (!initData || !mayDispatchActions(state) || !navigator.onLine) return false;
   if (state.draining) return state.draining;
   state.draining = (async () => {
@@ -189,7 +193,7 @@ async function drainActionQueue() {
         await api("/actions", { method: "POST", body: JSON.stringify({ request_id: action.request_id, kind: action.kind, payload: action.payload }) });
         const latestQueue = readActionQueue();
         if (!writeActionQueue(removeQueuedAction(latestQueue, action.request_id))) {
-          showToast("Request reached the computer, but this browser could not update its retry queue.");
+          if (!quiet) showToast("Request reached the computer, but this browser could not update its retry queue.");
           break;
         }
         sentAny = true;
@@ -210,7 +214,7 @@ async function drainActionQueue() {
           state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
           state.retryTimer = window.setTimeout(() => {
             state.retryTimer = 0;
-            drainActionQueue();
+            drainActionQueue({ quiet });
           }, delay);
         }
         connectionInterrupted = true;
@@ -224,7 +228,7 @@ async function drainActionQueue() {
       const remainder = connectionInterrupted ? " Other saved requests remain queued while the connection recovers." : "";
       const storageNote = removalFailed ? " One rejected request could not be removed from browser storage and will stay quarantined for this session." : "";
       showToast(`${count} rejected request${count === 1 ? " was" : "s were"} removed from the retry queue: ${details}.${remainder}${storageNote}`);
-    } else if (connectionInterrupted) {
+    } else if (!quiet && connectionInterrupted) {
       showToast("Connection interrupted. The request remains queued with the same ID.");
     }
     return sentAny;

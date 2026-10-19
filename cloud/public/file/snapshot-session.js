@@ -61,3 +61,8 @@ export function mayUsePrivateSnapshot(session) {
 export function mayDispatchActions(session) {
   return session?.ownerVerified === true && session?.canDispatchActions === true;
 }
+
+export async function drainActionsAfterSnapshotRefresh(session, online, drain) {
+  if (online !== true || !mayDispatchActions(session)) return false;
+  return await drain();
+}

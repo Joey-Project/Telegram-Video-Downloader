@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
@@ -42,6 +42,8 @@ const MAX_MANAGEMENT_STATE_RECORDS: usize = 100;
 pub(crate) const CLOUD_REQUEST_PAGE_SIZE: usize = 100;
 // Keep terminal local receipts through the same replay window as D1 ACK tombstones.
 const CLOUD_INBOX_TERMINAL_REPLAY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+// Abandoned confirmations expire with the persisted preview manifests in file_manager.rs.
+const CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION: Duration = CLOUD_INBOX_TERMINAL_REPLAY_RETENTION;
 // Each inbox API call makes bounded recovery/cleanup progress instead of draining history at once.
 const CLOUD_INBOX_SCAN_MAX_NAMES: usize = 32;
 const CLOUD_INBOX_SCAN_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -76,6 +78,7 @@ pub struct CloudRequest {
     pub seq: u64,
     pub kind: String,
     pub payload: Value,
+    /// Epoch milliseconds, matching the Cloud Worker `Date.now()` envelope field.
     pub created_at: u64,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
@@ -375,10 +378,15 @@ pub struct InboxRecord {
 struct InboxStateIndex {
     recent_management: BTreeSet<u64>,
     awaiting_previews: BTreeSet<u64>,
+    awaiting_preview_sequences: BTreeMap<String, BTreeSet<u64>>,
+    awaiting_preview_id_by_sequence: BTreeMap<u64, String>,
+    active_confirmations: BTreeMap<String, BTreeSet<(u64, u64)>>,
+    active_confirmation_by_sequence: BTreeMap<u64, (String, u64)>,
 }
 
 impl InboxStateIndex {
     fn record(&mut self, record: &InboxRecord) {
+        self.unindex_preview_associations(record.request.seq);
         if record.request.kind != "telegram" {
             self.recent_management.insert(record.request.seq);
             while self.recent_management.len() > MAX_MANAGEMENT_STATE_RECORDS {
@@ -390,15 +398,94 @@ impl InboxStateIndex {
         if record.request.kind == "file_preview" {
             if record.status == InboxStatus::AwaitingConfirmation {
                 self.awaiting_previews.insert(record.request.seq);
+                if let Some(preview_id) =
+                    inbox_preview_id(record).filter(|id| preview_identifier_is_indexable(id))
+                {
+                    self.awaiting_preview_sequences
+                        .entry(preview_id.to_string())
+                        .or_default()
+                        .insert(record.request.seq);
+                    self.awaiting_preview_id_by_sequence
+                        .insert(record.request.seq, preview_id.to_string());
+                }
             } else {
                 self.awaiting_previews.remove(&record.request.seq);
             }
+        }
+        if record.request.kind == "file_confirm"
+            && matches!(
+                record.status,
+                InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
+            )
+            && let Some(preview_id) = record
+                .request
+                .payload
+                .get("preview_id")
+                .and_then(Value::as_str)
+                .filter(|id| preview_identifier_is_indexable(id))
+        {
+            let created_at_millis = record.request.created_at;
+            self.active_confirmations
+                .entry(preview_id.to_string())
+                .or_default()
+                .insert((created_at_millis, record.request.seq));
+            self.active_confirmation_by_sequence.insert(
+                record.request.seq,
+                (preview_id.to_string(), created_at_millis),
+            );
         }
     }
 
     fn forget(&mut self, seq: u64) {
         self.recent_management.remove(&seq);
         self.awaiting_previews.remove(&seq);
+        self.unindex_preview_associations(seq);
+    }
+
+    fn unindex_preview_associations(&mut self, seq: u64) {
+        if let Some(preview_id) = self.awaiting_preview_id_by_sequence.remove(&seq) {
+            let remove_preview = self
+                .awaiting_preview_sequences
+                .get_mut(&preview_id)
+                .is_some_and(|sequences| {
+                    sequences.remove(&seq);
+                    sequences.is_empty()
+                });
+            if remove_preview {
+                self.awaiting_preview_sequences.remove(&preview_id);
+            }
+        }
+        if let Some((preview_id, created_at_millis)) =
+            self.active_confirmation_by_sequence.remove(&seq)
+        {
+            let remove_preview =
+                self.active_confirmations
+                    .get_mut(&preview_id)
+                    .is_some_and(|confirmations| {
+                        confirmations.remove(&(created_at_millis, seq));
+                        confirmations.is_empty()
+                    });
+            if remove_preview {
+                self.active_confirmations.remove(&preview_id);
+            }
+        }
+    }
+
+    fn awaiting_preview_sequence(&self, preview_id: &str) -> Option<u64> {
+        self.awaiting_preview_sequences
+            .get(preview_id)
+            .and_then(|sequences| sequences.last().copied())
+    }
+
+    fn has_active_confirmation_before(&self, preview_id: &str, expires_at_millis: u64) -> bool {
+        self.active_confirmations
+            .get(preview_id)
+            .is_some_and(|confirmations| {
+                confirmations
+                    .range(..(expires_at_millis, 0))
+                    .next()
+                    .is_some()
+            })
     }
 
     fn sequences_bounded(&self, max_awaiting_previews: usize) -> (BTreeSet<u64>, usize) {
@@ -467,6 +554,43 @@ fn inbox_terminal_record_expired(record: &InboxRecord, now: u64) -> bool {
     terminal
         && record.updated_at <= now
         && now.saturating_sub(record.updated_at) >= CLOUD_INBOX_TERMINAL_REPLAY_RETENTION.as_secs()
+}
+
+fn inbox_preview_id(record: &InboxRecord) -> Option<&str> {
+    record.result.as_ref().and_then(|result| {
+        result
+            .get("preview_id")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                result
+                    .get("preview")
+                    .and_then(|preview| preview.get("id"))
+                    .and_then(Value::as_str)
+            })
+    })
+}
+
+fn preview_identifier_is_indexable(preview_id: &str) -> bool {
+    !preview_id.is_empty()
+        && preview_id.len() <= 96
+        && preview_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn inbox_abandoned_preview_expired(record: &InboxRecord, now: u64) -> bool {
+    record.request.kind == "file_preview"
+        && record.status == InboxStatus::AwaitingConfirmation
+        && record.updated_at <= now
+        && now.saturating_sub(record.updated_at)
+            >= CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION.as_secs()
+}
+
+fn inbox_preview_expiry_millis(record: &InboxRecord) -> u64 {
+    record
+        .updated_at
+        .saturating_add(CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION.as_secs())
+        .saturating_mul(1_000)
 }
 
 impl InboxRecord {
@@ -627,6 +751,7 @@ impl CloudInbox {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub fn records(&self) -> Result<Vec<InboxRecord>> {
         let _guard = self
             .operation_lock
@@ -666,18 +791,26 @@ impl CloudInbox {
         if !self.recover_interrupted_requests()? {
             bail!("cloud inbox startup recovery is still in progress");
         }
-        let (sequences, omitted_previews) = self
+        let index = self
             .state_index
             .lock()
-            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
-            .sequences_bounded(max_awaiting_previews);
-        let records = sequences
-            .into_iter()
-            .map(|seq| {
-                self.read_record_path(&self.record_path(seq))?
-                    .ok_or_else(|| anyhow!("indexed cloud state request {seq} is missing"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
+        let (sequences, omitted_previews) = index.sequences_bounded(max_awaiting_previews);
+        let mut records = Vec::with_capacity(sequences.len());
+        for seq in sequences {
+            let mut record = self
+                .read_record_path(&self.record_path(seq))?
+                .ok_or_else(|| anyhow!("indexed cloud state request {seq} is missing"))?;
+            if inbox_abandoned_preview_expired(&record, now_seconds()) {
+                // Active confirmations protect the durable receipt for recovery, but a new
+                // confirmation created after expiry is rejected. Always project the expired
+                // preview as stale so snapshots cannot offer a confirmation that will fail.
+                record.status = InboxStatus::Stale;
+                record.error =
+                    Some("This preview expired after seven days. Run a fresh preview.".to_string());
+            }
+            records.push(record);
+        }
         Ok((records, omitted_previews))
     }
 
@@ -687,6 +820,48 @@ impl CloudInbox {
             .lock()
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
         self.read_record_path(&self.record_path(seq))
+    }
+
+    /// Resolve one active preview through the recovery-built preview index and re-read only its
+    /// durable inbox record. The confirmation's original epoch-millisecond creation time prevents
+    /// a new action submitted after preview expiry from extending the preview's lifetime.
+    pub fn awaiting_confirmation_record(
+        &self,
+        preview_id: &str,
+        confirmation_created_at_millis: u64,
+    ) -> Result<Option<InboxRecord>> {
+        if !preview_identifier_is_indexable(preview_id) {
+            return Ok(None);
+        }
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        if !self.recover_interrupted_requests()? {
+            bail!("cloud inbox startup recovery is still in progress");
+        }
+        let sequence = self
+            .state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
+            .awaiting_preview_sequence(preview_id);
+        let Some(sequence) = sequence else {
+            return Ok(None);
+        };
+        let Some(record) = self.read_record_path(&self.record_path(sequence))? else {
+            bail!("indexed cloud preview request {sequence} is missing");
+        };
+        if record.request.seq != sequence
+            || record.request.kind != "file_preview"
+            || record.status != InboxStatus::AwaitingConfirmation
+            || inbox_preview_id(&record) != Some(preview_id)
+        {
+            bail!("indexed cloud preview request {sequence} no longer matches its index");
+        }
+        if confirmation_created_at_millis >= inbox_preview_expiry_millis(&record) {
+            return Ok(None);
+        }
+        Ok(Some(record))
     }
 
     pub fn pending(&self) -> Result<Vec<InboxRecord>> {
@@ -807,6 +982,7 @@ impl CloudInbox {
         ))
     }
 
+    #[cfg(test)]
     fn list_record_paths(&self) -> Result<Vec<PathBuf>> {
         let mut entries = None;
         let mut list = |coordinated_path: &Path| -> Result<()> {
@@ -1347,10 +1523,11 @@ impl CloudInbox {
                                 );
                             }
 
-                            if inbox_terminal_record_expired(&record, now_seconds())
+                            let expired = self.inbox_record_retention_expired(&record)?;
+                            if expired
                                 && content_read_budget
                                     <= CLOUD_INBOX_SCAN_MAX_BYTES.saturating_sub(bytes_read)
-                                && self.remove_expired_terminal_record(
+                                && self.remove_expired_record(
                                     seq, &entry, identity, &file, &bytes, &record,
                                 )?
                             {
@@ -1363,7 +1540,7 @@ impl CloudInbox {
                                     })?,
                                 );
                                 continue;
-                            } else if inbox_terminal_record_expired(&record, now_seconds())
+                            } else if expired
                                 && content_read_budget
                                     <= CLOUD_INBOX_SCAN_MAX_BYTES.saturating_sub(bytes_read)
                             {
@@ -1458,6 +1635,23 @@ impl CloudInbox {
         Ok(())
     }
 
+    fn inbox_record_retention_expired(&self, record: &InboxRecord) -> Result<bool> {
+        if inbox_terminal_record_expired(record, now_seconds()) {
+            return Ok(true);
+        }
+        if !inbox_abandoned_preview_expired(record, now_seconds()) {
+            return Ok(false);
+        }
+        let Some(preview_id) = inbox_preview_id(record) else {
+            return Ok(true);
+        };
+        let index = self
+            .state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
+        Ok(!index.has_active_confirmation_before(preview_id, inbox_preview_expiry_millis(record)))
+    }
+
     fn restart_incomplete_recovery_after_directory_write(&self) -> Result<bool> {
         let mut scan = self
             .recovery_scan
@@ -1488,7 +1682,7 @@ impl CloudInbox {
         Ok(())
     }
 
-    fn remove_expired_terminal_record(
+    fn remove_expired_record(
         &self,
         seq: u64,
         entry: &BoundEntry,
@@ -1497,7 +1691,7 @@ impl CloudInbox {
         bytes: &[u8],
         record: &InboxRecord,
     ) -> Result<bool> {
-        if !inbox_terminal_record_expired(record, now_seconds()) {
+        if !self.inbox_record_retention_expired(record)? {
             return Ok(false);
         }
         let path = self.record_path(seq);
@@ -1507,7 +1701,7 @@ impl CloudInbox {
             if coordinated != path {
                 bail!("File Provider changed a cloud inbox cleanup path");
             }
-            if !inbox_terminal_record_expired(record, now_seconds()) {
+            if !self.inbox_record_retention_expired(record)? {
                 removed_result = Some(false);
                 return Ok(());
             }
@@ -1536,7 +1730,7 @@ impl CloudInbox {
                             .context("cloud inbox record became unreadable before cleanup")?;
                         if current.schema_version != INBOX_RECORD_VERSION
                             || current.request.seq != seq
-                            || !inbox_terminal_record_expired(&current, now_seconds())
+                            || !self.inbox_record_retention_expired(&current)?
                         {
                             no_longer_eligible = true;
                             bail!("cloud inbox record is no longer eligible for cleanup");
@@ -1774,6 +1968,49 @@ mod tests {
             payload: json!({"update_id": 12, "message": {"text": text}}),
             created_at: 100,
             extra: serde_json::Map::new(),
+        }
+    }
+
+    fn preview_inbox_record(seq: u64, preview_id: &str, updated_at: u64) -> InboxRecord {
+        let mut cloud_request = request(seq, "preview");
+        cloud_request.kind = "file_preview".to_string();
+        cloud_request.payload = json!({});
+        cloud_request.created_at = now_millis();
+        InboxRecord {
+            schema_version: INBOX_RECORD_VERSION,
+            request: cloud_request,
+            status: InboxStatus::AwaitingConfirmation,
+            attempts: 1,
+            updated_at,
+            next_attempt_at: 0,
+            error: None,
+            result: Some(json!({
+                "preview_id": preview_id,
+                "revision": "revision-1",
+                "preview": {"id": preview_id, "revision": "revision-1"}
+            })),
+        }
+    }
+
+    fn confirmation_inbox_record(
+        seq: u64,
+        preview_id: &str,
+        status: InboxStatus,
+        created_at_millis: u64,
+    ) -> InboxRecord {
+        let mut cloud_request = request(seq, "confirm");
+        cloud_request.kind = "file_confirm".to_string();
+        cloud_request.payload = json!({"preview_id": preview_id, "revision": "revision-1"});
+        cloud_request.created_at = created_at_millis;
+        InboxRecord {
+            schema_version: INBOX_RECORD_VERSION,
+            request: cloud_request,
+            status,
+            attempts: 1,
+            updated_at: now_seconds(),
+            next_attempt_at: 0,
+            error: None,
+            result: None,
         }
     }
 
@@ -2188,8 +2425,13 @@ mod tests {
                     .expect("pending fixture should persist"),
                 48 => write_fixture(122, InboxStatus::Retryable, "library_scan", old)
                     .expect("retryable fixture should persist"),
-                72 => write_fixture(123, InboxStatus::AwaitingConfirmation, "file_preview", old)
-                    .expect("awaiting preview fixture should persist"),
+                72 => write_fixture(
+                    123,
+                    InboxStatus::AwaitingConfirmation,
+                    "file_preview",
+                    now_seconds(),
+                )
+                .expect("awaiting preview fixture should persist"),
                 96 => write_fixture(124, InboxStatus::Processing, "library_scan", old)
                     .expect("processing fixture should persist"),
                 _ => {}
@@ -2381,6 +2623,316 @@ mod tests {
                 .next_state_version()
                 .expect("state version control file must remain available"),
             2
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_abandoned_previews_are_removed_but_live_confirms_protect_their_previews() {
+        let root = temp_root("inbox-abandoned-preview-retention");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let now = now_seconds();
+        let age = CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION
+            .as_secs()
+            .saturating_add(1);
+        let old = now.saturating_sub(age);
+        let expires_at_seconds =
+            old.saturating_add(CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION.as_secs());
+        let expires_at_millis = expires_at_seconds.saturating_mul(1_000);
+
+        for (seq, preview_id) in [
+            (1, "pending-preview"),
+            (3, "processing-preview"),
+            (5, "retryable-preview"),
+            (7, "abandoned-preview"),
+        ] {
+            let preview = preview_inbox_record(seq, preview_id, old);
+            inbox
+                .write_record_path(&inbox.record_path(seq), &preview)
+                .expect("preview fixture should persist");
+        }
+        for (seq, preview_id, status) in [
+            (2, "pending-preview", InboxStatus::Pending),
+            (4, "processing-preview", InboxStatus::Processing),
+            (6, "retryable-preview", InboxStatus::Retryable),
+        ] {
+            let confirmation =
+                confirmation_inbox_record(seq, preview_id, status, expires_at_millis - 1);
+            inbox
+                .write_record_path(&inbox.record_path(seq), &confirmation)
+                .expect("confirmation fixture should persist");
+        }
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen and index records");
+        let interrupted_confirmation = reopened
+            .record(4)
+            .expect("processing confirmation should be readable before recovery")
+            .expect("processing confirmation should still be on disk before recovery");
+        assert_eq!(
+            interrupted_confirmation.status,
+            InboxStatus::Processing,
+            "startup must see the persisted Processing state before recovering it"
+        );
+        let processing_preview = reopened
+            .record(3)
+            .expect("processing preview should be readable before recovery")
+            .expect("processing preview should remain on disk before recovery");
+        assert!(
+            inbox_abandoned_preview_expired(&processing_preview, now_seconds()),
+            "the Processing-linked preview fixture must be expired before recovery"
+        );
+        assert!(
+            reopened
+                .state_index
+                .lock()
+                .expect("cloud inbox state index lock should be available")
+                .has_active_confirmation_before(
+                    "processing-preview",
+                    inbox_preview_expiry_millis(&processing_preview),
+                ),
+            "the persisted Processing confirmation must be present in the active index"
+        );
+        assert!(
+            !reopened
+                .inbox_record_retention_expired(&processing_preview)
+                .expect("Processing confirmation should protect its expired preview"),
+            "a persisted Processing confirmation must protect the preview receipt"
+        );
+        for _ in 0..8 {
+            let _ = reopened
+                .pending()
+                .expect("bounded startup recovery should progress");
+            if reopened
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available")
+                .initial_complete
+            {
+                break;
+            }
+        }
+        assert!(
+            reopened
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available")
+                .initial_complete,
+            "all preview and confirmation records must be indexed before lookup"
+        );
+        for preview_id in ["pending-preview", "processing-preview", "retryable-preview"] {
+            let record = reopened
+                .awaiting_confirmation_record(preview_id, expires_at_millis - 1)
+                .expect("indexed preview lookup should succeed")
+                .expect("pre-expiry confirmation should retain its preview");
+            assert_eq!(record.status, InboxStatus::AwaitingConfirmation);
+            assert!(
+                reopened
+                    .awaiting_confirmation_record(preview_id, expires_at_millis)
+                    .expect("lookup should reject a confirmation at the expiry boundary")
+                    .is_none(),
+                "a confirmation at the exact millisecond expiry boundary must be rejected"
+            );
+            assert!(
+                reopened
+                    .awaiting_confirmation_record(preview_id, expires_at_millis + 1)
+                    .expect("lookup should reject a post-expiry confirmation")
+                    .is_none(),
+                "a confirmation after the millisecond expiry boundary must be rejected"
+            );
+        }
+        assert!(
+            reopened
+                .awaiting_confirmation_record("retryable-preview", expires_at_millis)
+                .expect("lookup should reject a post-expiry confirmation")
+                .is_none(),
+            "a newly submitted confirmation must not extend the preview retention window"
+        );
+        assert!(
+            reopened
+                .awaiting_confirmation_record("abandoned-preview", now_millis())
+                .expect("lookup should safely expire an abandoned preview")
+                .is_none()
+        );
+        assert!(
+            reopened
+                .record(7)
+                .expect("expired preview receipt should be readable")
+                .is_none(),
+            "an abandoned preview inbox file should be removed at the manifest retention boundary"
+        );
+
+        let (projected_records, _) = reopened
+            .state_records_bounded(10)
+            .expect("expired previews should be projected stale");
+        for preview_id in ["pending-preview", "processing-preview", "retryable-preview"] {
+            assert_eq!(
+                projected_records
+                    .iter()
+                    .find(|record| {
+                        record.request.kind == "file_preview"
+                            && inbox_preview_id(record) == Some(preview_id)
+                    })
+                    .expect("protected preview should remain in operation history")
+                    .status,
+                InboxStatus::Stale,
+                "an expired preview must not remain confirmable in snapshots"
+            );
+        }
+        for (seq, expected_status) in [
+            (2, InboxStatus::Pending),
+            (4, InboxStatus::Pending),
+            (6, InboxStatus::Retryable),
+        ] {
+            assert_eq!(
+                reopened
+                    .record(seq)
+                    .expect("active confirmation should remain readable")
+                    .expect("active confirmation should be retained")
+                    .status,
+                expected_status,
+                "pending, processing, and retryable confirms must keep their durable receipts"
+            );
+        }
+
+        reopened
+            .update(6, |record| record.status = InboxStatus::Completed)
+            .expect("completed confirmation should leave the active index");
+        assert!(
+            reopened
+                .awaiting_confirmation_record("retryable-preview", expires_at_millis - 1)
+                .expect("cleanup should run after the last active confirmation completes")
+                .is_none(),
+            "a preview should expire after its last pre-boundary active confirmation is terminal"
+        );
+        assert!(
+            reopened
+                .record(5)
+                .expect("preview lookup should succeed")
+                .is_none()
+        );
+        for seq in [1, 2, 3, 4] {
+            assert!(
+                reopened
+                    .record(seq)
+                    .expect("active request should read")
+                    .is_some(),
+                "pending or processing confirmation {seq} must keep its preview receipt"
+            );
+        }
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn current_worker_epoch_millis_resolves_a_fresh_confirmation_preview() {
+        let root = temp_root("inbox-worker-confirmation-millis");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        inbox
+            .write_record_path(
+                &inbox.record_path(1),
+                &preview_inbox_record(1, "fresh-preview", now_seconds()),
+            )
+            .expect("fresh preview fixture should persist");
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        for _ in 0..4 {
+            let _ = reopened
+                .pending()
+                .expect("bounded startup recovery should progress");
+            if reopened
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available")
+                .initial_complete
+            {
+                break;
+            }
+        }
+        assert!(
+            reopened
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available")
+                .initial_complete,
+            "the preview index must be complete before resolving confirmation"
+        );
+        let record = reopened
+            .awaiting_confirmation_record("fresh-preview", now_millis())
+            .expect("current Worker timestamp should resolve the preview")
+            .expect("a fresh preview must accept a current Worker confirmation");
+        assert_eq!(record.status, InboxStatus::AwaitingConfirmation);
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expired_preview_is_projected_stale_before_bounded_cleanup_reaches_its_file() {
+        let root = temp_root("inbox-preview-expiry-projection");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let old = now_seconds().saturating_sub(
+            CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION
+                .as_secs()
+                .saturating_add(1),
+        );
+        for seq in 1..=100 {
+            let preview_id = format!("expired-preview-{seq}");
+            let record = preview_inbox_record(seq, &preview_id, old);
+            inbox
+                .write_record_path(&inbox.record_path(seq), &record)
+                .expect("expired preview should persist");
+        }
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        for _ in 0..8 {
+            let _ = reopened
+                .pending()
+                .expect("bounded startup recovery should progress");
+            if reopened
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available")
+                .initial_complete
+            {
+                break;
+            }
+        }
+        assert!(
+            reopened
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available")
+                .initial_complete,
+            "the complete inbox index is required before publishing state"
+        );
+        let (records, _) = reopened
+            .state_records_bounded(10)
+            .expect("complete state should project expired previews safely");
+        let projected = records
+            .iter()
+            .find(|record| record.request.kind == "file_preview")
+            .expect("a preview beyond the bounded cleanup page should remain in history");
+        assert_eq!(projected.status, InboxStatus::Stale);
+        assert!(
+            projected
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("expired"))
+        );
+        let projected_seq = projected.request.seq;
+        assert_eq!(
+            reopened
+                .record(projected_seq)
+                .expect("disk receipt should still be readable before its cleanup page")
+                .expect("a preview beyond the current cleanup page should remain on disk")
+                .status,
+            InboxStatus::AwaitingConfirmation
         );
         drop(reopened);
         let _ = fs::remove_dir_all(root);

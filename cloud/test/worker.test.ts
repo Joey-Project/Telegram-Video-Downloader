@@ -9,7 +9,7 @@ import { filterPresentLegacyCandidates, getOrCreateLegacySelection, updateLegacy
 import { submitLegacyFileImport } from "../public/file/legacy-file-import.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "../public/file/metadata-preview.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "../public/file/selection-limit.js";
-import { acceptOwnerSnapshot, beginOwnerVerification, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
+import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
 import { canonicalJson, MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS, MAX_STATE_BODY_BYTES } from "../src/validation";
@@ -170,6 +170,19 @@ describe("owner snapshot session", () => {
     expect(firstLoadFailure.snapshot).toBeNull();
     expect(mayUsePrivateSnapshot(firstLoadFailure)).toBe(false);
     expect(mayDispatchActions(firstLoadFailure)).toBe(false);
+  });
+
+  it("drains saved actions after a quiet poll recovers owner verification", async () => {
+    const failedInitialLoad = failOwnerSnapshot(beginOwnerVerification(), 503, 1234);
+    const drain = vi.fn().mockResolvedValue(true);
+    expect(await drainActionsAfterSnapshotRefresh(failedInitialLoad, true, drain)).toBe(false);
+    expect(drain).not.toHaveBeenCalled();
+
+    const recovered = acceptOwnerSnapshot({ synced: true, library: { items: [] } });
+    expect(await drainActionsAfterSnapshotRefresh(recovered, true, drain)).toBe(true);
+    expect(drain).toHaveBeenCalledOnce();
+    expect(await drainActionsAfterSnapshotRefresh(recovered, false, drain)).toBe(false);
+    expect(drain).toHaveBeenCalledOnce();
   });
 });
 

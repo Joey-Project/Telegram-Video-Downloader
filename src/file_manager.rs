@@ -169,6 +169,13 @@ struct TargetReservationKey {
     components: Vec<String>,
 }
 
+struct ResolvedTargetParent {
+    relative_path: PathBuf,
+    identity: EntryIdentity,
+    unresolved_parent_components: Vec<String>,
+    target_name: String,
+}
+
 // These keys only prevent preview-time collisions; they are not persisted as filesystem identity.
 // Unknown or unsupported name-comparison rules fail closed instead of being guessed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,56 +198,95 @@ impl TargetReservationSet {
     }
 
     fn key_for(&mut self, root: &RootedFs, target: &str) -> Result<TargetReservationKey> {
-        let relative = safe_relative_path(target, false)?;
-        validate_not_private_downloader_path(root, &relative, self.private_library_identity)?;
-        let components = relative
-            .components()
-            .map(|component| match component {
-                Component::Normal(name) => name
-                    .to_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| anyhow!("target filename is not valid UTF-8")),
-                _ => bail!("target path contains an invalid component"),
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let (target_name, parent_components) = components
-            .split_last()
-            .ok_or_else(|| anyhow!("target path does not name a file"))?;
-
-        let mut existing_parent = PathBuf::new();
-        let mut parent_identity = root.root_identity();
-        let mut unresolved_at = parent_components.len();
-        for (index, component) in parent_components.iter().enumerate() {
-            let candidate = existing_parent.join(component);
-            let absolute = root.logical_root_path().join(&candidate);
-            match root.entry_identity(&absolute)? {
-                Some(identity) if identity.is_dir() => {
-                    existing_parent = candidate;
-                    parent_identity = identity;
-                }
-                Some(_) => bail!("target path parent is not a directory"),
-                None => {
-                    unresolved_at = index;
-                    break;
-                }
-            }
-        }
-
-        let directory_key = (parent_identity.device(), parent_identity.inode());
+        let resolved = resolve_target_parent(root, target, self.private_library_identity)?;
+        let directory_key = (resolved.identity.device(), resolved.identity.inode());
         let semantics = if let Some(semantics) = self.semantics_by_directory.get(&directory_key) {
             *semantics
         } else {
             let directory =
-                open_validated_target_directory(root, &existing_parent, parent_identity)?;
+                open_validated_target_directory(root, &resolved.relative_path, resolved.identity)?;
             let semantics = target_name_semantics(&directory)?;
             self.semantics_by_directory.insert(directory_key, semantics);
             semantics
         };
 
-        let mut names = parent_components[unresolved_at..].to_vec();
-        names.push(target_name.clone());
-        build_target_reservation_key(parent_identity, &names, semantics)
+        let mut names = resolved.unresolved_parent_components;
+        names.push(resolved.target_name);
+        build_target_reservation_key(resolved.identity, &names, semantics)
     }
+}
+
+fn resolve_target_parent(
+    root: &RootedFs,
+    target: &str,
+    private_library_identity: Option<EntryIdentity>,
+) -> Result<ResolvedTargetParent> {
+    let relative = safe_relative_path(target, false)?;
+    validate_not_private_downloader_path(root, &relative, private_library_identity)?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => name
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("target filename is not valid UTF-8")),
+            _ => bail!("target path contains an invalid component"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let (target_name, parent_components) = components
+        .split_last()
+        .ok_or_else(|| anyhow!("target path does not name a file"))?;
+
+    let mut relative_parent = PathBuf::new();
+    let mut parent_identity = root.root_identity();
+    let mut unresolved_at = parent_components.len();
+    for (index, component) in parent_components.iter().enumerate() {
+        let candidate = relative_parent.join(component);
+        let absolute = root.logical_root_path().join(&candidate);
+        match root.entry_identity(&absolute)? {
+            Some(identity) if identity.is_dir() => {
+                relative_parent = candidate;
+                parent_identity = identity;
+            }
+            Some(_) => bail!("target path parent is not a directory"),
+            None => {
+                unresolved_at = index;
+                break;
+            }
+        }
+    }
+
+    if relative_parent.as_os_str().is_empty() {
+        if root.root_identity() != parent_identity {
+            bail!("target root directory identity changed during preview");
+        }
+    } else {
+        let parent_path = root.logical_root_path().join(&relative_parent);
+        let entry = root.bind_entry(&parent_path, false)?;
+        root.open_bound_directory(&entry, parent_identity)?
+            .validate_identity()?;
+    }
+
+    Ok(ResolvedTargetParent {
+        relative_path: relative_parent,
+        identity: parent_identity,
+        unresolved_parent_components: parent_components[unresolved_at..].to_vec(),
+        target_name: target_name.clone(),
+    })
+}
+
+fn ensure_same_device_for_rename(
+    source_path: &str,
+    target_path: &str,
+    source_device: u64,
+    target_device: u64,
+) -> Result<()> {
+    if source_device != target_device {
+        bail!(
+            "cross-device moves are unsupported: source {source_path} and target {target_path} are on different devices"
+        );
+    }
+    Ok(())
 }
 
 fn build_target_reservation_key(
@@ -664,6 +710,14 @@ impl PreviewAnchorStore {
 }
 
 #[derive(Clone)]
+struct PreviewBuildRequest<'a> {
+    item_ids: &'a [String],
+    target_relative_dir: Option<&'a str>,
+    rename: bool,
+    conflict: ConflictPolicy,
+    patches: &'a [MetadataPatch],
+}
+
 pub struct LibraryManager {
     root: RootedFs,
     provider: Arc<dyn QueueFileProvider>,
@@ -1056,19 +1110,64 @@ impl LibraryManager {
         hints: &[SourceHint],
         patches: &[MetadataPatch],
     ) -> Result<MovePreview> {
+        self.preview_with_hints_and_patches_and_target_device_resolver(
+            PreviewBuildRequest {
+                item_ids,
+                target_relative_dir,
+                rename,
+                conflict,
+                patches,
+            },
+            hints,
+            |target_path| self.target_parent_device(target_path),
+        )
+    }
+
+    fn target_parent_device(&self, target_path: &str) -> Result<u64> {
+        Ok(
+            resolve_target_parent(&self.root, target_path, Some(self.library_dir_identity))?
+                .identity
+                .device(),
+        )
+    }
+
+    fn preview_with_hints_and_patches_and_target_device_resolver<F>(
+        &self,
+        request: PreviewBuildRequest<'_>,
+        hints: &[SourceHint],
+        mut target_device_for_path: F,
+    ) -> Result<MovePreview>
+    where
+        F: FnMut(&str) -> Result<u64>,
+    {
         let _process_guard = self
             .in_process_lock
             .lock()
             .map_err(|_| anyhow!("media-library lock is poisoned"))?;
         let _disk_guard = self.lock_store()?;
         let snapshot = self.scan_locked(hints)?;
-        self.build_and_persist_preview(
-            &snapshot,
-            item_ids,
-            target_relative_dir,
-            rename,
-            conflict,
-            patches,
+        self.build_and_persist_preview(&snapshot, request, &mut target_device_for_path)
+    }
+
+    #[cfg(test)]
+    fn preview_with_target_device_resolver(
+        &self,
+        item_ids: &[String],
+        target_relative_dir: &str,
+        rename: bool,
+        conflict: ConflictPolicy,
+        target_device_for_path: impl FnMut(&str) -> Result<u64>,
+    ) -> Result<MovePreview> {
+        self.preview_with_hints_and_patches_and_target_device_resolver(
+            PreviewBuildRequest {
+                item_ids,
+                target_relative_dir: Some(target_relative_dir),
+                rename,
+                conflict,
+                patches: &[],
+            },
+            &[],
+            target_device_for_path,
         )
     }
 
@@ -1117,12 +1216,16 @@ impl LibraryManager {
     fn build_and_persist_preview(
         &self,
         snapshot: &LibrarySnapshot,
-        item_ids: &[String],
-        target_relative_dir: Option<&str>,
-        rename: bool,
-        conflict: ConflictPolicy,
-        patches: &[MetadataPatch],
+        request: PreviewBuildRequest<'_>,
+        target_device_for_path: &mut impl FnMut(&str) -> Result<u64>,
     ) -> Result<MovePreview> {
+        let PreviewBuildRequest {
+            item_ids,
+            target_relative_dir,
+            rename,
+            conflict,
+            patches,
+        } = request;
         if item_ids.is_empty() && patches.is_empty() {
             bail!("select at least one media item or metadata patch");
         }
@@ -1168,6 +1271,7 @@ impl LibraryManager {
                 rename,
                 conflict,
                 &mut reserved_targets,
+                target_device_for_path,
             )?;
             preview_anchors.extend(anchors);
             let main_target = files
@@ -1407,6 +1511,7 @@ impl LibraryManager {
         rename: bool,
         conflict: ConflictPolicy,
         reserved_targets: &mut TargetReservationSet,
+        target_device_for_path: &mut impl FnMut(&str) -> Result<u64>,
     ) -> Result<(Vec<FileMovePreview>, HashMap<String, BoundFile>)> {
         let primary = self.absolute_path(&item.relative_path)?;
         let mut source_paths = vec![item.relative_path.clone()];
@@ -1514,15 +1619,20 @@ impl LibraryManager {
         }
         let final_conflicts = self.has_move_conflicts(&source_paths, &targets, reserved_targets)?;
         let mut files = Vec::new();
+        let mut source_devices = Vec::new();
         let mut anchors = HashMap::new();
         for (source_rel, target_rel) in source_paths.iter().zip(targets) {
             let source_abs = self.absolute_path(source_rel)?;
             let skip = final_conflicts && conflict == ConflictPolicy::Skip;
-            let (identity, size) = if skip {
+            let (identity, size, source_device) = if skip {
                 let fingerprint = self.file_fingerprint(&source_abs)?.ok_or_else(|| {
                     anyhow!("selected media or attachment disappeared: {source_rel}")
                 })?;
-                (String::new(), fingerprint.size)
+                (
+                    String::new(),
+                    fingerprint.size,
+                    fingerprint.identity.device(),
+                )
             } else {
                 let BoundFileRead { token, file, .. } = self
                     .read_file_with_token_and_handle(&source_abs, None)?
@@ -1530,9 +1640,11 @@ impl LibraryManager {
                         anyhow!("selected media or attachment disappeared: {source_rel}")
                     })?;
                 let size = token_size(&token)?;
+                let source_device = file.identity().device();
                 anchors.insert(token.clone(), file);
-                (token, size)
+                (token, size, source_device)
             };
+            source_devices.push(source_device);
             files.push(FileMovePreview {
                 source_path: source_rel.clone(),
                 target_path: target_rel,
@@ -1542,6 +1654,20 @@ impl LibraryManager {
         }
         if final_conflicts && conflict == ConflictPolicy::Skip {
             return Ok((files, anchors));
+        }
+        for ((source_path, file), source_device) in
+            source_paths.iter().zip(&files).zip(source_devices)
+        {
+            if source_path == &file.target_path {
+                continue;
+            }
+            let target_device = target_device_for_path(&file.target_path)?;
+            ensure_same_device_for_rename(
+                source_path,
+                &file.target_path,
+                source_device,
+                target_device,
+            )?;
         }
         files.sort_by(|left, right| {
             let left_primary = left.source_path == item.relative_path;
@@ -7579,6 +7705,19 @@ mod tests {
             .expect("fixture media item should be present in the scan")
     }
 
+    fn persisted_preview_count(manager: &LibraryManager) -> usize {
+        fs::read_dir(&manager.library_dir)
+            .expect("private library directory should list")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(PREVIEW_PREFIX) && name.ends_with(".json"))
+            })
+            .count()
+    }
+
     fn queue_hint(source_ids: &[&str], collection: CollectionMetadata) -> SourceHint {
         SourceHint {
             source_ids: source_ids.iter().map(|id| (*id).to_string()).collect(),
@@ -8794,11 +8933,14 @@ mod tests {
 
         let unavailable_preview = manager.build_and_persist_preview(
             &snapshot,
-            std::slice::from_ref(&incomplete_item.id),
-            Some("Moved"),
-            false,
-            ConflictPolicy::Skip,
-            &[],
+            PreviewBuildRequest {
+                item_ids: std::slice::from_ref(&incomplete_item.id),
+                target_relative_dir: Some("Moved"),
+                rename: false,
+                conflict: ConflictPolicy::Skip,
+                patches: &[],
+            },
+            &mut |target_path| manager.target_parent_device(target_path),
         );
         assert!(
             unavailable_preview.is_err(),
@@ -8811,11 +8953,14 @@ mod tests {
         let complete_preview = manager
             .build_and_persist_preview(
                 &snapshot,
-                std::slice::from_ref(&complete_item.id),
-                Some("Moved"),
-                false,
-                ConflictPolicy::Skip,
-                &[],
+                PreviewBuildRequest {
+                    item_ids: std::slice::from_ref(&complete_item.id),
+                    target_relative_dir: Some("Moved"),
+                    rename: false,
+                    conflict: ConflictPolicy::Skip,
+                    patches: &[],
+                },
+                &mut |target_path| manager.target_parent_device(target_path),
             )
             .expect("complete sibling directory should remain movable");
         assert_eq!(complete_preview.items[0].files.len(), 3);
@@ -9816,6 +9961,153 @@ mod tests {
             };
             assert!(validate_metadata_patch(&rejected_collection).is_err());
         }
+    }
+
+    #[test]
+    fn round11_preview_checks_attachment_devices_before_persisting() {
+        let root = TemporaryRoot::new("round11-attachment-device");
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("source media should write");
+        fs::write(root.path().join("clip.srt"), b"subtitle")
+            .expect("subtitle attachment should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("library scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        let device = fs::metadata(root.path())
+            .expect("fixture root metadata should read")
+            .dev();
+        let rejected = manager.preview_with_target_device_resolver(
+            std::slice::from_ref(&item_id),
+            "New/Nested",
+            false,
+            ConflictPolicy::KeepBoth,
+            |target| {
+                if target.ends_with("clip.srt") {
+                    Ok(device ^ 1)
+                } else {
+                    Ok(device)
+                }
+            },
+        );
+        let error = rejected.expect_err("cross-device attachment should reject the preview");
+        assert!(
+            error
+                .to_string()
+                .contains("cross-device moves are unsupported")
+        );
+        assert_eq!(persisted_preview_count(&manager), 0);
+        assert!(!root.path().join("New").exists());
+        assert_eq!(
+            fs::read(root.path().join("clip.mp4")).unwrap(),
+            b"fixture-video"
+        );
+        assert_eq!(fs::read(root.path().join("clip.srt")).unwrap(), b"subtitle");
+
+        let preview = manager
+            .preview(
+                std::slice::from_ref(&item_id),
+                "New/Nested",
+                false,
+                ConflictPolicy::KeepBoth,
+            )
+            .expect("same-device files under not-yet-created parents should preview");
+        assert_eq!(preview.items[0].outcome, MoveOutcome::Move);
+        assert_eq!(preview.items[0].files.len(), 2);
+        assert!(
+            preview.items[0]
+                .files
+                .iter()
+                .any(|file| file.target_path == "New/Nested/clip.mp4")
+        );
+        assert!(
+            preview.items[0]
+                .files
+                .iter()
+                .any(|file| file.target_path == "New/Nested/clip.srt")
+        );
+        assert!(!root.path().join("New").exists());
+        release_preview_anchors(&preview.id);
+    }
+
+    #[test]
+    fn round11_mixed_device_batch_is_rejected_before_preview_persistence() {
+        let root = TemporaryRoot::new("round11-mixed-device-batch");
+        fs::write(root.path().join("first.mp4"), b"first source")
+            .expect("first source should write");
+        fs::write(root.path().join("second.mp4"), b"second source")
+            .expect("second source should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("library scan should complete");
+        let ids = [
+            item_at(&snapshot, "first.mp4").id.clone(),
+            item_at(&snapshot, "second.mp4").id.clone(),
+        ];
+        let device = fs::metadata(root.path())
+            .expect("fixture root metadata should read")
+            .dev();
+        let error = manager
+            .preview_with_target_device_resolver(
+                &ids,
+                "Archive/Nested",
+                false,
+                ConflictPolicy::KeepBoth,
+                |target| {
+                    if target.ends_with("second.mp4") {
+                        Ok(device ^ 1)
+                    } else {
+                        Ok(device)
+                    }
+                },
+            )
+            .expect_err("one cross-device item should reject the whole batch preview");
+        assert!(error.to_string().contains("second.mp4"));
+        assert_eq!(persisted_preview_count(&manager), 0);
+        assert!(!root.path().join("Archive").exists());
+        assert_eq!(
+            fs::read(root.path().join("first.mp4")).unwrap(),
+            b"first source"
+        );
+        assert_eq!(
+            fs::read(root.path().join("second.mp4")).unwrap(),
+            b"second source"
+        );
+    }
+
+    #[test]
+    fn round11_skip_and_noop_previews_do_not_resolve_a_rename_device() {
+        let root = TemporaryRoot::new("round11-skip-noop-device");
+        fs::write(root.path().join("clip.mp4"), b"source").expect("source media should write");
+        fs::create_dir(root.path().join("Existing")).expect("target directory should create");
+        fs::write(root.path().join("Existing/clip.mp4"), b"existing target")
+            .expect("conflicting target should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("library scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+
+        let skipped = manager
+            .preview_with_target_device_resolver(
+                std::slice::from_ref(&item_id),
+                "Existing",
+                false,
+                ConflictPolicy::Skip,
+                |_| panic!("skipped item should not resolve a rename target device"),
+            )
+            .expect("skip policy should remain a valid preview");
+        assert_eq!(skipped.items[0].outcome, MoveOutcome::Skip);
+
+        let noop = manager
+            .preview_with_target_device_resolver(
+                std::slice::from_ref(&item_id),
+                "",
+                false,
+                ConflictPolicy::KeepBoth,
+                |_| panic!("no-op item should not resolve a rename target device"),
+            )
+            .expect("same-path no-op should remain a valid preview");
+        assert_eq!(noop.items[0].outcome, MoveOutcome::NoOp);
+        assert_eq!(noop.items[0].target_path, "clip.mp4");
+        release_preview_anchors(&skipped.id);
+        release_preview_anchors(&noop.id);
     }
 
     #[test]
