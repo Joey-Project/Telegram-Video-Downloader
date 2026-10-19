@@ -40,16 +40,21 @@ superseded_by:
 
 ## Validation
 
-- Rust/Cargo 1.99.1: isolated, locked, offline release build; 770 all-target
+- Rust/Cargo 1.99.1: isolated, locked, offline release build; 771 all-target
   release tests passed, 16 opt-in tests ignored; release all-target Clippy
   with warnings denied and formatting passed.
 - Before switching, both media indexes parse and all 19 indexed video records
   are readable: 14 completed and 5 cancelled. PDF has no indexed tasks.
-- Installer: 33 fake-HOME regression tests, shell integration, Bash syntax,
+- Installer: 39 fake-HOME regression tests, shell integration, Bash syntax,
   ShellCheck, Ruff 0.15.13 lint and formatting pass. Coverage includes a
   temporary build artifact inheriting group `wheel`, strict state backup
   metadata, startup PID visibility, partial-stop failures, and both rollback
   policies. Runtime builds and tests use isolated target/build directories.
+- GitHub review corrections preserve configured media aliases, record media
+  hardlink anchors without reading or copying payloads, and validate/capture the
+  entire saved plist before rollback stops any service. A subprocess regression
+  verifies that startup and exactly two poll markers survive `RUST_LOG=off`
+  while ordinary tracing output remains filtered.
 - Existing main-checkout changes and divergent local history remain untouched.
 
 ## Controlled Cutover and Current Runtime

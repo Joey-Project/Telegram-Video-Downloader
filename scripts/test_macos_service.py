@@ -158,6 +158,136 @@ class InstallationTest(unittest.TestCase):
         self.assertEqual(document, expected)
         self.assertEqual(self.state_snapshot(), self.before_state)
 
+    def snapshot_runner(self, *, on_copy=None, forbidden=()):
+        def copied(argv, **_):
+            self.assertEqual(argv[0], "ditto")
+            source, destination = map(Path, argv[-2:])
+            for payload in forbidden:
+                self.assertNotEqual(source, payload, "media payload must not be copied")
+                self.assertNotIn(source, payload.parents, "media payload parent must not be copied")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, destination)
+            else:
+                shutil.copy2(source, destination)
+            if on_copy:
+                on_copy(source)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        return mock.patch.object(service, "run", side_effect=copied)
+
+    def aliased_media_fixture(self):
+        configured = self.repo / "media/videos"
+        physical = self.root / "physical-videos"
+        configured.rename(physical)
+        configured.symlink_to(physical, target_is_directory=True)
+        return configured, physical
+
+    def test_media_alias_is_preserved_while_snapshot_uses_its_physical_directory(self):
+        configured, physical = self.aliased_media_fixture()
+        original_config = self.config.read_bytes()
+        deployment = self.deployment()
+        plan = self.audit(deployment)
+        self.assertEqual(plan["media"]["video"], str(configured))
+        self.assertEqual(deployment.media["video"], configured)
+        self.assertEqual(plan["working_directory"], str(self.repo))
+        backup = self.root / "aliased-snapshot"
+        backup.mkdir()
+        with self.snapshot_runner():
+            deployment.snapshot_state(backup)
+        document = json.loads((backup / "state-manifest.json").read_text())
+        sources = {Path(entry["source"]) for entry in document["entries"]}
+        self.assertTrue(any(source.is_relative_to(physical) for source in sources))
+        self.assertFalse(any(source.is_relative_to(configured) for source in sources))
+        self.assertEqual(document["media_roots"]["video"]["configured"], str(configured))
+        self.assertEqual(document["media_roots"]["video"]["physical"], str(physical))
+        self.assertEqual(self.config.read_bytes(), original_config)
+        self.assertEqual(self.state_snapshot(), self.before_state)
+        expected = dict(self.original_plist)
+        expected["ProgramArguments"] = [str(deployment.binary), str(self.config)]
+        self.assertEqual(plistlib.loads(deployment.new_plist()), expected)
+
+    def test_snapshot_rejects_media_alias_retargeted_during_copy(self):
+        configured, physical = self.aliased_media_fixture()
+        replacement = self.root / "different-media-root"
+        replacement.mkdir()
+        deployment = self.deployment()
+        self.audit(deployment)
+        backup = self.root / "retargeted-snapshot"
+        backup.mkdir()
+        retargeted = False
+
+        def retarget(_):
+            nonlocal retargeted
+            if not retargeted:
+                configured.unlink()
+                configured.symlink_to(replacement, target_is_directory=True)
+                retargeted = True
+
+        with self.snapshot_runner(on_copy=retarget), self.assertRaises(service.InstallError):
+            deployment.snapshot_state(backup)
+        self.assertTrue(retargeted)
+        self.assertTrue((physical / ".telegram-video-downloader-queue/index.json").is_file())
+        self.assertEqual(list(replacement.iterdir()), [])
+
+    def test_media_binding_allows_child_churn_and_rejects_root_replacement(self):
+        _, physical = self.aliased_media_fixture()
+        deployment = self.deployment()
+        self.audit(deployment)
+        (physical / "new-child-entry").write_bytes(b"benign directory content change")
+        deployment.revalidate_media_bindings()
+        previous = self.root / "previous-physical-videos"
+        physical.rename(previous)
+        physical.mkdir()
+        with self.assertRaises(service.InstallError):
+            deployment.revalidate_media_bindings()
+
+    def test_sparse_media_anchors_are_metadata_only_and_do_not_consume_snapshot_budget(self):
+        media = self.repo / "media/videos"
+        payload = media / "large-video.mp4"
+        with payload.open("wb") as stream:
+            stream.truncate(service.SNAPSHOT_BYTES + 4096)
+        control_anchor = media / ".telegram-video-downloader-control/output.anchor"
+        overwrite = media / ".telegram-video-downloader-overwrite-fixture"
+        overwrite.mkdir()
+        overwrite_anchor = overwrite / ".committed-output-0"
+        os.link(payload, control_anchor)
+        os.link(payload, overwrite_anchor)
+        (overwrite / ".transaction.json").write_text('{"version":4}\n')
+        protected = {payload, control_anchor, overwrite_anchor}
+        original_open = Path.open
+
+        def metadata_only(path, *args, **kwargs):
+            self.assertNotIn(Path(path), protected, "media anchor must not be opened or hashed")
+            return original_open(path, *args, **kwargs)
+
+        deployment = self.deployment()
+        self.audit(deployment)
+        backup = self.root / "anchor-snapshot"
+        backup.mkdir()
+        with (
+            self.snapshot_runner(forbidden=protected),
+            mock.patch.object(Path, "open", metadata_only),
+        ):
+            deployment.snapshot_state(backup)
+        document = json.loads((backup / "state-manifest.json").read_text())
+        anchors = {Path(entry["path"]): entry for entry in document["anchors"]}
+        self.assertEqual(set(anchors), {control_anchor, overwrite_anchor})
+        expected = payload.stat()
+        for entry in anchors.values():
+            self.assertEqual(entry["size"], service.SNAPSHOT_BYTES + 4096)
+            self.assertEqual(entry["device"], expected.st_dev)
+            self.assertEqual(entry["inode"], expected.st_ino)
+            self.assertEqual(entry["links"], 3)
+            self.assertTrue(entry["evidence_only"])
+            self.assertNotIn("sha256", entry)
+            self.assertNotIn("backup", entry)
+        copied_paths = {
+            Path(item["path"]) for entry in document["entries"] for item in entry["files"]
+        }
+        self.assertTrue(copied_paths.isdisjoint(protected))
+        self.assertEqual(self.state_snapshot(), self.before_state)
+
     def test_symlink_source_binary_is_rejected_before_external_commands(self):
         actual = self.repo / "actual-binary"
         self.old_binary.rename(actual)
@@ -500,6 +630,58 @@ class InstallationTest(unittest.TestCase):
         )
         self.assertEqual(self.state_snapshot(), self.before_state)
         self.assertEqual(rolled_back["runtime_state"], "left unchanged")
+
+    def test_default_rollback_rejects_invalid_saved_plist_before_stopping_or_replacing_binary(self):
+        deployment, arguments, events, registry, _ = self.original_rollback_fixture()
+        arguments.original_entrypoint = False
+        saved = arguments.backup / "previous.plist"
+        missing_arguments = dict(self.original_plist)
+        missing_arguments.pop("ProgramArguments")
+        non_string_argument = dict(self.original_plist)
+        non_string_argument["ProgramArguments"] = [str(self.old_binary), 123]
+        explicit_program = {**self.original_plist, "Program": "/unexpected/override"}
+        invalid_documents = {
+            "missing": None,
+            "unparseable": b"not a saved property list",
+            "non_mapping": plistlib.dumps(["unexpected", "list"]),
+            "missing_arguments": plistlib.dumps(missing_arguments),
+            "non_string_argument": plistlib.dumps(non_string_argument),
+            "explicit_program": plistlib.dumps(explicit_program),
+        }
+        installed_bytes = deployment.binary.read_bytes()
+        live_plist = self.plist.read_bytes()
+        for label, contents in invalid_documents.items():
+            with self.subTest(saved_plist=label):
+                if contents is None:
+                    saved.unlink()
+                else:
+                    saved.write_bytes(contents)
+                    saved.chmod(0o600)
+                events.clear()
+                with self.assertRaises(service.InstallError):
+                    service.rollback(arguments)
+                self.assertEqual(deployment.binary.read_bytes(), installed_bytes)
+                self.assertEqual(self.plist.read_bytes(), live_plist)
+                self.assertEqual(registry, {self.gui: 303})
+                self.assertFalse(any(event[:2] == ["launchctl", "bootout"] for event in events))
+                self.assertEqual(self.state_snapshot(), self.before_state)
+
+    def test_default_rollback_uses_captured_plist_when_backup_changes_after_validation(self):
+        deployment, arguments, _, _, _ = self.original_rollback_fixture()
+        arguments.original_entrypoint = False
+        saved = arguments.backup / "previous.plist"
+        stop = service.stop_services
+
+        def change_saved_plist(targets):
+            saved.write_bytes(b"invalid replacement after validation")
+            return stop(targets)
+
+        with mock.patch.object(service, "stop_services", side_effect=change_saved_plist):
+            service.rollback(arguments)
+        expected = dict(self.original_plist)
+        expected["ProgramArguments"] = [str(deployment.binary), str(self.config)]
+        self.assertEqual(plistlib.loads(self.plist.read_bytes()), expected)
+        self.assertEqual(self.state_snapshot(), self.before_state)
 
     def original_rollback_fixture(self):
         original_plist_bytes = self.plist.read_bytes()

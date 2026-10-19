@@ -327,10 +327,7 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
     let mut offset = None;
     let mut startup_poll_successes = 0;
 
-    info!(
-        concurrency = config.bot.concurrency,
-        "telegram local downloader started"
-    );
+    emit_startup_readiness(config.bot.concurrency);
 
     loop {
         tokio::select! {
@@ -342,13 +339,7 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
             updates = telegram.get_updates(offset, config.bot.poll_timeout_seconds) => {
                 match updates {
                     Ok(updates) => {
-                        if startup_poll_successes < 2 {
-                            startup_poll_successes += 1;
-                            info!(
-                                poll = startup_poll_successes,
-                                "telegram polling completed"
-                            );
-                        }
+                        emit_poll_readiness(&mut startup_poll_successes);
                         if let Err(err) = process_telegram_updates(
                             &telegram,
                             &config,
@@ -380,6 +371,18 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
     }
 
     Ok(())
+}
+
+fn emit_startup_readiness(concurrency: usize) {
+    // Deployment readiness must remain observable with a preserved RUST_LOG=off.
+    eprintln!("telegram local downloader started concurrency={concurrency}");
+}
+
+fn emit_poll_readiness(successes: &mut u8) {
+    if *successes < 2 {
+        *successes += 1;
+        eprintln!("telegram polling completed poll={successes}");
+    }
 }
 
 fn spawn_bot_runtime_worker<F>(future: F) -> Result<oneshot::Receiver<Result<()>>>
@@ -9261,6 +9264,48 @@ mod tests {
     use super::*;
 
     static TEST_AUTH_GENERATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[test]
+    fn readiness_markers_ignore_rust_log_off() {
+        const CHILD_FLAG: &str = "TVD_READINESS_TEST_CHILD";
+        const FILTERED_EVENT: &str = "readiness logging filter sentinel";
+        if std::env::var_os(CHILD_FLAG).is_some_and(|value| value == "1") {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap())
+                .init();
+            info!("readiness logging filter sentinel");
+            emit_startup_readiness(2);
+            let mut polls = 0;
+            for _ in 0..3 {
+                emit_poll_readiness(&mut polls);
+            }
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::readiness_markers_ignore_rust_log_off",
+                "--nocapture",
+            ])
+            .env("RUST_LOG", "off")
+            .env(CHILD_FLAG, "1")
+            .output()
+            .expect("readiness child should run without shared environment changes");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "child failed: {stdout}\n{stderr}");
+        assert!(!stdout.contains(FILTERED_EVENT));
+        assert!(!stderr.contains(FILTERED_EVENT));
+        assert_eq!(
+            stderr.lines().collect::<Vec<_>>(),
+            [
+                "telegram local downloader started concurrency=2",
+                "telegram polling completed poll=1",
+                "telegram polling completed poll=2",
+            ]
+        );
+    }
 
     #[test]
     fn episode_failure_results_precede_verbose_worker_logs_and_survive_truncation() {

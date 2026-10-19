@@ -384,6 +384,49 @@ def file_manifest(root, budget=SNAPSHOT_BYTES, deadline=None):
     return entries
 
 
+def media_binding(configured):
+    """Bind an allowed media alias to its physical directory's object identity.
+
+    Child-entry churn and File Provider metadata changes do not change the root
+    object. Only its resolved path and device/inode participate in revalidation.
+    """
+    try:
+        physical = configured.resolve(strict=False)
+        try:
+            metadata = physical.stat()
+        except FileNotFoundError:
+            metadata = None
+    except (OSError, RuntimeError):
+        raise InstallError(f"cannot resolve media root: {configured}") from None
+    if metadata and not stat.S_ISDIR(metadata.st_mode):
+        raise InstallError(f"media root is not a directory: {configured}")
+    return {
+        "configured": str(configured),
+        "physical": str(physical),
+        "device": metadata.st_dev if metadata else None,
+        "inode": metadata.st_ino if metadata else None,
+    }
+
+
+def anchor_evidence(path):
+    """Inspect media hard-link anchors without opening or hashing their payload."""
+    no_symlinks(path)
+    metadata = path.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise InstallError(f"media anchor is not a regular file: {path}")
+    return {
+        "path": str(path),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "size": metadata.st_size,
+        "links": metadata.st_nlink,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "evidence_only": True,
+    }
+
+
 class Deployment:
     def __init__(self, args):
         self.args = args
@@ -459,8 +502,9 @@ class Deployment:
             "video": absolute(downloads.get("video_dir", "~/Movies/Downloads"), self.config.parent),
             "pdf": absolute(downloads.get("pdf_dir", "~/Documents/Downloads"), self.config.parent),
         }
-        for directory in self.media.values():
-            no_symlinks(directory)
+        self.media_bindings = {
+            kind: media_binding(directory) for kind, directory in self.media.items()
+        }
         if self.old_plist or self.old_binary.exists():
             self.requirement, self.identity = signature(self.old_binary)
         else:
@@ -520,6 +564,11 @@ class Deployment:
             }
         )
 
+    def revalidate_media_bindings(self):
+        for kind, directory in self.media.items():
+            if media_binding(directory) != self.media_bindings[kind]:
+                raise InstallError(f"media root binding changed: {directory}")
+
     def snapshot_state(self, backup):
         """Back up config/auth/queue and recovery metadata, never media payloads.
 
@@ -527,7 +576,9 @@ class Deployment:
         evidence, not valid replacements for inode-bound lock/owner records.
         """
         deadline = time.monotonic() + SNAPSHOT_SECONDS
+        self.revalidate_media_bindings()
         candidates = {self.config}
+        anchors = {}
         auth = self.document.get("bilibili", {}).get("auth", {})
         for key, default in [
             ("state_path", "~/.local/state/telegram-video-downloader/bilibili-auth.json"),
@@ -537,12 +588,12 @@ class Deployment:
             no_symlinks(source)
             if source.parent.exists():
                 candidates.update(source.parent.glob(source.name + "*"))
-        for directory in set(self.media.values()):
+        physical_roots = {Path(binding["physical"]) for binding in self.media_bindings.values()}
+        for directory in physical_roots:
             if not directory.exists():
                 continue
             for name in [
                 ".telegram-video-downloader-queue",
-                ".telegram-video-downloader-control",
                 ".telegram-video-downloader.lock",
                 ".telegram-video-downloader.recovery",
             ]:
@@ -565,6 +616,13 @@ class Deployment:
                         part.startswith(".telegram-video-downloader")
                         for part in path.relative_to(directory).parts[:-1]
                     )
+                    # These names are hard links to complete media outputs, not
+                    # recovery metadata. Never copy, hash, or budget their bytes.
+                    if hidden and (
+                        name == "output.anchor" or name.startswith(".committed-output-")
+                    ):
+                        anchors[str(path)] = anchor_evidence(path)
+                        continue
                     if (
                         name.startswith(".telegram-video-downloader-task-")
                         or name.endswith(".pdf.lock")
@@ -573,7 +631,7 @@ class Deployment:
                             and (
                                 name.startswith(".")
                                 or name.endswith(".json")
-                                or name == "output.anchor"
+                                or name in {"output-lock", "recovery-state", "recovery-state.next"}
                             )
                         )
                     ):
@@ -608,12 +666,19 @@ class Deployment:
                 else:
                     hardlinks[identity] = copied
             manifest.append({"source": str(path), "backup": str(destination), "files": originals})
+        for path, evidence in anchors.items():
+            current = anchor_evidence(Path(path))
+            if (current["device"], current["inode"]) != (evidence["device"], evidence["inode"]):
+                raise InstallError(f"media anchor identity changed: {path}")
+        self.revalidate_media_bindings()
         atomic_bytes(
             backup / "state-manifest.json",
             json.dumps(
                 {
                     "restore_policy": "manual; preserve live state and inode-bound lock identities",
                     "entries": manifest,
+                    "media_roots": self.media_bindings,
+                    "anchors": list(anchors.values()),
                 },
                 indent=2,
             ).encode(),
@@ -804,12 +869,78 @@ class Deployment:
             raise
 
 
-def validate_original_entrypoint(backup, transaction):
+def validate_saved_plist(backup, transaction):
+    """Validate rollback inputs completely before stopping or replacing anything."""
+    binary = backup / "previous-binary"
+    if binary.exists():
+        no_symlinks(binary)
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise InstallError("saved previous executable is not a regular executable file")
+        run(
+            [
+                "codesign",
+                "--verify",
+                "--strict",
+                "--test-requirement",
+                "=" + transaction["requirement"],
+                binary,
+            ]
+        )
+    elif transaction["had_plist"]:
+        raise InstallError("saved previous executable is missing")
+    if not transaction["had_plist"]:
+        return None
+    source = backup / "previous.plist"
+    no_symlinks(source)
+    try:
+        with source.open("rb") as stream:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 1024 * 1024:
+                raise InstallError("saved previous plist is not a supported regular plist")
+            contents = stream.read(1024 * 1024 + 1)
+        document = plistlib.loads(contents)
+    except InstallError:
+        raise
+    except Exception:
+        raise InstallError("saved previous plist is missing or invalid") from None
+
+    def valid_string(value):
+        return isinstance(value, str) and bool(value) and "\0" not in value
+
+    if not isinstance(document, dict):
+        raise InstallError("saved previous plist must be a dictionary")
+    if document.get("Label") != transaction["label"]:
+        raise InstallError("saved previous plist Label does not match the selected service")
+    arguments = document.get("ProgramArguments")
+    if (
+        not isinstance(arguments, list)
+        or len(arguments) != 2
+        or not all(valid_string(argument) for argument in arguments)
+        or "Program" in document
+    ):
+        raise InstallError("saved previous plist has unsupported ProgramArguments or Program")
+    for key in ("WorkingDirectory", "StandardOutPath", "StandardErrorPath"):
+        if key in document and (
+            not valid_string(document[key]) or not Path(document[key]).is_absolute()
+        ):
+            raise InstallError(f"saved previous plist has an unsupported {key}")
+    environment = document.get("EnvironmentVariables", {})
+    if not isinstance(environment, dict) or not all(
+        valid_string(key) and isinstance(value, str) and "\0" not in value
+        for key, value in environment.items()
+    ):
+        raise InstallError("saved previous plist has unsupported environment values")
+    return {"bytes": contents, "document": document, "mode": stat.S_IMODE(metadata.st_mode)}
+
+
+def validate_original_entrypoint(backup, transaction, saved=None):
     """Admit an explicitly requested old entry only while its trusted bytes exist."""
     if not transaction["had_plist"] or not (backup / "previous-binary").is_file():
         raise InstallError("original entrypoint rollback requires a saved executable and plist")
-    previous_plist = (backup / "previous.plist").read_bytes()
-    previous = plistlib.loads(previous_plist)
+    if saved is None:
+        saved = validate_saved_plist(backup, transaction)
+    previous_plist = saved["bytes"]
+    previous = saved["document"]
     arguments = previous.get("ProgramArguments", [])
     if len(arguments) != 2 or "Program" in previous:
         raise InstallError("saved plist has no supported original entrypoint")
@@ -840,21 +971,10 @@ def validate_original_entrypoint(backup, transaction):
 
 def restore_binary_and_plist(backup, transaction, *, original_entrypoint=False):
     """Restore executable/plist only, retaining every newer runtime write."""
-    if (backup / "previous-binary").exists():
-        # A damaged backup must not stop a healthy service or replace its binary.
-        run(
-            [
-                "codesign",
-                "--verify",
-                "--strict",
-                "--test-requirement",
-                "=" + transaction["requirement"],
-                backup / "previous-binary",
-            ]
-        )
+    saved = validate_saved_plist(backup, transaction)
     if original_entrypoint:
         # Missing/changed original binaries must fail before interrupting any service.
-        original, _ = validate_original_entrypoint(backup, transaction)
+        original, _ = validate_original_entrypoint(backup, transaction, saved)
     stop_services(transaction["targets"])
     if bot_processes():
         raise InstallError(
@@ -863,7 +983,7 @@ def restore_binary_and_plist(backup, transaction, *, original_entrypoint=False):
     binary = original if original_entrypoint else Path(transaction["binary"])
     if original_entrypoint:
         # Revalidate after stopping before launchd is allowed to execute this path.
-        validate_original_entrypoint(backup, transaction)
+        validate_original_entrypoint(backup, transaction, saved)
     elif (backup / "previous-binary").exists():
         atomic_install(backup / "previous-binary", binary)
         run(
@@ -880,13 +1000,11 @@ def restore_binary_and_plist(backup, transaction, *, original_entrypoint=False):
         binary.unlink()
     plist = Path(transaction["plist"])
     if original_entrypoint:
-        atomic_install(backup / "previous.plist", plist)
+        atomic_bytes(plist, saved["bytes"], saved["mode"])
     elif transaction["had_plist"]:
-        old = plistlib.loads((backup / "previous.plist").read_bytes())
+        old = copy.deepcopy(saved["document"])
         old["ProgramArguments"][0] = str(binary)
-        atomic_bytes(
-            plist, plistlib.dumps(old), stat.S_IMODE((backup / "previous.plist").stat().st_mode)
-        )
+        atomic_bytes(plist, plistlib.dumps(old), saved["mode"])
     elif plist.exists():
         plist.unlink()
     for service in transaction["previous_services"]:

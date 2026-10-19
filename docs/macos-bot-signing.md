@@ -29,6 +29,12 @@ Application Support or remove it as part of Cargo cache cleanup. Copied lock
 backups are recovery evidence; they cannot be blindly substituted for original
 inode-bound objects.
 
+Configured media aliases remain unchanged. Snapshotting resolves and binds the
+physical root, then rejects alias retargeting or root replacement while allowing
+ordinary child-entry changes. Media hardlink anchors such as `output.anchor`
+and committed overwrite anchors are recorded by device/inode, size, and link
+evidence; their video payloads are neither copied nor charged as metadata.
+
 ## Explicit Commands
 
 The macOS installer requires `python3` 3.11 or newer, Apple command-line tools
@@ -57,7 +63,8 @@ replace the plist. For an existing service, only its executable argument changes
 
 Require a single registered/running service, the installed executable and
 expected working directory, the startup-ready marker, and two successful
-Telegram polls from the new process. Startup emits `telegram polling completed`
+Telegram polls from the new process. Startup writes its ready marker and
+`telegram polling completed` directly to stderr, independently of `RUST_LOG`,
 for its first two successful polls; these logs contain no token, URL, or message
 payload. Check queue/completion readability and preserved ownership/permissions.
 Do not use a second `getUpdates` consumer to test polling.
@@ -76,7 +83,9 @@ validated repair respecting lock identities.
 
 Default rollback keeps the restored executable at the fixed installation path,
 so it also works after Cargo output has been removed. It does not prove that the
-restored process reached startup-ready. If the new path needs a privacy grant
+restored process reached startup-ready. Both rollback modes validate and capture
+the saved plist and verify the previous executable before stopping any service.
+If the new path needs a privacy grant
 that the user declines, explicitly restore the original entrypoint instead:
 
 ```sh
