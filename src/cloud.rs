@@ -8,6 +8,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::CloudConfig;
+use crate::file_manager::{PreviewCleanupGate, PreviewCleanupOutcome};
 use crate::file_provider::{
     QueueFileProvider, classify_deadlock_error, is_deadlock_error, platform_queue_file_provider,
 };
@@ -380,6 +381,7 @@ struct InboxStateIndex {
     awaiting_previews: BTreeSet<u64>,
     awaiting_preview_sequences: BTreeMap<String, BTreeSet<u64>>,
     awaiting_preview_id_by_sequence: BTreeMap<u64, String>,
+    awaiting_preview_expiry_millis_by_sequence: BTreeMap<u64, u64>,
     active_confirmations: BTreeMap<String, BTreeSet<(u64, u64)>>,
     active_confirmation_by_sequence: BTreeMap<u64, (String, u64)>,
 }
@@ -407,6 +409,8 @@ impl InboxStateIndex {
                         .insert(record.request.seq);
                     self.awaiting_preview_id_by_sequence
                         .insert(record.request.seq, preview_id.to_string());
+                    self.awaiting_preview_expiry_millis_by_sequence
+                        .insert(record.request.seq, inbox_preview_expiry_millis(record));
                 }
             } else {
                 self.awaiting_previews.remove(&record.request.seq);
@@ -443,6 +447,7 @@ impl InboxStateIndex {
     }
 
     fn unindex_preview_associations(&mut self, seq: u64) {
+        self.awaiting_preview_expiry_millis_by_sequence.remove(&seq);
         if let Some(preview_id) = self.awaiting_preview_id_by_sequence.remove(&seq) {
             let remove_preview = self
                 .awaiting_preview_sequences
@@ -486,6 +491,29 @@ impl InboxStateIndex {
                     .next()
                     .is_some()
             })
+    }
+
+    fn has_preexpiry_confirmation_for_preview(&self, preview_id: &str) -> Option<bool> {
+        let expiry_millis = self
+            .awaiting_preview_sequence(preview_id)
+            .and_then(|sequence| {
+                self.awaiting_preview_expiry_millis_by_sequence
+                    .get(&sequence)
+                    .copied()
+            });
+        match expiry_millis {
+            Some(expiry_millis) => {
+                Some(self.has_active_confirmation_before(preview_id, expiry_millis))
+            }
+            None if self
+                .active_confirmations
+                .get(preview_id)
+                .is_some_and(|confirmations| !confirmations.is_empty()) =>
+            {
+                None
+            }
+            None => Some(false),
+        }
     }
 
     fn sequences_bounded(&self, max_awaiting_previews: usize) -> (BTreeSet<u64>, usize) {
@@ -1757,6 +1785,36 @@ impl CloudInbox {
     }
 }
 
+impl PreviewCleanupGate for CloudInbox {
+    fn remove_preview_if_unconfirmed(
+        &self,
+        preview_id: &str,
+        remove: &mut dyn FnMut() -> Result<bool>,
+    ) -> Result<PreviewCleanupOutcome> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        if !self.recover_interrupted_requests()? {
+            return Ok(PreviewCleanupOutcome::Deferred);
+        }
+        let active = self
+            .state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
+            .has_preexpiry_confirmation_for_preview(preview_id);
+        match active {
+            Some(true) => Ok(PreviewCleanupOutcome::Retained),
+            None => Ok(PreviewCleanupOutcome::Deferred),
+            Some(false) => Ok(if remove()? {
+                PreviewCleanupOutcome::Removed
+            } else {
+                PreviewCleanupOutcome::NotRemoved
+            }),
+        }
+    }
+}
+
 fn create_owner_lock(
     requested_directory: &Path,
     directory: &Path,
@@ -1947,6 +2005,8 @@ pub async fn next_websocket_request(socket: &mut CloudWebSocket) -> Result<Optio
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::mpsc;
+    use std::thread;
     use std::time::SystemTime;
 
     use serde_json::json;
@@ -2823,6 +2883,216 @@ mod tests {
             );
         }
         drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_cleanup_allows_terminal_receipt_without_active_confirmations() {
+        let root = temp_root("preview-cleanup-terminal-receipt");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let mut preview_request = request(1, "preview");
+        preview_request.kind = "file_preview".to_string();
+        preview_request.payload = json!({});
+        inbox
+            .persist(preview_request)
+            .expect("preview request should persist");
+        inbox
+            .update(1, |record| {
+                record.status = InboxStatus::AwaitingConfirmation;
+                record.result = Some(json!({
+                    "preview_id": "terminal-receipt-preview",
+                    "revision": "revision-1",
+                    "preview": {"id": "terminal-receipt-preview", "revision": "revision-1"}
+                }));
+            })
+            .expect("preview should become confirmable");
+        inbox
+            .update(1, |record| record.status = InboxStatus::Stale)
+            .expect("terminal preview should leave the awaiting index");
+
+        let mut unlink_called = false;
+        let mut unlink = || {
+            unlink_called = true;
+            Ok(true)
+        };
+        assert!(matches!(
+            inbox
+                .remove_preview_if_unconfirmed("terminal-receipt-preview", &mut unlink)
+                .expect("terminal receipt with no active confirmations should be known inactive"),
+            PreviewCleanupOutcome::Removed
+        ));
+        assert!(
+            unlink_called,
+            "expired private preview cleanup should proceed"
+        );
+        drop(inbox);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_cleanup_defers_when_active_confirmation_has_no_preview_expiry() {
+        let root = temp_root("preview-cleanup-missing-expiry");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let mut preview_request = request(1, "preview");
+        preview_request.kind = "file_preview".to_string();
+        preview_request.payload = json!({});
+        inbox
+            .persist(preview_request)
+            .expect("preview request should persist");
+        inbox
+            .update(1, |record| {
+                record.status = InboxStatus::AwaitingConfirmation;
+                record.result = Some(json!({
+                    "preview_id": "missing-expiry-preview",
+                    "revision": "revision-1",
+                    "preview": {"id": "missing-expiry-preview", "revision": "revision-1"}
+                }));
+            })
+            .expect("preview should become confirmable");
+
+        let mut confirmation = request(2, "confirm");
+        confirmation.kind = "file_confirm".to_string();
+        confirmation.payload = json!({
+            "preview_id": "missing-expiry-preview",
+            "revision": "revision-1"
+        });
+        confirmation.created_at = now_millis();
+        inbox
+            .persist(confirmation)
+            .expect("active pre-expiry confirmation should persist");
+        inbox
+            .update(1, |record| record.status = InboxStatus::Stale)
+            .expect("terminal preview receipt should leave the expiry index");
+
+        let mut unlink_called = false;
+        let mut unlink = || {
+            unlink_called = true;
+            Ok(true)
+        };
+        assert!(matches!(
+            inbox
+                .remove_preview_if_unconfirmed("missing-expiry-preview", &mut unlink)
+                .expect("missing expiry for an active confirmation should defer cleanup"),
+            PreviewCleanupOutcome::Deferred
+        ));
+        assert!(
+            !unlink_called,
+            "an active confirmation with unknown expiry must retain its private preview"
+        );
+        drop(inbox);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_cleanup_serializes_confirmation_persistence_through_unlink() {
+        let root = temp_root("preview-cleanup-gate-race");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let mut preview_request = request(1, "preview");
+        preview_request.kind = "file_preview".to_string();
+        preview_request.payload = json!({});
+        inbox
+            .persist(preview_request)
+            .expect("preview request should persist");
+        inbox
+            .update(1, |record| {
+                record.status = InboxStatus::AwaitingConfirmation;
+                record.result = Some(json!({
+                    "preview_id": "cleanup-race-preview",
+                    "revision": "revision-1",
+                    "preview": {"id": "cleanup-race-preview", "revision": "revision-1"}
+                }));
+            })
+            .expect("preview should become confirmable");
+
+        let (unlink_started_tx, unlink_started_rx) = mpsc::channel();
+        let (release_unlink_tx, release_unlink_rx) = mpsc::channel();
+        let cleanup_inbox = inbox.clone();
+        let cleanup = thread::spawn(move || {
+            let mut unlink = || {
+                assert!(
+                    cleanup_inbox.operation_lock.try_lock().is_err(),
+                    "the inbox operation lock must remain held through unlink"
+                );
+                unlink_started_tx
+                    .send(())
+                    .expect("cleanup test should signal its final unlink window");
+                release_unlink_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("cleanup test should release the final unlink window");
+                assert!(
+                    cleanup_inbox.operation_lock.try_lock().is_err(),
+                    "confirmation persistence must remain excluded until unlink completes"
+                );
+                Ok(true)
+            };
+            cleanup_inbox.remove_preview_if_unconfirmed("cleanup-race-preview", &mut unlink)
+        });
+        unlink_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cleanup should reach its conditional unlink callback");
+
+        let (persist_started_tx, persist_started_rx) = mpsc::channel();
+        let (persist_done_tx, persist_done_rx) = mpsc::channel();
+        let persist_inbox = inbox.clone();
+        let persistence = thread::spawn(move || {
+            let mut confirmation = request(2, "confirm");
+            confirmation.kind = "file_confirm".to_string();
+            confirmation.payload = json!({
+                "preview_id": "cleanup-race-preview",
+                "revision": "revision-1"
+            });
+            persist_started_tx
+                .send(())
+                .expect("persistence test should signal before writing");
+            let result = persist_inbox.persist(confirmation);
+            persist_done_tx
+                .send(result.is_ok())
+                .expect("persistence test should report completion");
+        });
+        persist_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("confirmation persistence should start");
+        assert!(
+            persist_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "a new active confirmation must not persist between the absence check and unlink"
+        );
+        release_unlink_tx
+            .send(())
+            .expect("cleanup test should release unlink");
+        assert!(matches!(
+            cleanup.join().expect("cleanup worker should finish"),
+            Ok(PreviewCleanupOutcome::Removed)
+        ));
+        assert!(
+            persist_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("confirmation should persist after unlink")
+        );
+        persistence
+            .join()
+            .expect("persistence worker should finish");
+
+        let mut retained = false;
+        let mut should_not_unlink = || {
+            retained = true;
+            Ok(true)
+        };
+        assert!(matches!(
+            inbox
+                .remove_preview_if_unconfirmed("cleanup-race-preview", &mut should_not_unlink)
+                .expect("active confirmation lookup should succeed"),
+            PreviewCleanupOutcome::Retained
+        ));
+        assert!(
+            !retained,
+            "a persisted active confirmation must retain its preview"
+        );
+        drop(inbox);
         let _ = fs::remove_dir_all(root);
     }
 

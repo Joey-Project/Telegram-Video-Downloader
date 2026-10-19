@@ -723,11 +723,28 @@ pub struct LibraryManager {
     provider: Arc<dyn QueueFileProvider>,
     library_dir: PathBuf,
     library_dir_identity: EntryIdentity,
+    preview_cleanup_gate: Option<Arc<dyn PreviewCleanupGate>>,
     in_process_lock: Arc<Mutex<()>>,
     last_snapshot: Arc<Mutex<Option<LibrarySnapshot>>>,
     process_nonce: String,
     #[cfg(test)]
     scan_test_hooks: Arc<Mutex<ScanTestHooks>>,
+}
+
+pub(crate) enum PreviewCleanupOutcome {
+    Removed,
+    Retained,
+    Deferred,
+    NotRemoved,
+}
+
+/// Coordinates preview cleanup with durable Cloud confirmation receipt updates.
+pub(crate) trait PreviewCleanupGate: Send + Sync {
+    fn remove_preview_if_unconfirmed(
+        &self,
+        preview_id: &str,
+        remove: &mut dyn FnMut() -> Result<bool>,
+    ) -> Result<PreviewCleanupOutcome>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -880,6 +897,7 @@ struct ScannedFile {
 #[derive(Debug, Default)]
 struct SidecarIndex {
     by_media: HashMap<String, Vec<String>>,
+    authoritative_nfo_by_media: HashMap<String, String>,
     ambiguous_count: usize,
 }
 
@@ -969,6 +987,33 @@ impl LibraryManager {
         root_path: impl AsRef<Path>,
         provider: Arc<dyn QueueFileProvider>,
     ) -> Result<Self> {
+        Self::open_with_provider_and_optional_preview_cleanup_gate(root_path, provider, None)
+    }
+
+    pub(crate) fn open_with_provider_and_preview_cleanup_gate(
+        root_path: impl AsRef<Path>,
+        provider: Arc<dyn QueueFileProvider>,
+        preview_cleanup_gate: Arc<dyn PreviewCleanupGate>,
+    ) -> Result<Self> {
+        let mut manager = Self::open_with_provider(root_path, provider)?;
+        manager.preview_cleanup_gate = Some(preview_cleanup_gate);
+        Ok(manager)
+    }
+
+    pub(crate) fn open_with_preview_cleanup_gate(
+        root_path: impl AsRef<Path>,
+        preview_cleanup_gate: Arc<dyn PreviewCleanupGate>,
+    ) -> Result<Self> {
+        let mut manager = Self::open(root_path)?;
+        manager.preview_cleanup_gate = Some(preview_cleanup_gate);
+        Ok(manager)
+    }
+
+    fn open_with_provider_and_optional_preview_cleanup_gate(
+        root_path: impl AsRef<Path>,
+        provider: Arc<dyn QueueFileProvider>,
+        preview_cleanup_gate: Option<Arc<dyn PreviewCleanupGate>>,
+    ) -> Result<Self> {
         let root_path = root_path.as_ref().to_path_buf();
         let mut rooted = None;
         let mut bind_root = |accessor_path: &Path| -> Result<()> {
@@ -994,6 +1039,7 @@ impl LibraryManager {
             provider,
             library_dir,
             library_dir_identity,
+            preview_cleanup_gate,
             in_process_lock: Arc::new(Mutex::new(())),
             last_snapshot: Arc::new(Mutex::new(None)),
             process_nonce: PROCESS_NONCE
@@ -1250,6 +1296,15 @@ impl LibraryManager {
             private_library_identity: Some(self.library_dir_identity),
             ..TargetReservationSet::default()
         };
+        let organized_target_dirs = match target_dir.as_deref() {
+            Some(target_dir) => organized_target_directories(
+                &snapshot.items,
+                target_dir,
+                &self.root,
+                &mut reserved_targets,
+            )?,
+            None => HashMap::new(),
+        };
         let mut preview_anchors = HashMap::new();
         for item_id in item_ids {
             let item = items_by_id
@@ -1261,10 +1316,13 @@ impl LibraryManager {
                     item.relative_path
                 );
             }
-            let target_dir = target_dir
-                .as_deref()
-                .ok_or_else(|| anyhow!("a target directory is required for media moves"))?;
-            let item_target_dir = organized_target_dir(item, &snapshot.items, target_dir)?;
+            if target_dir.is_none() {
+                bail!("a target directory is required for media moves");
+            }
+            let item_target_dir = organized_target_dirs
+                .get(&item.id)
+                .cloned()
+                .ok_or_else(|| anyhow!("selected media item has no organized target directory"))?;
             let (files, anchors) = self.preview_files_for_item(
                 item,
                 &item_target_dir,
@@ -1331,15 +1389,29 @@ impl LibraryManager {
         if !patches.is_empty() {
             for source_item in &snapshot.items {
                 let source_media = self.absolute_path(&source_item.relative_path)?;
-                let source_nfo = with_extension(&source_media, "nfo");
-                let source_nfo_relative = path_to_relative_string(
-                    source_nfo.strip_prefix(self.root.logical_root_path())?,
-                )?;
-                let key = reserved_targets.key_for(&self.root, &source_nfo_relative)?;
-                source_nfo_owners
-                    .entry(key)
-                    .or_default()
-                    .push(source_item.id.as_str());
+                let canonical_nfo = with_extension(&source_media, "nfo");
+                let mut source_nfo_paths = vec![path_to_relative_string(
+                    canonical_nfo.strip_prefix(self.root.logical_root_path())?,
+                )?];
+                source_nfo_paths.extend(
+                    source_item
+                        .attachments
+                        .iter()
+                        .filter(|attachment| attachment.kind == "nfo")
+                        .map(|attachment| attachment.relative_path.clone()),
+                );
+                if let Some(authoritative) = &source_item.authoritative_nfo_path {
+                    source_nfo_paths.push(authoritative.clone());
+                }
+                source_nfo_paths.sort();
+                source_nfo_paths.dedup();
+                for source_nfo_relative in source_nfo_paths {
+                    let key = reserved_targets.key_for(&self.root, &source_nfo_relative)?;
+                    source_nfo_owners
+                        .entry(key)
+                        .or_default()
+                        .push(source_item.id.as_str());
+                }
             }
         }
         let mut patch_target_owners: HashMap<TargetReservationKey, &str> = HashMap::new();
@@ -1367,15 +1439,44 @@ impl LibraryManager {
                 .read_file_with_token_and_handle(&source_media, None)?
                 .ok_or_else(|| anyhow!("selected media disappeared before metadata preview"))?;
             preview_anchors.insert(media_identity.clone(), media_file);
-            let target_media = move_targets
+            let move_target = move_targets
                 .get(patch.item_id.as_str())
-                .filter(|entry| entry.outcome == MoveOutcome::Move)
+                .filter(|entry| entry.outcome == MoveOutcome::Move);
+            if let Some(authoritative) = &item.authoritative_nfo_path
+                && !item.attachments.iter().any(|attachment| {
+                    attachment.kind == "nfo" && attachment.relative_path == *authoritative
+                })
+            {
+                bail!("selected authoritative NFO is not attached to the scanned media item");
+            }
+            let target_media = move_target
                 .map(|entry| entry.target_path.as_str())
                 .unwrap_or(&item.relative_path);
-            let source_nfo = with_extension(&source_media, "nfo");
-            let target_nfo = with_extension(&self.absolute_path(target_media)?, "nfo");
-            let target_nfo_relative =
-                path_to_relative_string(target_nfo.strip_prefix(self.root.logical_root_path())?)?;
+            let source_nfo_relative = match &item.authoritative_nfo_path {
+                Some(path) => path.clone(),
+                None => {
+                    let source_nfo = with_extension(&source_media, "nfo");
+                    path_to_relative_string(
+                        source_nfo.strip_prefix(self.root.logical_root_path())?,
+                    )?
+                }
+            };
+            let target_nfo_relative = match (&item.authoritative_nfo_path, move_target) {
+                (Some(source_nfo), Some(move_item)) => move_item
+                    .files
+                    .iter()
+                    .find(|file| file.source_path == *source_nfo)
+                    .map(|file| file.target_path.clone())
+                    .ok_or_else(|| anyhow!("authoritative NFO was omitted from the move plan"))?,
+                (Some(source_nfo), None) => source_nfo.clone(),
+                (None, _) => {
+                    let target_nfo = with_extension(&self.absolute_path(target_media)?, "nfo");
+                    path_to_relative_string(
+                        target_nfo.strip_prefix(self.root.logical_root_path())?,
+                    )?
+                }
+            };
+            let source_nfo = self.absolute_path(&source_nfo_relative)?;
             let target_nfo_key = reserved_targets.key_for(&self.root, &target_nfo_relative)?;
             if source_nfo_owners
                 .get(&target_nfo_key)
@@ -1418,6 +1519,9 @@ impl LibraryManager {
                         Some((decoded.mode & 0o777) as u16),
                         Some(bytes),
                     )
+                }
+                None if item.authoritative_nfo_path.is_some() => {
+                    bail!("authoritative NFO disappeared before metadata preview")
                 }
                 None => (None, None, None, None),
             };
@@ -2735,12 +2839,15 @@ impl LibraryManager {
                     &id,
                     retention,
                 ) {
-                    Ok(true) => {
+                    Ok(PreviewCleanupOutcome::Removed) => {
                         if kind == OperationStateFileKind::Preview {
                             release_preview_anchors(&id);
                         }
                     }
-                    Ok(false) => {}
+                    Ok(PreviewCleanupOutcome::Deferred) => warnings.push(format!(
+                        "retained expired preview {id} while cloud confirmation state cannot be verified"
+                    )),
+                    Ok(PreviewCleanupOutcome::Retained | PreviewCleanupOutcome::NotRemoved) => {}
                     Err(error) => warnings.push(format!(
                         "retained persisted operation-state file after safe cleanup could not be verified: {error:#}"
                     )),
@@ -2866,15 +2973,27 @@ impl LibraryManager {
         kind: OperationStateFileKind,
         id: &str,
         retention: Duration,
-    ) -> Result<bool> {
-        self.remove_operation_state_candidate_with_hook(
-            candidate,
-            limit,
-            kind,
-            id,
-            retention,
-            || {},
-        )
+    ) -> Result<PreviewCleanupOutcome> {
+        let mut remove = || {
+            self.remove_operation_state_candidate_with_hook(
+                candidate,
+                limit,
+                kind,
+                id,
+                retention,
+                || {},
+            )
+        };
+        if kind == OperationStateFileKind::Preview
+            && let Some(gate) = self.preview_cleanup_gate.as_ref()
+        {
+            return gate.remove_preview_if_unconfirmed(id, &mut remove);
+        }
+        Ok(if remove()? {
+            PreviewCleanupOutcome::Removed
+        } else {
+            PreviewCleanupOutcome::NotRemoved
+        })
     }
 
     fn remove_operation_state_candidate_with_hook(
@@ -3758,6 +3877,7 @@ impl LibraryManager {
                         source_ids: Vec::new(),
                         collection: None,
                         attachments: Vec::new(),
+                        authoritative_nfo_path: None,
                         confidence: Confidence::Low,
                         metadata_status: status,
                         integrity_status: IntegrityStatus::Unverified,
@@ -3789,6 +3909,9 @@ impl LibraryManager {
         let mut title = title_from_name;
         let mut source_ids = ids_from_path(&media.relative_path);
         let mut collection = None;
+        let authoritative_nfo_path = sidecars
+            .authoritative_nfo(&media.relative_path)
+            .map(str::to_owned);
         let mut nfo_title_present = false;
         let mut nfo_source_id_present = false;
         let mut sidecar_title_present = false;
@@ -3807,6 +3930,9 @@ impl LibraryManager {
             }
             let lower = attachment.to_ascii_lowercase();
             if lower.ends_with(".nfo") {
+                if authoritative_nfo_path.as_deref() != Some(attachment.as_str()) {
+                    continue;
+                }
                 let path = self.absolute_path(attachment)?;
                 match self.read_file(&path, SIDE_CAR_LIMIT) {
                     Ok(Some(contents)) => match String::from_utf8(contents) {
@@ -3843,7 +3969,12 @@ impl LibraryManager {
                             warnings.push(format!("NFO is not UTF-8: {attachment}"));
                         }
                     },
-                    Ok(None) => {}
+                    Ok(None) => {
+                        sidecar_unreadable = true;
+                        warnings.push(format!(
+                            "authoritative NFO disappeared during scan: {attachment}"
+                        ));
+                    }
                     Err(error) => {
                         sidecar_unreadable = true;
                         warnings.push(format!("NFO unavailable at {attachment}: {error:#}"));
@@ -3932,6 +4063,7 @@ impl LibraryManager {
                 source_ids,
                 collection,
                 attachments: library_attachments,
+                authoritative_nfo_path,
                 confidence,
                 metadata_status,
                 integrity_status: IntegrityStatus::Unverified,
@@ -4576,48 +4708,158 @@ fn part_ordinal(part_id: &str) -> Option<u32> {
     digits.parse::<u32>().ok().filter(|ordinal| *ordinal > 0)
 }
 
-fn organized_target_dir(
-    item: &LibraryItem,
-    all_items: &[LibraryItem],
+fn organized_target_directories(
+    items: &[LibraryItem],
     base: &Path,
-) -> Result<PathBuf> {
-    let Some(collection) = item
-        .collection
-        .as_ref()
-        .filter(|collection| !collection.kind.trim().is_empty())
-    else {
-        return Ok(base.to_path_buf());
+    root: &RootedFs,
+    reservations: &mut TargetReservationSet,
+) -> Result<HashMap<String, PathBuf>> {
+    let mut key_for = |path: &Path| {
+        let relative_path = path_to_relative_string(path)?;
+        reservations.key_for(root, &relative_path)
     };
-    let title = collection.title.trim();
-    if title.is_empty() {
-        return Ok(base.to_path_buf());
-    }
-    let mut folder = safe_file_stem(title);
-    let has_title_collision = all_items.iter().any(|other| {
-        if other.id == item.id {
-            return false;
-        }
-        let Some(other_collection) = other
+    organized_target_directories_with_key(items, base, &mut key_for)
+}
+
+fn organized_target_directories_with_key<F>(
+    items: &[LibraryItem],
+    base: &Path,
+    key_for: &mut F,
+) -> Result<HashMap<String, PathBuf>>
+where
+    F: FnMut(&Path) -> Result<TargetReservationKey>,
+{
+    let mut collection_titles = BTreeMap::<Vec<u8>, String>::new();
+    let mut collection_identities_by_item = HashMap::new();
+    for item in items {
+        let Some(collection) = item
             .collection
             .as_ref()
-            .filter(|value| !value.kind.trim().is_empty())
+            .filter(|collection| !collection.kind.trim().is_empty())
         else {
-            return false;
+            continue;
         };
-        normalize_title(&other_collection.title) == normalize_title(title)
-            && (other_collection.kind != collection.kind || other_collection.id != collection.id)
-    });
-    if has_title_collision
-        && let Some(id) = collection.id.as_deref().filter(|id| !id.trim().is_empty())
-    {
-        folder = format!("{} [{}]", folder, safe_file_stem(id));
+        let title = collection.title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        let identity = collection_directory_identity(collection)?;
+        collection_titles
+            .entry(identity.clone())
+            .and_modify(|existing| {
+                if title < existing.as_str() {
+                    *existing = title.to_string();
+                }
+            })
+            .or_insert_with(|| title.to_string());
+        collection_identities_by_item.insert(item.id.as_str(), identity);
     }
-    let base_name = base.file_name().and_then(OsStr::to_str).unwrap_or_default();
-    if normalize_title(base_name) == normalize_title(&folder) {
-        Ok(base.to_path_buf())
-    } else {
-        Ok(base.join(folder))
+
+    let identities = collection_titles.keys().cloned().collect::<Vec<_>>();
+    let mut hashed_identities = HashSet::<Vec<u8>>::new();
+    let mut base_name_owners = HashMap::<TargetReservationKey, Vec<Vec<u8>>>::new();
+    for identity in &identities {
+        let title = &collection_titles[identity];
+        let candidate = base.join(safe_file_stem(title));
+        base_name_owners
+            .entry(key_for(&candidate)?)
+            .or_default()
+            .push(identity.clone());
     }
+    for owners in base_name_owners.values().filter(|owners| owners.len() > 1) {
+        hashed_identities.extend(owners.iter().cloned());
+    }
+
+    const MAX_COLLISION_PASSES: usize = 8;
+    let mut collision_passes = 0usize;
+    let mut hash_round = 0u32;
+    let folder_names = loop {
+        let mut folders = BTreeMap::<Vec<u8>, String>::new();
+        let mut final_name_owners = HashMap::<TargetReservationKey, Vec<Vec<u8>>>::new();
+        for identity in &identities {
+            let title = &collection_titles[identity];
+            let stem = safe_file_stem(title);
+            let folder = if hashed_identities.contains(identity) {
+                let discriminator = collection_directory_discriminator(identity, hash_round)?;
+                format!("{stem} [{discriminator}]")
+            } else {
+                stem
+            };
+            let target_path = base.join(&folder);
+            final_name_owners
+                .entry(key_for(&target_path)?)
+                .or_default()
+                .push(identity.clone());
+            folders.insert(identity.clone(), folder);
+        }
+
+        let collisions = final_name_owners
+            .into_values()
+            .filter(|owners| owners.len() > 1)
+            .collect::<Vec<_>>();
+        if collisions.is_empty() {
+            break folders;
+        }
+
+        collision_passes += 1;
+        if collision_passes > MAX_COLLISION_PASSES {
+            bail!("collection folder names cannot be disambiguated within the retry limit");
+        }
+
+        let mut newly_hashed = false;
+        for owners in collisions {
+            for identity in owners {
+                newly_hashed |= hashed_identities.insert(identity);
+            }
+        }
+        if !newly_hashed {
+            hash_round = hash_round
+                .checked_add(1)
+                .filter(|round| *round < 8)
+                .ok_or_else(|| anyhow!("collection folder names cannot be disambiguated safely"))?;
+        }
+    };
+
+    let base_name = base.file_name().and_then(OsStr::to_str);
+    let base_parent = base.parent().unwrap_or_else(|| Path::new(""));
+    let base_key = base_name
+        .map(|name| key_for(&base_parent.join(name)))
+        .transpose()?;
+
+    let mut targets = HashMap::with_capacity(items.len());
+    for item in items {
+        let Some(identity) = collection_identities_by_item.get(item.id.as_str()) else {
+            targets.insert(item.id.clone(), base.to_path_buf());
+            continue;
+        };
+        let folder = folder_names
+            .get(identity)
+            .ok_or_else(|| anyhow!("collection folder identity was not indexed"))?;
+        let folder_key = key_for(&base_parent.join(folder))?;
+        let target_dir = if base_key.as_ref().is_some_and(|key| *key == folder_key) {
+            base.to_path_buf()
+        } else {
+            base.join(folder)
+        };
+        targets.insert(item.id.clone(), target_dir);
+    }
+    Ok(targets)
+}
+
+fn collection_directory_identity(collection: &CollectionMetadata) -> Result<Vec<u8>> {
+    let (identity_source, collection_key) =
+        match collection.id.as_deref().filter(|id| !id.trim().is_empty()) {
+            Some(id) => ("id", id.trim()),
+            None => ("title", collection.title.trim()),
+        };
+    serde_json::to_vec(&(collection.kind.trim(), identity_source, collection_key))
+        .context("serialize collection directory identity")
+}
+
+fn collection_directory_discriminator(identity: &[u8], round: u32) -> Result<String> {
+    let encoded_identity = serde_json::to_vec(&(identity, round))
+        .context("serialize collection directory discriminator")?;
+    Ok(format!("{:x}", Sha256::digest(encoded_identity)))
 }
 
 fn file_name_with_stem(source: &Path, stem: &str) -> Result<String> {
@@ -5687,6 +5929,46 @@ impl SidecarIndex {
         for attachments in index.by_media.values_mut() {
             attachments.sort();
         }
+        for (media_relative_path, attachments) in &index.by_media {
+            let media = Path::new(media_relative_path);
+            let parent = media
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy()
+                .into_owned();
+            let semantics = directory_name_semantics
+                .get(&parent)
+                .copied()
+                .ok_or_else(|| anyhow!("filesystem name semantics unavailable under {parent}"))?;
+            let Some(media_stem) = media.file_stem().and_then(OsStr::to_str) else {
+                continue;
+            };
+            let media_key =
+                target_component_key_with(media_stem, semantics, |value| case_fold(value))?;
+            let mut candidates = Vec::new();
+            for attachment in attachments
+                .iter()
+                .filter(|attachment| attachment_kind(attachment) == "nfo")
+            {
+                let Some(nfo_stem) = Path::new(attachment).file_stem().and_then(OsStr::to_str)
+                else {
+                    continue;
+                };
+                let nfo_key =
+                    target_component_key_with(nfo_stem, semantics, |value| case_fold(value))?;
+                candidates.push((nfo_key == media_key, attachment.clone()));
+            }
+            candidates.sort_by(|(left_exact, left_path), (right_exact, right_path)| {
+                right_exact
+                    .cmp(left_exact)
+                    .then_with(|| left_path.cmp(right_path))
+            });
+            if let Some((_, authoritative_nfo)) = candidates.into_iter().next() {
+                index
+                    .authoritative_nfo_by_media
+                    .insert(media_relative_path.clone(), authoritative_nfo);
+            }
+        }
         Ok(index)
     }
 
@@ -5695,6 +5977,12 @@ impl SidecarIndex {
             .get(&media.relative_path)
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn authoritative_nfo(&self, media_relative_path: &str) -> Option<&str> {
+        self.authoritative_nfo_by_media
+            .get(media_relative_path)
+            .map(String::as_str)
     }
 }
 
@@ -7741,6 +8029,7 @@ mod tests {
             source_ids: Vec::new(),
             collection: None,
             attachments: Vec::new(),
+            authoritative_nfo_path: None,
             confidence: Confidence::Low,
             metadata_status: MetadataStatus::Unknown,
             integrity_status: IntegrityStatus::Unverified,
@@ -10338,6 +10627,251 @@ mod tests {
     }
 
     #[test]
+    fn metadata_patch_uses_the_scanned_uppercase_nfo_path() {
+        let root = TemporaryRoot::new("uppercase-nfo-patch");
+        fs::write(root.path().join("Movie.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        fs::write(
+            root.path().join("Movie.NFO"),
+            "<movie><title>Original title</title><future>keep me</future></movie>",
+        )
+        .expect("uppercase NFO fixture should write");
+
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let item = item_at(&snapshot, "Movie.mp4");
+        assert_eq!(item.authoritative_nfo_path.as_deref(), Some("Movie.NFO"));
+        assert_eq!(item.title, "Original title");
+
+        let serialized = serde_json::to_value(item).expect("library item should serialize");
+        assert!(
+            serialized.get("authoritative_nfo_path").is_none(),
+            "the scan-local NFO selection must not persist into an old index"
+        );
+        let restored: LibraryItem =
+            serde_json::from_value(serialized).expect("legacy library item should deserialize");
+        assert!(restored.authoritative_nfo_path.is_none());
+
+        let patch = MetadataPatch {
+            item_id: item.id.clone(),
+            title: Some("Updated title".to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+        };
+        let preview = manager
+            .preview_with_hints_and_patches(
+                std::slice::from_ref(&item.id),
+                Some("Moved"),
+                false,
+                ConflictPolicy::KeepBoth,
+                &[],
+                &[patch],
+            )
+            .expect("the selected existing NFO should move and patch together");
+        assert!(preview.items[0].files.iter().any(|file| {
+            file.source_path == "Movie.NFO" && file.target_path == "Moved/Movie.NFO"
+        }));
+        assert_eq!(preview.metadata_patches[0].nfo_path, "Moved/Movie.NFO");
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed NFO patch should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+        let patched = fs::read_to_string(root.path().join("Moved/Movie.NFO"))
+            .expect("the mapped uppercase target should remain readable");
+        assert!(patched.contains("<title>Updated title</title>"));
+        assert!(patched.contains("<future>keep me</future>"));
+        let moved_dir = root.path().join("Moved");
+        let nfo_names = fs::read_dir(&moved_dir)
+            .expect("moved fixture directory should list")
+            .map(|entry| {
+                entry
+                    .expect("directory entry should read")
+                    .file_name()
+                    .into_string()
+                    .expect("fixture names should be UTF-8")
+            })
+            .filter(|name| name.to_ascii_lowercase().ends_with(".nfo"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            nfo_names,
+            vec!["Movie.NFO".to_string()],
+            "the patch must follow the move mapping instead of creating a lowercase sibling"
+        );
+        assert!(!root.path().join("Movie.nfo").exists());
+
+        let rescanned = manager.scan(&[]).expect("patched NFO should rescan");
+        let rescanned_item = item_at(&rescanned, "Moved/Movie.mp4");
+        assert_eq!(
+            rescanned_item.authoritative_nfo_path.as_deref(),
+            Some("Moved/Movie.NFO")
+        );
+        assert_eq!(rescanned_item.title, "Updated title");
+    }
+
+    #[test]
+    fn exact_nfo_wins_over_a_dotted_suffix_nfo() {
+        let root = TemporaryRoot::new("exact-nfo-priority");
+        fs::write(root.path().join("Movie.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        fs::write(
+            root.path().join("Movie.nfo"),
+            "<movie><title>Exact title</title></movie>",
+        )
+        .expect("exact NFO should write");
+        let suffix_nfo = "<movie><title>Suffix title</title><future>suffix stays</future></movie>";
+        fs::write(root.path().join("Movie.zz.nfo"), suffix_nfo).expect("suffix NFO should write");
+
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let item = item_at(&snapshot, "Movie.mp4");
+        assert_eq!(item.authoritative_nfo_path.as_deref(), Some("Movie.nfo"));
+        assert_eq!(item.title, "Exact title");
+
+        let patch = MetadataPatch {
+            item_id: item.id.clone(),
+            title: Some("Updated exact title".to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+        };
+        let preview = manager
+            .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
+            .expect("the exact-stem NFO should be selected");
+        assert_eq!(preview.metadata_patches[0].nfo_path, "Movie.nfo");
+        manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed exact NFO patch should complete");
+
+        assert!(
+            fs::read_to_string(root.path().join("Movie.nfo"))
+                .unwrap()
+                .contains("<title>Updated exact title</title>")
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("Movie.zz.nfo")).unwrap(),
+            suffix_nfo,
+            "the non-authoritative suffix NFO must remain unchanged"
+        );
+        let rescanned = manager.scan(&[]).expect("patched exact NFO should rescan");
+        assert_eq!(
+            item_at(&rescanned, "Movie.mp4").title,
+            "Updated exact title"
+        );
+    }
+
+    #[test]
+    fn move_and_patch_preserve_the_selected_suffixed_nfo_path() {
+        let root = TemporaryRoot::new("move-suffixed-nfo");
+        fs::write(root.path().join("Movie.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        fs::write(
+            root.path().join("Movie.en.nfo"),
+            "<movie><title>Original title</title><future>keep me</future></movie>",
+        )
+        .expect("language-suffixed NFO should write");
+
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let item = item_at(&snapshot, "Movie.mp4");
+        assert_eq!(item.authoritative_nfo_path.as_deref(), Some("Movie.en.nfo"));
+        let patch = MetadataPatch {
+            item_id: item.id.clone(),
+            title: Some("Moved title".to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+        };
+        let preview = manager
+            .preview_with_hints_and_patches(
+                std::slice::from_ref(&item.id),
+                Some("Moved"),
+                false,
+                ConflictPolicy::KeepBoth,
+                &[],
+                &[patch],
+            )
+            .expect("move and metadata patch should preview together");
+        assert!(preview.items[0].files.iter().any(|file| {
+            file.source_path == "Movie.en.nfo" && file.target_path == "Moved/Movie.en.nfo"
+        }));
+        assert_eq!(
+            preview.metadata_patches[0].nfo_path, "Moved/Movie.en.nfo",
+            "the patch target must follow the selected attachment's actual move mapping"
+        );
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("move and patch should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+        let patched = fs::read_to_string(root.path().join("Moved/Movie.en.nfo"))
+            .expect("moved NFO should be updated at its mapped path");
+        assert!(patched.contains("<title>Moved title</title>"));
+        assert!(patched.contains("<future>keep me</future>"));
+
+        let rescanned = manager.scan(&[]).expect("moved item should rescan");
+        let moved_item = item_at(&rescanned, "Moved/Movie.mp4");
+        assert_eq!(
+            moved_item.authoritative_nfo_path.as_deref(),
+            Some("Moved/Movie.en.nfo")
+        );
+        assert_eq!(moved_item.title, "Moved title");
+    }
+
+    #[test]
+    fn missing_authoritative_nfo_does_not_fall_back_to_create_canonical_path() {
+        let root = TemporaryRoot::new("missing-authoritative-nfo");
+        fs::write(root.path().join("Movie.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        fs::write(
+            root.path().join("Movie.NFO"),
+            "<movie><title>Original title</title></movie>",
+        )
+        .expect("uppercase NFO should write");
+
+        let manager = manager(&root);
+        let _process_guard = manager
+            .in_process_lock
+            .lock()
+            .expect("manager process lock should be available");
+        let _disk_guard = manager
+            .lock_store()
+            .expect("manager store lock should be available");
+        let snapshot = manager
+            .scan_locked(&[])
+            .expect("scan should complete under the normal manager locks");
+        let item = item_at(&snapshot, "Movie.mp4");
+        assert_eq!(item.authoritative_nfo_path.as_deref(), Some("Movie.NFO"));
+        fs::remove_file(root.path().join("Movie.NFO"))
+            .expect("selected NFO should disappear before preview");
+        let patch = MetadataPatch {
+            item_id: item.id.clone(),
+            title: Some("Replacement title".to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+        };
+
+        let mut no_target_device = |_target_path: &str| Ok(0_u64);
+        let error = manager
+            .build_and_persist_preview(
+                &snapshot,
+                PreviewBuildRequest {
+                    item_ids: &[],
+                    target_relative_dir: None,
+                    rename: false,
+                    conflict: ConflictPolicy::Skip,
+                    patches: std::slice::from_ref(&patch),
+                },
+                &mut no_target_device,
+            )
+            .expect_err("a disappeared selected NFO must reject the metadata preview");
+        assert!(
+            error.to_string().contains("authoritative NFO disappeared"),
+            "unexpected preview error: {error:#}"
+        );
+        assert_eq!(persisted_preview_count(&manager), 0);
+        assert!(!root.path().join("Movie.nfo").exists());
+    }
+
+    #[test]
     fn repeated_metadata_patch_expands_self_closing_tag_without_losing_siblings() {
         let original = "<movie><title/><futureField key=\"x\">keep &amp; opaque</futureField><actor>keep actor</actor></movie>";
         let first_patch = MetadataPatch {
@@ -11162,6 +11696,287 @@ mod tests {
                 .iter()
                 .map(|item| &item.target_path)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    fn organized_collection_fixture(
+        item_id: &str,
+        title: &str,
+        collection_kind: &str,
+        collection_id: Option<&str>,
+    ) -> LibraryItem {
+        let mut item = index_fixture_item(item_id, "clip.mp4", Presence::Present);
+        item.collection = Some(CollectionMetadata {
+            id: collection_id.map(str::to_string),
+            title: title.to_string(),
+            kind: collection_kind.to_string(),
+            order: None,
+            part_id: None,
+        });
+        item
+    }
+
+    fn organized_test_case_fold(value: &str) -> Result<String> {
+        let mut folded = String::new();
+        for character in value.chars() {
+            match character {
+                'ß' | 'ẞ' => folded.push_str("ss"),
+                'ς' => folded.push('σ'),
+                _ => folded.extend(character.to_lowercase()),
+            }
+        }
+        Ok(folded)
+    }
+
+    fn organized_test_target_key(
+        path: &Path,
+        semantics: TargetNameSemantics,
+    ) -> Result<TargetReservationKey> {
+        let components = path
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => {
+                    let name = name
+                        .to_str()
+                        .ok_or_else(|| anyhow!("test target component is not UTF-8"))?;
+                    target_component_key_with(name, semantics, organized_test_case_fold)
+                }
+                _ => bail!("test target path has an unexpected component"),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(TargetReservationKey {
+            directory_device: 7,
+            directory_inode: 9,
+            components,
+        })
+    }
+
+    #[test]
+    fn organized_collection_directories_disambiguate_sanitized_ids_and_truncated_titles() {
+        let mut long_title_a = "x".repeat(150);
+        long_title_a.push_str("-first");
+        let mut long_title_b = "x".repeat(150);
+        long_title_b.push_str("-second");
+        let items = vec![
+            organized_collection_fixture("one", "AC/DC", "series", Some("set/a")),
+            organized_collection_fixture("two", "AC:DC", "series", Some("set:a")),
+            organized_collection_fixture("three", "No/ID", "series", None),
+            organized_collection_fixture("four", "No:ID", "series", None),
+            organized_collection_fixture("five", &long_title_a, "series", None),
+            organized_collection_fixture("six", &long_title_b, "series", None),
+        ];
+        let case_insensitive = TargetNameSemantics {
+            normalization_insensitive: true,
+            case_insensitive: true,
+            hfs_ignorable: false,
+        };
+        let mut key_for = |path: &Path| organized_test_target_key(path, case_insensitive);
+        let targets =
+            organized_target_directories_with_key(&items, Path::new("Organized"), &mut key_for)
+                .expect("colliding collection names should receive deterministic folders");
+
+        for (first, second) in [("one", "two"), ("three", "four"), ("five", "six")] {
+            let first_target = targets.get(first).unwrap();
+            let second_target = targets.get(second).unwrap();
+            assert_ne!(first_target, second_target);
+            let first_name = first_target.file_name().unwrap().to_str().unwrap();
+            let second_name = second_target.file_name().unwrap().to_str().unwrap();
+            assert!(first_name.len() <= 217, "component was {first_name:?}");
+            assert!(second_name.len() <= 217, "component was {second_name:?}");
+            assert!(first_name.ends_with(']'));
+            assert!(second_name.ends_with(']'));
+        }
+        assert_eq!(
+            safe_file_stem(&"x".repeat(150)).len() + 2 + 64 + 1,
+            217,
+            "the largest disambiguated component must fit the 217-byte budget"
+        );
+    }
+
+    #[test]
+    fn organized_collection_directories_follow_case_and_unicode_target_semantics() {
+        let items = [
+            organized_collection_fixture("upper", "Series", "series", Some("upper-id")),
+            organized_collection_fixture("lower", "series", "series", Some("lower-id")),
+            organized_collection_fixture("composed", "Café", "series", Some("composed-id")),
+            organized_collection_fixture(
+                "decomposed",
+                "Cafe\u{301}",
+                "series",
+                Some("decomposed-id"),
+            ),
+        ];
+        let case_sensitive = TargetNameSemantics {
+            normalization_insensitive: true,
+            case_insensitive: false,
+            hfs_ignorable: false,
+        };
+        let mut sensitive_key = |path: &Path| organized_test_target_key(path, case_sensitive);
+        let sensitive_targets = organized_target_directories_with_key(
+            &items[..2],
+            Path::new("Organized"),
+            &mut sensitive_key,
+        )
+        .expect("case-sensitive target names should preserve case distinctions");
+        assert_eq!(sensitive_targets["upper"], Path::new("Organized/Series"));
+        assert_eq!(sensitive_targets["lower"], Path::new("Organized/series"));
+
+        let case_insensitive = TargetNameSemantics {
+            case_insensitive: true,
+            ..case_sensitive
+        };
+        let mut insensitive_key = |path: &Path| organized_test_target_key(path, case_insensitive);
+        let insensitive_targets = organized_target_directories_with_key(
+            &items[..2],
+            Path::new("Organized"),
+            &mut insensitive_key,
+        )
+        .expect("case-insensitive target names should disambiguate case aliases");
+        assert_ne!(insensitive_targets["upper"], insensitive_targets["lower"]);
+
+        let mut normalization_key = |path: &Path| organized_test_target_key(path, case_sensitive);
+        let normalized_targets = organized_target_directories_with_key(
+            &items[2..],
+            Path::new("Organized"),
+            &mut normalization_key,
+        )
+        .expect("normalization aliases should receive distinct stable names");
+        assert_ne!(
+            normalized_targets["composed"],
+            normalized_targets["decomposed"]
+        );
+    }
+
+    #[test]
+    fn organized_collection_base_comparison_uses_target_name_semantics() {
+        let item = organized_collection_fixture("one", "series", "series", Some("series-id"));
+        let sensitive = TargetNameSemantics {
+            normalization_insensitive: true,
+            case_insensitive: false,
+            hfs_ignorable: false,
+        };
+        let mut sensitive_key = |path: &Path| organized_test_target_key(path, sensitive);
+        let sensitive_target = organized_target_directories_with_key(
+            std::slice::from_ref(&item),
+            Path::new("Series"),
+            &mut sensitive_key,
+        )
+        .expect("case-sensitive base should preserve a distinct lowercase folder");
+        assert_eq!(sensitive_target["one"], Path::new("Series/series"));
+
+        let insensitive = TargetNameSemantics {
+            case_insensitive: true,
+            ..sensitive
+        };
+        let mut insensitive_key = |path: &Path| organized_test_target_key(path, insensitive);
+        let insensitive_target = organized_target_directories_with_key(
+            std::slice::from_ref(&item),
+            Path::new("Series"),
+            &mut insensitive_key,
+        )
+        .expect("case-insensitive base alias should avoid an unnecessary nested folder");
+        assert_eq!(insensitive_target["one"], Path::new("Series"));
+    }
+
+    #[test]
+    fn items_with_the_same_collection_identity_share_one_organized_folder() {
+        let items = vec![
+            organized_collection_fixture("one", "Series A", "series", Some("same-id")),
+            organized_collection_fixture("two", "Series B", "series", Some("same-id")),
+        ];
+        let case_sensitive = TargetNameSemantics {
+            normalization_insensitive: true,
+            case_insensitive: false,
+            hfs_ignorable: false,
+        };
+        let mut key_for = |path: &Path| organized_test_target_key(path, case_sensitive);
+        let targets =
+            organized_target_directories_with_key(&items, Path::new("Organized"), &mut key_for)
+                .expect("same collection identity should map to one folder");
+        assert_eq!(targets["one"], targets["two"]);
+    }
+
+    #[test]
+    fn collection_identity_keeps_id_and_title_namespaces_distinct() {
+        let items = vec![
+            organized_collection_fixture("with-id", "One", "series", Some("Topic")),
+            organized_collection_fixture("without-id", "Topic", "series", None),
+        ];
+        let semantics = TargetNameSemantics {
+            normalization_insensitive: true,
+            case_insensitive: false,
+            hfs_ignorable: false,
+        };
+        let mut key_for = |path: &Path| organized_test_target_key(path, semantics);
+        let targets =
+            organized_target_directories_with_key(&items, Path::new("Organized"), &mut key_for)
+                .expect("ID and title fallback values should remain distinct identities");
+        assert_eq!(targets["with-id"], Path::new("Organized/One"));
+        assert_eq!(targets["without-id"], Path::new("Organized/Topic"));
+    }
+
+    #[test]
+    fn organized_collection_collision_retry_limit_bounds_new_owner_chains() {
+        let mut items = vec![
+            organized_collection_fixture("first", "A", "series", Some("first-id")),
+            organized_collection_fixture("second", "B", "series", Some("second-id")),
+        ];
+        for index in 0..9 {
+            items.push(organized_collection_fixture(
+                &format!("item-{index}"),
+                &format!("Title{index}"),
+                "series",
+                Some(&format!("id-{index}")),
+            ));
+        }
+
+        let mut assigned_keys = HashMap::<String, usize>::new();
+        assigned_keys.insert("A".to_string(), 0);
+        assigned_keys.insert("B".to_string(), 0);
+        for index in 0..9 {
+            assigned_keys.insert(format!("Title{index}"), index + 1);
+        }
+        for item in &items {
+            let collection = item.collection.as_ref().unwrap();
+            let identity = collection_directory_identity(collection).unwrap();
+            let discriminator = collection_directory_discriminator(&identity, 0).unwrap();
+            let stem = safe_file_stem(&collection.title);
+            let next_key = match collection.title.as_str() {
+                "A" => 1,
+                "B" => 100,
+                title => {
+                    let index = title
+                        .strip_prefix("Title")
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    index + 2
+                }
+            };
+            assigned_keys.insert(format!("{stem} [{discriminator}]"), next_key);
+        }
+
+        let calls = AtomicUsize::new(0);
+        let mut key_for = |path: &Path| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+            let key = assigned_keys.get(name).copied().unwrap_or(1_000);
+            Ok(TargetReservationKey {
+                directory_device: 7,
+                directory_inode: 9,
+                components: vec![format!("target-{key}")],
+            })
+        };
+        let result =
+            organized_target_directories_with_key(&items, Path::new("Organized"), &mut key_for);
+        assert!(
+            result.is_err(),
+            "a multi-round collision chain should fail closed at the fixed pass limit"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            items.len() * 10,
+            "the fixture adds one newly hashed owner per pass and must stop after eight retries"
         );
     }
 
@@ -12328,6 +13143,7 @@ mod tests {
                 part_id: Some("P03".to_string()),
             }),
             attachments: Vec::new(),
+            authoritative_nfo_path: None,
             confidence: Confidence::High,
             metadata_status: MetadataStatus::Complete,
             integrity_status: IntegrityStatus::Unverified,

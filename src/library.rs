@@ -24,6 +24,10 @@ pub struct LibraryItem {
     pub source_ids: Vec<String>,
     pub collection: Option<CollectionMetadata>,
     pub attachments: Vec<LibraryAttachment>,
+    /// The NFO selected by the current scan for metadata reads and patches.
+    /// This path is rebuilt from the live sidecar index and is not persisted.
+    #[serde(skip)]
+    pub(crate) authoritative_nfo_path: Option<String>,
     pub confidence: Confidence,
     pub metadata_status: MetadataStatus,
     pub integrity_status: IntegrityStatus,

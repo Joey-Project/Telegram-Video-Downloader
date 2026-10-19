@@ -444,14 +444,15 @@ struct CloudStateSnapshot {
 async fn run_cloud_library_operation<T>(
     runtime: &CloudBotRuntime,
     failure_context: &'static str,
-    operation: impl FnOnce(BotContext) -> Result<(T, LibrarySnapshot)> + Send + 'static,
+    operation: impl FnOnce(BotContext, Arc<CloudInbox>) -> Result<(T, LibrarySnapshot)> + Send + 'static,
 ) -> Result<T>
 where
     T: Send + 'static,
 {
     let _publication_guard = runtime.library_scan_publication_gate.lock().await;
     let context = runtime.bot.clone();
-    let worker = tokio::task::spawn_blocking(move || operation(context))
+    let inbox = Arc::clone(&runtime.inbox);
+    let worker = tokio::task::spawn_blocking(move || operation(context, inbox))
         .await
         .with_context(|| failure_context);
     match worker {
@@ -884,7 +885,7 @@ async fn cloud_initial_library_scan(runtime: CloudBotRuntime) {
     if let Err(error) = run_cloud_library_operation(
         &runtime,
         "initial media-library scan worker failed",
-        |context| Ok(((), scan_cloud_library(&context)?)),
+        |context, inbox| Ok(((), scan_cloud_library(&context, inbox)?)),
     )
     .await
     {
@@ -903,7 +904,7 @@ async fn cloud_library_publication_watcher(runtime: CloudBotRuntime) {
         if let Err(error) = run_cloud_library_operation(
             &runtime,
             "media-library refresh worker failed",
-            |context| Ok(((), scan_cloud_library(&context)?)),
+            |context, inbox| Ok(((), scan_cloud_library(&context, inbox)?)),
         )
         .await
         {
@@ -1820,8 +1821,8 @@ async fn dispatch_cloud_management(
             let snapshot = run_cloud_library_operation(
                 runtime,
                 "media-library scan worker failed",
-                |context| {
-                    let snapshot = scan_cloud_library(&context)?;
+                |context, inbox| {
+                    let snapshot = scan_cloud_library(&context, inbox)?;
                     let response = serde_json::to_value(&snapshot)?;
                     Ok((response, snapshot))
                 },
@@ -1852,7 +1853,7 @@ async fn dispatch_cloud_management(
             let preview = run_cloud_library_operation(
                 runtime,
                 "file preview worker failed",
-                move |context| create_cloud_file_preview(&context, parsed, &records),
+                move |context, inbox| create_cloud_file_preview(&context, parsed, &records, inbox),
             )
             .await?;
             let preview_id = preview.id.clone();
@@ -1928,12 +1929,13 @@ async fn dispatch_cloud_management(
             let result = match run_cloud_library_operation(
                 runtime,
                 "file confirmation worker failed",
-                move |context| {
+                move |context, inbox| {
                     execute_cloud_file_preview_with_provider(
                         &context,
                         &preview_id_for_execution,
                         &revision_for_execution,
                         file_provider,
+                        inbox,
                     )
                 },
             )
@@ -2038,8 +2040,8 @@ async fn dispatch_cloud_management(
             let (report, library_revision) = run_cloud_library_operation(
                 runtime,
                 "legacy import worker failed",
-                move |context| {
-                    let (report, snapshot) = import_cloud_legacy_metadata(&context, &text)?;
+                move |context, inbox| {
+                    let (report, snapshot) = import_cloud_legacy_metadata(&context, &text, inbox)?;
                     Ok(((report, snapshot.revision.clone()), snapshot))
                 },
             )
@@ -2260,9 +2262,16 @@ fn create_cloud_file_preview(
     bot: &BotContext,
     prepared: PreparedFilePreview,
     records: &[InboxRecord],
+    inbox: Arc<CloudInbox>,
 ) -> Result<(MovePreview, LibrarySnapshot)> {
-    validate_legacy_metadata_patches(bot, records, &prepared.patches, &prepared.hint_indices)?;
-    let manager = LibraryManager::open(&bot.config.downloads.video_dir)?;
+    validate_legacy_metadata_patches(
+        bot,
+        records,
+        &prepared.patches,
+        &prepared.hint_indices,
+        Arc::clone(&inbox),
+    )?;
+    let manager = open_cloud_library_manager(bot, inbox, None)?;
     let hints = queue_source_hints(bot)?;
     let snapshot = manager.scan(&hints)?;
     let preview = manager.preview_with_hints_and_patches(
@@ -2286,6 +2295,7 @@ fn validate_legacy_metadata_patches(
     records: &[InboxRecord],
     patches: &[MetadataPatch],
     hint_indices: &[(String, Option<usize>)],
+    inbox: Arc<CloudInbox>,
 ) -> Result<()> {
     if patches.is_empty() {
         return Ok(());
@@ -2300,7 +2310,7 @@ fn validate_legacy_metadata_patches(
     if imports.is_empty() {
         bail!("metadata patches must come from a completed legacy import");
     }
-    let manager = LibraryManager::open(&bot.config.downloads.video_dir)?;
+    let manager = open_cloud_library_manager(bot, inbox, None)?;
     let snapshot = manager.scan(&queue_source_hints(bot)?)?;
     for patch in patches {
         if !snapshot.items.iter().any(|item| item.id == patch.item_id) {
@@ -2626,13 +2636,9 @@ fn execute_cloud_file_preview_with_provider(
     preview_id: &str,
     revision: &str,
     file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
+    inbox: Arc<CloudInbox>,
 ) -> Result<(crate::library::BatchMoveResult, LibrarySnapshot)> {
-    let manager = match file_provider {
-        Some(file_provider) => {
-            LibraryManager::open_with_provider(&bot.config.downloads.video_dir, file_provider)?
-        }
-        None => LibraryManager::open(&bot.config.downloads.video_dir)?,
-    };
+    let manager = open_cloud_library_manager(bot, inbox, file_provider)?;
     let result = manager.execute_preview(preview_id, revision)?;
     let snapshot = manager.scan(&queue_source_hints(bot)?)?;
     Ok((result, snapshot))
@@ -2641,17 +2647,35 @@ fn execute_cloud_file_preview_with_provider(
 fn import_cloud_legacy_metadata(
     bot: &BotContext,
     text: &str,
+    inbox: Arc<CloudInbox>,
 ) -> Result<(crate::library::LegacyImportReport, LibrarySnapshot)> {
-    let manager = LibraryManager::open(&bot.config.downloads.video_dir)?;
+    let manager = open_cloud_library_manager(bot, inbox, None)?;
     let hints = queue_source_hints(bot)?;
     let report = manager.import_legacy_with_hints(text, &hints)?;
     let snapshot = manager.scan(&queue_source_hints(bot)?)?;
     Ok((report, snapshot))
 }
 
-fn scan_cloud_library(bot: &BotContext) -> Result<LibrarySnapshot> {
-    let manager = LibraryManager::open(&bot.config.downloads.video_dir)?;
+fn scan_cloud_library(bot: &BotContext, inbox: Arc<CloudInbox>) -> Result<LibrarySnapshot> {
+    let manager = open_cloud_library_manager(bot, inbox, None)?;
     manager.scan(&queue_source_hints(bot)?)
+}
+
+fn open_cloud_library_manager(
+    bot: &BotContext,
+    inbox: Arc<CloudInbox>,
+    file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
+) -> Result<LibraryManager> {
+    match file_provider {
+        Some(file_provider) => LibraryManager::open_with_provider_and_preview_cleanup_gate(
+            &bot.config.downloads.video_dir,
+            file_provider,
+            inbox,
+        ),
+        None => {
+            LibraryManager::open_with_preview_cleanup_gate(&bot.config.downloads.video_dir, inbox)
+        }
+    }
 }
 
 fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {

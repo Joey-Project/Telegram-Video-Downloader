@@ -104,6 +104,7 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
         source_ids: Vec::new(),
         collection: None,
         attachments: Vec::new(),
+        authoritative_nfo_path: None,
         confidence: Confidence::High,
         metadata_status: MetadataStatus::Complete,
         integrity_status: IntegrityStatus::Verified,
@@ -126,7 +127,7 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
     assert_eq!(posts[0]["library_scan_warning"], serde_json::Value::Null);
 
     let scan_result =
-        run_cloud_library_operation::<()>(&runtime, "fixture library scan failed", move |_| {
+        run_cloud_library_operation::<()>(&runtime, "fixture library scan failed", move |_, _| {
             Err(anyhow::anyhow!("temporary provider enumeration failure"))
         })
         .await;
@@ -166,7 +167,7 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
     run_cloud_library_operation::<()>(
         &runtime,
         "fixture library scan recovery failed",
-        move |_| Ok(((), recovery_snapshot)),
+        move |_, _| Ok(((), recovery_snapshot)),
     )
     .await
     .expect("the simulated recovery scan should publish successfully");
@@ -243,6 +244,7 @@ async fn cloud_state_reporter_retries_413_with_new_incomplete_snapshot_then_sync
             source_ids: Vec::new(),
             collection: None,
             attachments: Vec::new(),
+            authoritative_nfo_path: None,
             confidence: Confidence::High,
             metadata_status: MetadataStatus::Complete,
             integrity_status: IntegrityStatus::Verified,
@@ -381,6 +383,7 @@ async fn cloud_state_reporter_bounds_large_library_warnings_and_categories_with_
                 source_ids: Vec::new(),
                 collection: None,
                 attachments: Vec::new(),
+                authoritative_nfo_path: None,
                 confidence: Confidence::High,
                 metadata_status: MetadataStatus::Complete,
                 integrity_status: IntegrityStatus::Verified,
@@ -637,6 +640,7 @@ async fn cloud_state_reporter_stops_retrying_413_when_no_smaller_snapshot_is_pos
         source_ids: Vec::new(),
         collection: None,
         attachments: Vec::new(),
+        authoritative_nfo_path: None,
         confidence: Confidence::High,
         metadata_status: MetadataStatus::Complete,
         integrity_status: IntegrityStatus::Verified,

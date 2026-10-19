@@ -1250,6 +1250,337 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
 }
 
 #[tokio::test]
+async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry() {
+    const PREVIEW_RETENTION_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+    let root = temp_cloud_bot_dir("preexpiry-confirmation-retention");
+    let (telegram, _telegram_requests, telegram_shutdown, telegram_server) =
+        spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let source_path = config.downloads.video_dir.join("clip.mp4");
+    fs::write(&source_path, b"fixture-video").expect("media fixture should write");
+
+    let file_provider = Arc::new(MockQueueFileProvider::default());
+    let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+    let library =
+        LibraryManager::open_with_provider(&config.downloads.video_dir, Arc::clone(&provider))
+            .expect("library manager should open with mock File Provider access");
+    let snapshot = library
+        .scan(&[])
+        .expect("library scan should find the fixture");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4")
+        .expect("media fixture should appear in the snapshot")
+        .id
+        .clone();
+    let preview = library
+        .preview(
+            std::slice::from_ref(&item_id),
+            "organized",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("file move should produce a persistent preview");
+    let preview_id = preview.id.clone();
+    let preview_revision = preview.revision.clone();
+    let preview_manifest = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-library")
+        .join(format!("preview-{preview_id}.json"));
+    let manifest_file = fs::OpenOptions::new()
+        .write(true)
+        .open(&preview_manifest)
+        .expect("preview manifest should open for expiry fixture");
+    manifest_file
+        .set_modified(SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
+        .expect("preview manifest should be old enough to expire");
+
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    inbox
+        .persist(CloudRequest {
+            seq: 83,
+            kind: "file_preview".to_string(),
+            payload: serde_json::json!({
+                "item_ids": [item_id],
+                "target_relative_dir": "organized"
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("preview request should persist");
+    inbox
+        .update(83, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+            record.result = Some(serde_json::json!({
+                "preview_id": preview_id,
+                "revision": preview_revision,
+                "preview": preview,
+            }));
+        })
+        .expect("preview should await confirmation");
+
+    let preview_updated_at = now_seconds().saturating_sub(PREVIEW_RETENTION_SECONDS + 1);
+    let preview_expires_at_millis = preview_updated_at
+        .saturating_add(PREVIEW_RETENTION_SECONDS)
+        .saturating_mul(1_000);
+    let preview_receipt_path = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud")
+        .join("request-00000000000000000083.json");
+    let mut preview_receipt: InboxRecord = serde_json::from_slice(
+        &fs::read(&preview_receipt_path).expect("preview receipt should read"),
+    )
+    .expect("preview receipt should parse");
+    preview_receipt.updated_at = preview_updated_at;
+    fs::write(
+        &preview_receipt_path,
+        serde_json::to_vec(&preview_receipt).expect("expired preview receipt should encode"),
+    )
+    .expect("expired preview receipt should persist");
+    drop(inbox);
+
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should reopen"));
+    inbox
+        .persist(CloudRequest {
+            seq: 84,
+            kind: "file_confirm".to_string(),
+            payload: serde_json::json!({
+                "preview_id": preview_id,
+                "revision": preview_revision,
+            }),
+            created_at: preview_expires_at_millis.saturating_sub(1),
+            extra: serde_json::Map::new(),
+        })
+        .expect("pre-expiry confirmation should persist");
+    inbox
+        .update(84, |record| record.status = InboxStatus::Processing)
+        .expect("confirmation should enter processing before restart");
+    drop(inbox);
+
+    let inbox = Arc::new(
+        CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should recover"),
+    );
+    let mut pending_confirmation = None;
+    for _ in 0..4 {
+        if let Some(record) = inbox
+            .pending()
+            .expect("bounded startup recovery should progress")
+            .into_iter()
+            .find(|record| record.request.seq == 84)
+        {
+            pending_confirmation = Some(record);
+            break;
+        }
+    }
+    let pending_confirmation =
+        pending_confirmation.expect("restarted confirmation should return to Pending");
+    assert_eq!(pending_confirmation.status, InboxStatus::Pending);
+    assert!(pending_confirmation.request.created_at < preview_expires_at_millis);
+
+    let scan_manager = LibraryManager::open_with_provider_and_preview_cleanup_gate(
+        &config.downloads.video_dir,
+        Arc::clone(&provider),
+        inbox.clone(),
+    )
+    .expect("cloud library manager should open with confirmation retention");
+    scan_manager
+        .scan(&[])
+        .expect("an unrelated library scan should complete after restart");
+    assert!(
+        preview_manifest.exists(),
+        "a pre-expiry confirmation must protect its expired preview through another scan"
+    );
+
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let runtime = make_runtime(telegram, config.clone(), queue, Arc::clone(&inbox));
+    let mut runtime = runtime;
+    runtime.test_file_provider = Some(Arc::clone(&provider));
+    let processing_confirmation = inbox
+        .update(84, |record| record.status = InboxStatus::Processing)
+        .expect("dispatcher should mark the recovered confirmation processing");
+    dispatch_cloud_record(runtime.clone(), processing_confirmation).await;
+
+    assert!(
+        !source_path.exists(),
+        "the restored confirmation should move the source after the preview retention boundary"
+    );
+    assert!(
+        config
+            .downloads
+            .video_dir
+            .join("organized/clip.mp4")
+            .exists(),
+        "the restored confirmation should complete its planned move"
+    );
+    assert_eq!(
+        inbox
+            .record(84)
+            .expect("confirmation receipt should read")
+            .expect("confirmation receipt should remain")
+            .status,
+        InboxStatus::Completed
+    );
+
+    drop(runtime);
+    drop(inbox);
+    stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn expired_preview_manifests_follow_terminal_and_unknown_confirmation_state() {
+    let root = temp_cloud_bot_dir("expired-preview-confirmation-index");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    fs::write(
+        config.downloads.video_dir.join("clip.mp4"),
+        b"fixture-video",
+    )
+    .expect("media fixture should write");
+
+    let provider = Arc::new(MockQueueFileProvider::default());
+    let provider_trait: Arc<dyn QueueFileProvider> = provider.clone();
+    let library = LibraryManager::open_with_provider(
+        &config.downloads.video_dir,
+        Arc::clone(&provider_trait),
+    )
+    .expect("library manager should open with mock File Provider access");
+    let snapshot = library.scan(&[]).expect("library scan should find fixture");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4")
+        .expect("media fixture should appear in the snapshot")
+        .id
+        .clone();
+    let abandoned_preview = library
+        .preview(
+            std::slice::from_ref(&item_id),
+            "abandoned",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("abandoned preview should persist");
+    let unresolved_preview = library
+        .preview(
+            std::slice::from_ref(&item_id),
+            "unresolved",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("second preview should persist");
+    let library_dir = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-library");
+    let abandoned_manifest = library_dir.join(format!("preview-{}.json", abandoned_preview.id));
+    let unresolved_manifest = library_dir.join(format!("preview-{}.json", unresolved_preview.id));
+    let expired_at = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+    for path in [&abandoned_manifest, &unresolved_manifest] {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("preview manifest should open for expiry fixture")
+            .set_modified(expired_at)
+            .expect("preview manifest should be old enough to expire");
+    }
+
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    for (seq, preview) in [(1, &abandoned_preview), (2, &unresolved_preview)] {
+        inbox
+            .persist(CloudRequest {
+                seq,
+                kind: "file_preview".to_string(),
+                payload: serde_json::json!({
+                    "item_ids": [item_id.clone()],
+                    "target_relative_dir": "organized"
+                }),
+                created_at: now_millis(),
+                extra: serde_json::Map::new(),
+            })
+            .expect("preview request should persist");
+        inbox
+            .update(seq, |record| {
+                record.status = InboxStatus::AwaitingConfirmation;
+                record.result = Some(serde_json::json!({
+                    "preview_id": preview.id.clone(),
+                    "revision": preview.revision.clone(),
+                    "preview": preview,
+                }));
+            })
+            .expect("preview request should become confirmable");
+    }
+    inbox
+        .update(1, |record| record.status = InboxStatus::Stale)
+        .expect("abandoned preview receipt should become terminal");
+    inbox
+        .persist(CloudRequest {
+            seq: 3,
+            kind: "file_confirm".to_string(),
+            payload: serde_json::json!({
+                "preview_id": unresolved_preview.id.clone(),
+                "revision": unresolved_preview.revision.clone(),
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("active confirmation should persist");
+    inbox
+        .update(2, |record| record.status = InboxStatus::Stale)
+        .expect("missing preview receipt should leave no expiry association");
+    drop(inbox);
+
+    let missing_preview_receipt = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud")
+        .join("request-00000000000000000002.json");
+    fs::remove_file(&missing_preview_receipt)
+        .expect("expired preview receipt should be absent for restart recovery");
+    let inbox = Arc::new(
+        CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should recover"),
+    );
+
+    let manager = LibraryManager::open_with_provider_and_preview_cleanup_gate(
+        &config.downloads.video_dir,
+        provider_trait,
+        inbox.clone(),
+    )
+    .expect("cloud library manager should open with inbox cleanup gate");
+    manager
+        .scan(&[])
+        .expect("scan should perform bounded expired preview cleanup");
+    assert!(
+        !abandoned_manifest.exists(),
+        "terminal receipt with no active confirmation must allow expired manifest cleanup"
+    );
+    assert!(
+        unresolved_manifest.exists(),
+        "active confirmation with no recoverable preview expiry must retain its manifest"
+    );
+
+    drop(manager);
+    drop(inbox);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
     let root = temp_cloud_bot_dir("retryable-provider-confirmation");
     let (telegram, _telegram_requests, telegram_shutdown, telegram_server) =
@@ -2544,7 +2875,7 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
     let release_older_worker = Arc::clone(&release_older);
     let older_runtime = runtime.clone();
     let older = tokio::spawn(async move {
-        run_cloud_library_operation(&older_runtime, "older fixture scan failed", move |_| {
+        run_cloud_library_operation(&older_runtime, "older fixture scan failed", move |_, _| {
             let _ = older_started_worker.wait();
             let _ = release_older_worker.wait();
             Ok(((), scan_order_test_snapshot("older")))
@@ -2561,7 +2892,7 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
     let older_holds_publication_gate = runtime.library_scan_publication_gate.try_lock().is_err();
     let newer_runtime = runtime.clone();
     let mut newer_future = Box::pin(async move {
-        run_cloud_library_operation(&newer_runtime, "newer fixture scan failed", move |_| {
+        run_cloud_library_operation(&newer_runtime, "newer fixture scan failed", move |_, _| {
             Ok(((), scan_order_test_snapshot("newer")))
         })
         .await
@@ -2606,7 +2937,7 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
     let release_failing_worker = Arc::clone(&release_failing);
     let failing_runtime = runtime.clone();
     let failing = tokio::spawn(async move {
-        run_cloud_library_operation::<()>(&failing_runtime, "older failure fixture", move |_| {
+        run_cloud_library_operation::<()>(&failing_runtime, "older failure fixture", move |_, _| {
             let _ = failing_started_worker.wait();
             let _ = release_failing_worker.wait();
             Err(anyhow::anyhow!("older scan failed"))
@@ -2626,7 +2957,7 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         run_cloud_library_operation(
             &recovery_runtime,
             "recovery fixture scan failed",
-            move |_| Ok(((), scan_order_test_snapshot("recovered"))),
+            move |_, _| Ok(((), scan_order_test_snapshot("recovered"))),
         )
         .await
     });
