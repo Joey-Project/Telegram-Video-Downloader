@@ -1,7 +1,7 @@
 use std::fs;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Barrier, Mutex as StdMutex};
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,12 +34,163 @@ struct FakeTelegramRequest {
 
 struct FakeCloudApiState {
     pending: StdMutex<Vec<CloudRequest>>,
+    fetch_count: AtomicUsize,
+    ack_count: AtomicUsize,
     fail_first_ack: AtomicBool,
     durable_before_ack: AtomicBool,
     inbox_root: PathBuf,
     state_posts: StdMutex<Vec<serde_json::Value>>,
     state_post_statuses: StdMutex<Vec<u16>>,
     state_post_response_headers: StdMutex<Vec<Vec<(String, String)>>>,
+}
+
+struct PauseOnDirectoryReadProvider {
+    inner: MockQueueFileProvider,
+    directory: PathBuf,
+    armed: AtomicBool,
+    read_started: std::sync::mpsc::SyncSender<()>,
+    release_read: StdMutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[derive(Default)]
+struct FailOnceInboxFileProvider {
+    inner: MockQueueFileProvider,
+    fail_write_paths: StdMutex<Vec<PathBuf>>,
+    write_attempts: StdMutex<Vec<PathBuf>>,
+}
+
+impl FailOnceInboxFileProvider {
+    fn fail_next_read(&self, detail: impl Into<String>) {
+        self.inner.fail_next_read(detail);
+    }
+
+    fn fail_next_write_to(&self, path: PathBuf) {
+        self.fail_write_paths
+            .lock()
+            .expect("inbox write failure lock should remain healthy")
+            .push(path);
+    }
+
+    fn write_attempts(&self) -> Vec<PathBuf> {
+        self.write_attempts
+            .lock()
+            .expect("inbox write attempts lock should remain healthy")
+            .clone()
+    }
+}
+
+impl QueueFileProvider for FailOnceInboxFileProvider {
+    fn coordinate_read(
+        &self,
+        path: &std::path::Path,
+        accessor: &mut dyn FnMut(&std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        self.inner.coordinate_read(path, accessor)
+    }
+
+    fn coordinate_write(
+        &self,
+        path: &std::path::Path,
+        accessor: &mut dyn FnMut(&std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        self.write_attempts
+            .lock()
+            .expect("inbox write attempts lock should remain healthy")
+            .push(path.to_path_buf());
+        let failure = {
+            let mut paths = self
+                .fail_write_paths
+                .lock()
+                .expect("inbox write failure lock should remain healthy");
+            paths
+                .iter()
+                .position(|candidate| candidate == path)
+                .map(|index| paths.remove(index))
+        };
+        if failure.is_some() {
+            return Err(crate::file_provider::FileProviderAccessError::new(
+                path,
+                "write",
+                "simulated one-time inbox storage failure",
+            )
+            .into());
+        }
+        self.inner.coordinate_write(path, accessor)
+    }
+
+    fn coordinate_move(
+        &self,
+        source: &std::path::Path,
+        destination: &std::path::Path,
+        accessor: &mut dyn FnMut(&std::path::Path, &std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        self.inner.coordinate_move(source, destination, accessor)
+    }
+}
+
+impl PauseOnDirectoryReadProvider {
+    fn new(
+        directory: PathBuf,
+    ) -> (
+        Arc<Self>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                inner: MockQueueFileProvider::default(),
+                directory,
+                armed: AtomicBool::new(false),
+                read_started: started_tx,
+                release_read: StdMutex::new(release_rx),
+            }),
+            started_rx,
+            release_tx,
+        )
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, AtomicOrdering::SeqCst);
+    }
+}
+
+impl QueueFileProvider for PauseOnDirectoryReadProvider {
+    fn coordinate_read(
+        &self,
+        path: &std::path::Path,
+        accessor: &mut dyn FnMut(&std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        if path == self.directory && self.armed.swap(false, AtomicOrdering::SeqCst) {
+            let _ = self.read_started.send(());
+            self.release_read
+                .lock()
+                .expect("read release lock should remain healthy")
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|error| {
+                    anyhow::anyhow!("timed out waiting to resume recovery: {error}")
+                })?;
+        }
+        self.inner.coordinate_read(path, accessor)
+    }
+
+    fn coordinate_write(
+        &self,
+        path: &std::path::Path,
+        accessor: &mut dyn FnMut(&std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        self.inner.coordinate_write(path, accessor)
+    }
+
+    fn coordinate_move(
+        &self,
+        source: &std::path::Path,
+        destination: &std::path::Path,
+        accessor: &mut dyn FnMut(&std::path::Path, &std::path::Path) -> Result<()>,
+    ) -> Result<()> {
+        self.inner.coordinate_move(source, destination, accessor)
+    }
 }
 
 async fn spawn_fake_telegram_api() -> (
@@ -83,43 +234,46 @@ async fn spawn_fake_telegram_api() -> (
     )
 }
 
-async fn read_fake_telegram_request(stream: &mut TcpStream) -> Result<FakeTelegramRequest> {
+async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTelegramRequest>> {
     let mut bytes = Vec::new();
     let header_end = loop {
         let mut chunk = [0_u8; 4_096];
         let read = stream
             .read(&mut chunk)
             .await
-            .context("fake Telegram API request read failed")?;
+            .context("fake HTTP request read failed")?;
         if read == 0 {
-            anyhow::bail!("fake Telegram API request ended before headers");
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            anyhow::bail!("fake HTTP request ended before headers");
         }
         bytes.extend_from_slice(&chunk[..read]);
         if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
             break index + 4;
         }
         if bytes.len() > 64 * 1024 {
-            anyhow::bail!("fake Telegram API request headers were too large");
+            anyhow::bail!("fake HTTP request headers were too large");
         }
     };
     let headers = std::str::from_utf8(&bytes[..header_end])
-        .context("fake Telegram API request headers were not UTF-8")?;
+        .context("fake HTTP request headers were not UTF-8")?;
     let request_line = headers
         .lines()
         .next()
-        .context("fake Telegram API request line was missing")?;
+        .context("fake HTTP request line was missing")?;
     let request_path = request_line
         .split_whitespace()
         .nth(1)
-        .context("fake Telegram API request path was missing")?;
+        .context("fake HTTP request path was missing")?;
     let method = request_path
         .split('?')
         .next()
-        .context("fake API request target was missing")?
+        .context("fake HTTP request target was missing")?
         .rsplit('/')
         .next()
         .filter(|method| !method.is_empty())
-        .context("fake Telegram API method was missing")?
+        .context("fake HTTP request method was missing")?
         .to_string();
     let content_length = headers
         .lines()
@@ -130,7 +284,7 @@ async fn read_fake_telegram_request(stream: &mut TcpStream) -> Result<FakeTelegr
         })
         .unwrap_or("0")
         .parse::<usize>()
-        .context("fake Telegram API content length was invalid")?;
+        .context("fake HTTP content length was invalid")?;
     let authorization = headers.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
         name.eq_ignore_ascii_case("authorization")
@@ -142,9 +296,9 @@ async fn read_fake_telegram_request(stream: &mut TcpStream) -> Result<FakeTelegr
         let read = stream
             .read(&mut chunk)
             .await
-            .context("fake Telegram API request body read failed")?;
+            .context("fake HTTP request body read failed")?;
         if read == 0 {
-            anyhow::bail!("fake Telegram API request ended before body");
+            anyhow::bail!("fake HTTP request ended before body");
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
@@ -152,13 +306,44 @@ async fn read_fake_telegram_request(stream: &mut TcpStream) -> Result<FakeTelegr
         serde_json::json!({})
     } else {
         serde_json::from_slice(&bytes[header_end..body_end])
-            .context("fake Telegram API request body was not JSON")?
+            .context("fake HTTP request body was not JSON")?
     };
-    Ok(FakeTelegramRequest {
+    Ok(Some(FakeTelegramRequest {
         method,
         body,
         authorization,
-    })
+    }))
+}
+
+async fn read_fake_telegram_request(stream: &mut TcpStream) -> Result<FakeTelegramRequest> {
+    read_fake_http_request(stream)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("fake HTTP request ended before headers"))
+}
+
+async fn parse_fake_http_fragment(fragment: &[u8]) -> Result<Option<FakeTelegramRequest>> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("fake HTTP fragment listener should bind")?;
+    let address = listener
+        .local_addr()
+        .context("fake HTTP fragment listener should expose its address")?;
+    let parser = tokio::spawn(async move {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .context("fake HTTP fragment should connect")?;
+        read_fake_http_request(&mut stream).await
+    });
+    let mut client = TcpStream::connect(address)
+        .await
+        .context("fake HTTP fragment client should connect")?;
+    client
+        .write_all(fragment)
+        .await
+        .context("fake HTTP fragment should be sent")?;
+    drop(client);
+    parser.await.context("fake HTTP parser task should join")?
 }
 
 fn fake_telegram_response(request: &FakeTelegramRequest, next_message_id: &mut i64) -> String {
@@ -211,6 +396,8 @@ async fn spawn_fake_cloud_api(
         .expect("fake cloud API should expose its address");
     let state = Arc::new(FakeCloudApiState {
         pending: StdMutex::new(pending),
+        fetch_count: AtomicUsize::new(0),
+        ack_count: AtomicUsize::new(0),
         fail_first_ack: AtomicBool::new(true),
         durable_before_ack: AtomicBool::new(false),
         inbox_root,
@@ -226,7 +413,9 @@ async fn spawn_fake_cloud_api(
                 _ = &mut shutdown_rx => return Ok(()),
                 accepted = listener.accept() => {
                     let (mut stream, _) = accepted.context("fake cloud API accept failed")?;
-                    let request = read_fake_telegram_request(&mut stream).await?;
+                    let Some(request) = read_fake_http_request(&mut stream).await? else {
+                        continue;
+                    };
                     let expected_authorization = format!("Bearer {TEST_CLOUD_SECRET}");
                     if request.authorization.as_deref() != Some(expected_authorization.as_str()) {
                         stream.write_all(fake_http_response(401, &serde_json::json!({"error":"unauthorized"})).as_bytes()).await?;
@@ -234,10 +423,12 @@ async fn spawn_fake_cloud_api(
                     }
                     let (status, payload) = match request.method.as_str() {
                         "requests" => {
+                            task_state.fetch_count.fetch_add(1, AtomicOrdering::SeqCst);
                             let pending = task_state.pending.lock().expect("fake cloud state lock should not poison").clone();
                             (200, serde_json::json!({"requests": pending}))
                         }
                         "ack" => {
+                            task_state.ack_count.fetch_add(1, AtomicOrdering::SeqCst);
                             let seqs = request.body["seqs"]
                                 .as_array()
                                 .context("ACK body should contain sequence list")?
@@ -422,6 +613,53 @@ async fn stop_fake_cloud_api(
         .expect("fake cloud API should stop within timeout")
         .expect("fake cloud API task should not panic")
         .expect("fake cloud API should not fail");
+}
+
+#[tokio::test]
+async fn fake_cloud_api_continues_after_empty_cancelled_connection() {
+    let root = temp_cloud_bot_dir("fake-cloud-empty-cancel");
+    let (cloud_base_url, _cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(root.clone(), Vec::new()).await;
+    let address = cloud_base_url
+        .strip_prefix("http://")
+        .and_then(|url| url.strip_suffix('/'))
+        .expect("fake cloud URL should contain a local socket address")
+        .parse::<std::net::SocketAddr>()
+        .expect("fake cloud URL should contain a valid socket address");
+    let cancelled = TcpStream::connect(address)
+        .await
+        .expect("empty cancellation connection should be accepted");
+    drop(cancelled);
+
+    let client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("fake cloud client should use localhost");
+    let requests = client
+        .fetch_requests()
+        .await
+        .expect("fake cloud server should keep serving after empty cancellation");
+    assert!(requests.is_empty());
+
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn fake_http_parser_rejects_nonempty_truncated_headers_and_bodies() {
+    let header_error = match parse_fake_http_fragment(b"GET /requests HTTP/1.1\r\nHost:").await {
+        Ok(_) => panic!("a nonempty truncated header must remain an error"),
+        Err(error) => error,
+    };
+    assert!(format!("{header_error:#}").contains("ended before headers"));
+
+    let body_error = match parse_fake_http_fragment(
+        b"POST /state HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\n{}",
+    )
+    .await
+    {
+        Ok(_) => panic!("a truncated request body must remain an error"),
+        Err(error) => error,
+    };
+    assert!(format!("{body_error:#}").contains("ended before body"));
 }
 
 async fn spawn_fake_cloud_websocket_api(
@@ -652,6 +890,7 @@ fn make_runtime(
         backlog_sync_gate: Arc::new(Mutex::new(())),
         reconciliation_complete: Arc::new(AtomicBool::new(true)),
         test_file_provider: None,
+        test_library_refresh_failure: Arc::new(StdMutex::new(None)),
     }
 }
 
@@ -1740,6 +1979,319 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn completed_file_confirmation_is_preserved_when_library_refresh_fails() {
+    let root = temp_cloud_bot_dir("completed-confirmation-refresh-failure");
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let source_path = config.downloads.video_dir.join("clip.mp4");
+    let source_nfo = config.downloads.video_dir.join("clip.nfo");
+    fs::write(&source_path, b"fixture-video").expect("media fixture should write");
+    fs::write(
+        &source_nfo,
+        "<movie><title>Original title</title><future>keep this</future></movie>",
+    )
+    .expect("NFO fixture should write");
+
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let file_provider = Arc::new(MockQueueFileProvider::default());
+    let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+    let library = LibraryManager::open_with_provider_and_preview_cleanup_gate(
+        &config.downloads.video_dir,
+        Arc::clone(&provider),
+        inbox.clone(),
+    )
+    .expect("library manager should open with mock File Provider access");
+    let snapshot = library
+        .scan(&[])
+        .expect("library scan should find the fixture");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4")
+        .expect("media fixture should appear in the snapshot")
+        .id
+        .clone();
+    let preview = library
+        .preview_with_hints_and_patches(
+            std::slice::from_ref(&item_id),
+            Some("organized"),
+            false,
+            ConflictPolicy::KeepBoth,
+            &[],
+            &[MetadataPatch {
+                item_id: item_id.clone(),
+                title: Some("Updated title".to_string()),
+                source_ids: Vec::new(),
+                collection: None,
+            }],
+        )
+        .expect("move and NFO patch should produce a preview");
+    let mut expected_cached_snapshot = snapshot.clone();
+    expected_cached_snapshot.revision = "last-successful-snapshot".to_string();
+    expected_cached_snapshot.scanned_at = 1_792_407_600;
+    let preview_id = preview.id.clone();
+    let preview_revision = preview.revision.clone();
+    inbox
+        .persist(CloudRequest {
+            seq: 86,
+            kind: "file_preview".to_string(),
+            payload: serde_json::json!({
+                "item_ids": [item_id],
+                "target_relative_dir": "organized"
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("preview request should persist");
+    inbox
+        .update(86, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+            record.result = Some(serde_json::json!({
+                "preview_id": preview_id,
+                "revision": preview_revision,
+                "preview": preview,
+            }));
+        })
+        .expect("preview should await confirmation");
+    inbox
+        .persist(CloudRequest {
+            seq: 87,
+            kind: "file_confirm".to_string(),
+            payload: serde_json::json!({
+                "preview_id": preview_id,
+                "revision": preview_revision,
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("confirmation request should persist");
+    let confirmation = inbox
+        .update(87, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("confirmation should enter processing");
+
+    let mut runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.test_file_provider = Some(Arc::clone(&provider));
+    *runtime.library_snapshot.lock().await = Some(expected_cached_snapshot.clone());
+    *runtime
+        .test_library_refresh_failure
+        .lock()
+        .expect("refresh-failure test hook should remain healthy") =
+        Some("simulated ordinary library refresh error".to_string());
+
+    dispatch_cloud_record(runtime.clone(), confirmation).await;
+
+    let completed = inbox
+        .record(87)
+        .expect("confirmation receipt should load")
+        .expect("confirmation receipt should remain present");
+    assert_eq!(completed.status, InboxStatus::Completed);
+    assert!(completed.error.is_none());
+    let stored_result = completed
+        .result
+        .as_ref()
+        .expect("completed confirmation should store its result");
+    let operation: crate::library::BatchMoveResult =
+        serde_json::from_value(stored_result["operation"].clone())
+            .expect("completed batch result should be retained");
+    assert_eq!(operation.status, crate::library::BatchStatus::Complete);
+    assert_eq!(operation.items.len(), 1);
+    assert!(operation.items[0].metadata_patched);
+    assert_eq!(
+        operation.items[0].outcome,
+        crate::library::MoveOutcome::Move
+    );
+    assert!(
+        stored_result["library_refresh_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("simulated ordinary library refresh error"))
+    );
+
+    let completed_preview = inbox
+        .record(86)
+        .expect("preview receipt should load")
+        .expect("preview receipt should remain present");
+    assert_eq!(completed_preview.status, InboxStatus::Completed);
+    assert!(!source_path.exists(), "the source media should have moved");
+    assert!(!source_nfo.exists(), "the source NFO should have moved");
+    assert!(
+        config
+            .downloads
+            .video_dir
+            .join("organized/clip.mp4")
+            .exists()
+    );
+    let target_nfo = fs::read_to_string(config.downloads.video_dir.join("organized/clip.nfo"))
+        .expect("patched NFO should be at the move destination");
+    assert!(target_nfo.contains("<title>Updated title</title>"));
+    assert!(target_nfo.contains("<future>keep this</future>"));
+
+    let retained_snapshot = runtime
+        .library_snapshot
+        .lock()
+        .await
+        .as_ref()
+        .expect("previous library snapshot should remain cached")
+        .clone();
+    assert_eq!(retained_snapshot, expected_cached_snapshot);
+    assert!(
+        runtime
+            .library_scan_warning
+            .lock()
+            .await
+            .as_deref()
+            .is_some_and(|warning| warning.contains("simulated ordinary library refresh error"))
+    );
+
+    let mut recorded = Vec::new();
+    while let Ok(request) = requests.try_recv() {
+        recorded.push(request);
+    }
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        vec!["sendMessage", "editMessageText"]
+    );
+    let final_text = recorded[1].body["text"]
+        .as_str()
+        .expect("final Telegram status should contain text");
+    assert!(final_text.contains("completed"));
+    assert!(final_text.contains("Library refresh warning"));
+    assert!(!final_text.contains("failed before it could complete"));
+    assert!(!final_text.contains("the file batch completed"));
+
+    drop(runtime);
+    drop(library);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn missing_related_preview_does_not_retry_a_durable_primary_outcome() {
+    const PRIMARY_SEQ: u64 = 861;
+    const MISSING_PREVIEW_SEQ: u64 = 862;
+
+    let root = temp_cloud_bot_dir("missing-related-preview-outcome");
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox =
+        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    inbox
+        .persist(CloudRequest {
+            seq: PRIMARY_SEQ,
+            kind: "file_confirm".to_string(),
+            payload: serde_json::json!({
+                "preview_id": "completed-preview",
+                "revision": "revision-a"
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("primary request should persist before dispatch");
+    let processing = inbox
+        .update(PRIMARY_SEQ, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("primary request should be durably processing");
+    assert_eq!(processing.status, InboxStatus::Processing);
+
+    let runtime = make_runtime(telegram, config, Arc::clone(&queue), Arc::clone(&inbox));
+    let expected_result = serde_json::json!({
+        "preview_id": "completed-preview",
+        "revision": "revision-a",
+        "operation": {"status": "complete"}
+    });
+    let completed = tokio::time::timeout(
+        Duration::from_secs(5),
+        persist_cloud_dispatch_outcome(
+            &runtime,
+            PRIMARY_SEQ,
+            CloudDispatchOutcome {
+                status: InboxStatus::Completed,
+                result: Some(expected_result.clone()),
+                error: None,
+                related_preview: Some((MISSING_PREVIEW_SEQ, InboxStatus::Completed)),
+            },
+        ),
+    )
+    .await
+    .is_ok();
+    let primary = inbox
+        .record(PRIMARY_SEQ)
+        .expect("primary receipt should remain readable")
+        .expect("primary receipt should remain durable");
+    let missing_preview = inbox
+        .record(MISSING_PREVIEW_SEQ)
+        .expect("missing preview lookup should succeed");
+    let no_telegram_calls = requests.try_recv().is_err();
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+
+    assert!(
+        completed,
+        "a missing related preview should not keep retrying after the primary result is durable"
+    );
+    assert_eq!(primary.status, InboxStatus::Completed);
+    assert_eq!(primary.result, Some(expected_result));
+    assert!(primary.error.is_none());
+    assert!(missing_preview.is_none());
+    assert!(
+        no_telegram_calls,
+        "outcome persistence must not repeat Telegram side effects"
+    );
+}
+
+#[test]
+fn refresh_warning_does_not_change_a_partial_batch_summary() {
+    let result = crate::library::BatchMoveResult {
+        id: "partial-batch".to_string(),
+        revision: "revision-a".to_string(),
+        status: crate::library::BatchStatus::Partial,
+        retryable_access_error: false,
+        items: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    let message = render_cloud_batch_result_with_refresh_warning(
+        &result,
+        Some("Library refresh failed after file confirmation: simulated error"),
+    );
+
+    assert!(message.contains("File batch partial-batch partially completed"));
+    assert!(message.contains("Library refresh warning"));
+    assert!(!message.contains("the file batch completed"));
+}
+
 fn cloud_telegram_update(seq: u64, update_id: i64) -> CloudRequest {
     CloudRequest {
         seq,
@@ -1891,6 +2443,109 @@ async fn cloud_rest_persists_before_ack_and_recovers_duplicate_backlog_after_res
     drop(queue);
     stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
     stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn startup_recovery_defers_ack_and_keeps_the_authoritative_page_in_memory() {
+    let root = temp_cloud_bot_dir("startup-recovery-no-ack");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = CloudInbox::open(&config.downloads.video_dir)
+        .expect("cloud inbox should open for history fixture");
+    for seq in 1..=120 {
+        inbox
+            .persist(cloud_telegram_update(seq, seq as i64))
+            .expect("history request should persist");
+        inbox
+            .persist_dispatch_result(seq, InboxStatus::Completed, None, None)
+            .expect("history request should be terminal");
+    }
+    drop(inbox);
+
+    let pending = cloud_telegram_update(200, 200);
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), vec![pending]).await;
+    cloud_state
+        .fail_first_ack
+        .store(false, AtomicOrdering::SeqCst);
+    let inbox_directory = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud");
+    let (provider, read_started, release_read) = PauseOnDirectoryReadProvider::new(inbox_directory);
+    let provider_trait: Arc<dyn QueueFileProvider> = provider.clone();
+    let inbox = Arc::new(
+        CloudInbox::open_with_file_provider(&config.downloads.video_dir, provider_trait)
+            .expect("bounded inbox recovery should start"),
+    );
+    provider.arm();
+    let telegram = TelegramClient::with_test_api_base_url(
+        TEST_TELEGRAM_TOKEN.to_string(),
+        "http://127.0.0.1:1".to_string(),
+    );
+    let mut runtime = make_runtime(telegram, config.clone(), queue.clone(), inbox.clone());
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+
+    let sync_runtime = runtime.clone();
+    let sync_task = tokio::spawn(async move { sync_cloud_backlog(&sync_runtime).await });
+    tokio::task::spawn_blocking(move || read_started.recv_timeout(Duration::from_secs(5)))
+        .await
+        .expect("recovery pause waiter should join")
+        .expect("initial recovery should reach its controlled read");
+    assert_eq!(cloud_state.fetch_count.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(cloud_state.ack_count.load(AtomicOrdering::SeqCst), 0);
+    let incoming_path = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud")
+        .join(format!("request-{:020}.json", 200));
+    assert!(
+        !incoming_path.exists(),
+        "the incoming envelope must remain unwritten while the startup index is incomplete"
+    );
+    assert!(
+        !sync_task.is_finished(),
+        "backlog reconciliation must wait rather than ACK an incomplete recovery"
+    );
+    release_read
+        .send(())
+        .expect("test should release the bounded recovery read");
+    tokio::time::timeout(Duration::from_secs(10), sync_task)
+        .await
+        .expect("backlog recovery should finish within its bounded history fixture")
+        .expect("backlog sync task should not panic")
+        .expect("recovered backlog request should persist and ACK");
+
+    assert_eq!(cloud_state.fetch_count.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(cloud_state.ack_count.load(AtomicOrdering::SeqCst), 1);
+    assert!(cloud_state.durable_before_ack.load(AtomicOrdering::SeqCst));
+    assert!(
+        cloud_state
+            .pending
+            .lock()
+            .expect("fake cloud pending lock should remain healthy")
+            .is_empty()
+    );
+    assert_eq!(
+        inbox
+            .record(200)
+            .expect("persisted request should load")
+            .expect("request should be durable after ACK")
+            .status,
+        InboxStatus::Pending
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -3009,3 +3664,325 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
 }
 
 include!("cloud_state_http_tests.rs");
+
+#[tokio::test]
+async fn completed_telegram_action_retries_receipt_without_sending_twice() {
+    let root = temp_cloud_bot_dir("telegram-result-persist-retry");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox_provider = Arc::new(FailOnceInboxFileProvider::default());
+    let provider: Arc<dyn QueueFileProvider> = inbox_provider.clone();
+    let inbox = Arc::new(
+        CloudInbox::open_with_file_provider(&config.downloads.video_dir, provider)
+            .expect("cloud inbox should open with retryable test storage"),
+    );
+    let request = cloud_telegram_update_with_text(301, 301, "/help");
+    inbox
+        .persist(request.clone())
+        .expect("Telegram request should persist");
+    let processing = inbox
+        .update(request.seq, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("Telegram request should enter processing");
+    let receipt_path = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud")
+        .join(format!("request-{:020}.json", request.seq));
+    inbox_provider.fail_next_write_to(receipt_path.clone());
+
+    let (telegram, mut telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let runtime = make_runtime(telegram, config.clone(), queue.clone(), inbox.clone());
+    dispatch_cloud_record(runtime.clone(), processing).await;
+
+    let completed = inbox
+        .record(request.seq)
+        .expect("Telegram receipt should load")
+        .expect("Telegram receipt should remain durable");
+    assert_eq!(completed.status, InboxStatus::Completed);
+    let sends = std::iter::from_fn(|| telegram_requests.try_recv().ok())
+        .filter(|request| request.method == "sendMessage")
+        .count();
+    assert_eq!(
+        sends, 1,
+        "the completed Telegram action must not be replayed"
+    );
+    assert_eq!(
+        inbox_provider
+            .write_attempts()
+            .iter()
+            .filter(|path| *path == &receipt_path)
+            .count(),
+        4,
+        "the terminal receipt should retry the same write after one injected failure"
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn retryable_status_write_failure_preserves_error_and_retry_deadline() {
+    let root = temp_cloud_bot_dir("retryable-status-persist-retry");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox_provider = Arc::new(FailOnceInboxFileProvider::default());
+    let provider: Arc<dyn QueueFileProvider> = inbox_provider.clone();
+    let inbox = Arc::new(
+        CloudInbox::open_with_file_provider(&config.downloads.video_dir, provider)
+            .expect("cloud inbox should open with retryable test storage"),
+    );
+    let request = CloudRequest {
+        seq: 302,
+        kind: "file_confirm".to_string(),
+        payload: serde_json::json!({"preview_id": "missing-preview", "revision": "revision-1"}),
+        created_at: now_millis(),
+        extra: serde_json::Map::new(),
+    };
+    inbox
+        .persist(request.clone())
+        .expect("confirmation request should persist");
+    let processing = inbox
+        .update(request.seq, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("confirmation should enter processing");
+    let receipt_path = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud")
+        .join(format!("request-{:020}.json", request.seq));
+    inbox_provider.fail_next_read("simulated temporary inbox read failure");
+    inbox_provider.fail_next_write_to(receipt_path.clone());
+
+    let telegram = TelegramClient::with_test_api_base_url(
+        TEST_TELEGRAM_TOKEN.to_string(),
+        "http://127.0.0.1:1".to_string(),
+    );
+    let mut runtime = make_runtime(telegram, config.clone(), queue.clone(), inbox.clone());
+    let library_provider = Arc::new(MockQueueFileProvider::default());
+    let library_provider_trait: Arc<dyn QueueFileProvider> = library_provider.clone();
+    runtime.test_file_provider = Some(library_provider_trait);
+    let before = now_seconds();
+    dispatch_cloud_record(runtime.clone(), processing).await;
+
+    let retryable = inbox
+        .record(request.seq)
+        .expect("retryable confirmation should load")
+        .expect("retryable confirmation should remain durable");
+    assert_eq!(retryable.status, InboxStatus::Retryable);
+    assert!(
+        retryable
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("simulated temporary inbox read failure"))
+    );
+    assert!(retryable.next_attempt_at >= before.saturating_add(5));
+    assert_eq!(
+        inbox_provider
+            .write_attempts()
+            .iter()
+            .filter(|path| *path == &receipt_path)
+            .count(),
+        4,
+        "the Retryable state write should retry after one injected failure"
+    );
+    assert!(
+        library_provider.read_paths().is_empty() && library_provider.move_paths().is_empty(),
+        "the rejected inbox lookup must not reach local library execution"
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn completed_file_move_retries_primary_and_preview_receipts_without_repeating_move() {
+    let root = temp_cloud_bot_dir("file-result-persist-retry");
+    let (telegram, mut telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let source_path = config.downloads.video_dir.join("clip.mp4");
+    fs::write(&source_path, b"fixture-video").expect("media fixture should write");
+
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox_provider = Arc::new(FailOnceInboxFileProvider::default());
+    let inbox_provider_trait: Arc<dyn QueueFileProvider> = inbox_provider.clone();
+    let inbox = Arc::new(
+        CloudInbox::open_with_file_provider(&config.downloads.video_dir, inbox_provider_trait)
+            .expect("cloud inbox should open with retryable test storage"),
+    );
+    let library_provider = Arc::new(MockQueueFileProvider::default());
+    let library_provider_trait: Arc<dyn QueueFileProvider> = library_provider.clone();
+    let library = LibraryManager::open_with_provider_and_preview_cleanup_gate(
+        &config.downloads.video_dir,
+        Arc::clone(&library_provider_trait),
+        inbox.clone(),
+    )
+    .expect("cloud library manager should open with mock file access");
+    let snapshot = library
+        .scan(&[])
+        .expect("library scan should find the fixture");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4")
+        .expect("media fixture should appear in the snapshot")
+        .id
+        .clone();
+    let preview = library
+        .preview(
+            std::slice::from_ref(&item_id),
+            "organized",
+            false,
+            ConflictPolicy::KeepBoth,
+        )
+        .expect("file move should produce a persistent preview");
+    let preview_id = preview.id.clone();
+    let preview_revision = preview.revision.clone();
+    let preview_seq = 303;
+    let confirmation_seq = 304;
+    inbox
+        .persist(CloudRequest {
+            seq: preview_seq,
+            kind: "file_preview".to_string(),
+            payload: serde_json::json!({
+                "item_ids": [item_id],
+                "target_relative_dir": "organized"
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("preview receipt should persist");
+    inbox
+        .update(preview_seq, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+            record.result = Some(serde_json::json!({
+                "preview_id": preview_id,
+                "revision": preview_revision,
+                "telegram_status_delivery": "sent",
+                "telegram_status_message_id": 9_999,
+                "telegram_status_chat_id": configured_cloud_management_chat_id(&config)
+                    .expect("test config should have one private owner chat"),
+                "preview": preview,
+            }));
+        })
+        .expect("preview should await confirmation");
+    let confirm_request = CloudRequest {
+        seq: confirmation_seq,
+        kind: "file_confirm".to_string(),
+        payload: serde_json::json!({
+            "preview_id": preview_id,
+            "revision": preview_revision,
+        }),
+        created_at: now_millis(),
+        extra: serde_json::Map::new(),
+    };
+    inbox
+        .persist(confirm_request.clone())
+        .expect("confirmation request should persist");
+    let processing = inbox
+        .update(confirmation_seq, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("confirmation should enter processing");
+
+    let inbox_directory = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud");
+    let primary_path = inbox_directory.join(format!("request-{confirmation_seq:020}.json"));
+    let preview_path = inbox_directory.join(format!("request-{preview_seq:020}.json"));
+    inbox_provider.fail_next_write_to(primary_path.clone());
+    inbox_provider.fail_next_write_to(preview_path.clone());
+
+    let mut runtime = make_runtime(telegram, config.clone(), queue.clone(), inbox.clone());
+    runtime.test_file_provider = Some(library_provider_trait);
+    dispatch_cloud_record(runtime.clone(), processing).await;
+
+    let confirmation = inbox
+        .record(confirmation_seq)
+        .expect("confirmation receipt should load")
+        .expect("confirmation receipt should remain durable");
+    assert_eq!(
+        confirmation.status,
+        InboxStatus::Completed,
+        "stored error: {:?}; moves: {:?}",
+        confirmation.error,
+        library_provider.move_paths()
+    );
+    assert_eq!(
+        inbox
+            .record(preview_seq)
+            .expect("related preview receipt should load")
+            .expect("related preview receipt should remain durable")
+            .status,
+        InboxStatus::Completed
+    );
+    assert_eq!(library_provider.move_paths().len(), 1);
+    let telegram_methods = std::iter::from_fn(|| telegram_requests.try_recv().ok())
+        .map(|request| request.method)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        telegram_methods
+            .iter()
+            .filter(|method| method.as_str() == "sendMessage")
+            .count(),
+        0,
+        "an existing status message should prevent a new progress message"
+    );
+    assert_eq!(
+        telegram_methods
+            .iter()
+            .filter(|method| method.as_str() == "editMessageText")
+            .count(),
+        2,
+        "the existing status message should be edited before and after execution"
+    );
+    let writes = inbox_provider.write_attempts();
+    for path in [&primary_path, &preview_path] {
+        assert_eq!(
+            writes.iter().filter(|written| *written == path).count(),
+            4,
+            "each result receipt should retry the same write once without repeating the file move"
+        );
+    }
+    assert!(!source_path.exists());
+    assert!(
+        config
+            .downloads
+            .video_dir
+            .join("organized/clip.mp4")
+            .exists()
+    );
+
+    drop(runtime);
+    drop(library);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = std::fs::remove_dir_all(root);
+}

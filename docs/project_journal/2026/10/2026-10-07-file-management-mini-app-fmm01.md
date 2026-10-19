@@ -23,7 +23,7 @@ superseded_by: ""
 - 当前接受的架构大方向是公开托管的静态界面自动加载文件库并提交操作；Telegram webhook 进入 Cloudflare Worker，再进入 D1 持久收件箱。本机 Rust bot 主动领取操作，并由本机通过同一 Telegram bot 发送或编辑进度消息。本机没有公网入站接口。偏好使用 Cloudflare Free；达到额度限制时暂停操作并提示用户。
 - Rust 通过固定 Worker API 补领、确认和回写状态；Mini App 验证 Telegram initData。休眠 WebSocket 推送完整请求，固定共享密钥鉴权，本机落盘后才确认接收。状态通过持久递增版本防止旧回写覆盖新快照。
 - 第一至第四阶段的本地代码已落在隔离分支：Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段 `/settings` 与新下载位置选择仍延期。
-- Cloudflare 等待卡片重复问题已修复。2026-10-19 的类型检查、54 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 968 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录及来源匹配和有界状态清理覆盖。
+- Cloudflare 等待卡片重复问题已修复。2026-10-19 的类型检查、54 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 983 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录及来源匹配和有界状态清理覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
 - 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `fefdfcb3cd03a5e153e9e02fd8f9bdf6c727e5b0` 的 master 修复，包含 ASS 弹幕显示默认值及恢复工作流收尾。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
 
@@ -182,6 +182,8 @@ superseded_by: ""
 
 - 已实现 Worker/D1 收件、HTTPS 领取/ACK/state API、Bearer 鉴权、WS 通知、Rust 私有 durable inbox、准确 sequence/envelope 去重、乱序收件和重启恢复；现有 Telegram `getUpdates` 路径在 cloud 配置缺省时继续工作。
 - WS 和 REST 共享先落盘再逐条 ACK 的边界；ACK 丢失时 D1 重送由 inbox 去重。WebSocket 长时间空闲保持连接，只有真实关闭或错误才重连；REST fallback 读取持久 backlog。
+- 初始 inbox 恢复以有界页推进，新本地写入等待恢复完成；新请求仍保留在 D1 且不 ACK，接收路径自身继续恢复，不因持续新消息清空进度。外部目录条目变化仍要求完整性重扫，身份与访问策略独立核验。
+- 运行中的 dispatcher 保留已完成操作的 outcome，终态 receipt 或关联 preview 写入暂时失败时只重试持久化；不重新调用 Telegram 或执行文件操作。跨进程退出仍采用原有 Telegram Uncertain 和文件 journal 恢复边界。
 - 本地 mock 覆盖 Cloud REST 落盘/ACK/重启、Telegram `/queue` 分派、重复与乱序请求、云端 ACK 失败重送；新增了空闲超过 75 秒后 WS 收到请求的虚拟时间回归，已纳入通过的完整 Rust 测试。mock 不能替代生产 hibernation 或 webhook 切换验证。
 - 生产切换仍需处理旧待收 update，并确保同一 bot 不同时由生产 webhook 与 `getUpdates` 消费；本轮没有执行这些操作。
 
@@ -194,6 +196,7 @@ superseded_by: ""
 ### 第三阶段：首个完整的 `/file` 整理流程
 
 - `/file` Mini App、library snapshot 查询、搜索/选择、移动 preview 和 `file_confirm` 已实现。每个受选文件与目标均 root-bound；执行时重验 preview identity、SHA-256 和访问策略，按每文件 journal 持久恢复，不把多文件移动当作原子事务。
+- 同一 preview 只做一次锁内 fresh scan，legacy mapping 校验、preview 构造和发布使用同一 snapshot。文件批次执行结果与之后的 refresh 分离；refresh 失败保留已完成结果、原缓存 snapshot 和独立 warning，不重新执行已完成的文件操作。
 - 目标冲突支持跳过或保留两份，不静默覆盖。每个确认批次尝试创建一条 Telegram status 消息并编辑同一消息；Telegram `sendMessage` 没有 idempotency key，若接受与本地保存 message ID 之间进程退出，程序避免重复发送并报告关联不确定，Mini App 状态为操作结果来源。
 - 关闭 Mini App 不会取消已收件的批次。File Provider 暂时不可访问使用持久 backoff；永久或 stale preview 需重新预览。错误与 restart recovery 场景已纳入通过的本地测试。
 - 校验分别保护对象身份、内容稳定性和 POSIX 访问策略。创建时间单独变化时，仅在同进程仍持有原文件 descriptor、当前路径仍指向同一对象且类型、体积、SHA-256、owner/group/mode 全部匹配时允许继续；重启或缓存淘汰后没有该证明则要求重新预览。不把 mtime、ctime 或 link count 的任意差异当作内容变更。
@@ -201,6 +204,7 @@ superseded_by: ""
 ### 第四阶段：旧内容补齐与迁移
 
 - 已实现 legacy text 导入报告、hint 和候选项。候选仅作为线索，不会自动改写媒体 metadata。用户选择 hint 与 library item 后，UI 提交 `metadata_patches`，Rust 生成含 NFO 变更摘要的 preview，再由 `file_confirm` 执行；无可靠候选时允许用户手动选择 item，但仍要 preview 与确认。
+- legacy 候选按当前 snapshot 一次建立来源 ID 和规范化标题索引，保留来源 ID 优先、文件顺序和歧义确认语义。匹配工作量、候选条数和编码体积均有上限；截断会明确告知，保留的 hints 仍可手动关联。
 - 确认批次可同时移动和补 metadata；patch 仅对可核验字段生成 NFO 更新，逐字段显示原值与新值及实际加入的来源 ID，保留未知 XML 字段和普通 POSIX 权限。组织路径支持合集目录与多 P 排序信息。
 - 历史 Telegram 导出格式、裸附件可靠匹配和其他媒体库 NFO 互操作仍有覆盖边界；这些不是“自动导入/自动覆盖”功能。本地 metadata preview/确认测试已通过，其他媒体库互操作仍需实测。
 

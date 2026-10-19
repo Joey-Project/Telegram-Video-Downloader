@@ -45,9 +45,10 @@ use crate::bilibili_attempt::{
     BilibiliAttemptUpdate,
 };
 use crate::cloud::{
-    CLOUD_REQUEST_PAGE_SIZE, CloudClient, CloudInbox, CloudRequest, CloudSettings, CloudState,
-    CloudStatePostError, CloudWebSocket, InboxRecord, InboxStatus, MAX_CLOUD_STATE_VERSION,
-    is_state_version_exhausted, next_websocket_request, now_millis, now_seconds,
+    CLOUD_REQUEST_PAGE_SIZE, CloudClient, CloudInbox, CloudInboxRecoveryIncomplete, CloudRequest,
+    CloudSettings, CloudState, CloudStatePostError, CloudWebSocket, InboxRecord, InboxStatus,
+    MAX_CLOUD_STATE_VERSION, is_state_version_exhausted, next_websocket_request, now_millis,
+    now_seconds,
 };
 use crate::config::{AppConfig, CloudConfig};
 use crate::downloader::{
@@ -63,7 +64,9 @@ use crate::downloader::{
     sync_bilibili_rust_credentials, validate_bilibili_report_media_hashes,
     validate_existing_bilibili_report_for_completion,
 };
-use crate::file_manager::{LibraryManager, metadata_title_within_limits, release_preview_anchors};
+use crate::file_manager::{
+    LibraryManager, PreviewBuildRequest, metadata_title_within_limits, release_preview_anchors,
+};
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 use crate::library::{
     ConflictPolicy, HintOrigin, LibrarySnapshot, MetadataPatch, MovePreview, SourceHint,
@@ -426,6 +429,8 @@ struct CloudBotRuntime {
     reconciliation_complete: Arc<AtomicBool>,
     #[cfg(test)]
     test_file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
+    #[cfg(test)]
+    test_library_refresh_failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -436,6 +441,11 @@ struct CloudStateSnapshot {
     operations: Vec<serde_json::Value>,
     tasks: Vec<serde_json::Value>,
     download_dir: String,
+}
+
+enum CloudLibrarySnapshotUpdate {
+    Publish(LibrarySnapshot),
+    PreserveWithWarning(String),
 }
 
 /// Serializes each library scan through publishing its snapshot or failure warning.
@@ -449,6 +459,27 @@ async fn run_cloud_library_operation<T>(
 where
     T: Send + 'static,
 {
+    run_cloud_library_operation_with_snapshot_update(
+        runtime,
+        failure_context,
+        move |context, inbox| {
+            operation(context, inbox)
+                .map(|(value, snapshot)| (value, CloudLibrarySnapshotUpdate::Publish(snapshot)))
+        },
+    )
+    .await
+}
+
+async fn run_cloud_library_operation_with_snapshot_update<T>(
+    runtime: &CloudBotRuntime,
+    failure_context: &'static str,
+    operation: impl FnOnce(BotContext, Arc<CloudInbox>) -> Result<(T, CloudLibrarySnapshotUpdate)>
+    + Send
+    + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
     let _publication_guard = runtime.library_scan_publication_gate.lock().await;
     let context = runtime.bot.clone();
     let inbox = Arc::clone(&runtime.inbox);
@@ -456,9 +487,20 @@ where
         .await
         .with_context(|| failure_context);
     match worker {
-        Ok(Ok((value, snapshot))) => {
-            *runtime.library_snapshot.lock().await = Some(snapshot);
-            *runtime.library_scan_warning.lock().await = None;
+        Ok(Ok((value, snapshot_update))) => {
+            match snapshot_update {
+                CloudLibrarySnapshotUpdate::Publish(snapshot) => {
+                    *runtime.library_snapshot.lock().await = Some(snapshot);
+                    *runtime.library_scan_warning.lock().await = None;
+                }
+                CloudLibrarySnapshotUpdate::PreserveWithWarning(warning) => {
+                    let warning = redact_sensitive_text(&warning);
+                    *runtime.library_scan_warning.lock().await = Some(truncate_cloud_warning(
+                        &warning,
+                        CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES,
+                    ));
+                }
+            }
             runtime.state_notify.notify_one();
             Ok(value)
         }
@@ -858,6 +900,8 @@ async fn run_cloud_bot(
         reconciliation_complete: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
         test_file_provider: None,
+        #[cfg(test)]
+        test_library_refresh_failure: Arc::new(std::sync::Mutex::new(None)),
     };
 
     info!(
@@ -1493,7 +1537,13 @@ async fn sync_cloud_backlog_inner(
     runtime
         .reconciliation_complete
         .store(false, Ordering::Release);
+    sync_cloud_backlog_pass(runtime, websocket_request).await
+}
 
+async fn sync_cloud_backlog_pass(
+    runtime: &CloudBotRuntime,
+    websocket_request: Option<&CloudRequest>,
+) -> Result<()> {
     let mut expected_request_seen = false;
     let mut previous_page_last_seq = None;
     loop {
@@ -1562,11 +1612,23 @@ async fn sync_cloud_backlog_inner(
 }
 
 async fn persist_cloud_request(runtime: &CloudBotRuntime, request: CloudRequest) -> Result<()> {
-    let inbox = Arc::clone(&runtime.inbox);
-    tokio::task::spawn_blocking(move || inbox.persist(request))
-        .await
-        .context("cloud inbox persistence worker failed")??;
-    Ok(())
+    loop {
+        let inbox = Arc::clone(&runtime.inbox);
+        let request = request.clone();
+        let result = tokio::task::spawn_blocking(move || inbox.persist(request))
+            .await
+            .context("cloud inbox persistence worker failed")?;
+        match result {
+            Ok(_) => return Ok(()),
+            Err(error) if error.is::<CloudInboxRecoveryIncomplete>() => {
+                // Keep this authoritative envelope in memory and advance one bounded recovery
+                // pass before retrying it. The caller does not ACK this page until persistence
+                // succeeds, and the sleep holds no inbox lock or blocking worker.
+                sleep(Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn cloud_request_dispatcher(runtime: CloudBotRuntime) {
@@ -1633,7 +1695,7 @@ async fn cloud_request_dispatcher(runtime: CloudBotRuntime) {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CloudDispatchOutcome {
     status: InboxStatus,
     result: Option<serde_json::Value>,
@@ -1695,72 +1757,206 @@ async fn dispatch_cloud_record(runtime: CloudBotRuntime, record: InboxRecord) {
     };
     let seq = record.request.seq;
     match outcome {
-        Ok(outcome) => {
-            let preview_id = outcome
-                .result
-                .as_ref()
-                .and_then(|result| result.get("preview_id"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
-            let inbox = Arc::clone(&runtime.inbox);
-            let update = tokio::task::spawn_blocking(move || {
-                inbox.persist_dispatch_result(seq, outcome.status, outcome.result, outcome.error)
-            })
-            .await;
-            match update {
-                Ok(Ok(_)) => {
-                    if let Some((preview_seq, preview_status)) = outcome.related_preview {
-                        let inbox = Arc::clone(&runtime.inbox);
-                        let update = tokio::task::spawn_blocking(move || {
-                            inbox.update(preview_seq, |preview| {
-                                preview.status = preview_status;
-                                preview.error = (preview_status == InboxStatus::Stale)
-                                    .then(|| "Preview is stale; run a fresh preview.".to_string());
-                            })
-                        })
-                        .await
-                        .context("cloud preview completion worker failed")
-                        .and_then(|result| result.map(|_| ()));
-                        if let Err(error) = update {
-                            warn!(seq, preview_seq, error = %format!("{error:#}"), "failed to close confirmed preview record");
-                        } else if preview_status != InboxStatus::AwaitingConfirmation
-                            && let Some(preview_id) = preview_id.as_deref()
-                        {
-                            release_preview_anchors(preview_id);
-                        }
-                    }
-                    runtime.state_notify.notify_one();
-                }
-                Ok(Err(error)) => {
-                    warn!(seq, error = %format!("{error:#}"), "failed to persist local cloud operation result")
-                }
-                Err(error) => warn!(seq, error = %error, "cloud operation result worker failed"),
-            }
-        }
+        Ok(outcome) => persist_cloud_dispatch_outcome(&runtime, seq, outcome).await,
         Err(error) => {
             let message = redact_sensitive_text(&format!("{error:#}"));
             warn!(seq, error = %message, "local cloud operation will remain retryable");
             let delay = cloud_retry_delay_seconds(record.attempts);
             let next_attempt_at = now_seconds().saturating_add(delay);
-            let inbox = Arc::clone(&runtime.inbox);
-            let _ = tokio::task::spawn_blocking(move || {
-                inbox.update(seq, |record| {
-                    record.status = InboxStatus::Retryable;
-                    record.error = Some(message);
-                    record.next_attempt_at = next_attempt_at;
-                })
-            })
-            .await;
-            runtime.state_notify.notify_one();
-            // Keep transient File Provider failures locally retryable with a persisted exponential
-            // backoff. The next periodic scan also checks next_attempt_at after restart.
-            let notify = Arc::clone(&runtime.request_notify);
-            tokio::spawn(async move {
-                sleep(Duration::from_secs(delay)).await;
-                notify.notify_one();
-            });
+            persist_cloud_retryable_status(&runtime, seq, message, next_attempt_at, delay).await;
         }
     }
+}
+
+async fn persist_cloud_retryable_status(
+    runtime: &CloudBotRuntime,
+    seq: u64,
+    message: String,
+    next_attempt_at: u64,
+    delay_seconds: u64,
+) {
+    let mut attempts = 0_u32;
+    loop {
+        let inbox = Arc::clone(&runtime.inbox);
+        let message = message.clone();
+        let update = tokio::task::spawn_blocking(move || {
+            inbox.update(seq, |record| {
+                record.status = InboxStatus::Retryable;
+                record.error = Some(message);
+                record.next_attempt_at = next_attempt_at;
+            })
+        })
+        .await;
+        match update {
+            Ok(Ok(_)) => break,
+            Ok(Err(error)) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts.is_multiple_of(10) {
+                    warn!(
+                        seq,
+                        attempts,
+                        error = %redact_sensitive_text(&format!("{error:#}")),
+                        "retrying durable retryable cloud request state"
+                    );
+                }
+            }
+            Err(error) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts.is_multiple_of(10) {
+                    warn!(
+                        seq,
+                        attempts,
+                        error = %redact_sensitive_text(&error.to_string()),
+                        "retryable cloud request state worker failed; retrying captured state"
+                    );
+                }
+            }
+        }
+        sleep(cloud_outcome_persist_retry_delay(attempts)).await;
+    }
+
+    runtime.state_notify.notify_one();
+    // Preserve the original retry deadline after the Retryable receipt is durable.
+    let notify = Arc::clone(&runtime.request_notify);
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(delay_seconds)).await;
+        notify.notify_one();
+    });
+}
+
+async fn persist_cloud_dispatch_outcome(
+    runtime: &CloudBotRuntime,
+    seq: u64,
+    outcome: CloudDispatchOutcome,
+) {
+    let mut attempts = 0_u32;
+    loop {
+        let inbox = Arc::clone(&runtime.inbox);
+        let status = outcome.status;
+        let result = outcome.result.clone();
+        let error = outcome.error.clone();
+        match tokio::task::spawn_blocking(move || {
+            inbox.persist_dispatch_result(seq, status, result, error)
+        })
+        .await
+        {
+            Ok(Ok(_)) => break,
+            Ok(Err(error)) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts.is_multiple_of(10) {
+                    warn!(
+                        seq,
+                        attempts,
+                        error = %redact_sensitive_text(&format!("{error:#}")),
+                        "retrying durable local cloud operation result; completed action will not be rerun"
+                    );
+                }
+            }
+            Err(error) => {
+                attempts = attempts.saturating_add(1);
+                if attempts == 1 || attempts.is_multiple_of(10) {
+                    warn!(
+                        seq,
+                        attempts,
+                        error = %redact_sensitive_text(&error.to_string()),
+                        "cloud operation result worker failed; retrying the captured outcome"
+                    );
+                }
+            }
+        }
+        // Keep the completed outcome in memory until its receipt is durable. Abrupt process exit
+        // still follows the existing inbox recovery contract; this is not a persistent outbox.
+        sleep(cloud_outcome_persist_retry_delay(attempts)).await;
+    }
+
+    if let Some((preview_seq, preview_status)) = outcome.related_preview {
+        let mut attempts = 0_u32;
+        loop {
+            let inbox = Arc::clone(&runtime.inbox);
+            let update = tokio::task::spawn_blocking(move || {
+                update_cloud_related_preview(&inbox, preview_seq, preview_status)
+            })
+            .await;
+            match update {
+                Ok(Ok(true)) => break,
+                Ok(Ok(false)) => {
+                    warn!(
+                        seq,
+                        preview_seq,
+                        "related cloud preview receipt disappeared after the primary result became durable"
+                    );
+                    break;
+                }
+                Ok(Err(error)) => {
+                    attempts = attempts.saturating_add(1);
+                    if attempts == 1 || attempts.is_multiple_of(10) {
+                        warn!(
+                            seq,
+                            preview_seq,
+                            attempts,
+                            error = %redact_sensitive_text(&format!("{error:#}")),
+                            "retrying durable cloud preview completion"
+                        );
+                    }
+                }
+                Err(error) => {
+                    attempts = attempts.saturating_add(1);
+                    if attempts == 1 || attempts.is_multiple_of(10) {
+                        warn!(
+                            seq,
+                            preview_seq,
+                            attempts,
+                        error = %redact_sensitive_text(&error.to_string()),
+                            "cloud preview completion worker failed; retrying its captured state"
+                        );
+                    }
+                }
+            }
+            sleep(cloud_outcome_persist_retry_delay(attempts)).await;
+        }
+
+        if preview_status != InboxStatus::AwaitingConfirmation
+            && let Some(preview_id) = outcome
+                .result
+                .as_ref()
+                .and_then(|result| result.get("preview_id"))
+                .and_then(serde_json::Value::as_str)
+        {
+            release_preview_anchors(preview_id);
+        }
+    }
+    runtime.state_notify.notify_one();
+}
+
+fn update_cloud_related_preview(
+    inbox: &CloudInbox,
+    preview_seq: u64,
+    preview_status: InboxStatus,
+) -> Result<bool> {
+    if inbox.record(preview_seq)?.is_none() {
+        return Ok(false);
+    }
+    match inbox.update(preview_seq, |preview| {
+        preview.status = preview_status;
+        preview.error = (preview_status == InboxStatus::Stale)
+            .then(|| "Preview is stale; run a fresh preview.".to_string());
+    }) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            // Retention can remove an expired preview after the primary receipt is durable. Only
+            // a confirmed missing record completes this related update; read/policy failures retry.
+            if inbox.record(preview_seq)?.is_none() {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn cloud_outcome_persist_retry_delay(attempts: u32) -> Duration {
+    let shift = attempts.saturating_sub(1).min(6);
+    Duration::from_millis(100_u64.saturating_mul(1_u64 << shift).min(5_000))
 }
 
 fn cloud_retry_delay_seconds(attempts: u32) -> u64 {
@@ -1926,7 +2122,9 @@ async fn dispatch_cloud_management(
             let file_provider = runtime.test_file_provider.clone();
             #[cfg(not(test))]
             let file_provider = None;
-            let result = match run_cloud_library_operation(
+            #[cfg(test)]
+            let refresh_failure = Arc::clone(&runtime.test_library_refresh_failure);
+            let result = match run_cloud_library_operation_with_snapshot_update(
                 runtime,
                 "file confirmation worker failed",
                 move |context, inbox| {
@@ -1936,6 +2134,8 @@ async fn dispatch_cloud_management(
                         &revision_for_execution,
                         file_provider,
                         inbox,
+                        #[cfg(test)]
+                        refresh_failure,
                     )
                 },
             )
@@ -1987,9 +2187,13 @@ async fn dispatch_cloud_management(
                     ));
                 }
             };
+            let (result, library_refresh_warning) = result;
+            let final_message = render_cloud_batch_result_with_refresh_warning(
+                &result,
+                library_refresh_warning.as_deref(),
+            );
             let final_message_warning =
-                edit_cloud_batch_message(runtime, preview_seq, render_cloud_batch_result(&result))
-                    .await;
+                edit_cloud_batch_message(runtime, preview_seq, final_message).await;
             let telegram_progress_warning = final_message_warning.or(start_message_warning);
             let result_json = serde_json::to_value(&result)?;
             let completed = result.status == crate::library::BatchStatus::Complete;
@@ -2000,6 +2204,7 @@ async fn dispatch_cloud_management(
                     "preview_id": result.id,
                     "revision": result.revision,
                     "operation": result_json,
+                    "library_refresh_warning": library_refresh_warning,
                     "telegram_progress_warning": telegram_progress_warning,
                 })),
                 error: (!completed).then(|| {
@@ -2264,38 +2469,37 @@ fn create_cloud_file_preview(
     records: &[InboxRecord],
     inbox: Arc<CloudInbox>,
 ) -> Result<(MovePreview, LibrarySnapshot)> {
-    validate_legacy_metadata_patches(
-        bot,
-        records,
-        &prepared.patches,
-        &prepared.hint_indices,
-        Arc::clone(&inbox),
-    )?;
     let manager = open_cloud_library_manager(bot, inbox, None)?;
     let hints = queue_source_hints(bot)?;
-    let snapshot = manager.scan(&hints)?;
-    let preview = manager.preview_with_hints_and_patches(
-        if prepared.target_relative_dir.is_some() {
-            &prepared.item_ids
-        } else {
-            &[]
+    manager.preview_with_hints_and_patches_and_snapshot_validator(
+        PreviewBuildRequest {
+            item_ids: if prepared.target_relative_dir.is_some() {
+                &prepared.item_ids
+            } else {
+                &[]
+            },
+            target_relative_dir: prepared.target_relative_dir.as_deref(),
+            rename: prepared.rename,
+            conflict: prepared.conflict,
+            patches: &prepared.patches,
         },
-        prepared.target_relative_dir.as_deref(),
-        prepared.rename,
-        prepared.conflict,
         &hints,
-        &prepared.patches,
-    )?;
-    let refreshed = manager.scan(&hints).unwrap_or(snapshot);
-    Ok((preview, refreshed))
+        |snapshot| {
+            validate_legacy_metadata_patches(
+                snapshot,
+                records,
+                &prepared.patches,
+                &prepared.hint_indices,
+            )
+        },
+    )
 }
 
 fn validate_legacy_metadata_patches(
-    bot: &BotContext,
+    snapshot: &LibrarySnapshot,
     records: &[InboxRecord],
     patches: &[MetadataPatch],
     hint_indices: &[(String, Option<usize>)],
-    inbox: Arc<CloudInbox>,
 ) -> Result<()> {
     if patches.is_empty() {
         return Ok(());
@@ -2310,8 +2514,6 @@ fn validate_legacy_metadata_patches(
     if imports.is_empty() {
         bail!("metadata patches must come from a completed legacy import");
     }
-    let manager = open_cloud_library_manager(bot, inbox, None)?;
-    let snapshot = manager.scan(&queue_source_hints(bot)?)?;
     for patch in patches {
         if !snapshot.items.iter().any(|item| item.id == patch.item_id) {
             bail!("metadata patch item is not present in the current library snapshot");
@@ -2631,17 +2833,67 @@ fn render_cloud_batch_result(result: &crate::library::BatchMoveResult) -> String
     )
 }
 
+fn render_cloud_batch_result_with_refresh_warning(
+    result: &crate::library::BatchMoveResult,
+    refresh_warning: Option<&str>,
+) -> String {
+    let summary = render_cloud_batch_result(result);
+    if refresh_warning.is_some() {
+        format!(
+            "{summary}\nLibrary refresh warning: the library view could not be refreshed and may be stale until a later scan."
+        )
+    } else {
+        summary
+    }
+}
+
 fn execute_cloud_file_preview_with_provider(
     bot: &BotContext,
     preview_id: &str,
     revision: &str,
     file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
     inbox: Arc<CloudInbox>,
-) -> Result<(crate::library::BatchMoveResult, LibrarySnapshot)> {
+    #[cfg(test)] test_library_refresh_failure: Arc<std::sync::Mutex<Option<String>>>,
+) -> Result<(
+    (crate::library::BatchMoveResult, Option<String>),
+    CloudLibrarySnapshotUpdate,
+)> {
     let manager = open_cloud_library_manager(bot, inbox, file_provider)?;
     let result = manager.execute_preview(preview_id, revision)?;
-    let snapshot = manager.scan(&queue_source_hints(bot)?)?;
-    Ok((result, snapshot))
+    #[cfg(test)]
+    let injected_refresh_error = test_library_refresh_failure
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .map(|message| anyhow::anyhow!(message));
+    #[cfg(not(test))]
+    let injected_refresh_error: Option<anyhow::Error> = None;
+    let refreshed = injected_refresh_error.map_or_else(
+        || {
+            queue_source_hints(bot)
+                .and_then(|hints| manager.scan(&hints))
+                .map_err(|error| error.context("local library refresh failed after confirmation"))
+        },
+        Err,
+    );
+    match refreshed {
+        Ok(snapshot) => Ok((
+            (result, None),
+            CloudLibrarySnapshotUpdate::Publish(snapshot),
+        )),
+        Err(error) => {
+            let warning = truncate_cloud_warning(
+                &redact_sensitive_text(&format!(
+                    "Library refresh failed after file confirmation: {error:#}"
+                )),
+                CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES,
+            );
+            Ok((
+                (result, Some(warning.clone())),
+                CloudLibrarySnapshotUpdate::PreserveWithWarning(warning),
+            ))
+        }
+    }
 }
 
 fn import_cloud_legacy_metadata(

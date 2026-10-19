@@ -710,12 +710,12 @@ impl PreviewAnchorStore {
 }
 
 #[derive(Clone)]
-struct PreviewBuildRequest<'a> {
-    item_ids: &'a [String],
-    target_relative_dir: Option<&'a str>,
-    rename: bool,
-    conflict: ConflictPolicy,
-    patches: &'a [MetadataPatch],
+pub(crate) struct PreviewBuildRequest<'a> {
+    pub(crate) item_ids: &'a [String],
+    pub(crate) target_relative_dir: Option<&'a str>,
+    pub(crate) rename: bool,
+    pub(crate) conflict: ConflictPolicy,
+    pub(crate) patches: &'a [MetadataPatch],
 }
 
 pub struct LibraryManager {
@@ -729,6 +729,8 @@ pub struct LibraryManager {
     process_nonce: String,
     #[cfg(test)]
     scan_test_hooks: Arc<Mutex<ScanTestHooks>>,
+    #[cfg(test)]
+    scan_attempts: AtomicUsize,
 }
 
 pub(crate) enum PreviewCleanupOutcome {
@@ -1047,6 +1049,8 @@ impl LibraryManager {
                 .clone(),
             #[cfg(test)]
             scan_test_hooks: Arc::new(Mutex::new(ScanTestHooks::default())),
+            #[cfg(test)]
+            scan_attempts: AtomicUsize::new(0),
         };
         manager.ensure_lock_file()?;
         manager.ensure_output_lock_file()?;
@@ -1113,7 +1117,11 @@ impl LibraryManager {
         let mut report = parse_legacy_import(input);
         let snapshot = self.scan(hints)?;
         report.revision = Some(snapshot.revision.clone());
-        report.candidates = legacy_candidates(&report.hints, &snapshot.items);
+        populate_legacy_candidates(
+            &mut report,
+            &snapshot.items,
+            DEFAULT_LEGACY_CANDIDATE_LIMITS,
+        )?;
         Ok(report)
     }
 
@@ -1147,6 +1155,7 @@ impl LibraryManager {
         )
     }
 
+    #[cfg(test)]
     pub fn preview_with_hints_and_patches(
         &self,
         item_ids: &[String],
@@ -1169,6 +1178,25 @@ impl LibraryManager {
         )
     }
 
+    /// Builds and persists a preview from one locked scan, returning that same snapshot.
+    /// The validator runs under the scan/store locks and must only inspect the supplied snapshot.
+    pub(crate) fn preview_with_hints_and_patches_and_snapshot_validator<V>(
+        &self,
+        request: PreviewBuildRequest<'_>,
+        hints: &[SourceHint],
+        validate_snapshot: V,
+    ) -> Result<(MovePreview, LibrarySnapshot)>
+    where
+        V: FnOnce(&LibrarySnapshot) -> Result<()>,
+    {
+        self.preview_with_hints_and_patches_and_snapshot_validator_and_target_device_resolver(
+            request,
+            hints,
+            validate_snapshot,
+            |target_path| self.target_parent_device(target_path),
+        )
+    }
+
     fn target_parent_device(&self, target_path: &str) -> Result<u64> {
         Ok(
             resolve_target_parent(&self.root, target_path, Some(self.library_dir_identity))?
@@ -1177,14 +1205,35 @@ impl LibraryManager {
         )
     }
 
+    #[cfg(test)]
     fn preview_with_hints_and_patches_and_target_device_resolver<F>(
         &self,
         request: PreviewBuildRequest<'_>,
         hints: &[SourceHint],
-        mut target_device_for_path: F,
+        target_device_for_path: F,
     ) -> Result<MovePreview>
     where
         F: FnMut(&str) -> Result<u64>,
+    {
+        self.preview_with_hints_and_patches_and_snapshot_validator_and_target_device_resolver(
+            request,
+            hints,
+            |_| Ok(()),
+            target_device_for_path,
+        )
+        .map(|(preview, _)| preview)
+    }
+
+    fn preview_with_hints_and_patches_and_snapshot_validator_and_target_device_resolver<F, V>(
+        &self,
+        request: PreviewBuildRequest<'_>,
+        hints: &[SourceHint],
+        validate_snapshot: V,
+        mut target_device_for_path: F,
+    ) -> Result<(MovePreview, LibrarySnapshot)>
+    where
+        F: FnMut(&str) -> Result<u64>,
+        V: FnOnce(&LibrarySnapshot) -> Result<()>,
     {
         let _process_guard = self
             .in_process_lock
@@ -1192,7 +1241,15 @@ impl LibraryManager {
             .map_err(|_| anyhow!("media-library lock is poisoned"))?;
         let _disk_guard = self.lock_store()?;
         let snapshot = self.scan_locked(hints)?;
-        self.build_and_persist_preview(&snapshot, request, &mut target_device_for_path)
+        validate_snapshot(&snapshot)?;
+        let preview =
+            self.build_and_persist_preview(&snapshot, request, &mut target_device_for_path)?;
+        Ok((preview, snapshot))
+    }
+
+    #[cfg(test)]
+    fn scan_attempt_count_for_test(&self) -> usize {
+        self.scan_attempts.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -3075,6 +3132,8 @@ impl LibraryManager {
     }
 
     fn scan_locked(&self, hints: &[SourceHint]) -> Result<LibrarySnapshot> {
+        #[cfg(test)]
+        self.scan_attempts.fetch_add(1, Ordering::Relaxed);
         let operation_state_warnings = self.prune_persisted_operation_states();
         let (mut index, index_warning) = self.read_index_with_recovery()?;
         let mut walk = ScanWalk::default();
@@ -7507,36 +7566,232 @@ fn normalize_title(title: &str) -> String {
         .collect()
 }
 
-fn legacy_candidates(hints: &[SourceHint], items: &[LibraryItem]) -> Vec<LegacyCandidate> {
-    let mut result = Vec::new();
-    for (hint_index, hint) in hints.iter().enumerate() {
-        let hint_ids = normalize_source_ids(hint.source_ids.clone())
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let direct = items
-            .iter()
-            .filter(|item| {
-                item.presence == Presence::Present
-                    && item.source_ids.iter().any(|id| hint_ids.contains(id))
-            })
-            .collect::<Vec<_>>();
-        let (matches, match_kind) = if !direct.is_empty() {
-            (direct, "source_id")
+const DEFAULT_LEGACY_CANDIDATE_LIMITS: LegacyCandidateLimits = LegacyCandidateLimits {
+    max_candidates: 10_000,
+    max_serialized_array_bytes: 512 * 1024,
+    max_match_visits: 500_000,
+};
+
+#[derive(Clone, Copy)]
+struct LegacyCandidateLimits {
+    max_candidates: usize,
+    max_serialized_array_bytes: usize,
+    max_match_visits: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyCandidateTruncation {
+    CandidateCount,
+    SerializedBytes,
+    MatchVisits,
+}
+
+impl LegacyCandidateTruncation {
+    fn warning(self, limits: LegacyCandidateLimits) -> String {
+        match self {
+            Self::CandidateCount => format!(
+                "Legacy candidate results were truncated at the {}-candidate limit; refine the import to see more matches.",
+                limits.max_candidates
+            ),
+            Self::SerializedBytes => format!(
+                "Legacy candidate results were truncated at the {}-byte serialized array limit; refine the import to see more matches.",
+                limits.max_serialized_array_bytes
+            ),
+            Self::MatchVisits => format!(
+                "Legacy candidate matching was truncated at the {} lookup/match-visit limit; refine the import to see more matches.",
+                limits.max_match_visits
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LegacyCandidateWork {
+    present_items_indexed: usize,
+    item_title_normalizations: usize,
+    source_id_index_entries: usize,
+    source_id_lookups: usize,
+    title_index_lookups: usize,
+    match_entries_visited: usize,
+    hint_title_normalizations: usize,
+    hint_source_id_values_normalized: usize,
+}
+
+struct LegacyCandidateMatches {
+    candidates: Vec<LegacyCandidate>,
+    truncation: Option<LegacyCandidateTruncation>,
+    #[cfg(test)]
+    work: LegacyCandidateWork,
+}
+
+fn populate_legacy_candidates(
+    report: &mut LegacyImportReport,
+    items: &[LibraryItem],
+    limits: LegacyCandidateLimits,
+) -> Result<()> {
+    let matches = legacy_candidates(&report.hints, items, limits)?;
+    report.candidates = matches.candidates;
+    if let Some(truncation) = matches.truncation {
+        report.warnings.push(truncation.warning(limits));
+    }
+    Ok(())
+}
+
+fn legacy_candidates(
+    hints: &[SourceHint],
+    items: &[LibraryItem],
+    limits: LegacyCandidateLimits,
+) -> Result<LegacyCandidateMatches> {
+    let mut items_by_source_id: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut items_by_title: HashMap<String, Vec<usize>> = HashMap::new();
+    #[cfg(test)]
+    let mut work = LegacyCandidateWork::default();
+
+    for (item_index, item) in items.iter().enumerate() {
+        if item.presence != Presence::Present {
+            continue;
+        }
+        #[cfg(test)]
+        {
+            work.present_items_indexed += 1;
+            work.item_title_normalizations += 1;
+        }
+
+        let mut indexed_item_ids = HashSet::with_capacity(item.source_ids.len());
+        for id in &item.source_ids {
+            // Preserve the old exact comparison against item.source_ids; only hint IDs are
+            // canonicalized by normalize_source_ids.
+            if indexed_item_ids.insert(id.as_str()) {
+                items_by_source_id
+                    .entry(id.as_str())
+                    .or_default()
+                    .push(item_index);
+                #[cfg(test)]
+                {
+                    work.source_id_index_entries += 1;
+                }
+            }
+        }
+
+        items_by_title
+            .entry(normalize_title(&item.title))
+            .or_default()
+            .push(item_index);
+    }
+
+    let mut candidates = Vec::new();
+    let mut serialized_array_bytes = 2usize;
+    let mut match_visits_remaining = limits.max_match_visits;
+    let mut truncation = None;
+
+    'hints: for (hint_index, hint) in hints.iter().enumerate() {
+        let mut item_indices = Vec::new();
+        let mut matching_complete = true;
+
+        #[cfg(test)]
+        {
+            work.hint_source_id_values_normalized += hint.source_ids.len();
+        }
+        let normalized_hint_ids = normalize_source_ids(hint.source_ids.clone());
+        for id in normalized_hint_ids {
+            if match_visits_remaining == 0 {
+                matching_complete = false;
+                truncation = Some(LegacyCandidateTruncation::MatchVisits);
+                break;
+            }
+            match_visits_remaining -= 1;
+            #[cfg(test)]
+            {
+                work.source_id_lookups += 1;
+            }
+
+            if let Some(indexed_items) = items_by_source_id.get(id.as_str()) {
+                for item_index in indexed_items {
+                    if match_visits_remaining == 0 {
+                        matching_complete = false;
+                        truncation = Some(LegacyCandidateTruncation::MatchVisits);
+                        break;
+                    }
+                    match_visits_remaining -= 1;
+                    #[cfg(test)]
+                    {
+                        work.match_entries_visited += 1;
+                    }
+                    item_indices.push(*item_index);
+                }
+            }
+            if !matching_complete {
+                break;
+            }
+        }
+
+        item_indices.sort_unstable();
+        item_indices.dedup();
+        if !matching_complete {
+            // Do not show partial matches or fall back to title when some source IDs were not
+            // checked; either could give the user an incomplete or lower-priority choice set.
+            break 'hints;
+        }
+        let (match_kind, matched_indices) = if !item_indices.is_empty() {
+            ("source_id", item_indices)
         } else if let Some(title) = hint.title.as_deref() {
-            let normalized = normalize_title(title);
-            let title_matches = items
-                .iter()
-                .filter(|item| {
-                    item.presence == Presence::Present && normalize_title(&item.title) == normalized
-                })
-                .collect::<Vec<_>>();
-            (title_matches, "title")
+            if match_visits_remaining == 0 {
+                truncation = Some(LegacyCandidateTruncation::MatchVisits);
+                break 'hints;
+            }
+            match_visits_remaining -= 1;
+            #[cfg(test)]
+            {
+                work.title_index_lookups += 1;
+                work.hint_title_normalizations += 1;
+            }
+
+            let normalized_title = normalize_title(title);
+            let mut title_indices = Vec::new();
+            let mut title_match_complete = true;
+            if let Some(indexed_items) = items_by_title.get(&normalized_title) {
+                for item_index in indexed_items {
+                    if match_visits_remaining == 0 {
+                        title_match_complete = false;
+                        truncation = Some(LegacyCandidateTruncation::MatchVisits);
+                        break;
+                    }
+                    match_visits_remaining -= 1;
+                    #[cfg(test)]
+                    {
+                        work.match_entries_visited += 1;
+                    }
+                    title_indices.push(*item_index);
+                }
+            }
+            if !title_match_complete {
+                // Keep this hint's candidate set whole and in the original library order.
+                break 'hints;
+            }
+            ("title", title_indices)
         } else {
-            (Vec::new(), "unmatched")
+            ("unmatched", Vec::new())
         };
-        let ambiguous = matches.len() > 1 || hint.source_ids.is_empty();
-        for item in matches {
-            result.push(LegacyCandidate {
+
+        if matched_indices.is_empty() {
+            continue;
+        }
+
+        let ambiguous = matched_indices.len() > 1 || hint.source_ids.is_empty();
+        let mut hint_candidates = Vec::with_capacity(
+            matched_indices
+                .len()
+                .min(limits.max_candidates.saturating_sub(candidates.len())),
+        );
+        let mut hint_array_bytes = serialized_array_bytes;
+        for item_index in matched_indices {
+            if candidates.len() + hint_candidates.len() >= limits.max_candidates {
+                truncation = Some(LegacyCandidateTruncation::CandidateCount);
+                break;
+            }
+            let item = &items[item_index];
+            let candidate = LegacyCandidate {
                 hint_index,
                 item_id: item.id.clone(),
                 title: item.title.clone(),
@@ -7544,10 +7799,39 @@ fn legacy_candidates(hints: &[SourceHint], items: &[LibraryItem]) -> Vec<LegacyC
                 match_kind: match_kind.to_string(),
                 ambiguous,
                 requires_confirmation: true,
-            });
+            };
+            let candidate_bytes = serde_json::to_vec(&candidate)?.len();
+            let separator_bytes = if candidates.is_empty() && hint_candidates.is_empty() {
+                0
+            } else {
+                1
+            };
+            let next_array_bytes = hint_array_bytes
+                .saturating_add(separator_bytes)
+                .saturating_add(candidate_bytes);
+            if next_array_bytes > limits.max_serialized_array_bytes {
+                truncation = Some(LegacyCandidateTruncation::SerializedBytes);
+                break;
+            }
+            hint_array_bytes = next_array_bytes;
+            hint_candidates.push(candidate);
         }
+
+        if truncation.is_some() {
+            // Emit candidate groups atomically: never make a hint look uniquely matched because
+            // the global count/byte budget cut off its remaining choices.
+            break 'hints;
+        }
+        candidates.extend(hint_candidates);
+        serialized_array_bytes = hint_array_bytes;
     }
-    result
+
+    Ok(LegacyCandidateMatches {
+        candidates,
+        truncation,
+        #[cfg(test)]
+        work,
+    })
 }
 
 fn parse_legacy_import(input: &str) -> LegacyImportReport {
@@ -10130,7 +10414,9 @@ mod tests {
             },
         ];
 
-        let candidates = legacy_candidates(&hints, &items);
+        let candidates = legacy_candidates(&hints, &items, DEFAULT_LEGACY_CANDIDATE_LIMITS)
+            .expect("legacy candidates should serialize")
+            .candidates;
         assert_eq!(
             candidates
                 .iter()
@@ -10145,6 +10431,331 @@ mod tests {
                 (1, "present-title", "title"),
             ],
             "non-present records must neither become candidates nor shadow a present title fallback"
+        );
+    }
+
+    #[test]
+    fn legacy_candidates_preserve_multi_id_order_priority_and_title_ambiguity() {
+        let mut unavailable =
+            index_fixture_item("unavailable", "unavailable.mp4", Presence::Unavailable);
+        unavailable.title = "Shared title".to_string();
+        unavailable.source_ids = vec!["cid1234".to_string()];
+
+        let mut first = index_fixture_item("first", "first.mp4", Presence::Present);
+        first.title = "Shared title".to_string();
+        first.source_ids = vec![
+            "cid1234".to_string(),
+            "cid2345".to_string(),
+            "cid1234".to_string(),
+        ];
+
+        let mut second = index_fixture_item("second", "second.mp4", Presence::Present);
+        second.title = "Shared title".to_string();
+        second.source_ids = vec!["cid2345".to_string()];
+
+        let mut title_only = index_fixture_item("title-only", "title-only.mp4", Presence::Present);
+        title_only.title = "Shared title".to_string();
+
+        let items = vec![unavailable, first, second, title_only];
+        let hints = vec![
+            SourceHint {
+                source_ids: vec!["cid2345".to_string(), "cid1234".to_string()],
+                title: Some("Shared title".to_string()),
+                relative_path: None,
+                collection: None,
+                origin: HintOrigin::LegacyText,
+                requires_confirmation: true,
+            },
+            SourceHint {
+                source_ids: Vec::new(),
+                title: Some("Shared title".to_string()),
+                relative_path: None,
+                collection: None,
+                origin: HintOrigin::LegacyText,
+                requires_confirmation: true,
+            },
+        ];
+
+        let matches = legacy_candidates(&hints, &items, DEFAULT_LEGACY_CANDIDATE_LIMITS)
+            .expect("legacy candidates should serialize");
+        assert_eq!(
+            matches
+                .candidates
+                .iter()
+                .map(|candidate| (
+                    candidate.hint_index,
+                    candidate.item_id.as_str(),
+                    candidate.match_kind.as_str(),
+                    candidate.ambiguous,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "first", "source_id", true),
+                (0, "second", "source_id", true),
+                (1, "first", "title", true),
+                (1, "second", "title", true),
+                (1, "title-only", "title", true),
+            ],
+            "source-ID unions should deduplicate and retain library order, while direct matches outrank title matches"
+        );
+        assert_eq!(matches.truncation, None);
+    }
+
+    #[test]
+    fn legacy_candidate_matching_work_scales_with_index_and_matches() {
+        const ITEM_COUNT: usize = 1_000;
+        let items = (0..ITEM_COUNT)
+            .map(|index| {
+                let mut item = index_fixture_item(
+                    &format!("item-{index}"),
+                    &format!("item-{index}.mp4"),
+                    Presence::Present,
+                );
+                item.title = format!("Title {index}");
+                item.source_ids = vec![format!("cid{}", 10_000 + index)];
+                item
+            })
+            .collect::<Vec<_>>();
+        let hints = (0..ITEM_COUNT)
+            .map(|index| SourceHint {
+                source_ids: if index % 2 == 0 {
+                    vec![format!("cid{}", 10_000 + index)]
+                } else {
+                    Vec::new()
+                },
+                title: Some(format!("Title {index}")),
+                relative_path: None,
+                collection: None,
+                origin: HintOrigin::LegacyText,
+                requires_confirmation: true,
+            })
+            .collect::<Vec<_>>();
+
+        let matches = legacy_candidates(&hints, &items, DEFAULT_LEGACY_CANDIDATE_LIMITS)
+            .expect("legacy candidates should serialize");
+        assert_eq!(matches.candidates.len(), ITEM_COUNT);
+        assert_eq!(matches.truncation, None);
+        assert_eq!(
+            matches.work,
+            LegacyCandidateWork {
+                present_items_indexed: ITEM_COUNT,
+                item_title_normalizations: ITEM_COUNT,
+                source_id_index_entries: ITEM_COUNT,
+                source_id_lookups: ITEM_COUNT / 2,
+                title_index_lookups: ITEM_COUNT / 2,
+                match_entries_visited: ITEM_COUNT,
+                hint_title_normalizations: ITEM_COUNT / 2,
+                hint_source_id_values_normalized: ITEM_COUNT / 2,
+            }
+        );
+        let lookup_and_match_visits = matches.work.source_id_lookups
+            + matches.work.title_index_lookups
+            + matches.work.match_entries_visited;
+        assert!(
+            lookup_and_match_visits < ITEM_COUNT * ITEM_COUNT,
+            "matching work should follow the index and actual matches, not hints multiplied by items"
+        );
+    }
+
+    #[test]
+    fn legacy_candidate_count_budget_keeps_prior_hints_and_warns() {
+        let mut first_item = index_fixture_item("first", "first.mp4", Presence::Present);
+        first_item.source_ids = vec!["cid1234".to_string()];
+        let mut second_item = index_fixture_item("second", "second.mp4", Presence::Present);
+        second_item.source_ids = vec!["cid2345".to_string()];
+        let items = vec![first_item, second_item];
+        let hints = vec![
+            SourceHint {
+                source_ids: vec!["cid1234".to_string()],
+                title: None,
+                relative_path: None,
+                collection: None,
+                origin: HintOrigin::LegacyText,
+                requires_confirmation: true,
+            },
+            SourceHint {
+                source_ids: vec!["cid2345".to_string()],
+                title: None,
+                relative_path: None,
+                collection: None,
+                origin: HintOrigin::LegacyText,
+                requires_confirmation: true,
+            },
+        ];
+        let mut report = LegacyImportReport {
+            hints,
+            warnings: Vec::new(),
+            needs_confirmation: true,
+            revision: None,
+            candidates: Vec::new(),
+        };
+
+        populate_legacy_candidates(
+            &mut report,
+            &items,
+            LegacyCandidateLimits {
+                max_candidates: 1,
+                max_serialized_array_bytes: 512 * 1024,
+                max_match_visits: 100,
+            },
+        )
+        .expect("bounded candidates should serialize");
+
+        assert_eq!(
+            report.hints.len(),
+            2,
+            "all imported hints must remain available"
+        );
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].hint_index, 0);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("1-candidate limit"))
+        );
+        assert_eq!(DEFAULT_LEGACY_CANDIDATE_LIMITS.max_candidates, 10_000);
+    }
+
+    #[test]
+    fn legacy_candidate_byte_budget_counts_serialized_array_and_keeps_hint_whole() {
+        let mut first_item = index_fixture_item("first", "first.mp4", Presence::Present);
+        first_item.source_ids = vec!["cid1234".to_string()];
+        let mut second_item = index_fixture_item("second", "second.mp4", Presence::Present);
+        second_item.source_ids = vec!["cid1234".to_string()];
+        let items = vec![first_item, second_item];
+        let hints = vec![SourceHint {
+            source_ids: vec!["cid1234".to_string()],
+            title: Some("not the matching title".to_string()),
+            relative_path: None,
+            collection: None,
+            origin: HintOrigin::LegacyText,
+            requires_confirmation: true,
+        }];
+        let first_match = legacy_candidates(
+            &hints,
+            &items,
+            LegacyCandidateLimits {
+                max_candidates: 10,
+                max_serialized_array_bytes: 512 * 1024,
+                max_match_visits: 100,
+            },
+        )
+        .expect("unbounded-by-test-limit match should serialize")
+        .candidates
+        .remove(0);
+        let one_candidate_array_bytes = serde_json::to_vec(&vec![first_match])
+            .expect("candidate array should serialize")
+            .len();
+        assert_eq!(
+            DEFAULT_LEGACY_CANDIDATE_LIMITS.max_serialized_array_bytes,
+            512 * 1024
+        );
+
+        let mut report = LegacyImportReport {
+            hints,
+            warnings: Vec::new(),
+            needs_confirmation: true,
+            revision: None,
+            candidates: Vec::new(),
+        };
+        populate_legacy_candidates(
+            &mut report,
+            &items,
+            LegacyCandidateLimits {
+                max_candidates: 10,
+                max_serialized_array_bytes: one_candidate_array_bytes,
+                max_match_visits: 100,
+            },
+        )
+        .expect("bounded candidates should serialize");
+
+        assert!(
+            report.candidates.is_empty(),
+            "an incomplete hint must not expose a partial choice set"
+        );
+        assert_eq!(report.hints.len(), 1);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("serialized array limit"))
+        );
+    }
+
+    #[test]
+    fn legacy_candidate_match_visit_budget_skips_incomplete_hint() {
+        let ids = vec![
+            "cid1000".to_string(),
+            "cid2000".to_string(),
+            "cid3000".to_string(),
+            "cid4000".to_string(),
+        ];
+        let items = (0..4)
+            .map(|index| {
+                let mut item = index_fixture_item(
+                    &format!("item-{index}"),
+                    &format!("item-{index}.mp4"),
+                    Presence::Present,
+                );
+                item.source_ids = ids.clone();
+                item
+            })
+            .collect::<Vec<_>>();
+        let hints = vec![SourceHint {
+            source_ids: ids,
+            title: Some("Must not fall back".to_string()),
+            relative_path: None,
+            collection: None,
+            origin: HintOrigin::LegacyText,
+            requires_confirmation: true,
+        }];
+        let mut report = LegacyImportReport {
+            hints,
+            warnings: Vec::new(),
+            needs_confirmation: true,
+            revision: None,
+            candidates: Vec::new(),
+        };
+
+        populate_legacy_candidates(
+            &mut report,
+            &items,
+            LegacyCandidateLimits {
+                max_candidates: 10,
+                max_serialized_array_bytes: 512 * 1024,
+                max_match_visits: 10,
+            },
+        )
+        .expect("bounded candidates should serialize");
+
+        assert_eq!(report.hints.len(), 1);
+        assert!(
+            report.candidates.is_empty(),
+            "an incomplete source-ID union must not become a partial or title fallback result"
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("10 lookup/match-visit limit"))
+        );
+
+        let matches = legacy_candidates(
+            &report.hints,
+            &items,
+            LegacyCandidateLimits {
+                max_candidates: 10,
+                max_serialized_array_bytes: 512 * 1024,
+                max_match_visits: 10,
+            },
+        )
+        .expect("bounded matching should complete with a warning");
+        assert_eq!(matches.work.match_entries_visited, 8);
+        assert_eq!(matches.work.source_id_lookups, 2);
+        assert_eq!(
+            matches.truncation,
+            Some(LegacyCandidateTruncation::MatchVisits)
         );
     }
 
@@ -10461,6 +11072,44 @@ mod tests {
         assert!(!root.path().join("Existing/clip (2).mp4").exists());
         release_preview_anchors(&skip.id);
         release_preview_anchors(&keep_both.id);
+    }
+
+    #[test]
+    fn preview_validator_and_result_share_a_single_locked_scan() {
+        let root = TemporaryRoot::new("preview-single-authoritative-scan");
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("source media should write");
+        let manager = manager(&root);
+        let initial = manager.scan(&[]).expect("initial scan should complete");
+        let item_id = item_at(&initial, "clip.mp4").id.clone();
+        let before = manager.scan_attempt_count_for_test();
+        let mut validated_revision = None;
+
+        let (preview, snapshot) = manager
+            .preview_with_hints_and_patches_and_snapshot_validator(
+                PreviewBuildRequest {
+                    item_ids: std::slice::from_ref(&item_id),
+                    target_relative_dir: Some("Organized"),
+                    rename: false,
+                    conflict: ConflictPolicy::KeepBoth,
+                    patches: &[],
+                },
+                &[],
+                |fresh_snapshot| {
+                    assert!(fresh_snapshot.items.iter().any(|item| item.id == item_id));
+                    validated_revision = Some(fresh_snapshot.revision.clone());
+                    Ok(())
+                },
+            )
+            .expect("validated preview should be built from the fresh scan");
+
+        assert_eq!(manager.scan_attempt_count_for_test(), before + 1);
+        assert_eq!(
+            validated_revision.as_deref(),
+            Some(snapshot.revision.as_str())
+        );
+        assert_eq!(preview.items.len(), 1);
+        assert_eq!(preview.items[0].source_path, "clip.mp4");
     }
 
     #[test]

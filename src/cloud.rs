@@ -66,6 +66,20 @@ impl std::fmt::Display for CloudStateVersionExhausted {
 
 impl std::error::Error for CloudStateVersionExhausted {}
 
+#[derive(Debug)]
+pub(crate) struct CloudInboxRecoveryIncomplete;
+
+impl std::fmt::Display for CloudInboxRecoveryIncomplete {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cloud inbox startup recovery is still in progress"
+        )
+    }
+}
+
+impl std::error::Error for CloudInboxRecoveryIncomplete {}
+
 pub(crate) fn is_state_version_exhausted(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CloudStateVersionExhausted>().is_some()
 }
@@ -755,6 +769,7 @@ impl CloudInbox {
                 request.seq
             );
         }
+        self.require_initial_recovery_complete_before_write()?;
         let record = InboxRecord {
             schema_version: INBOX_RECORD_VERSION,
             request,
@@ -766,16 +781,14 @@ impl CloudInbox {
             result: None,
         };
         self.write_record_path(&path, &record)?;
-        if !self.restart_incomplete_recovery_after_directory_write()? {
-            self.pending_sequences
-                .lock()
-                .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?
-                .insert(record.request.seq);
-            self.state_index
-                .lock()
-                .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
-                .record(&record);
-        }
+        self.pending_sequences
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?
+            .insert(record.request.seq);
+        self.state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
+            .record(&record);
         Ok(true)
     }
 
@@ -956,6 +969,7 @@ impl CloudInbox {
             .operation_lock
             .lock()
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        self.require_initial_recovery_complete_before_write()?;
         let path = self.record_path(seq);
         let mut record = self
             .read_record_path(&path)?
@@ -963,18 +977,16 @@ impl CloudInbox {
         update(&mut record)?;
         record.updated_at = now_seconds();
         self.write_record_path(&path, &record)?;
-        if !self.restart_incomplete_recovery_after_directory_write()? {
-            let mut pending = self
-                .pending_sequences
-                .lock()
-                .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?;
-            let mut state_index = self
-                .state_index
-                .lock()
-                .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
-            set_pending_sequence(&mut pending, seq, record.status);
-            state_index.record(&record);
-        }
+        let mut pending = self
+            .pending_sequences
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox pending index lock was poisoned"))?;
+        let mut state_index = self
+            .state_index
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
+        set_pending_sequence(&mut pending, seq, record.status);
+        state_index.record(&record);
         Ok(record)
     }
 
@@ -987,6 +999,7 @@ impl CloudInbox {
             .operation_lock
             .lock()
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        self.require_initial_recovery_complete_before_write()?;
         if observed_version > MAX_JS_SAFE_INTEGER {
             bail!("observed cloud state version is outside JavaScript's safe integer range");
         }
@@ -1000,7 +1013,6 @@ impl CloudInbox {
             return Err(CloudStateVersionExhausted.into());
         }
         self.write_state_version(&path, next)?;
-        self.restart_incomplete_recovery_after_directory_write()?;
         Ok(next)
     }
 
@@ -1680,16 +1692,19 @@ impl CloudInbox {
         Ok(!index.has_active_confirmation_before(preview_id, inbox_preview_expiry_millis(record)))
     }
 
-    fn restart_incomplete_recovery_after_directory_write(&self) -> Result<bool> {
-        let mut scan = self
+    fn require_initial_recovery_complete_before_write(&self) -> Result<()> {
+        let initial_complete = self
             .recovery_scan
             .lock()
-            .map_err(|_| anyhow!("cloud inbox recovery cursor lock was poisoned"))?;
-        if scan.initial_complete {
-            return Ok(false);
+            .map_err(|_| anyhow!("cloud inbox recovery cursor lock was poisoned"))?
+            .initial_complete;
+        if initial_complete {
+            return Ok(());
         }
-        self.reset_incomplete_recovery(&mut scan)?;
-        Ok(true)
+        if self.recover_interrupted_requests()? {
+            return Ok(());
+        }
+        Err(CloudInboxRecoveryIncomplete.into())
     }
 
     fn reset_incomplete_recovery(&self, scan: &mut InboxRecoveryScan) -> Result<()> {
@@ -2534,18 +2549,20 @@ mod tests {
             "partial indexes must not be published as complete history"
         );
 
+        let incoming = request(126, "arrived during startup recovery");
+        let incomplete = reopened
+            .persist(incoming.clone())
+            .expect_err("incomplete startup recovery must defer new durable writes");
         assert!(
-            reopened
-                .persist(request(126, "arrived during startup recovery"))
-                .expect("new durable request should persist during bounded recovery"),
-            "a new sequence should be durably added"
+            incomplete.is::<CloudInboxRecoveryIncomplete>(),
+            "bounded recovery should be distinguishable from an access or format error"
         );
         assert!(
             reopened
-                .pending()
-                .expect("recovery should restart after a new directory entry")
-                .is_empty(),
-            "dispatch must remain blocked while the restarted index is partial"
+                .record(126)
+                .expect("deferred request lookup should succeed")
+                .is_none(),
+            "a deferred request must not be written or acknowledged before full recovery"
         );
 
         let mut externally_materialized = InboxRecord {
@@ -2567,26 +2584,67 @@ mod tests {
             "directory churn during enumeration must not publish a partial index"
         );
 
-        let pending = (0..32)
-            .find_map(|_| {
-                let pending = reopened
-                    .pending()
-                    .expect("bounded recovery pass should succeed");
-                let initial_complete = reopened
-                    .recovery_scan
-                    .lock()
-                    .expect("recovery scan lock should be available")
-                    .initial_complete;
-                if initial_complete {
-                    (!pending.is_empty()).then_some(pending)
-                } else {
-                    assert!(
-                        pending.is_empty(),
-                        "partial startup indexes must not dispatch active records"
-                    );
-                    None
+        let mut deferred_attempts = 0;
+        let mut persisted = false;
+        for _ in 0..32 {
+            match reopened.persist(incoming.clone()) {
+                Ok(inserted) => {
+                    assert!(inserted, "the deferred request should be written once");
+                    persisted = true;
+                    break;
                 }
-            })
+                Err(error) if error.is::<CloudInboxRecoveryIncomplete>() => {
+                    deferred_attempts += 1;
+                    assert!(
+                        reopened
+                            .record(126)
+                            .expect("deferred request lookup should succeed")
+                            .is_none(),
+                        "partial startup recovery must not persist a new request"
+                    );
+                    assert!(
+                        !reopened
+                            .recovery_scan
+                            .lock()
+                            .expect("recovery scan lock should be available")
+                            .initial_complete,
+                        "a deferred write must not claim recovery completed"
+                    );
+                }
+                Err(error) => panic!("recovery should not fail for the valid inbox: {error:#}"),
+            }
+        }
+        assert!(
+            persisted,
+            "bounded recovery should eventually admit the request"
+        );
+        assert!(
+            deferred_attempts >= 2,
+            "repeated arrivals should advance a shared recovery cursor instead of restarting it"
+        );
+        assert!(
+            reopened
+                .recovery_scan
+                .lock()
+                .expect("recovery scan lock should be available")
+                .initial_complete,
+            "the first write must wait until the complete durable index is recovered"
+        );
+
+        for seq in [1, 120] {
+            let record = reopened
+                .record(seq)
+                .expect("expired fixture should be readable before cleanup")
+                .expect("expired fixture should exist before cleanup");
+            assert_eq!(record.updated_at, old);
+            assert!(
+                inbox_terminal_record_expired(&record, now_seconds()),
+                "terminal fixture {seq} should be expired before cleanup starts"
+            );
+        }
+
+        let pending = reopened
+            .pending()
             .expect("recovery should make bounded progress through history");
         assert_eq!(
             pending
@@ -2603,18 +2661,6 @@ mod tests {
                 .expect("recovery scan lock should be available")
                 .initial_complete
         );
-
-        for seq in [1, 120] {
-            let record = reopened
-                .record(seq)
-                .expect("expired fixture should be readable before cleanup")
-                .expect("expired fixture should exist before cleanup");
-            assert_eq!(record.updated_at, old);
-            assert!(
-                inbox_terminal_record_expired(&record, now_seconds()),
-                "terminal fixture {seq} should be expired before cleanup starts"
-            );
-        }
 
         for _ in 0..16 {
             let pending = reopened
