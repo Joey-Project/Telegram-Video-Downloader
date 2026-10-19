@@ -1,7 +1,7 @@
 ---
 id: 20261019-msi01
 title: Production Executable Outside Cargo Output
-status: blocked
+status: completed
 created: 2026-10-19
 updated: 2026-10-19
 branch: codex/macos-service-install
@@ -76,31 +76,38 @@ superseded_by:
 
 ## Controlled Cutover and Current Runtime
 
-- The new destination is
-  `/Users/joey/.local/lib/telegram-video-downloader/bin/telegram-video-downloader`.
-  Retain the rollback executable, exact plist, configuration, and state metadata
-  under `~/.local/lib/telegram-video-downloader/backups/20261019T103210.929774Z`.
-  Metadata backups preserve ownership/permissions/content; staging media payloads
-  remain in place. Original lock identities are recorded, never recreated.
-- The new path triggered a native Documents authorization request
-  (`kTCCServiceSystemPolicyDocumentsFolder`, request `65688.38`). Joey declined
-  granting new-path access and asked to restore the original repository entry.
-- Restore the exact original plist and signed executable entrypoint at
-  `~/Program/Codex-workspace/Telegram-Video-Downloader/target/release/telegram-video-downloader`.
-  Configuration, working directory, logs, authentication, and media remain in
-  their existing locations. No privacy grants or TCC state were changed.
-- Recovery PID 74606 is a single original-path process but still waits inside
-  `NSFileCoordinator` during queue startup. No new startup-ready marker or
-  resumed polling has been verified. Do not treat a running PID as recovery.
-- Compare 30 configuration, queue/completion, lock, and authentication files
-  against the pre-switch snapshot: hashes, ownership, modes, device/inode,
-  and link counts are unchanged. All 19 indexed records remain readable.
+- Joey initially deferred the new-path Documents authorization and requested
+  restoration of the original entrypoint, then resumed migration after unlocking
+  the system. At `2026-10-19 18:33:37 UTC`, fixed-path PID `2221` passed startup-ready
+  and two distinct successful Telegram polls, with all three markers bound to that PID.
+- The GUI LaunchAgent is the only running downloader instance; the legacy user
+  service is absent. `lsof` confirms
+  `~/.local/lib/telegram-video-downloader/bin/telegram-video-downloader` and the
+  preserved canonical repository working directory. Configuration, logs,
+  authentication and media paths remain unchanged.
+- An independent release build of the reviewed merged source took 2m32s in
+  isolated target/build directories. The installed executable retains
+  `Telegram Video Downloader Local Signing`, fingerprint
+  `C24FE0C91539BD95BA4081CD944A8E17053FB304`, identifier
+  `io.github.telegram-local-downloader.bot`, and the original designated
+  requirement. Signature integrity and requirement verification pass.
+- Both queue indexes parse and all 19 video records remain readable: 14 completed
+  and 5 cancelled, with no missing indexed record. PDF has no indexed tasks.
+  All 30 compared configuration/state files retain their hashes, owner, group,
+  mode, device and link count. Twenty-eight retain their inodes; the two
+  `index.json` files have new inodes from the expected atomic rewrite in
+  `QueueManager::open`. Lock identities and media-associated state remain in place.
+- Retain the new rollback executable, plist, configuration and state metadata in
+  `~/.local/lib/telegram-video-downloader/backups/20261019T182920.731238Z`, alongside
+  the earlier `20261019T103210.929774Z` backup. All 40 backed-up files pass hash,
+  owner, group and mode checks; manifests record original device/inode identities.
+  Media payloads are not copied or relocated.
 
 ## Next Steps
 
-- Resolve the outstanding native authorization/coordinator request without
-  granting new-path access against Joey's decision, then verify the original
-  service's startup-ready and Telegram activity.
-- Activate the fixed path only after separate authorization and successful
-  runtime checks. The original live Cargo release output must not be cleaned
-  while this cutover remains deferred.
+- No migration step remains. Future production updates use explicit signed,
+  atomic installation; ordinary builds and tests do not deploy.
+- Cargo cache cleanup is independent of the active executable. Keep rollback
+  backups, configuration, repository PDF-helper resources, authentication data,
+  logs and media-associated queue/completion/lock/recovery state. Cache cleanup
+  is a separate operation and was not performed during this cutover.
