@@ -35,3 +35,18 @@ jobs:
 
       - name: Run all Rust tests, including mock Telegram E2E
         run: cargo test --all-targets --quiet
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.14'
+
+      - name: Check macOS service shell syntax
+        run: |
+          bash -n scripts/launch_agent.sh
+          bash -n scripts/test_launch_agent.sh
+
+      - name: Test macOS service helpers
+        run: |
+          python3 scripts/test_macos_service.py
+          bash scripts/test_launch_agent.sh

@@ -889,8 +889,10 @@ fn make_runtime(
         management_dispatch: Arc::new(Semaphore::new(1)),
         backlog_sync_gate: Arc::new(Mutex::new(())),
         reconciliation_complete: Arc::new(AtomicBool::new(true)),
+        cloud_ready_marker_emitted: Arc::new(AtomicBool::new(false)),
         test_file_provider: None,
         test_library_refresh_failure: Arc::new(StdMutex::new(None)),
+        test_cloud_ready_marker_emissions: Arc::new(AtomicUsize::new(0)),
     }
 }
 
@@ -2347,6 +2349,13 @@ async fn cloud_rest_persists_before_ack_and_recovers_duplicate_backlog_after_res
     first_runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
         .expect("test cloud client should use localhost");
     assert!(sync_cloud_backlog(&first_runtime).await.is_err());
+    assert_eq!(
+        first_runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        0,
+        "a failed authoritative ACK must not emit Cloud readiness"
+    );
     assert!(
         cloud_state.durable_before_ack.load(AtomicOrdering::SeqCst),
         "mock Worker must observe the complete private inbox record before ACK"
@@ -2381,6 +2390,13 @@ async fn cloud_rest_persists_before_ack_and_recovers_duplicate_backlog_after_res
     sync_cloud_backlog(&runtime)
         .await
         .expect("redelivered requests should persist and ACK");
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        1,
+        "readiness should be emitted after the full authoritative backlog is durable and ACKed"
+    );
     let records = reopened_inbox
         .records()
         .expect("recovered inbox records should list");
@@ -2431,6 +2447,13 @@ async fn cloud_rest_persists_before_ack_and_recovers_duplicate_backlog_after_res
     sync_cloud_backlog(&runtime)
         .await
         .expect("empty backlog should remain safe after duplicate delivery");
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        1,
+        "later successful reconciliations must not repeat the Cloud readiness marker"
+    );
     assert!(
         telegram_requests.try_recv().is_err(),
         "empty backlog must not replay a completed request"
@@ -2444,6 +2467,96 @@ async fn cloud_rest_persists_before_ack_and_recovers_duplicate_backlog_after_res
     stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
     stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cloud_readiness_requires_durable_persistence_and_ack_then_emits_once() {
+    let root = temp_cloud_bot_dir("readiness-durable-ack");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox_provider = Arc::new(FailOnceInboxFileProvider::default());
+    let provider: Arc<dyn QueueFileProvider> = inbox_provider.clone();
+    let inbox = Arc::new(
+        CloudInbox::open_with_file_provider(&config.downloads.video_dir, provider)
+            .expect("cloud inbox should open with retryable test storage"),
+    );
+    let request = cloud_telegram_update_with_text(401, 401, "/help");
+    let request_path = config
+        .downloads
+        .video_dir
+        .join(".telegram-video-downloader-cloud")
+        .join(format!("request-{:020}.json", request.seq));
+    inbox_provider.fail_next_write_to(request_path);
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), vec![request]).await;
+    let telegram = TelegramClient::with_test_api_base_url(
+        TEST_TELEGRAM_TOKEN.to_string(),
+        "http://127.0.0.1:1".to_string(),
+    );
+    let mut runtime = make_runtime(telegram, config, queue.clone(), inbox.clone());
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+
+    let persistence_error = sync_cloud_backlog(&runtime)
+        .await
+        .expect_err("an inbox write failure must stop reconciliation before ACK");
+    assert!(
+        format!("{persistence_error:#}").contains("simulated one-time inbox storage failure"),
+        "the reconciliation failure should retain its inbox persistence cause"
+    );
+    assert_eq!(cloud_state.ack_count.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        0,
+        "an inbox persistence failure must not emit Cloud readiness"
+    );
+
+    assert!(
+        sync_cloud_backlog(&runtime).await.is_err(),
+        "the mock's failed ACK response must also keep Cloud unready"
+    );
+    assert_eq!(cloud_state.ack_count.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        0,
+        "durable persistence without a successful ACK is not full reconciliation"
+    );
+
+    sync_cloud_backlog(&runtime)
+        .await
+        .expect("the redelivered durable request should eventually reconcile");
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        1,
+        "the first complete durable-and-ACKed reconciliation should emit readiness"
+    );
+    sync_cloud_backlog(&runtime)
+        .await
+        .expect("later empty reconciliation should succeed");
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        1,
+        "periodic successful reconciliations must not repeat readiness"
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -3370,6 +3483,13 @@ async fn websocket_backlog_fetch_failure_does_not_persist_or_dispatch_later_fram
         session_result.is_err(),
         "REST fetch failure should propagate from the receiver"
     );
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        0,
+        "a failed authoritative fetch must not emit Cloud readiness"
+    );
     server_result.expect("fake WebSocket API should complete");
     assert!(
         inbox
@@ -3460,6 +3580,13 @@ async fn local_dispatch_waits_for_initial_authoritative_reconciliation() {
     assert!(
         runtime.reconciliation_complete.load(AtomicOrdering::SeqCst),
         "successful authoritative fetch should enable dispatcher"
+    );
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        1,
+        "a successful REST-only reconciliation should establish Cloud readiness without WebSocket"
     );
     let request = tokio::time::timeout(Duration::from_secs(5), telegram_requests.recv())
         .await

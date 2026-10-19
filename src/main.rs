@@ -25,6 +25,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -364,11 +366,9 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
         return run_cloud_bot(context, cloud_config.clone(), &mut shutdown).await;
     }
     let mut offset = None;
+    let mut startup_poll_successes = 0;
 
-    info!(
-        concurrency = config.bot.concurrency,
-        "telegram local downloader started"
-    );
+    emit_startup_readiness(config.bot.concurrency);
 
     loop {
         tokio::select! {
@@ -380,6 +380,7 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
             updates = telegram.get_updates(offset, config.bot.poll_timeout_seconds) => {
                 match updates {
                     Ok(updates) => {
+                        emit_poll_readiness(&mut startup_poll_successes);
                         if let Err(err) = process_telegram_updates(
                             &telegram,
                             &config,
@@ -427,10 +428,13 @@ struct CloudBotRuntime {
     management_dispatch: Arc<Semaphore>,
     backlog_sync_gate: Arc<Mutex<()>>,
     reconciliation_complete: Arc<AtomicBool>,
+    cloud_ready_marker_emitted: Arc<AtomicBool>,
     #[cfg(test)]
     test_file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
     #[cfg(test)]
     test_library_refresh_failure: Arc<std::sync::Mutex<Option<String>>>,
+    #[cfg(test)]
+    test_cloud_ready_marker_emissions: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -898,12 +902,16 @@ async fn run_cloud_bot(
         management_dispatch: Arc::new(Semaphore::new(1)),
         backlog_sync_gate: Arc::new(Mutex::new(())),
         reconciliation_complete: Arc::new(AtomicBool::new(false)),
+        cloud_ready_marker_emitted: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
         test_file_provider: None,
         #[cfg(test)]
         test_library_refresh_failure: Arc::new(std::sync::Mutex::new(None)),
+        #[cfg(test)]
+        test_cloud_ready_marker_emissions: Arc::new(AtomicUsize::new(0)),
     };
 
+    emit_cloud_startup_readiness(runtime.bot.config.bot.concurrency);
     info!(
         fallback_poll_seconds = cloud_config.fallback_poll_seconds,
         "telegram local cloud ingress started"
@@ -1606,6 +1614,17 @@ async fn sync_cloud_backlog_pass(
     runtime
         .reconciliation_complete
         .store(true, Ordering::Release);
+    if runtime
+        .cloud_ready_marker_emitted
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        emit_cloud_reconciliation_readiness();
+        #[cfg(test)]
+        runtime
+            .test_cloud_ready_marker_emissions
+            .fetch_add(1, Ordering::SeqCst);
+    }
     runtime.request_notify.notify_one();
     runtime.state_notify.notify_one();
     Ok(())
@@ -3294,6 +3313,30 @@ fn youtube_video_id(raw_url: &str) -> Option<String> {
             .find_map(|(key, value)| (key == "v").then(|| value.into_owned()));
     }
     None
+}
+
+fn emit_startup_readiness(concurrency: usize) {
+    // Deployment readiness must remain observable with a preserved RUST_LOG=off.
+    let pid = std::process::id();
+    eprintln!("telegram local downloader started concurrency={concurrency} pid={pid}");
+}
+
+fn emit_cloud_startup_readiness(concurrency: usize) {
+    let pid = std::process::id();
+    eprintln!("telegram local cloud ingress started concurrency={concurrency} pid={pid}");
+}
+
+fn emit_cloud_reconciliation_readiness() {
+    let pid = std::process::id();
+    eprintln!("cloud ingress reconciliation completed pid={pid}");
+}
+
+fn emit_poll_readiness(successes: &mut u8) {
+    if *successes < 2 {
+        *successes += 1;
+        let pid = std::process::id();
+        eprintln!("telegram polling completed poll={successes} pid={pid}");
+    }
 }
 
 fn spawn_bot_runtime_worker<F>(future: F) -> Result<oneshot::Receiver<Result<()>>>
@@ -12537,6 +12580,59 @@ mod tests {
                 .expect("trimmed snapshot should encode")
                 .saturating_add(1024)
                 <= budget
+        );
+    }
+
+    #[test]
+    fn readiness_markers_ignore_rust_log_off() {
+        const CHILD_FLAG: &str = "TVD_READINESS_TEST_CHILD";
+        const FILTERED_EVENT: &str = "readiness logging filter sentinel";
+        if std::env::var_os(CHILD_FLAG).is_some_and(|value| value == "1") {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap())
+                .init();
+            info!("readiness logging filter sentinel");
+            emit_startup_readiness(2);
+            emit_cloud_startup_readiness(2);
+            emit_cloud_reconciliation_readiness();
+            let mut polls = 0;
+            for _ in 0..3 {
+                emit_poll_readiness(&mut polls);
+            }
+            return;
+        }
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::readiness_markers_ignore_rust_log_off",
+                "--nocapture",
+            ])
+            .env("RUST_LOG", "off")
+            .env(CHILD_FLAG, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("readiness child should run without shared environment changes");
+        let child_pid = child.id();
+        assert_ne!(child_pid, std::process::id());
+        let output = child
+            .wait_with_output()
+            .expect("readiness child should finish");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "child failed: {stdout}\n{stderr}");
+        assert!(!stdout.contains(FILTERED_EVENT));
+        assert!(!stderr.contains(FILTERED_EVENT));
+        assert_eq!(
+            stderr.lines().collect::<Vec<_>>(),
+            [
+                format!("telegram local downloader started concurrency=2 pid={child_pid}"),
+                format!("telegram local cloud ingress started concurrency=2 pid={child_pid}"),
+                format!("cloud ingress reconciliation completed pid={child_pid}"),
+                format!("telegram polling completed poll=1 pid={child_pid}"),
+                format!("telegram polling completed poll=2 pid={child_pid}"),
+            ]
         );
     }
 

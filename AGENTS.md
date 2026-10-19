@@ -2,6 +2,17 @@
 
 ## macOS Bot Deployment
 
+- Install production executables at
+  `$HOME/.local/lib/telegram-video-downloader/bin/telegram-video-downloader`
+  using the explicit deployment command. Never run the LaunchAgent from Cargo
+  output directories; ordinary builds and tests must not deploy or restart it.
+- Queue, completion records, staging, publication locks, and recovery metadata
+  intentionally live beside the media. Preserve their paths and inode bindings.
+  Keep existing configuration, authentication state, working directory, and logs
+  in place when they are outside Cargo output; do not relocate them for cache cleanup.
+- Retain rollback binaries, plist/configuration copies, and state backups outside
+  Cargo output before a controlled switch. Do not blindly restore inode-bound
+  lock state from copied backups; follow the deployment documentation.
 - Follow [the signing procedure](docs/macos-bot-signing.md) before deploying or
   restarting the macOS LaunchAgent.
 - Record the canonical executable's existing designated requirement before a

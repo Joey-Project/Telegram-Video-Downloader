@@ -23,9 +23,10 @@ superseded_by: ""
 - 当前接受的架构大方向是公开托管的静态界面自动加载文件库并提交操作；Telegram webhook 进入 Cloudflare Worker，再进入 D1 持久收件箱。本机 Rust bot 主动领取操作，并由本机通过同一 Telegram bot 发送或编辑进度消息。本机没有公网入站接口。偏好使用 Cloudflare Free；达到额度限制时暂停操作并提示用户。
 - Rust 通过固定 Worker API 补领、确认和回写状态；Mini App 验证 Telegram initData。休眠 WebSocket 推送完整请求，固定共享密钥鉴权，本机落盘后才确认接收。状态通过持久递增版本防止旧回写覆盖新快照。
 - 第一至第四阶段的本地代码已落在隔离分支：Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段 `/settings` 与新下载位置选择仍延期。
-- Cloudflare 等待卡片重复问题已修复。2026-10-19 的类型检查、54 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 983 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录及来源匹配和有界状态清理覆盖。
+- Cloudflare 等待卡片重复问题已修复。2026-10-19 的类型检查、54 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 985 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录及来源匹配和有界状态清理覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
-- 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `fefdfcb3cd03a5e153e9e02fd8f9bdf6c727e5b0` 的 master 修复，包含 ASS 弹幕显示默认值及恢复工作流收尾。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
+- 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `3b3263eab291158725002b749664096807dcbeeb` 的 master 修复，包含 ASS 弹幕显示默认值、恢复工作流收尾及 Cargo 输出目录之外的签名服务安装流程，并补齐 Cloud 模式的服务就绪兼容。本机已安装的 bot 和其他 worktree 保持各自原状；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
+- Python 3.14.5 的 93 项服务单测、隔离 shell 集成测试、shell 语法检查和 ShellCheck 均通过；测试使用临时 HOME 和模拟系统命令，不安装或重启实际服务。CI 已纳入 Python 与 shell 服务测试。
 
 ### 2026-10-18 审查修复
 
@@ -182,6 +183,7 @@ superseded_by: ""
 
 - 已实现 Worker/D1 收件、HTTPS 领取/ACK/state API、Bearer 鉴权、WS 通知、Rust 私有 durable inbox、准确 sequence/envelope 去重、乱序收件和重启恢复；现有 Telegram `getUpdates` 路径在 cloud 配置缺省时继续工作。
 - WS 和 REST 共享先落盘再逐条 ACK 的边界；ACK 丢失时 D1 重送由 inbox 去重。WebSocket 长时间空闲保持连接，只有真实关闭或错误才重连；REST fallback 读取持久 backlog。
+- macOS 服务就绪检查按同一配置选择 Telegram 或 Cloud 收件模式，保留同 PID、安装二进制、工作目录和新增日志校验。Cloud 仅在完整 REST 对账、持久化与 ACK 成功后报告就绪，stderr 标记不受 `RUST_LOG=off` 影响；不伪造 Telegram 轮询，也不要求 WS 必须可用。
 - 初始 inbox 恢复以有界页推进，新本地写入等待恢复完成；新请求仍保留在 D1 且不 ACK，接收路径自身继续恢复，不因持续新消息清空进度。外部目录条目变化仍要求完整性重扫，身份与访问策略独立核验。
 - 运行中的 dispatcher 保留已完成操作的 outcome，终态 receipt 或关联 preview 写入暂时失败时只重试持久化；不重新调用 Telegram 或执行文件操作。跨进程退出仍采用原有 Telegram Uncertain 和文件 journal 恢复边界。
 - 本地 mock 覆盖 Cloud REST 落盘/ACK/重启、Telegram `/queue` 分派、重复与乱序请求、云端 ACK 失败重送；新增了空闲超过 75 秒后 WS 收到请求的虚拟时间回归，已纳入通过的完整 Rust 测试。mock 不能替代生产 hibernation 或 webhook 切换验证。
