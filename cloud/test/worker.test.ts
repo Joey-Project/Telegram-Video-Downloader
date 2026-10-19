@@ -13,7 +13,8 @@ import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotR
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
 import { canonicalJson, MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS, MAX_STATE_BODY_BYTES } from "../src/validation";
-import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue } from "../src/store";
+import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue, storeSnapshot } from "../src/store";
+import type { LocalSnapshot } from "../src/types";
 import worker from "../src/index";
 
 const testEnv = env as typeof env & { TEST_MIGRATIONS: D1Migration[] };
@@ -283,6 +284,52 @@ function localSnapshot(overrides: Record<string, unknown> = {}): Record<string, 
     settings: { download_dir: "/Users/test/Videos" },
     ...overrides,
   };
+}
+
+function snapshotReadRaceDb(db: D1Database, commitNewSnapshot: () => Promise<void>): D1Database {
+  let interleaved = false;
+  const wrappedStatements = new WeakMap<object, D1PreparedStatement>();
+  const interleaveOnce = async (): Promise<void> => {
+    if (interleaved) return;
+    interleaved = true;
+    await commitNewSnapshot();
+  };
+
+  return new Proxy(db, {
+    get(target, property) {
+      if (property === "prepare") {
+        return (query: string) => {
+          const statement = target.prepare(query);
+          if (!query.includes("FROM snapshot_meta WHERE id = 1")) return statement;
+
+          const wrapped = new Proxy(statement, {
+            get(inner, method) {
+              if (method === "first") {
+                return async (...args: unknown[]) => {
+                  const first = inner.first.bind(inner) as (...values: unknown[]) => Promise<unknown>;
+                  const result = await first(...args);
+                  await interleaveOnce();
+                  return result;
+                };
+              }
+              const value = Reflect.get(inner, method, inner) as unknown;
+              return typeof value === "function" ? value.bind(inner) : value;
+            },
+          });
+          wrappedStatements.set(wrapped, statement);
+          return wrapped;
+        };
+      }
+      if (property === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          await interleaveOnce();
+          return target.batch(statements.map((statement) => wrappedStatements.get(statement) ?? statement));
+        };
+      }
+      const value = Reflect.get(target, property, target) as unknown;
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
 }
 
 describe("durable Telegram ingress", () => {
@@ -560,6 +607,107 @@ describe("Mini App identity and actions", () => {
 });
 
 describe("local client API and state snapshots", () => {
+  it.each([
+    { label: "same", paddingBytes: 0 },
+    { label: "different", paddingBytes: 500_100 },
+  ])("reads a consistent snapshot through both owner APIs when a write lands between queries ($label chunk counts)", async ({ paddingBytes }) => {
+    const owner = await signInitData();
+    for (const path of ["/api/state", "/api/library"] as const) {
+      const current = await testEnv.DB.prepare(
+        "SELECT state_version, reported_at FROM snapshot_meta WHERE id = 1",
+      ).first<{ state_version: number; reported_at: number }>();
+      const oldVersion = (current?.state_version ?? 0) + 1;
+      const newVersion = oldVersion + 1;
+      const oldReportedAt = Math.max(Date.now(), (current?.reported_at ?? 0) + 1);
+      const library = (label: string) => ({
+        revision: `library-${label}-${newVersion}`,
+        scanned_at: Math.floor(oldReportedAt / 1000),
+        root_label: "Videos",
+        items: [],
+        categories: [],
+        warnings: [],
+        ready: true,
+        marker: label,
+        ...(paddingBytes === 0 || label === "old" ? {} : { padding: "x".repeat(paddingBytes) }),
+      });
+      const oldSnapshot = localSnapshot({
+        state_version: oldVersion,
+        reported_at: oldReportedAt,
+        library: { ...library("old"), revision: `library-old-${oldVersion}` },
+        operations: [{ seq: oldVersion, status: "old" }],
+      }) as unknown as LocalSnapshot;
+      const newSnapshot = localSnapshot({
+        state_version: newVersion,
+        reported_at: oldReportedAt + 1,
+        library: library("new"),
+        operations: [{ seq: newVersion, status: "new" }],
+      }) as unknown as LocalSnapshot;
+
+      await storeSnapshot(testEnv.DB, oldSnapshot);
+      const racingDb = snapshotReadRaceDb(testEnv.DB, async () => {
+        await storeSnapshot(testEnv.DB, newSnapshot);
+      });
+      const response = await worker.fetch(new Request(`${workerUrl}${path}`, {
+        headers: { "x-telegram-init-data": owner },
+      }), { ...testEnv, DB: racingDb });
+
+      expect(response.status).toBe(200);
+      if (path === "/api/state") {
+        const state = await responseJson<{
+          state_version: number;
+          reported_at: number;
+          library: { revision: string; marker: string };
+          operations: Array<{ status: string }>;
+        }>(response);
+        expect(state.state_version).toBe(newVersion);
+        expect(state.reported_at).toBe(oldReportedAt + 1);
+        expect(state.library).toMatchObject({ revision: `library-new-${newVersion}`, marker: "new" });
+        expect(state.operations).toEqual([{ seq: newVersion, status: "new" }]);
+      } else {
+        const state = await responseJson<{
+          reported_at: number;
+          library: { revision: string; marker: string };
+        }>(response);
+        expect(state.reported_at).toBe(oldReportedAt + 1);
+        expect(state.library).toMatchObject({ revision: `library-new-${newVersion}`, marker: "new" });
+      }
+    }
+  });
+
+  it("rejects valid-JSON snapshot chunks whose stored canonical hash no longer matches", async () => {
+    const current = await testEnv.DB.prepare(
+      "SELECT state_version, reported_at FROM snapshot_meta WHERE id = 1",
+    ).first<{ state_version: number; reported_at: number }>();
+    const snapshot = localSnapshot({
+      state_version: (current?.state_version ?? 0) + 1,
+      reported_at: Math.max(Date.now(), (current?.reported_at ?? 0) + 1),
+      library: {
+        revision: "library-before-corruption",
+        scanned_at: Math.floor(Date.now() / 1000),
+        root_label: "Videos",
+        items: [],
+        categories: [],
+        warnings: [],
+        ready: true,
+      },
+    }) as unknown as LocalSnapshot;
+    await storeSnapshot(testEnv.DB, snapshot);
+
+    const chunk = await testEnv.DB.prepare(
+      "SELECT data FROM snapshot_chunks WHERE kind = 'library' AND part = 0",
+    ).first<{ data: string }>();
+    expect(chunk).not.toBeNull();
+    const library = JSON.parse(chunk?.data ?? "null") as Record<string, unknown>;
+    const corruptedJson = JSON.stringify({ ...library, revision: "valid-json-with-a-different-hash" });
+    await testEnv.DB.prepare(
+      "UPDATE snapshot_chunks SET data = ? WHERE kind = 'library' AND part = 0",
+    ).bind(corruptedJson).run();
+
+    const response = await ownerRequest("/api/library", await signInitData());
+    expect(response.status).toBe(503);
+    expect(await responseJson<{ error: string }>(response)).toEqual({ error: "Service unavailable" });
+  });
+
   it("requires the shared local authorization for every local endpoint", async () => {
     const response = await SELF.fetch(new Request(`${workerUrl}/api/local/requests`));
     const state = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {

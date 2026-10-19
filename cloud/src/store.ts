@@ -336,25 +336,35 @@ export interface StoredSnapshot {
 }
 
 export async function readSnapshot(db: D1Database): Promise<StoredSnapshot | null> {
-  const meta = await db.prepare(
-    `SELECT state_version, reported_at, received_at, library_revision, library_hash,
-            library_chunk_count, state_hash, state_chunk_count
-     FROM snapshot_meta WHERE id = 1`,
-  ).first<SnapshotMetaRow>();
-  if (meta === null) return null;
+  const [metaResult, chunksResult] = await db.batch<SnapshotMetaRow | SnapshotChunkRow>([
+    db.prepare(
+      `SELECT state_version, reported_at, received_at, library_revision, library_hash,
+              library_chunk_count, state_hash, state_chunk_count
+       FROM snapshot_meta WHERE id = 1`,
+    ),
+    db.prepare("SELECT kind, part, data FROM snapshot_chunks ORDER BY kind ASC, part ASC"),
+  ]);
+  if (!metaResult?.success) throw new Error("D1 snapshot metadata read failed");
+  const meta = metaResult.results[0] as SnapshotMetaRow | undefined;
+  if (meta === undefined) return null;
 
-  const chunksResult = await db.prepare(
-    "SELECT kind, part, data FROM snapshot_chunks ORDER BY kind ASC, part ASC",
-  ).all<SnapshotChunkRow>();
-  if (!chunksResult.success) throw new Error("D1 snapshot chunks read failed");
-  const libraryChunks = chunksResult.results.filter((chunk) => chunk.kind === "library");
-  const stateChunks = chunksResult.results.filter((chunk) => chunk.kind === "state");
+  if (!chunksResult?.success) throw new Error("D1 snapshot chunks read failed");
+  const chunks = chunksResult.results as SnapshotChunkRow[];
+  const libraryChunks = chunks.filter((chunk) => chunk.kind === "library");
+  const stateChunks = chunks.filter((chunk) => chunk.kind === "state");
   if (libraryChunks.length !== meta.library_chunk_count || stateChunks.length !== meta.state_chunk_count) {
     throw new Error("Stored snapshot chunk count mismatch");
   }
 
-  const library = JSON.parse(libraryChunks.map((chunk) => chunk.data).join("")) as unknown;
-  const state = JSON.parse(stateChunks.map((chunk) => chunk.data).join("")) as unknown;
+  const libraryJson = libraryChunks.map((chunk) => chunk.data).join("");
+  const stateJson = stateChunks.map((chunk) => chunk.data).join("");
+  const [libraryHash, stateHash] = await Promise.all([sha256Hex(libraryJson), sha256Hex(stateJson)]);
+  if (libraryHash !== meta.library_hash || stateHash !== meta.state_hash) {
+    throw new Error("Stored snapshot hash mismatch");
+  }
+
+  const library = JSON.parse(libraryJson) as unknown;
+  const state = JSON.parse(stateJson) as unknown;
   if (typeof library !== "object" || library === null || Array.isArray(library) ||
     typeof state !== "object" || state === null || Array.isArray(state)) {
     throw new Error("Stored snapshot is malformed");
