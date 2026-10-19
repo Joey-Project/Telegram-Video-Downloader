@@ -29,6 +29,9 @@ EXECUTABLE = "telegram-video-downloader"
 STOP_TIMEOUT = 15
 SNAPSHOT_SECONDS = 120
 SNAPSHOT_BYTES = 256 * 1024 * 1024
+# launchd.plist(5), execvp(3), and the Darwin SDK's paths.h define this lookup.
+LAUNCHD_STDPATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+AUTH_REMOVE_NAME = re.compile(r"\.telegram-video-downloader-remove-[0-9]+-[0-9a-f]{16}")
 
 
 class InstallError(Exception):
@@ -86,6 +89,38 @@ def config_path(value, config_parent, runtime_home):
     return expanded if expanded.is_absolute() else Path(config_parent) / expanded
 
 
+def plist_path(value, working_directory):
+    """LaunchAgent paths are literal strings; launchd does not expand HOME."""
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise InstallError("LaunchAgent contains an unsupported path")
+    path = Path(value)
+    return path if path.is_absolute() else Path(working_directory) / path
+
+
+def resolve_launchd_executable(argument, working_directory, captured=None):
+    """Match launchd's standard-path lookup and execvp's slash exception."""
+    if not isinstance(argument, str) or not argument or "\0" in argument:
+        raise InstallError("LaunchAgent contains an unsupported executable argument")
+    if "/" in argument:
+        executable = plist_path(argument, working_directory)
+    elif captured is not None:
+        # Default rollback remains usable after the original executable was removed.
+        executable = Path(captured)
+        candidates = {Path(directory) / argument for directory in LAUNCHD_STDPATH.split(":")}
+        if executable not in candidates:
+            raise InstallError("saved executable does not match launchd's standard search path")
+    else:
+        found = shutil.which(argument, path=LAUNCHD_STDPATH)
+        if found is None:
+            raise InstallError(
+                "LaunchAgent executable was not found in launchd's standard search path"
+            )
+        executable = Path(found)
+    if captured is not None and executable != Path(captured):
+        raise InstallError("saved executable does not match the LaunchAgent argument")
+    return executable
+
+
 def no_symlinks(path):
     """Protect path identity: never copy or replace through symbolic links."""
     for entry in [Path(path), *Path(path).parents]:
@@ -95,8 +130,10 @@ def no_symlinks(path):
 
 def validate_stderr_path(path):
     """Require observable stderr without opening special files or changing logs."""
-    path = Path(path)
-    no_symlinks(path)
+    try:
+        path = Path(path).resolve(strict=False)
+    except (OSError, RuntimeError):
+        raise InstallError("StandardErrorPath target cannot be resolved") from None
     try:
         metadata = path.lstat()
     except FileNotFoundError:
@@ -128,6 +165,83 @@ def traversal_error(error):
 
 def strict_walk(path):
     return os.walk(path, followlinks=False, onerror=traversal_error)
+
+
+def auth_recovery_entry(path):
+    """Recognize private safe_fs removal journals without scanning unrelated trees."""
+    path = Path(path)
+    tombstone = path.name.endswith(".cleanup.json")
+    name = path.name.removesuffix(".cleanup.json") if tombstone else path.name
+    if not AUTH_REMOVE_NAME.fullmatch(name):
+        return False
+    no_symlinks(path)
+    metadata = path.lstat()
+    if not tombstone and (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise InstallError("managed auth recovery directory has invalid ownership or permissions")
+    manifest_path = path if tombstone else path / "manifest.json"
+    no_symlinks(manifest_path)
+    descriptor = os.open(manifest_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        with os.fdopen(descriptor, "rb") as stream:
+            manifest_metadata = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(manifest_metadata.st_mode)
+                or manifest_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(manifest_metadata.st_mode) != 0o600
+                or manifest_metadata.st_nlink != 1
+                or manifest_metadata.st_size > 1024
+            ):
+                raise InstallError("managed auth recovery manifest has invalid metadata")
+            manifest = json.loads(stream.read(1025))
+    except (ValueError, UnicodeError):
+        raise InstallError("managed auth recovery manifest is invalid") from None
+    parent = path.parent.stat()
+    if (
+        not isinstance(manifest, dict)
+        or type(manifest.get("version")) is not int
+        or manifest["version"] not in {1, 2, 3}
+        or manifest.get("quarantine_name") != name
+        or manifest.get("parent_device") != parent.st_dev
+        or manifest.get("parent_inode") != parent.st_ino
+        or type(manifest.get("entry_is_directory")) is not bool
+        or any(type(manifest.get(key)) is not int for key in ("entry_device", "entry_inode"))
+    ):
+        raise InstallError("managed auth recovery manifest does not describe its directory")
+    if tombstone and manifest["version"] < 2:
+        raise InstallError("managed auth cleanup tombstone has an unsupported version")
+    if manifest["version"] >= 2:
+        expected = (manifest.get("quarantine_device"), manifest.get("quarantine_inode"))
+        if any(type(value) is not int for value in expected) or (
+            not tombstone and expected != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise InstallError(
+                "managed auth recovery directory identity does not match its manifest"
+            )
+    if manifest["version"] == 3:
+        original = manifest.get("original_name_hex")
+        if not isinstance(original, str) or not re.fullmatch(r"(?:[0-9a-f]{2})+", original):
+            raise InstallError("managed auth recovery manifest has an invalid original name")
+        original = bytes.fromhex(original)
+        if b"/" in original or b"\0" in original or original in {b".", b".."}:
+            raise InstallError("managed auth recovery manifest has an invalid original name")
+    if not tombstone:
+        entry = path / "entry"
+        no_symlinks(entry)
+        try:
+            entry_metadata = entry.stat()
+        except FileNotFoundError:
+            entry_metadata = None
+        if entry_metadata and (
+            (entry_metadata.st_dev, entry_metadata.st_ino)
+            != (manifest["entry_device"], manifest["entry_inode"])
+            or stat.S_ISDIR(entry_metadata.st_mode) != manifest["entry_is_directory"]
+        ):
+            raise InstallError("quarantined auth entry identity does not match its manifest")
+    return True
 
 
 def file_binding(configured, capture=False):
@@ -407,12 +521,27 @@ def process_inventory():
     return inventory
 
 
-def bot_processes(include_workers=False):
+def bot_processes(include_workers=False, *, expected_executables=()):
     inventory = process_inventory()
+    expected_paths = {Path(path) for path in expected_executables}
+    try:
+        expected_paths |= {path.resolve() for path in expected_paths}
+    except OSError:
+        raise InstallError("cannot resolve the expected downloader executable") from None
+    expected_names = {path.name for path in expected_paths}
+
+    def matches(executable):
+        if executable.name == EXECUTABLE or executable in expected_paths:
+            return True
+        if executable.name not in expected_names:
+            return False
+        try:
+            return executable.resolve() in expected_paths
+        except OSError:
+            raise InstallError("cannot resolve a downloader process executable") from None
+
     downloaders = {
-        pid
-        for pid, process in inventory.items()
-        if pid > 0 and process["executable"].name == EXECUTABLE
+        pid for pid, process in inventory.items() if pid > 0 and matches(process["executable"])
     }
     if include_workers:
         return sorted(downloaders)
@@ -431,11 +560,11 @@ def bot_processes(include_workers=False):
     return sorted(roots)
 
 
-def wait_for_no_bot_processes():
+def wait_for_no_bot_processes(*, expected_executables=()):
     """Do not replace or restart until old service and worker images have exited."""
     deadline = time.monotonic() + STOP_TIMEOUT
     while True:
-        remaining = bot_processes(include_workers=True)
+        remaining = bot_processes(include_workers=True, expected_executables=expected_executables)
         if not remaining:
             return
         if time.monotonic() >= deadline:
@@ -767,12 +896,13 @@ class _ReadinessLogScanner:
     STARTED = b"telegram local downloader started"
     POLLS = {b"telegram polling completed poll=1", b"telegram polling completed poll=2"}
     STARTED_PREFIX = STARTED + b" concurrency="
-    LINE_BYTES = len(STARTED_PREFIX) + 20 + 1
+    LINE_BYTES = len(STARTED_PREFIX) + 20 + len(b" pid=") + 10 + 1
 
     def __init__(self, paths, offsets):
         self.paths = list(dict.fromkeys(paths))
         self.boundaries = {}
         self.streams = {}
+        self.pid = None
         for path in self.paths:
             boundary = offsets.get(str(path), 0)
             if isinstance(boundary, int):
@@ -780,7 +910,13 @@ class _ReadinessLogScanner:
                 boundary = {"offset": boundary, "device": None, "inode": None}
             self.boundaries[path] = dict(boundary)
 
-    def scan(self):
+    def scan(self, expected_pid):
+        if type(expected_pid) is not int or not 0 < expected_pid <= 2**31 - 1:
+            raise InstallError("readiness requires a valid observed service PID")
+        if self.pid is not None and self.pid != expected_pid:
+            raise InstallError("service PID changed during readiness log verification")
+        self.pid = expected_pid
+        pid_suffix = f" pid={self.pid}".encode()
         opened = []
         try:
             for path in self.paths:
@@ -791,7 +927,15 @@ class _ReadinessLogScanner:
                         if boundary["device"] is not None:
                             raise InstallError("startup log changed during readiness verification")
                         continue
-                    stream = path.open("rb")
+                    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                    try:
+                        opened_metadata = os.fstat(descriptor)
+                        if not stat.S_ISREG(opened_metadata.st_mode):
+                            raise InstallError("startup log changed during readiness verification")
+                        stream = os.fdopen(descriptor, "rb")
+                    except BaseException:
+                        os.close(descriptor)
+                        raise
                 except FileNotFoundError:
                     if boundary["device"] is not None:
                         raise InstallError(
@@ -851,12 +995,14 @@ class _ReadinessLogScanner:
                     if index < len(fragments) - 1:
                         if not state["overflow"] and len(line) <= self.LINE_BYTES:
                             line = line.removesuffix(b"\r")
-                            state["started"] |= line == self.STARTED or (
-                                line.startswith(self.STARTED_PREFIX)
-                                and line[len(self.STARTED_PREFIX) :].isdigit()
-                            )
-                            if line in self.POLLS:
-                                state["polls"].add(line)
+                            if line.endswith(pid_suffix):
+                                marker = line[: -len(pid_suffix)]
+                                state["started"] |= marker == self.STARTED or (
+                                    marker.startswith(self.STARTED_PREFIX)
+                                    and marker[len(self.STARTED_PREFIX) :].isdigit()
+                                )
+                                if marker in self.POLLS:
+                                    state["polls"].add(marker)
                         state["line"], state["overflow"] = b"", False
                     else:
                         state["overflow"] |= len(line) > self.LINE_BYTES
@@ -943,14 +1089,20 @@ class Deployment:
         old_args = self.old_plist.get("ProgramArguments", []) if self.old_plist else []
         if self.old_plist and len(old_args) != 2:
             raise InstallError("expected an existing binary and config ProgramArguments pair")
-        self.workdir = (
-            absolute(self.old_plist.get("WorkingDirectory", self.repo), self.repo)
-            if self.old_plist
-            else self.repo
+        if self.old_plist:
+            cwd = self.old_plist.get("WorkingDirectory")
+            if not isinstance(cwd, str) or not cwd or "\0" in cwd or not Path(cwd).is_absolute():
+                raise InstallError(
+                    "existing LaunchAgent requires an explicit absolute WorkingDirectory"
+                )
+            self.workdir = Path(cwd)
+        else:
+            self.workdir = self.repo
+        self.old_binary = (
+            resolve_launchd_executable(old_args[0], self.workdir) if old_args else self.binary
         )
-        self.old_binary = absolute(old_args[0], self.workdir) if old_args else self.binary
         self.config = (
-            absolute(old_args[1], self.workdir)
+            plist_path(old_args[1], self.workdir)
             if old_args
             else absolute(args.config or self.repo / "config.toml", self.repo)
         )
@@ -958,7 +1110,7 @@ class Deployment:
             raise InstallError("existing service config path is preserved; change it separately")
         if self.old_plist:
             self.log_paths = [
-                absolute(self.old_plist[key], self.workdir)
+                plist_path(self.old_plist[key], self.workdir)
                 for key in ["StandardOutPath", "StandardErrorPath"]
                 if self.old_plist.get(key)
             ]
@@ -978,7 +1130,6 @@ class Deployment:
         for path in [
             self.binary,
             self.backups,
-            *self.log_paths,
         ]:
             no_symlinks(path)
         self.workdir_binding = directory_binding(self.workdir)
@@ -1045,7 +1196,7 @@ class Deployment:
                 "stop the duplicate before deployment"
             )
         known = {info["pid"] for info in registered if info["pid"]}
-        if set(bot_processes()) - known:
+        if set(bot_processes(expected_executables=(self.old_binary, self.binary))) - known:
             raise InstallError(
                 "another downloader executable is running; wait for workers to finish "
                 "or stop unmanaged instances before deployment"
@@ -1130,9 +1281,12 @@ class Deployment:
             no_symlinks(source)
             try:
                 with os.scandir(source.parent) as entries:
-                    candidates.update(
-                        Path(entry.path) for entry in entries if entry.name.startswith(source.name)
-                    )
+                    for entry in entries:
+                        if time.monotonic() >= deadline:
+                            raise InstallError("auth state inventory exceeded its time budget")
+                        path = Path(entry.path)
+                        if entry.name.startswith(source.name) or auth_recovery_entry(path):
+                            candidates.add(path)
             except FileNotFoundError:
                 pass
             except OSError:
@@ -1265,7 +1419,7 @@ class Deployment:
     def wait_ready(self, offsets):
         deadline = time.monotonic() + self.args.ready_timeout
         observed_pid = None
-        logs = _ReadinessLogScanner(self.log_paths, offsets)
+        logs = _ReadinessLogScanner([self.stderr_path], offsets)
         while time.monotonic() < deadline:
             current = service_info(self.targets[0])
             if current and current["pid"]:
@@ -1275,7 +1429,7 @@ class Deployment:
                         f"expected {observed_pid}, observed {current['pid']}"
                     )
                 observed_pid = current["pid"]
-                processes = bot_processes()
+                processes = bot_processes(expected_executables=(self.old_binary, self.binary))
                 if not processes:
                     # launchd can publish the PID before exec updates its process name.
                     time.sleep(1)
@@ -1285,7 +1439,7 @@ class Deployment:
                         "expected exactly one downloader process after bootstrap: "
                         f"expected PID {current['pid']}, observed PIDs {sorted(processes)}"
                     )
-                if logs.scan():
+                if logs.scan(current["pid"]):
                     listing = run(
                         ["lsof", "-nP", "-a", "-p", str(current["pid"]), "-d", "cwd,txt", "-Ffn"]
                     ).stdout
@@ -1322,6 +1476,9 @@ class Deployment:
                             "running executable or working directory "
                             "differs from the installed plist"
                         )
+                    confirmed = service_info(self.targets[0])
+                    if not confirmed or confirmed["pid"] != observed_pid:
+                        raise InstallError("service PID changed before readiness was confirmed")
                     return current["pid"]
             time.sleep(1)
         raise InstallError(
@@ -1406,9 +1563,9 @@ class Deployment:
             # Set this before bootout: a later domain may fail after the first stopped.
             stopped = True
             stop_services(self.targets)
-            wait_for_no_bot_processes()
+            wait_for_no_bot_processes(expected_executables=(self.old_binary, self.binary))
             state_entries = self.snapshot_state(backup)
-            offsets = capture_log_offsets(self.log_paths)
+            offsets = capture_log_offsets([self.stderr_path])
             atomic_install(staged, self.binary)
             run(
                 [
@@ -1425,7 +1582,7 @@ class Deployment:
             )
             atomic_bytes(self.plist_path, self.new_plist(), mode)
             for path in self.log_paths:
-                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                path.resolve(strict=False).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             run(["launchctl", "bootstrap", self.args.domain, self.plist_path])
             pid = self.wait_ready(offsets)
             atomic_bytes(
@@ -1485,7 +1642,7 @@ def validate_saved_plist(backup, transaction):
                 binary,
             ]
         )
-    elif transaction["had_plist"]:
+    elif transaction["had_plist"] or transaction["had_installed_binary"]:
         raise InstallError("saved previous executable is missing")
     if not transaction["had_plist"]:
         return None
@@ -1523,6 +1680,11 @@ def validate_saved_plist(backup, transaction):
             not valid_string(document[key]) or not Path(document[key]).is_absolute()
         ):
             raise InstallError(f"saved previous plist has an unsupported {key}")
+    if "WorkingDirectory" not in document:
+        raise InstallError("saved previous plist requires an explicit absolute WorkingDirectory")
+    resolve_launchd_executable(
+        arguments[0], document["WorkingDirectory"], captured=transaction["previous_binary"]
+    )
     environment = document.get("EnvironmentVariables", {})
     if not isinstance(environment, dict) or not all(
         valid_string(key) and isinstance(value, str) and "\0" not in value
@@ -1543,7 +1705,7 @@ def validate_original_entrypoint(backup, transaction, saved=None):
     arguments = previous.get("ProgramArguments", [])
     if len(arguments) != 2 or "Program" in previous:
         raise InstallError("saved plist has no supported original entrypoint")
-    original = absolute(arguments[0], previous.get("WorkingDirectory", Path.home()))
+    original = resolve_launchd_executable(arguments[0], previous["WorkingDirectory"])
     if original != Path(transaction["previous_binary"]):
         raise InstallError("saved original entrypoint does not match the backup transaction")
     binding, _ = file_binding(original)
@@ -1580,7 +1742,9 @@ def restore_binary_and_plist(backup, transaction, *, original_entrypoint=False):
         # Missing/changed original binaries must fail before interrupting any service.
         original, _ = validate_original_entrypoint(backup, transaction, saved)
     stop_services(transaction["targets"])
-    wait_for_no_bot_processes()
+    wait_for_no_bot_processes(
+        expected_executables=(transaction["previous_binary"], transaction["binary"])
+    )
     binary = original if original_entrypoint else Path(transaction["binary"])
     if original_entrypoint:
         # Revalidate after stopping before launchd is allowed to execute this path.
@@ -1622,6 +1786,8 @@ def rollback(args):
     transaction = validate_transaction(
         json.loads((backup / "transaction.json").read_text()), args.label
     )
+    # Reject incomplete rollback inputs before retaining files or changing service state.
+    validate_saved_plist(backup, transaction)
     retained = backup / datetime.datetime.now(datetime.UTC).strftime(
         "pre-rollback-%Y%m%dT%H%M%S.%fZ"
     )

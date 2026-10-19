@@ -17,6 +17,8 @@ Cargo configuration redirects intermediate artifacts to a shared cache.
 Existing configuration, authentication files, working directory, environment,
 and log paths are preserved when installing over an existing LaunchAgent. They
 are outside Cargo output and do not need relocation for `cargo clean -p`.
+The legacy binary/config argument pair and an explicit absolute
+`WorkingDirectory` are required. Unsupported plist shapes fail preflight.
 An existing plist must configure an absolute `StandardErrorPath` so the
 installer can observe readiness. Missing, relative, special-file or inaccessible
 destinations fail preflight before the running service is stopped; choose its
@@ -26,9 +28,12 @@ For a first installation, choose a configuration outside Cargo output. Its
 relative paths retain their existing meaning; the PDF helper also needs the
 Python project and helper resources beside that configuration.
 
-The configuration argument is relative to the LaunchAgent working directory.
+The configuration argument is a literal filesystem path relative to the
+LaunchAgent working directory; it is not expanded by a shell.
+Bare executable names use launchd's standard search path, independently of the
+service PATH; executable paths containing `/` retain their filesystem meaning.
 Media, authentication and PDF-helper paths are relative to the configuration's
-physical parent directory. Configuration HOME expansion follows the preserved
+physical parent directory. HOME expansion inside TOML follows the preserved
 service environment and supports `~`, `$HOME` and `${HOME}`; aliases followed by
 `..` retain filesystem resolution semantics. Bare tool names still use the
 preserved PATH, while relative command paths retain their task-specific working
@@ -84,12 +89,14 @@ expected working directory, the startup-ready marker, and two successful
 Telegram polls from the new process. Startup writes its ready marker and
 `telegram polling completed` directly to stderr, independently of `RUST_LOG`,
 with distinct `poll=1` and `poll=2` markers for its first two successful polls;
-these logs contain no token, URL, or message
+the startup and poll records include the emitting PID, which must match the
+observed service. These logs contain no token, URL, or message
 payload. Check queue/completion readability and preserved ownership/permissions.
 Do not use a second `getUpdates` consumer to test polling.
 
-Process checks cover this user's service and download workers, independently of
-other users' installations. Working-directory checks compare directory identity.
+Process checks cover this user's configured executable and download workers,
+including an existing custom executable basename, independently of other users'
+installations. Working-directory checks compare directory identity.
 Readiness scanning advances through bounded log chunks so verbose output does
 not hide later markers; observed rotation or truncation fails verification.
 
@@ -115,6 +122,8 @@ so it also works after Cargo output has been removed. It does not prove that the
 restored process reached startup-ready. Both rollback modes validate and capture
 the saved plist, service targets and previous registrations, and verify the
 previous executable before stopping any service.
+An existing executable still requires its retained binary when the old service
+had no plist. Missing that rollback artifact fails preflight.
 If the new path needs a privacy grant
 that the user declines, explicitly restore the original entrypoint instead:
 

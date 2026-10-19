@@ -161,6 +161,129 @@ class InstallationTest(unittest.TestCase):
         self.assertEqual(document, expected)
         self.assertEqual(self.state_snapshot(), self.before_state)
 
+    def test_plist_paths_remain_literal_while_toml_fields_expand_runtime_home(self):
+        working = self.root / "literal-$HOME-working-directory"
+        working.mkdir()
+        runtime_home = self.root / "service-home"
+        runtime_home.mkdir()
+        logs = self.root / "literal-${HOME}-logs"
+        for index, argument in enumerate(["$HOME/config.toml", "~/config.toml"]):
+            with self.subTest(config_argument=argument):
+                config = working / argument
+                config.parent.mkdir(exist_ok=True)
+                config.write_text(
+                    '[downloads]\nvideo_dir="${HOME}/videos"\npdf_dir="$HOME/pdfs"\n'
+                    '[bilibili.auth]\nstate_path="~/state.json"\n'
+                    'credential_file="relative-credentials.json"\n'
+                )
+                config.chmod(0o600)
+                relative_auth = config.parent / "relative-credentials.json"
+                relative_auth.write_bytes(b"private fixture state")
+                relative_auth.chmod(0o600)
+                document = {
+                    **self.original_plist,
+                    "ProgramArguments": [str(self.old_binary), argument],
+                    "WorkingDirectory": str(working),
+                    "StandardOutPath": str(logs / "stdout.log"),
+                    "StandardErrorPath": str(logs / "stderr.log"),
+                    "EnvironmentVariables": {
+                        **self.original_plist["EnvironmentVariables"],
+                        "HOME": str(runtime_home),
+                    },
+                }
+                self.plist.write_bytes(plistlib.dumps(document))
+                deployment = self.deployment()
+                self.audit(deployment)
+                self.assertEqual(deployment.config, config)
+                self.assertEqual(deployment.workdir, working)
+                self.assertEqual(deployment.media["video"], runtime_home / "videos")
+                self.assertEqual(deployment.media["pdf"], runtime_home / "pdfs")
+                self.assertEqual(deployment.auth_paths["state_path"], runtime_home / "state.json")
+                self.assertEqual(deployment.auth_paths["credential_file"], relative_auth)
+                expected = {**document, "ProgramArguments": [str(deployment.binary), argument]}
+                self.assertEqual(plistlib.loads(deployment.new_plist()), expected)
+                backup = self.root / f"literal-plist-paths-{index}"
+                backup.mkdir()
+                with self.snapshot_runner():
+                    deployment.snapshot_state(backup)
+                manifest = json.loads((backup / "state-manifest.json").read_text())
+                self.assertIn(
+                    relative_auth, {Path(entry["source"]) for entry in manifest["entries"]}
+                )
+        self.external.assert_not_called()
+
+    def test_bare_launchd_executable_uses_standard_search_instead_of_cwd_or_service_path(self):
+        name = "custom-service-bot"
+        standard = self.root / "launchd-standard-bin"
+        service_path = self.root / "service-path-bin"
+        standard.mkdir()
+        service_path.mkdir()
+        for path in [standard / name, service_path / name, self.repo / name]:
+            shutil.copy2(self.old_binary, path)
+        document = {
+            **self.original_plist,
+            "ProgramArguments": [name, str(self.config)],
+            "EnvironmentVariables": {"PATH": str(service_path)},
+        }
+        self.plist.write_bytes(plistlib.dumps(document))
+        with mock.patch.object(service, "LAUNCHD_STDPATH", str(standard)):
+            deployment = self.deployment()
+            self.audit(deployment)
+            self.assertEqual(deployment.old_binary, standard / name)
+            self.assertEqual(service.resolve_launchd_executable(name, self.repo), standard / name)
+            (standard / name).unlink()
+            self.assertEqual(
+                service.resolve_launchd_executable(name, self.repo, captured=standard / name),
+                standard / name,
+            )
+            with self.assertRaises(service.InstallError):
+                service.resolve_launchd_executable(name, self.repo)
+        expected = {**document, "ProgramArguments": [str(deployment.binary), str(self.config)]}
+        self.assertEqual(plistlib.loads(deployment.new_plist()), expected)
+
+    def test_bare_custom_entrypoint_can_roll_back_after_its_original_source_is_removed(self):
+        standard = self.root / "launchd-standard-bin"
+        standard.mkdir()
+        custom = standard / "custom-service-entry"
+        shutil.copy2(self.old_binary, custom)
+        self.plist.write_bytes(
+            plistlib.dumps(
+                {
+                    **self.original_plist,
+                    "ProgramArguments": [custom.name, str(self.config)],
+                }
+            )
+        )
+        with mock.patch.object(service, "LAUNCHD_STDPATH", str(standard)):
+            deployment = self.deployment("deploy", "--no-build", "--binary", str(self.artifact))
+            _, registry = self.transaction_environment(deployment)
+            deployment.audit()
+            with mock.patch.object(deployment, "wait_ready", return_value=303):
+                result = deployment.deploy()
+            custom.unlink()
+            arguments = service.parser().parse_args(
+                ["rollback", "--label", self.label, "--backup", result["backup"]]
+            )
+            arguments.original_entrypoint = True
+            with (
+                mock.patch.object(service, "stop_services") as stopped,
+                self.assertRaises(service.InstallError),
+            ):
+                service.rollback(arguments)
+            stopped.assert_not_called()
+            arguments.original_entrypoint = False
+            with mock.patch.object(service, "wait_for_no_bot_processes") as drained:
+                service.rollback(arguments)
+            drained.assert_called_once_with(
+                expected_executables=(str(custom), str(deployment.binary))
+            )
+        self.assertEqual(deployment.binary.read_bytes(), b"old signed executable")
+        self.assertEqual(
+            plistlib.loads(self.plist.read_bytes())["ProgramArguments"][0], str(deployment.binary)
+        )
+        self.assertEqual(registry, {self.gui: 303})
+        self.assertEqual(self.state_snapshot(), self.before_state)
+
     def test_existing_service_without_stderr_capture_is_rejected_during_preflight(self):
         document = dict(self.original_plist)
         document.pop("StandardErrorPath")
@@ -181,10 +304,8 @@ class InstallationTest(unittest.TestCase):
         os.mkfifo(fifo, 0o600)
         directory = self.root / "readiness-directory"
         directory.mkdir()
-        regular = self.root / "symlink-target.log"
-        regular.write_bytes(b"existing log")
         alias = self.root / "stderr-alias.log"
-        alias.symlink_to(regular)
+        alias.symlink_to(fifo)
         unusable = {Path("/dev/null"), fifo, directory, alias}
         original_open = Path.open
 
@@ -216,6 +337,45 @@ class InstallationTest(unittest.TestCase):
                     (self.home / ".local/lib/telegram-video-downloader/backups").exists()
                 )
         self.external.assert_not_called()
+
+    def test_log_leaf_and_parent_aliases_preserve_plist_and_bind_their_targets(self):
+        physical = self.root / "physical-logs"
+        physical.mkdir()
+        stdout = physical / "stdout.log"
+        stderr = physical / "stderr.log"
+        stdout.write_bytes(b"previous stdout\n")
+        stderr.write_bytes(b"previous stderr\n")
+        parent_alias = self.root / "log-directory-alias"
+        parent_alias.symlink_to(physical, target_is_directory=True)
+        leaf_alias = self.root / "stderr-alias.log"
+        leaf_alias.symlink_to(stderr)
+        document = {
+            **self.original_plist,
+            "StandardOutPath": str(parent_alias / "stdout.log"),
+            "StandardErrorPath": str(leaf_alias),
+        }
+        self.plist.write_bytes(plistlib.dumps(document))
+        deployment = self.deployment()
+        self.audit(deployment)
+        offsets = service.capture_log_offsets(deployment.log_paths)
+        self.assertEqual(offsets[str(leaf_alias)]["inode"], stderr.stat().st_ino)
+        self.assertEqual(offsets[str(parent_alias / "stdout.log")]["inode"], stdout.stat().st_ino)
+        with stderr.open("ab") as stream:
+            stream.write(
+                b"telegram local downloader started concurrency=1 pid=303\n"
+                b"telegram polling completed poll=1 pid=303\n"
+                b"telegram polling completed poll=2 pid=303\n"
+            )
+        scanner = service._ReadinessLogScanner(deployment.log_paths, offsets)
+        self.assertTrue(scanner.scan(303))
+        expected = {**document, "ProgramArguments": [str(deployment.binary), str(self.config)]}
+        self.assertEqual(plistlib.loads(deployment.new_plist()), expected)
+        replacement = self.root / "replacement-stderr.log"
+        replacement.write_bytes(stderr.read_bytes())
+        leaf_alias.unlink()
+        leaf_alias.symlink_to(replacement)
+        with self.assertRaises(service.InstallError):
+            scanner.scan(303)
 
     def test_regular_or_creatable_stderr_is_allowed_when_stdout_is_dev_null(self):
         existing = self.root / "readiness-regular.log"
@@ -520,6 +680,66 @@ class InstallationTest(unittest.TestCase):
             self.audit(self.deployment())
         self.assertFalse((self.home / ".local/lib/telegram-video-downloader/backups").exists())
         self.external.assert_not_called()
+
+    def test_auth_removal_quarantine_preserves_manifest_entry_and_private_metadata(self):
+        parent = self.repo / "auth"
+        name = ".telegram-video-downloader-remove-123-0123456789abcdef"
+        quarantine = parent / name
+        quarantine.mkdir(mode=0o700)
+        entry = quarantine / "entry"
+        credentials = parent / "credentials.json"
+        os.link(credentials, entry)
+        parent_stat, directory_stat, entry_stat = parent.stat(), quarantine.stat(), entry.stat()
+        contents = json.dumps(
+            {
+                "version": 3,
+                "quarantine_name": name,
+                "quarantine_device": directory_stat.st_dev,
+                "quarantine_inode": directory_stat.st_ino,
+                "parent_device": parent_stat.st_dev,
+                "parent_inode": parent_stat.st_ino,
+                "entry_device": entry_stat.st_dev,
+                "entry_inode": entry_stat.st_ino,
+                "entry_is_directory": False,
+                "recursive": False,
+                "original_name_hex": b"credentials.json".hex(),
+                "restore_requires_revalidation": True,
+            }
+        ).encode()
+        manifest = quarantine / "manifest.json"
+        tombstone = parent / (name + ".cleanup.json")
+        for path in [manifest, tombstone]:
+            path.write_bytes(contents)
+            path.chmod(0o600)
+        originals = {
+            path: (path.read_bytes(), path.stat()) for path in [entry, manifest, tombstone]
+        }
+        deployment = self.deployment()
+        self.audit(deployment)
+        backup = self.root / "quarantine-snapshot"
+        backup.mkdir()
+        with self.snapshot_runner():
+            deployment.snapshot_state(backup)
+        saved = json.loads((backup / "state-manifest.json").read_text())
+        records = {Path(record["source"]): record for record in saved["entries"]}
+        self.assertIn(quarantine, records)
+        self.assertIn(tombstone, records)
+        copied_directory = Path(records[quarantine]["backup"])
+        self.assertEqual(stat.S_IMODE(copied_directory.stat().st_mode), 0o700)
+        copied_credentials = Path(records[credentials]["backup"])
+        self.assertTrue((copied_directory / "entry").samefile(copied_credentials))
+        for path, (data, metadata) in originals.items():
+            copied = (
+                copied_directory / path.name
+                if path.parent == quarantine
+                else Path(records[path]["backup"])
+            )
+            self.assertEqual(copied.read_bytes(), data)
+            self.assertEqual(copied.stat().st_uid, metadata.st_uid)
+            self.assertEqual(copied.stat().st_gid, metadata.st_gid)
+            self.assertEqual(stat.S_IMODE(copied.stat().st_mode), stat.S_IMODE(metadata.st_mode))
+            self.assertEqual(path.stat().st_ino, metadata.st_ino)
+        self.assertEqual(self.state_snapshot(), self.before_state)
 
     def test_config_leaf_and_parent_aliases_preserve_argv_and_snapshot_the_canonical_target(self):
         physical = self.root / "physical-config"
@@ -1055,14 +1275,15 @@ class InstallationTest(unittest.TestCase):
             with self.subTest(old_plist=label):
                 previous = plistlib.dumps({**self.original_plist, **override})
                 self.plist.write_bytes(previous)
-                deployment = self.deployment("deploy")
-                _, registry = self.transaction_environment(deployment)
+                registry = {self.gui: 101, self.legacy: None}
                 with (
                     mock.patch.object(service, "build_release") as build,
                     mock.patch.object(service, "stop_services") as stop,
                     mock.patch.object(service, "atomic_install") as install,
                     self.assertRaises(service.InstallError),
                 ):
+                    deployment = self.deployment("deploy")
+                    _, registry = self.transaction_environment(deployment)
                     deployment.audit()
                     deployment.deploy()
                 build.assert_not_called()
@@ -1071,7 +1292,11 @@ class InstallationTest(unittest.TestCase):
                 self.assertEqual(registry, {self.gui: 101, self.legacy: None})
                 self.assertEqual(self.plist.read_bytes(), previous)
                 self.assertEqual(self.old_binary.read_bytes(), b"old signed executable")
-                self.assertFalse(deployment.binary.exists())
+                self.assertFalse(
+                    (
+                        self.home / ".local/lib/telegram-video-downloader/bin" / service.EXECUTABLE
+                    ).exists()
+                )
                 self.assertEqual(self.state_snapshot(), self.before_state)
 
     def test_failed_readiness_restores_binary_and_plist_without_reverting_runtime(self):
@@ -1326,6 +1551,35 @@ class InstallationTest(unittest.TestCase):
         self.assertEqual(plistlib.loads(self.plist.read_bytes()), expected)
         self.assertEqual(self.state_snapshot(), self.before_state)
 
+    def test_installed_binary_without_a_plist_still_requires_a_saved_binary_before_rollback(self):
+        deployment, arguments, _, registry, _ = self.original_rollback_fixture()
+        arguments.original_entrypoint = False
+        transaction_path = arguments.backup / "transaction.json"
+        transaction = json.loads(transaction_path.read_text())
+        transaction.update(had_installed_binary=True, had_plist=False, previous_services=[])
+        transaction_path.write_text(json.dumps(transaction))
+        (arguments.backup / "previous-binary").unlink()
+        live_binary = deployment.binary.read_bytes()
+        live_plist = self.plist.read_bytes()
+        with (
+            mock.patch.object(service, "stop_services") as stopped,
+            mock.patch.object(service, "preserve_copy") as copied,
+            mock.patch.object(service, "atomic_install") as installed,
+            mock.patch.object(Path, "unlink") as removed,
+            mock.patch.object(Path, "mkdir") as mkdir,
+            self.assertRaises(service.InstallError),
+        ):
+            service.rollback(arguments)
+        stopped.assert_not_called()
+        copied.assert_not_called()
+        installed.assert_not_called()
+        removed.assert_not_called()
+        mkdir.assert_not_called()
+        self.assertEqual(deployment.binary.read_bytes(), live_binary)
+        self.assertEqual(self.plist.read_bytes(), live_plist)
+        self.assertEqual(registry, {self.gui: 303})
+        self.assertEqual(self.state_snapshot(), self.before_state)
+
     def test_damaged_transaction_service_entries_are_rejected_before_any_mutation(self):
         deployment, arguments, _, registry, _ = self.original_rollback_fixture()
         arguments.original_entrypoint = False
@@ -1507,11 +1761,12 @@ class InstallationTest(unittest.TestCase):
     def test_readiness_requires_new_polling_records_and_running_paths(self):
         deployment = self.deployment()
         self.audit(deployment)
-        stdout = deployment.log_paths[0]
+        stdout = deployment.stderr_path
         stdout.parent.mkdir(parents=True)
         ready_log = (
-            "telegram local downloader started\n"
-            "telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+            "telegram local downloader started concurrency=1 pid=303\n"
+            "telegram polling completed poll=1 pid=303\n"
+            "telegram polling completed poll=2 pid=303\n"
         )
         stdout.write_text(ready_log)
         info = {"target": self.gui, "pid": 303}
@@ -1549,23 +1804,33 @@ class InstallationTest(unittest.TestCase):
         stderr.parent.mkdir(parents=True)
         stderr.write_bytes(b"previous service transcript\n")
         original_open = Path.open
+        original_fd_open = os.open
 
         def do_not_open_stdout_device(path, *args, **kwargs):
             self.assertNotEqual(Path(path), Path("/dev/null"))
             return original_open(path, *args, **kwargs)
 
-        with mock.patch.object(Path, "open", do_not_open_stdout_device):
+        def do_not_open_stdout_descriptor(path, *args, **kwargs):
+            self.assertNotEqual(Path(path), Path("/dev/null"))
+            return original_fd_open(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(Path, "open", do_not_open_stdout_device),
+            mock.patch.object(service.os, "open", do_not_open_stdout_descriptor),
+        ):
             offsets = service.capture_log_offsets(deployment.log_paths)
         self.assertNotIn("/dev/null", offsets)
         with stderr.open("ab") as stream:
             stream.write(
-                b"telegram local downloader started concurrency=1\n"
-                b"telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+                b"telegram local downloader started concurrency=1 pid=303\n"
+                b"telegram polling completed poll=1 pid=303\n"
+                b"telegram polling completed poll=2 pid=303\n"
             )
         info = {"target": self.gui, "pid": 303}
         listing = f"p303\nfcwd\nn{deployment.workdir}\nftxt\nn{deployment.binary}\n"
         with (
             mock.patch.object(Path, "open", do_not_open_stdout_device),
+            mock.patch.object(service.os, "open", do_not_open_stdout_descriptor),
             mock.patch.object(service, "service_info", return_value=info),
             mock.patch.object(service, "bot_processes", return_value=[303]),
             mock.patch.object(
@@ -1574,16 +1839,41 @@ class InstallationTest(unittest.TestCase):
         ):
             self.assertEqual(deployment.wait_ready(offsets), 303)
 
+    def test_write_only_stdout_is_preserved_and_never_read_for_stderr_readiness(self):
+        deployment, offsets, info, listing = self.startup_fixture()
+        stdout = Path(self.original_plist["StandardOutPath"])
+        stdout.write_bytes(b"private output requires no installer read access")
+        stdout.chmod(0o200)
+        original_open = os.open
+
+        def reject_stdout_read(path, *args, **kwargs):
+            if Path(path) == stdout:
+                raise PermissionError("stdout is intentionally write only")
+            return original_open(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(service.os, "open", side_effect=reject_stdout_read),
+            mock.patch.object(service, "service_info", return_value=info),
+            mock.patch.object(service, "bot_processes", return_value=[303]),
+            mock.patch.object(
+                service, "run", return_value=subprocess.CompletedProcess([], 0, listing, "")
+            ),
+        ):
+            self.assertEqual(deployment.wait_ready(offsets), 303)
+        self.assertEqual(stat.S_IMODE(stdout.stat().st_mode), 0o200)
+        self.assertEqual(plistlib.loads(deployment.new_plist())["StandardOutPath"], str(stdout))
+
     def startup_fixture(self):
         deployment = self.deployment()
         self.audit(deployment)
-        stdout = deployment.log_paths[0]
+        stdout = deployment.stderr_path
         stdout.parent.mkdir(parents=True)
         old_log = "records from the previous service instance\n"
         stdout.write_text(
             old_log
-            + "telegram local downloader started\n"
-            + "telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+            + "telegram local downloader started concurrency=1 pid=303\n"
+            + "telegram polling completed poll=1 pid=303\n"
+            "telegram polling completed poll=2 pid=303\n"
         )
         offsets = {str(stdout): len(old_log.encode())}
         info = {"target": self.gui, "pid": 303}
@@ -1609,9 +1899,10 @@ class InstallationTest(unittest.TestCase):
         stdout, stderr = deployment.log_paths
         stdout.write_text(
             "records from the previous service instance\n"
-            "telegram local downloader started\n"
-            "telegram polling completed poll=1\n"
+            "telegram local downloader started concurrency=1 pid=303\n"
+            "telegram polling completed poll=1 pid=303\n"
         )
+        stderr.unlink()
         os.link(stdout, stderr)
         self.assertEqual(stdout.stat().st_ino, stderr.stat().st_ino)
         with (
@@ -1624,7 +1915,7 @@ class InstallationTest(unittest.TestCase):
             deployment.wait_ready(offsets)
         self.external.assert_not_called()
         with stdout.open("a") as stream:
-            stream.write("telegram polling completed poll=2\n")
+            stream.write("telegram polling completed poll=2 pid=303\n")
         with (
             mock.patch.object(service, "service_info", return_value=info),
             mock.patch.object(service, "bot_processes", return_value=[303]),
@@ -1636,17 +1927,18 @@ class InstallationTest(unittest.TestCase):
 
     def test_incremental_log_scanning_reaches_markers_after_two_megabytes_with_bounded_state(self):
         deployment, _, _, _ = self.startup_fixture()
-        stdout = deployment.log_paths[0]
+        stdout = deployment.stderr_path
         contents = (
             b"x" * (2 * 1024 * 1024 + 123)
-            + b"\ntelegram local downloader started\n"
-            + b"telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+            + b"\ntelegram local downloader started concurrency=1 pid=303\n"
+            + b"telegram polling completed poll=1 pid=303\n"
+            b"telegram polling completed poll=2 pid=303\n"
         )
         stdout.write_bytes(contents)
         scanner = service._ReadinessLogScanner(deployment.log_paths, {str(stdout): 0})
         previous_offset = 0
         for _ in range(len(contents) // scanner.CHUNK_BYTES + 2):
-            ready = scanner.scan()
+            ready = scanner.scan(303)
             self.assertEqual(len(scanner.streams), 1)
             state = next(iter(scanner.streams.values()))
             self.assertLessEqual(state["offset"] - previous_offset, scanner.CHUNK_BYTES)
@@ -1659,71 +1951,157 @@ class InstallationTest(unittest.TestCase):
 
     def test_incremental_log_markers_may_cross_a_chunk_boundary(self):
         deployment, _, _, _ = self.startup_fixture()
-        stdout = deployment.log_paths[0]
+        stdout = deployment.stderr_path
         chunk = service._ReadinessLogScanner.CHUNK_BYTES
         stdout.write_bytes(
             b"x" * (chunk - 11)
-            + b"\ntelegram local downloader started\n"
-            + b"telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+            + b"\ntelegram local downloader started concurrency=1 pid=303\n"
+            + b"telegram polling completed poll=1 pid=303\n"
+            b"telegram polling completed poll=2 pid=303\n"
         )
         scanner = service._ReadinessLogScanner(deployment.log_paths, {str(stdout): 0})
-        self.assertFalse(scanner.scan())
-        self.assertTrue(scanner.scan())
+        self.assertFalse(scanner.scan(303))
+        self.assertTrue(scanner.scan(303))
+
+    def test_readiness_markers_are_bound_to_the_expected_service_pid(self):
+        deployment, _, _, _ = self.startup_fixture()
+        log = deployment.stderr_path
+        invalid = [
+            b"telegram local downloader started concurrency=1\n"
+            b"telegram polling completed poll=1\ntelegram polling completed poll=2\n",
+            b"telegram local downloader started concurrency=1 pid=404\n"
+            b"telegram polling completed poll=1 pid=404\n"
+            b"telegram polling completed poll=2 pid=404\n",
+            b"telegram local downloader started concurrency=1 pid=303\n"
+            b"telegram polling completed poll=1 pid=303\n"
+            b"telegram polling completed poll=2 pid=404\n",
+        ]
+        for contents in invalid:
+            with self.subTest(records=contents):
+                log.write_bytes(contents)
+                scanner = service._ReadinessLogScanner([log], {str(log): 0})
+                self.assertFalse(scanner.scan(303))
+        log.write_bytes(
+            b"telegram local downloader started concurrency=1 pid=303\n"
+            b"telegram polling completed poll=1 pid=303\n"
+            b"telegram polling completed poll=2 pid=303\n"
+        )
+        scanner = service._ReadinessLogScanner([log], {str(log): 0})
+        self.assertFalse(scanner.scan(404))
+        with log.open("ab") as stream:
+            stream.write(
+                b"telegram local downloader started concurrency=1 pid=404\n"
+                b"telegram polling completed poll=1 pid=404\n"
+                b"telegram polling completed poll=2 pid=404\n"
+            )
+        self.assertTrue(scanner.scan(404))
+        with self.assertRaises(service.InstallError):
+            scanner.scan(303)
+
+    def test_replacement_pid_cannot_inherit_the_previous_process_readiness(self):
+        deployment, offsets, info, listing = self.startup_fixture()
+        replacement = {"target": self.gui, "pid": 404}
+        with (
+            mock.patch.object(service, "service_info", return_value=replacement),
+            mock.patch.object(service, "bot_processes", return_value=[404]),
+            mock.patch.object(service.time, "monotonic", side_effect=[0, 0, 999]),
+            mock.patch.object(service.time, "sleep"),
+            self.assertRaises(service.InstallError),
+        ):
+            deployment.wait_ready(offsets)
+        self.external.assert_not_called()
+        with (
+            mock.patch.object(service, "service_info", side_effect=[info, replacement]),
+            mock.patch.object(service, "bot_processes", return_value=[303]),
+            mock.patch.object(
+                service, "run", return_value=subprocess.CompletedProcess([], 0, listing, "")
+            ),
+            self.assertRaises(service.InstallError),
+        ):
+            deployment.wait_ready(offsets)
+
+    def test_log_replaced_with_fifo_between_stat_and_open_is_rejected_without_blocking(self):
+        deployment, _, _, _ = self.startup_fixture()
+        log = deployment.stderr_path
+        scanner = service._ReadinessLogScanner([log], {str(log): 0})
+        original_open = os.open
+        switched = False
+
+        def replace_then_open(path, flags, *args, **kwargs):
+            nonlocal switched
+            if Path(path) == log:
+                self.assertTrue(flags & os.O_NONBLOCK)
+                log.unlink()
+                os.mkfifo(log, 0o600)
+                switched = True
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(service.os, "open", side_effect=replace_then_open),
+            self.assertRaises(service.InstallError),
+        ):
+            scanner.scan(303)
+        self.assertTrue(switched)
 
     def test_giant_payload_line_suffixes_cannot_forge_polling_cycles(self):
         deployment, _, _, _ = self.startup_fixture()
-        stdout = deployment.log_paths[0]
+        stdout = deployment.stderr_path
         chunk = service._ReadinessLogScanner.CHUNK_BYTES
         contents = (
-            b"telegram local downloader started concurrency=1\n"
+            b"telegram local downloader started concurrency=1 pid=303\n"
             + b"x" * (chunk + 123)
-            + b"telegram polling completed poll=1\n"
+            + b"telegram polling completed poll=1 pid=303\n"
             + b"y" * (chunk + 321)
-            + b"telegram polling completed poll=2\n"
+            + b"telegram polling completed poll=2 pid=303\n"
         )
         stdout.write_bytes(contents)
         scanner = service._ReadinessLogScanner(deployment.log_paths, {str(stdout): 0})
         for _ in range(len(contents) // chunk + 2):
-            self.assertFalse(scanner.scan())
+            self.assertFalse(scanner.scan(303))
             self.assertLessEqual(
                 len(next(iter(scanner.streams.values()))["line"]), scanner.LINE_BYTES
             )
         self.assertEqual(next(iter(scanner.streams.values()))["polls"], set())
         with stdout.open("ab") as stream:
-            stream.write(b"telegram polling completed poll=1\ntelegram polling completed poll=2\n")
-        self.assertTrue(scanner.scan())
+            stream.write(
+                b"telegram polling completed poll=1 pid=303\n"
+                b"telegram polling completed poll=2 pid=303\n"
+            )
+        self.assertTrue(scanner.scan(303))
 
     def test_payload_startup_substring_does_not_satisfy_startup_readiness(self):
         deployment, _, _, _ = self.startup_fixture()
-        stdout = deployment.log_paths[0]
+        stdout = deployment.stderr_path
         stdout.write_bytes(
-            b"payload telegram local downloader started\n"
-            b"telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+            b"payload telegram local downloader started concurrency=1 pid=303\n"
+            b"telegram polling completed poll=1 pid=303\n"
+            b"telegram polling completed poll=2 pid=303\n"
         )
         scanner = service._ReadinessLogScanner(deployment.log_paths, {str(stdout): 0})
-        self.assertFalse(scanner.scan())
+        self.assertFalse(scanner.scan(303))
         with stdout.open("ab") as stream:
-            stream.write(b"telegram local downloader started concurrency=1\n")
-        self.assertTrue(scanner.scan())
+            stream.write(b"telegram local downloader started concurrency=1 pid=303\n")
+        self.assertTrue(scanner.scan(303))
 
     def test_log_rotation_or_truncation_rejects_cold_historical_readiness_markers(self):
         deployment, _, _, _ = self.startup_fixture()
-        stdout = deployment.log_paths[0]
+        stdout = deployment.stderr_path
         historical = (
-            b"telegram local downloader started\n"
-            b"telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+            b"telegram local downloader started concurrency=1 pid=303\n"
+            b"telegram polling completed poll=1 pid=303\n"
+            b"telegram polling completed poll=2 pid=303\n"
         )
         for change in ["rotation", "truncation"]:
             with self.subTest(log_change=change):
                 stdout.write_bytes(b"old transcript\n" * 100)
                 offsets = service.capture_log_offsets(deployment.log_paths)
                 scanner = service._ReadinessLogScanner(deployment.log_paths, offsets)
-                self.assertFalse(scanner.scan())
+                self.assertFalse(scanner.scan(303))
                 if change == "rotation":
                     stdout.rename(self.root / "rotated-readiness.log")
                 stdout.write_bytes(historical)
                 with self.assertRaises(service.InstallError) as failure:
-                    scanner.scan()
+                    scanner.scan(303)
                 self.assertIn("log changed", str(failure.exception))
 
     def test_readiness_uses_the_physical_working_directory_without_rewriting_its_alias(self):
@@ -1737,11 +2115,12 @@ class InstallationTest(unittest.TestCase):
         self.plist.write_bytes(plistlib.dumps(original))
         deployment = self.deployment()
         self.audit(deployment)
-        stdout = deployment.log_paths[0]
+        stdout = deployment.stderr_path
         stdout.parent.mkdir(parents=True)
         stdout.write_text(
-            "telegram local downloader started\n"
-            "telegram polling completed poll=1\ntelegram polling completed poll=2\n"
+            "telegram local downloader started concurrency=1 pid=303\n"
+            "telegram polling completed poll=1 pid=303\n"
+            "telegram polling completed poll=2 pid=303\n"
         )
         info = {"target": self.gui, "pid": 303}
         listing = f"p303\nfcwd\nn{external}\nftxt\nn{deployment.binary}\n"
@@ -1828,6 +2207,26 @@ class InstallationTest(unittest.TestCase):
 
 
 class ProcessInventoryTest(unittest.TestCase):
+    def test_custom_executable_names_include_workers_and_orphans_only_when_bound(self):
+        uid = os.geteuid()
+        custom = Path("/fixture/custom-service-entry")
+        result = subprocess.CompletedProcess(
+            [],
+            0,
+            f"303 1 {uid} {custom}\n304 303 {uid} {custom}\n"
+            f"404 1 {uid + 1} {custom}\n405 404 {uid + 1} {custom}\n",
+            "",
+        )
+        with mock.patch.object(service, "run", return_value=result):
+            self.assertEqual(service.bot_processes(), [])
+            self.assertEqual(service.bot_processes(expected_executables=(custom,)), [303])
+            self.assertEqual(
+                service.bot_processes(include_workers=True, expected_executables=(custom,)),
+                [303, 304],
+            )
+            result.stdout = f"304 1 {uid} {custom}\n"
+            self.assertEqual(service.bot_processes(expected_executables=(custom,)), [304])
+
     def test_full_executable_paths_identify_long_names_and_preserve_spaces(self):
         uid = os.geteuid()
         full_path = Path("/fixture/path with spaces/bin") / service.EXECUTABLE
@@ -2040,13 +2439,28 @@ class BuildSupervisorTest(unittest.TestCase):
 
 
 class ServiceControlTest(unittest.TestCase):
+    def test_shutdown_tracks_the_bound_custom_executable_until_all_workers_exit(self):
+        custom = Path("/fixture/custom-service-entry")
+        with (
+            mock.patch.object(service, "bot_processes", side_effect=[[304], []]) as inventory,
+            mock.patch.object(service.time, "sleep"),
+        ):
+            service.wait_for_no_bot_processes(expected_executables=(custom,))
+        self.assertEqual(
+            inventory.call_args_list,
+            [mock.call(include_workers=True, expected_executables=(custom,))] * 2,
+        )
+
     def test_shutdown_waits_for_worker_descendants_after_service_parent_exits(self):
         with (
             mock.patch.object(service, "bot_processes", side_effect=[[304], []]) as inventory,
             mock.patch.object(service.time, "sleep") as sleep,
         ):
             service.wait_for_no_bot_processes()
-        self.assertEqual(inventory.call_args_list, [mock.call(include_workers=True)] * 2)
+        self.assertEqual(
+            inventory.call_args_list,
+            [mock.call(include_workers=True, expected_executables=())] * 2,
+        )
         sleep.assert_called_once()
 
     def test_shutdown_worker_timeout_reports_remaining_pid(self):

@@ -375,13 +375,15 @@ async fn run_bot(config_path: PathBuf, shutdown_receiver: watch::Receiver<bool>)
 
 fn emit_startup_readiness(concurrency: usize) {
     // Deployment readiness must remain observable with a preserved RUST_LOG=off.
-    eprintln!("telegram local downloader started concurrency={concurrency}");
+    let pid = std::process::id();
+    eprintln!("telegram local downloader started concurrency={concurrency} pid={pid}");
 }
 
 fn emit_poll_readiness(successes: &mut u8) {
     if *successes < 2 {
         *successes += 1;
-        eprintln!("telegram polling completed poll={successes}");
+        let pid = std::process::id();
+        eprintln!("telegram polling completed poll={successes} pid={pid}");
     }
 }
 
@@ -9282,7 +9284,7 @@ mod tests {
             return;
         }
 
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "tests::readiness_markers_ignore_rust_log_off",
@@ -9290,8 +9292,15 @@ mod tests {
             ])
             .env("RUST_LOG", "off")
             .env(CHILD_FLAG, "1")
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .expect("readiness child should run without shared environment changes");
+        let child_pid = child.id();
+        assert_ne!(child_pid, std::process::id());
+        let output = child
+            .wait_with_output()
+            .expect("readiness child should finish");
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(output.status.success(), "child failed: {stdout}\n{stderr}");
@@ -9300,9 +9309,9 @@ mod tests {
         assert_eq!(
             stderr.lines().collect::<Vec<_>>(),
             [
-                "telegram local downloader started concurrency=2",
-                "telegram polling completed poll=1",
-                "telegram polling completed poll=2",
+                format!("telegram local downloader started concurrency=2 pid={child_pid}"),
+                format!("telegram polling completed poll=1 pid={child_pid}"),
+                format!("telegram polling completed poll=2 pid={child_pid}"),
             ]
         );
     }
