@@ -5,7 +5,7 @@ status: blocked
 created: 2026-10-19
 updated: 2026-10-19
 branch: codex/macos-service-install
-pr:
+pr: https://github.com/Joey-Project/Telegram-Video-Downloader/pull/45
 supersedes: []
 superseded_by:
 ---
@@ -45,7 +45,7 @@ superseded_by:
   with warnings denied and formatting passed.
 - Before switching, both media indexes parse and all 19 indexed video records
   are readable: 14 completed and 5 cancelled. PDF has no indexed tasks.
-- Installer: 39 fake-HOME regression tests, shell integration, Bash syntax,
+- Installer: 51 fake-HOME regression tests, shell integration, Bash syntax,
   ShellCheck, Ruff 0.15.13 lint and formatting pass. Coverage includes a
   temporary build artifact inheriting group `wheel`, strict state backup
   metadata, startup PID visibility, partial-stop failures, and both rollback
@@ -55,6 +55,10 @@ superseded_by:
   entire saved plist before rollback stops any service. A subprocess regression
   verifies that startup and exactly two poll markers survive `RUST_LOG=off`
   while ordinary tracing output remains filtered.
+- Further regressions cover macOS full-width executable-path inventory,
+  download-worker ancestry and shutdown, stderr preflight, unrelated media
+  symlinks, role-specific executable/cwd checks, and rollback transaction
+  validation before any stop or replacement.
 - Existing main-checkout changes and divergent local history remain untouched.
 
 ## Controlled Cutover and Current Runtime

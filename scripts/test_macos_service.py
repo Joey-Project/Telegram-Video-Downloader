@@ -20,6 +20,7 @@ SPEC = importlib.util.spec_from_file_location(
 )
 service = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(service)
+actual_bot_processes = service.bot_processes
 
 FINGERPRINT = "A" * 40
 REQUIREMENT = f'identifier "{service.IDENTIFIER}" and certificate leaf = H"{FINGERPRINT}"'
@@ -54,8 +55,10 @@ class InstallationTest(unittest.TestCase):
         )
         self.config.chmod(0o600)
         self.label = service.IDENTIFIER
-        self.gui = f"gui/123/{self.label}"
-        self.legacy = f"user/123/{self.label}"
+        self.domain = f"gui/{os.getuid()}"
+        self.legacy_domain = f"user/{os.getuid()}"
+        self.gui = f"{self.domain}/{self.label}"
+        self.legacy = f"{self.legacy_domain}/{self.label}"
         self.plist = self.home / "Library/LaunchAgents" / f"{self.label}.plist"
         self.plist.parent.mkdir(parents=True)
         self.original_plist = {
@@ -112,9 +115,9 @@ class InstallationTest(unittest.TestCase):
                     "--repo",
                     str(self.repo),
                     "--domain",
-                    "gui/123",
+                    self.domain,
                     "--legacy-domain",
-                    "user/123",
+                    self.legacy_domain,
                     *options,
                 ]
             )
@@ -157,6 +160,21 @@ class InstallationTest(unittest.TestCase):
         expected["ProgramArguments"] = [str(deployment.binary), str(self.config)]
         self.assertEqual(document, expected)
         self.assertEqual(self.state_snapshot(), self.before_state)
+
+    def test_existing_service_without_stderr_capture_is_rejected_during_preflight(self):
+        document = dict(self.original_plist)
+        document.pop("StandardErrorPath")
+        self.plist.write_bytes(plistlib.dumps(document))
+        previous_bytes = self.plist.read_bytes()
+        with self.assertRaises(service.InstallError):
+            self.audit(self.deployment())
+        self.assertEqual(self.plist.read_bytes(), previous_bytes)
+        self.assertEqual(self.old_binary.read_bytes(), b"old signed executable")
+        install = self.home / ".local/lib/telegram-video-downloader"
+        self.assertFalse((install / "bin" / service.EXECUTABLE).exists())
+        self.assertFalse((install / "backups").exists())
+        self.assertEqual(self.state_snapshot(), self.before_state)
+        self.external.assert_not_called()
 
     def snapshot_runner(self, *, on_copy=None, forbidden=()):
         def copied(argv, **_):
@@ -241,6 +259,65 @@ class InstallationTest(unittest.TestCase):
         physical.mkdir()
         with self.assertRaises(service.InstallError):
             deployment.revalidate_media_bindings()
+
+    def test_snapshot_skips_unrelated_child_directory_symlinks(self):
+        media = self.repo / "media/videos"
+        outside = self.root / "unrelated-media-library"
+        outside.mkdir()
+        outside_metadata = outside / ".telegram-video-downloader-task-unrelated.json"
+        outside_metadata.write_bytes(b"outside configured media inventory")
+        alias = media / "unrelated-library-alias"
+        alias.symlink_to(outside, target_is_directory=True)
+        deployment = self.deployment()
+        self.audit(deployment)
+        backup = self.root / "unrelated-alias-snapshot"
+        backup.mkdir()
+        original_open = Path.open
+
+        def reject_outside_read(path, *args, **kwargs):
+            self.assertNotEqual(Path(path).resolve(), outside_metadata)
+            return original_open(path, *args, **kwargs)
+
+        with (
+            self.snapshot_runner(forbidden={outside_metadata}),
+            mock.patch.object(Path, "open", reject_outside_read),
+        ):
+            deployment.snapshot_state(backup)
+        manifest = json.loads((backup / "state-manifest.json").read_text())
+        sources = {Path(entry["source"]) for entry in manifest["entries"]}
+        self.assertFalse(any(source.is_relative_to(outside) for source in sources))
+        self.assertFalse(any(source.is_relative_to(alias) for source in sources))
+        self.assertEqual(outside_metadata.read_bytes(), b"outside configured media inventory")
+        self.assertEqual(self.state_snapshot(), self.before_state)
+
+    def test_snapshot_rejects_symlink_for_selected_control_metadata(self):
+        selected = self.repo / "media/videos/.telegram-video-downloader-control/owner.json"
+        outside = self.root / "external-owner.json"
+        outside.write_bytes(b"external control metadata must not be followed")
+        selected.unlink()
+        selected.symlink_to(outside)
+        deployment = self.deployment()
+        self.audit(deployment)
+        backup = self.root / "selected-symlink-snapshot"
+        backup.mkdir()
+        with self.snapshot_runner(forbidden={outside}), self.assertRaises(service.InstallError):
+            deployment.snapshot_state(backup)
+        self.assertEqual(outside.read_bytes(), b"external control metadata must not be followed")
+
+    def test_snapshot_rejects_symlink_for_selected_control_directory(self):
+        selected = self.repo / "media/videos/.telegram-video-downloader-control"
+        outside = self.root / "external-control-directory"
+        selected.rename(outside)
+        selected.symlink_to(outside, target_is_directory=True)
+        deployment = self.deployment()
+        self.audit(deployment)
+        backup = self.root / "selected-directory-symlink-snapshot"
+        backup.mkdir()
+        with (
+            self.snapshot_runner(forbidden={outside / "owner.json"}),
+            self.assertRaises(service.InstallError),
+        ):
+            deployment.snapshot_state(backup)
 
     def test_sparse_media_anchors_are_metadata_only_and_do_not_consume_snapshot_budget(self):
         media = self.repo / "media/videos"
@@ -386,7 +463,7 @@ class InstallationTest(unittest.TestCase):
             mock.patch.object(
                 service,
                 "bot_processes",
-                side_effect=lambda: [pid for pid in registry.values() if pid],
+                side_effect=lambda **_: [pid for pid in registry.values() if pid],
             ),
             mock.patch.object(
                 service, "pid_exists", side_effect=lambda pid: pid in registry.values()
@@ -683,6 +760,56 @@ class InstallationTest(unittest.TestCase):
         self.assertEqual(plistlib.loads(self.plist.read_bytes()), expected)
         self.assertEqual(self.state_snapshot(), self.before_state)
 
+    def test_damaged_transaction_service_entries_are_rejected_before_any_mutation(self):
+        deployment, arguments, _, registry, _ = self.original_rollback_fixture()
+        arguments.original_entrypoint = False
+        transaction_path = arguments.backup / "transaction.json"
+        original = json.loads(transaction_path.read_text())
+        live_binary = deployment.binary.read_bytes()
+        live_plist = self.plist.read_bytes()
+        invalid_values = {
+            "targets_string": {"targets": self.gui},
+            "targets_empty": {"targets": []},
+            "targets_mixed": {"targets": [self.gui, 123]},
+            "targets_wrong_label": {"targets": ["gui/123/unrelated-service"]},
+            "previous_services_string": {"previous_services": self.gui},
+            "previous_services_empty_entry": {"previous_services": [{}]},
+            "previous_services_missing_pid": {"previous_services": [{"target": self.gui}]},
+            "previous_services_string_pid": {
+                "previous_services": [{"target": self.gui, "pid": "303"}]
+            },
+            "previous_services_negative_pid": {
+                "previous_services": [{"target": self.gui, "pid": -1}]
+            },
+            "previous_services_bool_pid": {
+                "previous_services": [{"target": self.gui, "pid": True}]
+            },
+            "previous_services_unmanaged_target": {
+                "previous_services": [{"target": "gui/123/unrelated-service", "pid": 303}]
+            },
+        }
+        for label, override in invalid_values.items():
+            with self.subTest(transaction=label):
+                transaction_path.write_text(json.dumps({**original, **override}))
+                with (
+                    mock.patch.object(service, "stop_services") as stop,
+                    mock.patch.object(service, "preserve_copy") as copied,
+                    mock.patch.object(service, "atomic_install") as installed,
+                    mock.patch.object(service, "atomic_bytes") as written,
+                    mock.patch.object(Path, "mkdir") as mkdir,
+                    self.assertRaises(service.InstallError),
+                ):
+                    service.rollback(arguments)
+                stop.assert_not_called()
+                copied.assert_not_called()
+                installed.assert_not_called()
+                written.assert_not_called()
+                mkdir.assert_not_called()
+                self.assertEqual(deployment.binary.read_bytes(), live_binary)
+                self.assertEqual(self.plist.read_bytes(), live_plist)
+                self.assertEqual(registry, {self.gui: 303})
+                self.assertEqual(self.state_snapshot(), self.before_state)
+
     def original_rollback_fixture(self):
         original_plist_bytes = self.plist.read_bytes()
         deployment = self.deployment("deploy", "--no-build", "--binary", str(self.artifact))
@@ -830,7 +957,7 @@ class InstallationTest(unittest.TestCase):
         ):
             deployment.wait_ready({str(stdout): stdout.stat().st_size})
         self.external.assert_not_called()
-        listing = f"p303\nn{deployment.workdir}\nn{deployment.binary}\n"
+        listing = f"p303\nfcwd\nn{deployment.workdir}\nftxt\nn{deployment.binary}\n"
         with (
             mock.patch.object(service, "service_info", return_value=info),
             mock.patch.object(service, "bot_processes", return_value=[303]),
@@ -853,7 +980,7 @@ class InstallationTest(unittest.TestCase):
         )
         offsets = {str(stdout): len(old_log.encode())}
         info = {"target": self.gui, "pid": 303}
-        listing = f"p303\nn{deployment.workdir}\nn{deployment.binary}\n"
+        listing = f"p303\nfcwd\nn{deployment.workdir}\nftxt\nn{deployment.binary}\n"
         return deployment, offsets, info, listing
 
     def test_startup_waits_for_process_inventory_to_catch_up_with_launchctl(self):
@@ -869,6 +996,44 @@ class InstallationTest(unittest.TestCase):
             self.assertEqual(deployment.wait_ready(offsets), 303)
         self.assertEqual(inventory.call_count, 2)
         sleep.assert_called_once()
+
+    def test_audit_and_readiness_allow_same_executable_bilibili_worker_descendants(self):
+        deployment, offsets, info, listing = self.startup_fixture()
+        processes = (
+            f"303 1 {deployment.binary}\n"
+            f"304 303 {deployment.binary}\n"
+            "305 304 /usr/bin/intermediate-child\n"
+            f"306 305 {deployment.binary}\n"
+        )
+
+        def command(argv, **_):
+            output = processes if argv[0] == "/bin/ps" else listing
+            return subprocess.CompletedProcess(argv, 0, output, "")
+
+        with (
+            mock.patch.object(
+                service,
+                "service_info",
+                side_effect=lambda target: info if target == self.gui else None,
+            ),
+            mock.patch.object(service, "bot_processes", actual_bot_processes),
+            mock.patch.object(service, "run", side_effect=command),
+        ):
+            self.audit(deployment)
+            self.assertEqual(deployment.wait_ready(offsets), 303)
+
+    def test_startup_rejects_executable_and_workdir_found_only_in_wrong_lsof_roles(self):
+        deployment, offsets, info, _ = self.startup_fixture()
+        wrong_roles = f"p303\nfcwd\nn{deployment.binary}\nftxt\nn{deployment.workdir}\n"
+        with (
+            mock.patch.object(service, "service_info", return_value=info),
+            mock.patch.object(service, "bot_processes", return_value=[303]),
+            mock.patch.object(
+                service, "run", return_value=subprocess.CompletedProcess([], 0, wrong_roles, "")
+            ),
+            self.assertRaises(service.InstallError),
+        ):
+            deployment.wait_ready(offsets)
 
     def test_startup_times_out_when_process_inventory_remains_empty(self):
         deployment, offsets, info, _ = self.startup_fixture()
@@ -898,6 +1063,64 @@ class InstallationTest(unittest.TestCase):
             self.assertIn("404", str(failure.exception))
             sleep.assert_not_called()
         self.external.assert_not_called()
+
+
+class ProcessInventoryTest(unittest.TestCase):
+    def test_full_executable_paths_identify_long_names_and_preserve_spaces(self):
+        full_path = Path("/fixture/path with spaces/bin") / service.EXECUTABLE
+        second_path = Path("/fixture/other/bin") / service.EXECUTABLE
+        result = subprocess.CompletedProcess(
+            [],
+            0,
+            (
+                f"  303 1 {full_path}\n"
+                f"  101 1 {second_path}\n"
+                "  404 1 /fixture/bin/telegram-video-\n"
+                "  405 1 /fixture/bin/telegram-video-downloader-helper\n"
+                "  406 1 /usr/bin/python3\n"
+                "    0 0 kernel_task\n"
+            ),
+            "",
+        )
+        with mock.patch.object(service, "run", return_value=result) as run:
+            inventory = service.process_inventory()
+            self.assertEqual(service.bot_processes(), [101, 303])
+        self.assertEqual(inventory[303], {"parent": 1, "executable": full_path})
+        self.assertEqual(inventory[101], {"parent": 1, "executable": second_path})
+        for call in run.call_args_list:
+            self.assertEqual(call.args[0], ["/bin/ps", "-axww", "-o", "pid=,ppid=,comm="])
+
+    def test_worker_ancestry_preserves_independent_and_orphan_root_detection(self):
+        executable = Path("/fixture/bin") / service.EXECUTABLE
+        output = (
+            f"303 1 {executable}\n"
+            f"304 303 {executable}\n"
+            "305 304 /usr/bin/intermediate-child\n"
+            f"306 305 {executable}\n"
+            f"404 1 {executable}\n"
+        )
+        result = subprocess.CompletedProcess([], 0, output, "")
+        with mock.patch.object(service, "run", return_value=result):
+            self.assertEqual(service.bot_processes(), [303, 404])
+            self.assertEqual(service.bot_processes(include_workers=True), [303, 304, 306, 404])
+        result.stdout = f"304 1 {executable}\n"
+        with mock.patch.object(service, "run", return_value=result):
+            self.assertEqual(service.bot_processes(), [304])
+
+    def test_process_inventory_errors_are_closed_and_do_not_expose_external_output(self):
+        for status, output in [
+            (1, PRIVATE_MARKER),
+            (0, "invalid-pid 1 /fixture/executable\n"),
+            (0, "303 1 /fixture/first\n303 2 /fixture/different\n"),
+        ]:
+            with self.subTest(status=status, output=output):
+                result = subprocess.CompletedProcess([], status, output, PRIVATE_MARKER)
+                with (
+                    mock.patch.object(service, "run", return_value=result),
+                    self.assertRaises(service.InstallError) as failure,
+                ):
+                    service.process_inventory()
+                self.assertNotIn(PRIVATE_MARKER, str(failure.exception))
 
 
 class SignatureTest(unittest.TestCase):
@@ -1036,6 +1259,25 @@ class BuildSupervisorTest(unittest.TestCase):
 
 
 class ServiceControlTest(unittest.TestCase):
+    def test_shutdown_waits_for_worker_descendants_after_service_parent_exits(self):
+        with (
+            mock.patch.object(service, "bot_processes", side_effect=[[304], []]) as inventory,
+            mock.patch.object(service.time, "sleep") as sleep,
+        ):
+            service.wait_for_no_bot_processes()
+        self.assertEqual(inventory.call_args_list, [mock.call(include_workers=True)] * 2)
+        sleep.assert_called_once()
+
+    def test_shutdown_worker_timeout_reports_remaining_pid(self):
+        with (
+            mock.patch.object(service, "bot_processes", return_value=[304]),
+            mock.patch.object(service.time, "monotonic", side_effect=[0, 0, 999]),
+            mock.patch.object(service.time, "sleep"),
+            self.assertRaises(service.InstallError) as failure,
+        ):
+            service.wait_for_no_bot_processes()
+        self.assertIn("304", str(failure.exception))
+
     def test_stop_waits_for_both_registration_and_old_process_exit(self):
         gui, legacy = "gui/123/example", "user/123/example"
         checks = {gui: 0, legacy: 0}

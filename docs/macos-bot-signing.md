@@ -17,6 +17,10 @@ Cargo configuration redirects intermediate artifacts to a shared cache.
 Existing configuration, authentication files, working directory, environment,
 and log paths are preserved when installing over an existing LaunchAgent. They
 are outside Cargo output and do not need relocation for `cargo clean -p`.
+An existing plist must configure an absolute `StandardErrorPath` so the
+installer can observe readiness. A missing, empty or relative destination fails
+preflight before the running service is stopped; choose its log destination
+separately instead of silently changing existing paths during deployment.
 For a first installation, choose a configuration outside Cargo output. Its
 relative paths retain their existing meaning; the PDF helper also needs the
 Python project and helper resources beside that configuration.
@@ -31,7 +35,9 @@ inode-bound objects.
 
 Configured media aliases remain unchanged. Snapshotting resolves and binds the
 physical root, then rejects alias retargeting or root replacement while allowing
-ordinary child-entry changes. Media hardlink anchors such as `output.anchor`
+ordinary child-entry changes. Unrelated symlinked media subdirectories are
+skipped; links selected as transactional metadata still fail validation.
+Media hardlink anchors such as `output.anchor`
 and committed overwrite anchors are recorded by device/inode, size, and link
 evidence; their video payloads are neither copied nor charged as metadata.
 
@@ -84,7 +90,8 @@ validated repair respecting lock identities.
 Default rollback keeps the restored executable at the fixed installation path,
 so it also works after Cargo output has been removed. It does not prove that the
 restored process reached startup-ready. Both rollback modes validate and capture
-the saved plist and verify the previous executable before stopping any service.
+the saved plist, service targets and previous registrations, and verify the
+previous executable before stopping any service.
 If the new path needs a privacy grant
 that the user declines, explicitly restore the original entrypoint instead:
 

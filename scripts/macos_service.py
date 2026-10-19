@@ -216,16 +216,61 @@ def stop_services(targets):
         time.sleep(0.1)
 
 
-def bot_processes():
-    result = run(["pgrep", "-x", EXECUTABLE], check=False)
-    if result.returncode == 1:
-        return []
+def process_inventory():
+    """Read executable paths, not macOS's truncated names or process arguments."""
+    result = run(["/bin/ps", "-axww", "-o", "pid=,ppid=,comm="], check=False)
     if result.returncode:
         raise InstallError("cannot inspect downloader processes")
-    try:
-        return [int(pid) for pid in result.stdout.split()]
-    except ValueError:
-        raise InstallError("unexpected downloader process inventory") from None
+    inventory = {}
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        fields = line.strip().split(None, 2)
+        if len(fields) != 3 or not all(re.fullmatch(r"[0-9]+", value) for value in fields[:2]):
+            raise InstallError("unexpected downloader process inventory")
+        pid, parent, executable = int(fields[0]), int(fields[1]), Path(fields[2])
+        if pid in inventory:
+            raise InstallError("duplicate PID in downloader process inventory")
+        inventory[pid] = {"parent": parent, "executable": executable}
+    return inventory
+
+
+def bot_processes(include_workers=False):
+    inventory = process_inventory()
+    downloaders = {
+        pid
+        for pid, process in inventory.items()
+        if pid > 0 and process["executable"].name == EXECUTABLE
+    }
+    if include_workers:
+        return sorted(downloaders)
+    roots = []
+    for pid in downloaders:
+        ancestor, visited = inventory[pid]["parent"], {pid}
+        while ancestor > 0 and ancestor in inventory:
+            if ancestor in visited:
+                raise InstallError("cyclic downloader ancestry in process inventory")
+            if ancestor in downloaders:
+                break
+            visited.add(ancestor)
+            ancestor = inventory[ancestor]["parent"]
+        else:
+            roots.append(pid)
+    return sorted(roots)
+
+
+def wait_for_no_bot_processes():
+    """Do not replace or restart until old service and worker images have exited."""
+    deadline = time.monotonic() + STOP_TIMEOUT
+    while True:
+        remaining = bot_processes(include_workers=True)
+        if not remaining:
+            return
+        if time.monotonic() >= deadline:
+            raise InstallError(
+                f"downloader executable PIDs remained after service stop: {remaining}"
+            )
+        time.sleep(0.1)
 
 
 def signature(binary):
@@ -427,6 +472,99 @@ def anchor_evidence(path):
     }
 
 
+def allowed_domains():
+    return {f"gui/{os.getuid()}", f"user/{os.getuid()}"}
+
+
+def validate_transaction(transaction, label=None):
+    """Admit only complete, same-user rollback plans before any mutation."""
+    if not isinstance(transaction, dict):
+        raise InstallError("rollback transaction must be a dictionary")
+    required = {
+        "version",
+        "label",
+        "domain",
+        "targets",
+        "previous_services",
+        "binary",
+        "previous_binary",
+        "plist",
+        "had_plist",
+        "had_installed_binary",
+        "requirement",
+    }
+    if not required.issubset(transaction):
+        raise InstallError("rollback transaction is incomplete")
+    saved_label = transaction["label"]
+    if (
+        type(transaction["version"]) is not int
+        or transaction["version"] != 1
+        or not isinstance(saved_label, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", saved_label)
+        or (label is not None and saved_label != label)
+    ):
+        raise InstallError("backup does not match this LaunchAgent")
+    domain = transaction["domain"]
+    domains = allowed_domains()
+    if not isinstance(domain, str) or domain not in domains:
+        raise InstallError("rollback transaction domain must be this user's gui or user domain")
+    targets = transaction["targets"]
+    allowed_targets = {f"{candidate}/{saved_label}" for candidate in domains}
+    if (
+        not isinstance(targets, list)
+        or not 1 <= len(targets) <= 2
+        or not all(isinstance(target, str) and target in allowed_targets for target in targets)
+        or len(set(targets)) != len(targets)
+        or f"{domain}/{saved_label}" not in targets
+    ):
+        raise InstallError("rollback transaction has invalid or duplicate service targets")
+    for key in ("had_plist", "had_installed_binary"):
+        if type(transaction[key]) is not bool:
+            raise InstallError(f"rollback transaction has an invalid {key}")
+    expected_paths = {
+        "binary": Path.home() / ".local/lib/telegram-video-downloader/bin" / EXECUTABLE,
+        "plist": Path.home() / "Library/LaunchAgents" / f"{saved_label}.plist",
+    }
+    for key in ("binary", "previous_binary", "plist"):
+        value = transaction[key]
+        if (
+            not isinstance(value, str)
+            or not value
+            or "\0" in value
+            or not Path(value).is_absolute()
+        ):
+            raise InstallError(f"rollback transaction has an invalid {key} path")
+        if key in expected_paths and value != str(expected_paths[key]):
+            raise InstallError(f"rollback transaction has an unexpected {key} path")
+    requirement = transaction["requirement"]
+    if (
+        not isinstance(requirement, str)
+        or "\0" in requirement
+        or f'identifier "{IDENTIFIER}"' not in requirement
+        or not re.search(r'certificate (?:root|leaf|0) = H"[a-fA-F0-9]{40}"', requirement)
+    ):
+        raise InstallError("rollback transaction has an invalid designated requirement")
+    services = transaction["previous_services"]
+    if not isinstance(services, list) or len(services) > 1:
+        raise InstallError("rollback transaction must restore at most one saved service")
+    for service in services:
+        if (
+            not isinstance(service, dict)
+            or "target" not in service
+            or "pid" not in service
+            or not isinstance(service["target"], str)
+            or service["target"] not in targets
+            or (
+                service["pid"] is not None
+                and (type(service["pid"]) is not int or not 0 < service["pid"] <= 2**31 - 1)
+            )
+        ):
+            raise InstallError("rollback transaction has an invalid saved service")
+    if services and not transaction["had_plist"]:
+        raise InstallError("rollback transaction cannot restore a service without a saved plist")
+    return copy.deepcopy(transaction)
+
+
 class Deployment:
     def __init__(self, args):
         self.args = args
@@ -434,6 +572,12 @@ class Deployment:
             raise InstallError(
                 "LaunchAgent label must contain only letters, digits, dot, underscore or dash"
             )
+        if (
+            not isinstance(args.domain, str)
+            or args.domain not in allowed_domains()
+            or (args.legacy_domain and args.legacy_domain not in allowed_domains())
+        ):
+            raise InstallError("production deployment requires this user's gui or user domain")
         self.home = Path.home()
         self.repo = absolute(args.repo, Path.cwd())
         self.binary = self.home / ".local/lib/telegram-video-downloader/bin" / EXECUTABLE
@@ -451,6 +595,18 @@ class Deployment:
             raise InstallError(
                 "existing plist has an explicit Program override; normalize it first"
             )
+        if self.old_plist:
+            stderr = self.old_plist.get("StandardErrorPath")
+            if (
+                not isinstance(stderr, str)
+                or not stderr
+                or "\0" in stderr
+                or not Path(stderr).is_absolute()
+            ):
+                raise InstallError(
+                    "existing LaunchAgent requires an absolute StandardErrorPath "
+                    "to capture startup and polling readiness; configure it before deployment"
+                )
         old_args = self.old_plist.get("ProgramArguments", []) if self.old_plist else []
         if self.old_plist and len(old_args) != 2:
             raise InstallError("expected an existing binary and config ProgramArguments pair")
@@ -518,7 +674,8 @@ class Deployment:
         known = {info["pid"] for info in registered if info["pid"]}
         if set(bot_processes()) - known:
             raise InstallError(
-                "a downloader process is outside the managed LaunchAgent; stop it before deployment"
+                "another downloader executable is running; wait for workers to finish "
+                "or stop unmanaged instances before deployment"
             )
         self.registered = registered
         return {
@@ -605,11 +762,15 @@ class Deployment:
                 visited += len(dirs) + len(files)
                 if visited > 200_000:
                     raise InstallError("media metadata inventory exceeded its 200000-entry bound")
-                for name in dirs:
-                    if (Path(root) / name).is_symlink():
-                        raise InstallError(
-                            f"symbolic link in media metadata inventory: {Path(root) / name}"
-                        )
+                for name in dirs[:]:
+                    child = Path(root) / name
+                    if child.is_symlink():
+                        if any(
+                            part.startswith(".telegram-video-downloader")
+                            for part in child.relative_to(directory).parts
+                        ):
+                            raise InstallError(f"symbolic link selected as media metadata: {child}")
+                        dirs.remove(name)
                 for name in files:
                     path = Path(root) / name
                     hidden = any(
@@ -718,10 +879,18 @@ class Deployment:
                     and output.count("telegram polling completed") >= 2
                 ):
                     listing = run(
-                        ["lsof", "-nP", "-a", "-p", str(current["pid"]), "-d", "cwd,txt", "-Fn"]
+                        ["lsof", "-nP", "-a", "-p", str(current["pid"]), "-d", "cwd,txt", "-Ffn"]
                     ).stdout
-                    names = {line[1:] for line in listing.splitlines() if line.startswith("n")}
-                    if str(self.binary) not in names or str(self.workdir) not in names:
+                    names, descriptor = {"cwd": set(), "txt": set()}, None
+                    for line in listing.splitlines():
+                        if line.startswith("f"):
+                            descriptor = line[1:]
+                        elif line.startswith("n") and descriptor in names:
+                            names[descriptor].add(line[1:])
+                    if (
+                        str(self.binary) not in names["txt"]
+                        or str(self.workdir) not in names["cwd"]
+                    ):
                         raise InstallError(
                             "running executable or working directory "
                             "differs from the installed plist"
@@ -802,10 +971,7 @@ class Deployment:
             # Set this before bootout: a later domain may fail after the first stopped.
             stopped = True
             stop_services(self.targets)
-            if bot_processes():
-                raise InstallError(
-                    "a downloader process remained after stopping both LaunchAgent domains"
-                )
+            wait_for_no_bot_processes()
             state_entries = self.snapshot_state(backup)
             offsets = {
                 str(path): path.stat().st_size if path.exists() else 0 for path in self.log_paths
@@ -971,15 +1137,13 @@ def validate_original_entrypoint(backup, transaction, saved=None):
 
 def restore_binary_and_plist(backup, transaction, *, original_entrypoint=False):
     """Restore executable/plist only, retaining every newer runtime write."""
+    transaction = validate_transaction(transaction)
     saved = validate_saved_plist(backup, transaction)
     if original_entrypoint:
         # Missing/changed original binaries must fail before interrupting any service.
         original, _ = validate_original_entrypoint(backup, transaction, saved)
     stop_services(transaction["targets"])
-    if bot_processes():
-        raise InstallError(
-            "rollback stopped: downloader process remained; old service was not started"
-        )
+    wait_for_no_bot_processes()
     binary = original if original_entrypoint else Path(transaction["binary"])
     if original_entrypoint:
         # Revalidate after stopping before launchd is allowed to execute this path.
@@ -1018,9 +1182,9 @@ def rollback(args):
         raise InstallError("rollback requires --backup PATH")
     backup = absolute(args.backup, Path.cwd())
     check_tree(backup)
-    transaction = json.loads((backup / "transaction.json").read_text())
-    if transaction.get("version") != 1 or transaction.get("label") != args.label:
-        raise InstallError("backup does not match this LaunchAgent")
+    transaction = validate_transaction(
+        json.loads((backup / "transaction.json").read_text()), args.label
+    )
     retained = backup / datetime.datetime.now(datetime.UTC).strftime(
         "pre-rollback-%Y%m%dT%H%M%S.%fZ"
     )
