@@ -830,9 +830,17 @@ impl QueueManager {
             return Ok(Vec::new());
         }
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
-        let mut records = self.video.list_records()?;
+        // History sidecars stay in the index for pagination, but a task-summary refresh only
+        // needs a bounded set of entries that the index still locates in the active queue.
+        // Reading every history record here made each progress update pay for the full history.
+        let mut records = self
+            .video
+            .active_summary_records_for_chats(chat_ids, max_records)?;
         if !self.video.shares_root(&self.pdf) {
-            records.extend(self.pdf.list_records()?);
+            records.extend(
+                self.pdf
+                    .active_summary_records_for_chats(chat_ids, max_records)?,
+            );
         }
         after_snapshot();
 
@@ -3193,6 +3201,56 @@ impl DownloadStore {
                 }
                 records.push(record);
             }
+        }
+        Ok(records)
+    }
+
+    fn active_summary_records_for_chats(
+        &self,
+        chat_ids: &[i64],
+        max_records: usize,
+    ) -> Result<Vec<TaskRecord>> {
+        if chat_ids.is_empty() || max_records == 0 {
+            return Ok(Vec::new());
+        }
+
+        let chat_order =
+            chat_ids
+                .iter()
+                .enumerate()
+                .fold(HashMap::new(), |mut order, (index, chat_id)| {
+                    order.entry(*chat_id).or_insert(index);
+                    order
+                });
+        let index = self.read_index()?;
+        let mut candidates = index
+            .tasks
+            .iter()
+            .filter(|(_, entry)| {
+                chat_order.contains_key(&entry.chat_id)
+                    && entry.move_target.is_none()
+                    && entry.record_path.parent() == Some(self.queue_dir.as_path())
+            })
+            .collect::<Vec<_>>();
+        // The index's updated_at value is maintained with each record write. Task IDs provide
+        // the same stable within-store tie order as StoreIndex's BTreeMap iteration.
+        candidates.sort_by(|(left_id, left), (right_id, right)| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| chat_order[&left.chat_id].cmp(&chat_order[&right.chat_id]))
+                .then_with(|| left_id.cmp(right_id))
+        });
+
+        let mut records = Vec::with_capacity(max_records.min(candidates.len()));
+        for (id, entry) in candidates.into_iter().take(max_records) {
+            let Some(record) = self.read_record(&entry.record_path)? else {
+                continue;
+            };
+            if record.id != *id || record.chat_id != entry.chat_id {
+                bail!("task index points to a mismatched record for task {id}");
+            }
+            records.push(record);
         }
         Ok(records)
     }
@@ -8767,6 +8825,161 @@ mod tests {
                 .all(|record| record.chat_id == 10 || record.chat_id == 20)
         );
         assert!(records.iter().all(|record| !record.status.is_history()));
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn active_chat_snapshot_reads_only_bounded_indexed_candidates() {
+        const HISTORY_COUNT: usize = 1_024;
+
+        let directory = temp_queue_root("active-chat-snapshot-bounded-reads");
+        let config = test_video_config(&directory);
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let queue = QueueManager::open_with_file_provider(&config, provider.clone())
+            .expect("queue should open");
+        queue
+            .video
+            .ensure_private_history_directory()
+            .expect("history directory should be private");
+
+        let mut index = queue.video.read_index().expect("queue index should load");
+        for number in 0..HISTORY_COUNT {
+            let id = format!("history-{number:05}");
+            let mut record = test_task(
+                &id,
+                JobRequest::Youtube {
+                    url: format!("https://example.invalid/{id}"),
+                },
+            );
+            record.status = TaskStatus::Completed;
+            record.updated_at = 10_000 + number as u64;
+            let path = queue
+                .video
+                .terminal_history_path(&id)
+                .expect("history path should be valid");
+            queue
+                .video
+                .write_record(&path, &record)
+                .expect("history record should persist");
+            index.tasks.insert(
+                id,
+                TaskIndexEntry {
+                    chat_id: record.chat_id,
+                    record_path: path,
+                    move_target: None,
+                    revision: record.revision,
+                    updated_at: record.updated_at,
+                },
+            );
+        }
+
+        for (id, status, updated_at) in [
+            ("active-old", TaskStatus::Received, 100),
+            ("active-middle", TaskStatus::Running, 200),
+            ("active-newest", TaskStatus::AwaitingConfirmation, 300),
+        ] {
+            let mut record = test_task(
+                id,
+                JobRequest::Youtube {
+                    url: format!("https://example.invalid/{id}"),
+                },
+            );
+            record.status = status;
+            record.updated_at = updated_at;
+            let path = queue
+                .video
+                .task_path(id)
+                .expect("active task path should be valid");
+            queue
+                .video
+                .write_record(&path, &record)
+                .expect("active record should persist");
+            index.tasks.insert(
+                id.to_string(),
+                TaskIndexEntry {
+                    chat_id: record.chat_id,
+                    record_path: path,
+                    move_target: None,
+                    revision: record.revision,
+                    updated_at: record.updated_at,
+                },
+            );
+        }
+
+        let mut pdf_index = queue.pdf.read_index().expect("PDF index should load");
+        for (id, updated_at) in [("pdf-old", 150), ("pdf-newest", 400)] {
+            let mut record = test_task(
+                id,
+                JobRequest::Pdf {
+                    url: format!("https://example.invalid/{id}"),
+                },
+            );
+            record.status = TaskStatus::Queued;
+            record.updated_at = updated_at;
+            let path = queue
+                .pdf
+                .task_path(id)
+                .expect("PDF task path should be valid");
+            queue
+                .pdf
+                .write_record(&path, &record)
+                .expect("PDF record should persist");
+            pdf_index.tasks.insert(
+                id.to_string(),
+                TaskIndexEntry {
+                    chat_id: record.chat_id,
+                    record_path: path,
+                    move_target: None,
+                    revision: record.revision,
+                    updated_at: record.updated_at,
+                },
+            );
+        }
+        queue
+            .pdf
+            .write_index(&pdf_index)
+            .expect("PDF index should persist");
+
+        queue
+            .video
+            .write_index(&index)
+            .expect("queue index should persist");
+
+        let reads_before = provider.read_paths();
+        let records = queue
+            .active_records_for_chats(&[123_456_789], 2)
+            .expect("bounded active summary should load");
+        let reads_after = provider.read_paths();
+        let summary_reads = &reads_after[reads_before.len()..];
+        let record_reads = summary_reads
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("task-"))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pdf-newest", "active-newest"]
+        );
+        assert_eq!(
+            record_reads.len(),
+            4,
+            "each independent store opens at most the requested candidate count"
+        );
+        assert!(record_reads.iter().all(|path| {
+            path.parent() == Some(queue.video.queue_dir.as_path())
+                || path.parent() == Some(queue.pdf.queue_dir.as_path())
+        }));
+        assert_eq!(index.tasks.len(), HISTORY_COUNT + 3);
+        assert_eq!(pdf_index.tasks.len(), 2);
 
         drop(queue);
         let _ = fs::remove_dir_all(directory);

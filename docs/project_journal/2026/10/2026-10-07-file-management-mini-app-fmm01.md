@@ -36,10 +36,12 @@ superseded_by: ""
 
 ### 2026-10-20 Recovery boundaries
 
-- Local validation passed with 1,028 Rust tests, 0 failures, and 16 ignored tests; 78 Cloud tests passed. Formatting, all-target compilation, strict Clippy, the debug build, Cloud typechecking, and the Wrangler dry-run also passed. HTTP retry regressions compare actual request timestamps instead of short negative timing windows, preserving the configured 100 ms retry and 500 ms exhaustion-backoff assertions under concurrent test scheduling.
+- Local validation passed with 1,031 Rust tests, 0 failures, and 16 ignored tests; 78 Cloud tests passed. Formatting, all-target compilation, strict Clippy, the debug build, Cloud typechecking, and the Wrangler dry-run also passed. HTTP retry regressions compare actual request timestamps instead of short negative timing windows, preserving the configured 100 ms retry and 500 ms exhaustion-backoff assertions under concurrent test scheduling.
 - State uploads keep their pending content and version after HTTP 400, refresh the timestamp on each attempt, and use backoff so correcting clock skew can recover without another library change.
 - Cloud previews check the complete prospective inbox receipt before saving descriptor anchors or a manifest. Oversized selections receive an actionable split request; smaller previews retain the normal confirmation flow.
 - The local inbox is scoped to an authenticated D1 epoch. A replacement database gets a separate local namespace; legacy and retired records keep their original paths and inode bindings. A same-epoch sequence collision conditionally rotates the cloud epoch using the current server request identity, then stops the runtime for a fresh start. ACK transactions compare the complete server request identity as well as the epoch, including when a restore occurs between persistence and ACK. Stale ACK and state writes are rejected transactionally. Retired records conservatively protect existing private preview manifests from cleanup.
+- Active task summaries select candidates from the committed queue index before reading task records, so retained history does not trigger repeated record reads under the global queue operation lock. Record access still uses the existing File Provider and identity checks; startup and retry paths retain their existing orphan recovery.
+- Legacy title hints normalize Unicode whitespace to single spaces before candidate matching and enforce the same control-character and length limits as metadata patches. Tabs in imported titles therefore cannot create mapping actions that the Worker permanently rejects.
 
 ### 2026-10-18 审查修复
 

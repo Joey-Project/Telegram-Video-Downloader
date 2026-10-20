@@ -7428,6 +7428,7 @@ fn validate_metadata_patch(patch: &MetadataPatch) -> Result<()> {
 pub(crate) fn metadata_title_within_limits(title: &str) -> bool {
     title.len() <= MAX_METADATA_TITLE_BYTES
         && title.trim().chars().count() <= MAX_METADATA_TITLE_CHARS
+        && !title.chars().any(char::is_control)
 }
 
 fn metadata_from_json(
@@ -8353,22 +8354,44 @@ fn title_hint_from_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
     let lower = trimmed.to_ascii_lowercase();
     for prefix in ["title:", "title：", "标题:", "标题：", "名称:", "名称："] {
-        if lower.starts_with(prefix) || trimmed.starts_with(prefix) {
-            let value = trimmed[prefix.len()..].trim();
-            if !value.is_empty() && metadata_title_within_limits(value) {
-                return Some(value.to_string());
-            }
+        if (lower.starts_with(prefix) || trimmed.starts_with(prefix))
+            && let Some(title) = normalize_legacy_title_hint(&trimmed[prefix.len()..])
+        {
+            return Some(title);
         }
     }
     if let Some((title, rest)) = trimmed.split_once(" - ")
-        && !title.trim().is_empty()
         && !title.contains("http")
         && !extract_source_ids(rest).is_empty()
-        && metadata_title_within_limits(title)
     {
-        return Some(title.trim().to_string());
+        return normalize_legacy_title_hint(title);
     }
     None
+}
+
+fn normalize_legacy_title_hint(title: &str) -> Option<String> {
+    if title.len() > MAX_METADATA_TITLE_BYTES {
+        return None;
+    }
+
+    let mut normalized = String::with_capacity(title.len());
+    let mut pending_space = false;
+    for character in title.trim().chars() {
+        if character.is_whitespace() {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if character.is_control() {
+            return None;
+        }
+        if pending_space {
+            normalized.push(' ');
+        }
+        normalized.push(character);
+        pending_space = false;
+    }
+
+    (!normalized.is_empty() && metadata_title_within_limits(&normalized)).then_some(normalized)
 }
 
 #[cfg(all(test, unix))]
@@ -10982,6 +11005,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_import_normalizes_title_whitespace_before_candidate_matching() {
+        let root = TemporaryRoot::new("legacy-title-whitespace-candidate");
+        fs::write(root.path().join("Star Wars.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let manager = manager(&root);
+
+        let report = manager
+            .import_legacy("Title: Star\tWars")
+            .expect("tab-separated title hint should be normalized before matching");
+
+        assert_eq!(report.hints.len(), 1);
+        assert_eq!(report.hints[0].title.as_deref(), Some("Star Wars"));
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(report.candidates[0].match_kind, "title");
+        assert!(report.candidates[0].requires_confirmation);
+        assert_eq!(report.candidates[0].title, "Star Wars");
+    }
+
+    #[test]
     fn legacy_candidates_only_match_present_items_by_source_id_or_title() {
         let mut present_direct =
             index_fixture_item("present-direct", "direct.mp4", Presence::Present);
@@ -11459,6 +11501,46 @@ mod tests {
     }
 
     #[test]
+    fn legacy_title_hints_normalize_whitespace_and_reject_controls() {
+        assert_eq!(
+            title_hint_from_line("Title:  Star\t\t Wars  ").as_deref(),
+            Some("Star Wars")
+        );
+        assert_eq!(
+            title_hint_from_line("Star\tWars - cid12345678").as_deref(),
+            Some("Star Wars")
+        );
+
+        let json = serde_json::json!({
+            "messages": [{ "text": "Title: 星河\t战士🙂" }]
+        })
+        .to_string();
+        let json_report = parse_legacy_import(&json);
+        assert_eq!(json_report.hints.len(), 1);
+        assert_eq!(json_report.hints[0].title.as_deref(), Some("星河 战士🙂"));
+        assert_eq!(json_report.hints[0].origin, HintOrigin::LegacyTelegramJson);
+        assert!(json_report.warnings.is_empty());
+
+        let exactly_500 = format!("{}\tb", "a".repeat(498));
+        let expected_500 = format!("{} b", "a".repeat(498));
+        assert_eq!(
+            title_hint_from_line(&format!("Title: {exactly_500}")).as_deref(),
+            Some(expected_500.as_str()),
+            "the normalized title should be measured against the shared scalar limit"
+        );
+        let normalized_501 = format!("{}\tb", "a".repeat(499));
+        assert_eq!(
+            title_hint_from_line(&format!("Title: {normalized_501}")),
+            None
+        );
+
+        assert_eq!(title_hint_from_line("Title: Bad\u{0001}Name"), None);
+        assert!(!metadata_title_within_limits("Star\tWars"));
+        assert!(!metadata_title_within_limits("Bad\u{0001}Name"));
+        assert!(metadata_title_within_limits("星河 战士🙂"));
+    }
+
+    #[test]
     fn round7_metadata_patch_validation_uses_scalar_limits_for_titles() {
         for scalar in ["a", "界", "🙂"] {
             let accepted_title = scalar.repeat(MAX_METADATA_TITLE_CHARS);
@@ -11507,6 +11589,14 @@ mod tests {
             };
             assert!(validate_metadata_patch(&rejected_collection).is_err());
         }
+
+        let control_character_title = MetadataPatch {
+            item_id: "fixture-item".to_string(),
+            title: Some("Star\tWars".to_string()),
+            source_ids: Vec::new(),
+            collection: None,
+        };
+        assert!(validate_metadata_patch(&control_character_title).is_err());
     }
 
     #[test]
