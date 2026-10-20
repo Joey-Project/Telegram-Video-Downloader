@@ -7,6 +7,7 @@
     <meta name="description" content="Browse and organize your local video library.">
     <title>Video Library</title>
     <link rel="stylesheet" href="/file/styles.css">
+    <link rel="stylesheet" href="/file/extensions.css">
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
     <script type="module" src="/file/app.js"></script>
   </head>
@@ -57,11 +58,14 @@
           <section id="view-library" class="view-panel">
             <div class="toolbar">
               <label class="search-box"><span aria-hidden="true">⌕</span><input id="search-input" type="search" placeholder="Search titles, folders, or IDs" autocomplete="off" aria-label="Search library"></label>
+              <label class="select-label">Media library <select id="library-select" class="select-control" aria-label="Choose media library"></select></label>
               <input id="category-filter" class="select-control" type="search" list="category-folders" placeholder="All folders" autocomplete="off" aria-label="Filter by folder">
               <datalist id="category-folders"></datalist>
               <select id="status-filter" class="select-control" aria-label="Filter by file status"><option value="">All statuses</option><option value="present">Available</option><option value="unavailable">Unavailable</option><option value="missing">Missing</option><option value="unknown">Unknown</option></select>
+              <button id="download-here" class="secondary-button" type="button">Download here</button>
               <button id="select-visible" class="quiet-button" type="button">Select visible</button>
             </div>
+            <div class="library-context"><span id="library-local-status" class="badge">Availability not reported</span><code id="library-location">Media root unavailable</code><a class="small-button" href="/settings/">Manage libraries</a></div>
             <div id="library-summary" class="section-summary"></div>
             <div id="library-empty" class="empty-state hidden"><div class="empty-art" aria-hidden="true">▱</div><h2>Your library is ready when you are</h2><p>Start a scan on the connected computer to discover videos and their sidecar files.</p><button class="primary-button" data-scan type="button">Scan library</button></div>
             <div id="library-list" class="library-list" aria-live="polite"></div>
@@ -101,6 +105,23 @@
               <div class="legacy-footer"><span id="legacy-size" class="field-hint">0 / 256 KB</span><button id="import-legacy" class="secondary-button" type="button">Read legacy list</button></div>
               <div id="legacy-mappings" class="legacy-mappings hidden"></div>
             </section>
+            <section class="organize-card migration-card">
+              <div class="organize-card-heading"><span class="step-number lavender">3</span><div><h3>Migrate a library</h3><p>Move a whole library or selected media to another registered root. Review paths, sidecars, space, and conflicts before starting.</p></div></div>
+              <div class="organize-controls">
+                <p id="migration-source" class="field-hint"></p>
+                <label class="field-label" for="migration-target">Target library</label>
+                <select id="migration-target" class="select-control"></select>
+                <label class="field-label" for="migration-scope">What to migrate</label>
+                <select id="migration-scope" class="select-control"><option value="library">Entire source library</option><option value="selected">Selected media and collections</option></select>
+                <p id="migration-selection-count" class="field-hint"></p>
+                <div id="migration-task-option" class="option-row hidden"><label class="check-option"><input id="migration-include-tasks" type="checkbox"><span>Also migrate unfinished tasks and staged data <small id="migration-task-count" class="field-hint"></small></span></label></div>
+                <div class="option-row"><label class="check-option"><input id="migration-set-default" type="checkbox"><span>Set the target as default after a successful migration</span></label>
+                  <label class="inline-select">If a file already exists <select id="migration-conflict" class="select-control"><option value="skip">Skip it</option><option value="keep_both">Keep both</option></select></label></div>
+                <button id="migration-preview" class="primary-button" type="button">Preview migration <span aria-hidden="true">→</span></button>
+              </div>
+              <div id="migration-preview-list" class="stack-list"></div>
+              <div id="migration-progress-list" class="stack-list"></div>
+            </section>
             <div id="preview-list" class="stack-list"></div>
             <div id="operation-list" class="stack-list"></div>
           </section>
@@ -109,5 +130,20 @@
       <footer class="footer"><span>Actions run on your connected computer.</span><span id="queued-actions"></span></footer>
       <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
     </div>
+    <dialog id="download-dialog" class="download-dialog" aria-labelledby="download-title">
+      <form id="download-form" class="download-form">
+        <div class="detail-top"><div><p class="eyebrow">NEW DOWNLOAD</p><h2 id="download-title">Download here</h2></div><button id="download-close" class="detail-close" type="button" aria-label="Close download form">×</button></div>
+        <p class="field-hint">The destination is fixed when the task is added to the local queue. Your computer validates the link and library before applying it.</p>
+        <label class="field-label" for="download-url">Video or collection URL</label>
+        <input id="download-url" class="text-control" type="url" maxlength="8192" required autocomplete="url" placeholder="https://www.bilibili.com/video/…">
+        <label class="field-label" for="download-library-select">Media library</label>
+        <select id="download-library-select" class="select-control" required></select>
+        <label class="field-label" for="download-category">Category <span class="field-hint">Leave blank to save at this library root.</span></label>
+        <input id="download-category" class="text-control" type="text" maxlength="1024" list="download-categories" autocomplete="off" placeholder="e.g. Films/Recently added">
+        <datalist id="download-categories"></datalist>
+        <p id="download-status" class="field-hint" aria-live="polite">Paste a video or collection URL. The selected library and category are saved with this task.</p>
+        <div class="stack-actions"><button id="download-cancel" class="quiet-button" type="button">Cancel</button><button id="download-submit" class="primary-button" type="submit">Add to queue</button></div>
+      </form>
+    </dialog>
   </body>
 </html>

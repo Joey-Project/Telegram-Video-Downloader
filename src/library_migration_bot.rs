@@ -1,0 +1,984 @@
+//! Cloud commands and background scheduling for durable media-library migrations.
+
+use std::sync::Mutex as StdMutex;
+
+use super::*;
+use crate::library::Presence;
+use crate::library_migration::{
+    MigrationControl, MigrationDeliveryState, MigrationEngine, MigrationPreview, MigrationRequest,
+    MigrationRunStatus, MigrationRuntimeContext, MigrationScope, MigrationStatus,
+    MigrationTaskImpact,
+};
+use crate::media_libraries::TaskDestination;
+use serde::Deserialize;
+use serde_json::json;
+
+const MAX_MIGRATION_TASKS: usize = 10_000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewPayload {
+    source_library_id: String,
+    target_library_id: String,
+    scope: MigrationScope,
+    #[serde(default)]
+    item_ids: Vec<String>,
+    #[serde(default)]
+    conflict: Option<ConflictPolicy>,
+    #[serde(default)]
+    item_conflicts: BTreeMap<String, ConflictPolicy>,
+    #[serde(default)]
+    include_incomplete_tasks: bool,
+    #[serde(default)]
+    set_target_default_on_success: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmPayload {
+    preview_id: String,
+    revision: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlPayload {
+    migration_id: String,
+    control: MigrationControl,
+}
+
+fn manager(runtime: &CloudBotRuntime, id: &str) -> Result<Arc<LibraryManager>> {
+    let (scoped, _) = media_library_bot::scoped_runtime(runtime, Some(id))?;
+    Ok(Arc::new(open_cloud_library_manager(
+        &scoped.bot,
+        Arc::clone(&runtime.inbox),
+        None,
+    )?))
+}
+
+fn engine(runtime: &CloudBotRuntime, source: &str, target: &str) -> Result<MigrationEngine> {
+    MigrationEngine::new(
+        source,
+        manager(runtime, source)?,
+        target,
+        manager(runtime, target)?,
+    )
+}
+
+pub(super) async fn ensure_library_io_available(
+    runtime: &CloudBotRuntime,
+    library_id: &str,
+) -> Result<()> {
+    let active = runtime.migration_runners.lock().await.clone();
+    if runtime.migrations.lock().await.values().any(|status| {
+        active.contains(&status.id)
+            && (status.source_library_id == library_id || status.target_library_id == library_id)
+    }) {
+        bail!(
+            "this library has an active migration; pause it before scanning or changing its files"
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn ensure_library_removable(runtime: &CloudBotRuntime, library_id: &str) -> Result<()> {
+    let libraries = runtime.bot.queue.registry_snapshot()?.libraries;
+    if !libraries.iter().any(|library| library.id == library_id) {
+        return Ok(());
+    }
+    for library in libraries {
+        let source=manager(runtime,&library.id)
+            .context("all media libraries must be reachable to verify migration dependencies before unregistering")?;
+        for status in MigrationEngine::list_for_source(&source)? {
+            if (status.source_library_id == library_id || status.target_library_id == library_id)
+                && !matches!(
+                    status.status,
+                    MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+                )
+            {
+                bail!(
+                    "finish or stop migration {} before removing this library registration",
+                    status.id
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn item_ids_for_task(snapshot: &LibrarySnapshot, task: &TaskRecord, root: &Path) -> Vec<String> {
+    let mut paths = published_primary_relative_paths(task, root);
+    if let Some(attempt) = task.bilibili_attempt.as_ref() {
+        for entry in &attempt.entries {
+            paths.extend(published_entry_primary_relative_paths(entry, root));
+        }
+    }
+    snapshot
+        .items
+        .iter()
+        .filter(|item| paths.contains(&item.relative_path))
+        .map(|item| item.id.clone())
+        .collect()
+}
+
+fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<MigrationPreview> {
+    let source = manager(runtime, &payload.source_library_id)?;
+    let target = manager(runtime, &payload.target_library_id)?;
+    let snapshot = source.migration_scan()?;
+    let tasks = runtime
+        .bot
+        .queue
+        .list_incomplete_task_transfer_snapshots(&payload.source_library_id, MAX_MIGRATION_TASKS)?;
+    let mut selected: HashSet<String> = payload.item_ids.iter().cloned().collect();
+    let mut impacts = Vec::new();
+    let mut expanded = false;
+    for task in tasks {
+        let published = item_ids_for_task(&snapshot, &task.record, &task.destination.root);
+        let affected = payload.scope == MigrationScope::Library
+            || published.iter().any(|id| selected.contains(id));
+        if !affected {
+            continue;
+        }
+        if task.record.destination_transfer.is_some() {
+            bail!(
+                "an affected task already belongs to another migration; finish or stop that migration first"
+            );
+        }
+        if payload.include_incomplete_tasks {
+            for id in &published {
+                expanded |= selected.insert(id.clone());
+            }
+        }
+        impacts.push(MigrationTaskImpact {
+            task_id: task.record.id,
+            generation: task.record.generation,
+            revision: task.record.revision,
+            staging_bytes: task.staging_bytes,
+            staging_file_count: task.staging_file_count,
+            published_item_ids: published,
+        });
+    }
+    let mut item_ids = if payload.scope == MigrationScope::Library {
+        Vec::new()
+    } else {
+        selected.into_iter().collect()
+    };
+    item_ids.sort();
+    let mut warnings = Vec::new();
+    if !impacts.is_empty() {
+        warnings.push("Unfinished-task sizes are estimates; exact retained files are bound after confirmed writers stop.".to_string());
+    }
+    if expanded && payload.scope == MigrationScope::Selected {
+        warnings.push("The selection includes every published member of the affected unfinished task, so its recovery remains in one library.".to_string());
+    }
+    let task_items = impacts
+        .iter()
+        .flat_map(|impact| impact.published_item_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    let preview = MigrationEngine::new(
+        payload.source_library_id,
+        source,
+        payload.target_library_id,
+        target,
+    )?
+    .preview(&MigrationRequest {
+        scope: payload.scope,
+        item_ids,
+        conflict: payload.conflict.unwrap_or(ConflictPolicy::Skip),
+        item_conflicts: payload.item_conflicts,
+        include_incomplete_tasks: payload.include_incomplete_tasks,
+        set_target_default_on_success: payload.set_target_default_on_success,
+        task_impacts: impacts,
+        warnings,
+    })?;
+    if payload.include_incomplete_tasks
+        && preview.items.iter().any(|item| {
+            task_items.contains(&item.item_id)
+                && item.status == crate::library_migration::MigrationItemPhase::Skipped
+        })
+    {
+        bail!(
+            "a conflicting published member of an unfinished task would stay in the source library; choose Keep both or leave unfinished tasks in the source library"
+        );
+    }
+    Ok(preview)
+}
+
+async fn publish_status(runtime: &CloudBotRuntime, status: MigrationStatus) {
+    runtime
+        .migrations
+        .lock()
+        .await
+        .insert(status.id.clone(), status);
+    runtime.state_notify.notify_one();
+}
+
+fn locate_preview(runtime: &CloudBotRuntime, id: &str) -> Result<MigrationPreview> {
+    for library in runtime.bot.queue.registry_snapshot()?.libraries {
+        let source = match manager(runtime, &library.id) {
+            Ok(source) => source,
+            Err(_) => continue,
+        };
+        if let Some(preview) = MigrationEngine::find_preview_for_source(&source, id)? {
+            return Ok(preview.preview);
+        }
+    }
+    bail!("migration preview is unavailable; reconnect the source library or create a new preview")
+}
+
+pub(super) async fn dispatch(
+    runtime: &CloudBotRuntime,
+    request: &CloudRequest,
+) -> Option<Result<CloudDispatchOutcome>> {
+    if !matches!(
+        request.kind.as_str(),
+        "library_migration_preview" | "library_migration_confirm" | "library_migration_control"
+    ) {
+        return None;
+    }
+    Some(dispatch_inner(runtime, request).await)
+}
+
+async fn dispatch_inner(
+    runtime: &CloudBotRuntime,
+    request: &CloudRequest,
+) -> Result<CloudDispatchOutcome> {
+    match request.kind.as_str() {
+        "library_migration_preview" => {
+            let payload: PreviewPayload = serde_json::from_value(request.payload.clone())?;
+            ensure_library_io_available(runtime, &payload.source_library_id).await?;
+            ensure_library_io_available(runtime, &payload.target_library_id).await?;
+            let worker = runtime.clone();
+            let preview =
+                tokio::task::spawn_blocking(move || build_preview(&worker, payload)).await??;
+            Ok(CloudDispatchOutcome {
+                status: InboxStatus::AwaitingConfirmation,
+                result: Some(serde_json::to_value(preview)?),
+                error: None,
+                related_preview: None,
+            })
+        }
+        "library_migration_confirm" => {
+            let payload: ConfirmPayload = serde_json::from_value(request.payload.clone())?;
+            let record = cloud_awaiting_confirmation_record(
+                runtime,
+                payload.preview_id.clone(),
+                request.seq,
+            )
+            .await?
+            .context("the migration preview is no longer awaiting confirmation")?;
+            if record.request.kind != "library_migration_preview" {
+                bail!("a file-operation preview cannot authorize a library migration");
+            }
+            let preview: MigrationPreview = serde_json::from_value(
+                record
+                    .result
+                    .clone()
+                    .context("migration preview result is missing")?,
+            )?;
+            if preview.id != payload.preview_id || preview.revision != payload.revision {
+                bail!("migration preview ID or revision does not match confirmation");
+            }
+            let worker = runtime.clone();
+            let id = payload.preview_id.clone();
+            let revision = payload.revision;
+            let migration = tokio::task::spawn_blocking(move || {
+                let persisted = locate_preview(&worker, &id)?;
+                let engine = engine(
+                    &worker,
+                    &persisted.source_library_id,
+                    &persisted.target_library_id,
+                )?;
+                let status = engine.confirm(&id, &revision)?;
+                Ok::<_, anyhow::Error>((engine, status))
+            })
+            .await??;
+            let (engine, status) = migration;
+            ensure_message_context(runtime, &engine, &status, record.request.seq).await?;
+            publish_status(runtime, status.clone()).await;
+            start(runtime.clone(), status.clone()).await;
+            Ok(CloudDispatchOutcome {
+                status: InboxStatus::Completed,
+                result: Some(
+                    json!({"preview_id": payload.preview_id,"revision": preview.revision,"migration": status}),
+                ),
+                error: None,
+                related_preview: Some((record.request.seq, InboxStatus::Completed)),
+            })
+        }
+        "library_migration_control" => {
+            let payload: ControlPayload = serde_json::from_value(request.payload.clone())?;
+            let worker = runtime.clone();
+            let (engine, status) = tokio::task::spawn_blocking(move || {
+                let preview = locate_preview(&worker, &payload.migration_id)?;
+                let engine = engine(
+                    &worker,
+                    &preview.source_library_id,
+                    &preview.target_library_id,
+                )?;
+                if matches!(
+                    payload.control,
+                    MigrationControl::Resume | MigrationControl::RetryFailed
+                ) {
+                    let mut context = engine
+                        .runtime_context(&payload.migration_id)?
+                        .context("migration recovery context is missing")?;
+                    context.database_epoch = worker.inbox.database_epoch().to_string();
+                    engine.set_runtime_context(&payload.migration_id, context)?;
+                }
+                let status = engine.control(&payload.migration_id, payload.control)?;
+                Ok::<_, anyhow::Error>((engine, status))
+            })
+            .await??;
+            if status.status == MigrationRunStatus::Stopped
+                && !runtime.migration_runners.lock().await.contains(&status.id)
+            {
+                finish_task_transfers(runtime, &engine, &status).await?;
+                edit_status(runtime, &engine, &status).await?;
+            }
+            publish_status(runtime, status.clone()).await;
+            start(runtime.clone(), status.clone()).await;
+            Ok(CloudDispatchOutcome {
+                status: InboxStatus::Completed,
+                result: Some(json!({"migration":status})),
+                error: None,
+                related_preview: None,
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+async fn ensure_message_context(
+    runtime: &CloudBotRuntime,
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+    seq: u64,
+) -> Result<()> {
+    let worker = engine.clone();
+    let id = status.id.clone();
+    if tokio::task::spawn_blocking(move || worker.runtime_context(&id))
+        .await??
+        .is_some()
+    {
+        return Ok(());
+    }
+    let mut context = MigrationRuntimeContext {
+        database_epoch: runtime.inbox.database_epoch().to_string(),
+        preview_seq: seq,
+        chat_id: configured_cloud_management_chat_id(&runtime.bot.config),
+        message_id: None,
+        delivery: MigrationDeliveryState::Unknown,
+    };
+    let worker = engine.clone();
+    let id = status.id.clone();
+    let saved = context.clone();
+    tokio::task::spawn_blocking(move || worker.set_runtime_context(&id, saved)).await??;
+    context.message_id = begin_cloud_batch_message(runtime, seq, &status.id).await?;
+    if context.message_id.is_some() {
+        context.delivery = MigrationDeliveryState::Sent;
+    }
+    let worker = engine.clone();
+    let id = status.id.clone();
+    tokio::task::spawn_blocking(move || worker.set_runtime_context(&id, context)).await??;
+    Ok(())
+}
+
+async fn start(runtime: CloudBotRuntime, status: MigrationStatus) {
+    if !matches!(
+        status.status,
+        MigrationRunStatus::Queued | MigrationRunStatus::Running | MigrationRunStatus::Completed
+    ) {
+        return;
+    }
+    if !runtime
+        .migration_runners
+        .lock()
+        .await
+        .insert(status.id.clone())
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        let id = status.id.clone();
+        let source = status.source_library_id.clone();
+        if let Err(error) = run(&runtime, status).await {
+            warn!(migration_id=%id,error=%redact_sensitive_text(&format!("{error:#}")),"media-library migration paused for recovery");
+            let worker = runtime.clone();
+            let lookup = id.clone();
+            let diagnostic =
+                redact_sensitive_text(&format!("Migration needs attention: {error:#}"));
+            let paused = tokio::task::spawn_blocking(move || {
+                let source = manager(&worker, &source)?;
+                MigrationEngine::pause_for_source(&source, &lookup, &diagnostic)
+            })
+            .await;
+            if let Ok(Ok((status, context))) = paused {
+                if let Some(context) = context {
+                    edit_status_with_context(&runtime, &context, &status).await;
+                }
+                publish_status(&runtime, status).await;
+            } else if let Some(status) = runtime.migrations.lock().await.get_mut(&id) {
+                status.status = MigrationRunStatus::Paused;
+                status.warnings.push(redact_sensitive_text(&format!(
+                    "Migration needs attention: {error:#}. The runner stopped, but its pause could not be saved; reconnect the source library before continuing."
+                )));
+            }
+            runtime.state_notify.notify_one();
+        }
+        runtime.migration_runners.lock().await.remove(&id);
+    });
+}
+
+pub(super) async fn watch(runtime: CloudBotRuntime) {
+    let mut tick = interval(Duration::from_secs(15));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! { _=runtime.epoch_fatal.notified()=>return, _=tick.tick()=>{} }
+        if let Err(error) = discover(&runtime).await {
+            warn!(error=%redact_sensitive_text(&format!("{error:#}")),"could not refresh durable library migrations");
+        }
+    }
+}
+
+async fn discover(runtime: &CloudBotRuntime) -> Result<()> {
+    let worker = runtime.clone();
+    let statuses = tokio::task::spawn_blocking(move || {
+        let mut statuses = Vec::new();
+        for library in worker.bot.queue.registry_snapshot()?.libraries {
+            if let Ok(source) = manager(&worker, &library.id) {
+                statuses.extend(MigrationEngine::list_for_source(&source)?);
+            }
+        }
+        Ok::<_, anyhow::Error>(statuses)
+    })
+    .await??;
+    for status in statuses {
+        publish_status(runtime, status.clone()).await;
+        start(runtime.clone(), status).await;
+    }
+    Ok(())
+}
+
+async fn edit_status(
+    runtime: &CloudBotRuntime,
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+) -> Result<()> {
+    let worker = engine.clone();
+    let id = status.id.clone();
+    let context = tokio::task::spawn_blocking(move || worker.runtime_context(&id)).await??;
+    if let Some(context) = context {
+        edit_status_with_context(runtime, &context, status).await;
+    }
+    Ok(())
+}
+
+async fn edit_status_with_context(
+    runtime: &CloudBotRuntime,
+    context: &MigrationRuntimeContext,
+    status: &MigrationStatus,
+) {
+    if context.database_epoch == runtime.inbox.database_epoch()
+        && context.chat_id == configured_cloud_management_chat_id(&runtime.bot.config)
+        && let (Some(chat), Some(message)) = (context.chat_id, context.message_id)
+    {
+        let mut text = format!(
+            "Library migration {}: {:?}\n{} completed, {} skipped, {} failed; {} / {} copied.\nSee /file for actual locations and recovery controls.",
+            status.id,
+            status.status,
+            status.success_count,
+            status.skipped_count,
+            status.failed_count,
+            human_bytes(status.copied_bytes),
+            human_bytes(status.total_bytes)
+        );
+        if let Some(warning) = status
+            .warnings
+            .iter()
+            .rev()
+            .find(|warning| warning.starts_with("Migration needs attention:"))
+        {
+            text.push_str(&format!("\n{}", truncate(warning)));
+        }
+        if let Err(error) = runtime
+            .bot
+            .telegram
+            .edit_message_text(chat, message, truncate(&text))
+            .await
+        {
+            warn!(error=%error,"could not update library migration Telegram status");
+        }
+    }
+}
+
+async fn run(runtime: &CloudBotRuntime, initial: MigrationStatus) -> Result<()> {
+    let worker = runtime.clone();
+    let source_id = initial.source_library_id.clone();
+    let target_id = initial.target_library_id.clone();
+    let engine =
+        tokio::task::spawn_blocking(move || engine(&worker, &source_id, &target_id)).await??;
+    let id = initial.id.clone();
+    let worker = engine.clone();
+    let lookup = id.clone();
+    let context = tokio::task::spawn_blocking(move || worker.runtime_context(&lookup)).await??;
+    if context
+        .as_ref()
+        .is_none_or(|context| context.database_epoch != runtime.inbox.database_epoch())
+    {
+        let worker = engine.clone();
+        let lookup = id.clone();
+        let status =
+            tokio::task::spawn_blocking(move || worker.control(&lookup, MigrationControl::Pause))
+                .await??;
+        publish_status(runtime, status).await;
+        return Ok(());
+    }
+    if initial.status == MigrationRunStatus::Completed {
+        finish_task_transfers(runtime, &engine, &initial).await?;
+        apply_success_default(runtime, &engine, &initial).await?;
+        return Ok(());
+    }
+    // Task writers must acknowledge cancellation before either output lease is acquired.
+    if !prepare_task_transfers(runtime, &engine, &initial).await? {
+        if let Some(status) = read_status(&engine, &id).await? {
+            finish_task_transfers(runtime, &engine, &status).await?;
+            publish_status(runtime, status).await;
+        }
+        return Ok(());
+    }
+    let settings = runtime.bot.queue.registry_snapshot()?;
+    let mut roots = settings
+        .libraries
+        .into_iter()
+        .filter(|library| {
+            library.id == initial.source_library_id || library.id == initial.target_library_id
+        })
+        .map(|library| library.root)
+        .collect::<Vec<_>>();
+    roots.sort();
+    let acquire = downloader::hold_video_outputs_for_migration(&roots);
+    tokio::pin!(acquire);
+    let guards = loop {
+        tokio::select! {
+            _=runtime.epoch_fatal.notified()=>return Ok(()),
+            result=&mut acquire=>break result?,
+            _=sleep(Duration::from_millis(250))=>{
+                if let Some(status)=read_status(&engine,&id).await?
+                    && !matches!(status.status,MigrationRunStatus::Queued|MigrationRunStatus::Running)
+                {
+                    finish_task_transfers(runtime,&engine,&status).await?;
+                    publish_status(runtime,status).await;
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let guards = Arc::new(StdMutex::new(guards));
+    attach_task_plans(runtime, &engine, &initial, Arc::clone(&guards)).await?;
+    let mut last_edit = Instant::now() - Duration::from_secs(5);
+    loop {
+        if runtime.epoch_fatal.is_signaled() {
+            return Ok(());
+        }
+        let worker = engine.clone();
+        let lookup = id.clone();
+        let lease = Arc::clone(&guards);
+        let status = tokio::task::spawn_blocking(move || {
+            let lease = lease
+                .lock()
+                .map_err(|_| anyhow::anyhow!("migration output lease is poisoned"))?;
+            worker.step_with_output_lease(&lookup, &lease)
+        })
+        .await??;
+        if status.awaiting_task_commit {
+            commit_task_transfers(runtime, &engine, &status).await?;
+        }
+        let terminal = !matches!(
+            status.status,
+            MigrationRunStatus::Queued | MigrationRunStatus::Running
+        );
+        runtime
+            .migrations
+            .lock()
+            .await
+            .insert(status.id.clone(), status.clone());
+        // Copy checkpoints may complete faster than a cloud round trip. Keep local progress
+        // current, but coalesce snapshot uploads and Telegram edits to a bounded cadence.
+        if terminal || last_edit.elapsed() >= Duration::from_secs(5) {
+            runtime.state_notify.notify_one();
+            edit_status(runtime, &engine, &status).await?;
+            last_edit = Instant::now();
+        }
+        if terminal {
+            finish_task_transfers(runtime, &engine, &status).await?;
+            apply_success_default(runtime, &engine, &status).await?;
+            drop(guards);
+            runtime.bot.queue.publication_notify().notify_one();
+            return Ok(());
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn read_status(engine: &MigrationEngine, id: &str) -> Result<Option<MigrationStatus>> {
+    let worker = engine.clone();
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || worker.status(&id)).await?
+}
+
+async fn apply_success_default(
+    runtime: &CloudBotRuntime,
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+) -> Result<()> {
+    if status.status == MigrationRunStatus::Completed
+        && status.set_target_default_on_success
+        && !status.default_update_applied
+    {
+        let queue = Arc::clone(&runtime.bot.queue);
+        let target = status.target_library_id.clone();
+        let id = status.id.clone();
+        tokio::task::spawn_blocking(move || {
+            queue.set_default_video_library_for_migration(&target, &id)
+        })
+        .await??;
+        let worker = engine.clone();
+        let id = status.id.clone();
+        tokio::task::spawn_blocking(move || worker.mark_default_update_applied(&id)).await??;
+        if let Some(status) = read_status(engine, &status.id).await? {
+            publish_status(runtime, status).await;
+        }
+    }
+    Ok(())
+}
+
+// Queue-transfer coordination follows below. The durable engine owns file checkpoints;
+// QueueManager alone owns queue record/index installation and token restoration.
+
+async fn task_plans(
+    engine: &MigrationEngine,
+    id: &str,
+) -> Result<Vec<crate::media_libraries::TaskTransferPlan>> {
+    let worker = engine.clone();
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || worker.task_transfer_plans(&id)).await?
+}
+
+async fn prepare_task_transfers(
+    runtime: &CloudBotRuntime,
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+) -> Result<bool> {
+    if !status.include_incomplete_tasks {
+        return Ok(true);
+    }
+    let worker = engine.clone();
+    let id = status.id.clone();
+    let impacts = tokio::task::spawn_blocking(move || worker.task_impacts(&id)).await??;
+    let attached = task_plans(engine, &status.id).await?;
+    let worker = engine.clone();
+    let id = status.id.clone();
+    let acknowledged = tokio::task::spawn_blocking(move || worker.task_transfer_statuses(&id))
+        .await??
+        .into_iter()
+        .filter(|transfer| transfer.commit_acked)
+        .map(|transfer| transfer.transfer_id)
+        .collect::<HashSet<_>>();
+    let worker = runtime.clone();
+    let source = status.source_library_id.clone();
+    let target_id = status.target_library_id.clone();
+    let (snapshot, tasks, target) = tokio::task::spawn_blocking(move || {
+        let snapshot = manager(&worker, &source)?.migration_scan()?;
+        let tasks = worker
+            .bot
+            .queue
+            .list_incomplete_task_transfer_snapshots(&source, MAX_MIGRATION_TASKS)?;
+        let target = worker
+            .bot
+            .queue
+            .registry_snapshot()?
+            .libraries
+            .into_iter()
+            .find(|library| library.id == target_id)
+            .context("target library is no longer registered")?;
+        Ok::<_, anyhow::Error>((snapshot, tasks, target))
+    })
+    .await??;
+    let approved: HashSet<_> = status
+        .items
+        .iter()
+        .map(|item| item.item_id.as_str())
+        .collect();
+    for impact in impacts {
+        if let Some(current) = read_status(engine, &status.id).await?
+            && !matches!(
+                current.status,
+                MigrationRunStatus::Queued | MigrationRunStatus::Running
+            )
+        {
+            return Ok(false);
+        }
+        // A crash may occur after the target queue record is installed but before the
+        // migration checkpoint acknowledges it. Reuse that exact persisted handoff;
+        // the task no longer belongs to the source-only incomplete-task listing.
+        if let Some(plan) = attached
+            .iter()
+            .find(|plan| plan.transfer.task_id == impact.task_id)
+        {
+            let queue = Arc::clone(&runtime.bot.queue);
+            let plan = plan.clone();
+            let acknowledged = acknowledged.contains(&plan.transfer.transfer_id);
+            let installed = tokio::task::spawn_blocking(move || {
+                let Some(task) = queue.get(&plan.transfer.task_id)? else {
+                    return Ok(false);
+                };
+                if task.destination.as_ref() != Some(&plan.transfer.target) {
+                    return Ok(false);
+                }
+                if task.destination_transfer_phase
+                    != Some(crate::media_libraries::TaskDestinationTransferPhase::TargetInstalled)
+                    || task.destination_transfer.as_ref() != Some(&plan.transfer)
+                {
+                    bail!("installed task does not match its durable migration handoff");
+                }
+                if !acknowledged {
+                    queue.verify_task_transfer_plan(&plan)?;
+                }
+                Ok::<_, anyhow::Error>(true)
+            })
+            .await??;
+            if installed {
+                continue;
+            }
+        }
+        let task = tasks
+            .iter()
+            .find(|task| task.record.id == impact.task_id)
+            .context("an unfinished task changed or completed; create a fresh migration preview")?;
+        if task.record.destination_transfer.is_none() && task.record.generation != impact.generation
+        {
+            bail!("unfinished task generation changed; create a fresh migration preview");
+        }
+        let current_ids = item_ids_for_task(&snapshot, &task.record, &task.destination.root);
+        if current_ids.iter().any(|id| !approved.contains(id.as_str())) {
+            bail!(
+                "an unfinished task published media outside the approved preview; create a fresh preview"
+            );
+        }
+        let queue = Arc::clone(&runtime.bot.queue);
+        let task = task.clone();
+        let migration_id = status.id.clone();
+        let destination = TaskDestination {
+            library_id: target.id.clone(),
+            root: target.root.clone(),
+            category: task.destination.category.clone(),
+        };
+        let token = tokio::task::spawn_blocking(move || {
+            queue.begin_task_destination_transfer(
+                &task.record.id,
+                &migration_id,
+                task.record.generation,
+                task.record.revision,
+                destination,
+            )
+        })
+        .await??;
+        let settled = runtime.bot.queue.wait_for_task_destination_transfer(&token);
+        tokio::pin!(settled);
+        loop {
+            tokio::select! {
+                _=runtime.epoch_fatal.notified()=>return Ok(false),
+                result=&mut settled=>{result?;break;},
+                _=sleep(Duration::from_millis(250))=>{
+                    if let Some(current)=read_status(engine,&status.id).await?
+                        && !matches!(current.status,MigrationRunStatus::Queued|MigrationRunStatus::Running) {return Ok(false);}
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+async fn attach_task_plans(
+    runtime: &CloudBotRuntime,
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+    output_lease: Arc<StdMutex<downloader::VideoMigrationGuard>>,
+) -> Result<()> {
+    if !status.include_incomplete_tasks {
+        return Ok(());
+    }
+    let worker = engine.clone();
+    let id = status.id.clone();
+    let impacts = tokio::task::spawn_blocking(move || worker.task_impacts(&id)).await??;
+    let attached = task_plans(engine, &status.id).await?;
+    let worker = runtime.clone();
+    let source_id = status.source_library_id.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let source = manager(&worker, &source_id)?;
+        let lease = output_lease
+            .lock()
+            .map_err(|_| anyhow::anyhow!("migration output lease is poisoned"))?;
+        source.migration_scan_with_output_lease(&lease)
+    })
+    .await??;
+    let approved = status
+        .items
+        .iter()
+        .map(|item| item.item_id.clone())
+        .collect::<HashSet<_>>();
+    // Cancellation and dirty-publication recovery can finish work after the initial
+    // task scan. Bind task plans only after checking the settled, leased source view.
+    // A resumed job may already have removed approved media; only extra present media
+    // is a scope expansion, so missing completed members do not invalidate recovery.
+    if status.scope == MigrationScope::Library
+        && snapshot
+            .items
+            .iter()
+            .any(|item| item.presence == Presence::Present && !approved.contains(&item.id))
+    {
+        bail!(
+            "source library gained media outside the approved preview; create a fresh migration preview"
+        );
+    }
+    let libraries = runtime.bot.queue.registry_snapshot()?.libraries;
+    let source_root = libraries
+        .iter()
+        .find(|library| library.id == status.source_library_id)
+        .context("source library is no longer registered")?
+        .root
+        .clone();
+    let target_root = libraries
+        .iter()
+        .find(|library| library.id == status.target_library_id)
+        .context("target library is no longer registered")?
+        .root
+        .clone();
+    for impact in impacts {
+        if attached
+            .iter()
+            .any(|plan| plan.transfer.task_id == impact.task_id)
+        {
+            continue;
+        }
+        let queue = Arc::clone(&runtime.bot.queue);
+        let id = impact.task_id.clone();
+        let snapshot = snapshot.clone();
+        let approved = approved.clone();
+        let source = source_root.clone();
+        let rewrites = status
+            .items
+            .iter()
+            .filter(|item| impact.published_item_ids.contains(&item.item_id))
+            .flat_map(|item| item.files.iter())
+            .map(|file| {
+                (
+                    source_root.join(&file.source_path),
+                    target_root.join(&file.target_path),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let plan = tokio::task::spawn_blocking(move || {
+            let task = queue
+                .get(&id)?
+                .context("task disappeared while migration was acquiring output leases")?;
+            if item_ids_for_task(&snapshot, &task, &source)
+                .iter()
+                .any(|id| !approved.contains(id))
+            {
+                bail!("an unfinished task published media outside the approved preview; create a fresh migration preview");
+            }
+            let token = task
+                .destination_transfer
+                .context("task transfer ownership disappeared")?;
+            queue.task_transfer_plan_with_published_paths(&token, &rewrites)
+        })
+        .await??;
+        let worker = engine.clone();
+        let id = status.id.clone();
+        tokio::task::spawn_blocking(move || worker.attach_task_transfer(&id, plan)).await??;
+    }
+    Ok(())
+}
+
+async fn commit_task_transfers(
+    runtime: &CloudBotRuntime,
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+) -> Result<()> {
+    for plan in task_plans(engine, &status.id).await? {
+        let queue = Arc::clone(&runtime.bot.queue);
+        let saved = plan.clone();
+        tokio::task::spawn_blocking(move || queue.commit_task_destination_transfer(&saved))
+            .await??;
+        let worker = engine.clone();
+        let id = status.id.clone();
+        let transfer = plan.transfer.transfer_id;
+        tokio::task::spawn_blocking(move || worker.ack_task_transfer(&id, &transfer)).await??;
+    }
+    Ok(())
+}
+
+async fn restore_task(runtime: &CloudBotRuntime, task: Option<TaskRecord>) -> Result<()> {
+    if let Some(task) = task
+        && task.status == TaskStatus::Queued
+    {
+        let id = task.id.clone();
+        let generation = task.generation;
+        let context = task_bot_context(runtime.bot.clone(), &id, generation).await?;
+        let job_id = context.next_job_id.fetch_add(1, Ordering::Relaxed);
+        queue_queued_task(
+            context,
+            task.chat_id,
+            job_id,
+            id,
+            task.job,
+            JobRunMode::StagedKeepBoth,
+            Some(generation),
+        )
+        .await;
+    }
+    Ok(())
+}
+
+async fn finish_task_transfers(
+    runtime: &CloudBotRuntime,
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+) -> Result<()> {
+    if !matches!(
+        status.status,
+        MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+    ) {
+        return Ok(());
+    }
+    let worker = engine.clone();
+    let id = status.id.clone();
+    let impacts = tokio::task::spawn_blocking(move || worker.task_impacts(&id)).await??;
+    for impact in impacts {
+        let queue = Arc::clone(&runtime.bot.queue);
+        let migration_id = status.id.clone();
+        let completed = status.status == MigrationRunStatus::Completed;
+        let task = tokio::task::spawn_blocking(move || {
+            let Some(current) = queue.get(&impact.task_id)? else {
+                return Ok(None);
+            };
+            let Some(token) = current.destination_transfer else {
+                return Ok(None);
+            };
+            if token.migration_id != migration_id {
+                bail!("task transfer belongs to another migration");
+            }
+            let installed = current.destination.as_ref() == Some(&token.target);
+            if completed || installed {
+                queue.ack_task_destination_transfer(&token)
+            } else {
+                queue.abort_task_destination_transfer(&token)
+            }
+        })
+        .await??;
+        restore_task(runtime, task).await?;
+    }
+    Ok(())
+}

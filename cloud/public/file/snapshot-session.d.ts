@@ -8,7 +8,7 @@ export interface OwnerSnapshotSession<T = unknown> {
 }
 
 export function beginOwnerVerification(): OwnerSnapshotSession<never>;
-export function acceptOwnerSnapshot<T>(snapshot: T): OwnerSnapshotSession<T>;
+export function acceptOwnerSnapshot<T>(snapshot: T, previousSession?: OwnerSnapshotSession<unknown> | null): OwnerSnapshotSession<T>;
 export function failOwnerSnapshot<T>(session: OwnerSnapshotSession<T>, status: number | undefined, now?: number): OwnerSnapshotSession<T>;
 export function mayUsePrivateSnapshot(session: OwnerSnapshotSession<unknown>): boolean;
 export function mayDispatchActions(session: OwnerSnapshotSession<unknown>): boolean;

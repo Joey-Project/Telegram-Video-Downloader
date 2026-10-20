@@ -34,8 +34,10 @@ use crate::library::{
     MetadataPatchPreview, MetadataStatus, MoveOutcome, MovePreview, MovePreviewItem,
     MoveResultItem, Presence, SourceHint,
 };
+use crate::media_libraries::{TaskTransferEntryKind, TaskTransferFile};
 use crate::safe_fs::{
-    BoundDirectoryCursor, BoundDirectoryCursorEntry, BoundFile, EntryIdentity, RootedFs,
+    BoundDirectoryCursor, BoundDirectoryCursorEntry, BoundFile, BoundFileAccessPolicy,
+    EntryIdentity, MigrationCopyChunk, RootedFs,
 };
 
 const LIBRARY_DIRECTORY: &str = ".telegram-video-downloader-library";
@@ -224,7 +226,7 @@ fn resolve_target_parent(
     private_library_identity: Option<EntryIdentity>,
 ) -> Result<ResolvedTargetParent> {
     let relative = safe_relative_path(target, false)?;
-    validate_not_private_downloader_path(root, &relative, private_library_identity)?;
+    validate_not_private_downloader_path_with_identity(root, &relative, private_library_identity)?;
     let components = relative
         .components()
         .map(|component| match component {
@@ -408,7 +410,11 @@ fn is_private_downloader_component(name: &str, semantics: TargetNameSemantics) -
     is_private_downloader_component_with(name, semantics, &platform_case_fold)
 }
 
-fn validate_not_private_downloader_path(
+pub(crate) fn validate_not_private_downloader_path(root: &RootedFs, relative: &Path) -> Result<()> {
+    validate_not_private_downloader_path_with_identity(root, relative, None)
+}
+
+fn validate_not_private_downloader_path_with_identity(
     root: &RootedFs,
     relative: &Path,
     private_library_identity: Option<EntryIdentity>,
@@ -1014,6 +1020,59 @@ struct FileFingerprint {
     birth_nanoseconds: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MigrationFileProof {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size: u64,
+    pub(crate) mode: u32,
+    pub(crate) owner: u32,
+    pub(crate) group: u32,
+    pub(crate) link_count: u64,
+    pub(crate) birth_seconds: Option<i64>,
+    pub(crate) birth_nanoseconds: Option<i64>,
+    pub(crate) sha256: String,
+}
+
+impl MigrationFileProof {
+    pub(crate) fn entry_identity(&self) -> EntryIdentity {
+        EntryIdentity::regular_file(self.device, self.inode)
+    }
+
+    pub(crate) fn access_policy(&self) -> BoundFileAccessPolicy {
+        BoundFileAccessPolicy {
+            owner: self.owner,
+            group: self.group,
+            mode: self.mode,
+            link_count: self.link_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MigrationPlannedFile {
+    pub(crate) source_path: String,
+    pub(crate) target_path: String,
+    pub(crate) proof: MigrationFileProof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MigrationPlanOutcome {
+    Move,
+    Skip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MigrationPlannedGroup {
+    pub(crate) item_id: String,
+    pub(crate) source_path: String,
+    pub(crate) target_path: String,
+    pub(crate) outcome: MigrationPlanOutcome,
+    pub(crate) conflict: bool,
+    pub(crate) files: Vec<MigrationPlannedFile>,
+}
+
 struct StoreGuards {
     _output: BoundFile,
     _library: BoundFile,
@@ -1105,6 +1164,1004 @@ impl LibraryManager {
             .map_err(|_| anyhow!("media-library lock is poisoned"))?;
         let _disk_guard = self.lock_store()?;
         self.scan_locked(hints)
+    }
+
+    pub(crate) fn migration_root_path(&self) -> &Path {
+        self.root.root_path()
+    }
+
+    pub(crate) fn migration_root_identity(&self) -> EntryIdentity {
+        self.root.root_identity()
+    }
+
+    pub(crate) fn migration_scan(&self) -> Result<LibrarySnapshot> {
+        self.scan(&[])
+    }
+
+    pub(crate) fn migration_scan_with_output_lease(
+        &self,
+        lease: &crate::downloader::VideoMigrationGuard,
+    ) -> Result<LibrarySnapshot> {
+        lease.validate_for_root(&self.root)?;
+        let _process_guard = self
+            .in_process_lock
+            .lock()
+            .map_err(|_| anyhow!("media-library lock is poisoned"))?;
+        let _library_guard = self.lock_library()?;
+        self.scan_locked(&[])
+    }
+
+    pub(crate) fn migration_validate_output_lease(
+        &self,
+        lease: &crate::downloader::VideoMigrationGuard,
+    ) -> Result<()> {
+        lease.validate_for_root(&self.root)
+    }
+
+    pub(crate) fn migration_available_space_bytes(&self) -> Result<u64> {
+        self.root.available_space_bytes()
+    }
+
+    pub(crate) fn migration_path_identity(
+        &self,
+        relative_path: &str,
+    ) -> Result<Option<EntryIdentity>> {
+        let absolute = self.absolute_path(relative_path)?;
+        self.root.entry_identity_if_parent_exists(&absolute)
+    }
+
+    pub(crate) fn migration_target_matches_exact(
+        &self,
+        relative_path: &str,
+        expected_identity: EntryIdentity,
+        expected_size: u64,
+        expected_access: BoundFileAccessPolicy,
+        expected_sha256: &str,
+    ) -> Result<bool> {
+        let absolute = self.absolute_path(relative_path)?;
+        let expected_digest = parse_sha256(expected_sha256)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration target path changed during exact verification");
+            }
+            let Some(file) = self.root.open_bound_file(coordinated)? else {
+                return Ok(false);
+            };
+            if file.identity() != expected_identity
+                || !expected_identity.is_file()
+                || file.byte_len()? != expected_size
+                || file.access_policy()? != expected_access
+            {
+                return Ok(false);
+            }
+            Ok(file.sha256()? == expected_digest)
+        })
+    }
+
+    pub(crate) fn migration_file_proof(&self, relative_path: &str) -> Result<MigrationFileProof> {
+        let absolute = self.absolute_path(relative_path)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration source path changed during verification");
+            }
+            let file = self
+                .root
+                .open_bound_file(coordinated)?
+                .ok_or_else(|| anyhow!("migration source file is missing: {relative_path}"))?;
+            migration_proof_for_bound_file(&file)
+        })
+    }
+
+    pub(crate) fn migration_file_identity_matches(
+        &self,
+        relative_path: &str,
+        expected: &MigrationFileProof,
+    ) -> Result<bool> {
+        let absolute = self.absolute_path(relative_path)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration source path changed during revalidation");
+            }
+            let Some(file) = self.root.open_bound_file(coordinated)? else {
+                return Ok(false);
+            };
+            let actual = fingerprint(&file)?;
+            let policy = file.access_policy()?;
+            Ok(actual.identity == expected.entry_identity()
+                && actual.size == expected.size
+                && actual.birth_seconds == expected.birth_seconds
+                && actual.birth_nanoseconds == expected.birth_nanoseconds
+                && policy == expected.access_policy())
+        })
+    }
+
+    pub(crate) fn migration_file_chunk_sha256(
+        &self,
+        relative_path: &str,
+        expected: &MigrationFileProof,
+        offset: u64,
+        length: u64,
+    ) -> Result<String> {
+        if length > 8 * 1024 * 1024 {
+            bail!("migration source verification chunk exceeds its byte budget");
+        }
+        let absolute = self.absolute_path(relative_path)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration source path changed during chunk verification");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            let file = self
+                .root
+                .open_bound_file_if_identity(&entry, expected.entry_identity())?;
+            file.validate_identity()?;
+            if file.byte_len()? != expected.size
+                || file.access_policy()? != expected.access_policy()
+            {
+                bail!("migration source size or access policy changed during chunk verification");
+            }
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| anyhow!("migration verification offset overflowed"))?;
+            if end > expected.size {
+                bail!("migration source verification chunk exceeds its expected file size");
+            }
+            let byte_count = usize::try_from(length)
+                .context("migration source verification chunk does not fit in memory")?;
+            let mut bytes = vec![0_u8; byte_count];
+            if byte_count > 0 {
+                let mut reader = file.duplicate_std_file()?;
+                reader.seek(SeekFrom::Start(offset))?;
+                reader.read_exact(&mut bytes)?;
+            }
+            file.validate_identity()?;
+            if file.byte_len()? != expected.size
+                || file.access_policy()? != expected.access_policy()
+            {
+                bail!("migration source changed while verifying a content chunk");
+            }
+            Ok(hex_digest(Sha256::digest(bytes).as_slice()))
+        })
+    }
+
+    pub(crate) fn plan_migration_groups(
+        &self,
+        target: &LibraryManager,
+        snapshot: &LibrarySnapshot,
+        item_ids: &[String],
+        conflict: ConflictPolicy,
+        item_conflicts: &BTreeMap<String, ConflictPolicy>,
+    ) -> Result<Vec<MigrationPlannedGroup>> {
+        if item_ids.is_empty() {
+            bail!("select at least one media item to migrate");
+        }
+        let mut unique_ids = HashSet::new();
+        if item_ids
+            .iter()
+            .any(|item_id| !unique_ids.insert(item_id.as_str()))
+        {
+            bail!("a media item was selected more than once for migration");
+        }
+        let items_by_id = snapshot
+            .items
+            .iter()
+            .map(|item| (item.id.as_str(), item))
+            .collect::<HashMap<_, _>>();
+        if item_ids
+            .iter()
+            .any(|item_id| !items_by_id.contains_key(item_id.as_str()))
+        {
+            bail!("selected media item is not present in the current source scan");
+        }
+
+        let mut reserved = TargetReservationSet {
+            private_library_identity: Some(target.library_dir_identity),
+            ..TargetReservationSet::default()
+        };
+        let mut seen_sources = HashSet::new();
+        let mut groups = Vec::with_capacity(item_ids.len());
+        for item_id in item_ids {
+            let conflict = item_conflicts.get(item_id).copied().unwrap_or(conflict);
+            let item = items_by_id[item_id.as_str()];
+            if item.presence != Presence::Present {
+                bail!(
+                    "selected media is missing or unavailable: {}",
+                    item.relative_path
+                );
+            }
+            let mut source_paths = vec![item.relative_path.clone()];
+            source_paths.extend(
+                item.attachments
+                    .iter()
+                    .map(|attachment| attachment.relative_path.clone()),
+            );
+            source_paths.sort_by(|left, right| {
+                let left_primary = left == &item.relative_path;
+                let right_primary = right == &item.relative_path;
+                right_primary
+                    .cmp(&left_primary)
+                    .then_with(|| left.cmp(right))
+            });
+            if source_paths
+                .iter()
+                .any(|path| !seen_sources.insert(path.clone()))
+            {
+                bail!("a sidecar is associated with more than one selected media item");
+            }
+
+            let primary = self.absolute_path(&item.relative_path)?;
+            let primary_stem = primary
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| anyhow!("selected media has a non-UTF-8 filename"))?;
+            let target_parent = Path::new(&item.relative_path)
+                .parent()
+                .unwrap_or_else(|| Path::new(""));
+            let source_parent_absolute = self.root.logical_root_path().join(target_parent);
+            let source_name_semantics =
+                self.coordinate_read(&source_parent_absolute, |coordinated| {
+                    if self.path_in_root(coordinated)? != source_parent_absolute {
+                        bail!("coordinated source directory changed during migration preview");
+                    }
+                    let identity = if target_parent.as_os_str().is_empty() {
+                        self.root.root_identity()
+                    } else {
+                        self.root
+                            .entry_identity(&source_parent_absolute)?
+                            .ok_or_else(|| anyhow!("source media directory disappeared"))?
+                    };
+                    if !identity.is_dir() {
+                        bail!("source media parent is no longer a directory");
+                    }
+                    let directory =
+                        open_validated_target_directory(&self.root, target_parent, identity)?;
+                    target_name_semantics(&directory)
+                        .context("filesystem name semantics unavailable for migration sidecars")
+                })?;
+
+            let mut planned_sources = Vec::with_capacity(source_paths.len());
+            let mut longest_filename_tail = 0;
+            for source_relative in &source_paths {
+                let source_absolute = self.absolute_path(source_relative)?;
+                let source_stem = source_absolute
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .ok_or_else(|| anyhow!("migration attachment has a non-UTF-8 filename"))?;
+                let suffix = if source_relative == &item.relative_path {
+                    String::new()
+                } else {
+                    matching_sidecar_suffix_with(
+                        source_stem,
+                        primary_stem,
+                        source_name_semantics,
+                        platform_case_fold,
+                    )?
+                    .ok_or_else(|| {
+                        anyhow!("sidecar association changed during migration planning")
+                    })?
+                };
+                longest_filename_tail =
+                    longest_filename_tail.max(filename_tail_bytes(&source_absolute, &suffix)?);
+                planned_sources.push((source_relative.clone(), source_absolute, suffix));
+            }
+
+            let candidate_for_stem = |stem_suffix: &str| -> Result<(String, Vec<String>)> {
+                let candidate_stem =
+                    budgeted_group_stem(primary_stem, longest_filename_tail, stem_suffix, true)?;
+                let candidate_primary =
+                    target_parent.join(file_name_with_stem(&primary, &candidate_stem, "")?);
+                let primary_target = path_to_relative_string(&candidate_primary)?;
+                let target_primary_stem = candidate_primary
+                    .file_stem()
+                    .and_then(OsStr::to_str)
+                    .ok_or_else(|| anyhow!("migration target filename is invalid"))?;
+                let targets = planned_sources
+                    .iter()
+                    .map(|(_, source_absolute, suffix)| {
+                        let name =
+                            file_name_with_stem(source_absolute, target_primary_stem, suffix)?;
+                        path_to_relative_string(&target_parent.join(name))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((primary_target, targets))
+            };
+
+            let (mut target_path, mut target_paths) = candidate_for_stem("")?;
+            let has_conflict = migration_targets_conflict(target, &target_paths, &mut reserved)?;
+            let mut skip_group = has_conflict && conflict == ConflictPolicy::Skip;
+            if has_conflict && conflict == ConflictPolicy::KeepBoth {
+                let mut found = false;
+                for number in 2..=10_000 {
+                    let suffix = format!(" ({number})");
+                    let (candidate_primary, candidate_targets) = candidate_for_stem(&suffix)?;
+                    if !migration_targets_conflict(target, &candidate_targets, &mut reserved)? {
+                        target_path = candidate_primary;
+                        target_paths = candidate_targets;
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    bail!("could not find a free keep-both migration filename");
+                }
+                skip_group = false;
+            }
+
+            let mut files = Vec::with_capacity(planned_sources.len());
+            for ((source_path, _, _), target_path) in planned_sources.iter().zip(&target_paths) {
+                let proof = self.migration_file_proof(source_path)?;
+                files.push(MigrationPlannedFile {
+                    source_path: source_path.clone(),
+                    target_path: target_path.clone(),
+                    proof,
+                });
+            }
+            if !skip_group {
+                for path in &target_paths {
+                    reserved.insert(&target.root, path)?;
+                }
+            }
+            groups.push(MigrationPlannedGroup {
+                item_id: item_id.clone(),
+                source_path: item.relative_path.clone(),
+                target_path,
+                outcome: if skip_group {
+                    MigrationPlanOutcome::Skip
+                } else {
+                    MigrationPlanOutcome::Move
+                },
+                conflict: has_conflict,
+                files,
+            });
+        }
+        Ok(groups)
+    }
+
+    pub(crate) fn migration_create_staging_file(&self, name: &str) -> Result<EntryIdentity> {
+        let absolute = self.migration_staging_path(name)?;
+        self.coordinate_write(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated staging path changed during migration");
+            }
+            self.validate_library_directory()?;
+            self.root.create_migration_staging_file(&absolute)
+        })
+    }
+
+    pub(crate) fn migration_staging_identity(&self, name: &str) -> Result<Option<EntryIdentity>> {
+        let absolute = self.migration_staging_path(name)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration staging path changed during recovery");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            let Some(identity) = self.root.bound_entry_identity(&entry)? else {
+                return Ok(None);
+            };
+            if !identity.is_file() {
+                bail!("migration staging entry is not a regular file");
+            }
+            self.root
+                .open_bound_file_if_identity(&entry, identity)?
+                .validate_private_single_link(0o600)?;
+            Ok(Some(identity))
+        })
+    }
+
+    pub(crate) fn migration_staging_entry_identity(
+        &self,
+        name: &str,
+    ) -> Result<Option<EntryIdentity>> {
+        let absolute = self.migration_staging_path(name)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration staging path changed during orphan inspection");
+            }
+            self.root.entry_identity_if_parent_exists(coordinated)
+        })
+    }
+
+    pub(crate) fn migration_staging_access_policy(
+        &self,
+        name: &str,
+        expected_identity: EntryIdentity,
+    ) -> Result<BoundFileAccessPolicy> {
+        let absolute = self.migration_staging_path(name)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration staging path changed during access-policy capture");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            let file = self
+                .root
+                .open_bound_file_if_identity(&entry, expected_identity)?;
+            file.validate_private_single_link(0o600)?;
+            file.access_policy()
+        })
+    }
+
+    pub(crate) fn migration_staging_chunk_sha256(
+        &self,
+        name: &str,
+        expected_identity: EntryIdentity,
+        expected_size: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<String> {
+        if length > 8 * 1024 * 1024 {
+            bail!("migration verification chunk exceeds its byte budget");
+        }
+        let absolute = self.migration_staging_path(name)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration staging path changed during chunk verification");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            let file = self
+                .root
+                .open_bound_file_if_identity(&entry, expected_identity)?;
+            file.validate_private_single_link(0o600)?;
+            if file.byte_len()? != expected_size {
+                bail!("migration staging size changed during chunk verification");
+            }
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| anyhow!("migration verification offset overflowed"))?;
+            if end > expected_size {
+                bail!("migration verification chunk exceeds its expected file size");
+            }
+            let byte_count = usize::try_from(length)
+                .context("migration verification chunk does not fit in memory")?;
+            let mut bytes = vec![0_u8; byte_count];
+            if byte_count > 0 {
+                let mut reader = file.duplicate_std_file()?;
+                reader.seek(SeekFrom::Start(offset))?;
+                reader.read_exact(&mut bytes)?;
+            }
+            file.validate_private_single_link(0o600)?;
+            if file.byte_len()? != expected_size {
+                bail!("migration staging changed while verifying its content chunk");
+            }
+            Ok(hex_digest(Sha256::digest(bytes).as_slice()))
+        })
+    }
+
+    pub(crate) fn migration_task_path_identity(
+        &self,
+        relative: &Path,
+    ) -> Result<Option<EntryIdentity>> {
+        let absolute = self.migration_task_absolute(relative)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated task staging path changed during inspection");
+            }
+            self.root.entry_identity_if_parent_exists(coordinated)
+        })
+    }
+
+    pub(crate) fn migration_prepare_task_staging_job(
+        &self,
+        relative: &Path,
+        migration_token: &str,
+    ) -> Result<EntryIdentity> {
+        let absolute = self.migration_task_absolute(relative)?;
+        self.coordinate_write(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration task job path changed before initialization");
+            }
+            crate::downloader::prepare_video_staging_for_migration(
+                &self.root,
+                relative,
+                migration_token,
+            )
+        })
+    }
+
+    pub(crate) fn migration_task_create_directory(
+        &self,
+        relative: &Path,
+        mode: u32,
+    ) -> Result<Option<EntryIdentity>> {
+        let absolute = self.migration_task_absolute(relative)?;
+        self.coordinate_write(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated task staging directory changed before creation");
+            }
+            self.ensure_task_staging_base()?;
+            ensure_relative_parents(&self.root, &absolute)?;
+            self.root.create_dir(&absolute, (mode & 0o7777) as u16)
+        })
+    }
+
+    pub(crate) fn migration_task_source_directory_matches(
+        &self,
+        file: &TaskTransferFile,
+    ) -> Result<bool> {
+        if file.kind != TaskTransferEntryKind::Directory {
+            bail!("task directory proof requested for a file entry");
+        }
+        let absolute = self.migration_task_absolute(&file.source_relative)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated task source directory changed during verification");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            let Some(identity) = self.root.bound_entry_identity(&entry)? else {
+                return Ok(false);
+            };
+            if !identity.is_dir()
+                || identity.device() != file.device
+                || identity.inode() != file.inode
+            {
+                return Ok(false);
+            }
+            let (owner, group, mode) = self
+                .root
+                .open_bound_directory(&entry, identity)?
+                .access_policy()?;
+            Ok(owner == file.owner && group == file.group && mode == file.mode)
+        })
+    }
+
+    pub(crate) fn migration_task_target_directory_matches(
+        &self,
+        relative: &Path,
+        expected_identity: EntryIdentity,
+        file: &TaskTransferFile,
+    ) -> Result<bool> {
+        if file.kind != TaskTransferEntryKind::Directory {
+            bail!("task directory proof requested for a file entry");
+        }
+        let absolute = self.migration_task_absolute(relative)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated task target directory changed during verification");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            let Some(identity) = self.root.bound_entry_identity(&entry)? else {
+                return Ok(false);
+            };
+            if identity != expected_identity || !identity.is_dir() {
+                return Ok(false);
+            }
+            let (owner, group, mode) = self
+                .root
+                .open_bound_directory(&entry, identity)?
+                .access_policy()?;
+            Ok(owner == file.owner && group == file.group && mode == file.mode)
+        })
+    }
+
+    pub(crate) fn migration_task_directory_is_empty(
+        &self,
+        relative: &Path,
+        expected_identity: EntryIdentity,
+    ) -> Result<bool> {
+        let absolute = self.migration_task_absolute(relative)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated task directory changed during emptiness check");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(expected_identity) {
+                bail!("task directory identity changed during emptiness check");
+            }
+            Ok(self
+                .root
+                .list_bound_directory(&entry, expected_identity)?
+                .is_empty())
+        })
+    }
+
+    pub(crate) fn migration_copy_task_chunk(
+        &self,
+        target: &LibraryManager,
+        file: &TaskTransferFile,
+        staging_name: &str,
+        staging_identity: EntryIdentity,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<MigrationCopyChunk> {
+        if file.kind != TaskTransferEntryKind::File {
+            bail!("task transfer copy requires a regular file entry");
+        }
+        let source_absolute = self.migration_task_absolute(&file.source_relative)?;
+        let staging_absolute = target.migration_staging_path(staging_name)?;
+        let expected_policy = task_transfer_access_policy(file)?;
+        self.coordinate_read(&source_absolute, |source_coordinated| {
+            if source_coordinated != source_absolute {
+                bail!("coordinated task source path changed during copy");
+            }
+            target.coordinate_write(&staging_absolute, |target_coordinated| {
+                if target_coordinated != staging_absolute {
+                    bail!("coordinated task staging file changed during copy");
+                }
+                self.root.copy_migration_chunk(
+                    &source_absolute,
+                    EntryIdentity::regular_file(file.device, file.inode),
+                    file.size_bytes,
+                    expected_policy,
+                    &target.root,
+                    &staging_absolute,
+                    staging_identity,
+                    offset,
+                    max_bytes,
+                )
+            })
+        })
+    }
+
+    pub(crate) fn migration_task_chunk_sha256(
+        &self,
+        path: &Path,
+        expected_identity: EntryIdentity,
+        expected_size: u64,
+        expected_policy: BoundFileAccessPolicy,
+        offset: u64,
+        length: u64,
+    ) -> Result<String> {
+        if length > 8 * 1024 * 1024 {
+            bail!("task staging verification chunk exceeds its byte budget");
+        }
+        let absolute = self.migration_task_absolute(path)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated task file changed during chunk verification");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            let file = self
+                .root
+                .open_bound_file_if_identity(&entry, expected_identity)?;
+            file.validate_identity()?;
+            if file.byte_len()? != expected_size || file.access_policy()? != expected_policy {
+                bail!("task file size or access policy changed during verification");
+            }
+            let end = offset
+                .checked_add(length)
+                .ok_or_else(|| anyhow!("task verification offset overflowed"))?;
+            if end > expected_size {
+                bail!("task verification chunk exceeds its expected file size");
+            }
+            let byte_count =
+                usize::try_from(length).context("task chunk does not fit in memory")?;
+            let mut bytes = vec![0_u8; byte_count];
+            if byte_count > 0 {
+                let mut reader = file.duplicate_std_file()?;
+                reader.seek(SeekFrom::Start(offset))?;
+                reader.read_exact(&mut bytes)?;
+            }
+            file.validate_identity()?;
+            if file.byte_len()? != expected_size || file.access_policy()? != expected_policy {
+                bail!("task file changed while verifying its content chunk");
+            }
+            Ok(hex_digest(Sha256::digest(bytes).as_slice()))
+        })
+    }
+
+    pub(crate) fn migration_task_publish_file(
+        &self,
+        staging_name: &str,
+        staging_identity: EntryIdentity,
+        target_relative: &Path,
+        file: &TaskTransferFile,
+    ) -> Result<EntryIdentity> {
+        let staging_absolute = self.migration_staging_path(staging_name)?;
+        let target_absolute = self.migration_task_absolute(target_relative)?;
+        self.coordinate_write(&target_absolute, |coordinated| {
+            if coordinated != target_absolute {
+                bail!("coordinated task target changed before publication");
+            }
+            ensure_relative_parents(&self.root, &target_absolute)?;
+            let staging_entry = self.root.bind_entry(&staging_absolute, false)?;
+            let staging = self
+                .root
+                .open_bound_file_if_identity(&staging_entry, staging_identity)?;
+            let staging_policy = staging.access_policy()?;
+            if staging_policy.owner != file.owner || staging_policy.group != file.group {
+                bail!("cannot preserve task file ownership or group at the destination");
+            }
+            self.root
+                .publish_migration_staging_file_after_chunk_verification(
+                    &staging_absolute,
+                    staging_identity,
+                    &target_absolute,
+                    file.size_bytes,
+                    (file.mode & 0o777) as u16,
+                )
+        })
+    }
+
+    pub(crate) fn migration_task_target_matches(
+        &self,
+        relative: &Path,
+        expected_identity: EntryIdentity,
+        file: &TaskTransferFile,
+    ) -> Result<bool> {
+        let absolute = self.migration_task_absolute(relative)?;
+        let digest = file
+            .sha256
+            .as_deref()
+            .ok_or_else(|| anyhow!("task transfer file is missing its full SHA-256 proof"))?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated task target changed during verification");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            let Some(identity) = self.root.bound_entry_identity(&entry)? else {
+                return Ok(false);
+            };
+            if identity != expected_identity {
+                bail!("task target identity changed after publication");
+            }
+            let actual = self.root.open_bound_file_if_identity(&entry, identity)?;
+            let policy = task_transfer_access_policy(file)?;
+            if actual.byte_len()? != file.size_bytes || actual.access_policy()? != policy {
+                return Ok(false);
+            }
+            Ok(actual.sha256()? == parse_sha256(digest)?)
+        })
+    }
+
+    /// Removes one exact task payload file after the migration journal has recorded its cleanup
+    /// intent. The queue record and inode-bound control files are handled by the queue protocol;
+    /// this helper is limited to a regular payload file in the recorded staging tree.
+    pub(crate) fn migration_task_remove_source_file(&self, file: &TaskTransferFile) -> Result<()> {
+        if file.kind != TaskTransferEntryKind::File {
+            bail!("task source cleanup requires a regular payload file");
+        }
+        let absolute = self.migration_task_absolute(&file.source_relative)?;
+        let digest = file
+            .sha256
+            .as_deref()
+            .ok_or_else(|| anyhow!("task transfer file is missing its full SHA-256 proof"))?;
+        let expected_digest = parse_sha256(digest)?;
+        let expected_identity = EntryIdentity::regular_file(file.device, file.inode);
+        let expected_access = task_transfer_access_policy(file)?;
+        self.coordinate_write(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated task source changed before payload cleanup");
+            }
+            let entry = self.root.bind_entry(&absolute, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(expected_identity) {
+                bail!("task source payload identity changed before cleanup");
+            }
+            let source = self
+                .root
+                .open_bound_file_if_identity(&entry, expected_identity)?;
+            source.validate_identity()?;
+            if source.byte_len()? != file.size_bytes
+                || source.access_policy()? != expected_access
+                || source.sha256()? != expected_digest
+            {
+                bail!("task source payload content or access policy changed before cleanup");
+            }
+            self.root.remove_bound_file_if_identity_with_validation(
+                &entry,
+                expected_identity,
+                || {
+                    source.validate_identity()?;
+                    if source.byte_len()? != file.size_bytes
+                        || source.access_policy()? != expected_access
+                        || source.sha256()? != expected_digest
+                    {
+                        bail!("task source payload changed while cleanup was quarantining it");
+                    }
+                    Ok(())
+                },
+            )
+        })
+    }
+
+    // The source proof, destination root/path, captured staging identity, and byte window are
+    // deliberately explicit so each cross-root copy step remains independently auditable.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn migration_copy_chunk(
+        &self,
+        target: &LibraryManager,
+        source_path: &str,
+        target_staging_path: &str,
+        proof: &MigrationFileProof,
+        staging_identity: EntryIdentity,
+        offset: u64,
+        max_bytes: u64,
+    ) -> Result<MigrationCopyChunk> {
+        let source_absolute = self.absolute_path(source_path)?;
+        let staging_absolute = target.migration_staging_path(target_staging_path)?;
+        self.coordinate_read(&source_absolute, |source_coordinated| {
+            if source_coordinated != source_absolute {
+                bail!("coordinated migration source path changed during copy");
+            }
+            target.coordinate_write(&staging_absolute, |target_coordinated| {
+                if target_coordinated != staging_absolute {
+                    bail!("coordinated migration staging path changed during copy");
+                }
+                self.root.copy_migration_chunk(
+                    &source_absolute,
+                    proof.entry_identity(),
+                    proof.size,
+                    proof.access_policy(),
+                    &target.root,
+                    &staging_absolute,
+                    staging_identity,
+                    offset,
+                    max_bytes,
+                )
+            })
+        })
+    }
+
+    pub(crate) fn migration_publish_staging_file(
+        &self,
+        staging_path: &str,
+        staging_identity: EntryIdentity,
+        target_path: &str,
+        proof: &MigrationFileProof,
+    ) -> Result<EntryIdentity> {
+        let staging_absolute = self.migration_staging_path(staging_path)?;
+        let target_absolute = self.absolute_path(target_path)?;
+        self.coordinate_write(&target_absolute, |target_coordinated| {
+            if target_coordinated != target_absolute {
+                bail!("coordinated migration target changed during publication");
+            }
+            ensure_relative_parents(&self.root, &target_absolute)?;
+            self.root
+                .publish_migration_staging_file_after_chunk_verification(
+                    &staging_absolute,
+                    staging_identity,
+                    &target_absolute,
+                    proof.size,
+                    (proof.mode & 0o777) as u16,
+                )
+        })
+    }
+
+    pub(crate) fn migration_remove_source(
+        &self,
+        relative_path: &str,
+        expected: &MigrationFileProof,
+    ) -> Result<()> {
+        let absolute = self.absolute_path(relative_path)?;
+        self.coordinate_write(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration source path changed before cleanup");
+            }
+            let entry = self.root.bind_entry(&absolute, false)?;
+            let identity = expected.entry_identity();
+            if self.root.bound_entry_identity(&entry)? != Some(identity) {
+                bail!("migration source object was replaced before cleanup");
+            }
+            let file = self.root.open_bound_file_if_identity(&entry, identity)?;
+            if migration_proof_for_bound_file(&file)? != *expected {
+                bail!("migration source content or access policy changed before cleanup");
+            }
+            self.root
+                .remove_bound_file_if_identity_with_validation(&entry, identity, || {
+                    if migration_proof_for_bound_file(&file)? != *expected {
+                        bail!("migration source changed while cleanup was quarantining it");
+                    }
+                    Ok(())
+                })
+        })
+    }
+
+    pub(crate) fn migration_read_state(&self, name: &str, limit: usize) -> Result<Option<Vec<u8>>> {
+        let path = self.migration_state_path(name)?;
+        self.read_private_file(&path, limit)
+    }
+
+    pub(crate) fn migration_write_state(&self, name: &str, contents: &[u8]) -> Result<()> {
+        let path = self.migration_state_path(name)?;
+        if contents.len() > 64 * 1024 * 1024 {
+            bail!("migration state file exceeds its size limit");
+        }
+        self.write_private_file(&path, contents)
+    }
+
+    pub(crate) fn migration_state_lock(&self) -> Result<BoundFile> {
+        let path = self.library_dir.join("migration.lock");
+        let file = self.coordinate_write(&path, |coordinated| {
+            self.validate_library_directory()?;
+            if self.root.open_bound_file(coordinated)?.is_none() {
+                match self.root.create_new_bound_file(coordinated, &[], 0o600) {
+                    Ok(_) => {}
+                    Err(_) if self.root.open_bound_file(coordinated)?.is_some() => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let file = self
+                .root
+                .open_bound_file(coordinated)?
+                .ok_or_else(|| anyhow!("migration state lock disappeared"))?;
+            file.validate_private_single_link(0o600)?;
+            Ok(file)
+        })?;
+        file.lock_exclusive()?;
+        Ok(file)
+    }
+
+    pub(crate) fn migration_state_names(&self) -> Result<Vec<String>> {
+        self.coordinate_read(&self.library_dir, |coordinated| {
+            if coordinated != self.library_dir {
+                bail!("coordinated migration state directory changed during listing");
+            }
+            self.validate_library_directory()?;
+            let entry = self.root.bind_entry(&self.library_dir, false)?;
+            let identity = self
+                .root
+                .bound_entry_identity(&entry)?
+                .ok_or_else(|| anyhow!("private media-library directory disappeared"))?;
+            self.root
+                .validate_private_bound_directory(&entry, identity, 0o700)?;
+            let names = self
+                .root
+                .list_bound_directory(&entry, identity)?
+                .into_iter()
+                .filter_map(|(name, entry_identity)| {
+                    if !entry_identity.is_file() {
+                        return None;
+                    }
+                    let name = name.to_str()?;
+                    name.starts_with("migration-").then(|| name.to_owned())
+                })
+                .collect::<Vec<_>>();
+            Ok(names)
+        })
+    }
+
+    fn migration_state_path(&self, name: &str) -> Result<PathBuf> {
+        if name.is_empty()
+            || name.len() > 160
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || !name.starts_with("migration-")
+            || !name.ends_with(".json")
+        {
+            bail!("migration state filename is invalid");
+        }
+        Ok(self.library_dir.join(name))
+    }
+
+    fn migration_staging_path(&self, name: &str) -> Result<PathBuf> {
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !name.starts_with("migration-stage-")
+        {
+            bail!("migration staging filename is invalid");
+        }
+        Ok(self.library_dir.join(format!("{name}.partial")))
+    }
+
+    fn migration_task_absolute(&self, relative: &Path) -> Result<PathBuf> {
+        if !is_task_staging_relative(relative) {
+            bail!("task transfer path is outside its private staging namespace");
+        }
+        Ok(self.root.logical_root_path().join(relative))
+    }
+
+    fn ensure_task_staging_base(&self) -> Result<()> {
+        let relative = Path::new(".telegram-video-downloader-staging");
+        let absolute = self.root.logical_root_path().join(relative);
+        let identity = match self.root.entry_identity(&absolute)? {
+            Some(identity) if identity.is_dir() => identity,
+            Some(_) => bail!("task staging root is not a directory"),
+            None => self
+                .root
+                .create_dir(&absolute, 0o700)?
+                .ok_or_else(|| anyhow!("task staging root appeared during creation"))?,
+        };
+        let entry = self.root.bind_entry(&absolute, false)?;
+        let (owner, _, mode) = self
+            .root
+            .open_bound_directory(&entry, identity)?
+            .access_policy()?;
+        if owner != unsafe { libc::geteuid() } || mode != 0o700 {
+            bail!("task staging root has an unexpected owner or access policy");
+        }
+        Ok(())
     }
 
     /// Returns active previews whose persisted identity requires a live descriptor that is no
@@ -4375,7 +5432,7 @@ impl LibraryManager {
 
     fn safe_relative_path(&self, value: &str, allow_empty: bool) -> Result<PathBuf> {
         let relative = safe_relative_path(value, allow_empty)?;
-        validate_not_private_downloader_path(
+        validate_not_private_downloader_path_with_identity(
             &self.root,
             &relative,
             Some(self.library_dir_identity),
@@ -4799,6 +5856,14 @@ impl LibraryManager {
 
     fn lock_store(&self) -> Result<StoreGuards> {
         let output = self.lock_output()?;
+        let library = self.lock_library()?;
+        Ok(StoreGuards {
+            _output: output,
+            _library: library,
+        })
+    }
+
+    fn lock_library(&self) -> Result<BoundFile> {
         let path = self.library_dir.join(LIBRARY_LOCK);
         let file = self.coordinate_read(&path, |coordinated| {
             self.validate_library_directory()?;
@@ -4810,10 +5875,7 @@ impl LibraryManager {
             Ok(file)
         })?;
         file.lock_exclusive()?;
-        Ok(StoreGuards {
-            _output: output,
-            _library: file,
-        })
+        Ok(file)
     }
 
     fn lock_output(&self) -> Result<BoundFile> {
@@ -4880,14 +5942,20 @@ fn ensure_private_directory(
 }
 
 fn coordinated_path_under_root(root: &RootedFs, path: &Path) -> Result<PathBuf> {
+    // File Provider can return canonical /private/... URLs for roots configured through the
+    // verified /var, /tmp, or /etc aliases. Normalize only those fixed system aliases; arbitrary
+    // path components remain subject to the rooted-prefix and normal-component checks below.
+    let path = crate::media_libraries::normalize_trusted_macos_alias(path)?;
     let logical = root.logical_root_path();
+    let normalized_logical = crate::media_libraries::normalize_trusted_macos_alias(logical)?;
     let canonical = root.root_path();
-    if path == logical || path == canonical {
+    let normalized_canonical = crate::media_libraries::normalize_trusted_macos_alias(canonical)?;
+    if path == normalized_logical || path == normalized_canonical {
         return Ok(logical.to_path_buf());
     }
     let relative = path
-        .strip_prefix(logical)
-        .or_else(|_| path.strip_prefix(canonical))
+        .strip_prefix(&normalized_logical)
+        .or_else(|_| path.strip_prefix(&normalized_canonical))
         .map_err(|_| anyhow!("coordinated path is outside the configured media root"))?;
     for component in relative.components() {
         if !matches!(component, Component::Normal(_)) {
@@ -5264,6 +6332,105 @@ fn safe_entry_identity(root: &RootedFs, path: &Path) -> Result<Option<EntryIdent
         }
     }
     root.entry_identity(path)
+}
+
+fn migration_proof_for_bound_file(file: &BoundFile) -> Result<MigrationFileProof> {
+    let before = fingerprint(file)?;
+    let access_before = file.access_policy()?;
+    let (_, sha256) = token_for_bound_file(file)?;
+    let after = fingerprint(file)?;
+    let access_after = file.access_policy()?;
+    if !same_protected_fingerprint(&before, &after) || access_before != access_after {
+        bail!("selected file identity, content length, or access policy changed while hashing");
+    }
+    Ok(MigrationFileProof {
+        device: before.identity.device(),
+        inode: before.identity.inode(),
+        size: before.size,
+        mode: access_before.mode,
+        owner: access_before.owner,
+        group: access_before.group,
+        link_count: access_before.link_count,
+        birth_seconds: before.birth_seconds,
+        birth_nanoseconds: before.birth_nanoseconds,
+        sha256,
+    })
+}
+
+fn task_transfer_access_policy(file: &TaskTransferFile) -> Result<BoundFileAccessPolicy> {
+    if file.kind != TaskTransferEntryKind::File {
+        bail!("task file access policy requested for a directory entry");
+    }
+    let link_count = file
+        .link_count
+        .ok_or_else(|| anyhow!("task transfer file is missing its hard-link count proof"))?;
+    if link_count != 1 {
+        bail!("task transfer file has an unexpected hard-link count");
+    }
+    Ok(BoundFileAccessPolicy {
+        owner: file.owner,
+        group: file.group,
+        mode: file.mode,
+        link_count,
+    })
+}
+
+fn is_task_staging_relative(path: &Path) -> bool {
+    if path.as_os_str().len() > 2048 {
+        return false;
+    }
+    let mut components = path.components();
+    let Some(Component::Normal(root)) = components.next() else {
+        return false;
+    };
+    if root != ".telegram-video-downloader-staging" {
+        return false;
+    }
+    let Some(Component::Normal(job)) = components.next() else {
+        return false;
+    };
+    if !job.to_string_lossy().starts_with("job-") {
+        return false;
+    }
+    components.all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn migration_targets_conflict(
+    target: &LibraryManager,
+    paths: &[String],
+    reserved: &mut TargetReservationSet,
+) -> Result<bool> {
+    let mut local = TargetReservationSet {
+        private_library_identity: Some(target.library_dir_identity),
+        ..TargetReservationSet::default()
+    };
+    for path in paths {
+        let absolute = target.absolute_path(path)?;
+        if reserved.contains(&target.root, path)?
+            || local.contains(&target.root, path)?
+            || target
+                .root
+                .entry_identity_if_parent_exists(&absolute)?
+                .is_some()
+        {
+            return Ok(true);
+        }
+        local.insert(&target.root, path)?;
+    }
+    Ok(false)
+}
+
+fn parse_sha256(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("migration SHA-256 value is invalid");
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let start = index * 2;
+        *byte = u8::from_str_radix(&value[start..start + 2], 16)
+            .context("migration SHA-256 value is invalid")?;
+    }
+    Ok(digest)
 }
 
 fn ensure_relative_parents(root: &RootedFs, path: &Path) -> Result<()> {

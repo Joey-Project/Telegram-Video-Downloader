@@ -15,6 +15,10 @@ mod episode_retry;
 mod file_manager;
 mod file_provider;
 mod library;
+mod library_migration;
+mod library_migration_bot;
+mod media_libraries;
+mod media_library_bot;
 mod queue;
 mod redaction;
 mod router;
@@ -431,6 +435,10 @@ struct CloudBotRuntime {
     request_notify: Arc<Notify>,
     state_notify: Arc<Notify>,
     library_snapshot: Arc<Mutex<Option<LibrarySnapshot>>>,
+    library_snapshots: Arc<Mutex<BTreeMap<String, LibrarySnapshot>>>,
+    library_unavailable: Arc<Mutex<BTreeMap<String, String>>>,
+    migrations: Arc<Mutex<BTreeMap<String, library_migration::MigrationStatus>>>,
+    migration_runners: Arc<Mutex<HashSet<String>>>,
     library_scan_warning: Arc<Mutex<Option<String>>>,
     library_scan_publication_gate: Arc<Mutex<()>>,
     telegram_dispatch: Arc<Semaphore>,
@@ -492,6 +500,7 @@ struct CloudStateSnapshot {
     operations: Vec<serde_json::Value>,
     tasks: Vec<serde_json::Value>,
     download_dir: String,
+    settings_applied: serde_json::Value,
 }
 
 enum CloudLibrarySnapshotUpdate {
@@ -534,6 +543,18 @@ where
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
     }
+    if let Some(library) = runtime
+        .bot
+        .queue
+        .registry_snapshot()?
+        .libraries
+        .iter()
+        .find(|library| {
+            media_library_bot::same_root(&library.root, &runtime.bot.config.downloads.video_dir)
+        })
+    {
+        library_migration_bot::ensure_library_io_available(runtime, &library.id).await?;
+    }
     let _publication_guard = runtime.library_scan_publication_gate.lock().await;
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
@@ -550,7 +571,26 @@ where
         Ok(Ok((value, snapshot_update))) => {
             match snapshot_update {
                 CloudLibrarySnapshotUpdate::Publish(snapshot) => {
-                    *runtime.library_snapshot.lock().await = Some(snapshot);
+                    if let Ok(settings) = runtime.bot.queue.registry_snapshot()
+                        && let Some(library) = settings.libraries.iter().find(|library| {
+                            media_library_bot::same_root(
+                                &library.root,
+                                &runtime.bot.config.downloads.video_dir,
+                            )
+                        })
+                    {
+                        runtime
+                            .library_snapshots
+                            .lock()
+                            .await
+                            .insert(library.id.clone(), snapshot.clone());
+                        runtime.library_unavailable.lock().await.remove(&library.id);
+                        if library.id == settings.default_library_id {
+                            *runtime.library_snapshot.lock().await = Some(snapshot);
+                        }
+                    } else {
+                        *runtime.library_snapshot.lock().await = Some(snapshot);
+                    }
                     *runtime.library_scan_warning.lock().await = None;
                 }
                 CloudLibrarySnapshotUpdate::PreserveWithWarning(warning) => {
@@ -782,7 +822,7 @@ impl CloudStateSnapshot {
             "previews": self.previews,
             "operations": self.operations,
             "tasks": self.tasks,
-            "settings": {"download_dir": self.download_dir},
+            "settings": {"download_dir": self.download_dir, "applied": self.settings_applied},
         }))
         .context("failed to fingerprint local cloud state")
     }
@@ -798,6 +838,7 @@ impl CloudStateSnapshot {
             tasks: &self.tasks,
             settings: CloudSettings {
                 download_dir: &self.download_dir,
+                applied: Some(&self.settings_applied),
             },
         };
         Ok(serde_json::to_vec(&state)?.len())
@@ -829,14 +870,110 @@ impl CloudStateSnapshot {
         self.trim_library_for_upload(state_version, reduced_budget.min(max_bytes))
     }
 
+    fn trim_nested_libraries_for_upload(
+        &mut self,
+        state_version: u64,
+        max_bytes: usize,
+    ) -> Result<bool> {
+        let original_size = self.encoded_size(state_version)?;
+        if let Some(libraries) = self
+            .library
+            .get_mut("libraries")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for library in libraries {
+                let snapshot = &mut library["snapshot"];
+                let (categories_changed, omitted) = if let Some(categories) = snapshot
+                    .get_mut("categories")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    compact_cloud_library_categories(categories)?
+                } else {
+                    (false, 0)
+                };
+                let mut metadata_changed = categories_changed;
+                if let Some(warnings) = snapshot
+                    .get_mut("warnings")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    if omitted > 0 {
+                        warnings.insert(0, serde_json::json!(format!(
+                            "Cloud snapshot omitted {omitted} category path(s) to fit the upload budget."
+                        )));
+                    }
+                    metadata_changed |= compact_cloud_library_warnings(warnings)?.0;
+                }
+                if metadata_changed {
+                    snapshot["incomplete"] = serde_json::json!(true);
+                }
+            }
+        }
+        for _ in 0..256 {
+            if self.encoded_size(state_version)?.saturating_add(1024) <= max_bytes {
+                break;
+            }
+            let largest = self
+                .library
+                .get("libraries")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(|(index, library)| {
+                    library["snapshot"]["items"]
+                        .as_array()
+                        .filter(|items| !items.is_empty())
+                        .map(|items| (index, items.len()))
+                })
+                .max_by_key(|(_, count)| *count);
+            let Some((index, count)) = largest else { break };
+            let default_id = self.library["default_library_id"]
+                .as_str()
+                .map(str::to_string);
+            let (is_default, retained_items) = {
+                let library = &mut self.library["libraries"][index];
+                let is_default = library["id"].as_str() == default_id.as_deref();
+                let snapshot = &mut library["snapshot"];
+                let previously_omitted = cloud_library_omitted_item_count(snapshot);
+                let retained = count / 2;
+                let items = snapshot["items"]
+                    .as_array_mut()
+                    .expect("selected library contains items");
+                items.truncate(retained);
+                let retained_items = is_default.then(|| items.clone());
+                snapshot["incomplete"] = serde_json::json!(true);
+                if !snapshot["warnings"].is_array() {
+                    snapshot["warnings"] = serde_json::json!([]);
+                }
+                let warnings = snapshot["warnings"]
+                    .as_array_mut()
+                    .expect("warnings were initialized");
+                set_cloud_library_omission_warning(
+                    warnings,
+                    previously_omitted.saturating_add(count - retained),
+                );
+                compact_cloud_library_warnings(warnings)?;
+                (is_default, retained_items)
+            };
+            if is_default && let Some(items) = retained_items {
+                let old_count = self.library["items"].as_array().map_or(0, Vec::len);
+                if old_count > items.len() {
+                    let omitted = cloud_library_omitted_item_count(&self.library)
+                        .saturating_add(old_count - items.len());
+                    self.library["items"] = serde_json::json!(items);
+                    self.library["incomplete"] = serde_json::json!(true);
+                    if let Some(warnings) = self.library["warnings"].as_array_mut() {
+                        set_cloud_library_omission_warning(warnings, omitted);
+                        compact_cloud_library_warnings(warnings)?;
+                    }
+                }
+            }
+        }
+        Ok(self.encoded_size(state_version)? < original_size)
+    }
+
     fn trim_library_for_upload(&mut self, state_version: u64, max_bytes: usize) -> Result<bool> {
         let original_size = self.encoded_size(state_version)?;
-        let original_items = self
-            .library
-            .get("items")
-            .and_then(serde_json::Value::as_array)
-            .cloned();
-        let previously_omitted_items = cloud_library_omitted_item_count(&self.library);
         let Some(library) = self.library.as_object_mut() else {
             return Ok(false);
         };
@@ -884,12 +1021,23 @@ impl CloudStateSnapshot {
             compact_cloud_library_warnings(warnings)?;
         }
 
+        // Compact metadata in both copies of the default library before dropping media.
+        // Otherwise a large legacy warning list can consume the budget and unnecessarily
+        // evict items from the per-library snapshot, or escape the metadata bounds entirely.
+        self.trim_migrations_for_upload(state_version, max_bytes)?;
+        let nested_reduced = self.trim_nested_libraries_for_upload(state_version, max_bytes)?;
         let metadata_size = self.encoded_size(state_version)?;
+        let original_items = self
+            .library
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .cloned();
+        let previously_omitted_items = cloud_library_omitted_item_count(&self.library);
         let Some(original_items) = original_items else {
-            return Ok(metadata_size < original_size);
+            return Ok(nested_reduced || metadata_size < original_size);
         };
         if metadata_size.saturating_add(1024) <= max_bytes {
-            return Ok(metadata_size < original_size);
+            return Ok(nested_reduced || metadata_size < original_size);
         }
 
         // Reserve space for the largest possible omission count while searching. The exact
@@ -969,6 +1117,58 @@ impl CloudStateSnapshot {
         Ok(self.encoded_size(state_version)? < original_size)
     }
 
+    fn trim_migrations_for_upload(&mut self, state_version: u64, max_bytes: usize) -> Result<()> {
+        for _ in 0..512 {
+            if self.encoded_size(state_version)?.saturating_add(1024) <= max_bytes {
+                break;
+            }
+            let largest = self
+                .library
+                .get("migrations")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(|(index, migration)| {
+                    let items = migration["items"].as_array()?;
+                    (!items.is_empty()).then_some((index, items.len()))
+                })
+                .max_by_key(|(_, count)| *count);
+            let Some((index, count)) = largest else {
+                break;
+            };
+            let migration = &mut self.library["migrations"][index];
+            let omitted = migration["omitted_item_details"].as_u64().unwrap_or(0);
+            let items = migration["items"]
+                .as_array_mut()
+                .expect("selected migration has items");
+            items.sort_by_key(|item| match item["status"].as_str() {
+                Some("failed") => 0,
+                Some("complete" | "skipped") => 2,
+                _ => 1,
+            });
+            let retained = count / 2;
+            items.truncate(retained);
+            migration["details_incomplete"] = serde_json::json!(true);
+            migration["omitted_item_details"] =
+                serde_json::json!(omitted.saturating_add((count - retained) as u64));
+            if !migration["warnings"].is_array() {
+                migration["warnings"] = serde_json::json!([]);
+            }
+            let warnings = migration["warnings"]
+                .as_array_mut()
+                .expect("migration warnings initialized");
+            warnings.retain(|warning| {
+                !warning.as_str().is_some_and(|text| {
+                    text.starts_with("Cloud snapshot omitted migration item details")
+                })
+            });
+            warnings.insert(0,serde_json::json!("Cloud snapshot omitted migration item details to fit its upload budget; totals and recovery controls remain available. Full results are retained in the source library's private migration record."));
+            compact_cloud_library_warnings(warnings)?;
+        }
+        Ok(())
+    }
+
     async fn post(
         &self,
         runtime: &CloudBotRuntime,
@@ -984,6 +1184,7 @@ impl CloudStateSnapshot {
             tasks: &self.tasks,
             settings: CloudSettings {
                 download_dir: &self.download_dir,
+                applied: Some(&self.settings_applied),
             },
         };
         runtime.client.post_state(&state).await
@@ -1051,6 +1252,10 @@ async fn run_cloud_bot(
         request_notify: Arc::new(Notify::new()),
         state_notify: Arc::new(Notify::new()),
         library_snapshot: Arc::new(Mutex::new(None)),
+        library_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
+        library_unavailable: Arc::new(Mutex::new(BTreeMap::new())),
+        migrations: Arc::new(Mutex::new(BTreeMap::new())),
+        migration_runners: Arc::new(Mutex::new(HashSet::new())),
         library_scan_warning: Arc::new(Mutex::new(None)),
         library_scan_publication_gate: Arc::new(Mutex::new(())),
         telegram_dispatch: Arc::new(Semaphore::new(1)),
@@ -1073,6 +1278,7 @@ async fn run_cloud_bot(
         "telegram local cloud ingress started"
     );
     tokio::spawn(cloud_initial_library_scan(runtime.clone()));
+    tokio::spawn(library_migration_bot::watch(runtime.clone()));
     tokio::spawn(cloud_library_publication_watcher(runtime.clone()));
     tokio::spawn(cloud_queue_state_watcher(runtime.clone()));
     tokio::spawn(cloud_rest_fallback(
@@ -1098,13 +1304,7 @@ async fn run_cloud_bot(
 }
 
 async fn cloud_initial_library_scan(runtime: CloudBotRuntime) {
-    if let Err(error) = run_cloud_library_operation(
-        &runtime,
-        "initial media-library scan worker failed",
-        |context, inbox| Ok(((), scan_cloud_library(&context, inbox)?)),
-    )
-    .await
-    {
+    if let Err(error) = media_library_bot::refresh_libraries(&runtime).await {
         warn!(error = %format!("{error:#}"), "initial media-library scan failed");
     }
 }
@@ -1129,13 +1329,7 @@ async fn cloud_library_publication_watcher(runtime: CloudBotRuntime) {
         if runtime.epoch_fatal.is_signaled() {
             return;
         }
-        if let Err(error) = run_cloud_library_operation(
-            &runtime,
-            "media-library refresh worker failed",
-            |context, inbox| Ok(((), scan_cloud_library(&context, inbox)?)),
-        )
-        .await
-        {
+        if let Err(error) = media_library_bot::refresh_libraries(&runtime).await {
             warn!(error = %format!("{error:#}"), "media-library refresh after published output failed");
         }
     }
@@ -1589,29 +1783,8 @@ async fn build_cloud_state_snapshot(
     let scan_warning = runtime.library_scan_warning.lock().await.clone();
     let (mut records, omitted_preview_count) =
         cloud_state_records_bounded(runtime, CLOUD_STATE_PREVIEW_ENTRY_LIMIT).await?;
-    let preview_keys = records
-        .iter()
-        .filter(|record| {
-            record.request.kind == "file_preview"
-                && record.status == InboxStatus::AwaitingConfirmation
-        })
-        .filter_map(cloud_preview_identity)
-        .collect::<Vec<_>>();
-    let (unconfirmable_preview_ids, preview_check_failed) = match cloud_unconfirmable_preview_ids(
-        runtime,
-        &preview_keys,
-    )
-    .await
-    {
-        Ok(ids) => (ids, false),
-        Err(error) => {
-            warn!(
-                error = %redact_sensitive_text(&format!("{error:#}")),
-                "could not verify active cloud preview anchors; retaining their current statuses"
-            );
-            (HashSet::new(), true)
-        }
-    };
+    let (unconfirmable_preview_ids, preview_check_failed) =
+        media_library_bot::unconfirmable_previews(runtime, &records).await;
     for record in &mut records {
         if record.request.kind != "file_preview"
             || record.status != InboxStatus::AwaitingConfirmation
@@ -1638,9 +1811,14 @@ async fn build_cloud_state_snapshot(
         cloud_snapshot_budget::preview_snapshots(&management_records, omitted_preview_count);
     let config = Arc::clone(&runtime.bot.config);
     let queue = Arc::clone(&runtime.bot.queue);
-    let tasks = tokio::task::spawn_blocking(move || cloud_task_summaries(&config, &queue))
-        .await
-        .context("cloud task summary worker failed")??;
+    let (tasks, settings_applied) = tokio::task::spawn_blocking(move || -> Result<_> {
+        Ok((
+            cloud_task_summaries(&config, &queue)?,
+            media_library_bot::applied_settings(&queue)?,
+        ))
+    })
+    .await
+    .context("cloud task summary worker failed")??;
     let (revision, mut library_value) = match library {
         Some(library) => (
             library.revision.clone(),
@@ -1690,19 +1868,47 @@ async fn build_cloud_state_snapshot(
     if preview_check_failed {
         merge_cloud_library_preview_check_warning(&mut library_value);
     }
+    library_value =
+        media_library_bot::attach_library_views(runtime, &settings_applied, library_value).await?;
+    let revision = library_value["revision"]
+        .as_str()
+        .unwrap_or(&revision)
+        .to_string();
+    let default_library = settings_applied["libraries"]
+        .as_array()
+        .and_then(|libraries| {
+            libraries
+                .iter()
+                .find(|library| library["is_default"].as_bool() == Some(true))
+        });
+    let download_dir = default_library
+        .and_then(|library| library["root"].as_str())
+        .map(|root| {
+            let category = settings_applied["default_category"]
+                .as_str()
+                .unwrap_or_default();
+            Path::new(root)
+                .join(category)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .unwrap_or_else(|| {
+            runtime
+                .bot
+                .config
+                .downloads
+                .video_dir
+                .to_string_lossy()
+                .into_owned()
+        });
     Ok(Some(CloudStateSnapshot {
         revision,
         library: library_value,
         previews,
         operations,
         tasks,
-        download_dir: runtime
-            .bot
-            .config
-            .downloads
-            .video_dir
-            .to_string_lossy()
-            .into_owned(),
+        download_dir,
+        settings_applied,
     }))
 }
 
@@ -2493,6 +2699,39 @@ async fn dispatch_cloud_management(
     runtime: &CloudBotRuntime,
     request: &CloudRequest,
 ) -> Result<CloudDispatchOutcome> {
+    media_library_bot::refresh_library_bindings(runtime).await?;
+    if let Some(result) = library_migration_bot::dispatch(runtime, request).await {
+        return result;
+    }
+    if let Some(result) = media_library_bot::dispatch(runtime, request).await {
+        return result;
+    }
+    let mut owned_request = request.clone();
+    let requested_library_id = match owned_request
+        .payload
+        .as_object_mut()
+        .and_then(|payload| payload.remove("library_id"))
+    {
+        Some(serde_json::Value::String(id)) => Some(id),
+        Some(_) => return Ok(cloud_dispatch_failure("library_id must be a string")),
+        None => None,
+    };
+    let selected = if matches!(
+        request.kind.as_str(),
+        "library_scan" | "file_preview" | "legacy_import"
+    ) {
+        match media_library_bot::scoped_runtime(runtime, requested_library_id.as_deref()) {
+            Ok(selected) => Some(selected),
+            Err(error) => return Ok(cloud_dispatch_failure(format!("{error:#}"))),
+        }
+    } else {
+        None
+    };
+    let runtime = selected
+        .as_ref()
+        .map(|(runtime, _)| runtime)
+        .unwrap_or(runtime);
+    let request = &owned_request;
     match request.kind.as_str() {
         "library_scan" => {
             if !request
@@ -2553,7 +2792,11 @@ async fn dispatch_cloud_management(
             .await?;
             Ok(CloudDispatchOutcome {
                 status: InboxStatus::AwaitingConfirmation,
-                result: Some(cloud_file_preview_result(&preview)),
+                result: Some({
+                    let mut result = cloud_file_preview_result(&preview);
+                    result["library_id"] = serde_json::json!(selected.as_ref().map(|(_, id)| id));
+                    result
+                }),
                 error: None,
                 related_preview: None,
             })
@@ -2579,6 +2822,23 @@ async fn dispatch_cloud_management(
                     "This preview is no longer awaiting confirmation. Run a fresh preview.",
                 ));
             };
+            let source_library_id = preview_record
+                .result
+                .as_ref()
+                .and_then(|result| result["library_id"].as_str())
+                .map(str::to_string)
+                .map(Ok)
+                .unwrap_or_else(|| media_library_bot::original_library_id(runtime))?;
+            if requested_library_id
+                .as_ref()
+                .is_some_and(|id| id != &source_library_id)
+            {
+                return Ok(cloud_dispatch_failure(
+                    "the confirmation belongs to another media library",
+                ));
+            }
+            let (scoped, _) = media_library_bot::scoped_runtime(runtime, Some(&source_library_id))?;
+            let runtime = &scoped;
             let Some(preview_value) = preview_record
                 .result
                 .as_ref()
@@ -2760,6 +3020,7 @@ async fn dispatch_cloud_management(
             Ok(CloudDispatchOutcome {
                 status: InboxStatus::Completed,
                 result: Some(serde_json::json!({
+                    "library_id": selected.as_ref().map(|(_, id)| id),
                     "revision": report.revision,
                     "hints": report.hints,
                     "warnings": report.warnings,
@@ -2981,9 +3242,11 @@ fn create_cloud_file_preview(
     inbox: Arc<CloudInbox>,
     receipt_seq: u64,
 ) -> Result<(MovePreview, LibrarySnapshot)> {
-    let receipt = inbox
+    let mut receipt = inbox
         .record(receipt_seq)?
         .context("cloud preview request receipt is missing")?;
+    let library_id = media_library_bot::original_library_id_from_bot(bot)?;
+    receipt.request.payload["library_id"] = serde_json::json!(library_id);
     let manager = open_cloud_library_manager(bot, inbox, None)?;
     let hints = queue_source_hints(bot)?;
     manager.preview_with_hints_and_patches_and_snapshot_validator_and_preview_guard(
@@ -3023,6 +3286,11 @@ fn validate_cloud_file_preview_receipt(receipt: &InboxRecord, preview: &MovePrev
     let mut generated = receipt.clone();
     generated.status = InboxStatus::AwaitingConfirmation;
     generated.result = Some(cloud_file_preview_result(preview));
+    if let Some(library_id) = receipt.request.payload.get("library_id")
+        && let Some(result) = generated.result.as_mut()
+    {
+        result["library_id"] = library_id.clone();
+    }
     generated.error = None;
     generated.next_attempt_at = 0;
     if generated.compact_oversized_result()? {
@@ -3127,9 +3395,33 @@ async fn cloud_completed_legacy_import_records(
     runtime: &CloudBotRuntime,
 ) -> Result<Vec<InboxRecord>> {
     let inbox = Arc::clone(&runtime.inbox);
-    tokio::task::spawn_blocking(move || inbox.completed_legacy_import_records_bounded())
-        .await
-        .context("cloud inbox completed legacy import listing worker failed")?
+    let selected_id = runtime
+        .bot
+        .queue
+        .registry_snapshot()?
+        .libraries
+        .into_iter()
+        .find(|library| {
+            media_library_bot::same_root(&library.root, &runtime.bot.config.downloads.video_dir)
+        })
+        .map(|library| library.id);
+    let original_id = media_library_bot::original_library_id(runtime).ok();
+    tokio::task::spawn_blocking(move || {
+        let mut records = inbox.completed_legacy_import_records_bounded()?;
+        records.retain(|record| {
+            let id = record
+                .result
+                .as_ref()
+                .and_then(|result| result["library_id"].as_str())
+                .or_else(|| record.request.payload["library_id"].as_str())
+                .map(str::to_owned)
+                .or_else(|| original_id.clone());
+            id == selected_id
+        });
+        Ok(records)
+    })
+    .await
+    .context("cloud inbox completed legacy import listing worker failed")?
 }
 
 async fn cloud_state_records_bounded(
@@ -3216,6 +3508,13 @@ async fn begin_cloud_batch_message(
         .result
         .clone()
         .unwrap_or_else(|| serde_json::json!({}));
+    let label = if record.request.kind == "library_migration_preview" {
+        "Library migration"
+    } else {
+        "File batch"
+    };
+    let initial_message =
+        format!("{label} {preview_id} is processing. Closing the mini app will not stop it.");
     if let Some(message_id) = existing_result
         .get("telegram_status_message_id")
         .and_then(serde_json::Value::as_i64)
@@ -3233,13 +3532,7 @@ async fn begin_cloud_batch_message(
         if let Err(error) = runtime
             .bot
             .telegram
-            .edit_message_text(
-                chat_id,
-                message_id,
-                format!(
-                    "File batch {preview_id} is processing. Closing the mini app will not stop it."
-                ),
-            )
+            .edit_message_text(chat_id, message_id, initial_message.clone())
             .await
         {
             warn!(preview_seq, error = %error, "failed to edit file-batch progress message");
@@ -3278,12 +3571,7 @@ async fn begin_cloud_batch_message(
     let message_id = match runtime
         .bot
         .telegram
-        .send_message(
-            chat_id,
-            format!(
-                "File batch {preview_id} is processing. Closing the mini app will not stop it."
-            ),
-        )
+        .send_message(chat_id, initial_message)
         .await
     {
         Ok(message_id) => message_id,
@@ -3815,10 +4103,7 @@ fn published_primary_relative_paths(record: &TaskRecord, root: &std::path::Path)
             } else {
                 root.join(path)
             };
-            path.strip_prefix(root)
-                .ok()
-                .filter(|relative| !relative.as_os_str().is_empty())
-                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            published_relative_path(&path, root)
         })
         .collect::<Vec<_>>();
     paths.sort();
@@ -3844,15 +4129,30 @@ fn published_entry_primary_relative_paths(
             } else {
                 root.join(path)
             };
-            path.strip_prefix(root)
-                .ok()
-                .filter(|relative| !relative.as_os_str().is_empty())
-                .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+            published_relative_path(&path, root)
         })
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
     paths
+}
+
+// Queue hints and migration scope must recognize the system's logical and canonical root
+// spellings. This helper supplies metadata only; file-operation authorization still binds FDs.
+fn published_relative_path(path: &Path, root: &Path) -> Option<String> {
+    let relative = path
+        .strip_prefix(root)
+        .ok()
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            let canonical_root = std::fs::canonicalize(root).ok()?;
+            let canonical_path = std::fs::canonicalize(path).ok()?;
+            canonical_path
+                .strip_prefix(canonical_root)
+                .ok()
+                .map(Path::to_path_buf)
+        })?;
+    (!relative.as_os_str().is_empty()).then(|| relative.to_string_lossy().replace('\\', "/"))
 }
 
 fn youtube_video_id(raw_url: &str) -> Option<String> {
@@ -4311,6 +4611,11 @@ async fn handle_message(
         return Ok(());
     }
 
+    if is_settings_command(text) {
+        handle_settings_command(&telegram, &config, chat_id, is_private_chat).await?;
+        return Ok(());
+    }
+
     match route_message(text, &config.pdf.auto_domains) {
         RouteResult::Jobs(jobs) => {
             for (ordinal, job) in jobs.into_iter().enumerate() {
@@ -4389,6 +4694,10 @@ fn default_bot_commands() -> Vec<BotCommand> {
             description: "Open the private file manager.".to_string(),
         },
         BotCommand {
+            command: "settings".to_string(),
+            description: "Manage media libraries and download defaults.".to_string(),
+        },
+        BotCommand {
             command: "bbdown".to_string(),
             description: "Manage BBDown Bilibili login state.".to_string(),
         },
@@ -4400,6 +4709,62 @@ fn is_file_command(text: &str) -> bool {
         let command = command.to_ascii_lowercase();
         command == "/file" || command.starts_with("/file@")
     })
+}
+
+fn is_settings_command(text: &str) -> bool {
+    text.split_whitespace().next().is_some_and(|command| {
+        let command = command.to_ascii_lowercase();
+        command == "/settings" || command.starts_with("/settings@")
+    })
+}
+
+async fn handle_settings_command(
+    telegram: &TelegramClient,
+    config: &AppConfig,
+    chat_id: i64,
+    is_private_chat: bool,
+) -> Result<()> {
+    if !is_private_chat {
+        telegram
+            .send_message(
+                chat_id,
+                "Open /settings in a private chat with this bot.".to_string(),
+            )
+            .await?;
+        return Ok(());
+    }
+    let Some(cloud) = &config.cloud else {
+        telegram
+            .send_message(
+                chat_id,
+                "Settings are unavailable until the local Cloudflare Worker is configured."
+                    .to_string(),
+            )
+            .await?;
+        return Ok(());
+    };
+    let mut worker_url =
+        url::Url::parse(&cloud.worker_url).context("cloud.worker_url must be a valid URL")?;
+    if !worker_url.path().ends_with('/') {
+        worker_url.set_path(&format!("{}/", worker_url.path()));
+    }
+    let web_app_url = worker_url.join("settings/")?;
+    telegram
+        .send_message_with_inline_keyboard(
+            chat_id,
+            "Manage your media libraries and download defaults.".to_string(),
+            InlineKeyboardMarkup {
+                inline_keyboard: vec![vec![InlineKeyboardButton {
+                    text: "Open Settings".to_string(),
+                    callback_data: String::new(),
+                    web_app: Some(WebAppInfo {
+                        url: web_app_url.to_string(),
+                    }),
+                }]],
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 async fn handle_file_command(
@@ -4466,6 +4831,7 @@ fn help_message() -> String {
         "/help - Show this help.",
         "/pdf URL - Save a webpage as PDF.",
         "/file - Open the private file manager in a private chat.",
+        "/settings - Manage media libraries and download defaults in a private chat.",
         "/queue - View active tasks; use /queue history [page] for history.",
         "/bbdown login [web|tv|access-key] - Log in to Bilibili for BBDown downloads.",
         "/bbdown status - Check saved BBDown credentials.",
@@ -7126,6 +7492,25 @@ fn queue_or_prompt_job(
         {
             return;
         }
+        let context = match task_bot_context(context.clone(), &task_id, generation).await {
+            Ok(context) => context,
+            Err(error) => {
+                warn!(task_id, error = %format!("{error:#}"), "failed to resolve the saved task destination");
+                let detail = redact_sensitive_text(&format!("{error:#}"));
+                if let Ok(Some(_)) =
+                    context
+                        .queue
+                        .fail_if_generation(&task_id, generation, truncate(&detail))
+                {
+                    send_or_log(
+                        &context.telegram,
+                        chat_id,
+                        format!("Task {task_id} could not open its saved destination: {}\nIts queue record and retained fragments are preserved. Check the library in /settings, then retry from /queue.", truncate(&detail)),
+                    ).await;
+                }
+                return;
+            }
+        };
         let job = if needs_short_link_normalization {
             match Arc::clone(&context.job_dispatch.duplicate_scan_semaphore)
                 .acquire_owned()
@@ -7146,6 +7531,79 @@ fn queue_or_prompt_job(
         };
         queue_or_prompt_normalized_job(context, chat_id, job_id, task_id, generation, job).await;
     });
+}
+
+async fn task_bot_context(
+    mut context: BotContext,
+    task_id: &str,
+    generation: u64,
+) -> Result<BotContext> {
+    let mut reported_file_provider_error = false;
+    loop {
+        let queue = Arc::clone(&context.queue);
+        let base = Arc::clone(&context.config);
+        let task_id_for_worker = task_id.to_string();
+        let config_result = tokio::task::spawn_blocking(move || {
+            let config = queue.task_config(&base, &task_id_for_worker)?;
+            if let Some(config) = config.as_ref()
+                && config.downloads.video_dir != config.video_storage_root()
+            {
+                let root = crate::safe_fs::RootedFs::new(config.video_storage_root())?;
+                let category = config
+                    .downloads
+                    .video_dir
+                    .strip_prefix(config.video_storage_root())
+                    .context("saved category is outside its media-library root")?;
+                let mut path = root.logical_root_path().to_path_buf();
+                for component in category.components() {
+                    let std::path::Component::Normal(name) = component else {
+                        bail!("saved category contains an invalid component");
+                    };
+                    path.push(name);
+                    root.create_dir(&path, 0o755)?;
+                    let entry = root.bind_entry(&path, false)?;
+                    let identity = root
+                        .bound_entry_identity(&entry)?
+                        .context("saved category disappeared")?;
+                    root.open_bound_directory(&entry, identity)?;
+                }
+            }
+            Ok::<_, anyhow::Error>(config)
+        })
+        .await
+        .context("saved task destination worker failed")?;
+
+        match config_result {
+            Ok(Some(config)) => {
+                if !generation_is_current_with_retry_delay(
+                    &context.queue,
+                    task_id,
+                    generation,
+                    context.queue_start_retry_delay,
+                )
+                .await
+                {
+                    bail!("saved task generation changed before destination resolution");
+                }
+                context.config = Arc::new(config);
+                return Ok(context);
+            }
+            Ok(None) => bail!("the saved task no longer exists"),
+            Err(error) if is_file_provider_access_error(&error) => {
+                if !reported_file_provider_error {
+                    warn!(
+                        task_id,
+                        generation,
+                        error = %format!("{error:#}"),
+                        "File Provider blocked saved task destination lookup; retaining the task and retrying"
+                    );
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(context.queue_start_retry_delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn prepare_persisted_task_for_job(
@@ -8155,7 +8613,7 @@ async fn queue_queued_task(
     let is_collection = is_confirmed_bilibili_ugc_collection_job(&job);
     let mut reported_file_provider_error = false;
     let mut expected_generation = expected_generation;
-    let (generation, previous_status_message_id, cancel) = loop {
+    let (generation, previous_status_message_id, cancel, destination) = loop {
         if expected_generation.is_none() {
             match context.queue.get(&task_id) {
                 Ok(Some(task)) if task.status == TaskStatus::Queued => {
@@ -8197,7 +8655,7 @@ async fn queue_queued_task(
             .register_cancellation_if_queued_generation(&task_id, generation)
         {
             Ok(Some((task, cancel))) => {
-                break (generation, task.status_message_id, cancel);
+                break (generation, task.status_message_id, cancel, task.destination);
             }
             Ok(None) => {
                 if is_collection {
@@ -8257,7 +8715,22 @@ async fn queue_queued_task(
             }
         }
     };
-    let queued_text = format!("Queued job #{job_id}: {}", job.label());
+    let save_path = destination
+        .map(|destination| {
+            destination.category.map_or_else(
+                || destination.root.clone(),
+                |category| destination.root.join(category),
+            )
+        })
+        .unwrap_or_else(|| match &job {
+            JobRequest::Pdf { .. } => context.config.downloads.pdf_dir.clone(),
+            _ => context.config.downloads.video_dir.clone(),
+        });
+    let queued_text = format!(
+        "Queued job #{job_id}: {}\nSave to: {}",
+        job.label(),
+        redact_sensitive_text(&save_path.to_string_lossy())
+    );
     let queued_message_id = if is_collection || previous_status_message_id.is_some() {
         if let Some(message_id) = previous_status_message_id {
             edit_task_message_without_keyboard_if_current(
@@ -9580,7 +10053,6 @@ async fn run_queued_job(
     run_mode: JobRunMode,
 ) {
     let telegram = context.telegram.clone();
-    let config = Arc::clone(&context.config);
     let queue = Arc::clone(&context.queue);
     let semaphore = Arc::clone(&context.job_dispatch.download_semaphore);
     let is_collection = is_confirmed_bilibili_ugc_collection_job(&job);
@@ -9588,6 +10060,9 @@ async fn run_queued_job(
         biased;
         _ = cancel.notified() => {
             let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+            if !queue.generation_matches(&task_id, generation).unwrap_or(false) {
+                return;
+            }
             let message = format!("Canceled job #{job_id}: {}", job.label());
             if is_collection {
                 if let Some(message_id) = queued_message_id {
@@ -9687,6 +10162,25 @@ async fn run_queued_job(
         }
     }
 
+    let context = match task_bot_context(context, &task_id, generation).await {
+        Ok(context) => context,
+        Err(error) => {
+            let message = redact_sensitive_text(&format!("{error:#}"));
+            if let Ok(Some(_)) = queue.fail_if_generation(&task_id, generation, truncate(&message))
+                && let Some(message_id) = queued_message_id
+            {
+                edit_task_message_if_current(
+                    &queue, &task_id, generation, &telegram, chat_id, message_id,
+                    format!("Task {task_id} could not open its saved destination: {}\nCheck /settings, then retry from /queue. Retained fragments are preserved.", truncate(&message)),
+                ).await;
+            }
+            let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
+            warn!(task_id, error = %message, "failed to open the saved task destination");
+            return;
+        }
+    };
+    let config = Arc::clone(&context.config);
+
     let mut status_message_id = if is_collection {
         queued_message_id
     } else if let Some(message_id) = queued_message_id {
@@ -9702,9 +10196,16 @@ async fn run_queued_job(
         .await;
         Some(message_id)
     } else {
-        let message_id = send_or_log_message_id(
-            &telegram,
-            chat_id,
+        let message_id = send_task_message_id_if_current(
+            ProgressDeliveryContext {
+                telegram: &telegram,
+                queue: &queue,
+                task_id: &task_id,
+                generation,
+                chat_id,
+                job_id,
+                job_label: job.label(),
+            },
             job_status_message(job_id, job.label(), "Started", None),
         )
         .await;
@@ -9753,6 +10254,12 @@ async fn run_queued_job(
         drop(permit);
         let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
         status_message_id = finish_job_progress(progress_tx, progress_task).await;
+        if !queue
+            .generation_matches(&task_id, generation)
+            .unwrap_or(false)
+        {
+            return;
+        }
         let message = format!("Canceled job #{job_id}: {}", job.label());
         if let Some(message_id) = status_message_id {
             if is_collection {
@@ -9790,6 +10297,12 @@ async fn run_queued_job(
             drop(permit);
             let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
             status_message_id = finish_job_progress(progress_tx, progress_task).await;
+            if !queue
+                .generation_matches(&task_id, generation)
+                .unwrap_or(false)
+            {
+                return;
+            }
             let final_message = if paused {
                 format!(
                     "Paused job #{job_id}: {}\n{}",
@@ -9859,6 +10372,12 @@ async fn run_queued_job(
         drop(permit);
         let _ = queue.unregister_cancellation_if_current(&task_id, &cancel);
         status_message_id = finish_job_progress(progress_tx, progress_task).await;
+        if !queue
+            .generation_matches(&task_id, generation)
+            .unwrap_or(false)
+        {
+            return;
+        }
         let message = format!("Canceled job #{job_id}: {}", job.label());
         if let Some(message_id) = status_message_id {
             if is_collection {
@@ -9876,6 +10395,12 @@ async fn run_queued_job(
     }
     if !differences.is_empty() {
         status_message_id = finish_job_progress(progress_tx, progress_task).await;
+        if !queue
+            .generation_matches(&task_id, generation)
+            .unwrap_or(false)
+        {
+            return;
+        }
         let keyboard = task_action_keyboard(&[
             (
                 "Use updated plan".to_string(),
@@ -13288,6 +13813,7 @@ mod tests {
             operations: Vec::new(),
             tasks: Vec::new(),
             download_dir: "/tmp/downloads".to_string(),
+            settings_applied: serde_json::json!({}),
         };
         let state_version = 7;
         let full_size = snapshot
@@ -13361,6 +13887,7 @@ mod tests {
                 operations: Vec::new(),
                 tasks: Vec::new(),
                 download_dir: "/tmp/downloads".to_string(),
+                settings_applied: serde_json::json!({}),
             };
             let state_version = 9;
             let budget = 4 * 1024;
@@ -13410,6 +13937,7 @@ mod tests {
             operations: Vec::new(),
             tasks: vec![serde_json::json!({ "opaque": "y".repeat(16 * 1024) })],
             download_dir: "/tmp/downloads".to_string(),
+            settings_applied: serde_json::json!({}),
         };
         let state_version = 10;
         let original_items = snapshot.library["items"].clone();
@@ -14450,7 +14978,7 @@ mod tests {
                 .iter()
                 .map(|command| command.command.as_str())
                 .collect::<Vec<_>>(),
-            vec!["help", "pdf", "queue", "file", "bbdown"]
+            vec!["help", "pdf", "queue", "file", "settings", "bbdown"]
         );
         assert_eq!(
             commands
@@ -15930,7 +16458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_retries_file_provider_queue_open_failures() {
+    async fn startup_retains_video_library_as_offline_after_file_provider_open_failure() {
         let queue_root = temp_main_test_dir("queue-startup-file-provider-retry");
         let mut config = AppConfig::for_test();
         config.downloads.video_dir = queue_root.join("videos");
@@ -15956,10 +16484,27 @@ mod tests {
             &mut shutdown,
         )
         .await
-        .expect("startup should reopen the queue after a transient provider failure")
+        .expect("startup should remain available while a video library is offline")
         .expect("startup should complete before shutdown");
 
-        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        let default_library_id = queue
+            .registry_snapshot()
+            .expect("library registry should remain available")
+            .default_library_id;
+        let status = queue
+            .video_library_statuses()
+            .expect("library status should remain available");
+        let status = status
+            .get(&default_library_id)
+            .expect("registered default library should have a status");
+        assert!(!status.available);
+        assert!(
+            status
+                .diagnostic
+                .as_deref()
+                .is_some_and(|detail| detail.contains("simulated startup File Provider deadlock"))
+        );
         drop(queue);
         let _ = fs::remove_dir_all(queue_root);
     }
@@ -16002,7 +16547,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_retries_file_provider_queue_directory_creation_failures() {
+    async fn startup_retains_video_library_as_offline_after_queue_directory_creation_failure() {
         let queue_root = temp_main_test_dir("queue-directory-file-provider-retry");
         let mut config = AppConfig::for_test();
         config.downloads.video_dir = queue_root.join("videos");
@@ -16029,10 +16574,24 @@ mod tests {
             &mut shutdown,
         )
         .await
-        .expect("startup should retry coordinated queue directory creation")
+        .expect("startup should remain available while a video library is offline")
         .expect("startup should complete before shutdown");
 
-        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        let default_library_id = queue
+            .registry_snapshot()
+            .expect("library registry should remain available")
+            .default_library_id;
+        let status = queue
+            .video_library_statuses()
+            .expect("library status should remain available");
+        let status = status
+            .get(&default_library_id)
+            .expect("registered default library should have a status");
+        assert!(!status.available);
+        assert!(status.diagnostic.as_deref().is_some_and(|detail| {
+            detail.contains("simulated queue directory coordination failure")
+        }));
         assert_eq!(
             file_provider.write_paths().first(),
             Some(&queue_root.join("videos/.telegram-video-downloader-queue")),

@@ -1,6 +1,79 @@
 export const LIBRARY_PAGE_SIZE = 50;
 export const MAX_FOLDER_SUGGESTIONS = 100;
 
+export function mediaLibraryEntries(ownerSnapshot) {
+  const library = ownerSnapshot?.library;
+  const applied = ownerSnapshot?.settings?.applied;
+  const appliedEntries = Array.isArray(applied?.libraries) ? applied.libraries : [];
+  const statusEntries = Array.isArray(library?.libraries) ? library.libraries : [];
+  const merged = new Map();
+  for (const entry of appliedEntries) {
+    if (!entry || typeof entry.id !== "string") continue;
+    merged.set(entry.id, { ...entry });
+  }
+  for (const entry of statusEntries) {
+    if (!entry || typeof entry.id !== "string") continue;
+    merged.set(entry.id, { ...merged.get(entry.id), ...entry });
+  }
+  if (merged.size === 0 && library && typeof library === "object") {
+    const id = String(applied?.default_library_id ?? library.default_library_id ?? "default");
+    merged.set(id, {
+      id,
+      name: String(library.root_label ?? "Default library"),
+      root: String(ownerSnapshot?.settings?.download_dir ?? ""),
+      default_category: String(applied?.default_category ?? ""),
+      is_default: true,
+      availability: library.availability,
+      snapshot: library,
+    });
+  }
+  return [...merged.values()];
+}
+
+export function defaultMediaLibraryId(ownerSnapshot) {
+  const entries = mediaLibraryEntries(ownerSnapshot);
+  const configured = ownerSnapshot?.settings?.applied?.default_library_id ?? ownerSnapshot?.library?.default_library_id;
+  if (typeof configured === "string" && entries.some((entry) => entry.id === configured)) return configured;
+  return String(entries.find((entry) => entry.is_default === true)?.id ?? entries[0]?.id ?? "");
+}
+
+export function resolveMediaLibrary(ownerSnapshot, requestedId = "") {
+  const entries = mediaLibraryEntries(ownerSnapshot);
+  const fallbackId = defaultMediaLibraryId(ownerSnapshot);
+  const selected = entries.find((entry) => entry.id === requestedId)
+    ?? entries.find((entry) => entry.id === fallbackId)
+    ?? entries[0]
+    ?? null;
+  if (!selected) return { descriptor: null, snapshot: null, id: "" };
+  const snapshot = selected.snapshot && typeof selected.snapshot === "object"
+    ? selected.snapshot
+    : selected.id === fallbackId
+      ? ownerSnapshot?.library ?? null
+      : null;
+  return { descriptor: selected, snapshot, id: String(selected.id) };
+}
+
+export function mediaLibraryAvailability(descriptor) {
+  const value = String(descriptor?.availability ?? "").toLowerCase();
+  if (["offline", "unavailable"].includes(value) || descriptor?.available === false) return "offline";
+  if (value === "available" || descriptor?.available === true) return "available";
+  return "unknown";
+}
+
+export function operationLibraryId(operation) {
+  const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
+  const nested = result.operation && typeof result.operation === "object" ? result.operation : {};
+  const preview = result.preview && typeof result.preview === "object" ? result.preview : {};
+  const id = result.library_id ?? result.source_library_id ?? nested.library_id ?? nested.source_library_id
+    ?? preview.library_id ?? preview.source_library_id ?? operation?.source_library_id ?? operation?.library_id;
+  return typeof id === "string" ? id : "";
+}
+
+export function operationMatchesLibrary(operation, libraryId) {
+  const id = operationLibraryId(operation);
+  return !id || id === libraryId;
+}
+
 export function itemFolder(item) {
   const path = String(item?.relative_path ?? "").replaceAll("\\", "/");
   const slash = path.lastIndexOf("/");

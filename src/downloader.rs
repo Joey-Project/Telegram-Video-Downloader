@@ -41,6 +41,9 @@ use crate::bilibili_core;
 use crate::bilibili_planning;
 use crate::config::AppConfig;
 use crate::episode_retry::{EpisodeFailureDisposition, classify_episode_failure};
+use crate::media_libraries::{
+    StagingMigrationControlReceipt, TaskTransferControl, TaskTransferControlKind,
+};
 use crate::queue::{
     BilibiliCollectionDirectorySnapshot, BilibiliGroupEntryIdentity, PlanSize,
     PlanValidationSnapshot, sanitize_job_for_storage,
@@ -1874,7 +1877,10 @@ struct BilibiliEpisodeGroupInventory {
     source: BilibiliGroupSource,
     entries: Vec<BilibiliGroupEntry>,
     output_template: Option<String>,
+    // The selected collection folder is a direct child of downloads.video_dir. Keep this
+    // separate root-relative scope for staging and publication receipts under video_storage_root.
     output_folder: Option<String>,
+    storage_relative_output_folder: Option<String>,
     output_folder_identity: Option<EntryIdentity>,
 }
 
@@ -2125,7 +2131,8 @@ impl BilibiliEpisodeGroupInventory {
     }
 
     fn collection_directory_snapshot(&self) -> BilibiliCollectionDirectorySnapshot {
-        let (BilibiliGroupSource::Collection, Some(path)) = (self.source, &self.output_folder)
+        let (BilibiliGroupSource::Collection, Some(path)) =
+            (self.source, &self.storage_relative_output_folder)
         else {
             return BilibiliCollectionDirectorySnapshot::Untracked;
         };
@@ -2149,7 +2156,7 @@ fn establish_bilibili_group_collection_directory(
         return Ok(());
     }
     let folder = inventory
-        .output_folder
+        .storage_relative_output_folder
         .as_deref()
         .context("Bilibili collection inventory omitted its selected output directory")?;
     let path = bilibili_group_collection_output_folder_path(root, folder)?;
@@ -2261,6 +2268,7 @@ async fn resolve_bilibili_episode_group_inventory(
 
     let mut output_template = None;
     let mut output_folder = None;
+    let mut storage_relative_output_folder = None;
     let mut output_folder_identity = None;
     let (title, source, entries) = match resolved {
         ResolvedContent::Video(video) => {
@@ -2319,6 +2327,11 @@ async fn resolve_bilibili_episode_group_inventory(
                     input,
                 )?;
                 output_template = Some(bilibili_ugc_collection_output_template(
+                    &output_directory.folder,
+                )?);
+                storage_relative_output_folder = Some(bilibili_storage_relative_collection_folder(
+                    config.video_storage_root(),
+                    &config.downloads.video_dir,
                     &output_directory.folder,
                 )?);
                 output_folder_identity = output_directory.existing_identity;
@@ -2380,6 +2393,7 @@ async fn resolve_bilibili_episode_group_inventory(
         entries,
         output_template,
         output_folder,
+        storage_relative_output_folder,
         output_folder_identity,
     })
 }
@@ -2919,7 +2933,7 @@ pub async fn run_bilibili_episode_group(
     if inventory.source == BilibiliGroupSource::Collection {
         let establish_result = async {
             let guard = video_output_lock(
-                &config.downloads.video_dir,
+                config.video_storage_root(),
                 "Bilibili collection directory validation",
                 progress.as_ref(),
             )
@@ -3020,7 +3034,7 @@ async fn run_bilibili_episode_group_with_inventory(
     let collection_output_folder = if inventory.source == BilibiliGroupSource::Collection {
         Some(
             inventory
-                .output_folder
+                .storage_relative_output_folder
                 .as_deref()
                 .context("Bilibili collection inventory omitted its selected output directory")?,
         )
@@ -3113,7 +3127,7 @@ async fn run_bilibili_episode_group_with_inventory(
         bail!("saved Bilibili retry scope does not match the reviewed group inventory");
     }
 
-    let output_root_path = config.downloads.video_dir.clone();
+    let output_root_path = config.video_storage_root().to_path_buf();
     let mut report_paths = BTreeSet::new();
     let mut report_evidence = Vec::<(BilibiliDownloadEntry, ExistingEpisodeEvidence)>::new();
     let mut attempt = BilibiliGroupAttemptGuard::new(snapshot, progress.clone());
@@ -3832,11 +3846,7 @@ async fn run_bilibili_episode_group_with_inventory(
     let root = RootedFs::new(&output_root_path)
         .context("failed to bind output root while building Bilibili group report")?;
     let media_paths = report_paths.into_iter().collect::<Vec<_>>();
-    let saved_location = inventory
-        .output_folder
-        .as_ref()
-        .map(|folder| root.logical_root_path().join(folder))
-        .unwrap_or_else(|| root.logical_root_path().to_path_buf())
+    let saved_location = bilibili_group_saved_location(config, &inventory)
         .display()
         .to_string();
     let mut report = JobReport {
@@ -4081,8 +4091,17 @@ async fn build_bilibili_group_identity_index(
     inventory: &BilibiliEpisodeGroupInventory,
     mode: DownloadMode,
 ) -> Result<Arc<tokio::sync::Mutex<VideoIdentityIndex>>> {
-    let root_path = config.downloads.video_dir.clone();
-    let folder = inventory.output_folder.clone();
+    let is_collection = inventory.source == BilibiliGroupSource::Collection;
+    let root_path = if is_collection {
+        config.video_storage_root().to_path_buf()
+    } else {
+        config.downloads.video_dir.clone()
+    };
+    let folder = if is_collection {
+        inventory.storage_relative_output_folder.clone()
+    } else {
+        None
+    };
     let expected_folder_identity = inventory.output_folder_identity;
     let scan_permit = tokio_timeout(
         Duration::from_secs(6),
@@ -4159,7 +4178,7 @@ async fn execute_bilibili_group_entry(
             confirmed_streams,
             output_template: inventory.output_template.clone(),
             collection_output_folder: if inventory.source == BilibiliGroupSource::Collection {
-                Some(inventory.output_folder.clone().context(
+                Some(inventory.storage_relative_output_folder.clone().context(
                     "Bilibili collection inventory omitted its selected output directory",
                 )?)
             } else {
@@ -11801,7 +11820,7 @@ async fn run_staged_video_job(
     progress: Option<JobProgressSender>,
 ) -> Result<JobReport> {
     let guard = video_output_lock(
-        &config.downloads.video_dir,
+        config.video_storage_root(),
         "Staged video download",
         progress.as_ref(),
     )
@@ -12158,7 +12177,7 @@ async fn run_staged_video_job(
     )?;
     if let Some(receipt) = group_receipt.as_ref()
         && let Err(error) = verify_bilibili_group_publication_plan_receipt(
-            final_dir.clone(),
+            root.logical_root_path().to_path_buf(),
             receipt.clone(),
             primary_media_paths.clone(),
             expected_bilibili_entry
@@ -12332,14 +12351,74 @@ fn bilibili_group_collection_output_folder_path(
     root: &RootedFs,
     collection_output_folder: &str,
 ) -> Result<PathBuf> {
-    let mut components = Path::new(collection_output_folder).components();
-    let Some(std::path::Component::Normal(name)) = components.next() else {
-        bail!("Bilibili collection output directory scope is not a direct child path");
-    };
-    if components.next().is_some() || name != std::ffi::OsStr::new(collection_output_folder) {
-        bail!("Bilibili collection output directory scope is not a direct child path");
+    let relative = checked_storage_relative_path(
+        Path::new(collection_output_folder),
+        "Bilibili collection output directory scope",
+        false,
+    )?;
+    Ok(root.logical_root_path().join(relative))
+}
+
+fn checked_storage_relative_path(path: &Path, label: &str, allow_empty: bool) -> Result<PathBuf> {
+    if path.is_absolute() || (!allow_empty && path.as_os_str().is_empty()) {
+        bail!("{label} must be a storage-root-relative path");
     }
-    Ok(root.logical_root_path().join(name))
+    let Some(text) = path.to_str() else {
+        bail!("{label} must be valid UTF-8");
+    };
+    if text.contains('\\') {
+        bail!("{label} contains an invalid path separator");
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(name) => normalized.push(name),
+            _ => bail!("{label} contains a non-normal path component"),
+        }
+    }
+    if normalized.as_os_str().is_empty() && !allow_empty {
+        bail!("{label} must not be empty");
+    }
+    if normalized.to_str() != Some(text) {
+        bail!("{label} is not in normalized form");
+    }
+    Ok(normalized)
+}
+
+fn bilibili_storage_relative_collection_folder(
+    storage_root: &Path,
+    effective_video_dir: &Path,
+    collection_folder: &str,
+) -> Result<String> {
+    let category = effective_video_dir
+        .strip_prefix(storage_root)
+        .context("effective video directory is outside its selected storage root")?;
+    let category = checked_storage_relative_path(category, "effective video category", true)?;
+    let collection = checked_storage_relative_path(
+        Path::new(collection_folder),
+        "Bilibili collection folder",
+        false,
+    )?;
+    if collection.components().count() != 1 {
+        bail!("Bilibili collection folder must remain a direct child of its category");
+    }
+    let mut scope = category;
+    scope.push(collection);
+    scope
+        .to_str()
+        .map(str::to_string)
+        .context("Bilibili collection scope must be valid UTF-8")
+}
+
+fn bilibili_group_saved_location(
+    config: &AppConfig,
+    inventory: &BilibiliEpisodeGroupInventory,
+) -> PathBuf {
+    inventory
+        .output_folder
+        .as_ref()
+        .map(|folder| config.downloads.video_dir.join(folder))
+        .unwrap_or_else(|| config.downloads.video_dir.clone())
 }
 
 fn bilibili_group_paths_are_in_collection_folder(
@@ -13245,6 +13324,42 @@ struct VideoOutputGuard {
     file_guard: BoundFile,
 }
 
+struct VideoOutputRootGuard {
+    _root: RootedFs,
+    _recovery_state: VideoRecoveryState,
+    _file_guard: BoundFile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VideoOutputRootPurpose {
+    Download,
+    Migration,
+}
+
+/// Holds the in-process output slot once and the output flock for each participating root.
+/// Migration keeps this guard alive while it copies and rebinds task staging state.
+pub(crate) struct VideoMigrationGuard {
+    _process_guard: MutexGuard<'static, ()>,
+    _roots: Vec<VideoOutputRootGuard>,
+}
+
+impl VideoMigrationGuard {
+    pub(crate) fn validate_for_root(&self, root: &RootedFs) -> Result<()> {
+        root.validate_configured_root()?;
+        let held = self
+            ._roots
+            .iter()
+            .find(|held| held._root.root_identity() == root.root_identity())
+            .context("migration output lease does not cover this library root")?;
+        held._root.validate_configured_root()?;
+        held._file_guard.validate_private_link_count(0o600, 2)?;
+        if video_output_lock_file(&held._root)?.identity() != held._file_guard.identity() {
+            bail!("migration output lock object changed while its lease was held");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VideoControlOwner {
@@ -13896,6 +14011,72 @@ async fn video_output_lock(
         }
     };
 
+    let root_guard = acquire_video_output_root(
+        video_dir,
+        job_label,
+        progress,
+        VideoOutputRootPurpose::Download,
+    )
+    .await?;
+    Ok(VideoOutputGuard {
+        root: root_guard._root,
+        recovery_state: root_guard._recovery_state,
+        _process_guard: process_guard,
+        file_guard: root_guard._file_guard,
+    })
+}
+
+pub(crate) async fn hold_video_outputs_for_migration(
+    roots: &[PathBuf],
+) -> Result<VideoMigrationGuard> {
+    if roots.is_empty() || roots.len() > 16 {
+        bail!("migration output lease requires a bounded non-empty set of roots");
+    }
+    let mut roots = roots
+        .iter()
+        .map(|root| {
+            std::fs::canonicalize(root)
+                .with_context(|| format!("could not resolve video output root {}", root.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    roots.sort();
+    roots.dedup();
+    if roots.is_empty() {
+        bail!("migration output lease has no distinct roots");
+    }
+
+    let lock = VIDEO_OUTPUT_LOCK.get_or_init(|| Mutex::new(()));
+    let process_guard = lock.lock().await;
+    let mut identities = std::collections::HashSet::new();
+    let mut root_guards = Vec::with_capacity(roots.len());
+    for root in roots {
+        let rooted = RootedFs::new(&root)?;
+        let identity = rooted.root_identity();
+        if !identities.insert((identity.device(), identity.inode())) {
+            bail!("migration output roots resolve to the same directory object");
+        }
+        root_guards.push(
+            acquire_video_output_root(
+                &root,
+                "Media library migration",
+                None,
+                VideoOutputRootPurpose::Migration,
+            )
+            .await?,
+        );
+    }
+    Ok(VideoMigrationGuard {
+        _process_guard: process_guard,
+        _roots: root_guards,
+    })
+}
+
+async fn acquire_video_output_root(
+    video_dir: &Path,
+    job_label: &str,
+    progress: Option<&JobProgressSender>,
+    purpose: VideoOutputRootPurpose,
+) -> Result<VideoOutputRootGuard> {
     let root = RootedFs::new(video_dir)?;
     let file_guard = video_output_lock_file(&root)?;
     let mut reported_wait = false;
@@ -13920,6 +14101,12 @@ async fn video_output_lock(
     let mut unresolved_recovery = false;
     let mut incomplete_recovery = false;
     let recovery_state = video_recovery_state(&recovery_state_file)?;
+    if purpose == VideoOutputRootPurpose::Migration
+        && recovery_state_existed
+        && recovery_state == VIDEO_RECOVERY_STATE_DIRTY
+    {
+        preflight_migration_staging_recovery(&root)?;
+    }
     if recovery_state_existed && recovery_state == VIDEO_RECOVERY_STATE_INCOMPLETE {
         bail!(
             "video output recovery scan is incomplete; restore access to the reported directories and restart the bot before starting another download"
@@ -13958,15 +14145,14 @@ async fn video_output_lock(
         );
     }
     recovery_state_file.write_state(VIDEO_RECOVERY_STATE_DIRTY)?;
-    Ok(VideoOutputGuard {
-        root,
-        recovery_state: VideoRecoveryState {
+    Ok(VideoOutputRootGuard {
+        _root: root,
+        _recovery_state: VideoRecoveryState {
             marker: recovery_state_file,
             operation_clean: Cell::new(true),
             unresolved_before_operation: unresolved_recovery,
         },
-        _process_guard: process_guard,
-        file_guard,
+        _file_guard: file_guard,
     })
 }
 
@@ -16867,6 +17053,14 @@ fn create_video_staging_dir(root: &RootedFs) -> Result<BoundStagingDir> {
     )
 }
 
+#[cfg(test)]
+pub(crate) fn create_test_retained_video_staging(root: &Path) -> Result<PathBuf> {
+    let rooted = RootedFs::new(root)?;
+    let staging = create_video_staging_dir(&rooted)?;
+    staging.retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)?;
+    Ok(staging.path().to_path_buf())
+}
+
 fn is_staging_support_file(staging_dir: &Path, path: &Path) -> bool {
     path == staging_dir.join("BBDown.config")
         || path == staging_dir.join(VIDEO_STAGING_OWNER_FILE_NAME)
@@ -17147,6 +17341,697 @@ fn bilibili_worker_lifecycle_phase(
     }
 }
 
+/// Installs an owner- and retention-bound staging directory at the task plan's exact target path.
+/// The temporary directory is fully initialized before its no-replace rename, so startup recovery
+/// never sees a published `job-*` directory without migration ownership metadata.
+pub(crate) fn prepare_video_staging_for_migration(
+    root: &RootedFs,
+    job_relative: &Path,
+    migration_token: &str,
+) -> Result<EntryIdentity> {
+    let job_relative = validate_migration_job_relative(job_relative)?;
+    let migration_token = validate_migration_staging_token(migration_token)?;
+    let reason = migration_staging_retention_reason(&migration_token);
+    let (staging_root_entry, staging_root_identity) = ensure_private_video_staging_root(root)?;
+    let target_path = root.logical_root_path().join(&job_relative);
+
+    if let Some(identity) = root.entry_identity(&target_path)? {
+        if !identity.is_dir() {
+            bail!(
+                "migration target staging path is not a directory: {}",
+                target_path.display()
+            );
+        }
+        validate_video_staging_directory(root, &target_path, identity)?;
+        let actual_reason = retained_video_staging_reason(root, &target_path, identity)?;
+        if actual_reason.as_deref() != Some(reason.as_str()) {
+            bail!(
+                "existing migration staging directory is not bound to this migration token: {}",
+                target_path.display()
+            );
+        }
+        return Ok(identity);
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    for attempt in 0..128_u32 {
+        let initializing = root.logical_root_path().join(VIDEO_STAGING_DIR_NAME).join(format!(
+            "{VIDEO_STAGING_INITIALIZING_DIR_PREFIX}migration-{migration_token}-{}-{nanos}-{attempt}",
+            std::process::id(),
+        ));
+        let Some(identity) = root.create_dir(&initializing, 0o700)? else {
+            continue;
+        };
+        let entry = root.bind_entry(&initializing, false)?;
+        if root.bound_entry_identity(&entry)? != Some(identity) {
+            let _ = root.remove_bound_dir_if_identity(&entry, identity);
+            bail!("temporary migration staging directory identity changed");
+        }
+        root.validate_private_bound_directory(&entry, identity, 0o700)?;
+        let install = (|| -> Result<()> {
+            let owner = VideoStagingOwner {
+                version: VIDEO_STAGING_OWNER_VERSION,
+                root_device: root.root_identity().device(),
+                root_inode: root.root_identity().inode(),
+                staging_device: identity.device(),
+                staging_inode: identity.inode(),
+            };
+            let owner_contents =
+                serde_json::to_vec(&owner).context("failed to encode migration staging owner")?;
+            root.create_new_bound_file(
+                &initializing.join(VIDEO_STAGING_OWNER_FILE_NAME),
+                &owner_contents,
+                0o600,
+            )?;
+            persist_video_staging_retention_marker(
+                root,
+                &initializing.join(VIDEO_STAGING_RETENTION_FILE_NAME),
+                root.root_identity().device(),
+                root.root_identity().inode(),
+                identity.device(),
+                identity.inode(),
+                &reason,
+            )?;
+            let target_entry = root.bind_entry(&target_path, false)?;
+            root.rename_via_bound_parents_noreplace_if_identity(&entry, &target_entry, identity)
+                .context("failed to install initialized migration staging directory")?;
+            validate_video_staging_directory(root, &target_path, identity)?;
+            if retained_video_staging_reason(root, &target_path, identity)?.as_deref()
+                != Some(reason.as_str())
+            {
+                bail!("migration staging retention proof changed after installation");
+            }
+            Ok(())
+        })();
+        if let Err(error) = install {
+            // Before payload copy, remove only the temporary directory object created above.
+            // If rename already installed it, leave its valid owner/retention proof for recovery.
+            if root.bound_entry_identity(&entry).ok().flatten() == Some(identity) {
+                let _ = root.remove_bound_tree_if_identity(&entry, identity);
+            }
+            return Err(error);
+        }
+        if root.bound_entry_identity(&staging_root_entry)? != Some(staging_root_identity) {
+            bail!("private video staging root identity changed during migration setup");
+        }
+        return Ok(identity);
+    }
+    bail!("failed to allocate a temporary initialized migration staging directory")
+}
+
+pub(crate) fn inspect_video_staging_for_migration(
+    source_root: &RootedFs,
+    job_relative: &Path,
+    expected_job_identity: EntryIdentity,
+    controls: &[TaskTransferControl],
+) -> Result<Vec<StagingMigrationControlReceipt>> {
+    let job_relative = validate_migration_job_relative(job_relative)?;
+    let job_path = source_root.logical_root_path().join(&job_relative);
+    validate_video_staging_directory(source_root, &job_path, expected_job_identity)?;
+    validate_migration_control_inventory(source_root, &job_relative, controls)?;
+
+    let owner_path = job_path.join(VIDEO_STAGING_OWNER_FILE_NAME);
+    let owner = source_root
+        .open_bound_file(&owner_path)?
+        .context("migration source staging owner record is missing")?;
+    owner.validate_private_single_link(0o600)?;
+
+    let mut receipts = Vec::with_capacity(controls.len());
+    for control in controls {
+        let receipt = migration_control_receipt(source_root, &job_relative, control)?;
+        validate_migration_control_contents(
+            source_root,
+            &job_relative,
+            expected_job_identity,
+            control,
+        )?;
+        receipts.push(receipt);
+    }
+    Ok(receipts)
+}
+
+/// Recreates inode-bound control records against the destination root and job directory. Payload
+/// controls are never copied as ordinary files. Legacy BBDown.config is rejected because its
+/// opaque argument lines may contain paths tied to the source library.
+pub(crate) fn rebind_video_staging_controls_for_migration(
+    source_root: &RootedFs,
+    target_root: &RootedFs,
+    job_relative: &Path,
+    migration_token: &str,
+    expected_source_job_identity: EntryIdentity,
+    controls: &[TaskTransferControl],
+) -> Result<Vec<StagingMigrationControlReceipt>> {
+    let job_relative = validate_migration_job_relative(job_relative)?;
+    let migration_token = validate_migration_staging_token(migration_token)?;
+    let expected_retention_reason = migration_staging_retention_reason(&migration_token);
+    inspect_video_staging_for_migration(
+        source_root,
+        &job_relative,
+        expected_source_job_identity,
+        controls,
+    )?;
+    let target_path = target_root.logical_root_path().join(&job_relative);
+    let target_identity = target_root
+        .entry_identity(&target_path)?
+        .context("destination migration staging directory is missing")?;
+    validate_private_video_staging_job(target_root, &target_path, target_identity)?;
+
+    let has_lifecycle_transition = controls
+        .iter()
+        .any(|control| control.kind == TaskTransferControlKind::WorkerLifecycleTransition);
+    let mut receipts = Vec::with_capacity(controls.len().saturating_add(1));
+    for control in controls {
+        match control.kind {
+            TaskTransferControlKind::PublicationManifest
+            | TaskTransferControlKind::WorkerRequest
+            | TaskTransferControlKind::BbdownConfig => {
+                bail!(
+                    "migration cannot rebind unresolved or ephemeral staging control {:?}",
+                    control.kind
+                );
+            }
+            TaskTransferControlKind::Owner => {
+                let owner = VideoStagingOwner {
+                    version: VIDEO_STAGING_OWNER_VERSION,
+                    root_device: target_root.root_identity().device(),
+                    root_inode: target_root.root_identity().inode(),
+                    staging_device: target_identity.device(),
+                    staging_inode: target_identity.inode(),
+                };
+                let contents = serde_json::to_vec(&owner)
+                    .context("failed to encode destination staging owner")?;
+                ensure_migration_control_contents(
+                    target_root,
+                    &job_relative,
+                    control.kind,
+                    &contents,
+                    0o600,
+                    false,
+                )?;
+            }
+            TaskTransferControlKind::Retention => {
+                let reason =
+                    retained_video_staging_reason(target_root, &target_path, target_identity)?
+                        .context("destination migration retention marker is missing")?;
+                if reason != expected_retention_reason {
+                    bail!(
+                        "destination migration retention marker was replaced before queue handoff"
+                    );
+                }
+            }
+            TaskTransferControlKind::WorkerLifecycle => {
+                let source = migration_control_file(source_root, &job_relative, control)?;
+                let lifecycle: BilibiliWorkerLifecycle =
+                    serde_json::from_slice(&source.read_limited(BILIBILI_WORKER_LIFECYCLE_LIMIT)?)
+                        .context("failed to parse source Bilibili worker lifecycle")?;
+                let destination = BilibiliWorkerLifecycle {
+                    version: BILIBILI_WORKER_LIFECYCLE_VERSION,
+                    root_device: target_root.root_identity().device(),
+                    root_inode: target_root.root_identity().inode(),
+                    staging_device: target_identity.device(),
+                    staging_inode: target_identity.inode(),
+                    phase: if has_lifecycle_transition {
+                        BilibiliWorkerLifecyclePhase::CoreDownloadCompleted
+                    } else {
+                        lifecycle.phase
+                    },
+                };
+                let contents = encode_bilibili_worker_lifecycle(&destination)?;
+                ensure_migration_control_contents(
+                    target_root,
+                    &job_relative,
+                    control.kind,
+                    &contents,
+                    0o600,
+                    false,
+                )?;
+            }
+            TaskTransferControlKind::WorkerLifecycleTransition => {
+                // The source phase reader has authenticated this as one of the two valid
+                // completed-state crash windows. Normalize the destination pair so the main
+                // record always carries completion and the transition carries the old launch
+                // phase, both rebound to the destination's root and job identities.
+                let destination = BilibiliWorkerLifecycle {
+                    version: BILIBILI_WORKER_LIFECYCLE_VERSION,
+                    root_device: target_root.root_identity().device(),
+                    root_inode: target_root.root_identity().inode(),
+                    staging_device: target_identity.device(),
+                    staging_inode: target_identity.inode(),
+                    phase: BilibiliWorkerLifecyclePhase::Launched,
+                };
+                let contents = encode_bilibili_worker_lifecycle(&destination)?;
+                ensure_migration_control_contents(
+                    target_root,
+                    &job_relative,
+                    control.kind,
+                    &contents,
+                    0o600,
+                    false,
+                )?;
+            }
+        }
+        let relative = migration_control_relative_path(&job_relative, control.kind)?;
+        receipts.push(migration_target_control_receipt_for_path(
+            target_root,
+            &relative,
+            control.kind,
+        )?);
+    }
+
+    // Every installed migration staging directory has a target-bound owner and retention marker,
+    // including when neither was present in the source plan. The marker makes partial target
+    // payload durable across startup recovery while the queue transfer is pending.
+    for kind in [
+        TaskTransferControlKind::Owner,
+        TaskTransferControlKind::Retention,
+    ] {
+        let relative = migration_control_relative_path(&job_relative, kind)?;
+        if !receipts
+            .iter()
+            .any(|receipt| receipt.kind == kind && receipt.relative_path == relative)
+        {
+            receipts.push(migration_target_control_receipt_for_path(
+                target_root,
+                &relative,
+                kind,
+            )?);
+        }
+    }
+    Ok(receipts)
+}
+
+fn validate_private_video_staging_job(
+    root: &RootedFs,
+    path: &Path,
+    identity: EntryIdentity,
+) -> Result<()> {
+    let entry = root.bind_entry(path, false)?;
+    if root.bound_entry_identity(&entry)? != Some(identity) || !identity.is_dir() {
+        bail!(
+            "migration staging directory identity changed: {}",
+            path.display()
+        );
+    }
+    root.validate_private_bound_directory(&entry, identity, 0o700)
+}
+
+fn validate_migration_job_relative(path: &Path) -> Result<PathBuf> {
+    let components = path.components().collect::<Vec<_>>();
+    if components.len() != 2 {
+        bail!("migration staging path must name one job below the private staging root");
+    }
+    let first = components[0].as_os_str().to_str();
+    let second = components[1].as_os_str().to_str();
+    if first != Some(VIDEO_STAGING_DIR_NAME)
+        || !second.is_some_and(|name| name.starts_with("job-") && name.len() > 4)
+    {
+        bail!("migration staging path is outside an owned job directory");
+    }
+    Ok(path.to_path_buf())
+}
+
+fn migration_staging_retention_reason(token: &str) -> String {
+    format!("media library migration staging retained for {token}")
+}
+
+fn validate_migration_staging_token(token: &str) -> Result<String> {
+    if token.is_empty()
+        || token.len() > 96
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("migration staging token is invalid");
+    }
+    Ok(token.to_string())
+}
+
+fn migration_control_leaf(kind: TaskTransferControlKind) -> &'static str {
+    match kind {
+        TaskTransferControlKind::Owner => VIDEO_STAGING_OWNER_FILE_NAME,
+        TaskTransferControlKind::Retention => VIDEO_STAGING_RETENTION_FILE_NAME,
+        TaskTransferControlKind::PublicationManifest => VIDEO_STAGING_PUBLICATION_MANIFEST_NAME,
+        TaskTransferControlKind::WorkerRequest => BILIBILI_WORKER_REQUEST_FILE_NAME,
+        TaskTransferControlKind::WorkerLifecycle => BILIBILI_WORKER_LIFECYCLE_FILE_NAME,
+        TaskTransferControlKind::WorkerLifecycleTransition => {
+            BILIBILI_WORKER_LIFECYCLE_TRANSITION_FILE_NAME
+        }
+        TaskTransferControlKind::BbdownConfig => "BBDown.config",
+    }
+}
+
+fn migration_control_relative_path(
+    job_relative: &Path,
+    kind: TaskTransferControlKind,
+) -> Result<PathBuf> {
+    let expected = job_relative.join(migration_control_leaf(kind));
+    Ok(expected)
+}
+
+fn validate_migration_control_inventory(
+    root: &RootedFs,
+    job_relative: &Path,
+    controls: &[TaskTransferControl],
+) -> Result<()> {
+    if controls.len() > 16 {
+        bail!("migration staging control manifest exceeds its entry limit");
+    }
+    let mut listed = BTreeMap::new();
+    for control in controls {
+        let expected = migration_control_relative_path(job_relative, control.kind)?;
+        if control.source_relative != expected || control.target_relative != expected {
+            bail!("migration staging control path does not match its recognized role");
+        }
+        if listed.insert(expected.clone(), control.kind).is_some() {
+            bail!("migration staging control manifest contains a duplicate path");
+        }
+    }
+    let mut present = BTreeMap::new();
+    for kind in [
+        TaskTransferControlKind::Owner,
+        TaskTransferControlKind::Retention,
+        TaskTransferControlKind::PublicationManifest,
+        TaskTransferControlKind::WorkerRequest,
+        TaskTransferControlKind::WorkerLifecycle,
+        TaskTransferControlKind::WorkerLifecycleTransition,
+        TaskTransferControlKind::BbdownConfig,
+    ] {
+        let relative = migration_control_relative_path(job_relative, kind)?;
+        let absolute = root.logical_root_path().join(&relative);
+        if root.entry_identity(&absolute)?.is_some() {
+            present.insert(relative, kind);
+        }
+    }
+    if listed != present {
+        bail!("migration staging controls changed after task transfer plan capture");
+    }
+    if !present.iter().any(|(path, kind)| {
+        *kind == TaskTransferControlKind::Owner
+            && path == &job_relative.join(VIDEO_STAGING_OWNER_FILE_NAME)
+    }) {
+        bail!("migration source staging job has no ownership control");
+    }
+    if present.contains_key(&job_relative.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME)) {
+        bail!("staging job has an unresolved publication manifest and cannot migrate");
+    }
+    if present.contains_key(&job_relative.join(BILIBILI_WORKER_REQUEST_FILE_NAME)) {
+        bail!("staging job has an ephemeral Bilibili worker request and cannot migrate");
+    }
+    if present.contains_key(&job_relative.join("BBDown.config")) {
+        bail!("legacy BBDown.config must be resolved by staging recovery before migration");
+    }
+    if present.contains_key(&job_relative.join(BILIBILI_WORKER_LIFECYCLE_TRANSITION_FILE_NAME)) {
+        let job_path = root.logical_root_path().join(job_relative);
+        let job_identity = root
+            .entry_identity(&job_path)?
+            .context("migration source staging job disappeared during control validation")?;
+        if !job_identity.is_dir()
+            || bilibili_worker_lifecycle_phase(
+                root,
+                &job_path,
+                root.root_identity().device(),
+                root.root_identity().inode(),
+                job_identity.device(),
+                job_identity.inode(),
+            )? != Some(BilibiliWorkerLifecyclePhase::CoreDownloadCompleted)
+        {
+            bail!("Bilibili lifecycle transition is not a valid completed-state pair");
+        }
+    }
+    Ok(())
+}
+
+fn migration_control_file(
+    root: &RootedFs,
+    job_relative: &Path,
+    control: &TaskTransferControl,
+) -> Result<BoundFile> {
+    let expected = migration_control_relative_path(job_relative, control.kind)?;
+    if control.source_relative != expected {
+        bail!("migration staging control path does not match its role");
+    }
+    let path = root.logical_root_path().join(&expected);
+    let file = root
+        .open_bound_file(&path)?
+        .with_context(|| format!("migration staging control is missing: {}", path.display()))?;
+    let policy = file.access_policy()?;
+    if file.identity().device() != control.device
+        || file.identity().inode() != control.inode
+        || file.byte_len()? != control.size_bytes
+        || policy.owner != control.owner
+        || policy.group != control.group
+        || policy.mode != control.mode
+        || control
+            .link_count
+            .is_some_and(|count| count != policy.link_count)
+        || encode_sha256(&file.sha256()?) != control.sha256
+    {
+        bail!(
+            "migration staging control changed after transfer plan capture: {}",
+            path.display()
+        );
+    }
+    if policy.link_count != 1
+        || policy.owner != unsafe { libc::geteuid() }
+        || policy.mode & 0o077 != 0
+    {
+        bail!(
+            "migration staging control is not owner-private: {}",
+            path.display()
+        );
+    }
+    Ok(file)
+}
+
+fn migration_control_receipt(
+    root: &RootedFs,
+    job_relative: &Path,
+    control: &TaskTransferControl,
+) -> Result<StagingMigrationControlReceipt> {
+    let file = migration_control_file(root, job_relative, control)?;
+    let policy = file.access_policy()?;
+    Ok(StagingMigrationControlReceipt {
+        kind: control.kind,
+        relative_path: control.source_relative.clone(),
+        device: file.identity().device(),
+        inode: file.identity().inode(),
+        size_bytes: file.byte_len()?,
+        owner: policy.owner,
+        group: policy.group,
+        mode: policy.mode,
+        link_count: policy.link_count,
+        sha256: encode_sha256(&file.sha256()?),
+    })
+}
+
+fn validate_migration_control_contents(
+    root: &RootedFs,
+    job_relative: &Path,
+    job_identity: EntryIdentity,
+    control: &TaskTransferControl,
+) -> Result<()> {
+    match control.kind {
+        TaskTransferControlKind::Owner => {
+            validate_video_staging_directory(
+                root,
+                &root.logical_root_path().join(job_relative),
+                job_identity,
+            )?;
+        }
+        TaskTransferControlKind::Retention => {
+            if retained_video_staging_reason(
+                root,
+                &root.logical_root_path().join(job_relative),
+                job_identity,
+            )?
+            .is_none()
+            {
+                bail!("migration source retention control has an empty reason");
+            }
+        }
+        TaskTransferControlKind::WorkerLifecycle => {
+            if read_bilibili_worker_lifecycle(
+                root,
+                &root
+                    .logical_root_path()
+                    .join(job_relative)
+                    .join(BILIBILI_WORKER_LIFECYCLE_FILE_NAME),
+                root.root_identity().device(),
+                root.root_identity().inode(),
+                job_identity.device(),
+                job_identity.inode(),
+            )?
+            .is_none()
+            {
+                bail!("migration source worker lifecycle control is missing");
+            }
+        }
+        TaskTransferControlKind::BbdownConfig => {
+            bail!("legacy BBDown.config must be resolved by staging recovery before migration");
+        }
+        TaskTransferControlKind::PublicationManifest | TaskTransferControlKind::WorkerRequest => {
+            bail!("unresolved or ephemeral staging control cannot migrate");
+        }
+        TaskTransferControlKind::WorkerLifecycleTransition => {
+            if bilibili_worker_lifecycle_phase(
+                root,
+                &root.logical_root_path().join(job_relative),
+                root.root_identity().device(),
+                root.root_identity().inode(),
+                job_identity.device(),
+                job_identity.inode(),
+            )? != Some(BilibiliWorkerLifecyclePhase::CoreDownloadCompleted)
+            {
+                bail!("Bilibili lifecycle transition is not a valid completed-state pair");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_migration_control_contents(
+    root: &RootedFs,
+    job_relative: &Path,
+    kind: TaskTransferControlKind,
+    contents: &[u8],
+    mode: u16,
+    allow_replace_migration_marker: bool,
+) -> Result<()> {
+    let relative = migration_control_relative_path(job_relative, kind)?;
+    let path = root.logical_root_path().join(&relative);
+    if let Some(existing) = root.open_bound_file(&path)? {
+        let actual_contents = existing.read_limited(1024 * 1024).with_context(|| {
+            format!(
+                "failed to read existing destination control {}",
+                path.display()
+            )
+        })?;
+        if actual_contents == contents {
+            existing.validate_private_single_link(mode)?;
+            return Ok(());
+        }
+        if !allow_replace_migration_marker
+            || kind != TaskTransferControlKind::Retention
+            || !is_migration_retention_marker(root, job_relative, existing.identity())?
+        {
+            bail!(
+                "destination staging control already exists with different contents: {}",
+                path.display()
+            );
+        }
+        let entry = root.bind_entry(&path, false)?;
+        if root.bound_entry_identity(&entry)? != Some(existing.identity()) {
+            bail!("destination staging retention identity changed before rebind");
+        }
+        let temp = root.logical_root_path().join(job_relative).join(format!(
+            ".migration-retention-{}-{}.next",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        root.replace_bound_file_atomically_if_identity(
+            &entry,
+            existing.identity(),
+            &temp,
+            contents,
+            mode,
+        )?;
+        let replaced = root
+            .open_bound_file(&path)?
+            .context("destination staging retention disappeared after rebind")?;
+        replaced.validate_private_single_link(mode)?;
+        if replaced.read_limited(1024 * 1024)? != contents {
+            bail!("destination staging retention changed during rebind");
+        }
+        return Ok(());
+    }
+    root.create_new_bound_file(&path, contents, mode)
+        .with_context(|| {
+            format!(
+                "failed to create destination staging control {}",
+                path.display()
+            )
+        })?;
+    let created = root
+        .open_bound_file(&path)?
+        .context("destination staging control disappeared after creation")?;
+    created.validate_private_single_link(mode)?;
+    if created.read_limited(1024 * 1024)? != contents {
+        bail!("destination staging control changed after creation");
+    }
+    Ok(())
+}
+
+fn is_migration_retention_marker(
+    root: &RootedFs,
+    job_relative: &Path,
+    identity: EntryIdentity,
+) -> Result<bool> {
+    let path = root
+        .logical_root_path()
+        .join(job_relative)
+        .join(VIDEO_STAGING_RETENTION_FILE_NAME);
+    let Some(file) = root.open_bound_file(&path)? else {
+        return Ok(false);
+    };
+    if file.identity() != identity {
+        return Ok(false);
+    }
+    let retention: VideoStagingRetention =
+        serde_json::from_slice(&file.read_limited(VIDEO_STAGING_RETENTION_LIMIT)?)
+            .context("failed to parse destination migration retention record")?;
+    Ok(retention
+        .reason
+        .starts_with("media library migration staging retained for ")
+        && retention.root_device == root.root_identity().device()
+        && retention.root_inode == root.root_identity().inode())
+}
+
+fn migration_target_control_receipt_for_path(
+    root: &RootedFs,
+    relative: &Path,
+    kind: TaskTransferControlKind,
+) -> Result<StagingMigrationControlReceipt> {
+    let path = root.logical_root_path().join(relative);
+    let file = root
+        .open_bound_file(&path)?
+        .with_context(|| format!("destination staging control is missing: {}", path.display()))?;
+    let policy = file.access_policy()?;
+    if policy.link_count != 1
+        || policy.owner != unsafe { libc::geteuid() }
+        || policy.mode & 0o077 != 0
+    {
+        bail!(
+            "destination staging control is not owner-private: {}",
+            path.display()
+        );
+    }
+    Ok(StagingMigrationControlReceipt {
+        kind,
+        relative_path: relative.to_path_buf(),
+        device: file.identity().device(),
+        inode: file.identity().inode(),
+        size_bytes: file.byte_len()?,
+        owner: policy.owner,
+        group: policy.group,
+        mode: policy.mode,
+        link_count: policy.link_count,
+        sha256: encode_sha256(&file.sha256()?),
+    })
+}
+
+fn encode_sha256(bytes: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
 fn read_bilibili_worker_lifecycle(
     root: &RootedFs,
     path: &Path,
@@ -17311,6 +18196,93 @@ fn recover_pending_video_staging_directories_locked(
     root: &RootedFs,
 ) -> Result<VideoStagingRecoveryReport> {
     recover_pending_video_staging_directories_locked_with_hook(root, &mut |_, _| Ok(()))
+}
+
+/// A normal startup recovery may discard an interrupted staging tree or complete a pending
+/// publication. A migration lease must preserve source payload until its task plan is durable,
+/// so reject destructive recovery states before invoking the ordinary recovery path.
+fn preflight_migration_staging_recovery(root: &RootedFs) -> Result<()> {
+    let parent_path = root.logical_root_path().join(VIDEO_STAGING_DIR_NAME);
+    let Some(parent_identity) = root.entry_identity(&parent_path)? else {
+        return Ok(());
+    };
+    if !parent_identity.is_dir() {
+        return Ok(());
+    }
+    let parent_entry = root.bind_entry(&parent_path, false)?;
+    if root.bound_entry_identity(&parent_entry)? != Some(parent_identity) {
+        bail!(
+            "migration preflight refused destructive staging recovery: staging root identity changed"
+        );
+    }
+    root.validate_private_bound_directory(&parent_entry, parent_identity, 0o700)
+        .context(
+            "migration preflight refused destructive staging recovery: staging root is not private",
+        )?;
+
+    for (name, identity) in root.list_bound_directory(&parent_entry, parent_identity)? {
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("job-") || !identity.is_dir() {
+            continue;
+        }
+        let path = parent_path.join(name);
+        if validate_video_staging_directory(root, &path, identity).is_err() {
+            // Ordinary recovery will retain unowned or malformed state as unresolved. It cannot
+            // safely discard it, so this migration-only guard has no destructive action to block.
+            continue;
+        }
+        for support_name in ["BBDown.config", BILIBILI_WORKER_REQUEST_FILE_NAME] {
+            let support_path = path.join(support_name);
+            if root.entry_identity(&support_path)?.is_some() {
+                bail!(
+                    "migration preflight refused destructive staging recovery: legacy/path-bound staging support files must be resolved by staging recovery before migrating this library ({})",
+                    support_path.display()
+                );
+            }
+        }
+        let publication_path = path.join(VIDEO_STAGING_PUBLICATION_MANIFEST_NAME);
+        if root.entry_identity(&publication_path)?.is_some() {
+            bail!(
+                "migration preflight refused destructive staging recovery: pending publication recovery is required for {}",
+                path.display()
+            );
+        }
+        if retained_video_staging_reason(root, &path, identity)
+            .with_context(|| {
+                format!(
+                    "migration preflight refused destructive staging recovery: failed to validate retention for {}",
+                    path.display()
+                )
+            })?
+            .is_some()
+        {
+            continue;
+        }
+        let lifecycle_phase = bilibili_worker_lifecycle_phase(
+            root,
+            &path,
+            root.root_identity().device(),
+            root.root_identity().inode(),
+            identity.device(),
+            identity.inode(),
+        )
+        .with_context(|| {
+            format!(
+                "migration preflight refused destructive staging recovery: failed to validate completion state for {}",
+                path.display()
+            )
+        })?;
+        if lifecycle_phase == Some(BilibiliWorkerLifecyclePhase::CoreDownloadCompleted) {
+            continue;
+        }
+        bail!(
+            "migration preflight refused destructive staging recovery: unretained nonterminal staging job {} must be recovered or retained before migrating this library",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn recover_pending_video_staging_directories_locked_with_hook<F>(
@@ -21413,6 +22385,10 @@ fn join_paths(paths: &[PathBuf]) -> String {
 }
 
 #[cfg(test)]
+#[path = "staging_migration_tests.rs"]
+mod staging_migration_tests;
+
+#[cfg(test)]
 mod tests {
     use std::env;
     #[cfg(unix)]
@@ -21470,6 +22446,7 @@ mod tests {
             entries: (1..=count).map(test_group_entry).collect(),
             output_template: None,
             output_folder: None,
+            storage_relative_output_folder: None,
             output_folder_identity: None,
         }
     }
@@ -21481,8 +22458,91 @@ mod tests {
         let mut inventory = test_group_inventory(1);
         inventory.source = BilibiliGroupSource::Collection;
         inventory.output_folder = Some(folder.to_string());
+        inventory.storage_relative_output_folder = Some(folder.to_string());
         inventory.output_folder_identity = folder_identity;
         inventory
+    }
+
+    #[test]
+    fn collection_receipt_scope_preserves_legacy_root_and_derives_category_prefix() {
+        let storage_root = PathBuf::from("/media/library");
+        assert_eq!(
+            bilibili_storage_relative_collection_folder(
+                &storage_root,
+                &storage_root,
+                "Owner - Collection [series-17]",
+            )
+            .expect("legacy collection should remain a direct child"),
+            "Owner - Collection [series-17]"
+        );
+        assert_eq!(
+            bilibili_storage_relative_collection_folder(
+                &storage_root,
+                &storage_root.join("Films"),
+                "Owner - Collection [series-17]",
+            )
+            .expect("category scope should be prefixed under the storage root"),
+            "Films/Owner - Collection [series-17]"
+        );
+        assert!(bilibili_storage_relative_collection_folder(
+            &storage_root,
+            &storage_root,
+            "../outside",
+        )
+        .is_err());
+        assert!(
+            bilibili_storage_relative_collection_folder(
+                &storage_root,
+                &storage_root.join("../outside"),
+                "collection",
+            )
+            .is_err()
+        );
+        assert!(
+            bilibili_storage_relative_collection_folder(
+                &storage_root,
+                &storage_root.join("Films"),
+                "nested/collection",
+            )
+            .is_err()
+        );
+        assert!(
+            bilibili_storage_relative_collection_folder(
+                &storage_root,
+                &PathBuf::from("/other/library/Films"),
+                "collection",
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_collection_receipt_scope_does_not_follow_a_category_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let storage_root = temp_test_dir("category-collection-symlink-root");
+        let outside = temp_test_dir("category-collection-symlink-target");
+        let collection = outside.join("selected-collection");
+        fs::create_dir(&collection).expect("outside collection directory should exist");
+        symlink(&outside, storage_root.join("Films")).expect("category symlink should be created");
+        let scope = bilibili_storage_relative_collection_folder(
+            &storage_root,
+            &storage_root.join("Films"),
+            "selected-collection",
+        )
+        .expect("lexical category scope should be root relative");
+        let rooted = RootedFs::new(&storage_root).expect("storage root should bind");
+        let target = bilibili_group_collection_output_folder_path(&rooted, &scope)
+            .expect("nested storage scope should be valid");
+
+        assert!(rooted.entry_identity(&target).is_err());
+        assert!(
+            collection.is_dir(),
+            "symlink target should remain untouched"
+        );
+        fs::remove_dir_all(storage_root).expect("storage root should be removed");
+        fs::remove_dir_all(outside).expect("symlink target should be removed");
     }
 
     #[tokio::test]
@@ -23166,6 +24226,274 @@ mod tests {
         fs::remove_dir_all(output_root).expect("test output root should be removed");
     }
 
+    #[tokio::test]
+    async fn category_collection_publication_and_receipt_recovery_use_the_library_root() {
+        let mut config = test_config();
+        let storage_root = temp_test_dir("episode-group-category-storage-root");
+        let category_root = storage_root.join("Films");
+        let selected_folder = "selected-collection";
+        let collection_dir = category_root.join(selected_folder);
+        fs::create_dir_all(&collection_dir).expect("category collection directory should exist");
+        config.set_video_storage_root(storage_root.clone());
+        config.downloads.video_dir = category_root.clone();
+
+        let scope = bilibili_storage_relative_collection_folder(
+            config.video_storage_root(),
+            &config.downloads.video_dir,
+            selected_folder,
+        )
+        .expect("collection receipt scope should include its category");
+        assert_eq!(scope, "Films/selected-collection");
+        let root = RootedFs::new(config.video_storage_root())
+            .expect("shared library storage root should bind");
+        let collection_identity = root
+            .entry_identity(&collection_dir)
+            .expect("category collection identity should read")
+            .expect("category collection directory should exist");
+        let mut inventory =
+            test_collection_group_inventory(selected_folder, Some(collection_identity));
+        inventory.storage_relative_output_folder = Some(scope.clone());
+        assert_eq!(
+            inventory.collection_directory_snapshot(),
+            BilibiliCollectionDirectorySnapshot::Existing {
+                path: scope.clone(),
+                device: collection_identity.device(),
+                inode: collection_identity.inode(),
+                is_directory: true,
+            }
+        );
+        establish_bilibili_group_collection_directory(&root, &mut inventory)
+            .expect("collection validation should bind the category path under the library root");
+        assert_eq!(
+            bilibili_group_saved_location(&config, &inventory),
+            collection_dir,
+            "the report location must remain inside the selected category"
+        );
+
+        let index = build_bilibili_group_identity_index(&config, &inventory, DownloadMode::All)
+            .await
+            .expect("collection identity index should use the category folder under library root");
+        assert_eq!(
+            index
+                .lock()
+                .await
+                .root
+                .as_ref()
+                .map(RootedFs::root_identity),
+            Some(collection_identity)
+        );
+
+        let staging =
+            create_video_staging_dir(&root).expect("shared library staging should be created");
+        let staging_dir = staging.path().to_path_buf();
+        assert!(staging_dir.starts_with(&storage_root));
+        assert!(!staging_dir.starts_with(&category_root));
+        let staged_media = staging_dir.join("Episode 1.mkv");
+        fs::write(&staged_media, b"category-scoped published media")
+            .expect("staged media should write");
+        staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("completed staging marker should persist");
+
+        let entry = test_group_entry(1);
+        let expected_entry = BilibiliWorkerExpectedEntry {
+            index: entry.download.index,
+            title: entry.download.title.clone(),
+            stable_media_id: entry.stable_media_id.clone(),
+            bilibili_publication_namespace: Some(TEST_GROUP_PUBLICATION_NAMESPACE.to_string()),
+            output_template: None,
+            collection_output_folder: Some(scope.clone()),
+            collection_directory: inventory.collection_directory_snapshot(),
+            confirmed_streams: None,
+        };
+        let media_profile = "test-category-group-publication-profile-v1";
+        let expected_target = collection_dir.join("Episode 1.mkv");
+        let duplicate = VideoDuplicate {
+            skip_summary: None,
+            overwrite_confirmation: None,
+            identity: VideoIdentity {
+                provider: VideoProvider::Bilibili,
+                id: expected_entry.stable_media_id.clone(),
+            },
+            existing_videos: Vec::new(),
+        };
+        let publication = move_staged_video_files_with_root_and_sources(
+            MoveExecutionContext {
+                root: &root,
+                staging: Some(&staging),
+                bilibili_group_receipt: Some(BilibiliGroupReceiptWriteContext {
+                    expected_entry: &expected_entry,
+                    media_profile,
+                    progress: None,
+                }),
+            },
+            &staging_dir,
+            &collection_dir,
+            std::slice::from_ref(&staged_media),
+            VideoDuplicateAction::KeepBoth,
+            &duplicate,
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("category-scoped staged media should publish");
+        assert_eq!(
+            publication.primary_destinations,
+            vec![expected_target.clone()]
+        );
+        assert!(expected_target.is_file());
+        assert_eq!(
+            publication
+                .bilibili_group_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.paths.first()),
+            Some(&expected_target),
+            "the durable receipt should store library-root paths"
+        );
+
+        let receipt = publication
+            .bilibili_group_receipt
+            .as_ref()
+            .expect("group publication receipt should exist");
+        verify_bilibili_group_publication_plan_receipt_blocking(
+            &storage_root,
+            receipt,
+            &publication.primary_destinations,
+            Some(TEST_GROUP_PUBLICATION_NAMESPACE),
+            Some(&scope),
+        )
+        .expect("receipt verification should resolve published files through the library root");
+        assert!(matches!(
+            load_bilibili_group_publication_receipt_blocking(
+                &storage_root,
+                &entry.stable_media_id,
+                media_profile,
+                Some(TEST_GROUP_PUBLICATION_NAMESPACE),
+                Some(&scope),
+            )
+            .expect("receipt recovery lookup should succeed"),
+            BilibiliGroupReceiptLookup::Found(_)
+        ));
+
+        let previous = BilibiliAttemptSnapshot::new_independent(
+            inventory.title.clone(),
+            [(
+                entry.download.index,
+                entry.download.title.clone(),
+                Some(entry.stable_media_id.clone()),
+            )],
+            0,
+        );
+        let saved_entry = previous.entries[0].clone();
+        let recovered = recover_bilibili_group_publication_before_retry(
+            &storage_root,
+            &entry,
+            &saved_entry,
+            media_profile,
+            Some(TEST_GROUP_PUBLICATION_NAMESPACE),
+            Some(&scope),
+        )
+        .await
+        .expect("receipt-backed recovery should verify");
+        assert_eq!(
+            recovered
+                .expect("receipt-backed recovery should return the published media")
+                .paths,
+            vec![expected_target]
+        );
+
+        let direct_entry = test_group_entry(2);
+        let direct_expected_entry = BilibiliWorkerExpectedEntry {
+            index: direct_entry.download.index,
+            title: direct_entry.download.title.clone(),
+            stable_media_id: direct_entry.stable_media_id.clone(),
+            bilibili_publication_namespace: Some(TEST_GROUP_PUBLICATION_NAMESPACE.to_string()),
+            output_template: None,
+            collection_output_folder: None,
+            collection_directory: BilibiliCollectionDirectorySnapshot::Untracked,
+            confirmed_streams: None,
+        };
+        let direct_staging = create_video_staging_dir(&root)
+            .expect("direct category staging should share the library root");
+        let direct_staging_dir = direct_staging.path().to_path_buf();
+        let direct_staged_media = direct_staging_dir.join("Episode 2.mkv");
+        fs::write(&direct_staged_media, b"direct category media")
+            .expect("direct category media should write");
+        direct_staging
+            .retain_for_manual_recovery(VIDEO_STAGING_DOWNLOAD_COMPLETED_REASON)
+            .expect("direct category staging marker should persist");
+        let direct_target = category_root.join("Episode 2.mkv");
+        let direct_publication = move_staged_video_files_with_root_and_sources(
+            MoveExecutionContext {
+                root: &root,
+                staging: Some(&direct_staging),
+                bilibili_group_receipt: Some(BilibiliGroupReceiptWriteContext {
+                    expected_entry: &direct_expected_entry,
+                    media_profile,
+                    progress: None,
+                }),
+            },
+            &direct_staging_dir,
+            &category_root,
+            std::slice::from_ref(&direct_staged_media),
+            VideoDuplicateAction::KeepBoth,
+            &VideoDuplicate {
+                skip_summary: None,
+                overwrite_confirmation: None,
+                identity: VideoIdentity {
+                    provider: VideoProvider::Bilibili,
+                    id: direct_entry.stable_media_id.clone(),
+                },
+                existing_videos: Vec::new(),
+            },
+            StagedPrimaryMediaKind::Video,
+        )
+        .expect("direct Bilibili episode should publish into the selected category");
+        let direct_receipt = direct_publication
+            .bilibili_group_receipt
+            .as_ref()
+            .expect("direct category publication receipt should exist");
+        verify_bilibili_group_publication_plan_receipt_blocking(
+            &storage_root,
+            direct_receipt,
+            &direct_publication.primary_destinations,
+            Some(TEST_GROUP_PUBLICATION_NAMESPACE),
+            None,
+        )
+        .expect("direct category receipt verification should use the library root");
+        let direct_previous = BilibiliAttemptSnapshot::new_independent(
+            "Direct category group".to_string(),
+            [(
+                direct_entry.download.index,
+                direct_entry.download.title.clone(),
+                Some(direct_entry.stable_media_id.clone()),
+            )],
+            0,
+        );
+        let direct_recovered = recover_bilibili_group_publication_before_retry(
+            &storage_root,
+            &direct_entry,
+            &direct_previous.entries[0],
+            media_profile,
+            Some(TEST_GROUP_PUBLICATION_NAMESPACE),
+            None,
+        )
+        .await
+        .expect("direct category receipt recovery should verify");
+        assert_eq!(
+            direct_recovered
+                .expect("direct category receipt should be recoverable")
+                .paths,
+            vec![direct_target]
+        );
+
+        staging
+            .finish()
+            .expect("published staging should be removed");
+        direct_staging
+            .finish()
+            .expect("direct category staging should be removed");
+        fs::remove_dir_all(storage_root).expect("storage root should be removed");
+    }
+
     #[test]
     fn missing_collection_directory_creation_witness_allows_later_episode_publications() {
         let output_root = temp_test_dir("episode-group-missing-directory-witness");
@@ -24632,6 +25960,7 @@ mod tests {
         let mut inventory = test_group_inventory(2);
         inventory.source = BilibiliGroupSource::Collection;
         inventory.output_folder = Some("selected-collection".to_string());
+        inventory.storage_relative_output_folder = Some("selected-collection".to_string());
         let calls = Arc::new(StdMutex::new(Vec::<u32>::new()));
         let executor_calls = Arc::clone(&calls);
         let executor_root = root.clone();

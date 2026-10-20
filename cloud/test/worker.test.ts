@@ -10,6 +10,12 @@ import { submitLegacyFileImport } from "../public/file/legacy-file-import.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "../public/file/metadata-preview.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "../public/file/selection-limit.js";
 import {
+  buildMigrationPreviewRefreshPayload,
+  migrationConflictChoicesChanged,
+  migrationRefreshMatches,
+  setMigrationConflictChoice,
+} from "../public/file/migration-conflicts.js";
+import {
   MAX_TARGET_RELATIVE_DIR_BYTES as CLIENT_MAX_TARGET_RELATIVE_DIR_BYTES,
   MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES as CLIENT_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES,
   validateTargetRelativeDirectory,
@@ -22,11 +28,13 @@ import {
   canonicalJson,
   MAX_ACTION_BODY_BYTES,
   MAX_LEGACY_TEXT_BYTES,
+  MAX_MIGRATION_ITEM_CONFLICTS as WORKER_MAX_MIGRATION_ITEM_CONFLICTS,
   MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS,
   MAX_STATE_BODY_BYTES,
   MAX_TARGET_RELATIVE_DIR_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_BYTES,
   MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES,
   readJsonBody,
+  validateSnapshot,
 } from "../src/validation";
 import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue, getDatabaseEpoch, storeSnapshot } from "../src/store";
 import type { LocalSnapshot } from "../src/types";
@@ -108,6 +116,85 @@ describe("move preview rendering", () => {
 
     expect(rendered).not.toContain("<img");
     expect(rendered).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt; &amp; movie.mkv");
+  });
+});
+
+describe("migration conflict choices", () => {
+  it("marks changed bundle choices stale and binds refreshed choices to the new preview", () => {
+    const preview = {
+      id: "migration-preview-old",
+      revision: "revision-a",
+      source_library_id: "library-source",
+      target_library_id: "library-target",
+      scope: "library",
+      item_ids: ["item-a", "item-b"],
+      include_incomplete_tasks: true,
+      conflict: "skip",
+      item_conflicts: {},
+      set_target_default_on_success: false,
+      items: [{ item_id: "item-a", conflict: true }],
+    };
+    const draft = setMigrationConflictChoice(preview.item_conflicts, "item-a", "keep_both", "skip");
+    expect(migrationConflictChoicesChanged(preview.item_conflicts, draft)).toBe(true);
+    const refresh = buildMigrationPreviewRefreshPayload(preview, draft);
+    expect(refresh).toEqual({
+      source_library_id: "library-source",
+      target_library_id: "library-target",
+      scope: "library",
+      include_incomplete_tasks: true,
+      conflict: "skip",
+      set_target_default_on_success: false,
+      item_conflicts: { "item-a": "keep_both" },
+    });
+    expect(migrationRefreshMatches({ ...preview, id: "migration-preview-new", item_conflicts: draft }, refresh)).toBe(true);
+    expect(migrationRefreshMatches({ ...preview, id: "migration-preview-new", item_conflicts: {} }, refresh)).toBe(false);
+  });
+
+  it("omits overrides for non-conflicting bundles and restores the global choice cleanly", () => {
+    const changed = setMigrationConflictChoice({}, "item-a", "keep_both", "skip");
+    const restored = setMigrationConflictChoice(changed, "item-a", "skip", "skip");
+    expect(restored).toEqual({});
+    const refresh = buildMigrationPreviewRefreshPayload({
+      source_library_id: "library-source",
+      target_library_id: "library-target",
+      scope: "selected",
+      item_ids: ["item-a", "item-b"],
+      conflict: "skip",
+      items: [{ item_id: "item-a", conflict: false }, { item_id: "item-b", conflict: true }],
+    }, { "item-a": "keep_both", "item-b": "keep_both" });
+    expect(refresh?.item_conflicts).toEqual({ "item-b": "keep_both" });
+  });
+
+  it("preserves the inbox AUTOINCREMENT high-water mark when a migration rebuild copies no rows", async () => {
+    await testEnv.DB.prepare(`CREATE TABLE inbox_probe (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      dedup_key TEXT NOT NULL UNIQUE,
+      payload_hash TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      acked_at INTEGER
+    )`).run();
+    await testEnv.DB.prepare(`INSERT INTO inbox_probe (seq, dedup_key, payload_hash, kind, payload_json, created_at)
+      VALUES (6, 'probe:6', 'hash-6', 'library_scan', '{}', 1),
+             (47, 'probe:47', 'hash-47', 'library_scan', '{}', 1)`).run();
+    await testEnv.DB.prepare("DELETE FROM inbox_probe").run();
+
+    const migration = testEnv.TEST_MIGRATIONS.find(({ name }) => name.includes("0003_media_library_request_kinds"));
+    expect(migration).toBeDefined();
+    for (const query of migration?.queries ?? []) {
+      const probeQuery = query
+        .replaceAll("inbox_with_media_library_kinds", "inbox_probe_with_media_library_kinds")
+        .replaceAll("inbox_sequence_backup", "inbox_probe_sequence_backup")
+        .replaceAll("inbox_pending_seq", "inbox_probe_pending_seq")
+        .replace(/\binbox\b/gu, "inbox_probe");
+      await testEnv.DB.prepare(probeQuery).run();
+    }
+
+    const savedSequence = await testEnv.DB.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'inbox_probe'").first<{ seq: number }>();
+    expect(savedSequence?.seq).toBe(47);
+    const next = await testEnv.DB.prepare("INSERT INTO inbox_probe (dedup_key, payload_hash, kind, payload_json, created_at) VALUES ('probe:next', 'hash-next', 'library_scan', '{}', 2) RETURNING seq").first<{ seq: number }>();
+    expect(next?.seq).toBeGreaterThan(47);
   });
 });
 
@@ -255,6 +342,11 @@ describe("snapshot canonicalization bounds", () => {
 });
 
 describe("owner snapshot session", () => {
+  const snapshotLibraries = (session: { snapshot: unknown }) => {
+    const snapshot = session.snapshot as { library?: { libraries?: Array<Record<string, unknown>> } } | null;
+    return snapshot?.library?.libraries ?? [];
+  };
+
   it("keeps private UI and queued actions gated until a successful owner response", () => {
     const startup = beginOwnerVerification();
     expect(startup).toMatchObject({
@@ -300,6 +392,107 @@ describe("owner snapshot session", () => {
     expect(firstLoadFailure.snapshot).toBeNull();
     expect(mayUsePrivateSnapshot(firstLoadFailure)).toBe(false);
     expect(mayDispatchActions(firstLoadFailure)).toBe(false);
+  });
+
+  it("retains a stale per-library view only for the same verified owner, ID, and root", () => {
+    const previous = acceptOwnerSnapshot({
+      settings: {
+        applied: {
+          default_library_id: "main",
+          libraries: [
+            { id: "main", root: "/Volumes/Main" },
+            { id: "archive", root: "/Volumes/Archive" },
+            { id: "moved", root: "/Volumes/OldArchive" },
+          ],
+        },
+      },
+      library: {
+        default_library_id: "main",
+        libraries: [
+          { id: "main", root: "/Volumes/Main", availability: "available", snapshot: { ready: true, items: [] } },
+          { id: "archive", root: "/Volumes/Archive", availability: "available", snapshot: { ready: true, scanned_at: 123, items: [{ id: "cached", presence: "present" }] } },
+          { id: "moved", root: "/Volumes/OldArchive", availability: "available", snapshot: { ready: true, items: [{ id: "old-root", presence: "present" }] } },
+        ],
+      },
+    });
+    const incoming = {
+      synced: true,
+      settings: {
+        applied: {
+          default_library_id: "main",
+          libraries: [
+            { id: "main", root: "/Volumes/Main", name: "Main" },
+            { id: "archive", root: "/Volumes/Archive", name: "Renamed archive" },
+            { id: "moved", root: "/Volumes/NewArchive", name: "Moved archive" },
+          ],
+        },
+      },
+      library: {
+        default_library_id: "main",
+        libraries: [
+          { id: "main", root: "/Volumes/Main", availability: "available", snapshot: { ready: true, items: [{ id: "fresh", presence: "present" }] } },
+          { id: "archive", root: "/Volumes/Archive", availability: "offline", media_count: null, snapshot: null },
+          { id: "moved", root: "/Volumes/NewArchive", availability: "offline", media_count: null, snapshot: null },
+        ],
+      },
+    };
+
+    const accepted = acceptOwnerSnapshot(incoming, previous);
+    const libraries = snapshotLibraries(accepted);
+    expect(libraries.find((entry) => entry.id === "main")?.snapshot).toMatchObject({
+      items: [
+      { id: "fresh", presence: "present" },
+      ],
+    });
+    expect(libraries.find((entry) => entry.id === "archive")).toMatchObject({
+      root: "/Volumes/Archive",
+      availability: "offline",
+      snapshot_stale: true,
+      snapshot: {
+        stale: true,
+        scanned_at: 123,
+        items: [{ id: "cached", presence: "unavailable" }],
+      },
+    });
+    expect(libraries.find((entry) => entry.id === "moved")).toMatchObject({
+      root: "/Volumes/NewArchive",
+      snapshot: null,
+    });
+    expect(libraries.find((entry) => entry.id === "moved")?.snapshot_stale).toBeUndefined();
+
+    const notVerified = { ...beginOwnerVerification(), snapshot: previous.snapshot };
+    const isolated = acceptOwnerSnapshot(incoming, notVerified);
+    expect(snapshotLibraries(isolated).find((entry) => entry.id === "archive")?.snapshot).toBeNull();
+  });
+
+  it("replaces a retained library view when that same root reports a ready scan", () => {
+    const previous = acceptOwnerSnapshot({
+      settings: { applied: { default_library_id: "archive", libraries: [{ id: "archive", root: "/Volumes/Archive" }] } },
+      library: {
+        default_library_id: "archive",
+        libraries: [{ id: "archive", root: "/Volumes/Archive", availability: "available", snapshot: { ready: true, scanned_at: 123, items: [{ id: "old", presence: "present" }] } }],
+      },
+    });
+    const offline = acceptOwnerSnapshot({
+      settings: { applied: { default_library_id: "archive", libraries: [{ id: "archive", root: "/Volumes/Archive" }] } },
+      library: {
+        default_library_id: "archive",
+        libraries: [{ id: "archive", root: "/Volumes/Archive", availability: "offline", snapshot: null }],
+      },
+    }, previous);
+    const recovered = acceptOwnerSnapshot({
+      settings: { applied: { default_library_id: "archive", libraries: [{ id: "archive", root: "/Volumes/Archive" }] } },
+      library: {
+        default_library_id: "archive",
+        libraries: [{ id: "archive", root: "/Volumes/Archive", availability: "available", snapshot: { ready: true, scanned_at: 456, items: [{ id: "new", presence: "present" }] } }],
+      },
+    }, offline);
+
+    expect(snapshotLibraries(recovered)[0]).toMatchObject({
+      availability: "available",
+      snapshot: { scanned_at: 456, items: [{ id: "new", presence: "present" }] },
+    });
+    expect(snapshotLibraries(recovered)[0]?.snapshot_stale).toBeUndefined();
   });
 
   it("drains saved actions after a quiet poll recovers owner verification", async () => {
@@ -456,6 +649,59 @@ function localSnapshot(overrides: Record<string, unknown> = {}): Record<string, 
     ...overrides,
   };
 }
+
+describe("applied media-library snapshot validation", () => {
+  it("accepts registered applied settings plus separate per-library availability and snapshots", () => {
+    const descriptors = [
+      { id: "main", name: "Main", root: "/Volumes/Main", default_category: "Films", is_default: true },
+      { id: "archive", name: "Archive", root: "/Volumes/Archive", default_category: "", is_default: false },
+    ];
+    const snapshot = localSnapshot({
+      settings: {
+        download_dir: "/Volumes/Main",
+        applied: {
+          revision: "settings-revision-1",
+          default_library_id: "main",
+          default_category: "Films",
+          libraries: descriptors,
+        },
+      },
+      library: {
+        revision: "library-revision-1",
+        scanned_at: Math.floor(Date.now() / 1000),
+        items: [],
+        categories: [],
+        warnings: [],
+        libraries: [
+          { ...descriptors[0], availability: "available", media_count: 0, snapshot: { items: [], categories: [] } },
+          { ...descriptors[1], availability: "offline", media_count: 12, snapshot: null },
+        ],
+        migrations: [],
+      },
+    });
+
+    expect(validateSnapshot(snapshot).settings.applied?.default_library_id).toBe("main");
+  });
+
+  it("rejects duplicate or inconsistent default flags in applied library settings", () => {
+    const snapshot = localSnapshot({
+      settings: {
+        download_dir: "/Volumes/Main",
+        applied: {
+          revision: "settings-revision-1",
+          default_library_id: "archive",
+          default_category: "",
+          libraries: [
+            { id: "main", name: "Main", root: "/Volumes/Main", default_category: "", is_default: true },
+            { id: "archive", name: "Archive", root: "/Volumes/Archive", default_category: "", is_default: true },
+          ],
+        },
+      },
+    });
+
+    expect(() => validateSnapshot(snapshot)).toThrow("exactly one registered default library");
+  });
+});
 
 function snapshotReadRaceDb(db: D1Database, commitNewSnapshot: () => Promise<void>): D1Database {
   let interleaved = false;
@@ -804,6 +1050,69 @@ describe("Mini App identity and actions", () => {
     expect(duplicate.status).toBe(202);
     expect((await responseJson<{ duplicate: boolean }>(duplicate)).duplicate).toBe(true);
     expect(changed.status).toBe(409);
+  });
+
+  it("persists validated multi-library settings, downloads, and migration actions through the inbox", async () => {
+    const initData = await signInitData();
+    const actions = [
+      { kind: "library_register", payload: { name: "Archive", path: "/Volumes/Archive", default_category: "Films", set_default: false, create_directory: false } },
+      { kind: "library_set_default", payload: { library_id: "library-archive" } },
+      { kind: "library_set_category", payload: { library_id: "library-archive", default_category: "Films/Recent" } },
+      { kind: "library_rename", payload: { library_id: "library-archive", name: "Film archive" } },
+      { kind: "library_remove", payload: { library_id: "library-archive" } },
+      { kind: "library_scan", payload: { library_id: "library-archive" } },
+      { kind: "file_preview", payload: { library_id: "library-archive", item_ids: ["item-a"], target_relative_dir: "Films" } },
+      { kind: "file_confirm", payload: { preview_id: "preview-a", revision: "revision-a", library_id: "library-archive" } },
+      { kind: "legacy_import", payload: { text: "older links", library_id: "library-archive" } },
+      { kind: "download_submit", payload: { url: "https://www.bilibili.com/video/BV1xx", library_id: "library-archive", category: "Films" } },
+      { kind: "library_migration_preview", payload: { source_library_id: "library-main", target_library_id: "library-archive", scope: "library", include_incomplete_tasks: false, conflict: "skip", item_conflicts: { "item-a": "keep_both" }, set_target_default_on_success: false } },
+      { kind: "library_migration_confirm", payload: { preview_id: "migration-preview-a", revision: "revision-a" } },
+      { kind: "library_migration_control", payload: { migration_id: "migration-a", control: "resume" } },
+    ];
+
+    for (const [index, action] of actions.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: `00000000-0000-4000-8000-${String(0x9400 + index).padStart(12, "0")}`,
+          ...action,
+        }),
+      });
+      expect(response.status, action.kind).toBe(202);
+    }
+
+    const backlog = await responseJson<{ requests: Array<{ kind: string; payload: Record<string, unknown> }> }>(await localRequests());
+    expect(backlog.requests.map((request) => request.kind)).toEqual(actions.map((action) => action.kind));
+    expect(backlog.requests[9]?.payload).toMatchObject({ library_id: "library-archive", category: "Films" });
+    expect(backlog.requests[10]?.payload).toMatchObject({ scope: "library", conflict: "skip", item_conflicts: { "item-a": "keep_both" }, include_incomplete_tasks: false });
+  });
+
+  it("rejects unsafe media-library roots, URLs, migration selections, and controls before persistence", async () => {
+    const initData = await signInitData();
+    const cases = [
+      { kind: "library_register", payload: { name: "Relative", path: "Videos", default_category: "", set_default: false, create_directory: false } },
+      { kind: "download_submit", payload: { url: "file:///etc/passwd", library_id: "library-a", category: "" } },
+      { kind: "download_submit", payload: { url: "https://example.com/video", library_id: "library-a", category: "../outside" } },
+      { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-a", scope: "library" } },
+      { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "selected", item_ids: [], include_incomplete_tasks: false } },
+      { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "selected", item_ids: ["item-a"], item_conflicts: { "item-b": "keep_both" } } },
+      { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "library", item_conflicts: { "item-a": "overwrite" } } },
+      { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "library", item_conflicts: Object.fromEntries(Array.from({ length: WORKER_MAX_MIGRATION_ITEM_CONFLICTS + 1 }, (_, index) => [`item-${index}`, "skip"])) } },
+      { kind: "library_migration_control", payload: { migration_id: "migration-a", control: "delete_all" } },
+    ];
+
+    for (const [index, action] of cases.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({
+          request_id: `00000000-0000-4000-8000-${String(0x9500 + index).padStart(12, "0")}`,
+          ...action,
+        }),
+      });
+      expect(response.status, action.kind).toBe(400);
+    }
+    expect((await localRequests()).status).toBe(200);
+    expect((await responseJson<{ requests: unknown[] }>(await localRequests())).requests).toHaveLength(0);
   });
 
   it("shows a cloud-accepted request while the desktop is offline without exposing its payload", async () => {
@@ -1685,6 +1994,18 @@ describe("local client API and state snapshots", () => {
     const response = await SELF.fetch(new Request(`${workerUrl}/file/`));
     expect(response.status).toBe(200);
     expect(await response.text()).toContain("Video Library");
+  });
+
+  it("serves the independent settings Mini App at slashless and slash paths", async () => {
+    const slashless = await SELF.fetch(new Request(`${workerUrl}/settings`));
+    expect(slashless.status).toBe(200);
+    expect(await slashless.text()).toContain("Register a media library");
+    const response = await SELF.fetch(new Request(`${workerUrl}/settings/`));
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    expect(html).toContain("Register a media library");
+    expect(html).toContain("/settings/app.js");
+    expect(html).toContain("/file/");
   });
 });
 

@@ -1,8 +1,53 @@
 import { describe, expect, it } from "vitest";
-import { boundedFolderSuggestions, filterLibraryItems, groupLibraryItems, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, needsOrganizing, paginateLibraryItems } from "../public/file/library-view.js";
+import { boundedFolderSuggestions, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, needsOrganizing, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary } from "../public/file/library-view.js";
 import { updateSelectionWithinLimit } from "../public/file/selection-limit.js";
 
 describe("bounded library views", () => {
+  it("merges applied registrations with per-library snapshots and preserves offline status", () => {
+    const snapshot = {
+      settings: {
+        download_dir: "/Volumes/Main",
+        applied: {
+          default_library_id: "main",
+          libraries: [
+            { id: "main", name: "Main", root: "/Volumes/Main", default_category: "Films", is_default: true },
+            { id: "archive", name: "Archive", root: "/Volumes/Archive", default_category: "", is_default: false },
+          ],
+        },
+      },
+      library: {
+        default_library_id: "main",
+        libraries: [
+          { id: "main", availability: "available", media_count: 3, snapshot: { items: [{ id: "one" }] } },
+          { id: "archive", availability: "offline", media_count: 7, snapshot: null },
+        ],
+      },
+    };
+    const entries = mediaLibraryEntries(snapshot);
+    const archive = resolveMediaLibrary(snapshot, "archive");
+
+    expect(entries.map((entry) => entry.id)).toEqual(["main", "archive"]);
+    expect(defaultMediaLibraryId(snapshot)).toBe("main");
+    expect(entries[1]).toMatchObject({ name: "Archive", root: "/Volumes/Archive", media_count: 7 });
+    expect(mediaLibraryAvailability(entries[1])).toBe("offline");
+    expect(archive.snapshot).toBeNull();
+    expect(archive.id).toBe("archive");
+    expect(operationMatchesLibrary({ kind: "file_confirm", result: { library_id: "archive" } }, "archive")).toBe(true);
+    expect(operationMatchesLibrary({ kind: "file_confirm", result: { library_id: "main" } }, "archive")).toBe(false);
+  });
+
+  it("falls back to the legacy single-root snapshot until the registry is published", () => {
+    const snapshot = {
+      settings: { download_dir: "/Users/test/Videos" },
+      library: { root_label: "Videos", items: [{ id: "video-a" }], categories: [], warnings: [] },
+    };
+    const resolved = resolveMediaLibrary(snapshot);
+
+    expect(resolved.id).toBe("default");
+    expect(resolved.descriptor).toMatchObject({ name: "Videos", root: "/Users/test/Videos", is_default: true });
+    expect(resolved.snapshot?.items).toEqual([{ id: "video-a" }]);
+  });
+
   it("filters a large snapshot before slicing the matching page", () => {
     const items = Array.from({ length: 50_000 }, (_, index) => ({
       id: `item-${index}`,

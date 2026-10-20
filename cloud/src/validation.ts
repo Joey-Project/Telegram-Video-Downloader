@@ -17,6 +17,10 @@ export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
 export const MAX_TARGET_RELATIVE_DIR_BYTES = 1_024;
 export const MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES = 255;
 export const MAX_SELECTED_ITEMS = 100;
+export const MAX_MEDIA_LIBRARIES = 16;
+export const MAX_MIGRATION_ITEM_CONFLICTS = 10_000;
+export const MAX_LIBRARY_ROOT_BYTES = 1_024;
+export const MAX_DOWNLOAD_URL_BYTES = 8_192;
 const MAX_COLLECTION_ORDER = 0xffff_ffff;
 const MAX_LEGACY_HINTS = 10_000;
 const MAX_LEGACY_HINT_INDEX = MAX_LEGACY_HINTS - 1;
@@ -295,8 +299,28 @@ function parseRelativeDirectory(value: unknown): string {
   return directory;
 }
 
+function parseLibraryId(value: unknown, field = "library_id"): string {
+  return boundedUtf8String(value, field, 128);
+}
+
+function parseOptionalLibraryId(value: unknown): { library_id?: string } {
+  return value === undefined ? {} : { library_id: parseLibraryId(value) };
+}
+
+function parseAbsoluteLibraryRoot(value: unknown): string {
+  const root = boundedUtf8String(value, "path", MAX_LIBRARY_ROOT_BYTES);
+  if (!root.startsWith("/") && !/^[A-Za-z]:[\\/]/u.test(root) && !/^\\\\[^\\]/u.test(root)) {
+    throw new HttpError(400, "path must be an absolute path on the deployment machine");
+  }
+  return root;
+}
+
+function parseLibraryName(value: unknown, field = "name"): string {
+  return boundedUtf8String(value, field, 100);
+}
+
 function parsePreviewPayload(value: unknown): FilePreviewPayload {
-  if (!isRecord(value) || !onlyKeys(value, ["item_ids", "target_relative_dir", "rename", "conflict", "metadata_patches"])) {
+  if (!isRecord(value) || !onlyKeys(value, ["library_id", "item_ids", "target_relative_dir", "rename", "conflict", "metadata_patches"])) {
     throw new HttpError(400, "file_preview payload has an invalid shape");
   }
 
@@ -342,12 +366,225 @@ function parsePreviewPayload(value: unknown): FilePreviewPayload {
   }
 
   return {
+    ...parseOptionalLibraryId(value.library_id),
     ...(itemIds === undefined ? {} : { item_ids: itemIds }),
     ...(targetRelativeDir === undefined ? {} : { target_relative_dir: targetRelativeDir }),
     rename,
     conflict,
     ...(metadataPatches === undefined ? {} : { metadata_patches: metadataPatches }),
   };
+}
+
+function parseSettingsAction(kind: string, value: Record<string, unknown>): Record<string, unknown> {
+  switch (kind) {
+    case "library_register": {
+      if (!onlyKeys(value, ["name", "path", "default_category", "set_default", "create_directory"])) {
+        throw new HttpError(400, "library_register payload has an invalid shape");
+      }
+      const setDefault = value.set_default === undefined ? false : value.set_default;
+      const createDirectory = value.create_directory === undefined ? false : value.create_directory;
+      if (typeof setDefault !== "boolean" || typeof createDirectory !== "boolean") {
+        throw new HttpError(400, "set_default and create_directory must be booleans");
+      }
+      return {
+        name: parseLibraryName(value.name),
+        path: parseAbsoluteLibraryRoot(value.path),
+        default_category: value.default_category === undefined ? "" : parseRelativeDirectory(value.default_category),
+        set_default: setDefault,
+        create_directory: createDirectory,
+      };
+    }
+    case "library_set_default":
+    case "library_remove": {
+      if (!onlyKeys(value, ["library_id"])) throw new HttpError(400, `${kind} payload has an invalid shape`);
+      return { library_id: parseLibraryId(value.library_id) };
+    }
+    case "library_set_category": {
+      if (!onlyKeys(value, ["library_id", "default_category"])) {
+        throw new HttpError(400, "library_set_category payload has an invalid shape");
+      }
+      return {
+        library_id: parseLibraryId(value.library_id),
+        default_category: parseRelativeDirectory(value.default_category),
+      };
+    }
+    case "library_rename": {
+      if (!onlyKeys(value, ["library_id", "name"])) throw new HttpError(400, "library_rename payload has an invalid shape");
+      return { library_id: parseLibraryId(value.library_id), name: parseLibraryName(value.name) };
+    }
+    default:
+      throw new HttpError(400, "kind is not supported");
+  }
+}
+
+function parseMigrationPreview(value: Record<string, unknown>): Record<string, unknown> {
+  if (!onlyKeys(value, [
+    "source_library_id", "target_library_id", "scope", "item_ids", "include_incomplete_tasks",
+    "conflict", "item_conflicts", "set_target_default_on_success",
+  ])) {
+    throw new HttpError(400, "library_migration_preview payload has an invalid shape");
+  }
+  const scope = value.scope;
+  if (scope !== "library" && scope !== "selected") {
+    throw new HttpError(400, "scope must be library or selected");
+  }
+  const itemIds = value.item_ids === undefined
+    ? undefined
+    : stringList(value.item_ids, "item_ids", MAX_SELECTED_ITEMS, 128);
+  if (scope === "selected" && itemIds === undefined) {
+    throw new HttpError(400, "item_ids are required when scope is selected");
+  }
+  if (scope === "library" && itemIds !== undefined) {
+    throw new HttpError(400, "item_ids must be omitted when scope is library");
+  }
+  const includeIncompleteTasks = value.include_incomplete_tasks === undefined ? false : value.include_incomplete_tasks;
+  const setTargetDefault = value.set_target_default_on_success === undefined ? false : value.set_target_default_on_success;
+  if (typeof includeIncompleteTasks !== "boolean" || typeof setTargetDefault !== "boolean") {
+    throw new HttpError(400, "migration options must be booleans");
+  }
+  const conflict = value.conflict === undefined ? "skip" : value.conflict;
+  if (conflict !== "skip" && conflict !== "keep_both") {
+    throw new HttpError(400, "conflict must be skip or keep_both");
+  }
+  let itemConflicts: Record<string, "skip" | "keep_both"> | undefined;
+  if (value.item_conflicts !== undefined) {
+    if (!isRecord(value.item_conflicts)) {
+      throw new HttpError(400, "item_conflicts must be an object keyed by media item ID");
+    }
+    const entries = Object.entries(value.item_conflicts);
+    if (entries.length > MAX_MIGRATION_ITEM_CONFLICTS) {
+      throw new HttpError(400, `item_conflicts cannot exceed ${MAX_MIGRATION_ITEM_CONFLICTS} entries`);
+    }
+    const selectedIds = new Set(itemIds ?? []);
+    itemConflicts = Object.create(null) as Record<string, "skip" | "keep_both">;
+    for (const [rawItemId, policy] of entries) {
+      const itemId = boundedUtf8String(rawItemId, "item_conflicts item ID", 256);
+      if (itemId !== rawItemId) throw new HttpError(400, "item_conflicts IDs must not have surrounding whitespace");
+      if (scope === "selected" && !selectedIds.has(itemId)) {
+        throw new HttpError(400, "item_conflicts may only target selected media item IDs");
+      }
+      if (policy !== "skip" && policy !== "keep_both") {
+        throw new HttpError(400, "each item_conflicts value must be skip or keep_both");
+      }
+      itemConflicts[itemId] = policy;
+    }
+  }
+  const sourceLibraryId = parseLibraryId(value.source_library_id, "source_library_id");
+  const targetLibraryId = parseLibraryId(value.target_library_id, "target_library_id");
+  if (sourceLibraryId === targetLibraryId) throw new HttpError(400, "source and target libraries must differ");
+  return {
+    source_library_id: sourceLibraryId,
+    target_library_id: targetLibraryId,
+    scope,
+    ...(itemIds === undefined ? {} : { item_ids: itemIds }),
+    include_incomplete_tasks: includeIncompleteTasks,
+    conflict,
+    ...(itemConflicts === undefined ? {} : { item_conflicts: itemConflicts }),
+    set_target_default_on_success: setTargetDefault,
+  };
+}
+
+function parseDownloadSubmit(value: Record<string, unknown>): Record<string, unknown> {
+  if (!onlyKeys(value, ["url", "library_id", "category"])) {
+    throw new HttpError(400, "download_submit payload has an invalid shape");
+  }
+  const url = boundedUtf8String(value.url, "url", MAX_DOWNLOAD_URL_BYTES);
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new HttpError(400, "url must be an absolute HTTP or HTTPS URL");
+  }
+  if ((parsed.protocol !== "https:" && parsed.protocol !== "http:") || !parsed.hostname || parsed.username || parsed.password) {
+    throw new HttpError(400, "url must be an absolute HTTP or HTTPS URL without embedded credentials");
+  }
+  return {
+    url,
+    library_id: parseLibraryId(value.library_id),
+    category: value.category === undefined ? "" : parseRelativeDirectory(value.category),
+  };
+}
+
+function validateAppliedSettings(value: unknown): void {
+  if (!isRecord(value) || !onlyKeys(value, ["revision", "default_library_id", "default_category", "libraries"])) {
+    throw new HttpError(400, "settings.applied has an invalid shape");
+  }
+  boundedString(value.revision, "settings.applied.revision", 256);
+  const defaultLibraryId = value.default_library_id;
+  if (typeof defaultLibraryId !== "string" || new TextEncoder().encode(defaultLibraryId).byteLength > 128) {
+    throw new HttpError(400, "settings.applied.default_library_id is invalid");
+  }
+  if (typeof value.default_category !== "string") {
+    throw new HttpError(400, "settings.applied.default_category must be a string");
+  }
+  parseRelativeDirectory(value.default_category);
+  if (!Array.isArray(value.libraries) || value.libraries.length > MAX_MEDIA_LIBRARIES) {
+    throw new HttpError(400, `settings.applied.libraries must contain at most ${MAX_MEDIA_LIBRARIES} entries`);
+  }
+  const ids = new Set<string>();
+  let defaults = 0;
+  for (const [index, candidate] of value.libraries.entries()) {
+    if (!isRecord(candidate) || !onlyKeys(candidate, ["id", "name", "root", "default_category", "is_default"])) {
+      throw new HttpError(400, `settings.applied.libraries[${index}] has an invalid shape`);
+    }
+    const id = parseLibraryId(candidate.id, `settings.applied.libraries[${index}].id`);
+    if (ids.has(id)) throw new HttpError(400, "settings.applied.libraries contains duplicate IDs");
+    ids.add(id);
+    parseLibraryName(candidate.name, `settings.applied.libraries[${index}].name`);
+    parseAbsoluteLibraryRoot(candidate.root);
+    if (typeof candidate.default_category !== "string") {
+      throw new HttpError(400, `settings.applied.libraries[${index}].default_category must be a string`);
+    }
+    parseRelativeDirectory(candidate.default_category);
+    if (typeof candidate.is_default !== "boolean") {
+      throw new HttpError(400, `settings.applied.libraries[${index}].is_default must be a boolean`);
+    }
+    if (candidate.is_default) defaults += 1;
+  }
+  if (value.libraries.length > 0 && (defaults !== 1 || !ids.has(defaultLibraryId))) {
+    throw new HttpError(400, "settings.applied must identify exactly one registered default library");
+  }
+}
+
+function validateLibraryDescriptors(library: Record<string, unknown>): void {
+  if (library.libraries !== undefined) {
+    if (!Array.isArray(library.libraries) || library.libraries.length > MAX_MEDIA_LIBRARIES) {
+      throw new HttpError(400, `library.libraries must contain at most ${MAX_MEDIA_LIBRARIES} entries`);
+    }
+    const ids = new Set<string>();
+    for (const [index, candidate] of library.libraries.entries()) {
+      if (!isRecord(candidate)) throw new HttpError(400, `library.libraries[${index}] must be an object`);
+      const id = parseLibraryId(candidate.id, `library.libraries[${index}].id`);
+      if (ids.has(id)) throw new HttpError(400, "library.libraries contains duplicate IDs");
+      ids.add(id);
+      parseLibraryName(candidate.name, `library.libraries[${index}].name`);
+      parseAbsoluteLibraryRoot(candidate.root);
+      if (candidate.default_category !== undefined && candidate.default_category !== null) {
+        if (typeof candidate.default_category !== "string") {
+          throw new HttpError(400, `library.libraries[${index}].default_category must be a string`);
+        }
+        parseRelativeDirectory(candidate.default_category);
+      }
+      if (candidate.is_default !== undefined && typeof candidate.is_default !== "boolean") {
+        throw new HttpError(400, `library.libraries[${index}].is_default must be a boolean`);
+      }
+      if (candidate.availability !== undefined &&
+        !["available", "unavailable", "offline", "unknown"].includes(String(candidate.availability))) {
+        throw new HttpError(400, `library.libraries[${index}].availability is invalid`);
+      }
+      for (const field of ["media_count", "scanned_at", "free_bytes", "total_bytes"]) {
+        const fieldValue = candidate[field];
+        if (fieldValue !== undefined && fieldValue !== null &&
+          (!Number.isSafeInteger(fieldValue) || (fieldValue as number) < 0)) {
+          throw new HttpError(400, `library.libraries[${index}].${field} must be a non-negative safe integer`);
+        }
+      }
+    }
+  }
+  if (library.migrations !== undefined &&
+    (!Array.isArray(library.migrations) || library.migrations.length > 32)) {
+    throw new HttpError(400, "library.migrations must contain at most 32 entries");
+  }
 }
 
 export function validateActionRequest(value: unknown): ActionRequest {
@@ -358,7 +595,12 @@ export function validateActionRequest(value: unknown): ActionRequest {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(requestId)) {
     throw new HttpError(400, "request_id must be a UUID");
   }
-  if (typeof value.kind !== "string" || !["library_scan", "file_preview", "file_confirm", "legacy_import"].includes(value.kind)) {
+  const supportedKinds = [
+    "library_scan", "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove",
+    "file_preview", "file_confirm", "legacy_import", "download_submit", "library_migration_preview",
+    "library_migration_confirm", "library_migration_control",
+  ];
+  if (typeof value.kind !== "string" || !supportedKinds.includes(value.kind)) {
     throw new HttpError(400, "kind is not supported");
   }
   if (!isRecord(value.payload)) throw new HttpError(400, "payload must be an object");
@@ -367,25 +609,62 @@ export function validateActionRequest(value: unknown): ActionRequest {
   let payload: Record<string, unknown>;
   switch (kind) {
     case "library_scan":
-      if (Object.keys(value.payload).length !== 0) throw new HttpError(400, "library_scan payload must be empty");
-      payload = {};
+      if (!onlyKeys(value.payload, ["library_id"])) throw new HttpError(400, "library_scan payload has an invalid shape");
+      payload = parseOptionalLibraryId(value.payload.library_id);
       break;
     case "file_preview":
       payload = parsePreviewPayload(value.payload) as unknown as Record<string, unknown>;
       break;
     case "file_confirm":
-      if (!onlyKeys(value.payload, ["preview_id", "revision"])) {
+      if (!onlyKeys(value.payload, ["preview_id", "revision", "library_id"])) {
         throw new HttpError(400, "file_confirm payload has an invalid shape");
+      }
+      payload = {
+        preview_id: boundedString(value.payload.preview_id, "preview_id", 128),
+        revision: boundedString(value.payload.revision, "revision", 256),
+        ...parseOptionalLibraryId(value.payload.library_id),
+      };
+      break;
+    case "legacy_import": {
+      if (!onlyKeys(value.payload, ["text", "library_id"])) throw new HttpError(400, "legacy_import payload has an invalid shape");
+      const text = boundedLegacyText(value.payload.text);
+      payload = { text, ...parseOptionalLibraryId(value.payload.library_id) };
+      break;
+    }
+    case "download_submit":
+      payload = parseDownloadSubmit(value.payload);
+      break;
+    case "library_register":
+    case "library_set_default":
+    case "library_set_category":
+    case "library_rename":
+    case "library_remove":
+      payload = parseSettingsAction(kind, value.payload);
+      break;
+    case "library_migration_preview":
+      payload = parseMigrationPreview(value.payload);
+      break;
+    case "library_migration_confirm":
+      if (!onlyKeys(value.payload, ["preview_id", "revision"])) {
+        throw new HttpError(400, "library_migration_confirm payload has an invalid shape");
       }
       payload = {
         preview_id: boundedString(value.payload.preview_id, "preview_id", 128),
         revision: boundedString(value.payload.revision, "revision", 256),
       };
       break;
-    case "legacy_import": {
-      if (!onlyKeys(value.payload, ["text"])) throw new HttpError(400, "legacy_import payload has an invalid shape");
-      const text = boundedLegacyText(value.payload.text);
-      payload = { text };
+    case "library_migration_control": {
+      if (!onlyKeys(value.payload, ["migration_id", "control"])) {
+        throw new HttpError(400, "library_migration_control payload has an invalid shape");
+      }
+      const control = value.payload.control;
+      if (!["pause", "resume", "stop_remaining", "retry_failed"].includes(String(control))) {
+        throw new HttpError(400, "control is not supported");
+      }
+      payload = {
+        migration_id: boundedString(value.payload.migration_id, "migration_id", 128),
+        control,
+      };
       break;
     }
   }
@@ -445,6 +724,8 @@ export function validateSnapshot(value: unknown): LocalSnapshot {
   if (!isRecord(value.settings) || typeof value.settings.download_dir !== "string") {
     throw new HttpError(400, "settings.download_dir is required");
   }
+  if (value.settings.applied !== undefined) validateAppliedSettings(value.settings.applied);
+  validateLibraryDescriptors(library);
   return value as unknown as LocalSnapshot;
 }
 
