@@ -1,0 +1,202 @@
+import {
+  MAX_MIGRATION_ITEM_CONFLICTS,
+  migrationConflictChoicesChanged,
+  normalizeMigrationItemConflicts,
+} from "./migration-conflicts.js";
+import { escapeHtml } from "./preview-rendering.js";
+
+const MAX_SUMMARY_SAMPLE_ITEMS = 4;
+const MAX_SUMMARY_PATH_CHARS = 240;
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "Size unavailable";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let unit = -1;
+  do { size /= 1024; unit += 1; } while (size >= 1024 && unit < units.length - 1);
+  return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unit]}`;
+}
+
+function displayText(value, maxChars = MAX_SUMMARY_PATH_CHARS) {
+  const text = String(value ?? "");
+  const characters = [...text];
+  return characters.length > maxChars ? `${characters.slice(0, maxChars - 1).join("")}…` : text;
+}
+
+function validIdentity(value, { migrationId = false } = {}) {
+  if (typeof value !== "string" || !value || value.length > 128 || value.trim() !== value) return false;
+  if (/[\u0000-\u001f\u007f]/u.test(value)) return false;
+  return !migrationId || /^[A-Za-z0-9-]+$/u.test(value);
+}
+
+function safeCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function compactPreview(operation, result, options) {
+  const envelopeId = operation?.preview_id ?? operation?.id;
+  const envelopeRevision = operation?.revision;
+  const resultId = result.id ?? result.preview_id;
+  const id = typeof envelopeId === "string" ? envelopeId : resultId;
+  const revision = typeof envelopeRevision === "string" ? envelopeRevision : result.revision;
+  const identitiesMatch = (envelopeId === undefined || envelopeId === resultId)
+    && (envelopeRevision === undefined || envelopeRevision === result.revision);
+
+  const itemCount = safeCount(result.item_count);
+  const fileCount = safeCount(result.file_count);
+  const conflictCount = safeCount(result.conflict_count);
+  const incompleteTaskCount = safeCount(result.incomplete_task_count);
+  const omittedItemCount = safeCount(result.omitted_item_count);
+  const omittedFileCount = safeCount(result.omitted_file_count);
+  const byteFields = [result.total_bytes, result.required_space_bytes, result.available_space_bytes];
+  const byteFieldsValid = byteFields.every((value) => Number.isSafeInteger(value) && value >= 0)
+    && (result.staging_bytes === null || result.staging_bytes === undefined
+      || Number.isSafeInteger(result.staging_bytes) && result.staging_bytes >= 0);
+  const sampleItems = Array.isArray(result.sample_items) ? result.sample_items : [];
+  const samples = sampleItems.slice(0, MAX_SUMMARY_SAMPLE_ITEMS);
+  const locallyOmittedItemCount = sampleItems.length - samples.length;
+  const displayedOmittedItemCount = (omittedItemCount ?? 0) + locallyOmittedItemCount;
+  const sourceLibraryId = typeof result.source_library_id === "string" ? result.source_library_id : "";
+  const targetLibraryId = typeof result.target_library_id === "string" ? result.target_library_id : "";
+  const validScope = result.scope === "library" || result.scope === "selected";
+  const validConflict = result.conflict === "skip" || result.conflict === "keep_both";
+  const summaryValid = identitiesMatch
+    && validIdentity(id, { migrationId: true })
+    && validIdentity(revision)
+    && validIdentity(sourceLibraryId)
+    && validIdentity(targetLibraryId)
+    && validScope
+    && validConflict
+    && typeof result.include_incomplete_tasks === "boolean"
+    && typeof result.set_target_default_on_success === "boolean"
+    && [itemCount, fileCount, conflictCount, incompleteTaskCount, omittedItemCount, omittedFileCount]
+      .every((value) => value !== null)
+    && Array.isArray(result.sample_items)
+    && sampleItems.length <= MAX_SUMMARY_SAMPLE_ITEMS
+    && itemCount === sampleItems.length + omittedItemCount
+    && omittedFileCount === fileCount
+    && byteFieldsValid
+    && sampleItems.every((item) => item && typeof item === "object"
+      && typeof item.item_id === "string"
+      && typeof item.source_path === "string" && typeof item.target_path === "string"
+      && (item.outcome === "move" || item.outcome === "skip"));
+
+  const status = String(operation?.status ?? "unknown");
+  const invalidated = options.invalidated === true || options.draftChanged === true
+    || options.refreshPending === true || operation?.invalidated === true;
+  const awaitingConfirmation = status === "awaiting_confirmation";
+  const librariesAvailable = options.sourceAvailable === true && options.targetAvailable === true;
+  const canConfirm = summaryValid && awaitingConfirmation && librariesAvailable && !invalidated;
+
+  const summary = `${itemCount?.toLocaleString() ?? "Unknown"} media items · ${fileCount?.toLocaleString() ?? "Unknown"} files · ${formatBytes(result.total_bytes)} total`;
+  const space = `Required space ${formatBytes(result.required_space_bytes)} · Available ${formatBytes(result.available_space_bytes)} · ${conflictCount?.toLocaleString() ?? "Unknown"} conflict${conflictCount === 1 ? "" : "s"}`;
+  const taskBytes = result.staging_bytes === null || result.staging_bytes === undefined
+    ? "staged data size unknown"
+    : `${formatBytes(result.staging_bytes)} staged data`;
+  const tasks = incompleteTaskCount > 0
+    ? `<p>${incompleteTaskCount.toLocaleString()} unfinished tasks · ${taskBytes} ${result.include_incomplete_tasks === true ? "included" : "left in the source"}</p>`
+    : "";
+  const conflictLabel = result.conflict === "keep_both" ? "Keep both" : result.conflict === "skip" ? "Skip" : "Unknown";
+  const sampleRows = samples.map((item) => {
+    const outcome = item.outcome === "skip" || item.status === "skipped" ? "Will skip" : "Will move";
+    const source = escapeHtml(displayText(item.source_path));
+    const target = escapeHtml(displayText(item.target_path));
+    const label = escapeHtml(displayText(item.item_id ?? "Selected media", 160));
+    const truncated = [...String(item.source_path)].length > MAX_SUMMARY_PATH_CHARS
+      || [...String(item.target_path)].length > MAX_SUMMARY_PATH_CHARS;
+    const pathHint = truncated ? `<br><span class="field-hint">Sample path abbreviated for display.</span>` : "";
+    return `<div class="preview-line"><span>${label}<br><span class="field-hint">${source} → ${target}</span>${pathHint}</span><strong class="${outcome === "Will skip" ? "skip" : "move"}">${outcome}</strong></div>`;
+  }).join("");
+  const omittedItems = displayedOmittedItemCount > 0
+    ? `<p class="field-hint">Showing ${samples.length.toLocaleString()} sample media paths; ${displayedOmittedItemCount.toLocaleString()} item details omitted from this view.</p>`
+    : "";
+  const omittedFiles = omittedFileCount > 0
+    ? `<p class="field-hint">${omittedFileCount.toLocaleString()} attached-file paths omitted from this view.</p>`
+    : "";
+  const selectionNotice = `<p>The complete ${escapeHtml(result.scope === "selected" ? "selected set" : "library selection")} and its existing conflict choices will be used.</p>`;
+  const unavailable = !librariesAvailable
+    ? `<p class="field-hint">The source or target library is offline or showing a saved scan. Reconnect it before starting the migration.</p>`
+    : "";
+  const stale = !awaitingConfirmation
+    ? `<p class="field-hint" role="status">This preview is ${escapeHtml(status.replaceAll("_", " "))} and cannot be started.</p>`
+    : "";
+  const invalidatedMessage = invalidated
+    ? `<p class="field-hint" role="alert">This preview has pending or changed conflict choices. Request a fresh preview before starting.</p>`
+    : "";
+  const invalidSummary = !summaryValid
+    ? `<p class="field-hint" role="alert">The compact preview summary is incomplete or inconsistent. Request a fresh preview before starting.</p>`
+    : "";
+
+  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Source: ${escapeHtml(sourceLibraryId)} · Target: ${escapeHtml(targetLibraryId)}</p>${selectionNotice}<p>Default conflict choice: ${conflictLabel}.</p>${unavailable}${stale}${invalidatedMessage}${invalidSummary}</div><span class="state-pill pending">Compact review</span></div><div class="preview-table">${sampleRows || `<div class="preview-line"><span>No sample media paths are available.</span></div>`}${omittedItems}${omittedFiles}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button></div></article>`;
+}
+
+function fullPreview(operation, result, options) {
+  const id = String(result.id ?? result.preview_id ?? operation?.preview_id ?? operation?.id ?? "");
+  const revision = String(result.revision ?? operation?.revision ?? "");
+  const sourceAvailable = options.sourceAvailable === true;
+  const targetAvailable = options.targetAvailable === true;
+  if (operation?.incomplete || !Array.isArray(result.items)) {
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>${escapeHtml(operation?.reason ?? "Preview details are unavailable in this cloud snapshot. Request a fresh preview before confirming.")}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+  }
+  const files = result.items;
+  const displayItems = [...files.slice(0, 30), ...files.slice(30).filter((item) => item?.conflict === true)];
+  const draft = options.draft;
+  const savedConflicts = normalizeMigrationItemConflicts(result.item_conflicts);
+  const draftConflicts = draft ? normalizeMigrationItemConflicts(draft.itemConflicts) : savedConflicts;
+  const choicesChanged = Boolean(draft && migrationConflictChoicesChanged(savedConflicts, draftConflicts));
+  const invalidated = options.invalidated === true || choicesChanged;
+  const refreshPending = Boolean(draft?.refreshRequestId);
+  const paths = displayItems.map((item) => {
+    const itemId = String(item.item_id ?? "");
+    const conflict = item.conflict === true && itemId.length > 0;
+    const policy = conflict
+      ? draftConflicts[itemId] ?? (result.conflict === "keep_both" ? "keep_both" : "skip")
+      : "skip";
+    const outcome = item.outcome === "skip" || item.status === "skipped" ? "Will skip" : "Will move";
+    const nested = Array.isArray(item.files) ? item.files : [];
+    const labels = nested.slice(0, 12).map((file) => `${escapeHtml(file.source_path ?? "Source unavailable")} → ${escapeHtml(file.target_path ?? "Target unavailable")}`);
+    const path = `${escapeHtml(item.source_path ?? "Source unavailable")} → ${escapeHtml(item.target_path ?? "Target unavailable")}`;
+    const choice = conflict
+      ? `<label class="migration-conflict-choice">${escapeHtml(itemId)} conflict<select class="select-control" data-migration-conflict-item="${escapeHtml(itemId)}" data-migration-preview-id="${escapeHtml(id)}" aria-label="Conflict handling for ${escapeHtml(itemId)}" ${refreshPending || !sourceAvailable || !targetAvailable ? "disabled" : ""}><option value="skip" ${policy === "skip" ? "selected" : ""}>Skip</option><option value="keep_both" ${policy === "keep_both" ? "selected" : ""}>Keep both</option></select></label>`
+      : `<strong class="${item.outcome === "skip" || item.status === "skipped" ? "skip" : "move"}">${outcome}</strong>`;
+    return `<div class="preview-line${conflict ? " migration-conflict-line" : ""}"><span>${path}${labels.length ? `<br><span class="field-hint">${labels.join("<br>")}</span>` : ""}</span>${choice}</div>`;
+  }).join("");
+  const moreCount = Math.max(0, files.length - displayItems.length);
+  const more = moreCount ? `<p class="field-hint">${moreCount} non-conflicting item paths are retained in the preview.</p>` : "";
+  const summary = `${Number(result.item_count ?? files.length).toLocaleString()} media items · ${Number(result.file_count ?? 0).toLocaleString()} files · ${formatBytes(result.total_bytes)} total`;
+  const space = `Required space ${formatBytes(result.required_space_bytes)} · Available ${formatBytes(result.available_space_bytes)} · ${Number(result.conflict_count ?? 0)} conflict${Number(result.conflict_count ?? 0) === 1 ? "" : "s"}`;
+  const taskBytes = result.incomplete_task_bytes ?? result.staging_bytes;
+  const taskBytesLabel = taskBytes === null || taskBytes === undefined
+    ? "staged data size unknown"
+    : `${formatBytes(taskBytes)} staged data`;
+  const tasks = Number(result.incomplete_task_count ?? 0) > 0
+    ? `<p>${Number(result.incomplete_task_count).toLocaleString()} unfinished tasks · ${taskBytesLabel} ${result.include_incomplete_tasks === true ? "included" : "left in the source"}</p>`
+    : "";
+  const refreshMessage = refreshPending
+    ? `<p class="field-hint" role="status">Waiting for the updated preview from your computer. This preview cannot be confirmed.</p>`
+    : draft?.refreshError ? `<p class="field-hint" role="alert">${escapeHtml(draft.refreshError)}</p>` : "";
+  const staleMessage = invalidated && !refreshPending
+    ? `<p class="field-hint" role="alert">Conflict choices changed. Refresh this preview before starting the migration.</p>`
+    : "";
+  const supersededMessage = options.invalidated === true && !draft
+    ? `<p class="field-hint" role="status">This preview was superseded by a refreshed preview and cannot be confirmed.</p>`
+    : "";
+  const canConfirm = Boolean(id && revision) && !invalidated && sourceAvailable && targetAvailable;
+  const canRefresh = Boolean(id && revision && draft && choicesChanged && !refreshPending);
+  const refreshButton = canRefresh
+    ? `<button class="small-button" type="button" data-migration-refresh-conflicts="${escapeHtml(id)}" ${sourceAvailable && targetAvailable ? "" : "disabled"}>Refresh preview</button>`
+    : "";
+  const conflictLimit = Number(result.conflict_count ?? files.filter((item) => item?.conflict === true).length) > MAX_MIGRATION_ITEM_CONFLICTS
+    ? `<p class="field-hint">This preview has more than ${MAX_MIGRATION_ITEM_CONFLICTS.toLocaleString()} conflicting bundles. Refresh with the global choice to review a supported subset.</p>`
+    : "";
+  const offlineMessage = sourceAvailable && targetAvailable ? "" : `<p class="field-hint">The source or target library is offline or showing a saved scan. Reconnect it and refresh before starting the migration.</p>`;
+  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Category and collection structure will be preserved. Default conflict choice: ${escapeHtml(result.conflict ?? "skip")}.</p>${offlineMessage}${refreshMessage}${staleMessage}${supersededMessage}${conflictLimit}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${paths || `<div class="preview-line"><span>No media items were found in this selection.</span></div>`}${more}</div><div class="stack-actions">${refreshButton}<button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button></div></article>`;
+}
+
+export function renderMigrationPreview(operation, options = {}) {
+  const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
+  if (operation?.migration_summary === true) return compactPreview(operation, result, options);
+  return fullPreview(operation, result, options);
+}

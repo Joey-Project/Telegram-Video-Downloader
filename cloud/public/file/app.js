@@ -14,6 +14,7 @@ import { validateTargetRelativeDirectory } from "./target-directory.js";
 import { boundedFolderSuggestions, canOperateOnMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary, statusOf } from "./library-view.js";
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
 import { renderMigrationHistory } from "./migration-rendering.js";
+import { renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
 
 const API = "/api";
 const CACHE_KEY = "file-manager.snapshot.v1";
@@ -839,67 +840,23 @@ function settleMigrationConflictRefreshes() {
 function renderMigrationPreview(operation) {
   const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
   const id = String(result.id ?? result.preview_id ?? operation?.preview_id ?? operation?.id ?? "");
-  const revision = String(result.revision ?? operation?.revision ?? "");
   const sourceLibraryId = String(result.source_library_id ?? operation?.source_library_id ?? activeLibraryId());
   const sourceAvailable = libraryCanOperate(sourceLibraryId);
   const targetLibraryId = String(result.target_library_id ?? operation?.target_library_id ?? "");
   const targetAvailable = !targetLibraryId || libraryCanOperate(targetLibraryId);
-  if (operation?.incomplete || !Array.isArray(result.items)) {
-    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>${escapeHtml(operation?.reason ?? "Preview details are unavailable in this cloud snapshot. Request a fresh preview before confirming.")}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
-  }
-  const files = Array.isArray(result.items) ? result.items : [];
-  const displayItems = [...files.slice(0, 30), ...files.slice(30).filter((item) => item?.conflict === true)];
   const draft = state.migrationConflictDrafts.get(id);
   const savedConflicts = normalizeMigrationItemConflicts(result.item_conflicts);
   const draftConflicts = draft ? normalizeMigrationItemConflicts(draft.itemConflicts) : savedConflicts;
   const choicesChanged = Boolean(draft && migrationConflictChoicesChanged(savedConflicts, draftConflicts));
-  const invalidated = state.migrationConflictInvalidated.has(id) || choicesChanged;
-  const refreshPending = Boolean(draft?.refreshRequestId);
-  const paths = displayItems.map((item) => {
-    const itemId = String(item.item_id ?? "");
-    const conflict = item.conflict === true && itemId.length > 0;
-    const policy = conflict
-      ? draftConflicts[itemId] ?? (result.conflict === "keep_both" ? "keep_both" : "skip")
-      : "skip";
-    const outcome = item.outcome === "skip" || item.status === "skipped" ? "Will skip" : "Will move";
-    const nested = Array.isArray(item.files) ? item.files : [];
-    const labels = nested.slice(0, 12).map((file) => `${escapeHtml(file.source_path ?? "Source unavailable")} → ${escapeHtml(file.target_path ?? "Target unavailable")}`);
-    const path = `${escapeHtml(item.source_path ?? "Source unavailable")} → ${escapeHtml(item.target_path ?? "Target unavailable")}`;
-    const choice = conflict
-      ? `<label class="migration-conflict-choice">${escapeHtml(itemId)} conflict<select class="select-control" data-migration-conflict-item="${escapeHtml(itemId)}" data-migration-preview-id="${escapeHtml(id)}" aria-label="Conflict handling for ${escapeHtml(itemId)}" ${refreshPending || !sourceAvailable || !targetAvailable ? "disabled" : ""}><option value="skip" ${policy === "skip" ? "selected" : ""}>Skip</option><option value="keep_both" ${policy === "keep_both" ? "selected" : ""}>Keep both</option></select></label>`
-      : `<strong class="${item.outcome === "skip" || item.status === "skipped" ? "skip" : "move"}">${outcome}</strong>`;
-    return `<div class="preview-line${conflict ? " migration-conflict-line" : ""}"><span>${path}${labels.length ? `<br><span class="field-hint">${labels.join("<br>")}</span>` : ""}</span>${choice}</div>`;
-  }).join("");
-  const moreCount = Math.max(0, files.length - displayItems.length);
-  const more = moreCount ? `<p class="field-hint">${moreCount} non-conflicting item paths are retained in the preview.</p>` : "";
-  const summary = `${Number(result.item_count ?? files.length).toLocaleString()} media items · ${Number(result.file_count ?? 0).toLocaleString()} files · ${formatBytes(result.total_bytes)} total`;
-  const space = `Required space ${formatBytes(result.required_space_bytes)} · Available ${formatBytes(result.available_space_bytes)} · ${Number(result.conflict_count ?? 0)} conflict${Number(result.conflict_count ?? 0) === 1 ? "" : "s"}`;
-  const taskBytes = result.incomplete_task_bytes ?? result.staging_bytes;
-  const taskBytesLabel = taskBytes === null || taskBytes === undefined
-    ? "staged data size unknown"
-    : `${formatBytes(taskBytes)} staged data`;
-  const tasks = Number(result.incomplete_task_count ?? 0) > 0
-    ? `<p>${Number(result.incomplete_task_count).toLocaleString()} unfinished tasks · ${taskBytesLabel} ${result.include_incomplete_tasks === true ? "included" : "left in the source"}</p>`
-    : "";
-  const refreshMessage = refreshPending
-    ? `<p class="field-hint" role="status">Waiting for the updated preview from your computer. This preview cannot be confirmed.</p>`
-    : draft?.refreshError ? `<p class="field-hint" role="alert">${escapeHtml(draft.refreshError)}</p>` : "";
-  const staleMessage = invalidated && !refreshPending
-    ? `<p class="field-hint" role="alert">Conflict choices changed. Refresh this preview before starting the migration.</p>`
-    : "";
-  const supersededMessage = state.migrationConflictInvalidated.has(id) && !draft
-    ? `<p class="field-hint" role="status">This preview was superseded by a refreshed preview and cannot be confirmed.</p>`
-    : "";
-  const canConfirm = Boolean(id && revision) && !invalidated && sourceAvailable && targetAvailable;
-  const canRefresh = Boolean(id && revision && draft && choicesChanged && !refreshPending);
-  const refreshButton = canRefresh
-    ? `<button class="small-button" type="button" data-migration-refresh-conflicts="${escapeHtml(id)}" ${sourceAvailable && targetAvailable ? "" : "disabled"}>Refresh preview</button>`
-    : "";
-  const conflictLimit = Number(result.conflict_count ?? files.filter((item) => item?.conflict === true).length) > MAX_MIGRATION_ITEM_CONFLICTS
-    ? `<p class="field-hint">This preview has more than ${MAX_MIGRATION_ITEM_CONFLICTS.toLocaleString()} conflicting bundles. Refresh with the global choice to review a supported subset.</p>`
-    : "";
-  const offlineMessage = sourceAvailable && targetAvailable ? "" : `<p class="field-hint">The source or target library is offline or showing a saved scan. Reconnect it and refresh before starting the migration.</p>`;
-  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Category and collection structure will be preserved. Default conflict choice: ${escapeHtml(result.conflict ?? "skip")}.</p>${offlineMessage}${refreshMessage}${staleMessage}${supersededMessage}${conflictLimit}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${paths || `<div class="preview-line"><span>No media items were found in this selection.</span></div>`}${more}</div><div class="stack-actions">${refreshButton}<button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button></div></article>`;
+  return renderMigrationPreviewCard(operation, {
+    activeLibraryId: activeLibraryId(),
+    sourceAvailable,
+    targetAvailable,
+    draft,
+    draftChanged: choicesChanged,
+    refreshPending: Boolean(draft?.refreshRequestId),
+    invalidated: state.migrationConflictInvalidated.has(id),
+  });
 }
 
 function renderMigrations() {

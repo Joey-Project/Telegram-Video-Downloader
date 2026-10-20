@@ -2141,23 +2141,25 @@ async fn build_cloud_state_snapshot(
     let scan_warning = runtime.library_scan_warning.lock().await.clone();
     let (mut records, omitted_preview_count) =
         cloud_state_records_bounded(runtime, CLOUD_STATE_PREVIEW_ENTRY_LIMIT).await?;
-    let (unconfirmable_preview_ids, preview_check_failed) =
+    let (unconfirmable_preview_sequences, preview_check_failed) =
         media_library_bot::unconfirmable_previews(runtime, &records).await;
     for record in &mut records {
-        if record.request.kind != "file_preview"
-            || record.status != InboxStatus::AwaitingConfirmation
+        if record.status != InboxStatus::AwaitingConfirmation
+            || !matches!(
+                record.request.kind.as_str(),
+                "file_preview" | "library_migration_preview"
+            )
+            || !unconfirmable_preview_sequences.contains(&record.request.seq)
         {
             continue;
         }
-        if cloud_preview_identity(record)
-            .is_some_and(|(preview_id, _)| unconfirmable_preview_ids.contains(&preview_id))
-        {
-            record.status = InboxStatus::Stale;
-            record.error = Some(
-                "This preview is no longer confirmable in the current local file session. Run a fresh preview."
-                    .to_string(),
-            );
-        }
+        record.status = InboxStatus::Stale;
+        record.error = Some(if record.request.kind == "library_migration_preview" {
+            "This migration preview is expired, superseded, or already confirmed. Create a fresh migration preview.".to_string()
+        } else {
+            "This preview is no longer confirmable in the current local file session. Run a fresh preview."
+                .to_string()
+        });
     }
     let mut management_records = records
         .iter()

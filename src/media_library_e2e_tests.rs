@@ -132,6 +132,190 @@ async fn create_and_confirm_migration(
     preview
 }
 
+#[tokio::test]
+async fn expired_migration_preview_projects_stale_without_hiding_a_live_preview() {
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "migration-preview-expiry-projection",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    fs::write(fixture.video_root.join("clip.mp4"), b"preview source media")
+        .expect("source media should write");
+    let runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let payload = serde_json::json!({
+        "source_library_id": fixture.source_library_id,
+        "target_library_id": fixture.target_library_id,
+        "scope": "library",
+        "conflict": "skip",
+        "include_incomplete_tasks": false,
+    });
+    let expired_record = run_library_management_test_request(
+        &runtime,
+        3_301,
+        "library_migration_preview",
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(
+        expired_record.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        expired_record.error
+    );
+    let expired_preview = expired_record.result.unwrap();
+    let expired_id = expired_preview["id"]
+        .as_str()
+        .expect("migration preview should have an ID")
+        .to_string();
+    let expired_revision = expired_preview["revision"]
+        .as_str()
+        .expect("migration preview should have a revision")
+        .to_string();
+
+    let live_record =
+        run_library_management_test_request(&runtime, 3_302, "library_migration_preview", payload)
+            .await;
+    assert_eq!(
+        live_record.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        live_record.error
+    );
+    let live_preview = live_record.result.unwrap();
+    let live_id = live_preview["id"]
+        .as_str()
+        .expect("live migration preview should have an ID")
+        .to_string();
+    let live_revision = live_preview["revision"]
+        .as_str()
+        .expect("live migration preview should have a revision")
+        .to_string();
+
+    let unknown_record = run_library_management_test_request(
+        &runtime,
+        3_303,
+        "library_migration_preview",
+        serde_json::json!({
+            "source_library_id": fixture.source_library_id,
+            "target_library_id": fixture.target_library_id,
+            "scope": "library",
+            "conflict": "skip",
+            "include_incomplete_tasks": false,
+        }),
+    )
+    .await;
+    assert_eq!(unknown_record.status, InboxStatus::AwaitingConfirmation);
+    inbox
+        .update(3_303, |record| {
+            if let Some(payload) = record.request.payload.as_object_mut() {
+                payload.remove("source_library_id");
+            }
+            if let Some(result) = record
+                .result
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                result.remove("source_library_id");
+            }
+        })
+        .expect("fixture should make the source binding unavailable to projection");
+
+    let expired_path = expire_migration_preview_for_test(&fixture.video_root, &expired_id);
+    let snapshot = build_cloud_state_snapshot(&runtime)
+        .await
+        .expect("snapshot should check migration preview age")
+        .expect("cloud state should be available");
+
+    let expired_operation = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation["seq"] == 3_301)
+        .expect("expired migration operation should remain visible in history");
+    assert_eq!(expired_operation["status"], "stale");
+    assert!(
+        expired_operation["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("expired")),
+        "the operation should explain why confirmation is disabled"
+    );
+    assert!(
+        snapshot
+            .previews
+            .iter()
+            .all(|preview| preview["seq"] != 3_301),
+        "stale migration previews must be absent from the actionable preview list"
+    );
+    assert!(
+        expired_path.exists(),
+        "the stale projection should work before rotating maintenance retires the file"
+    );
+
+    let live_operation = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation["seq"] == 3_302)
+        .expect("live migration operation should remain visible");
+    assert_eq!(live_operation["status"], "awaiting_confirmation");
+    assert!(snapshot.previews.iter().any(|preview| {
+        preview["seq"] == 3_302
+            && preview["status"] == "awaiting_confirmation"
+            && preview["result"]["id"] == live_id
+            && preview["revision"] == live_revision
+    }));
+    let unknown_operation = snapshot
+        .operations
+        .iter()
+        .find(|operation| operation["seq"] == 3_303)
+        .expect("unbound migration operation should remain visible");
+    assert_eq!(unknown_operation["status"], "awaiting_confirmation");
+    assert!(
+        snapshot.library["warnings"]
+            .as_array()
+            .is_some_and(|warnings| {
+                warnings.iter().any(|warning| {
+                    warning.as_str().is_some_and(|text| {
+                        text.contains("could not verify whether a pending preview")
+                    })
+                })
+            })
+    );
+    assert_eq!(
+        expired_revision.as_str(),
+        expired_preview["revision"].as_str().unwrap(),
+        "the expiry check is bound to the original inbox preview revision"
+    );
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+fn expire_migration_preview_for_test(video_root: &Path, preview_id: &str) -> PathBuf {
+    let path = video_root
+        .join(".telegram-video-downloader-library")
+        .join(format!("migration-preview-{preview_id}.json"));
+    let bytes = fs::read(&path).expect("persisted migration preview should be readable");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("persisted migration preview should be JSON");
+    document["created_at"] = serde_json::json!(0);
+    fs::write(
+        &path,
+        serde_json::to_vec(&document).expect("expired preview should serialize"),
+    )
+    .expect("preview should be aged in its private test fixture");
+    path
+}
+
 async fn wait_for_migration_status(
     runtime: &CloudBotRuntime,
     migration_id: &str,

@@ -28,6 +28,7 @@ import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
 import { MAX_MIGRATION_TASK_ROWS, incompleteMigrationTaskSummary } from "../public/file/migration-task-summary.js";
 import { MAX_VISIBLE_MIGRATIONS, renderMigrationHistory } from "../public/file/migration-rendering.js";
+import { renderMigrationPreview } from "../public/file/migration-preview-rendering.js";
 import { canOperateOnMediaLibrary, resolveMediaLibrary } from "../public/file/library-view.js";
 import {
   canonicalJson,
@@ -249,7 +250,152 @@ describe("migration conflict choices", () => {
       scope: "library",
     }, {}, { seq: 1, id: "", revision: "rev" })).toBeNull();
   });
+});
 
+describe("migration preview rendering", () => {
+  const compactOperation = (): {
+    seq: number;
+    kind: string;
+    status: string;
+    migration_summary: boolean;
+    preview_id: string;
+    revision: string;
+    result: Record<string, unknown> & { sample_items: Array<Record<string, unknown>> };
+  } => ({
+    seq: 41,
+    kind: "library_migration_preview",
+    status: "awaiting_confirmation",
+    migration_summary: true,
+    preview_id: "migration-preview-large",
+    revision: "revision-17",
+    result: {
+      id: "migration-preview-large",
+      revision: "revision-17",
+      source_library_id: "library-source",
+      target_library_id: "library-archive",
+      scope: "library",
+      conflict: "keep_both",
+      include_incomplete_tasks: true,
+      set_target_default_on_success: false,
+      item_count: 14,
+      file_count: 31,
+      total_bytes: 4_294_967_296,
+      required_space_bytes: 4_294_967_296,
+      available_space_bytes: 8_589_934_592,
+      conflict_count: 3,
+      incomplete_task_count: 2,
+      staging_bytes: 524_288,
+      sample_items: [
+        {
+          item_id: "movie-1",
+          source_path: "Films/movie-1.mkv",
+          target_path: "Films/movie-1.mkv",
+          bytes: 123,
+          conflict: false,
+          status: "copying",
+          outcome: "move",
+        },
+        {
+          item_id: "movie-2",
+          source_path: "Films/movie-2.mkv",
+          target_path: "Films/movie-2 (1).mkv",
+          bytes: 456,
+          conflict: true,
+          status: "skipped",
+          outcome: "skip",
+        },
+      ],
+      omitted_item_count: 12,
+      omitted_file_count: 31,
+    },
+  });
+
+  it("renders an actionable compact summary with exact identity and visible omissions", () => {
+    const operation = compactOperation();
+    operation.result.sample_items[0]!.source_path = `Films/${"長いパス".repeat(90)}.mkv`;
+    const rendered = renderMigrationPreview(operation, {
+      sourceAvailable: true,
+      targetAvailable: true,
+    });
+
+    expect(rendered).toContain('data-migration-confirm="migration-preview-large" data-revision="revision-17" >Start migration</button>');
+    expect(rendered).toContain("14 media items");
+    expect(rendered).toContain("Showing 2 sample media paths; 12 item details omitted from this view.");
+    expect(rendered).toContain("31 attached-file paths omitted from this view.");
+    expect(rendered).toContain("existing conflict choices will be used");
+    expect(rendered).toContain("Sample path abbreviated for display.");
+    expect(rendered).toContain("Will skip");
+    expect(rendered).not.toContain("data-migration-conflict-item=");
+    expect(rendered).not.toContain("data-migration-refresh-conflicts=");
+  });
+
+  it("escapes summary sample text and never turns paths into action targets", () => {
+    const operation = compactOperation();
+    operation.result.sample_items[0]!.item_id = '<img src=x onerror="alert(1)">';
+    operation.result.sample_items[0]!.source_path = '<img src=x onerror="alert(1)">';
+    operation.result.sample_items[0]!.target_path = "Archive/movie & subtitles";
+    const rendered = renderMigrationPreview(operation, {
+      sourceAvailable: true,
+      targetAvailable: true,
+    });
+
+    expect(rendered).not.toContain("<img");
+    expect(rendered).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
+    expect(rendered).toContain("Archive/movie &amp; subtitles");
+    expect(rendered).not.toContain("data-source-path=");
+    expect(rendered).not.toContain("data-target-path=");
+  });
+
+  it.each([
+    { label: "offline source", operation: compactOperation(), options: { sourceAvailable: false, targetAvailable: true } },
+    { label: "offline target", operation: compactOperation(), options: { sourceAvailable: true, targetAvailable: false } },
+    { label: "stale status", operation: { ...compactOperation(), status: "stale" }, options: { sourceAvailable: true, targetAvailable: true } },
+    { label: "invalidated choices", operation: compactOperation(), options: { sourceAvailable: true, targetAvailable: true, invalidated: true } },
+    { label: "pending refresh", operation: compactOperation(), options: { sourceAvailable: true, targetAvailable: true, refreshPending: true } },
+    {
+      label: "mismatched summary identity",
+      operation: {
+        ...compactOperation(),
+        result: { ...compactOperation().result, revision: "different-revision" },
+      },
+      options: { sourceAvailable: true, targetAvailable: true },
+    },
+  ])("keeps Start disabled for $label", ({ operation, options }) => {
+    const rendered = renderMigrationPreview(operation, options);
+    expect(rendered).toMatch(/data-migration-confirm="migration-preview-large" data-revision="revision-17" disabled/u);
+  });
+
+  it("preserves per-item conflict editing and refresh in a full preview", () => {
+    const operation = compactOperation();
+    operation.migration_summary = false;
+    operation.result = {
+      ...operation.result,
+      item_count: 1,
+      file_count: 1,
+      conflict_count: 1,
+      item_conflicts: {},
+      items: [{
+        item_id: "movie-2",
+        conflict: true,
+        source_path: "Films/movie-2.mkv",
+        target_path: "Films/movie-2.mkv",
+        files: [],
+      }],
+    };
+    const rendered = renderMigrationPreview(operation, {
+      sourceAvailable: true,
+      targetAvailable: true,
+      draft: { itemConflicts: { "movie-2": "keep_both" } },
+    });
+
+    expect(rendered).toContain('data-migration-conflict-item="movie-2"');
+    expect(rendered).toContain('<option value="keep_both" selected>Keep both</option>');
+    expect(rendered).toContain('data-migration-refresh-conflicts="migration-preview-large"');
+    expect(rendered).toContain("Conflict choices changed. Refresh this preview before starting the migration.");
+  });
+});
+
+describe("inbox sequence preservation after migration", () => {
   it("preserves the inbox AUTOINCREMENT high-water mark when a migration rebuild copies no rows", async () => {
     await testEnv.DB.prepare(`CREATE TABLE inbox_probe (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,

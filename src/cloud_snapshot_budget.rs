@@ -14,6 +14,10 @@ const MAX_OPERATION_KIND_JSON_BYTES: usize = 128;
 const MAX_PREVIEW_SNAPSHOT_RECORDS: usize = 100;
 const MAX_PREVIEW_SNAPSHOT_BYTES: usize = 3 * 1024 * 1024;
 const MAX_PREVIEW_ID_JSON_BYTES: usize = 128;
+const MAX_MIGRATION_PREVIEW_SUMMARY_BYTES: usize = 12 * 1024;
+const MAX_MIGRATION_PREVIEW_SAMPLE_ITEMS: usize = 4;
+const MAX_MIGRATION_PREVIEW_SAMPLE_ID_JSON_BYTES: usize = 128;
+const MAX_MIGRATION_PREVIEW_SAMPLE_PATH_JSON_BYTES: usize = 384;
 
 const OPERATION_DETAILS_OMITTED_REASON: &str =
     "Older operation details were omitted to keep the cloud state within its size limit.";
@@ -21,6 +25,7 @@ const PREVIEW_DETAILS_OMITTED_REASON: &str =
     "Preview details exceeded the cloud snapshot budget. Reload the preview before confirming.";
 const PREVIEW_DETAILS_UNAVAILABLE_REASON: &str =
     "Preview details are unavailable in this cloud snapshot. Reload the preview before confirming.";
+const MIGRATION_SUMMARY_REASON: &str = "A bounded summary is shown. Start confirms the complete saved migration plan; item and file details are omitted.";
 const PREVIEWS_OMITTED_REASON: &str = "Some pending previews were omitted from this snapshot. Refresh pending previews before confirming.";
 /// Build the bounded operation receipt list, reserving space for the newest usable legacy import.
 pub(crate) fn operation_snapshots(records: &[&InboxRecord]) -> Result<Vec<Value>> {
@@ -198,10 +203,20 @@ pub(crate) fn preview_snapshots(
     }
     let omitted_count = omitted_preview_count.saturating_add(locally_omitted);
 
+    // Reserve one bounded, actionable fallback for each valid migration preview before any full
+    // preview can consume the shared budget. The cloud still confirms only the exact persisted
+    // ID/revision; sample paths and omission counts never reconstruct or alter the local plan.
     let mut snapshots = active
         .iter()
         .map(|record| {
             let result = record.result.as_ref();
+            if record.request.kind == "library_migration_preview"
+                && let Some(result) = result
+                && let Some(summary) = compact_migration_preview_summary(record, result)
+            {
+                return summary;
+            }
+
             let is_migration = record.request.kind == "library_migration_preview";
             let details_present = result.is_some_and(|value| {
                 if is_migration {
@@ -226,19 +241,18 @@ pub(crate) fn preview_snapshots(
                 if record.request.kind == "library_migration_preview"
                     && let Some(result) = result
                 {
-                    for field in [
-                        "source_library_id",
-                        "target_library_id",
-                        "scope",
-                        "conflict",
+                    for (field, max_json_bytes) in [
+                        ("source_library_id", 256),
+                        ("target_library_id", 256),
+                        ("scope", 64),
+                        ("conflict", 64),
+                        ("include_incomplete_tasks", 8),
+                        ("set_target_default_on_success", 8),
                     ] {
-                        if let Some(value) = result.get(field) {
-                            fields.insert(field.to_string(), value.clone());
-                        }
-                    }
-                    for field in ["include_incomplete_tasks", "set_target_default_on_success"] {
-                        if let Some(value) = result.get(field) {
-                            fields.insert(field.to_string(), value.clone());
+                        if let Some(value) =
+                            exact_bounded_scalar_field(result, field, max_json_bytes)
+                        {
+                            fields.insert(field.to_string(), value);
                         }
                     }
                 }
@@ -311,6 +325,163 @@ pub(crate) fn preview_snapshots(
         }
     }
     snapshots
+}
+
+fn compact_migration_preview_summary(record: &InboxRecord, result: &Value) -> Option<Value> {
+    let preview_id = compact_identity(result, "preview_id")?;
+    let revision = compact_identity(result, "revision")?;
+    let preview_id_text = preview_id.as_str()?;
+    let revision_text = revision.as_str()?;
+
+    let id = exact_bounded_scalar_field(result, "id", MAX_PREVIEW_ID_JSON_BYTES)?;
+    let result_revision =
+        exact_bounded_scalar_field(result, "revision", MAX_PREVIEW_ID_JSON_BYTES)?;
+    if id.as_str()? != preview_id_text || result_revision.as_str()? != revision_text {
+        return None;
+    }
+
+    let source_library_id = exact_bounded_scalar_field(result, "source_library_id", 256)?;
+    let target_library_id = exact_bounded_scalar_field(result, "target_library_id", 256)?;
+    let scope = exact_bounded_scalar_field(result, "scope", 64)?;
+    let conflict = exact_bounded_scalar_field(result, "conflict", 64)?;
+    let include_incomplete_tasks =
+        exact_bounded_scalar_field(result, "include_incomplete_tasks", 8)?;
+    let set_target_default_on_success =
+        exact_bounded_scalar_field(result, "set_target_default_on_success", 8)?;
+    if source_library_id.as_str().is_none()
+        || target_library_id.as_str().is_none()
+        || scope.as_str().is_none()
+        || conflict.as_str().is_none()
+        || include_incomplete_tasks.as_bool().is_none()
+        || set_target_default_on_success.as_bool().is_none()
+    {
+        return None;
+    }
+
+    let scalar_fields = [
+        "item_count",
+        "file_count",
+        "total_bytes",
+        "required_space_bytes",
+        "available_space_bytes",
+        "conflict_count",
+        "incomplete_task_count",
+        "staging_bytes",
+    ];
+    let mut aggregates = Map::new();
+    for field in scalar_fields {
+        let value = exact_bounded_scalar_field(result, field, 32)?;
+        value.as_u64()?;
+        aggregates.insert(field.to_string(), value);
+    }
+
+    let items = result.get("items")?.as_array()?;
+    let item_count = usize::try_from(aggregates.get("item_count")?.as_u64()?).ok()?;
+    let file_count = usize::try_from(aggregates.get("file_count")?.as_u64()?).ok()?;
+    if item_count != items.len() {
+        return None;
+    }
+    let item_ids = result.get("item_ids")?.as_array()?;
+    if item_ids.len() != item_count || item_ids.iter().any(|item_id| item_id.as_str().is_none()) {
+        return None;
+    }
+    let item_conflicts = result.get("item_conflicts")?.as_object()?;
+    let warnings = result.get("warnings")?.as_array()?;
+
+    let mut sample_items = Vec::with_capacity(items.len().min(MAX_MIGRATION_PREVIEW_SAMPLE_ITEMS));
+    let mut sampled_item_ids = 0usize;
+    for item in items.iter().take(MAX_MIGRATION_PREVIEW_SAMPLE_ITEMS) {
+        let Some(original_item_id) = item.get("item_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(item_id) =
+            bounded_json_string(original_item_id, MAX_MIGRATION_PREVIEW_SAMPLE_ID_JSON_BYTES)
+        else {
+            continue;
+        };
+        let Some(source_path) = item
+            .get("source_path")
+            .and_then(Value::as_str)
+            .and_then(|value| {
+                bounded_json_string(value, MAX_MIGRATION_PREVIEW_SAMPLE_PATH_JSON_BYTES)
+            })
+        else {
+            continue;
+        };
+        let Some(target_path) = item
+            .get("target_path")
+            .and_then(Value::as_str)
+            .and_then(|value| {
+                bounded_json_string(value, MAX_MIGRATION_PREVIEW_SAMPLE_PATH_JSON_BYTES)
+            })
+        else {
+            continue;
+        };
+        if !item_ids
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(original_item_id))
+        {
+            return None;
+        }
+        let bytes = item.get("bytes")?.as_u64()?;
+        let conflict = item.get("conflict")?.as_bool()?;
+        let status = item.get("status")?.as_str()?;
+        let outcome = match status {
+            "skipped" => "skip",
+            "copying" => "move",
+            _ => return None,
+        };
+        if item_id == original_item_id {
+            sampled_item_ids = sampled_item_ids.saturating_add(1);
+        }
+        sample_items.push(json!({
+            "item_id": item_id,
+            "source_path": source_path,
+            "target_path": target_path,
+            "bytes": bytes,
+            "conflict": conflict,
+            "status": status,
+            "outcome": outcome,
+        }));
+    }
+
+    let mut summary = json!({
+        "id": id,
+        "revision": result_revision,
+        "source_library_id": source_library_id,
+        "target_library_id": target_library_id,
+        "scope": scope,
+        "conflict": conflict,
+        "include_incomplete_tasks": include_incomplete_tasks,
+        "set_target_default_on_success": set_target_default_on_success,
+        "omitted_item_id_count": item_ids.len().saturating_sub(sampled_item_ids),
+        "omitted_conflict_choice_count": item_conflicts.len(),
+        "omitted_warning_count": warnings.len(),
+        "omitted_item_count": item_count.saturating_sub(sample_items.len()),
+        "omitted_file_count": file_count,
+        "sample_items": sample_items,
+    });
+    if let Some(fields) = summary.as_object_mut() {
+        fields.extend(aggregates);
+    }
+    let envelope = json!({
+        "seq": record.request.seq,
+        "kind": record.request.kind,
+        "preview_id": preview_id,
+        "revision": revision,
+        "status": "awaiting_confirmation",
+        "migration_summary": true,
+        "reason": MIGRATION_SUMMARY_REASON,
+        "result": summary,
+    });
+    json_size_within(&envelope, MAX_MIGRATION_PREVIEW_SUMMARY_BYTES)?;
+    Some(envelope)
+}
+
+fn exact_bounded_scalar_field(result: &Value, field: &str, max_json_bytes: usize) -> Option<Value> {
+    let candidate = result.get(field)?;
+    let compacted = compact_scalar_value(candidate, max_json_bytes)?;
+    (compacted == *candidate).then_some(compacted)
 }
 
 fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value {
@@ -637,6 +808,75 @@ mod tests {
             "hints": [{"hint_index": 0, "title": "Star Wars", "source_ids": []}],
             "candidates": candidates,
             "warnings": warnings,
+        })
+    }
+
+    fn migration_preview_result(
+        seq: u64,
+        item_count: usize,
+        files_per_item: usize,
+        nested_path_bytes: usize,
+        sample_path_bytes: usize,
+    ) -> Value {
+        let item_ids = (0..item_count)
+            .map(|index| format!("media-item-{seq}-{index}"))
+            .collect::<Vec<_>>();
+        let item_conflicts = item_ids
+            .iter()
+            .take(3)
+            .map(|item_id| (item_id.clone(), json!("keep_both")))
+            .collect::<Map<String, Value>>();
+        let items = item_ids
+            .iter()
+            .enumerate()
+            .map(|(index, item_id)| {
+                let nested_path = "nested/".repeat(nested_path_bytes / 7 + 1);
+                let files = (0..files_per_item)
+                    .map(|file_index| {
+                        json!({
+                            "source_path": format!("source/{nested_path}{file_index}.mkv"),
+                            "target_path": format!("target/{nested_path}{file_index}.mkv"),
+                            "size_bytes": 1024,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let sample_path = "segment/".repeat(sample_path_bytes / 8 + 1);
+                json!({
+                    "item_id": item_id,
+                    "status": if index == 0 { "skipped" } else { "copying" },
+                    "conflict": index < 3,
+                    "source_path": format!("source/{sample_path}{index}.mkv"),
+                    "target_path": format!("target/{sample_path}{index}.mkv"),
+                    "bytes": 1024,
+                    "files": files,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "id": format!("migration-preview-{seq}"),
+            "revision": format!("migration-revision-{seq}"),
+            "source_library_id": "library-source",
+            "target_library_id": "library-target",
+            "scope": "library",
+            "item_ids": item_ids,
+            "conflict": "skip",
+            "item_conflicts": item_conflicts,
+            "include_incomplete_tasks": true,
+            "set_target_default_on_success": false,
+            "item_count": item_count,
+            "file_count": item_count
+                .saturating_mul(files_per_item)
+                .saturating_add(2),
+            "total_bytes": item_count.saturating_mul(1024).saturating_add(4096) as u64,
+            "required_space_bytes": item_count
+                .saturating_mul(1024)
+                .saturating_add(4096) as u64,
+            "available_space_bytes": 8 * 1024 * 1024 * 1024_u64,
+            "conflict_count": item_count.min(3),
+            "incomplete_task_count": 2,
+            "staging_bytes": 4096,
+            "warnings": ["first warning", "second warning"],
+            "items": items,
         })
     }
 
@@ -1155,6 +1395,128 @@ mod tests {
         assert_eq!(previews[0]["result"], result);
         assert!(previews[0].get("preview").is_none());
         assert!(serde_json::to_vec(&previews).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn oversized_whole_library_migration_keeps_a_bounded_actionable_summary() {
+        let result = migration_preview_result(42, 120, 8, 2200, 700);
+        assert!(object_size(&result) > MAX_PREVIEW_SNAPSHOT_BYTES);
+        let record = record(
+            42,
+            "library_migration_preview",
+            InboxStatus::AwaitingConfirmation,
+            Some(result),
+            None,
+        );
+
+        let previews = preview_snapshots(&[&record], 0);
+        let snapshot = &previews[0];
+        let summary = &snapshot["result"];
+        let samples = summary["sample_items"]
+            .as_array()
+            .expect("summary samples should be present");
+
+        assert_eq!(snapshot["kind"], "library_migration_preview");
+        assert_eq!(snapshot["migration_summary"], true);
+        assert_eq!(snapshot["preview_id"], "migration-preview-42");
+        assert_eq!(snapshot["revision"], "migration-revision-42");
+        assert_eq!(snapshot["status"], "awaiting_confirmation");
+        assert_eq!(summary["id"], "migration-preview-42");
+        assert_eq!(summary["revision"], "migration-revision-42");
+        assert_eq!(summary["source_library_id"], "library-source");
+        assert_eq!(summary["target_library_id"], "library-target");
+        assert_eq!(summary["scope"], "library");
+        assert_eq!(summary["conflict"], "skip");
+        assert_eq!(summary["include_incomplete_tasks"], true);
+        assert_eq!(summary["set_target_default_on_success"], false);
+        assert_eq!(summary["item_count"], 120);
+        assert_eq!(summary["file_count"], 962);
+        assert_eq!(summary["total_bytes"], 124 * 1024);
+        assert_eq!(summary["required_space_bytes"], 124 * 1024);
+        assert_eq!(summary["available_space_bytes"], 8 * 1024 * 1024 * 1024_u64);
+        assert_eq!(summary["conflict_count"], 3);
+        assert_eq!(summary["incomplete_task_count"], 2);
+        assert_eq!(summary["staging_bytes"], 4096);
+        assert_eq!(summary["omitted_item_count"], 116);
+        assert_eq!(summary["omitted_file_count"], 962);
+        assert_eq!(summary["omitted_item_id_count"], 116);
+        assert_eq!(summary["omitted_conflict_choice_count"], 3);
+        assert_eq!(summary["omitted_warning_count"], 2);
+        assert_eq!(samples.len(), MAX_MIGRATION_PREVIEW_SAMPLE_ITEMS);
+        assert_eq!(samples[0]["outcome"], "skip");
+        assert_eq!(samples[0]["status"], "skipped");
+        assert_eq!(samples[1]["outcome"], "move");
+        assert_eq!(samples[1]["status"], "copying");
+        for sample in samples {
+            assert!(sample.get("files").is_none());
+            for field in ["source_path", "target_path"] {
+                let path = sample[field].as_str().unwrap();
+                assert!(path.ends_with('…'));
+                assert!(
+                    json_size_within(
+                        &Value::String(path.to_string()),
+                        MAX_MIGRATION_PREVIEW_SAMPLE_PATH_JSON_BYTES
+                    )
+                    .is_some()
+                );
+            }
+        }
+        for omitted_detail in ["items", "item_ids", "item_conflicts", "warnings"] {
+            assert!(summary.get(omitted_detail).is_none());
+        }
+        assert!(snapshot.get("reload_required").is_none());
+        assert!(snapshot.get("preview_incomplete").is_none());
+        assert!(object_size(snapshot) <= MAX_MIGRATION_PREVIEW_SUMMARY_BYTES);
+        assert!(serde_json::to_vec(&previews).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn reserves_actionable_summaries_for_migration_previews_under_shared_budget() {
+        let records = (1..=MAX_PREVIEW_SNAPSHOT_RECORDS as u64)
+            .map(|seq| {
+                record(
+                    seq,
+                    "library_migration_preview",
+                    InboxStatus::AwaitingConfirmation,
+                    Some(migration_preview_result(seq, 3, 3, 2048, 32)),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let refs = records.iter().collect::<Vec<_>>();
+        let previews = preview_snapshots(&refs, 0);
+        let encoded = serde_json::to_vec(&previews).expect("previews should serialize");
+        let mut full_count = 0usize;
+        let mut summary_count = 0usize;
+
+        assert_eq!(previews.len(), MAX_PREVIEW_SNAPSHOT_RECORDS);
+        assert!(encoded.len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+        for (index, preview) in previews.iter().enumerate() {
+            let expected_id = format!("migration-preview-{}", index + 1);
+            let expected_revision = format!("migration-revision-{}", index + 1);
+            assert_eq!(preview["preview_id"], expected_id);
+            assert_eq!(preview["revision"], expected_revision);
+            assert_eq!(preview["status"], "awaiting_confirmation");
+            assert!(preview.get("reload_required").is_none());
+            if preview["migration_summary"] == true {
+                summary_count += 1;
+                assert_eq!(preview["result"]["id"], expected_id);
+                assert_eq!(preview["result"]["revision"], expected_revision);
+                assert!(preview["result"].get("items").is_none());
+                assert!(preview["result"].get("item_ids").is_none());
+            } else {
+                full_count += 1;
+                assert!(preview["result"]["items"].is_array());
+            }
+        }
+        assert!(
+            summary_count > 0,
+            "some previews should use the compact form"
+        );
+        assert!(
+            full_count > 0,
+            "some previews should retain their full details"
+        );
     }
 
     #[test]

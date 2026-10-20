@@ -102,13 +102,13 @@ superseded_by: ""
 | 范围 | 最终结果 |
 | --- | --- |
 | Rust 1.99.1 格式及差异空白检查 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
-| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,151 通过、0 失败、16 个既有忽略项 |
+| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,157 通过、0 失败、16 个既有忽略项 |
 | Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline` 通过 |
-| Cloud / Node 25.8.2 | 类型检查通过；130 项测试通过；Wrangler 4.149.0 dry-run 通过，41 个静态资源 |
+| Cloud / Node 25.8.2 | 类型检查通过；139 项测试通过；Wrangler 4.149.0 dry-run 通过，43 个静态资源 |
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
-- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review5/`，后者包含默认设置归档、登记目录身份、预览生命周期及终态恢复回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
-- 最新 Rust 验证日志为 `mls01-review5/full-tests.log`、`clippy.log` 和 `build.log`。
+- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review6/`，后者包含恢复历史优先级、预览到期状态及大型预览摘要回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
+- 最新 Rust 验证日志为 `mls01-review6/full-tests.log`、`clippy-final.log` 和 `build.log`。
   Cloud 的最终测试、类型检查和 dry-run 日志分别为同目录下的 `cloud-npm-test.log`、
   `cloud-typecheck.log` 和 `cloud-build-dry-run.log`。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
@@ -217,6 +217,15 @@ superseded_by: ""
   are retired, superseded plans are compacted, and confirmed previews are retired after a
   durable job exists. Confirm replay and controls use that validated job; replaced or unreadable
   documents remain preserved with bounded diagnostics.
+- The 32-entry cloud migration history prioritizes completed and stopped jobs with pending
+  finalization alongside other recoverable work, so newer inert history cannot hide recovery.
+- Migration-preview confirmability is reconciled against local expiry and supersession before
+  rendering an awaiting-confirmation receipt. Definite expiry or absence becomes stale;
+  unreadable or unverified storage remains an attention state without a false stale result.
+- Oversized migration previews retain an actionable bounded summary with the exact confirmation
+  identity, complete aggregate counts, sampled paths and explicit omission totals. Compact
+  summaries confirm the complete selection with its existing choices and disable per-item
+  conflict edits; ordinary full previews retain their existing editing flow.
 
 ## Isolated Cloudflare and Rust E2E at `08f56d4`
 

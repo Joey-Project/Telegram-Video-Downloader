@@ -47,6 +47,13 @@ pub(crate) struct PreviewMaintenanceReport {
     pub(crate) warning: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MigrationPreviewConfirmability {
+    Confirmable,
+    DefinitelyUnconfirmable,
+    Unknown,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MigrationScope {
@@ -1817,6 +1824,27 @@ impl MigrationEngine {
         Ok(report)
     }
 
+    /// Checks a bounded set of inbox preview identities while holding the source migration lock.
+    /// Expired, superseded, confirmed, missing, or revision-mismatched previews are definitely
+    /// unconfirmable. A failed read or invalid binding remains Unknown so callers can retain the
+    /// receipt and publish an attention warning instead of claiming that it is stale.
+    pub(crate) fn preview_confirmability_for_inbox(
+        source: &LibraryManager,
+        preview_keys: &[(String, String)],
+    ) -> Result<Vec<MigrationPreviewConfirmability>> {
+        const MAX_CONFIRMABILITY_KEYS: usize = 128;
+        if preview_keys.len() > MAX_CONFIRMABILITY_KEYS {
+            bail!("migration preview confirmability request exceeds its bound");
+        }
+        let _state_lock = source.migration_state_lock()?;
+        Ok(preview_keys
+            .iter()
+            .map(|(preview_id, revision)| {
+                preview_confirmability_for_inbox_key(source, preview_id, revision)
+            })
+            .collect())
+    }
+
     pub(crate) fn set_runtime_context(
         &self,
         migration_id: &str,
@@ -2983,6 +3011,62 @@ fn source_binding_matches(source: &LibraryManager, binding: &RootBinding) -> boo
         && binding.root == source.migration_root_path()
         && binding.device == identity.device()
         && binding.inode == identity.inode()
+}
+
+fn preview_confirmability_for_inbox_key(
+    source: &LibraryManager,
+    preview_id: &str,
+    revision: &str,
+) -> MigrationPreviewConfirmability {
+    let checked = (|| -> Result<MigrationPreviewConfirmability> {
+        validate_migration_id(preview_id)?;
+        if revision.is_empty() || revision.len() > 128 || revision.chars().any(char::is_control) {
+            bail!("migration preview revision has an invalid shape");
+        }
+
+        if let Some(bytes) =
+            source.migration_read_state(&job_state_name(preview_id), MAX_STATE_BYTES)?
+        {
+            let job: JobDocument = decode_state(&bytes, "migration job")?;
+            if job.preview.id != preview_id
+                || job.preview.source_library_id != job.source.library_id
+                || job.preview.target_library_id != job.target.library_id
+                || !root_binding_shape_is_valid(&job.target)
+                || !source_binding_matches(source, &job.source)
+            {
+                bail!("persisted migration job binding does not match its source library");
+            }
+            return Ok(MigrationPreviewConfirmability::DefinitelyUnconfirmable);
+        }
+
+        let Some(snapshot) = source
+            .migration_read_state_snapshot(&preview_state_name(preview_id), MAX_STATE_BYTES)?
+        else {
+            return Ok(MigrationPreviewConfirmability::DefinitelyUnconfirmable);
+        };
+        let document: PreviewDocument = decode_state(&snapshot.contents, "migration preview")?;
+        if document.format_version != 1
+            || document.preview.id != preview_id
+            || document.preview.source_library_id != document.source.library_id
+            || document.preview.target_library_id != document.target.library_id
+            || !root_binding_shape_is_valid(&document.target)
+            || !source_binding_matches(source, &document.source)
+        {
+            bail!("persisted migration preview binding does not match its source library");
+        }
+        if document.preview.revision != revision
+            || document.superseded_by.is_some()
+            || document
+                .created_at
+                .saturating_add(PREVIEW_RETENTION_SECONDS)
+                < unix_seconds()
+        {
+            return Ok(MigrationPreviewConfirmability::DefinitelyUnconfirmable);
+        }
+        Ok(MigrationPreviewConfirmability::Confirmable)
+    })();
+
+    checked.unwrap_or(MigrationPreviewConfirmability::Unknown)
 }
 
 fn root_binding_shape_is_valid(binding: &RootBinding) -> bool {

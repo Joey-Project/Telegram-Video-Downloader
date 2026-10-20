@@ -245,6 +245,104 @@ fn unconfirmed_preview(label: &str) -> (TestRoot, TestRoot, MigrationEngine, Mig
     (source_root, target_root, engine, preview)
 }
 
+#[test]
+fn inbox_preview_confirmability_detects_expiry_and_preserves_unknown_reads() {
+    let (_source_root, _target_root, engine, preview) =
+        unconfirmed_preview("inbox-preview-confirmability");
+    let key = (preview.id.clone(), preview.revision.clone());
+    assert_eq!(
+        MigrationEngine::preview_confirmability_for_inbox(
+            engine.source.as_ref(),
+            std::slice::from_ref(&key)
+        )
+        .expect("preview check should complete"),
+        vec![MigrationPreviewConfirmability::Confirmable]
+    );
+    assert_eq!(
+        MigrationEngine::preview_confirmability_for_inbox(
+            engine.source.as_ref(),
+            &[(preview.id.clone(), "old-revision".to_string())],
+        )
+        .expect("revision mismatch should be a definite stale result"),
+        vec![MigrationPreviewConfirmability::DefinitelyUnconfirmable]
+    );
+
+    let name = preview_state_name(&preview.id);
+    let bytes = engine
+        .source
+        .migration_read_state(&name, MAX_STATE_BYTES)
+        .expect("preview should be readable")
+        .expect("preview should be persisted");
+    let mut document: PreviewDocument =
+        decode_state(&bytes, "migration preview").expect("preview should decode");
+    document.superseded_by = Some("refreshed-preview".to_string());
+    engine
+        .source
+        .migration_write_state(&name, &encode_state(&document).unwrap())
+        .expect("superseded preview marker should persist");
+    assert_eq!(
+        MigrationEngine::preview_confirmability_for_inbox(
+            engine.source.as_ref(),
+            std::slice::from_ref(&key),
+        )
+        .expect("superseded preview check should complete"),
+        vec![MigrationPreviewConfirmability::DefinitelyUnconfirmable]
+    );
+    document.superseded_by = None;
+    document.created_at = 0;
+    engine
+        .source
+        .migration_write_state(&name, &encode_state(&document).unwrap())
+        .expect("expired preview should remain persisted before maintenance");
+    assert!(
+        engine
+            .source
+            .migration_read_state(&name, MAX_STATE_BYTES)
+            .expect("expired preview should remain readable")
+            .is_some(),
+        "the check must recognize expiration before the rotating maintenance pass retires it"
+    );
+    assert_eq!(
+        MigrationEngine::preview_confirmability_for_inbox(engine.source.as_ref(), &[key])
+            .expect("expired preview check should complete"),
+        vec![MigrationPreviewConfirmability::DefinitelyUnconfirmable]
+    );
+
+    let path = engine
+        .source
+        .migration_root_path()
+        .join(".telegram-video-downloader-library")
+        .join(&name);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+        .expect("fixture should make the preview state fail its private-file policy");
+    assert_eq!(
+        MigrationEngine::preview_confirmability_for_inbox(
+            engine.source.as_ref(),
+            &[(preview.id, preview.revision)],
+        )
+        .expect("a per-preview read error should be represented as unknown"),
+        vec![MigrationPreviewConfirmability::Unknown],
+        "an unreadable expired preview must not be mislabeled as definitely missing"
+    );
+}
+
+#[test]
+fn inbox_preview_confirmability_rejects_a_confirmed_job_as_a_new_preview() {
+    let (_source_root, _target_root, engine, preview) =
+        unconfirmed_preview("inbox-preview-confirmed-job");
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("preview should confirm");
+    assert_eq!(
+        MigrationEngine::preview_confirmability_for_inbox(
+            engine.source.as_ref(),
+            &[(preview.id, preview.revision)],
+        )
+        .expect("job-backed preview check should complete"),
+        vec![MigrationPreviewConfirmability::DefinitelyUnconfirmable]
+    );
+}
+
 fn replace_with_same_bytes(path: &Path) {
     let replacement = path.with_extension("replacement");
     fs::write(&replacement, MEDIA_BYTES).expect("replacement file should write");

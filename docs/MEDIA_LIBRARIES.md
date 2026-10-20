@@ -48,6 +48,11 @@ cannot make that earlier revision executable again.
 Expired, superseded and confirmed preview documents are retired through bounded cleanup.
 Confirmation keeps the durable job plan and replay information needed for recovery; retiring a
 preview does not remove media, retained download fragments or an active migration's checkpoints.
+An expired migration preview is marked stale in the cloud view and cannot be started. Storage
+read failures remain an attention state rather than being treated as a missing preview.
+Large previews retain an actionable summary with counts, space requirements, sampled paths and
+explicit omission totals. Starting this summary confirms the complete selection with its existing
+conflict choices; per-item conflict editing is unavailable in the compact view.
 
 The separate **include unfinished tasks** checkbox is shown only when the scope affects such
 tasks and starts unchecked. When checked for a partially selected unfinished collection task,
@@ -108,7 +113,8 @@ fully finalized history does not show the control.
 The default update is conditional on the settings revision durably recorded at confirmation,
 before waiting for task writers or output ownership. A newer settings change causes it to be
 skipped durably. Cloud snapshots include at most 32 migrations, prioritizing active
-and recoverable jobs, then recent completed jobs. The UI displays that priority order and reports
+and recoverable jobs, including completed or stopped jobs with pending finalization,
+then recent completed jobs. The UI displays that priority order and reports
 omitted entries; local manifests remain available for recovery.
 Snapshot upload limits also compact migration item, task-handoff, and conflict-choice details.
 Totals, recovery controls, error counts, bounded error details and omission counts remain

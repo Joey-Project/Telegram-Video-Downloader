@@ -13,10 +13,17 @@ fn cloud_migration_history(
 ) -> Result<(Value, usize)> {
     use crate::library_migration::MigrationRunStatus;
 
-    let priority = |status: &crate::library_migration::MigrationStatus| match status.status {
-        MigrationRunStatus::Queued | MigrationRunStatus::Running => 0,
-        MigrationRunStatus::Paused | MigrationRunStatus::Failed | MigrationRunStatus::Partial => 1,
-        MigrationRunStatus::Completed | MigrationRunStatus::Stopped => 2,
+    let priority = |status: &crate::library_migration::MigrationStatus| {
+        if status.terminal_finalization_pending {
+            return 0;
+        }
+        match status.status {
+            MigrationRunStatus::Queued | MigrationRunStatus::Running => 0,
+            MigrationRunStatus::Paused
+            | MigrationRunStatus::Failed
+            | MigrationRunStatus::Partial => 1,
+            MigrationRunStatus::Completed | MigrationRunStatus::Stopped => 2,
+        }
     };
     let mut selected = migrations.values().collect::<Vec<_>>();
     selected.sort_by(|left, right| {
@@ -215,45 +222,152 @@ pub(super) async fn refresh_library_bindings(runtime: &CloudBotRuntime) -> Resul
 pub(super) async fn unconfirmable_previews(
     runtime: &CloudBotRuntime,
     records: &[InboxRecord],
-) -> (HashSet<String>, bool) {
-    let mut grouped = BTreeMap::<Option<String>, Vec<(String, String)>>::new();
+) -> (HashSet<u64>, bool) {
+    let mut file_previews = BTreeMap::<Option<String>, Vec<(String, String, u64)>>::new();
+    let mut migration_previews = BTreeMap::<String, Vec<(String, String, u64)>>::new();
+    let mut failed = false;
     for record in records {
-        if record.request.kind != "file_preview"
-            || record.status != InboxStatus::AwaitingConfirmation
-        {
+        if record.status != InboxStatus::AwaitingConfirmation {
             continue;
         }
-        if let Some(identity) = cloud_preview_identity(record) {
-            let library_id = record
-                .result
-                .as_ref()
-                .and_then(|result| result["library_id"].as_str())
-                .or_else(|| record.request.payload["library_id"].as_str())
-                .map(str::to_string);
-            grouped.entry(library_id).or_default().push(identity);
+        match record.request.kind.as_str() {
+            "file_preview" => {
+                if let Some((preview_id, revision)) = cloud_preview_identity(record) {
+                    let library_id = record
+                        .result
+                        .as_ref()
+                        .and_then(|result| result["library_id"].as_str())
+                        .or_else(|| record.request.payload["library_id"].as_str())
+                        .map(str::to_string);
+                    file_previews.entry(library_id).or_default().push((
+                        preview_id,
+                        revision,
+                        record.request.seq,
+                    ));
+                }
+            }
+            "library_migration_preview" => {
+                let result = record.result.as_ref();
+                let preview_id = result
+                    .and_then(|result| result["id"].as_str())
+                    .map(str::to_string);
+                let revision = result
+                    .and_then(|result| result["revision"].as_str())
+                    .map(str::to_string);
+                let library_id = result
+                    .and_then(|result| result["source_library_id"].as_str())
+                    .or_else(|| record.request.payload["source_library_id"].as_str())
+                    .map(str::to_string);
+                if let (Some(preview_id), Some(revision), Some(library_id)) =
+                    (preview_id, revision, library_id)
+                {
+                    migration_previews.entry(library_id).or_default().push((
+                        preview_id,
+                        revision,
+                        record.request.seq,
+                    ));
+                } else {
+                    failed = true;
+                    warn!(
+                        seq = record.request.seq,
+                        "could not read the source identity of an awaiting migration preview"
+                    );
+                }
+            }
+            _ => {}
         }
     }
-    let mut unavailable = HashSet::new();
-    let mut failed = false;
-    for (library_id, keys) in grouped {
+
+    let mut unconfirmable_sequences = HashSet::new();
+    for (library_id, entries) in file_previews {
         let library_id = library_id
             .map(Ok)
             .unwrap_or_else(|| original_library_id(runtime));
         let scoped = library_id
             .and_then(|id| scoped_runtime(runtime, Some(&id)).map(|(runtime, _)| runtime));
+        let keys = entries
+            .iter()
+            .map(|(preview_id, revision, _)| (preview_id.clone(), revision.clone()))
+            .collect::<Vec<_>>();
         let result = match scoped {
             Ok(scoped) => cloud_unconfirmable_preview_ids(&scoped, &keys).await,
             Err(error) => Err(error),
         };
         match result {
-            Ok(ids) => unavailable.extend(ids),
+            Ok(ids) => {
+                for (preview_id, _, seq) in entries {
+                    if ids.contains(&preview_id) {
+                        unconfirmable_sequences.insert(seq);
+                    }
+                }
+            }
             Err(error) => {
                 failed = true;
                 warn!(error = %redact_sensitive_text(&format!("{error:#}")), "could not verify library preview anchors");
             }
         }
     }
-    (unavailable, failed)
+
+    for (library_id, entries) in migration_previews {
+        let keys = entries
+            .iter()
+            .map(|(preview_id, revision, _)| (preview_id.clone(), revision.clone()))
+            .collect::<Vec<_>>();
+        match cloud_migration_preview_confirmability(runtime, &library_id, &keys).await {
+            Ok(states) => {
+                for ((_, _, seq), state) in entries.into_iter().zip(states) {
+                    match state {
+                        crate::library_migration::MigrationPreviewConfirmability::Confirmable => {}
+                        crate::library_migration::MigrationPreviewConfirmability::DefinitelyUnconfirmable => {
+                            unconfirmable_sequences.insert(seq);
+                        }
+                        crate::library_migration::MigrationPreviewConfirmability::Unknown => {
+                            failed = true;
+                            warn!(
+                                library_id = %library_id,
+                                seq,
+                                "could not verify whether an awaiting migration preview is still confirmable"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                failed = true;
+                warn!(
+                    library_id = %library_id,
+                    error = %redact_sensitive_text(&format!("{error:#}")),
+                    "could not verify migration preview state"
+                );
+            }
+        }
+    }
+
+    (unconfirmable_sequences, failed)
+}
+
+async fn cloud_migration_preview_confirmability(
+    runtime: &CloudBotRuntime,
+    library_id: &str,
+    preview_keys: &[(String, String)],
+) -> Result<Vec<crate::library_migration::MigrationPreviewConfirmability>> {
+    let (scoped, _) = scoped_runtime(runtime, Some(library_id))?;
+    let bot = scoped.bot;
+    let inbox = Arc::clone(&runtime.inbox);
+    let preview_keys = preview_keys.to_vec();
+    #[cfg(test)]
+    let file_provider = runtime.test_file_provider.clone();
+    #[cfg(not(test))]
+    let file_provider = None;
+    tokio::task::spawn_blocking(move || {
+        let manager = open_cloud_library_manager(&bot, inbox, file_provider)?;
+        crate::library_migration::MigrationEngine::preview_confirmability_for_inbox(
+            &manager,
+            &preview_keys,
+        )
+    })
+    .await
+    .context("cloud migration preview confirmability worker failed")?
 }
 
 pub(super) async fn attach_library_views(
@@ -610,6 +724,66 @@ mod tests {
             migrations.len(),
             43,
             "projection must retain durable/runtime history"
+        );
+    }
+
+    #[test]
+    fn cloud_migration_history_keeps_pending_terminal_controls_ahead_of_inert_history() {
+        let make_status = |id: &str, status: &str, created_at: u64, pending: bool| {
+            serde_json::from_value::<crate::library_migration::MigrationStatus>(json!({
+                "id":id, "preview_id":id, "revision":"1", "status":status,
+                "created_at":created_at,
+                "source_library_id":"source", "target_library_id":"target",
+                "scope":"library", "conflict":"skip", "item_conflicts":{},
+                "include_incomplete_tasks":false, "set_target_default_on_success":false,
+                "default_update_applied":false, "terminal_finalization_pending":pending,
+                "total_items":0, "completed_items":0,
+                "success_count":0, "skipped_count":0, "failed_count":0,
+                "total_files":0, "completed_files":0, "copied_bytes":0, "total_bytes":0,
+                "required_space_bytes":0, "available_space_bytes":0,
+                "incomplete_task_count":0, "staging_bytes":0,
+                "awaiting_task_plans":false, "awaiting_task_commit":false,
+                "warnings":[], "items":[], "task_transfers":[],
+            }))
+            .unwrap()
+        };
+        let mut migrations = BTreeMap::new();
+        for index in 0..40 {
+            let id = format!("inert-{:02}", index);
+            let status = if index % 2 == 0 {
+                "completed"
+            } else {
+                "stopped"
+            };
+            migrations.insert(id.clone(), make_status(&id, status, 1_000 + index, false));
+        }
+        migrations.insert(
+            "pending-completed".to_string(),
+            make_status("pending-completed", "completed", 1, true),
+        );
+        migrations.insert(
+            "pending-stopped".to_string(),
+            make_status("pending-stopped", "stopped", 2, true),
+        );
+
+        let (projection, omitted) = cloud_migration_history(&migrations).unwrap();
+        let rows = projection.as_array().unwrap();
+        assert_eq!(rows.len(), CLOUD_MIGRATION_HISTORY_LIMIT);
+        assert_eq!(omitted, 10);
+        for id in ["pending-completed", "pending-stopped"] {
+            let row = rows
+                .iter()
+                .find(|row| row["id"] == id)
+                .expect("pending terminal migration should remain in the UI projection");
+            assert_eq!(row["terminal_finalization_pending"], true);
+        }
+        assert!(
+            rows.iter().any(|row| row["id"] == "inert-39"),
+            "recent terminal history should remain available after recoverable rows"
+        );
+        assert!(
+            rows.iter().all(|row| row["id"] != "inert-00"),
+            "the projection should still enforce its 32-row cap"
         );
     }
 
