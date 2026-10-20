@@ -1,0 +1,47 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "telegram-video-downloader-cloud",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-09",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/webhook", "/file", "/file/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "telegram-video-downloader-cloud",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NOTIFIER",
+        "class_name": "NotificationHub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["NotificationHub"]
+    }
+  ],
+  "vars": {
+    "OWNER_USER_ID": "0"
+  },
+  "secrets": {
+    "required": ["LOCAL_SHARED_SECRET", "WEBHOOK_SECRET", "BOT_TOKEN"]
+  }
+}

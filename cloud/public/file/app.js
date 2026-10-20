@@ -1,0 +1,962 @@
+import { appendAction, removeQueuedAction, shouldRetryActionFailure } from "./action-queue.js";
+import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
+import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
+import { HttpResponseError } from "./http-error.js";
+import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
+import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limit.js";
+import { MAX_MANUAL_TARGET_OPTIONS, searchPresentManualTargets } from "./manual-target-picker.js";
+import { submitLegacyFileImport } from "./legacy-file-import.js";
+import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
+import { sourceIdUrl } from "./source-links.js";
+import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
+import { validateTargetRelativeDirectory } from "./target-directory.js";
+import { boundedFolderSuggestions, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, needsOrganizing, paginateLibraryItems, statusOf } from "./library-view.js";
+
+const API = "/api";
+const CACHE_KEY = "file-manager.snapshot.v1";
+const ACTION_QUEUE_KEY = "file-manager.actions.v1";
+const MAX_LEGACY_BYTES = 256 * 1024;
+const POLL_MS = 12_000;
+
+const telegram = window.Telegram?.WebApp;
+const initData = telegram?.initData ?? "";
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, selected: new Set(), quarantinedActionIds: new Set(), view: "library", query: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false };
+
+const byId = (id) => document.getElementById(id);
+let cachedFolderLibrary = null;
+let cachedFolders = [];
+const formatBytes = (value) => {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "Size unavailable";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let unit = -1;
+  do { size /= 1024; unit += 1; } while (size >= 1024 && unit < units.length - 1);
+  return `${size.toFixed(size >= 10 ? 0 : 1)} ${units[unit]}`;
+};
+const formatTime = (value, unit = "milliseconds") => {
+  const number = Number(value);
+  const date = new Date(unit === "seconds" ? number * 1000 : number);
+  if (!Number.isFinite(date.getTime()) || date.getTime() <= 0) return "Not available";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+};
+const timeAgo = (value, unit = "milliseconds") => {
+  const raw = Number(value);
+  const timestamp = unit === "seconds" ? raw * 1000 : raw;
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return "Not yet";
+  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (seconds < 60) return "Just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} hr ago`;
+  return `${Math.floor(seconds / 86400)} days ago`;
+};
+const libraryItems = () => Array.isArray(state.snapshot?.library?.items) ? state.snapshot.library.items : [];
+const snapshotValue = () => state.snapshot ?? { synced: false, stale: true, library: null, previews: [], operations: [], tasks: [], settings: {} };
+
+function showToast(message) {
+  const toast = byId("toast");
+  toast.textContent = message;
+  toast.classList.remove("hidden");
+  clearTimeout(state.toastTimer);
+  state.toastTimer = window.setTimeout(() => toast.classList.add("hidden"), 3600);
+}
+
+function setConnection(mode, label) {
+  const dot = byId("connection-dot");
+  dot.className = `connection-dot${mode === "live" ? " live" : mode === "stale" ? " stale" : ""}`;
+  byId("connection-label").textContent = label;
+}
+
+function clearCachedSnapshot() {
+  try { localStorage.removeItem(CACHE_KEY); } catch { /* Private content remains hidden if storage is unavailable. */ }
+}
+
+function showPrivateAccessGate(message) {
+  state.detailId = null;
+  state.selected.clear();
+  state.legacyOperation = null;
+  state.legacyOperationKey = null;
+  state.legacySelection.clear();
+  document.querySelector(".detail-panel")?.remove();
+  byId("app-content").classList.add("hidden");
+  byId("auth-gate").classList.remove("hidden");
+  byId("auth-message").textContent = message;
+  setConnection("", "Owner verification required");
+}
+
+function acceptFreshSnapshot(snapshot) {
+  Object.assign(state, acceptOwnerSnapshot(snapshot));
+  byId("auth-gate").classList.add("hidden");
+  byId("app-content").classList.remove("hidden");
+}
+
+function applySnapshotFailure(status) {
+  const transition = failOwnerSnapshot(state, status, Date.now());
+  Object.assign(state, transition);
+  if (transition.clearCache) clearCachedSnapshot();
+  if (transition.authorizationRejected) {
+    state.refreshAfterDrain = false;
+    if (state.retryTimer) window.clearTimeout(state.retryTimer);
+    state.retryTimer = 0;
+  }
+  return transition;
+}
+
+function handleAuthorizationFailure(error) {
+  applySnapshotFailure(error?.status);
+  showPrivateAccessGate("Owner access could not be verified. Reopen this Mini App from the owner's private chat.");
+}
+
+async function api(path, options = {}) {
+  const headers = new Headers(options.headers ?? {});
+  headers.set("X-Telegram-Init-Data", initData);
+  if (options.body !== undefined) headers.set("Content-Type", "application/json");
+  const response = await fetch(`${API}${path}`, { ...options, headers, cache: "no-store" });
+  let data;
+  try { data = await response.json(); } catch { data = {}; }
+  if (!response.ok) throw new HttpResponseError(response.status, typeof data?.error === "string" ? data.error : `Request failed (${response.status})`);
+  return data;
+}
+
+async function refreshState({ quiet = false } = {}) {
+  if (!initData || state.loading) return;
+  state.loading = true;
+  try {
+    const fresh = await api("/state");
+    acceptFreshSnapshot(fresh);
+    setConnection(fresh.synced ? (fresh.stale ? "stale" : "live") : "", fresh.synced ? (fresh.stale ? "Contact is overdue" : "Computer connected") : "Waiting for computer");
+    render();
+    await drainActionsAfterSnapshotRefresh(
+      state,
+      navigator.onLine,
+      () => drainActionQueue({ quiet }),
+    );
+  } catch (error) {
+    const transition = applySnapshotFailure(error?.status);
+    if (mayUsePrivateSnapshot(state)) {
+      setConnection("stale", "Showing saved library");
+      render();
+    } else {
+      showPrivateAccessGate(transition.authorizationRejected
+        ? "Owner access could not be verified. Reopen this Mini App from the owner's private chat."
+        : "The private library stays hidden until its owner is verified. Check the connection and retry.");
+    }
+    if (!quiet && navigator.onLine && mayUsePrivateSnapshot(state)) showToast(error.message);
+  } finally {
+    state.loading = false;
+    if (state.refreshAfterDrain) {
+      state.refreshAfterDrain = false;
+      window.setTimeout(() => refreshState({ quiet: true }), 0);
+    }
+  }
+}
+
+function readActionQueue() {
+  try {
+    const value = JSON.parse(localStorage.getItem(ACTION_QUEUE_KEY) ?? "[]");
+    return Array.isArray(value) ? value.filter((entry) => entry && typeof entry.request_id === "string" && typeof entry.kind === "string" && entry.payload && typeof entry.payload === "object") : [];
+  } catch { return []; }
+}
+
+function writeActionQueue(actions) {
+  if (actions.length > 20) return false;
+  try { localStorage.setItem(ACTION_QUEUE_KEY, JSON.stringify(actions)); } catch { showToast("This browser could not save the action queue."); return false; }
+  renderQueueCount();
+  return true;
+}
+
+function renderQueueCount() {
+  const count = readActionQueue().filter((action) => !state.quarantinedActionIds.has(action.request_id)).length;
+  byId("queued-actions").textContent = count ? `${count} action${count === 1 ? "" : "s"} waiting to send` : "";
+}
+
+async function drainActionQueue({ quiet = false } = {}) {
+  if (!initData || !mayDispatchActions(state) || !navigator.onLine) return false;
+  if (state.draining) return state.draining;
+  state.draining = (async () => {
+    let sentAny = false;
+    let connectionInterrupted = false;
+    let removalFailed = false;
+    const permanentRejections = [];
+    while (navigator.onLine) {
+      const action = readActionQueue().find((entry) => !state.quarantinedActionIds.has(entry.request_id));
+      if (!action) break;
+      try {
+        await api("/actions", { method: "POST", body: JSON.stringify({ request_id: action.request_id, kind: action.kind, payload: action.payload }) });
+        const latestQueue = readActionQueue();
+        if (!writeActionQueue(removeQueuedAction(latestQueue, action.request_id))) {
+          if (!quiet) showToast("Request reached the computer, but this browser could not update its retry queue.");
+          break;
+        }
+        sentAny = true;
+      } catch (error) {
+        if (error?.status === 401 || error?.status === 403) {
+          handleAuthorizationFailure(error);
+          break;
+        }
+        if (!shouldRetryActionFailure(error)) {
+          state.quarantinedActionIds.add(action.request_id);
+          const latestQueue = readActionQueue();
+          if (!writeActionQueue(removeQueuedAction(latestQueue, action.request_id))) removalFailed = true;
+          permanentRejections.push(typeof error?.message === "string" ? error.message : "Request rejected");
+          continue;
+        }
+        if (!state.retryTimer) {
+          const delay = state.retryDelay;
+          state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
+          state.retryTimer = window.setTimeout(() => {
+            state.retryTimer = 0;
+            drainActionQueue({ quiet });
+          }, delay);
+        }
+        connectionInterrupted = true;
+        break;
+      }
+    }
+    if (sentAny) state.retryDelay = 1500;
+    if (permanentRejections.length) {
+      const count = permanentRejections.length;
+      const details = [...new Set(permanentRejections)].slice(0, 2).join(" · ");
+      const remainder = connectionInterrupted ? " Other saved requests remain queued while the connection recovers." : "";
+      const storageNote = removalFailed ? " One rejected request could not be removed from browser storage and will stay quarantined for this session." : "";
+      showToast(`${count} rejected request${count === 1 ? " was" : "s were"} removed from the retry queue: ${details}.${remainder}${storageNote}`);
+    } else if (!quiet && connectionInterrupted) {
+      showToast("Connection interrupted. The request remains queued with the same ID.");
+    }
+    return sentAny;
+  })();
+  let sentAny = false;
+  try { sentAny = await state.draining; }
+  finally { state.draining = null; }
+  if (sentAny && state.ownerVerified) {
+    if (state.loading) state.refreshAfterDrain = true;
+    else await refreshState({ quiet: true });
+  }
+  return sentAny;
+}
+
+async function submitAction(kind, payload) {
+  if (!mayDispatchActions(state)) return false;
+  if (kind === "file_preview") {
+    for (const field of ["item_ids", "metadata_patches"]) {
+      if (Array.isArray(payload?.[field]) && payload[field].length > MAX_SELECTED_ITEMS) {
+        showToast(`Choose at most ${MAX_SELECTED_ITEMS} ${field === "item_ids" ? "videos" : "metadata matches"} per request.`);
+        return false;
+      }
+    }
+  }
+  const action = { request_id: crypto.randomUUID(), kind, payload };
+  const queued = appendAction(readActionQueue(), action);
+  if (!queued.ok) {
+    showToast("The offline queue is full. Reconnect and send its saved requests first.");
+    return false;
+  }
+  if (!writeActionQueue(queued.queue)) {
+    showToast("This browser could not save the action, so it was not sent.");
+    return false;
+  }
+  if (!navigator.onLine) {
+    showToast("Saved offline. It will send when this device reconnects.");
+    return true;
+  }
+  showToast("Sending the saved request");
+  await drainActionQueue();
+  return true;
+}
+
+function updateSelectedItems(candidateIds, selected) {
+  const result = updateSelectionWithinLimit(state.selected, candidateIds, selected);
+  state.selected.clear();
+  for (const id of result.ids) state.selected.add(id);
+  return result.omittedCount;
+}
+
+function selectionLimitMessage(omittedCount = 0) {
+  return omittedCount > 0
+    ? `Only ${MAX_SELECTED_ITEMS} items can be selected. ${omittedCount} more were left unselected; deselect an item to add another.`
+    : `Selection limit: ${MAX_SELECTED_ITEMS}. Deselect an item to select another.`;
+}
+
+function allFolders() {
+  const library = state.snapshot?.library ?? null;
+  if (library === cachedFolderLibrary) return cachedFolders;
+  const folders = new Set(Array.isArray(library?.categories) ? library.categories : []);
+  for (const item of libraryItems()) if (itemFolder(item)) folders.add(itemFolder(item));
+  cachedFolderLibrary = library;
+  cachedFolders = [...folders].filter((folder) => typeof folder === "string").sort((a, b) => a.localeCompare(b));
+  return cachedFolders;
+}
+
+function filteredItems() {
+  return filterLibraryItems(libraryItems(), {
+    query: state.query,
+    category: byId("category-filter").value,
+    status: byId("status-filter").value,
+  });
+}
+
+function renderFilters() {
+  const folders = allFolders();
+  const categorySuggestions = boundedFolderSuggestions(folders, byId("category-filter").value);
+  const destinationSuggestions = boundedFolderSuggestions(folders, byId("target-dir").value);
+  byId("category-folders").innerHTML = categorySuggestions.map((folder) => `<option value="${escapeHtml(folder)}"></option>`).join("");
+  byId("known-folders").innerHTML = destinationSuggestions.map((folder) => `<option value="${escapeHtml(folder)}"></option>`).join("");
+}
+
+function itemRow(item) {
+  const id = String(item.id ?? "");
+  const selected = state.selected.has(id);
+  const presence = statusOf(item);
+  const displayStatus = presence === "present" ? "Available" : presence === "missing" ? "Missing" : presence === "unavailable" ? "Unavailable" : "Status unknown";
+  const dims = item.width && item.height ? `${escapeHtml(item.width)} × ${escapeHtml(item.height)}` : "";
+  const codec = item.codec ? escapeHtml(item.codec) : "";
+  return `<article class="library-row${selected ? " selected" : ""}" data-item-row="${escapeHtml(id)}">
+    <input class="row-check" type="checkbox" aria-label="Select ${escapeHtml(item.title ?? item.relative_path)}" data-select-item="${escapeHtml(id)}" ${selected ? "checked" : ""} ${isPresentMedia(item) ? "" : "disabled"}>
+    <div class="media-icon" aria-hidden="true">▣</div>
+    <div class="media-main"><div class="media-title"><span>${escapeHtml(item.title || item.relative_path || "Untitled video")}</span></div><div class="media-path">${escapeHtml(item.relative_path || "Path unavailable")}</div></div>
+    <div class="media-meta"><span><i class="status-dot ${escapeHtml(presence)}"></i>${displayStatus}</span><span>${formatBytes(item.bytes)}</span>${dims ? `<span>${dims}</span>` : ""}${codec ? `<span>${codec}</span>` : ""}<button class="details-button" type="button" data-details="${escapeHtml(id)}">Details</button></div>
+  </article>`;
+}
+
+function libraryPageMarkup(page, scope) {
+  if (page.pageCount <= 1) return "";
+  const previous = page.page > 0
+    ? `<button class="quiet-button" type="button" data-library-page="${scope}" data-page-direction="-1">Previous</button>`
+    : `<button class="quiet-button" type="button" disabled>Previous</button>`;
+  const next = page.page + 1 < page.pageCount
+    ? `<button class="quiet-button" type="button" data-library-page="${scope}" data-page-direction="1">Next</button>`
+    : `<button class="quiet-button" type="button" disabled>Next</button>`;
+  const label = scope === "needs" ? "Needs organizing pages" : "Library pages";
+  return `<nav class="toolbar library-pagination" aria-label="${label}">${previous}<span class="field-hint">Page ${page.page + 1} of ${page.pageCount} · items ${page.start + 1}–${page.end} of ${page.total.toLocaleString()}</span>${next}</nav>`;
+}
+
+function renderGroupedItems(container, items, page, scope) {
+  const groups = groupLibraryItems(items);
+  const renderedGroups = groups.map(({ title, items: entries }, index) => {
+    const selectableEntries = presentMediaItems(entries);
+    const groupIds = selectableEntries.map((item) => String(item.id));
+    const allSelected = groupIds.length > 0 && groupIds.every((id) => state.selected.has(id));
+    const someSelected = groupIds.some((id) => state.selected.has(id));
+    return `<details class="collection-group" ${index < 3 ? "open" : ""}>
+      <summary><input class="group-check" type="checkbox" aria-label="Select available ${escapeHtml(title)} items on this page" data-select-group="${escapeHtml(title)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${selectableEntries.length ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count">${entries.length} file${entries.length === 1 ? "" : "s"} on this page</span></summary>
+      <div class="collection-items">${entries.map(itemRow).join("")}</div>
+    </details>`;
+  }).join("");
+  container.innerHTML = `${renderedGroups}${libraryPageMarkup(page, scope)}`;
+  container.querySelectorAll("[data-partial]").forEach((checkbox) => { checkbox.indeterminate = true; });
+}
+
+function pageItemsForScope(scope) {
+  const filtered = filteredItems();
+  const scopedItems = scope === "needs" ? filtered.filter(needsOrganizing) : filtered;
+  const pageKey = scope === "needs" ? "needsPage" : "libraryPage";
+  const page = paginateLibraryItems(scopedItems, state[pageKey]);
+  state[pageKey] = page.page;
+  return page.items;
+}
+
+function renderLibrary() {
+  const availableIds = new Set(presentMediaItems(libraryItems()).map((item) => String(item.id)));
+  for (const id of state.selected) if (!availableIds.has(id)) state.selected.delete(id);
+  renderFilters();
+  const items = filteredItems();
+  const needsItems = items.filter(needsOrganizing);
+  const libraryPage = paginateLibraryItems(items, state.libraryPage);
+  const needsPage = paginateLibraryItems(needsItems, state.needsPage);
+  state.libraryPage = libraryPage.page;
+  state.needsPage = needsPage.page;
+  const list = byId("library-list");
+  renderGroupedItems(list, libraryPage.items, libraryPage, "library");
+  renderGroupedItems(byId("needs-list"), needsPage.items, needsPage, "needs");
+  const synced = state.snapshot?.synced === true;
+  const firstScanPending = synced && (state.snapshot.library?.ready === false || Number(state.snapshot.library?.scanned_at) === 0);
+  byId("library-empty").classList.toggle("hidden", !synced || libraryItems().length > 0 && !firstScanPending);
+  list.classList.toggle("hidden", !synced || firstScanPending || libraryItems().length === 0);
+  const emptyHeading = byId("library-empty").querySelector("h2");
+  const emptyCopy = byId("library-empty").querySelector("p");
+  if (firstScanPending) {
+    emptyHeading.textContent = "Waiting for the first scan";
+    emptyCopy.textContent = "Your computer is connected. The library will appear when its first scan completes.";
+  } else {
+    emptyHeading.textContent = "No media found yet";
+    emptyCopy.textContent = "Run a scan on the connected computer to discover videos and their sidecar files.";
+  }
+  if (!synced) {
+    list.innerHTML = "";
+    byId("library-empty").classList.add("hidden");
+  }
+  const total = libraryItems().length;
+  byId("library-count").textContent = synced && !firstScanPending ? String(total) : "—";
+  byId("library-summary").textContent = firstScanPending
+    ? "Your computer is connected, but the first scan has not completed."
+    : state.snapshot?.synced
+    ? `${items.length.toLocaleString()} matching item${items.length === 1 ? "" : "s"} · ${items.length ? `showing ${libraryPage.start + 1}–${libraryPage.end} on page ${libraryPage.page + 1} of ${Math.max(1, libraryPage.pageCount)}` : "no matches"} · ${total.toLocaleString()} in library${state.selected.size ? ` · ${state.selected.size} selected${state.selected.size >= MAX_SELECTED_ITEMS ? ` · selection limit ${MAX_SELECTED_ITEMS}; deselect to add more` : ""}` : ""}`
+    : "A first scan has not completed yet.";
+  const needsTotal = libraryItems().filter(needsOrganizing).length;
+  byId("needs-count").textContent = synced && !firstScanPending ? String(needsTotal) : "—";
+  byId("needs-summary").textContent = firstScanPending
+    ? "Needs organizing will appear after the first scan completes."
+    : state.snapshot?.synced
+    ? `${needsItems.length.toLocaleString()} matching item${needsItems.length === 1 ? "" : "s"} · ${needsItems.length ? `showing ${needsPage.start + 1}–${needsPage.end} on page ${needsPage.page + 1} of ${Math.max(1, needsPage.pageCount)}` : "no matches"} · ${needsTotal.toLocaleString()} need attention in total`
+    : "Needs organizing will appear after the first scan.";
+  byId("needs-empty").classList.toggle("hidden", !synced || firstScanPending || needsItems.length > 0);
+  byId("needs-list").classList.toggle("hidden", !synced || firstScanPending || needsItems.length === 0);
+  byId("preview-move").disabled = state.selected.size === 0;
+}
+
+function operationTitle(operation) {
+  const kind = String(operation.kind ?? "operation").replaceAll("_", " ");
+  return kind.replace(/^\w/u, (letter) => letter.toLocaleUpperCase());
+}
+
+function statusText(value) {
+  const text = String(value ?? "pending").replaceAll("_", " ");
+  return text.replace(/^\w/u, (letter) => letter.toLocaleUpperCase());
+}
+
+function legacyOperations() {
+  return (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []).filter((operation) => operation?.kind === "legacy_import");
+}
+
+function renderWaiting() {
+  const tasks = Array.isArray(state.snapshot?.tasks) ? state.snapshot.tasks : [];
+  const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
+  const cloudQueue = Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : [];
+  const { cloud: pendingRequests, local } = buildWaitingEntries(cloudQueue, tasks, operations);
+  const pendingCloud = pendingRequests.filter(isWaitingEntryPending);
+  const pending = local.filter(isWaitingEntryPending);
+  const localQueue = readActionQueue();
+  byId("waiting-count").textContent = String(pendingCloud.length + pending.length + localQueue.length);
+  const cards = [];
+  for (const request of pendingCloud) cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(operationTitle(request))}</h3><p>Saved in the cloud inbox. Your desktop app has not acknowledged local receipt yet.</p></div><span class="state-pill pending">Waiting for computer · #${escapeHtml(request.seq)}</span></div><p>Received ${escapeHtml(timeAgo(request.created_at))}</p></article>`);
+  for (const action of localQueue) cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(action.kind.replaceAll("_", " "))}</h3><p>Saved in this browser. It will be sent when this device is connected.</p></div><span class="state-pill pending">Offline queue</span></div></article>`);
+  for (const entry of pending) cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(operationTitle(entry))}</h3><p>${escapeHtml(entry.message ?? entry.error ?? "Your computer has received this request and is working on it.")}</p></div><span class="state-pill pending">${escapeHtml(statusText(entry.status))}</span></div>${entry.updated_at ? `<p>Updated ${escapeHtml(timeAgo(entry.updated_at, "seconds"))}</p>` : ""}</article>`);
+  byId("waiting-list").innerHTML = cards.length ? cards.join("") : `<div class="empty-state"><div class="empty-art" aria-hidden="true">✓</div><h2>Nothing is waiting</h2><p>New requests and scans will appear here while your computer processes them.</p></div>`;
+}
+
+function operationPreview(operation) {
+  if (operation?.preview && typeof operation.preview === "object") return { id: operation.preview_id ?? operation.preview.id, revision: operation.revision ?? operation.preview.revision, preview: operation.preview, status: operation.status };
+  if (operation?.result?.preview && typeof operation.result.preview === "object") return { id: operation.preview_id ?? operation.result.preview_id ?? operation.result.preview.id, revision: operation.revision ?? operation.result.revision ?? operation.result.preview.revision, preview: operation.result.preview, status: operation.status };
+  return null;
+}
+
+function previews() {
+  const collected = [];
+  for (const preview of Array.isArray(state.snapshot?.previews) ? state.snapshot.previews : []) {
+    const incomplete = preview.preview_incomplete === true || preview.incomplete === true || preview.reload_required === true;
+    collected.push({
+      id: preview.preview_id ?? preview.id ?? (incomplete ? "omitted-preview-details" : undefined),
+      revision: preview.revision ?? preview.preview?.revision ?? (incomplete ? String(preview.omitted_count ?? "unknown") : undefined),
+      preview: incomplete ? null : preview.preview ?? preview,
+      incomplete: preview.incomplete === true,
+      preview_incomplete: preview.preview_incomplete === true,
+      reload_required: preview.reload_required === true,
+      reason: preview.reason,
+      status: preview.status,
+    });
+  }
+  for (const operation of Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []) {
+    const found = operationPreview(operation);
+    if (found) collected.push(found);
+  }
+  const unique = new Map();
+  for (const value of collected) {
+    if (value.id && value.revision) unique.set(`${value.id}:${value.revision}`, value);
+  }
+  return [...unique.values()].reverse();
+}
+
+function describePreview(preview) {
+  const moveItems = Array.isArray(preview.items) ? preview.items : [];
+  const patchItems = Array.isArray(preview.metadata_patches) ? preview.metadata_patches : [];
+  const lines = [];
+  const moveRows = renderMovePreviewItems(moveItems);
+  if (moveRows) lines.push(moveRows);
+  for (const patch of patchItems) {
+    const details = metadataPreviewDetails(patch).map((detail) => detail.kind === "status"
+      ? escapeHtml(detail.text)
+      : `${escapeHtml(detail.label)}: ${escapeHtml(detail.before ?? "Not set")} → ${escapeHtml(detail.after)}`);
+    const changes = details.join("<br>");
+    lines.push(`<div class="preview-line"><span>${escapeHtml(patch.nfo_path ?? patch.item_id ?? "Metadata file")}<br><span class="field-hint">${changes}</span></span><strong class="move">Metadata</strong></div>`);
+  }
+  return lines.length ? lines.join("") : `<div class="preview-line"><span>This preview contains no file or metadata changes.</span></div>`;
+}
+
+function renderPreviews() {
+  const pending = previews().filter((entry) => isReviewablePreviewStatus(entry.status));
+  byId("organizing-count").textContent = String(pending.length);
+  byId("preview-list").innerHTML = pending.map((entry) => {
+    if (isIncompletePreview(entry)) {
+      const reason = entry.reason || "Preview details were omitted from the saved snapshot. Request a fresh preview before confirming.";
+      return `<article class="stack-card"><div class="stack-card-head"><div><h3>Preview needs to be regenerated</h3><p>${escapeHtml(reason)}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+    }
+    const preview = entry.preview;
+    const hasMetadataChanges = hasMetadataPreviewChanges(preview);
+    const hasMoveItems = Array.isArray(preview.items) && preview.items.length > 0;
+    const title = hasMetadataChanges && hasMoveItems ? "Move and update metadata" : hasMetadataChanges ? "Update metadata" : "Move files";
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(preview.target_relative_dir ?? "Metadata only · file locations stay the same")} · Conflict: ${escapeHtml(preview.conflict ?? "skip")}</p></div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${describePreview(preview)}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}">Confirm changes</button></div></article>`;
+  }).join("");
+  if (!pending.length) byId("preview-list").innerHTML = "";
+}
+
+function renderLegacyMappings() {
+  const importSelection = selectLegacyImportForMapping(legacyOperations());
+  const operation = importSelection.usable ? importSelection.operation : null;
+  const container = byId("legacy-mappings");
+  state.legacyOperation = operation;
+  if (!importSelection.latest) {
+    container.classList.add("hidden");
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
+    return;
+  }
+  if (!operation) {
+    const latest = importSelection.latest;
+    const detailsWarning = operationDetailsWarning(latest);
+    const failure = typeof latest.error === "string" && latest.error ? `${latest.error} ` : "";
+    state.legacyOperationKey = null;
+    state.legacyPage = 0;
+    container.classList.remove("hidden");
+    container.innerHTML = `<p class="warning-text">${escapeHtml(detailsWarning || `The latest legacy import is ${statusText(latest.status)}.${failure} A completed, complete import report is required before mapping hints.`)}</p>`;
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
+    return;
+  }
+  const incompleteWarning = operationDetailsWarning(operation);
+  if (incompleteWarning || !Array.isArray(operation.result?.hints) || !Array.isArray(operation.result?.candidates)) {
+    state.legacyOperation = null;
+    state.legacyOperationKey = null;
+    state.legacyPage = 0;
+    container.classList.remove("hidden");
+    container.innerHTML = `<p class="warning-text">${escapeHtml(incompleteWarning || "The saved legacy import report is incomplete. Submit the import again to review the full report.")}</p>`;
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
+    return;
+  }
+  const operationKey = String(operation.seq ?? operation.created_at ?? "legacy-import");
+  if (state.legacyOperationKey !== operationKey) {
+    state.legacyOperationKey = operationKey;
+    state.legacySelection = new Map();
+    state.legacyPage = 0;
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
+  }
+  const hints = operation.result.hints;
+  const choices = buildLegacyMappingChoices(operationKey, hints, operation.result.candidates, libraryItems());
+  const page = paginateLegacyMappingChoices(choices, state.legacyPage, LEGACY_MAPPING_PAGE_SIZE);
+  state.legacyPage = page.page;
+  const warnings = Array.isArray(operation.result.warnings) ? operation.result.warnings : [];
+  const validKeys = new Set(choices.map((choice) => choice.key));
+  const manualKeys = new Set(choices.filter((choice) => choice.kind === "manual").map((choice) => choice.key));
+  if (state.manualPickerKey && !manualKeys.has(state.manualPickerKey)) {
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
+  }
+  container.classList.remove("hidden");
+  const rows = page.choices.map((choice) => {
+    const { hint, hintIndex } = choice;
+    const sourceIds = Array.isArray(hint.source_ids) ? hint.source_ids : [];
+    const collection = hint.collection && typeof hint.collection === "object" ? hint.collection.title : "";
+    const selection = getOrCreateLegacySelection(state.legacySelection, choice.key, {
+      selected: false, hintIndex, manual: choice.kind === "manual", item_id: "",
+      title: Boolean(hint.title), source_ids: sourceIds.length > 0, collection: Boolean(collection),
+    });
+    if (choice.kind === "candidate") {
+      const candidate = choice.candidate;
+      const candidateError = typeof candidate.error === "string" ? candidate.error : typeof candidate.error_message === "string" ? candidate.error_message : "";
+      return `<div class="mapping-row"><div class="mapping-row-head"><input type="checkbox" aria-label="Apply legacy hint to ${escapeHtml(candidate.title ?? candidate.relative_path)}" data-map-select="${escapeHtml(choice.key)}" data-hint-index="${hintIndex}" data-item-id="${escapeHtml(candidate.item_id)}" ${selection.selected ? "checked" : ""}><div><div class="mapping-name">${escapeHtml(hint.title || candidate.title || "Legacy source links")} → ${escapeHtml(candidate.title || candidate.relative_path || candidate.item_id)}</div><div class="mapping-path">${escapeHtml(candidate.relative_path ?? "Path unavailable")} · ${escapeHtml(candidate.match_kind ?? "candidate match")}${candidate.ambiguous ? " · check this match" : ""}</div>${candidateError ? `<p class="mapping-help">${escapeHtml(candidateError)}</p>` : ""}</div></div><div class="mapping-fields"><label><input type="checkbox" data-map-field="title" data-map-key="${escapeHtml(choice.key)}" ${selection.title ? "checked" : ""} ${hint.title ? "" : "disabled"}> Title</label><label><input type="checkbox" data-map-field="source_ids" data-map-key="${escapeHtml(choice.key)}" ${selection.source_ids ? "checked" : ""} ${sourceIds.length ? "" : "disabled"}> ${sourceIds.length} source link${sourceIds.length === 1 ? "" : "s"}</label><label><input type="checkbox" data-map-field="collection" data-map-key="${escapeHtml(choice.key)}" ${selection.collection ? "checked" : ""} ${collection ? "" : "disabled"}> Collection</label></div>${candidate.requires_confirmation || hint.requires_confirmation ? `<p class="mapping-help">This match needs your confirmation. Review the item path and proposed fields before continuing.</p>` : ""}<div class="mapping-actions"><button class="small-button" type="button" data-open-manual-hint="${hintIndex}">Choose a different video</button></div></div>`;
+    }
+    const pickerOpen = state.manualPickerKey === choice.key;
+    const picker = pickerOpen ? manualTargetPickerMarkup(choice.key, selection, hintIndex) : "";
+    const selectedTarget = selection.item_id ? `<p class="mapping-path">Selected video ID: ${escapeHtml(selection.item_id)}</p>` : "";
+    const description = choice.hasCandidate ? "Manual replacement for the automatic match" : "No reliable automatic match · choose a present video manually";
+    const pickerLabel = selection.item_id ? "Change selected video" : choice.hasCandidate ? "Choose a different video" : "Choose a video";
+    return `<div class="mapping-row manual-mapping"><div class="mapping-row-head"><input type="checkbox" aria-label="Apply this legacy hint after manually choosing a video" data-map-select="${escapeHtml(choice.key)}" data-manual="true" data-hint-index="${hintIndex}" ${selection.selected ? "checked" : ""}><div><div class="mapping-name">${escapeHtml(hint.title || "Legacy hint without a reliable match")}</div><div class="mapping-path">${description}</div></div></div><button class="small-button" type="button" data-manual-picker-toggle="${escapeHtml(choice.key)}" aria-expanded="${pickerOpen}">${pickerLabel}</button>${pickerOpen ? picker : selectedTarget}<div class="mapping-fields"><label><input type="checkbox" data-map-field="title" data-map-key="${escapeHtml(choice.key)}" ${selection.title ? "checked" : ""} ${hint.title ? "" : "disabled"}> Title</label><label><input type="checkbox" data-map-field="source_ids" data-map-key="${escapeHtml(choice.key)}" ${selection.source_ids ? "checked" : ""} ${sourceIds.length ? "" : "disabled"}> ${sourceIds.length} source link${sourceIds.length === 1 ? "" : "s"}</label><label><input type="checkbox" data-map-field="collection" data-map-key="${escapeHtml(choice.key)}" ${selection.collection ? "checked" : ""} ${collection ? "" : "disabled"}> Collection</label></div><p class="mapping-help">This is a manual association. Review the selected path and generated metadata preview before continuing.</p></div>`;
+  });
+  const displayedRange = page.total ? `Showing rows ${page.start + 1}–${page.end} of ${page.total.toLocaleString()} · ${hints.length.toLocaleString()} hints total` : `${hints.length.toLocaleString()} hints · no current mapping choices`;
+  const previousPage = page.page > 0 ? `<button class="quiet-button" type="button" data-legacy-page="-1">Previous</button>` : `<button class="quiet-button" type="button" disabled>Previous</button>`;
+  const nextPage = page.page + 1 < page.pageCount ? `<button class="quiet-button" type="button" data-legacy-page="1">Next</button>` : `<button class="quiet-button" type="button" disabled>Next</button>`;
+  const pagination = page.pageCount > 1 ? `<div class="mapping-pagination" aria-label="Legacy mapping pages">${previousPage}<span>Page ${page.page + 1} of ${page.pageCount}</span>${nextPage}</div>` : "";
+  const newerImportNotice = importSelection.latest !== operation ? `<p class="warning-text">A newer legacy import did not save a complete successful report. Showing the latest completed import; see request history for the newer result.</p>` : "";
+  const emptyMessage = hints.length === 0 ? `<p class="field-hint">No hints or possible media matches were found.</p>` : "";
+  container.innerHTML = `<p class="mapping-title">Choose a video for each legacy hint</p>${newerImportNotice}${warnings.length ? `<p class="warning-text">${warnings.map(escapeHtml).join(" · ")}</p>` : ""}<p class="field-hint">${displayedRange}</p>${rows.length ? rows.join("") : emptyMessage}${pagination}<div class="mapping-actions"><button id="preview-metadata" class="primary-button" type="button" ${choices.length ? "" : "disabled"}>Preview selected updates <span aria-hidden="true">→</span></button></div>`;
+  for (const key of state.legacySelection.keys()) if (!validKeys.has(key)) state.legacySelection.delete(key);
+}
+
+function manualTargetPickerContents(selection) {
+  const result = searchPresentManualTargets(libraryItems(), state.manualPickerQuery, selection.item_id);
+  const selectedId = String(selection.item_id ?? "");
+  const selectedPresent = selectedId && result.items.some((item) => String(item.id) === selectedId);
+  const options = result.items.map((item) => {
+    const id = String(item.id);
+    const title = item.title || item.relative_path || id;
+    return `<option value="${escapeHtml(id)}" ${id === selectedId ? "selected" : ""}>${escapeHtml(title)} · ${escapeHtml(item.relative_path || "Path unavailable")}</option>`;
+  }).join("");
+  const status = selection.item_id && !selectedPresent
+    ? "The previous video is no longer present. Choose a current video."
+    : result.hasMore
+      ? `Showing up to ${MAX_MANUAL_TARGET_OPTIONS} present matches. Refine the search to narrow the list.`
+      : `${result.items.length} present video${result.items.length === 1 ? "" : "s"} shown.`;
+  return {
+    options: `<option value="" ${selectedPresent ? "" : "selected"}>Choose a present video…</option>${options}`,
+    status,
+  };
+}
+
+function manualTargetPickerMarkup(key, selection, hintIndex) {
+  const contents = manualTargetPickerContents(selection);
+  return `<div class="manual-target-picker"><label class="field-label" for="manual-target-search-${hintIndex}">Search present videos</label><input id="manual-target-search-${hintIndex}" class="text-control" type="search" autocomplete="off" data-manual-picker-search="${escapeHtml(key)}" value="${escapeHtml(state.manualPickerQuery)}" placeholder="Title, path, or ID"><p class="field-hint" data-manual-picker-status="${escapeHtml(key)}">${escapeHtml(contents.status)}</p><select id="manual-target-${hintIndex}" class="select-control manual-target" data-manual-target="${escapeHtml(key)}">${contents.options}</select></div>`;
+}
+
+function renderOperations() {
+  const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
+  const visible = operationHistoryEntries(operations);
+  byId("operation-list").innerHTML = visible.slice(-12).reverse().map((entry) => {
+    const result = entry.result && typeof entry.result === "object" ? entry.result : {};
+    const outcome = result.operation && typeof result.operation === "object" ? result.operation : result;
+    const items = Array.isArray(outcome.items) ? outcome.items : Array.isArray(result.items) ? result.items : [];
+    const hintCount = Array.isArray(result.hints) ? result.hints.length : 0;
+    const candidateCount = Array.isArray(result.candidates) ? result.candidates.length : 0;
+    const detailsWarning = operationDetailsWarning(entry);
+    const movedFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.moved_files) ? item.moved_files : 0), 0);
+    const totalFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.total_files) ? item.total_files : 0), 0);
+    const metadataUpdated = items.filter((item) => item.metadata_patched === true).length;
+    const summary = items.length
+      ? `${items.length} item${items.length === 1 ? "" : "s"} · ${movedFiles}/${totalFiles} related file${totalFiles === 1 ? "" : "s"} moved · ${metadataUpdated} metadata update${metadataUpdated === 1 ? "" : "s"}`
+      : entry.kind === "legacy_import"
+        ? detailsWarning
+          ? "Legacy import report is incomplete; see the warning below."
+          : `${hintCount} hints read · ${candidateCount} possible matches. Choose the matches above to prepare updates.`
+          : "Request received by your computer.";
+    const warnings = [
+      ...(Array.isArray(entry.warnings) ? entry.warnings : []),
+      ...(Array.isArray(result.warnings) ? result.warnings : []),
+      ...(Array.isArray(outcome.warnings) ? outcome.warnings : []),
+    ];
+    const telegramWarning = result.telegram_progress_warning ?? outcome.telegram_progress_warning;
+    const itemResults = items.map((item) => {
+      const libraryItem = libraryItems().find((candidate) => String(candidate.id) === String(item.item_id));
+      const label = libraryItem?.title || libraryItem?.relative_path || item.source_path || item.item_id || "Selected item";
+      const fileProgress = Number.isSafeInteger(item.total_files) ? `${Number(item.moved_files ?? 0)}/${item.total_files} files moved` : "No files moved";
+      const metadata = item.metadata_patched === true ? " · metadata updated" : "";
+      return `<div class="preview-line"><span>${escapeHtml(label)}<br><span class="field-hint">${escapeHtml(fileProgress + metadata)}</span>${item.error ? `<br><span class="preview-reason">${escapeHtml(item.error)}</span>` : ""}</span><strong class="${item.error ? "skip" : "move"}">${item.error ? "Needs review" : "Done"}</strong></div>`;
+    }).join("");
+    const warningDetails = [...warnings, ...(typeof telegramWarning === "string" ? [telegramWarning] : [])];
+    if (detailsWarning) warningDetails.push(detailsWarning);
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(operationTitle(entry))}</h3><p>${escapeHtml(entry.error ?? summary)}</p></div><span class="state-pill">${escapeHtml(statusText(entry.status))}</span></div>${entry.created_at ? `<p>Received ${escapeHtml(timeAgo(entry.created_at))}</p>` : ""}${itemResults ? `<div class="preview-table">${itemResults}</div>` : ""}${warningDetails.length ? `<div class="operation-warnings">${warningDetails.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}</div>` : ""}${entry.kind === "legacy_import" && result.revision ? `<p>Library revision: ${escapeHtml(result.revision)}</p>` : ""}</article>`;
+  }).join("");
+}
+
+function renderSync() {
+  const snapshot = snapshotValue();
+  const synced = snapshot.synced === true;
+  const title = byId("sync-title");
+  const detail = byId("sync-detail");
+  const badge = byId("sync-badge");
+  badge.className = `badge${synced && !snapshot.stale ? " good" : synced ? " warning" : ""}`;
+  if (!synced) {
+    title.textContent = "Waiting for your computer";
+    detail.textContent = state.snapshot?.cached_at ? "Showing your last saved view while we reconnect." : "Your library appears here after the desktop app connects.";
+    badge.textContent = "Not synced";
+    return;
+  }
+  const firstScanPending = snapshot.library?.ready === false || Number(snapshot.library?.scanned_at) === 0;
+  title.textContent = snapshot.stale ? "No recent computer contact" : firstScanPending ? "Connected · first scan pending" : "Your library is synced";
+  detail.textContent = `Last contact ${timeAgo(snapshot.last_seen)} · Last scan ${firstScanPending ? "not completed" : formatTime(snapshot.library?.scanned_at, "seconds")}`;
+  badge.textContent = snapshot.stale ? "Contact overdue" : "Up to date";
+}
+
+function renderDetail() {
+  const old = document.querySelector(".detail-panel");
+  if (old) old.remove();
+  if (!state.detailId) return;
+  const item = libraryItems().find((entry) => String(entry.id) === state.detailId);
+  if (!item) { state.detailId = null; return; }
+  const panel = document.createElement("div");
+  panel.className = "detail-panel";
+  panel.setAttribute("role", "presentation");
+  const attachments = Array.isArray(item.attachments) ? item.attachments : [];
+  const sourceIds = Array.isArray(item.source_ids) ? item.source_ids : [];
+  const collection = item.collection && typeof item.collection === "object" ? item.collection.title : item.collection;
+  const root = String(state.snapshot?.settings?.download_dir ?? "").replace(/[\\/]+$/u, "");
+  const pathJoin = (relative) => root ? `${root}${root.includes("\\") && !root.includes("/") ? "\\" : "/"}${relative}` : "";
+  const relativePath = String(item.relative_path ?? "");
+  const fullPath = pathJoin(relativePath);
+  panel.innerHTML = `
+    <aside class="detail-sheet" role="dialog" aria-modal="true" aria-label="File details">
+      <div class="detail-top"><div><p class="eyebrow">FILE DETAILS</p><h2>${escapeHtml(item.title || "Untitled video")}</h2></div><button class="detail-close" type="button" aria-label="Close details">×</button></div>
+      <section class="detail-section path-section">
+        <h3>Relative path</h3><div class="copy-row"><code>${escapeHtml(relativePath || "Path unavailable")}</code><button class="small-button" type="button" data-copy="${escapeHtml(relativePath)}">Copy</button></div>
+        ${fullPath ? `<h3>Full path</h3><div class="copy-row"><code>${escapeHtml(fullPath)}</code><button class="small-button" type="button" data-copy="${escapeHtml(fullPath)}">Copy</button></div>` : `<p class="field-hint">Full path is unavailable until the desktop reports its library root.</p>`}
+      </section>
+      <div class="detail-grid">
+        <div class="detail-stat"><span>File size</span><strong>${formatBytes(item.bytes)}</strong></div>
+        <div class="detail-stat"><span>File availability</span><strong>${escapeHtml(statusOf(item))}</strong></div>
+        <div class="detail-stat"><span>Source availability</span><strong>Not checked</strong></div>
+        <div class="detail-stat"><span>Resolution</span><strong>${item.width && item.height ? `${escapeHtml(item.width)} × ${escapeHtml(item.height)}` : "Unknown"}</strong></div>
+        <div class="detail-stat"><span>Codec</span><strong>${escapeHtml(item.codec || "Unknown")}</strong></div>
+        <div class="detail-stat"><span>Metadata</span><strong>${escapeHtml(item.metadata_status ?? "Unknown")}</strong></div>
+        <div class="detail-stat"><span>Confidence</span><strong>${escapeHtml(item.confidence ?? "Unknown")}</strong></div>
+        <div class="detail-stat"><span>Integrity</span><strong>${escapeHtml(item.integrity_status ?? "Unknown")}</strong></div>
+        <div class="detail-stat"><span>Media + related files</span><strong>${1 + attachments.length} files</strong></div>
+      </div>
+      ${collection ? `<section class="detail-section"><h3>Collection</h3><div class="attachment">${escapeHtml(collection)}</div></section>` : ""}
+      <section class="detail-section"><h3>Source links (${sourceIds.length})</h3>${sourceIds.length ? sourceIds.map((source) => { const url = sourceIdUrl(source); return `<div class="attachment">${url ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${escapeHtml(source)}</a>` : escapeHtml(source)}</div>`; }).join("") : `<div class="attachment">No source links recorded.</div>`}<p class="field-hint">Remote source availability has not been checked.</p></section>
+      <section class="detail-section"><h3>Related files (${attachments.length})</h3>${attachments.length ? attachments.map((attachment) => { const rel = attachment.relative_path ?? attachment.path ?? "Related file"; const absolute = pathJoin(rel); return `<div class="attachment"><div class="copy-row"><code>${escapeHtml(rel)}</code><button class="small-button" type="button" data-copy="${escapeHtml(rel)}">Copy relative</button></div>${absolute ? `<div class="copy-row"><code>${escapeHtml(absolute)}</code><button class="small-button" type="button" data-copy="${escapeHtml(absolute)}">Copy full</button></div>` : ""}<span>${escapeHtml(attachment.kind ?? "attachment")}</span></div>`; }).join("") : `<div class="attachment">No attachments found.</div>`}</section>
+    </aside>`;
+  document.body.append(panel);
+  panel.addEventListener("click", (event) => { if (event.target === panel || event.target.closest(".detail-close")) { state.detailId = null; renderDetail(); } });
+}
+
+function render() {
+  if (!mayUsePrivateSnapshot(state)) return;
+  renderSync();
+  renderLibrary();
+  renderWaiting();
+  renderPreviews();
+  renderLegacyMappings();
+  renderOperations();
+  renderQueueCount();
+  for (const tab of document.querySelectorAll(".view-tab")) {
+    const active = tab.dataset.view === state.view;
+    tab.classList.toggle("active", active);
+    if (active) tab.setAttribute("aria-current", "page"); else tab.removeAttribute("aria-current");
+  }
+  for (const panel of document.querySelectorAll(".view-panel")) panel.classList.toggle("hidden", panel.id !== `view-${state.view}`);
+  renderDetail();
+}
+
+function previewSelectedLegacy() {
+  const operation = state.legacyOperation;
+  if (!operation) return;
+  const choices = buildLegacyMappingChoices(
+    state.legacyOperationKey,
+    operation.result.hints,
+    operation.result.candidates,
+    libraryItems(),
+  );
+  const result = buildLegacyMetadataPatches({
+    hints: operation.result.hints,
+    choices,
+    selections: state.legacySelection,
+    items: libraryItems(),
+    limit: MAX_SELECTED_ITEMS,
+  });
+  const messages = {
+    "empty-selection": "Select at least one explicit hint-to-video match.",
+    "selection-limit": `Choose at most ${MAX_SELECTED_ITEMS} metadata matches per request.`,
+    "duplicate-hint": "Choose at most one video for each legacy hint.",
+    "manual-target-required": "Choose a present video for every manual match.",
+    "target-not-present": "This video is no longer present. Choose a current video manually.",
+    "duplicate-target": "Choose each video once; combine its changes in one mapping.",
+    "invalid-hint": "This legacy hint is no longer available. Refresh the import report.",
+    "empty-fields": "Choose at least one metadata field to apply.",
+  };
+  if (result.error) return showToast(messages[result.error] ?? "Review the selected legacy mappings.");
+  submitAction("file_preview", { metadata_patches: result.patches, rename: false, conflict: "skip" });
+}
+
+function selectVisible() {
+  const scope = state.view === "needs" ? "needs" : "library";
+  const visible = presentMediaItems(pageItemsForScope(scope));
+  const allSelected = visible.length > 0 && visible.every((item) => state.selected.has(String(item.id)));
+  const omittedCount = updateSelectedItems(visible.map((item) => String(item.id)), !allSelected);
+  renderLibrary();
+  if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
+}
+
+function bindEvents() {
+  byId("refresh-button").addEventListener("click", () => refreshState());
+  byId("scan-button").addEventListener("click", () => submitAction("library_scan", {}));
+  document.querySelectorAll("[data-scan]").forEach((button) => button.addEventListener("click", () => submitAction("library_scan", {})));
+  byId("search-input").addEventListener("input", (event) => { state.query = event.target.value; state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
+  byId("category-filter").addEventListener("input", () => { state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
+  byId("status-filter").addEventListener("change", () => { state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
+  byId("select-visible").addEventListener("click", selectVisible);
+  byId("target-dir").addEventListener("input", renderFilters);
+  byId("root-target").addEventListener("click", () => { byId("target-dir").value = ""; renderFilters(); byId("target-dir").focus(); });
+  byId("preview-move").addEventListener("click", () => {
+    if (state.selected.size > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} videos per request.`);
+    const { directory, error } = validateTargetRelativeDirectory(byId("target-dir").value);
+    if (error) return showToast(error);
+    submitAction("file_preview", { item_ids: [...state.selected], target_relative_dir: directory, rename: byId("rename-toggle").checked, conflict: byId("conflict-select").value });
+  });
+  byId("legacy-text").addEventListener("input", (event) => { byId("legacy-size").textContent = `${new TextEncoder().encode(event.target.value).byteLength.toLocaleString()} / 256 KB`; });
+  byId("import-legacy").addEventListener("click", async () => {
+    let text = byId("legacy-text").value;
+    const fileInput = byId("legacy-file");
+    if (!text && fileInput?.files?.[0]) {
+      return submitLegacyFileImport(
+        fileInput.files[0],
+        (value) => submitAction("legacy_import", { text: value }),
+        showToast,
+        MAX_LEGACY_BYTES,
+      );
+    }
+    const bytes = new TextEncoder().encode(text).byteLength;
+    if (bytes === 0) return showToast("Paste legacy text or choose a text file first.");
+    if (bytes > MAX_LEGACY_BYTES) return showToast("Legacy text exceeds the 256 KB limit.");
+    submitAction("legacy_import", { text });
+  });
+  byId("legacy-text").addEventListener("paste", async (event) => {
+    if (byId("legacy-text").value) return;
+    const clipboard = event.clipboardData?.getData("text/plain");
+    if (clipboard && new TextEncoder().encode(clipboard).byteLength <= MAX_LEGACY_BYTES) {
+      window.setTimeout(() => { byId("legacy-size").textContent = `${new TextEncoder().encode(byId("legacy-text").value).byteLength.toLocaleString()} / 256 KB`; }, 0);
+    }
+  });
+  document.body.addEventListener("input", (event) => {
+    const search = event.target.closest("[data-manual-picker-search]");
+    if (!search) return;
+    state.manualPickerQuery = search.value;
+    const key = search.dataset.manualPickerSearch;
+    const selection = state.legacySelection.get(key) ?? { item_id: "" };
+    const contents = manualTargetPickerContents(selection);
+    const picker = search.closest(".manual-target-picker");
+    const target = picker?.querySelector("[data-manual-target]");
+    const status = picker?.querySelector("[data-manual-picker-status]");
+    if (target) target.innerHTML = contents.options;
+    if (status) status.textContent = contents.status;
+  });
+  document.body.addEventListener("change", (event) => {
+    const mapCheckbox = event.target.closest("[data-map-select]");
+    const mapField = event.target.closest("[data-map-field]");
+    const manualTarget = event.target.closest("[data-manual-target]");
+    if (mapCheckbox || mapField || manualTarget) {
+      const key = mapCheckbox?.dataset.mapSelect ?? mapField?.dataset.mapKey ?? manualTarget?.dataset.manualTarget;
+      if (mapCheckbox) {
+        const result = selectLegacyMappingChoice(
+          state.legacySelection,
+          key,
+          Number(mapCheckbox.dataset.hintIndex),
+          mapCheckbox.checked,
+          MAX_SELECTED_ITEMS,
+        );
+        if (!result.ok) {
+          mapCheckbox.checked = false;
+          if (result.reason === "limit") showToast(selectionLimitMessage(1));
+          else showToast("This legacy mapping is no longer available. Refresh the import report.");
+        }
+      }
+      if (mapField) updateLegacySelection(state.legacySelection, key, { [mapField.dataset.mapField]: mapField.checked });
+      if (manualTarget) updateLegacySelection(state.legacySelection, key, { item_id: manualTarget.value });
+      return;
+    }
+    const groupCheckbox = event.target.closest("[data-select-group]");
+    if (groupCheckbox) {
+      const groupTitle = groupCheckbox.dataset.selectGroup;
+      const scope = state.view === "needs" ? "needs" : "library";
+      const visibleItems = pageItemsForScope(scope);
+      const groupItems = presentMediaItems(visibleItems.filter((item) => (item.collection?.title ?? item.collection ?? "Uncollected") === groupTitle));
+      const omittedCount = updateSelectedItems(groupItems.map((item) => String(item.id)), groupCheckbox.checked);
+      renderLibrary();
+      if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
+      return;
+    }
+    const checkbox = event.target.closest("[data-select-item]");
+    if (!checkbox) return;
+    const itemId = checkbox.dataset.selectItem;
+    const item = libraryItems().find((entry) => String(entry.id) === String(itemId));
+    if (!isPresentMedia(item)) {
+      state.selected.delete(itemId);
+      renderLibrary();
+      return;
+    }
+    const omittedCount = updateSelectedItems([itemId], checkbox.checked);
+    renderLibrary();
+    if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
+  });
+  document.body.addEventListener("click", (event) => {
+    const libraryPageButton = event.target.closest("[data-library-page]");
+    if (libraryPageButton) {
+      const scope = libraryPageButton.dataset.libraryPage === "needs" ? "needs" : "library";
+      const pageKey = scope === "needs" ? "needsPage" : "libraryPage";
+      state[pageKey] += Number(libraryPageButton.dataset.pageDirection);
+      renderLibrary();
+      return;
+    }
+    const pageButton = event.target.closest("[data-legacy-page]");
+    if (pageButton) {
+      state.legacyPage += Number(pageButton.dataset.legacyPage);
+      renderLegacyMappings();
+      return;
+    }
+    const manualHintButton = event.target.closest("[data-open-manual-hint]");
+    if (manualHintButton && state.legacyOperation) {
+      const operationKey = state.legacyOperationKey;
+      const hintIndex = Number(manualHintButton.dataset.openManualHint);
+      const choices = buildLegacyMappingChoices(
+        operationKey,
+        state.legacyOperation.result.hints,
+        state.legacyOperation.result.candidates,
+        libraryItems(),
+      );
+      const manualKey = `${operationKey}:manual:${hintIndex}`;
+      const manualIndex = choices.findIndex((choice) => choice.key === manualKey);
+      if (manualIndex >= 0) {
+        state.legacyPage = Math.floor(manualIndex / LEGACY_MAPPING_PAGE_SIZE);
+        state.manualPickerKey = manualKey;
+        state.manualPickerQuery = "";
+        renderLegacyMappings();
+        byId("legacy-mappings").querySelector("[data-manual-picker-search]")?.focus();
+      }
+      return;
+    }
+    const manualPickerToggle = event.target.closest("[data-manual-picker-toggle]");
+    if (manualPickerToggle) {
+      const key = manualPickerToggle.dataset.manualPickerToggle;
+      state.manualPickerKey = state.manualPickerKey === key ? null : key;
+      state.manualPickerQuery = "";
+      renderLegacyMappings();
+      if (state.manualPickerKey) byId("legacy-mappings").querySelector("[data-manual-picker-search]")?.focus();
+      return;
+    }
+    const groupCheckbox = event.target.closest("[data-select-group]");
+    if (groupCheckbox) { event.stopPropagation(); return; }
+    const tab = event.target.closest("[data-view]");
+    if (tab) { state.view = tab.dataset.view; render(); return; }
+    const details = event.target.closest("[data-details]");
+    if (details) { state.detailId = details.dataset.details; renderDetail(); return; }
+    const confirm = event.target.closest("[data-confirm]");
+    if (confirm) {
+      const matchingPreview = previews().find((entry) => entry.id === confirm.dataset.confirm && entry.revision === confirm.dataset.revision);
+      if (!matchingPreview || isIncompletePreview(matchingPreview)) {
+        showToast("This preview is incomplete. Request a fresh preview before confirming.");
+        return;
+      }
+      confirm.disabled = true;
+      submitAction("file_confirm", { preview_id: confirm.dataset.confirm, revision: confirm.dataset.revision });
+      return;
+    }
+    const copyButton = event.target.closest("[data-copy]");
+    if (copyButton) {
+      const value = copyButton.dataset.copy ?? "";
+      if (navigator.clipboard?.writeText) navigator.clipboard.writeText(value).then(() => showToast("Copied to clipboard")).catch(() => showToast("Could not copy this path"));
+      else showToast("Clipboard access is unavailable in this browser.");
+      return;
+    }
+    if (event.target.closest("#preview-metadata")) { previewSelectedLegacy(); return; }
+  });
+  window.addEventListener("online", () => { showToast("Connection restored. Sending saved actions."); drainActionQueue(); refreshState({ quiet: true }); });
+  window.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.detailId) { state.detailId = null; renderDetail(); } });
+}
+
+function start() {
+  telegram?.ready?.();
+  telegram?.expand?.();
+  bindEvents();
+  Object.assign(state, beginOwnerVerification());
+  clearCachedSnapshot();
+  if (!initData) {
+    byId("auth-gate").classList.remove("hidden");
+    return;
+  }
+  byId("auth-message").textContent = "Verifying access to the private library…";
+  byId("auth-gate").classList.remove("hidden");
+  setConnection("", "Verifying owner access");
+  refreshState();
+  window.setInterval(() => refreshState({ quiet: true }), POLL_MS);
+}
+
+start();

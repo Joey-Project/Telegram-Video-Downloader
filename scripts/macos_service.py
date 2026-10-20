@@ -26,6 +26,7 @@ from pathlib import Path
 
 IDENTIFIER = "io.github.telegram-local-downloader.bot"
 EXECUTABLE = "telegram-video-downloader"
+LAUNCHD_CLOUD_SHARED_SECRET = "TELEGRAM_VIDEO_DOWNLOADER_CLOUD_SHARED_SECRET"
 STOP_TIMEOUT = 15
 SNAPSHOT_SECONDS = 120
 SNAPSHOT_BYTES = 256 * 1024 * 1024
@@ -893,12 +894,21 @@ class _ReadinessLogScanner:
     """Scan only appended bytes, keeping bounded parser state for each log object."""
 
     CHUNK_BYTES = 256 * 1024
-    STARTED = b"telegram local downloader started"
+    TELEGRAM_STARTED = b"telegram local downloader started"
+    STARTED = TELEGRAM_STARTED
     POLLS = {b"telegram polling completed poll=1", b"telegram polling completed poll=2"}
-    STARTED_PREFIX = STARTED + b" concurrency="
-    LINE_BYTES = len(STARTED_PREFIX) + 20 + len(b" pid=") + 10 + 1
+    TELEGRAM_STARTED_PREFIX = TELEGRAM_STARTED + b" concurrency="
+    STARTED_PREFIX = TELEGRAM_STARTED_PREFIX
+    CLOUD_STARTED_PREFIX = b"telegram local cloud ingress started concurrency="
+    CLOUD_RECONCILED = b"cloud ingress reconciliation completed"
+    LINE_BYTES = max(len(TELEGRAM_STARTED_PREFIX), len(CLOUD_STARTED_PREFIX)) + 20 + len(
+        b" pid="
+    ) + 10 + 1
 
-    def __init__(self, paths, offsets):
+    def __init__(self, paths, offsets, mode="telegram"):
+        if mode not in {"telegram", "cloud"}:
+            raise InstallError("readiness mode must be telegram or cloud")
+        self.mode = mode
         self.paths = list(dict.fromkeys(paths))
         self.boundaries = {}
         self.streams = {}
@@ -963,6 +973,7 @@ class _ReadinessLogScanner:
                         "overflow": False,
                         "started": False,
                         "polls": set(),
+                        "cloud_reconciled": False,
                         "initialized": False,
                     }
                     self.streams[identity] = state
@@ -997,12 +1008,18 @@ class _ReadinessLogScanner:
                             line = line.removesuffix(b"\r")
                             if line.endswith(pid_suffix):
                                 marker = line[: -len(pid_suffix)]
-                                state["started"] |= marker == self.STARTED or (
-                                    marker.startswith(self.STARTED_PREFIX)
-                                    and marker[len(self.STARTED_PREFIX) :].isdigit()
-                                )
-                                if marker in self.POLLS:
-                                    state["polls"].add(marker)
+                                if self.mode == "telegram":
+                                    state["started"] |= marker == self.TELEGRAM_STARTED or (
+                                        marker.startswith(self.TELEGRAM_STARTED_PREFIX)
+                                        and marker[len(self.TELEGRAM_STARTED_PREFIX) :].isdigit()
+                                    )
+                                    if marker in self.POLLS:
+                                        state["polls"].add(marker)
+                                else:
+                                    state["started"] |= marker.startswith(
+                                        self.CLOUD_STARTED_PREFIX
+                                    ) and marker[len(self.CLOUD_STARTED_PREFIX) :].isdigit()
+                                    state["cloud_reconciled"] |= marker == self.CLOUD_RECONCILED
                         state["line"], state["overflow"] = b"", False
                     else:
                         state["overflow"] |= len(line) > self.LINE_BYTES
@@ -1024,6 +1041,10 @@ class _ReadinessLogScanner:
             for _, stream in opened:
                 stream.close()
         started = any(state["started"] for state in self.streams.values())
+        if self.mode == "cloud":
+            return started and any(
+                state.get("cloud_reconciled", False) for state in self.streams.values()
+            )
         polls = set().union(*(state["polls"] for state in self.streams.values()))
         return started and self.POLLS.issubset(polls)
 
@@ -1043,6 +1064,9 @@ class Deployment:
             raise InstallError("production deployment requires this user's gui or user domain")
         self.home = Path.home()
         self.repo = absolute(args.repo, Path.cwd())
+        self.readiness_mode = "telegram"
+        self.launchd_cloud_shared_secret = None
+        self.config_has_cloud_shared_secret = False
         self.input_binary = absolute(args.binary, Path.cwd()) if args.binary else None
         self.binary = self.home / ".local/lib/telegram-video-downloader/bin" / EXECUTABLE
         self.backups = self.home / ".local/lib/telegram-video-downloader/backups"
@@ -1084,7 +1108,7 @@ class Deployment:
             ):
                 raise InstallError(
                     "existing LaunchAgent requires an absolute StandardErrorPath "
-                    "to capture startup and polling readiness; configure it before deployment"
+                    "to capture startup and readiness records; configure it before deployment"
                 )
         old_args = self.old_plist.get("ProgramArguments", []) if self.old_plist else []
         if self.old_plist and len(old_args) != 2:
@@ -1139,6 +1163,23 @@ class Deployment:
             self.document = tomllib.loads(contents.decode("utf-8"))
         except (UnicodeError, tomllib.TOMLDecodeError):
             raise InstallError("configuration is not valid UTF-8 TOML") from None
+        cloud_config = self.document.get("cloud")
+        if cloud_config is not None and not isinstance(cloud_config, dict):
+            raise InstallError("cloud configuration must be a TOML table")
+        self.readiness_mode = "cloud" if cloud_config is not None else "telegram"
+        self.launchd_cloud_shared_secret = None
+        configured_shared_secret = (
+            cloud_config.get("shared_secret") if self.readiness_mode == "cloud" else None
+        )
+        self.config_has_cloud_shared_secret = (
+            isinstance(configured_shared_secret, str) and bool(configured_shared_secret.strip())
+        )
+        if self.readiness_mode == "cloud":
+            shared_secret = os.environ.get(LAUNCHD_CLOUD_SHARED_SECRET)
+            # A non-empty installer value wins; otherwise a configured secret removes any
+            # persisted override so the runtime resolves the same source as this installer.
+            if shared_secret is not None and shared_secret.strip():
+                self.launchd_cloud_shared_secret = shared_secret
         auth = self.document.get("bilibili", {}).get("auth", {})
         self.auth_paths = {}
         for key, default in [
@@ -1210,6 +1251,7 @@ class Deployment:
             "source_binary": str(self.old_binary),
             "media": {key: str(value) for key, value in self.media.items()},
             "signing_identity": self.identity,
+            "readiness_mode": self.readiness_mode,
             "backups": str(self.backups),
             "state": "configuration and media transactional state stay at their existing paths",
         }
@@ -1218,6 +1260,16 @@ class Deployment:
         if self.old_plist:
             document = copy.deepcopy(self.old_plist)
             document["ProgramArguments"][0] = str(self.binary)
+            if (
+                self.launchd_cloud_shared_secret is not None
+                or self.config_has_cloud_shared_secret
+            ):
+                environment = dict(document.get("EnvironmentVariables", {}))
+                if self.launchd_cloud_shared_secret is not None:
+                    environment[LAUNCHD_CLOUD_SHARED_SECRET] = self.launchd_cloud_shared_secret
+                else:
+                    environment.pop(LAUNCHD_CLOUD_SHARED_SECRET, None)
+                document["EnvironmentVariables"] = environment
             return plistlib.dumps(document)
         environment = {
             "HOME": str(self.home),
@@ -1233,6 +1285,8 @@ class Deployment:
                 {"DOTNET_ROOT": str(self.dotnet_root), "DOTNET_ROOT_ARM64": str(self.dotnet_root)}
             )
             environment["PATH"] = f"{self.dotnet_root}:{environment['PATH']}"
+        if self.launchd_cloud_shared_secret is not None:
+            environment[LAUNCHD_CLOUD_SHARED_SECRET] = self.launchd_cloud_shared_secret
         return plistlib.dumps(
             {
                 "Label": self.args.label,
@@ -1245,6 +1299,12 @@ class Deployment:
                 "StandardErrorPath": str(self.log_paths[1]),
             }
         )
+
+    def plist_contains_cloud_shared_secret(self):
+        if self.launchd_cloud_shared_secret is not None:
+            return True
+        environment = self.old_plist.get("EnvironmentVariables", {}) if self.old_plist else {}
+        return LAUNCHD_CLOUD_SHARED_SECRET in environment
 
     def revalidate_media_bindings(self):
         for kind, directory in self.media.items():
@@ -1419,7 +1479,7 @@ class Deployment:
     def wait_ready(self, offsets):
         deadline = time.monotonic() + self.args.ready_timeout
         observed_pid = None
-        logs = _ReadinessLogScanner([self.stderr_path], offsets)
+        logs = _ReadinessLogScanner([self.stderr_path], offsets, mode=self.readiness_mode)
         while time.monotonic() < deadline:
             current = service_info(self.targets[0])
             if current and current["pid"]:
@@ -1481,6 +1541,11 @@ class Deployment:
                         raise InstallError("service PID changed before readiness was confirmed")
                     return current["pid"]
             time.sleep(1)
+        if self.readiness_mode == "cloud":
+            raise InstallError(
+                "cloud startup and initial REST ingress reconciliation readiness "
+                "were not observed before timeout"
+            )
         raise InstallError(
             "startup-ready and two successful Telegram polling cycles "
             "were not observed before timeout"
@@ -1580,21 +1645,35 @@ class Deployment:
             mode = (
                 stat.S_IMODE(self.plist_path.stat().st_mode) if self.plist_path.exists() else 0o644
             )
-            atomic_bytes(self.plist_path, self.new_plist(), mode)
+            plist_bytes = self.new_plist()
+            if self.plist_contains_cloud_shared_secret():
+                mode = 0o600
+            atomic_bytes(self.plist_path, plist_bytes, mode)
             for path in self.log_paths:
                 path.resolve(strict=False).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             run(["launchctl", "bootstrap", self.args.domain, self.plist_path])
             pid = self.wait_ready(offsets)
             atomic_bytes(
                 backup / "complete.json",
-                json.dumps({"pid": pid, "state_entries": state_entries}).encode(),
+                json.dumps(
+                    {
+                        "pid": pid,
+                        "state_entries": state_entries,
+                        "readiness_mode": self.readiness_mode,
+                    }
+                ).encode(),
             )
-            return {
+            result = {
                 "backup": str(backup),
                 "pid": pid,
                 "startup_ready": True,
-                "successful_poll_cycles": 2,
+                "readiness_mode": self.readiness_mode,
             }
+            if self.readiness_mode == "cloud":
+                result["cloud_ingress_reconciled"] = True
+            else:
+                result["successful_poll_cycles"] = 2
+            return result
         except BaseException as failure:
             if stopped:
                 failure_reason = (

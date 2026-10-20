@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
 use crate::bilibili_attempt::{
-    BilibiliAttemptEntryState, BilibiliAttemptOutcome, BilibiliAttemptSnapshot,
-    BilibiliAttemptUpdate,
+    BilibiliAttemptEntry, BilibiliAttemptEntryState, BilibiliAttemptOutcome,
+    BilibiliAttemptSnapshot, BilibiliAttemptUpdate,
 };
 use crate::config::AppConfig;
 use crate::file_provider::{
@@ -359,6 +359,7 @@ struct DownloadStore {
     queue_identity: EntryIdentity,
     operation_lock_path: PathBuf,
     file_provider: Arc<dyn QueueFileProvider>,
+    state_change_notify: Arc<Notify>,
 }
 
 struct QueueOperationLock {
@@ -376,6 +377,8 @@ pub struct QueueManager {
     _pdf_owner_lock: Option<QueueOwnerLock>,
     operation_lock: Mutex<()>,
     cancellations: Mutex<HashMap<String, CancellationRegistration>>,
+    publication_notify: Arc<Notify>,
+    state_change_notify: Arc<Notify>,
     #[cfg(test)]
     interrupt_after_sidecar_move: AtomicBool,
 }
@@ -482,6 +485,43 @@ fn refresh_bilibili_attempt_counts(record: &mut TaskRecord) {
         snapshot.skipped_entries.saturating_add(verified).min(total)
     };
     record.media_entries_failed = snapshot.failed_entries().min(total);
+}
+
+fn has_verified_bilibili_output_receipt(entry: &BilibiliAttemptEntry) -> bool {
+    entry.state == BilibiliAttemptEntryState::Verified
+        && !entry.stable_media_id.trim().is_empty()
+        && !entry.published_media_paths.is_empty()
+        && !entry.published_media_hashes.is_empty()
+        && entry.published_media_paths.iter().all(|path| {
+            entry
+                .published_media_hashes
+                .contains_key(path.to_string_lossy().as_ref())
+        })
+}
+
+type VerifiedBilibiliReceiptKey = (u32, String, Vec<(PathBuf, String)>);
+
+fn verified_bilibili_receipt_keys(record: &TaskRecord) -> BTreeSet<VerifiedBilibiliReceiptKey> {
+    record
+        .bilibili_attempt
+        .iter()
+        .flat_map(|attempt| &attempt.entries)
+        .filter(|entry| has_verified_bilibili_output_receipt(entry))
+        .map(|entry| {
+            let mut outputs = entry
+                .published_media_paths
+                .iter()
+                .filter_map(|path| {
+                    entry
+                        .published_media_hashes
+                        .get(path.to_string_lossy().as_ref())
+                        .map(|hash| (path.clone(), hash.clone()))
+                })
+                .collect::<Vec<_>>();
+            outputs.sort();
+            (entry.index, entry.stable_media_id.clone(), outputs)
+        })
+        .collect()
 }
 
 fn reconcile_accepted_bilibili_attempt(
@@ -625,7 +665,12 @@ impl QueueManager {
             coordinate_directory_root(file_provider.as_ref(), &config.downloads.video_dir)?;
         let pdf_root =
             coordinate_directory_root(file_provider.as_ref(), &config.downloads.pdf_dir)?;
-        let mut video = DownloadStore::from_root(video_root, Arc::clone(&file_provider))?;
+        let state_change_notify = Arc::new(Notify::new());
+        let mut video = DownloadStore::from_root(
+            video_root,
+            Arc::clone(&file_provider),
+            Arc::clone(&state_change_notify),
+        )?;
         let pdf = if video.root.root_identity() == pdf_root.root_identity() {
             let pdf_alias = pdf_root.logical_root_path().to_path_buf();
             if !video.root_aliases.contains(&pdf_alias) {
@@ -633,7 +678,7 @@ impl QueueManager {
             }
             video.clone()
         } else {
-            DownloadStore::from_root(pdf_root, file_provider)?
+            DownloadStore::from_root(pdf_root, file_provider, Arc::clone(&state_change_notify))?
         };
         // Protected property: a live queue manager exclusively owns each backing download root,
         // so no second process can mutate its task index or recover its running tasks. The
@@ -651,6 +696,8 @@ impl QueueManager {
             _pdf_owner_lock: pdf_owner_lock,
             operation_lock: Mutex::new(()),
             cancellations: Mutex::new(HashMap::new()),
+            publication_notify: Arc::new(Notify::new()),
+            state_change_notify,
             #[cfg(test)]
             interrupt_after_sidecar_move: AtomicBool::new(false),
         };
@@ -672,6 +719,16 @@ impl QueueManager {
         Ok(manager)
     }
 
+    /// Subscribe to newly published outputs without polling or rescanning task history.
+    pub fn publication_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.publication_notify)
+    }
+
+    /// Subscribe to durable queue status or progress changes without requesting a library scan.
+    pub fn state_change_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.state_change_notify)
+    }
+
     pub fn create(&self, mut task: TaskRecord) -> Result<bool> {
         if let Some(snapshot) = task.bilibili_attempt.as_mut() {
             snapshot.sanitize_errors();
@@ -688,6 +745,7 @@ impl QueueManager {
         }
         let store = self.store_for_job(&task.job);
         store.create_task(&mut task)?;
+        self.state_change_notify.notify_one();
         Ok(true)
     }
 
@@ -733,6 +791,107 @@ impl QueueManager {
             .skip(start)
             .take(QUEUE_PAGE_SIZE)
             .collect())
+    }
+
+    /// Return one stable bounded snapshot of active tasks for explicitly allowed chats.
+    /// The operation lock covers both queue stores and selection so task updates cannot reorder
+    /// records between offset pages. Equal timestamps retain the old per-chat list order.
+    pub fn active_records_for_chats(
+        &self,
+        chat_ids: &[i64],
+        max_records: usize,
+    ) -> Result<Vec<TaskRecord>> {
+        self.active_records_for_chats_with_snapshot_hook(chat_ids, max_records, || {})
+    }
+
+    #[cfg(test)]
+    fn active_records_for_chats_with_test_hook<F>(
+        &self,
+        chat_ids: &[i64],
+        max_records: usize,
+        after_snapshot: F,
+    ) -> Result<Vec<TaskRecord>>
+    where
+        F: FnOnce(),
+    {
+        self.active_records_for_chats_with_snapshot_hook(chat_ids, max_records, after_snapshot)
+    }
+
+    fn active_records_for_chats_with_snapshot_hook<F>(
+        &self,
+        chat_ids: &[i64],
+        max_records: usize,
+        after_snapshot: F,
+    ) -> Result<Vec<TaskRecord>>
+    where
+        F: FnOnce(),
+    {
+        if chat_ids.is_empty() || max_records == 0 {
+            return Ok(Vec::new());
+        }
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        // History sidecars stay in the index for pagination, but a task-summary refresh only
+        // needs a bounded set of entries that the index still locates in the active queue.
+        // Reading every history record here made each progress update pay for the full history.
+        let mut records = self
+            .video
+            .active_summary_records_for_chats(chat_ids, max_records)?;
+        if !self.video.shares_root(&self.pdf) {
+            records.extend(
+                self.pdf
+                    .active_summary_records_for_chats(chat_ids, max_records)?,
+            );
+        }
+        after_snapshot();
+
+        // Match the previous per-chat page concatenation order for stable timestamp ties, while
+        // avoiding duplicate publication if a configured chat ID appears more than once.
+        let mut chat_order = HashMap::with_capacity(chat_ids.len());
+        for (index, chat_id) in chat_ids.iter().enumerate() {
+            chat_order.entry(*chat_id).or_insert(index);
+        }
+        let mut selected = records
+            .into_iter()
+            .enumerate()
+            .filter_map(|(record_order, record)| {
+                if record.status.is_history() {
+                    return None;
+                }
+                let configured_chat_order = *chat_order.get(&record.chat_id)?;
+                Some((configured_chat_order, record_order, record))
+            })
+            .collect::<Vec<_>>();
+        selected.sort_by_key(|(configured_chat_order, record_order, record)| {
+            (
+                std::cmp::Reverse(record.updated_at),
+                *configured_chat_order,
+                *record_order,
+            )
+        });
+        selected.truncate(max_records);
+        Ok(selected.into_iter().map(|(_, _, record)| record).collect())
+    }
+
+    /// Return legacy completed records and tasks with verified per-entry output receipts.
+    ///
+    /// This is used to seed the media library's source hints. It intentionally does not filter
+    /// by chat ID because the local library belongs to the single configured bot instance and
+    /// `allow_all_chats` has no finite configured chat list.
+    pub fn published_records(&self) -> Result<Vec<TaskRecord>> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let mut records = self.video.list_records()?;
+        if !self.video.shares_root(&self.pdf) {
+            records.extend(self.pdf.list_records()?);
+        }
+        records.retain(|record| {
+            if record.bilibili_attempt.is_some() {
+                !verified_bilibili_receipt_keys(record).is_empty()
+            } else {
+                record.status == TaskStatus::Completed && record.saved_location.is_some()
+            }
+        });
+        records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
+        Ok(records)
     }
 
     pub fn page_count(&self, chat_id: i64, history: bool) -> Result<usize> {
@@ -1338,7 +1497,9 @@ impl QueueManager {
         expected_generation: u64,
         mut snapshot: BilibiliAttemptSnapshot,
     ) -> Result<Option<TaskRecord>> {
-        self.update_if_generation(id, expected_generation, true, |record| {
+        let mut added_receipt = false;
+        let result = self.update_if_generation(id, expected_generation, true, |record| {
+            let previous_receipts = verified_bilibili_receipt_keys(record);
             if record.status == TaskStatus::Completed && snapshot.independent_entries {
                 return Ok(());
             }
@@ -1349,8 +1510,16 @@ impl QueueManager {
             }
             record.bilibili_attempt = Some(snapshot);
             refresh_bilibili_attempt_counts(record);
+            added_receipt = verified_bilibili_receipt_keys(record)
+                .difference(&previous_receipts)
+                .next()
+                .is_some();
             Ok(())
-        })
+        })?;
+        if result.is_some() && added_receipt {
+            self.publication_notify.notify_one();
+        }
+        Ok(result)
     }
 
     #[cfg(test)]
@@ -1384,6 +1553,7 @@ impl QueueManager {
         if updates.is_empty() {
             return Ok(Some(record));
         }
+        let previous_receipts = verified_bilibili_receipt_keys(&record);
         let Some(snapshot) = record.bilibili_attempt.as_mut() else {
             return Ok(Some(record));
         };
@@ -1394,7 +1564,15 @@ impl QueueManager {
             update.apply(snapshot, *index);
         }
         refresh_bilibili_attempt_counts(&mut record);
-        store.save_mutated_record(record, entry, true).map(Some)
+        let added_receipt = verified_bilibili_receipt_keys(&record)
+            .difference(&previous_receipts)
+            .next()
+            .is_some();
+        let record = store.save_mutated_record(record, entry, true)?;
+        if added_receipt {
+            self.publication_notify.notify_one();
+        }
+        Ok(Some(record))
     }
 
     pub fn record_staging_path_if_generation(
@@ -1554,6 +1732,29 @@ impl QueueManager {
     }
 
     fn complete_if_generation_inner(
+        &self,
+        id: &str,
+        expected_generation: Option<u64>,
+        saved_location: String,
+        media_paths: &[PathBuf],
+        hashes: BTreeMap<String, String>,
+    ) -> Result<Option<TaskRecord>> {
+        let result = self.complete_if_generation_unnotified(
+            id,
+            expected_generation,
+            saved_location,
+            media_paths,
+            hashes,
+        )?;
+        if result.as_ref().is_some_and(|record| {
+            record.status == TaskStatus::Completed && record.saved_location.is_some()
+        }) {
+            self.publication_notify.notify_one();
+        }
+        Ok(result)
+    }
+
+    fn complete_if_generation_unnotified(
         &self,
         id: &str,
         expected_generation: Option<u64>,
@@ -2426,7 +2627,11 @@ fn coordinated_path_under_root(root: &RootedFs, coordinated_path: &Path) -> Resu
 }
 
 impl DownloadStore {
-    fn from_root(root: RootedFs, file_provider: Arc<dyn QueueFileProvider>) -> Result<Self> {
+    fn from_root(
+        root: RootedFs,
+        file_provider: Arc<dyn QueueFileProvider>,
+        state_change_notify: Arc<Notify>,
+    ) -> Result<Self> {
         let requested_queue_dir = root.logical_root_path().join(QUEUE_DIRECTORY);
         coordinate_private_directory_creation(
             file_provider.as_ref(),
@@ -2453,6 +2658,7 @@ impl DownloadStore {
             queue_dir,
             queue_identity,
             file_provider,
+            state_change_notify,
         };
         store.ensure_operation_lock_file()?;
         Ok(store)
@@ -2982,7 +3188,7 @@ impl DownloadStore {
     fn list_records(&self) -> Result<Vec<TaskRecord>> {
         let mut index = self.read_index()?;
         let original_index = index.clone();
-        self.scan_active_records(&mut index)?;
+        self.scan_active_records(&mut index, false)?;
         self.reconcile_move_targets(&mut index)?;
         if index != original_index {
             self.write_index(&index)?;
@@ -2999,10 +3205,60 @@ impl DownloadStore {
         Ok(records)
     }
 
+    fn active_summary_records_for_chats(
+        &self,
+        chat_ids: &[i64],
+        max_records: usize,
+    ) -> Result<Vec<TaskRecord>> {
+        if chat_ids.is_empty() || max_records == 0 {
+            return Ok(Vec::new());
+        }
+
+        let chat_order =
+            chat_ids
+                .iter()
+                .enumerate()
+                .fold(HashMap::new(), |mut order, (index, chat_id)| {
+                    order.entry(*chat_id).or_insert(index);
+                    order
+                });
+        let index = self.read_index()?;
+        let mut candidates = index
+            .tasks
+            .iter()
+            .filter(|(_, entry)| {
+                chat_order.contains_key(&entry.chat_id)
+                    && entry.move_target.is_none()
+                    && entry.record_path.parent() == Some(self.queue_dir.as_path())
+            })
+            .collect::<Vec<_>>();
+        // The index's updated_at value is maintained with each record write. Task IDs provide
+        // the same stable within-store tie order as StoreIndex's BTreeMap iteration.
+        candidates.sort_by(|(left_id, left), (right_id, right)| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| chat_order[&left.chat_id].cmp(&chat_order[&right.chat_id]))
+                .then_with(|| left_id.cmp(right_id))
+        });
+
+        let mut records = Vec::with_capacity(max_records.min(candidates.len()));
+        for (id, entry) in candidates.into_iter().take(max_records) {
+            let Some(record) = self.read_record(&entry.record_path)? else {
+                continue;
+            };
+            if record.id != *id || record.chat_id != entry.chat_id {
+                bail!("task index points to a mismatched record for task {id}");
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     fn get_task(&self, id: &str) -> Result<Option<(TaskRecord, TaskIndexEntry)>> {
         let mut index = self.read_index()?;
         let original_index = index.clone();
-        self.scan_active_records(&mut index)?;
+        self.scan_active_records(&mut index, false)?;
         self.reconcile_move_targets(&mut index)?;
         if index != original_index {
             self.write_index(&index)?;
@@ -3053,6 +3309,7 @@ impl DownloadStore {
         }
         index.tasks.insert(record.id.clone(), entry);
         self.write_index(&index)?;
+        self.state_change_notify.notify_one();
         self.cleanup_terminal_bilibili_group_receipts(&record);
         Ok(record)
     }
@@ -3085,7 +3342,13 @@ impl DownloadStore {
 
     fn reconcile_index(&self) -> Result<()> {
         let mut index = self.read_index()?;
-        self.scan_active_records(&mut index)?;
+        let original_index = index.clone();
+        self.scan_active_records(&mut index, true)?;
+        // Persist repaired metadata and any terminal move intent before moving files. This keeps
+        // the existing crash-safe intent -> rename -> final-index sequence intact.
+        if index != original_index {
+            self.write_index(&index)?;
+        }
         self.reconcile_move_targets(&mut index)?;
         self.write_index(&index)
     }
@@ -3106,7 +3369,11 @@ impl DownloadStore {
         Ok(())
     }
 
-    fn scan_active_records(&self, index: &mut StoreIndex) -> Result<()> {
+    fn scan_active_records(
+        &self,
+        index: &mut StoreIndex,
+        reconcile_indexed_records: bool,
+    ) -> Result<()> {
         let entries = self.list_coordinated_queue_directory()?;
         if entries.len() > MAX_ACTIVE_RECORDS {
             bail!("task queue contains more than {MAX_ACTIVE_RECORDS} entries");
@@ -3122,10 +3389,36 @@ impl DownloadStore {
                 continue;
             };
             validate_task_id(id)?;
-            if !identity.is_file() || index.tasks.contains_key(id) {
+            if !identity.is_file() {
                 continue;
             }
             let path = self.task_path(id)?;
+            if let Some(entry) = index.tasks.get_mut(id) {
+                // Ordinary lookups keep the established bounded behavior and only discover
+                // orphan records. During startup reconciliation, repair index metadata from
+                // each already-indexed active queue file. This single bounded directory pass
+                // prevents stale terminal timestamps from occupying every summary slot.
+                if reconcile_indexed_records
+                    && entry.record_path == path
+                    && entry.move_target.is_none()
+                    && let Some(record) = self.read_record(&path)?
+                {
+                    if record.id != id || record.chat_id != entry.chat_id {
+                        bail!("task index points to a mismatched record for task {id}");
+                    }
+                    entry.revision = record.revision;
+                    entry.updated_at = record.updated_at;
+                    if record.status.is_history() {
+                        entry.move_target = Some(self.terminal_history_path(&record.id)?);
+                    }
+                    let activity = index
+                        .chat_activity
+                        .entry(record.chat_id.to_string())
+                        .or_default();
+                    activity.revision = activity.revision.max(record.activity_revision);
+                }
+                continue;
+            }
             if let Some(record) = self.read_record(&path)? {
                 if record.id != id {
                     bail!(
@@ -3689,6 +3982,7 @@ fn poisoned_lock<T>(_: std::sync::PoisonError<T>) -> anyhow::Error {
 mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::mpsc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use crate::file_provider::MockQueueFileProvider;
@@ -8468,5 +8762,499 @@ mod tests {
 
         drop(queue);
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[tokio::test]
+    async fn queue_progress_notifies_state_without_requesting_library_publication() {
+        let directory = temp_queue_root("state-notify");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let state_changed = queue.state_change_notify();
+        let published = queue.publication_notify();
+        let id = "state-notify-task";
+
+        assert!(
+            queue
+                .create(test_task(
+                    id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        tokio::time::timeout(Duration::from_secs(1), state_changed.notified())
+            .await
+            .expect("task creation should notify cloud state");
+
+        queue
+            .set_status(id, TaskStatus::Running, None)
+            .expect("task status should persist");
+        tokio::time::timeout(Duration::from_secs(1), state_changed.notified())
+            .await
+            .expect("status change should notify cloud state");
+
+        let progress = queue
+            .set_collection_progress(id, 5, 3, 1)
+            .expect("task progress should persist");
+        assert_eq!(progress.media_entries_completed, 3);
+        tokio::time::timeout(Duration::from_secs(1), state_changed.notified())
+            .await
+            .expect("progress change should notify cloud state");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), published.notified())
+                .await
+                .is_err(),
+            "ordinary queue progress must not request a library publication scan"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn active_chat_snapshot_sorts_once_across_allowed_chats_and_filters_history() {
+        let directory = temp_queue_root("active-chat-snapshot-order");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let make_task = |id: &str, chat_id: i64, status: TaskStatus, updated_at| {
+            let mut task = TaskRecord::new(
+                id.to_string(),
+                1,
+                2,
+                chat_id,
+                Some(3),
+                0,
+                JobRequest::Youtube {
+                    url: format!("https://example.invalid/{id}"),
+                },
+            );
+            task.status = status;
+            task.updated_at = updated_at;
+            task
+        };
+
+        for task in [
+            make_task("a-video", 10, TaskStatus::Received, 100),
+            make_task("b-video", 20, TaskStatus::Failed, 100),
+            make_task("c-video", 10, TaskStatus::Completed, 200),
+            make_task("d-video", 30, TaskStatus::Running, 300),
+            make_task("e-video", 10, TaskStatus::AwaitingConfirmation, 100),
+        ] {
+            assert!(queue.create(task).expect("fixture task should persist"));
+        }
+
+        let records = queue
+            .active_records_for_chats(&[20, 10, 20], 100)
+            .expect("allowed-chat snapshot should load");
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b-video", "a-video", "e-video"],
+            "global timestamp ordering should keep configured-chat stable ties without duplicates"
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.chat_id == 10 || record.chat_id == 20)
+        );
+        assert!(records.iter().all(|record| !record.status.is_history()));
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn active_chat_snapshot_reads_only_bounded_indexed_candidates() {
+        const HISTORY_COUNT: usize = 1_024;
+
+        let directory = temp_queue_root("active-chat-snapshot-bounded-reads");
+        let config = test_video_config(&directory);
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let queue = QueueManager::open_with_file_provider(&config, provider.clone())
+            .expect("queue should open");
+        queue
+            .video
+            .ensure_private_history_directory()
+            .expect("history directory should be private");
+
+        let mut index = queue.video.read_index().expect("queue index should load");
+        for number in 0..HISTORY_COUNT {
+            let id = format!("history-{number:05}");
+            let mut record = test_task(
+                &id,
+                JobRequest::Youtube {
+                    url: format!("https://example.invalid/{id}"),
+                },
+            );
+            record.status = TaskStatus::Completed;
+            record.updated_at = 10_000 + number as u64;
+            let path = queue
+                .video
+                .terminal_history_path(&id)
+                .expect("history path should be valid");
+            queue
+                .video
+                .write_record(&path, &record)
+                .expect("history record should persist");
+            index.tasks.insert(
+                id,
+                TaskIndexEntry {
+                    chat_id: record.chat_id,
+                    record_path: path,
+                    move_target: None,
+                    revision: record.revision,
+                    updated_at: record.updated_at,
+                },
+            );
+        }
+
+        for (id, status, updated_at) in [
+            ("active-old", TaskStatus::Received, 100),
+            ("active-middle", TaskStatus::Running, 200),
+            ("active-newest", TaskStatus::AwaitingConfirmation, 300),
+        ] {
+            let mut record = test_task(
+                id,
+                JobRequest::Youtube {
+                    url: format!("https://example.invalid/{id}"),
+                },
+            );
+            record.status = status;
+            record.updated_at = updated_at;
+            let path = queue
+                .video
+                .task_path(id)
+                .expect("active task path should be valid");
+            queue
+                .video
+                .write_record(&path, &record)
+                .expect("active record should persist");
+            index.tasks.insert(
+                id.to_string(),
+                TaskIndexEntry {
+                    chat_id: record.chat_id,
+                    record_path: path,
+                    move_target: None,
+                    revision: record.revision,
+                    updated_at: record.updated_at,
+                },
+            );
+        }
+
+        let mut pdf_index = queue.pdf.read_index().expect("PDF index should load");
+        for (id, updated_at) in [("pdf-old", 150), ("pdf-newest", 400)] {
+            let mut record = test_task(
+                id,
+                JobRequest::Pdf {
+                    url: format!("https://example.invalid/{id}"),
+                },
+            );
+            record.status = TaskStatus::Queued;
+            record.updated_at = updated_at;
+            let path = queue
+                .pdf
+                .task_path(id)
+                .expect("PDF task path should be valid");
+            queue
+                .pdf
+                .write_record(&path, &record)
+                .expect("PDF record should persist");
+            pdf_index.tasks.insert(
+                id.to_string(),
+                TaskIndexEntry {
+                    chat_id: record.chat_id,
+                    record_path: path,
+                    move_target: None,
+                    revision: record.revision,
+                    updated_at: record.updated_at,
+                },
+            );
+        }
+        queue
+            .pdf
+            .write_index(&pdf_index)
+            .expect("PDF index should persist");
+
+        queue
+            .video
+            .write_index(&index)
+            .expect("queue index should persist");
+
+        let reads_before = provider.read_paths();
+        let records = queue
+            .active_records_for_chats(&[123_456_789], 2)
+            .expect("bounded active summary should load");
+        let reads_after = provider.read_paths();
+        let summary_reads = &reads_after[reads_before.len()..];
+        let record_reads = summary_reads
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("task-"))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pdf-newest", "active-newest"]
+        );
+        assert_eq!(
+            record_reads.len(),
+            4,
+            "each independent store opens at most the requested candidate count"
+        );
+        assert!(record_reads.iter().all(|path| {
+            path.parent() == Some(queue.video.queue_dir.as_path())
+                || path.parent() == Some(queue.pdf.queue_dir.as_path())
+        }));
+        assert_eq!(index.tasks.len(), HISTORY_COUNT + 3);
+        assert_eq!(pdf_index.tasks.len(), 2);
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn startup_reconciles_terminal_records_before_bounded_active_summary() {
+        const STALE_TERMINAL_COUNT: usize = 120;
+
+        let directory = temp_queue_root("startup-reconcile-terminal-active-index");
+        let config = test_video_config(&directory);
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let queue = QueueManager::open_with_file_provider(&config, provider.clone())
+            .expect("queue should open");
+
+        let mut index = queue.video.read_index().expect("queue index should load");
+        for number in 0..STALE_TERMINAL_COUNT {
+            let id = format!("stale-terminal-{number:03}");
+            let mut record = test_task(
+                &id,
+                JobRequest::Youtube {
+                    url: format!("https://example.invalid/{id}"),
+                },
+            );
+            record.status = if number % 2 == 0 {
+                TaskStatus::Completed
+            } else {
+                TaskStatus::Cancelled
+            };
+            record.revision = 2;
+            record.updated_at = 30_000 + number as u64;
+            let path = queue
+                .video
+                .task_path(&id)
+                .expect("active task path should be valid");
+            queue
+                .video
+                .write_record(&path, &record)
+                .expect("terminal record should persist before its stale index update");
+            index.tasks.insert(
+                id,
+                TaskIndexEntry {
+                    chat_id: record.chat_id,
+                    record_path: path,
+                    move_target: None,
+                    revision: 1,
+                    // The index still reflects its older active state. These 120 entries sort
+                    // ahead of the live task and would fill the summary's 100-record read cap.
+                    updated_at: 20_000 + number as u64,
+                },
+            );
+        }
+
+        let mut active = test_task(
+            "still-active-after-terminal-crash",
+            JobRequest::Youtube {
+                url: "https://example.invalid/still-active-after-terminal-crash".to_string(),
+            },
+        );
+        active.status = TaskStatus::Queued;
+        active.updated_at = 10_000;
+        let active_path = queue
+            .video
+            .task_path(&active.id)
+            .expect("active task path should be valid");
+        queue
+            .video
+            .write_record(&active_path, &active)
+            .expect("active task should persist");
+        index.tasks.insert(
+            active.id.clone(),
+            TaskIndexEntry {
+                chat_id: active.chat_id,
+                record_path: active_path,
+                move_target: None,
+                revision: active.revision,
+                updated_at: active.updated_at,
+            },
+        );
+        queue
+            .video
+            .write_index(&index)
+            .expect("crash-state index should persist");
+
+        assert!(
+            queue
+                .active_records_for_chats(&[123_456_789], 1)
+                .expect("pre-restart bounded summary should load")
+                .is_empty(),
+            "stale terminal entries reproduce the crash window by occupying the one-record cap"
+        );
+        drop(queue);
+
+        let reopened = QueueManager::open_with_file_provider(&config, provider.clone())
+            .expect("startup should reconcile the durable terminal records");
+        let repaired = reopened
+            .video
+            .read_index()
+            .expect("reconciled index should load");
+        for number in 0..STALE_TERMINAL_COUNT {
+            let id = format!("stale-terminal-{number:03}");
+            let entry = repaired
+                .tasks
+                .get(&id)
+                .expect("terminal task should remain available in history");
+            assert_eq!(
+                entry.record_path,
+                reopened
+                    .video
+                    .terminal_history_path(&id)
+                    .expect("history path should be valid")
+            );
+            assert_eq!(entry.move_target, None);
+            assert_eq!(entry.revision, 2);
+            assert_eq!(entry.updated_at, 30_000 + number as u64);
+        }
+
+        let reads_before_summary = provider.read_paths();
+        let visible = reopened
+            .active_records_for_chats(&[123_456_789], 1)
+            .expect("repaired active summary should load");
+        let reads_after_summary = provider.read_paths();
+        let summary_reads = &reads_after_summary[reads_before_summary.len()..];
+        let task_reads = summary_reads
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("task-"))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["still-active-after-terminal-crash"]
+        );
+        assert_eq!(
+            task_reads.len(),
+            1,
+            "summary should read only its one selected task"
+        );
+        assert!(task_reads.iter().all(|path| {
+            path.parent() == Some(reopened.video.queue_dir.as_path())
+                || path.parent() == Some(reopened.pdf.queue_dir.as_path())
+        }));
+        assert!(
+            task_reads.iter().all(|path| {
+                path.parent()
+                    != Some(
+                        reopened
+                            .video
+                            .queue_dir
+                            .join(TERMINAL_HISTORY_DIRECTORY)
+                            .as_path(),
+                    )
+            }),
+            "bounded active summaries must not read terminal history records"
+        );
+
+        drop(reopened);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn active_chat_snapshot_keeps_updates_out_until_selection_finishes() {
+        let directory = temp_queue_root("active-chat-snapshot-lock");
+        let config = test_video_config(&directory);
+        let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+        let task_id = "active-chat-snapshot-lock-task";
+        assert!(
+            queue
+                .create(test_task(
+                    task_id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=abcdefghijk".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+
+        let (snapshot_entered_tx, snapshot_entered_rx) = mpsc::sync_channel(0);
+        let (release_snapshot_tx, release_snapshot_rx) = mpsc::sync_channel(0);
+        let snapshot_queue = Arc::clone(&queue);
+        let snapshot = std::thread::spawn(move || {
+            snapshot_queue.active_records_for_chats_with_test_hook(&[123_456_789], 100, || {
+                snapshot_entered_tx
+                    .send(())
+                    .expect("test should observe the held queue snapshot");
+                release_snapshot_rx
+                    .recv()
+                    .expect("test should release the queue snapshot");
+            })
+        });
+
+        let snapshot_reached_selection = snapshot_entered_rx.recv().is_ok();
+        let (writer_lock_state_tx, writer_lock_state_rx) = mpsc::sync_channel(0);
+        let writer_queue = Arc::clone(&queue);
+        let writer = std::thread::spawn(move || {
+            let selection_holds_lock = match writer_queue.operation_lock.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    false
+                }
+                Err(std::sync::TryLockError::WouldBlock) => true,
+                Err(std::sync::TryLockError::Poisoned(_)) => false,
+            };
+            let _ = writer_lock_state_tx.send(selection_holds_lock);
+            writer_queue.set_status(task_id, TaskStatus::Queued, None)
+        });
+        let update_was_blocked = writer_lock_state_rx.recv().unwrap_or(false);
+
+        // Always release and join both workers before asserting, so a failed lock assertion
+        // cannot strand a thread at the deterministic barrier.
+        let _ = release_snapshot_tx.send(());
+        let snapshot_result = snapshot.join();
+        let writer_result = writer.join();
+
+        assert!(
+            snapshot_reached_selection,
+            "snapshot should reach selection"
+        );
+        assert!(
+            update_was_blocked,
+            "the queue update must wait while the same snapshot lock is held"
+        );
+        let captured = snapshot_result
+            .expect("snapshot worker should join")
+            .expect("active task snapshot should succeed");
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].status, TaskStatus::Received);
+        let updated = writer_result
+            .expect("queue update worker should join")
+            .expect("queue update should succeed after selection releases the lock");
+        assert_eq!(updated.status, TaskStatus::Queued);
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
     }
 }

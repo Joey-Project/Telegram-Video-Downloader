@@ -15,5 +15,12 @@ __pycache__/
 # Local secrets and machine-specific runtime config.
 config.toml
 
+# Cloudflare local runtime data and deployment secrets.
+cloud/.wrangler/
+cloud/.wrangler-build/
+cloud/.dev.vars
+cloud/.dev.vars.*
+cloud/wrangler.local.jsonc
+
 # Local generated journal index.
 docs/project_journal/INDEX.md

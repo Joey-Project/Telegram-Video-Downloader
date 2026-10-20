@@ -85,14 +85,21 @@ the verified executable with a same-directory atomic rename and atomically
 replace the plist. For an existing service, only its executable argument changes.
 
 Require a single registered/running service, the installed executable and
-expected working directory, the startup-ready marker, and two successful
-Telegram polls from the new process. Startup writes its ready marker and
-`telegram polling completed` directly to stderr, independently of `RUST_LOG`,
-with distinct `poll=1` and `poll=2` markers for its first two successful polls;
-the startup and poll records include the emitting PID, which must match the
-observed service. These logs contain no token, URL, or message
-payload. Check queue/completion readability and preserved ownership/permissions.
-Do not use a second `getUpdates` consumer to test polling.
+expected working directory, and readiness records appended by the new process.
+The service configuration selects the readiness protocol: without a `[cloud]`
+table, require the startup marker and the first two successful Telegram polls;
+with a `[cloud]` table, require Cloud startup followed by a successful initial
+REST ingress reconciliation. The Cloud markers are
+`telegram local cloud ingress started concurrency=N pid=PID` and
+`cloud ingress reconciliation completed pid=PID`; the second is written only
+after the complete authoritative backlog has been fetched, durably recorded,
+and acknowledged. Both protocols write their readiness markers directly to
+stderr, independently of `RUST_LOG`, and include the emitting PID, which must
+match the observed service. The installer selects the protocol from the same
+TOML configuration used by the bot and does not fall back between protocols.
+These logs contain no token, URL, or message payload. Check queue/completion
+readability and preserved ownership/permissions. Do not use a second
+`getUpdates` consumer or synthetic Telegram-poll markers to test readiness.
 
 Process checks cover this user's configured executable and download workers,
 including an existing custom executable basename, independently of other users'
@@ -219,8 +226,9 @@ probes succeeded. Pinning and recursive materialization did not remove that wait
    against the recorded requirement with `--test-requirement`. Inspect
    `codesign -dr -` to ensure the identity is stable rather than a lone `cdhash`.
 5. Atomically install the signed executable at the canonical path and restart the
-   existing LaunchAgent. Confirm a single instance, the
-   `telegram local downloader started` log, and successful Telegram polling.
+   existing LaunchAgent. Confirm a single instance and the readiness protocol
+   selected by its TOML configuration: two successful Telegram polls in normal
+   mode, or initial REST ingress reconciliation in Cloud mode.
 6. If startup still waits, inspect bounded TCC logs for this executable/PID and
    relevant request IDs. Distinguish Documents permission from Full Disk Access.
    A stale grant tied to an old `cdhash` is not repaired merely by restoring a
