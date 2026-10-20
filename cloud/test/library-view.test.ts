@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { boundedFolderSuggestions, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, needsOrganizing, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary } from "../public/file/library-view.js";
+import { boundedFolderSuggestions, canOperateOnMediaLibrary, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary } from "../public/file/library-view.js";
 import { updateSelectionWithinLimit } from "../public/file/selection-limit.js";
+import { renderMigrationPreview } from "../public/file/migration-preview-rendering.js";
 
 describe("bounded library views", () => {
   it("merges applied registrations with per-library snapshots and preserves offline status", () => {
@@ -46,6 +47,176 @@ describe("bounded library views", () => {
     expect(resolved.id).toBe("default");
     expect(resolved.descriptor).toMatchObject({ name: "Videos", root: "/Users/test/Videos", is_default: true });
     expect(resolved.snapshot?.items).toEqual([{ id: "video-a" }]);
+    expect(canOperateOnRegisteredMediaLibrary(snapshot, "default")).toBe(true);
+    expect(migrationEndpointAvailability(snapshot, "default", "default")).toMatchObject({
+      sourceRegistered: true,
+      targetRegistered: true,
+      sourceAvailable: true,
+      targetAvailable: true,
+    });
+  });
+
+  it("uses the full safe media count and reports compacted rows separately", () => {
+    const descriptor = { id: "main", media_count: 10_000 };
+    const snapshot = {
+      items: [{ id: "one" }, { id: "two" }, { id: "three" }],
+      warnings: ["Cloud snapshot omitted 9997 library item(s) from the complete source view to fit the upload budget."],
+    };
+
+    expect(mediaSnapshotInfo(descriptor, snapshot)).toEqual({ totalCount: 10_000, retainedCount: 3, omittedCount: 9_997 });
+    expect(mediaSnapshotOmissionNotice(descriptor, snapshot)).toContain("retains 3 of 10,000 media items");
+    expect(mediaSnapshotOmissionNotice(descriptor, snapshot)).toContain("pagination cover only the retained rows");
+    expect(paginateLibraryItems(snapshot.items, 0)).toMatchObject({ total: 3, items: snapshot.items });
+  });
+
+  it("keeps an empty retained list distinct from an empty library and falls back only for missing or invalid counts", () => {
+    const emptySnapshot = { items: [], warnings: [] };
+    expect(mediaSnapshotInfo({ id: "main", media_count: 12 }, emptySnapshot)).toEqual({
+      totalCount: 12,
+      retainedCount: 0,
+      omittedCount: 12,
+    });
+    expect(mediaSnapshotOmissionNotice({ id: "main", media_count: 12 }, emptySnapshot)).toContain("retains 0 of 12 media items");
+    expect(mediaSnapshotInfo({ id: "main", media_count: 0 }, emptySnapshot).totalCount).toBe(0);
+    expect(mediaSnapshotInfo({ id: "main", media_count: null }, { items: [{ id: "one" }] }).totalCount).toBe(1);
+    expect(mediaSnapshotInfo({ id: "main", media_count: "0" }, { items: [{ id: "one" }] }).totalCount).toBe(1);
+    expect(mediaSnapshotInfo({ id: "main" }, { items: [{ id: "one" }] }).totalCount).toBe(1);
+  });
+
+  it("requires registered, available migration endpoints while preserving the actual legacy root fallback", () => {
+    const snapshot = {
+      settings: { download_dir: "/Volumes/Main" },
+      library: { root_label: "Main", items: [], categories: [] },
+    };
+    const registry = {
+      settings: { applied: { default_library_id: "main", libraries: [{ id: "main", is_default: true }] } },
+      library: { libraries: [
+        { id: "main", availability: "available", snapshot: { items: [] } },
+        { id: "archive", availability: "offline", snapshot: null },
+      ] },
+    };
+
+    expect(canOperateOnMediaLibrary(undefined)).toBe(false);
+    expect(canOperateOnRegisteredMediaLibrary(registry, "removed")).toBe(false);
+    expect(migrationEndpointAvailability(registry, "main", "removed")).toMatchObject({
+      sourceAvailable: true,
+      targetRegistered: false,
+      targetAvailable: false,
+    });
+    expect(migrationEndpointAvailability(registry, "main", "archive")).toMatchObject({
+      sourceAvailable: true,
+      targetRegistered: true,
+      targetAvailable: false,
+    });
+    expect(migrationEndpointAvailability(registry, "main", "main").sourceAvailable).toBe(true);
+    expect(canOperateOnRegisteredMediaLibrary(snapshot, "default")).toBe(true);
+  });
+
+  it("disables migration Start for removed or offline descriptors and enables registered endpoints", () => {
+    const operation = {
+      status: "awaiting_confirmation",
+      result: {
+        id: "preview-a",
+        revision: "revision-a",
+        source_library_id: "main",
+        target_library_id: "archive",
+        scope: "library",
+        conflict: "skip",
+        include_incomplete_tasks: false,
+        set_target_default_on_success: false,
+        item_count: 0,
+        file_count: 0,
+        total_bytes: 0,
+        required_space_bytes: 0,
+        available_space_bytes: 0,
+        conflict_count: 0,
+        incomplete_task_count: 0,
+        items: [],
+      },
+    };
+    const registry = {
+      settings: { applied: { default_library_id: "main", libraries: [{ id: "main", is_default: true }, { id: "archive" }] } },
+      library: { libraries: [
+        { id: "main", availability: "available", snapshot: { items: [] } },
+        { id: "archive", availability: "offline", snapshot: null },
+      ] },
+    };
+    const render = (targetLibraryId: string) => {
+      const preview = { ...operation, result: { ...operation.result, target_library_id: targetLibraryId } };
+      return renderMigrationPreview(preview, migrationEndpointAvailability(registry, "main", targetLibraryId));
+    };
+
+    expect(render("removed")).toMatch(/data-migration-confirm="preview-a" data-revision="revision-a" disabled/u);
+    expect(render("archive")).toMatch(/data-migration-confirm="preview-a" data-revision="revision-a" disabled/u);
+    expect(render("main")).toContain('data-migration-confirm="preview-a" data-revision="revision-a" >Start migration</button>');
+
+    const legacy = { settings: { download_dir: "/Volumes/Main" }, library: { items: [] } };
+    const legacyPreview = { ...operation, result: { ...operation.result, source_library_id: "default", target_library_id: "default" } };
+    const legacyEndpoints = migrationEndpointAvailability(legacy, "default", "default");
+    expect(renderMigrationPreview(legacyPreview, legacyEndpoints)).toContain('data-migration-confirm="preview-a" data-revision="revision-a" >Start migration</button>');
+  });
+
+  it("shows a whole-library migration's full item count separately from retained sample paths", () => {
+    const sampleItems = Array.from({ length: 4 }, (_, index) => ({
+      item_id: `bundle-${index}`,
+      source_path: `source/${index}.mp4`,
+      target_path: `target/${index}.mp4`,
+      bytes: 100,
+      conflict: false,
+      status: "copying",
+      outcome: "move",
+    }));
+    const summary = renderMigrationPreview({
+      kind: "library_migration_preview",
+      status: "awaiting_confirmation",
+      migration_summary: true,
+      preview_id: "preview-summary",
+      revision: "revision-summary",
+      result: {
+        id: "preview-summary",
+        revision: "revision-summary",
+        source_library_id: "main",
+        target_library_id: "archive",
+        scope: "library",
+        conflict: "skip",
+        include_incomplete_tasks: false,
+        set_target_default_on_success: false,
+        item_count: 10_000,
+        file_count: 10_000,
+        total_bytes: 1_000_000,
+        required_space_bytes: 1_000_000,
+        available_space_bytes: 2_000_000,
+        conflict_count: 0,
+        incomplete_task_count: 0,
+        staging_bytes: null,
+        omitted_item_count: 9_996,
+        omitted_file_count: 10_000,
+        omitted_item_id_count: 0,
+        omitted_conflict_choice_count: 0,
+        omitted_warning_count: 0,
+        sample_items: sampleItems,
+      },
+    }, { sourceAvailable: true, targetAvailable: true });
+
+    expect(summary).toContain("10,000 media items");
+    expect(summary).toContain("Showing 4 sample media paths; 9,996 item details omitted from this view.");
+    expect(summary).not.toContain("4 media items");
+  });
+
+  it("keeps unbound legacy operations scoped by compatibility but rejects malformed explicit IDs", () => {
+    const legacy = { kind: "file_preview", result: { preview: { items: [] } } };
+    const valid = { kind: "file_preview", result: { library_id: "main" } };
+    const malformed = { kind: "file_preview", result: { library_id: "" } };
+    const oversized = { kind: "file_preview", result: { library_id: "x".repeat(129) } };
+
+    expect(operationLibraryId(legacy)).toBe("");
+    expect(operationMatchesLibrary(legacy, "main")).toBe(true);
+    expect(operationLibraryId(valid)).toBe("main");
+    expect(operationMatchesLibrary(valid, "main")).toBe(true);
+    expect(operationMatchesLibrary(valid, "archive")).toBe(false);
+    expect(operationLibraryId(malformed)).toBe("");
+    expect(operationMatchesLibrary(malformed, "main")).toBe(false);
+    expect(operationMatchesLibrary(oversized, "main")).toBe(false);
   });
 
   it("filters a large snapshot before slicing the matching page", () => {

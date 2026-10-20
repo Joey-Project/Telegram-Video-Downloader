@@ -2541,6 +2541,9 @@ impl QueueManager {
         if self.find_record_unlocked(&task.id)?.is_some() {
             return Ok(false);
         }
+        if video_library.is_some() {
+            self.ensure_registered_video_queues_searchable(&task.id)?;
+        }
         let store = match selected_store {
             Some(store) => store,
             None => self.pdf.clone(),
@@ -4205,6 +4208,41 @@ impl QueueManager {
         Ok(self
             .find_record_entry_unlocked(id)?
             .map(|(_, record, _)| record))
+    }
+
+    /// A negative lookup is authoritative only when every registered video queue was searchable.
+    /// Offline roots are intentionally omitted from `registered_video_stores`; creating on a new
+    /// default in that state could duplicate a Telegram task whose record is already durable but
+    /// whose index/acknowledgment write failed on the offline root.
+    fn ensure_registered_video_queues_searchable(&self, task_id: &str) -> Result<()> {
+        let libraries = self.registry_snapshot()?.libraries;
+        let open_library_ids = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .filter(|registered| registered.available)
+            .map(|registered| registered.library_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let statuses = self.video_statuses.read().map_err(poisoned_lock)?;
+        for library in libraries {
+            let detail = statuses
+                .get(&library.id)
+                .filter(|status| !status.available)
+                .and_then(|status| status.diagnostic.as_deref())
+                .unwrap_or("the registered queue store is not open and searchable");
+            if !open_library_ids.contains(&library.id)
+                || !statuses
+                    .get(&library.id)
+                    .is_some_and(|status| status.available)
+            {
+                bail!(
+                    "cannot verify whether task {task_id} already exists because registered media library {} is unavailable: {detail}",
+                    library.id
+                );
+            }
+        }
+        Ok(())
     }
 
     fn find_record_entry_unlocked(
@@ -7839,6 +7877,155 @@ mod tests {
                 ))
                 .expect("the restored root should accept a task"),
             "the restored original root should accept the default enqueue"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn default_enqueue_fails_closed_when_offline_queue_may_contain_durable_record() {
+        let temp_root = temp_queue_root("offline-duplicate-task-redelivery");
+        let config = test_video_config(&temp_root);
+        let video_root = config.downloads.video_dir.clone();
+        let offline_accessor = temp_root.join("provider-offline");
+        let archive_root = temp_root.join("archive");
+        fs::create_dir_all(&archive_root).expect("archive root should create");
+
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let provider_trait: Arc<dyn QueueFileProvider> = provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, Arc::clone(&provider_trait))
+            .expect("queue should open");
+        let original_destination = queue
+            .default_video_destination()
+            .expect("original default destination should resolve");
+        let archive = queue
+            .register_video_library("Archive", &archive_root, None, false, false)
+            .expect("archive library should register");
+        let task_id = "task-offline-duplicate-redelivery";
+        let record_path = video_root
+            .join(QUEUE_DIRECTORY)
+            .join(format!("task-{task_id}.json"));
+        let index_path = video_root.join(QUEUE_DIRECTORY).join(INDEX_FILE);
+        let original_plan = PlanValidationSnapshot {
+            stable_media_ids: vec!["media-before-redelivery".to_string()],
+            title: Some("Original persisted plan".to_string()),
+            ..PlanValidationSnapshot::default()
+        };
+        let mut original_task = test_task(
+            task_id,
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=offline-duplicate".to_string(),
+            },
+        );
+        original_task.plan = Some(original_plan.clone());
+        let writes_before_create = provider.write_paths().len();
+
+        // DownloadStore writes the task record before its index. Fail the second coordinated
+        // write to model a durable task whose Telegram acknowledgment/index update did not finish.
+        provider.fail_write_after(1, "injected task index write failure");
+        let error = queue
+            .create(original_task)
+            .expect_err("the index write should fail after the record is durable");
+        assert!(
+            error.to_string().contains("index write failure"),
+            "unexpected injected failure: {error:#}"
+        );
+        let writes_after_failed_create = provider.write_paths();
+        assert_eq!(
+            &writes_after_failed_create[writes_before_create..],
+            &[record_path.clone(), index_path.clone()],
+            "the failed create must have written the record and then failed its index write"
+        );
+        let durable_record = queue
+            .video
+            .read_record(&record_path)
+            .expect("record should remain readable after index failure")
+            .expect("record write should have completed before index failure");
+        assert_eq!(
+            durable_record.destination,
+            Some(original_destination.clone())
+        );
+        assert_eq!(durable_record.plan, Some(original_plan.clone()));
+        let original_generation = durable_record.generation;
+
+        provider.rewrite_paths_under(&video_root, &offline_accessor);
+        queue
+            .refresh_video_library(&original_destination.library_id)
+            .expect("offline source should be recorded without removing its registration");
+        assert!(
+            !queue
+                .video_library_statuses()
+                .expect("statuses should load")[&original_destination.library_id]
+                .available,
+            "the original queue must be known unavailable before redelivery"
+        );
+        queue
+            .set_default_video_library(&archive.id)
+            .expect("healthy archive should become the new default");
+
+        let writes_before_redelivery = provider.write_paths();
+        let redelivery_error = queue
+            .create(test_task(
+                task_id,
+                JobRequest::Youtube {
+                    url: "https://www.youtube.com/watch?v=offline-duplicate".to_string(),
+                },
+            ))
+            .expect_err("unknown global ID must fail closed while its old queue is offline");
+        assert!(
+            redelivery_error.to_string().contains("cannot verify")
+                && redelivery_error
+                    .to_string()
+                    .contains(&original_destination.library_id),
+            "redelivery should identify the unavailable registration: {redelivery_error:#}"
+        );
+        assert_eq!(
+            provider.write_paths(),
+            writes_before_redelivery,
+            "an uncertain duplicate lookup must not write to either queue"
+        );
+        let archive_record_path = archive_root
+            .join(QUEUE_DIRECTORY)
+            .join(format!("task-{task_id}.json"));
+        assert!(
+            !archive_record_path.exists(),
+            "redelivery must not create a second record on the new default"
+        );
+
+        provider.rewrite_paths_under(&video_root, &video_root);
+        queue
+            .refresh_video_library(&original_destination.library_id)
+            .expect("restored original root should reconnect");
+        assert!(
+            queue
+                .video_library_statuses()
+                .expect("statuses should load")[&original_destination.library_id]
+                .available,
+            "the original registration should become searchable after restoration"
+        );
+        assert!(
+            !queue
+                .create(test_task(
+                    task_id,
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=offline-duplicate".to_string(),
+                    },
+                ))
+                .expect("reconnected redelivery should resolve as an existing task"),
+            "the recovered record must make redelivery idempotent"
+        );
+        let replayed = queue
+            .get(task_id)
+            .expect("replayed task should load")
+            .expect("exactly one original task should remain");
+        assert_eq!(replayed.destination, Some(original_destination));
+        assert_eq!(replayed.plan, Some(original_plan));
+        assert_eq!(replayed.generation, original_generation);
+        assert!(record_path.is_file());
+        assert!(
+            !archive_record_path.exists(),
+            "replay must preserve the source record instead of duplicating it"
         );
 
         drop(queue);

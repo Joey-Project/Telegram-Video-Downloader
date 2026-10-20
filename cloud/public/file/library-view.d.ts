@@ -26,7 +26,21 @@ export function mediaLibraryEntries(ownerSnapshot: unknown): MediaLibraryDescrip
 export function defaultMediaLibraryId(ownerSnapshot: unknown): string;
 export function resolveMediaLibrary(ownerSnapshot: unknown, requestedId?: string): MediaLibrarySnapshot;
 export function mediaLibraryAvailability(descriptor: MediaLibraryDescriptor | null | undefined): "available" | "offline" | "unknown";
+export function registeredMediaLibrary(ownerSnapshot: unknown, libraryId: string): MediaLibraryDescriptor | null;
+export function canOperateOnRegisteredMediaLibrary(ownerSnapshot: unknown, libraryId: string): boolean;
+export function migrationEndpointAvailability(ownerSnapshot: unknown, sourceLibraryId: string, targetLibraryId: string): {
+  sourceRegistered: boolean;
+  targetRegistered: boolean;
+  sourceAvailable: boolean;
+  targetAvailable: boolean;
+};
 export function canOperateOnMediaLibrary(descriptor: MediaLibraryDescriptor | null | undefined): boolean;
+export function mediaSnapshotInfo(descriptor: MediaLibraryDescriptor | null | undefined, snapshot: unknown): {
+  totalCount: number;
+  retainedCount: number;
+  omittedCount: number;
+};
+export function mediaSnapshotOmissionNotice(descriptor: MediaLibraryDescriptor | null | undefined, snapshot: unknown): string;
 export function operationLibraryId(operation: Record<string, unknown> | null | undefined): string;
 export function operationMatchesLibrary(operation: Record<string, unknown> | null | undefined, libraryId: string): boolean;
 export function filterLibraryItems<T extends LibraryViewItem>(

@@ -1,4 +1,4 @@
-import { appendAction, removeQueuedAction, shouldRetryActionFailure } from "./action-queue.js";
+import { ACTION_SURFACE_FILE, appendAction, dispatchNextOwnedAction, recordActionReceipt, removeQueuedAction, shouldRetryActionFailure } from "./action-queue.js";
 import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
@@ -11,7 +11,7 @@ import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewableP
 import { sourceIdUrl } from "./source-links.js";
 import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
 import { validateTargetRelativeDirectory } from "./target-directory.js";
-import { boundedFolderSuggestions, canOperateOnMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary, statusOf } from "./library-view.js";
+import { boundedFolderSuggestions, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary, statusOf } from "./library-view.js";
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
 import { renderMigrationHistory } from "./migration-rendering.js";
 import { renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
@@ -63,8 +63,19 @@ const libraryItems = () => Array.isArray(activeLibrarySnapshot()?.items) ? activ
 const snapshotValue = () => state.snapshot ?? { synced: false, stale: true, library: null, previews: [], operations: [], tasks: [], settings: {} };
 
 function libraryCanOperate(libraryId = activeLibraryId()) {
-  const descriptor = mediaLibraryEntries(state.snapshot).find((entry) => entry.id === libraryId);
-  return canOperateOnMediaLibrary(descriptor);
+  return canOperateOnRegisteredMediaLibrary(state.snapshot, libraryId);
+}
+
+function migrationLibraryId(operation, result, field) {
+  for (const candidate of [result, operation]) {
+    if (!candidate || typeof candidate !== "object" || !Object.prototype.hasOwnProperty.call(candidate, field)) continue;
+    const value = candidate[field];
+    return typeof value === "string" && value.length > 0 && value.length <= 128
+      && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value)
+      ? value
+      : "";
+  }
+  return "";
 }
 
 function normalizeLibraryContext() {
@@ -348,62 +359,69 @@ async function drainActionQueue({ quiet = false } = {}) {
     let removalFailed = false;
     const permanentRejections = [];
     while (navigator.onLine) {
-      const action = readActionQueue().find((entry) => !state.quarantinedActionIds.has(entry.request_id));
-      if (!action) break;
-      try {
-        const receipt = await api("/actions", { method: "POST", body: JSON.stringify({ request_id: action.request_id, kind: action.kind, payload: action.payload }) });
-        if (state.downloadSubmission?.request_id === action.request_id && Number.isSafeInteger(receipt?.seq)) {
-          state.downloadSubmission.seq = receipt.seq;
-          renderDownloadStatus();
-        }
-        for (const draft of state.migrationConflictDrafts.values()) {
-          if (draft.refreshRequestId === action.request_id && Number.isSafeInteger(receipt?.seq)) {
-            draft.refreshSeq = receipt.seq;
-          }
-        }
-        const latestQueue = readActionQueue();
-        if (!writeActionQueue(removeQueuedAction(latestQueue, action.request_id))) {
-          if (!quiet) showToast("Request reached the computer, but this browser could not update its retry queue.");
-          break;
-        }
-        sentAny = true;
-      } catch (error) {
-        if (error?.status === 401 || error?.status === 403) {
-          handleAuthorizationFailure(error);
-          break;
-        }
-        if (!shouldRetryActionFailure(error)) {
-          state.quarantinedActionIds.add(action.request_id);
-          const latestQueue = readActionQueue();
-          if (!writeActionQueue(removeQueuedAction(latestQueue, action.request_id))) removalFailed = true;
-          if (state.downloadSubmission?.request_id === action.request_id) {
-            state.downloadSubmission = null;
-            state.downloadMessage = typeof error?.message === "string" ? error.message : "The request was rejected before it reached your computer.";
-            renderDownloadStatus();
-          }
-          for (const [previewId, draft] of state.migrationConflictDrafts) {
-            if (draft.refreshRequestId === action.request_id) {
-              draft.refreshRequestId = null;
-              draft.refreshSeq = null;
-              draft.refreshError = typeof error?.message === "string" ? error.message : "The refreshed preview request was rejected.";
-              state.migrationConflictDrafts.set(previewId, draft);
-            }
-          }
-          renderMigrations();
-          permanentRejections.push(typeof error?.message === "string" ? error.message : "Request rejected");
-          continue;
-        }
-        if (!state.retryTimer) {
-          const delay = state.retryDelay;
-          state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
-          state.retryTimer = window.setTimeout(() => {
-            state.retryTimer = 0;
-            drainActionQueue({ quiet });
-          }, delay);
-        }
-        connectionInterrupted = true;
+      const outcome = await dispatchNextOwnedAction({
+        surface: ACTION_SURFACE_FILE,
+        readQueue: readActionQueue,
+        writeQueue: writeActionQueue,
+        excludedIds: state.quarantinedActionIds,
+        dispatch: (action) => api("/actions", {
+          method: "POST",
+          body: JSON.stringify({ request_id: action.request_id, kind: action.kind, payload: action.payload }),
+        }),
+        onReceipt: (action, receipt) => recordActionReceipt(action, receipt, {
+          downloadSubmission: state.downloadSubmission,
+          migrationConflictDrafts: state.migrationConflictDrafts,
+        }),
+      });
+      const receiptUpdate = outcome.receiptUpdate ?? {};
+      if (receiptUpdate.downloadSubmission) renderDownloadStatus();
+      if (receiptUpdate.migrationConflictDrafts > 0) renderMigrations();
+      if (outcome.status === "empty") break;
+      if (outcome.status === "remove_failed") {
+        if (!quiet) showToast("Request reached the computer, but this browser could not update its retry queue.");
         break;
       }
+      if (outcome.status === "sent") {
+        sentAny = true;
+        continue;
+      }
+
+      const { action, error } = outcome;
+      if (error?.status === 401 || error?.status === 403) {
+        handleAuthorizationFailure(error);
+        break;
+      }
+      if (!shouldRetryActionFailure(error)) {
+        state.quarantinedActionIds.add(action.request_id);
+        const latestQueue = readActionQueue();
+        if (!writeActionQueue(removeQueuedAction(latestQueue, action.request_id))) removalFailed = true;
+        if (state.downloadSubmission?.request_id === action.request_id) {
+          state.downloadSubmission = null;
+          state.downloadMessage = typeof error?.message === "string" ? error.message : "The request was rejected before it reached your computer.";
+          renderDownloadStatus();
+        }
+        for (const [previewId, draft] of state.migrationConflictDrafts) {
+          if (draft.refreshRequestId === action.request_id) {
+            draft.refreshRequestId = null;
+            draft.refreshSeq = null;
+            draft.refreshError = typeof error?.message === "string" ? error.message : "The refreshed preview request was rejected.";
+            state.migrationConflictDrafts.set(previewId, draft);
+          }
+        }
+        renderMigrations();
+        permanentRejections.push(typeof error?.message === "string" ? error.message : "Request rejected");
+        continue;
+      }
+      if (!state.retryTimer) {
+        const delay = state.retryDelay;
+        state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
+        state.retryTimer = window.setTimeout(() => {
+          state.retryTimer = 0;
+          drainActionQueue({ quiet });
+        }, delay);
+      }
+      connectionInterrupted = true;
+      break;
     }
     if (sentAny) state.retryDelay = 1500;
     if (permanentRejections.length) {
@@ -445,9 +463,10 @@ async function submitAction(kind, payload, { onQueued } = {}) {
     if (kind === "library_migration_confirm") {
       const preview = migrationPreviewEntries().find((entry) => entry.id === payload?.preview_id);
       const result = preview?.result ?? {};
-      const sourceId = String(result.source_library_id ?? preview?.source_library_id ?? activeLibraryId());
-      const targetId = String(result.target_library_id ?? preview?.target_library_id ?? "");
-      return !libraryCanOperate(sourceId) || Boolean(targetId && !libraryCanOperate(targetId));
+      const sourceId = migrationLibraryId(preview, result, "source_library_id");
+      const targetId = migrationLibraryId(preview, result, "target_library_id");
+      const endpoints = migrationEndpointAvailability(state.snapshot, sourceId, targetId);
+      return !endpoints.sourceAvailable || !endpoints.targetAvailable;
     }
     return false;
   })();
@@ -463,7 +482,7 @@ async function submitAction(kind, payload, { onQueued } = {}) {
       }
     }
   }
-  const action = { request_id: crypto.randomUUID(), kind, payload };
+  const action = { request_id: crypto.randomUUID(), kind, payload, surface: ACTION_SURFACE_FILE };
   const queued = appendAction(readActionQueue(), action);
   if (!queued.ok) {
     showToast("The offline queue is full. Reconnect and send its saved requests first.");
@@ -601,7 +620,10 @@ function renderLibrary() {
   renderGroupedItems(list, libraryPage.items, libraryPage, "library", canOperate);
   renderGroupedItems(byId("needs-list"), needsPage.items, needsPage, "needs", canOperate);
   const synced = state.snapshot?.synced === true;
+  const mediaInfo = mediaSnapshotInfo(activeLibrary().descriptor, library);
+  const omissionNotice = mediaSnapshotOmissionNotice(activeLibrary().descriptor, library);
   const firstScanPending = synced && (library?.ready === false || Number(library?.scanned_at) === 0);
+  const retainedRowsMissing = mediaInfo.omittedCount > 0 && mediaInfo.retainedCount === 0;
   const localOffline = mediaLibraryAvailability(activeLibrary().descriptor) === "offline";
   const savedLibraryView = activeLibrary().descriptor?.snapshot_stale === true;
   byId("library-empty").classList.toggle("hidden", !synced || libraryItems().length > 0 && !firstScanPending);
@@ -617,6 +639,9 @@ function renderLibrary() {
   } else if (!library) {
     emptyHeading.textContent = "No saved view for this library";
     emptyCopy.textContent = "This registered root has not reported a library snapshot yet.";
+  } else if (retainedRowsMissing) {
+    emptyHeading.textContent = "The cloud list has no retained media rows";
+    emptyCopy.textContent = `The full scan reports ${mediaInfo.totalCount.toLocaleString()} media items, but no item details fit in this cloud view. Open the desktop app to browse the complete list.`;
   } else {
     emptyHeading.textContent = "No media found yet";
     emptyCopy.textContent = "Run a scan on the connected computer to discover videos and their sidecar files.";
@@ -625,19 +650,19 @@ function renderLibrary() {
     list.innerHTML = "";
     byId("library-empty").classList.add("hidden");
   }
-  const total = libraryItems().length || Number(activeLibrary().descriptor?.media_count ?? 0);
+  const total = mediaInfo.totalCount;
   byId("library-count").textContent = synced && !firstScanPending ? String(total) : "—";
   byId("library-summary").textContent = firstScanPending
     ? "Your computer is connected, but the first scan has not completed."
     : state.snapshot?.synced
-    ? `${savedLibraryView ? "Showing the last saved scan; cached items are read-only · " : ""}${items.length.toLocaleString()} matching item${items.length === 1 ? "" : "s"} · ${items.length ? `showing ${libraryPage.start + 1}–${libraryPage.end} on page ${libraryPage.page + 1} of ${Math.max(1, libraryPage.pageCount)}` : "no matches"} · ${total.toLocaleString()} in library${state.selected.size ? ` · ${state.selected.size} selected${state.selected.size >= MAX_SELECTED_ITEMS ? ` · selection limit ${MAX_SELECTED_ITEMS}; deselect to add more` : ""}` : ""}`
+    ? `${savedLibraryView ? "Showing the last saved scan; cached items are read-only · " : ""}${items.length.toLocaleString()} matching retained item${items.length === 1 ? "" : "s"} · ${items.length ? `showing ${libraryPage.start + 1}–${libraryPage.end} on page ${libraryPage.page + 1} of ${Math.max(1, libraryPage.pageCount)} filtered retained rows` : "no matches"} · ${mediaInfo.retainedCount.toLocaleString()} retained in cloud list · ${total.toLocaleString()} in library${omissionNotice ? ` · ${omissionNotice}` : ""}${state.selected.size ? ` · ${state.selected.size} selected${state.selected.size >= MAX_SELECTED_ITEMS ? ` · selection limit ${MAX_SELECTED_ITEMS}; deselect to add more` : ""}` : ""}`
     : "A first scan has not completed yet.";
   const needsTotal = libraryItems().filter(needsOrganizing).length;
   byId("needs-count").textContent = synced && !firstScanPending ? String(needsTotal) : "—";
   byId("needs-summary").textContent = firstScanPending
     ? "Needs organizing will appear after the first scan completes."
     : state.snapshot?.synced
-    ? `${needsItems.length.toLocaleString()} matching item${needsItems.length === 1 ? "" : "s"} · ${needsItems.length ? `showing ${needsPage.start + 1}–${needsPage.end} on page ${needsPage.page + 1} of ${Math.max(1, needsPage.pageCount)}` : "no matches"} · ${needsTotal.toLocaleString()} need attention in total`
+    ? `${needsItems.length.toLocaleString()} matching retained item${needsItems.length === 1 ? "" : "s"} · ${needsItems.length ? `showing ${needsPage.start + 1}–${needsPage.end} on page ${needsPage.page + 1} of ${Math.max(1, needsPage.pageCount)} filtered retained rows` : "no matches"} · ${needsTotal.toLocaleString()} retained rows need attention${omissionNotice ? ` · ${omissionNotice}` : ""}`
     : "Needs organizing will appear after the first scan.";
   byId("needs-empty").classList.toggle("hidden", !synced || firstScanPending || needsItems.length > 0);
   byId("needs-list").classList.toggle("hidden", !synced || firstScanPending || needsItems.length === 0);
@@ -756,15 +781,17 @@ function migrationTargetOptions() {
   byId("migration-preview").disabled = availableTargets.length === 0 || !sourceAvailable;
   byId("migration-source").textContent = `Source: ${libraryLabel(sourceId)} · Choose the source in the library selector above.`;
   const selectionSize = state.selected.size;
-  byId("migration-selection-count").textContent = selectionSize
-    ? `${selectionSize} selected media item${selectionSize === 1 ? "" : "s"} from this library. Collection selections include their selected media rows.`
-    : "Select media in the Library view first to migrate a selected subset.";
+  const sourceMediaInfo = mediaSnapshotInfo(activeLibrary().descriptor, activeLibrarySnapshot());
+  const sourceOmissionNotice = mediaSnapshotOmissionNotice(activeLibrary().descriptor, activeLibrarySnapshot());
+  const selectedScope = byId("migration-scope").value === "selected";
+  byId("migration-selection-count").textContent = selectedScope
+    ? `${selectionSize ? `${selectionSize} selected media item${selectionSize === 1 ? "" : "s"} from this library. Collection selections include their selected media rows.` : "Select media in the Library view first to migrate a selected subset."}${sourceOmissionNotice ? ` Selected-scope previews can use only the ${sourceMediaInfo.retainedCount.toLocaleString()} retained rows available in this cloud view.` : ""}`
+    : `An entire-library preview uses a fresh full local scan.${sourceOmissionNotice ? ` The cloud view currently retains ${sourceMediaInfo.retainedCount.toLocaleString()} of ${sourceMediaInfo.totalCount.toLocaleString()} items; the preview will report the full scan count.` : ""}`;
   const taskSummary = incompleteTaskSummary(sourceId);
   byId("migration-task-option").classList.toggle("hidden", taskSummary.count === 0);
   const countLabel = taskSummary.countIsLowerBound ? `At least ${taskSummary.count}` : String(taskSummary.count);
   const byteLabel = taskSummary.bytes === null ? "staged data size unknown" : `${formatBytes(taskSummary.bytes)} staged data`;
   byId("migration-task-count").textContent = `${countLabel} unfinished task${taskSummary.count === 1 ? "" : "s"} · ${byteLabel}. This option is off by default.`;
-  const selectedScope = byId("migration-scope").value === "selected";
   byId("migration-preview").disabled = !sourceAvailable || availableTargets.length === 0 || selectedScope && selectionSize === 0;
 }
 
@@ -840,18 +867,17 @@ function settleMigrationConflictRefreshes() {
 function renderMigrationPreview(operation) {
   const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
   const id = String(result.id ?? result.preview_id ?? operation?.preview_id ?? operation?.id ?? "");
-  const sourceLibraryId = String(result.source_library_id ?? operation?.source_library_id ?? activeLibraryId());
-  const sourceAvailable = libraryCanOperate(sourceLibraryId);
-  const targetLibraryId = String(result.target_library_id ?? operation?.target_library_id ?? "");
-  const targetAvailable = !targetLibraryId || libraryCanOperate(targetLibraryId);
+  const sourceLibraryId = migrationLibraryId(operation, result, "source_library_id");
+  const targetLibraryId = migrationLibraryId(operation, result, "target_library_id");
+  const endpoints = migrationEndpointAvailability(state.snapshot, sourceLibraryId, targetLibraryId);
   const draft = state.migrationConflictDrafts.get(id);
   const savedConflicts = normalizeMigrationItemConflicts(result.item_conflicts);
   const draftConflicts = draft ? normalizeMigrationItemConflicts(draft.itemConflicts) : savedConflicts;
   const choicesChanged = Boolean(draft && migrationConflictChoicesChanged(savedConflicts, draftConflicts));
   return renderMigrationPreviewCard(operation, {
     activeLibraryId: activeLibraryId(),
-    sourceAvailable,
-    targetAvailable,
+    sourceAvailable: endpoints.sourceAvailable,
+    targetAvailable: endpoints.targetAvailable,
     draft,
     draftChanged: choicesChanged,
     refreshPending: Boolean(draft?.refreshRequestId),
@@ -1379,8 +1405,10 @@ function bindEvents() {
     if (migrationRefresh) {
       const previewId = migrationRefresh.dataset.migrationRefreshConflicts;
       const operation = migrationPreviewEntries().find((entry) => entry.id === previewId);
-      const sourceLibraryId = String(operation?.result?.source_library_id ?? operation?.source_library_id ?? activeLibraryId());
-      if (!libraryCanOperate(sourceLibraryId)) {
+      const sourceLibraryId = migrationLibraryId(operation, operation?.result ?? {}, "source_library_id");
+      const targetLibraryId = migrationLibraryId(operation, operation?.result ?? {}, "target_library_id");
+      const endpoints = migrationEndpointAvailability(state.snapshot, sourceLibraryId, targetLibraryId);
+      if (!endpoints.sourceAvailable || !endpoints.targetAvailable) {
         showToast("This source library is offline or showing a saved scan. Reconnect it before refreshing the preview.");
         return;
       }

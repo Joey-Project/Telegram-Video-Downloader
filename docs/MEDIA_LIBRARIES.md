@@ -30,6 +30,10 @@ a replacement directory at the same pathname is rejected while task and staging 
 bound to the original directory.
 The selected root is checked again before enqueue writes queue state, so a replacement between
 configuration lookup and task creation cannot redirect durable task records.
+Before writing a new video task, every registered queue must be searchable to prove the task ID
+is unused. If a library is offline, creation refuses that uncertain absence; a safely found existing
+task remains an idempotent replay. Reconnecting the original library allows replay without moving
+the task to a newer default library.
 Changing the default or a library's category also requires the registered root to be available
 and identity-matched; rejection preserves the existing settings and revision.
 Registration stores the identity of the directory opened during preparation with the new entry.
@@ -44,6 +48,12 @@ returns, while a replacement at the same path remains rejected.
 A failed refresh retains the last successful view for that library and marks it unavailable.
 Cached items stay visible but read-only until a successful scan. Refresh and library switching
 remain available so the user can recover or inspect another library.
+Compacted file previews retain their original library ID, including reload-required placeholders.
+Explicit malformed IDs are omitted rather than assigned to the currently selected library.
+The media total remains the full reported count when the cloud retains only part of an item list;
+the page discloses that filters and pagination apply to the retained rows.
+The `/file` and `/settings` pages keep locally queued actions with their originating surface,
+including receipt tracking before removing an action from their shared browser queue.
 
 ## Moving a library
 
@@ -61,6 +71,8 @@ low-confidence metadata do not by themselves make a scan incomplete.
 Refreshing conflict choices durably supersedes the exact earlier preview. Reloading the Mini App
 cannot make that earlier revision executable again. A refreshed candidate is durable before the
 old revision is superseded; interrupted refreshes replay from those durable records after restart.
+Starting a migration requires both endpoint IDs to resolve to registered libraries. Removing a
+previously selected target disables that preview's Start control.
 Expired, superseded and confirmed preview documents are retired through bounded cleanup.
 Confirmation keeps the durable job plan and replay information needed for recovery; retiring a
 preview does not remove media, retained download fragments or an active migration's checkpoints.

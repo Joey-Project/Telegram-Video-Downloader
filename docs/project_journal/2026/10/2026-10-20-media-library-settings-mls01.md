@@ -3,7 +3,7 @@ id: 20261020-mls01
 title: 媒体库设置、下载目标与迁移
 status: completed
 created: 2026-10-20
-updated: 2026-10-20
+updated: 2026-10-21
 branch: "codex/media-library-settings"
 pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/47"
 supersedes: []
@@ -102,13 +102,13 @@ superseded_by: ""
 | 范围 | 最终结果 |
 | --- | --- |
 | Rust 1.99.1 格式及差异空白检查 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
-| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,176 通过、0 失败、16 个既有忽略项 |
+| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,180 通过、0 失败、16 个既有忽略项 |
 | Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline --bin telegram-video-downloader` 通过 |
-| Cloud / Node 25.8.2 | 类型检查通过；139 项测试通过；Wrangler 4.149.0 dry-run 通过，43 个静态资源 |
+| Cloud / Node 25.8.2 | 类型检查通过；148 项测试通过；Wrangler 4.149.0 dry-run 通过，43 个静态资源 |
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
-- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review8/`；后者记录 17 项定向回归、根目录入队复验、离线恢复、预览持久化顺序及扫描完整性检查。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
-- 最新 Rust 验证日志为 `mls01-review8/full-review8-final3.log`、`clippy-review8-final3.log` 和 `build-review8-final3.log`。
+- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review9/`；后者记录 22 项定向回归、离线队列去重、压缩预览的库归属、双入口提交回执和完整媒体总数显示。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
+- 最新 Rust 验证日志为 `mls01-review9/tests-review9-final.log`、`clippy-review9-final.log` 和 `build-review9-final.log`；Cloud 日志为 `cloud-test.log`、`cloud-typecheck.log` 和 `cloud-build-dry-run.log`。
   Cloud 的最终测试、类型检查和 dry-run 日志分别为同目录下的 `cloud-npm-test.log`、
   `cloud-typecheck.log` 和 `cloud-build-dry-run.log`。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
@@ -170,6 +170,16 @@ superseded_by: ""
 - The current master's Bilibili page-selection flow keeps the task-specific download context.
   `bilibili_page_choice_keeps_frozen_destination_after_default_switch` verifies that selection and
   queue reopening preserve the original library root and category after changing the default.
+- New video-task creation refuses uncertain task-ID absence when any registered queue is offline;
+  positive existing-task replay remains idempotent. A durable-record/index-failure regression covers
+  offline source, changed default, no second record and restoration of the original destination.
+- File-preview projection preserves the exact bounded source library ID in both full and compact
+  envelopes after the operation-result budget removes full details. Explicit malformed IDs are
+  omitted and counted; genuinely absent legacy IDs retain their existing compatibility behavior.
+- Shared browser actions carry local surface ownership, so `/file` and `/settings` retain their own
+  receipts before dequeuing submissions. The wire action schema is unchanged. Media summaries use
+  the full reported count while disclosing retained-only list filters and pagination; migration
+  previews require both endpoint IDs to resolve to registered descriptors before Start is enabled.
 - `cloud_snapshot_projects_video_library_ids_and_authorized_incomplete_counts` exercises the
   production snapshot builder with legacy, failed, PDF, malformed-staging, and unauthorized-chat
   records; `failed_non_default_library_open_keeps_cache_unavailable_until_scoped_recovery`

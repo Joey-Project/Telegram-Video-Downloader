@@ -1,4 +1,4 @@
-import { appendAction, removeQueuedAction, shouldRetryActionFailure } from "/file/action-queue.js";
+import { ACTION_QUEUE_LIMIT, ACTION_SURFACE_SETTINGS, appendAction, dispatchNextOwnedAction, recordActionReceipt, removeQueuedAction, shouldRetryActionFailure } from "/file/action-queue.js";
 import { HttpResponseError } from "/file/http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "/file/snapshot-session.js";
 import { escapeHtml } from "/file/preview-rendering.js";
@@ -8,10 +8,7 @@ import { mediaLibraryAvailability, mediaLibraryEntries } from "/file/library-vie
 const API = "/api";
 const ACTION_QUEUE_KEY = "file-manager.actions.v1";
 const POLL_MS = 12_000;
-const MAX_ACTION_QUEUE = 20;
-const SETTINGS_KINDS = new Set([
-  "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove", "library_scan",
-]);
+const MAX_ACTION_QUEUE = ACTION_QUEUE_LIMIT;
 
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
@@ -143,46 +140,52 @@ async function drainActionQueue({ quiet = false } = {}) {
     let interrupted = false;
     const rejected = [];
     while (navigator.onLine) {
-      const action = readActionQueue().find((entry) => !state.quarantinedActionIds.has(entry.request_id));
-      if (!action) break;
-      try {
-        const receipt = await api("/actions", {
+      const outcome = await dispatchNextOwnedAction({
+        surface: ACTION_SURFACE_SETTINGS,
+        readQueue: readActionQueue,
+        writeQueue: writeActionQueue,
+        excludedIds: state.quarantinedActionIds,
+        dispatch: (action) => api("/actions", {
           method: "POST",
           body: JSON.stringify({ request_id: action.request_id, kind: action.kind, payload: action.payload }),
-        });
-        const local = state.localActions.get(action.request_id);
-        if (local && Number.isSafeInteger(receipt?.seq)) local.seq = receipt.seq;
-        if (!writeActionQueue(removeQueuedAction(readActionQueue(), action.request_id))) {
-          if (!quiet) showToast("The request reached the cloud inbox, but this browser could not update its retry queue.");
-          break;
-        }
-        sentAny = true;
-      } catch (error) {
-        if (error?.status === 401 || error?.status === 403) {
-          state.snapshot = null;
-          Object.assign(state, failOwnerSnapshot(state, error.status));
-          showPrivateAccessGate("Owner access could not be verified. Reopen this Mini App from the owner’s private chat.");
-          break;
-        }
-        if (!shouldRetryActionFailure(error)) {
-          state.quarantinedActionIds.add(action.request_id);
-          writeActionQueue(removeQueuedAction(readActionQueue(), action.request_id));
-          const local = state.localActions.get(action.request_id);
-          if (local) clearLocalSettingsAction(action, `${local.label} was rejected before reaching the desktop: ${error.message}`);
-          else rejected.push(String(error?.message ?? "Request rejected"));
-          continue;
-        }
-        interrupted = true;
-        if (!state.retryTimer) {
-          const delay = state.retryDelay;
-          state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
-          state.retryTimer = window.setTimeout(() => {
-            state.retryTimer = 0;
-            drainActionQueue({ quiet });
-          }, delay);
-        }
+        }),
+        onReceipt: (action, receipt) => recordActionReceipt(action, receipt, { localActions: state.localActions }),
+      });
+      if (outcome.status === "empty") break;
+      if (outcome.status === "remove_failed") {
+        if (!quiet) showToast("The request reached the cloud inbox, but this browser could not update its retry queue.");
         break;
       }
+      if (outcome.status === "sent") {
+        sentAny = true;
+        continue;
+      }
+
+      const { action, error } = outcome;
+      if (error?.status === 401 || error?.status === 403) {
+        state.snapshot = null;
+        Object.assign(state, failOwnerSnapshot(state, error.status));
+        showPrivateAccessGate("Owner access could not be verified. Reopen this Mini App from the owner’s private chat.");
+        break;
+      }
+      if (!shouldRetryActionFailure(error)) {
+        state.quarantinedActionIds.add(action.request_id);
+        writeActionQueue(removeQueuedAction(readActionQueue(), action.request_id));
+        const local = state.localActions.get(action.request_id);
+        if (local) clearLocalSettingsAction(action, `${local.label} was rejected before reaching the desktop: ${error.message}`);
+        else rejected.push(String(error?.message ?? "Request rejected"));
+        continue;
+      }
+      interrupted = true;
+      if (!state.retryTimer) {
+        const delay = state.retryDelay;
+        state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
+        state.retryTimer = window.setTimeout(() => {
+          state.retryTimer = 0;
+          drainActionQueue({ quiet });
+        }, delay);
+      }
+      break;
     }
     if (sentAny) state.retryDelay = 1_500;
     if (rejected.length) showToast(`Request rejected before local execution: ${[...new Set(rejected)].slice(0, 2).join(" · ")}`);
@@ -201,7 +204,7 @@ async function drainActionQueue({ quiet = false } = {}) {
 
 async function submitAction(kind, payload, label) {
   if (!mayDispatchActions(state)) return false;
-  const action = { request_id: crypto.randomUUID(), kind, payload };
+  const action = { request_id: crypto.randomUUID(), kind, payload, surface: ACTION_SURFACE_SETTINGS };
   const queued = appendAction(readActionQueue(), action);
   if (!queued.ok) return showToast("The browser retry queue is full. Send its saved requests first."), false;
   if (!writeActionQueue(queued.queue)) return showToast("This browser could not save the request, so it was not sent."), false;
