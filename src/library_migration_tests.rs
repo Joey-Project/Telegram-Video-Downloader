@@ -295,6 +295,129 @@ fn uncheckpointed_orphan_stage_is_preserved_and_retried_at_a_fresh_name() {
 }
 
 #[test]
+fn refreshing_preview_durably_supersedes_the_old_revision() {
+    let source_root = TestRoot::new("superseded-preview-source");
+    let target_root = TestRoot::new("superseded-preview-target");
+    let source_path = source_root.path().join("clip.mp4");
+    fs::write(&source_path, MEDIA_BYTES).expect("synthetic media should write");
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let snapshot = engine
+        .source
+        .migration_scan()
+        .expect("source library should scan");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4" && item.presence == Presence::Present)
+        .expect("synthetic media should be indexed")
+        .id
+        .clone();
+    let request = MigrationRequest {
+        scope: MigrationScope::Selected,
+        item_ids: vec![item_id],
+        conflict: ConflictPolicy::Skip,
+        item_conflicts: BTreeMap::new(),
+        include_incomplete_tasks: false,
+        set_target_default_on_success: false,
+        task_impacts: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let old = engine
+        .preview(&request)
+        .expect("first preview should be created");
+
+    let mut invalid_refresh = request.clone();
+    invalid_refresh.item_ids = vec!["missing-item".to_string()];
+    assert!(
+        engine
+            .preview_replacing(&invalid_refresh, &old.id, &old.revision)
+            .is_err()
+    );
+    let mut old_document: PreviewDocument = decode_state(
+        &engine
+            .source
+            .migration_read_state(&preview_state_name(&old.id), MAX_STATE_BYTES)
+            .expect("old preview should remain readable")
+            .expect("old preview should remain persisted"),
+        "migration preview",
+    )
+    .expect("old preview should decode");
+    old_document.superseded_by = Some("missing-refresh-document".to_string());
+    engine
+        .source
+        .migration_write_state(
+            &preview_state_name(&old.id),
+            &encode_state(&old_document).unwrap(),
+        )
+        .expect("simulated crash tombstone should persist");
+    let refreshed = engine
+        .preview_replacing(&request, &old.id, &old.revision)
+        .expect("a retry should recover from a tombstone whose new document was not saved");
+    assert_ne!(refreshed.id, old.id);
+    let replayed = engine
+        .preview_replacing(&request, &old.id, &old.revision)
+        .expect("an inbox replay should reuse the exact persisted refresh receipt");
+    assert_eq!(replayed.id, refreshed.id);
+    let stale = engine
+        .confirm(&old.id, &old.revision)
+        .expect_err("the superseded preview must no longer confirm");
+    assert!(stale.to_string().contains("superseded"));
+    assert_eq!(
+        engine
+            .confirm(&refreshed.id, &refreshed.revision)
+            .expect("the refreshed preview should remain confirmable")
+            .status,
+        MigrationRunStatus::Queued
+    );
+}
+
+#[test]
+fn default_library_revision_latches_once_for_the_migration_run() {
+    let fixture = Fixture::new("default-revision-latch");
+    let mut job = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("migration job should load");
+    job.preview.set_target_default_on_success = true;
+    job.request.set_target_default_on_success = true;
+    fixture
+        .engine
+        .save_job(&job)
+        .expect("migration should persist the requested default update");
+
+    fixture
+        .engine
+        .bind_default_update_expected_revision(&fixture.migration_id, 17)
+        .expect("first observed registry revision should be persisted");
+    fixture
+        .engine
+        .bind_default_update_expected_revision(&fixture.migration_id, 29)
+        .expect("later observations should leave the original CAS baseline intact");
+    assert_eq!(
+        fixture
+            .engine
+            .default_update_expected_revision(&fixture.migration_id)
+            .expect("saved CAS revision should load"),
+        Some(17)
+    );
+}
+
+#[test]
 fn publication_rename_before_checkpoint_recovers_only_the_captured_inode() {
     let fixture = Fixture::new("publish-before-save");
     for _ in 0..16 {

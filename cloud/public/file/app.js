@@ -5,7 +5,7 @@ import { HttpResponseError } from "./http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limit.js";
 import { MAX_MANUAL_TARGET_OPTIONS, searchPresentManualTargets } from "./manual-target-picker.js";
-import { MAX_MIGRATION_ITEM_CONFLICTS, buildMigrationPreviewRefreshPayload, migrationConflictChoicesChanged, migrationConflictPolicy, migrationRefreshMatches, normalizeMigrationItemConflicts, setMigrationConflictChoice } from "./migration-conflicts.js";
+import { MAX_MIGRATION_ITEM_CONFLICTS, buildMigrationPreviewRefreshPayload, migrationConflictChoicesChanged, migrationConflictPolicy, migrationControlActions, migrationHistoryNotice, migrationRefreshMatches, normalizeMigrationItemConflicts, setMigrationConflictChoice } from "./migration-conflicts.js";
 import { submitLegacyFileImport } from "./legacy-file-import.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
 import { sourceIdUrl } from "./source-links.js";
@@ -858,7 +858,6 @@ function renderMigrationPreview(operation) {
 function renderMigrationProgress(migration) {
   const status = String(migration.status ?? "unknown");
   const active = ["queued", "running"].includes(status);
-  const paused = status === "paused";
   const items = Array.isArray(migration.items) ? migration.items : [];
   const resultRows = items.slice(0, 40).map((item) => {
     const itemStatus = String(item.status ?? "unknown");
@@ -888,12 +887,16 @@ function renderMigrationProgress(migration) {
   const taskHandoffStatus = incompleteTaskCount > 0 && transfers.length === 0
     ? `<div class="preview-line"><span>Unfinished task handoffs<br><span class="field-hint">${escapeHtml(migration.awaiting_task_plans === true ? "Preparing the task transfer plans." : "Waiting for task transfer details.")}</span></span><strong>${incompleteTaskCount.toLocaleString()} task${incompleteTaskCount === 1 ? "" : "s"}</strong></div>`
     : "";
-  const controls = [
-    active ? `<button class="small-button" type="button" data-migration-control="pause" data-migration-id="${escapeHtml(migration.id)}">Pause</button>` : "",
-    paused ? `<button class="small-button" type="button" data-migration-control="resume" data-migration-id="${escapeHtml(migration.id)}">Resume</button>` : "",
-    active || paused ? `<button class="small-button" type="button" data-migration-control="stop_remaining" data-migration-id="${escapeHtml(migration.id)}">Stop remaining</button>` : "",
-    Number(migration.failed_count ?? 0) > 0 ? `<button class="small-button" type="button" data-migration-control="retry_failed" data-migration-id="${escapeHtml(migration.id)}">Retry failed items</button>` : "",
-  ].filter(Boolean).join("");
+  const retryLabel = Number(migration.failed_count ?? 0) > 0 ? "Retry failed items" : "Retry task handoffs";
+  const controlLabels = {
+    pause: "Pause",
+    resume: "Resume",
+    stop_remaining: "Stop remaining",
+    retry_failed: retryLabel,
+  };
+  const controls = migrationControlActions(migration).map((control) =>
+    `<button class="small-button" type="button" data-migration-control="${control}" data-migration-id="${escapeHtml(migration.id)}">${controlLabels[control]}</button>`
+  ).join("");
   const source = mediaLibraryEntries(state.snapshot).find((entry) => entry.id === migration.source_library_id);
   const target = mediaLibraryEntries(state.snapshot).find((entry) => entry.id === migration.target_library_id);
   const visibleItems = items.length > 40 ? `<p class="field-hint">Showing the first 40 of ${items.length} item results.</p>` : "";
@@ -906,7 +909,9 @@ function renderMigrations() {
   byId("migration-preview-list").innerHTML = previews.map(renderMigrationPreview).join("");
   const migrations = Array.isArray(state.snapshot?.library?.migrations) ? state.snapshot.library.migrations : [];
   const relevant = migrations.filter((migration) => migration?.source_library_id === activeLibraryId() || migration?.target_library_id === activeLibraryId());
-  byId("migration-progress-list").innerHTML = relevant.slice(-8).reverse().map(renderMigrationProgress).join("");
+  const historyNotice = migrationHistoryNotice(state.snapshot?.library?.migration_omitted_count);
+  const historyNoticeMarkup = historyNotice ? `<p class="field-hint">${escapeHtml(historyNotice)}</p>` : "";
+  byId("migration-progress-list").innerHTML = `${historyNoticeMarkup}${relevant.slice(-8).reverse().map(renderMigrationProgress).join("")}`;
 }
 
 function renderPreviews() {
@@ -1409,7 +1414,11 @@ function bindEvents() {
       const previewId = migrationRefresh.dataset.migrationRefreshConflicts;
       const operation = migrationPreviewEntries().find((entry) => entry.id === previewId);
       const draft = state.migrationConflictDrafts.get(previewId);
-      const payload = buildMigrationPreviewRefreshPayload(operation?.result, draft?.itemConflicts);
+      const payload = buildMigrationPreviewRefreshPayload(operation?.result, draft?.itemConflicts, {
+        seq: operation?.seq,
+        id: operation?.id,
+        revision: operation?.revision,
+      });
       if (!payload) {
         showToast("This preview cannot be refreshed. Choose a new source and target, then request another preview.");
         return;

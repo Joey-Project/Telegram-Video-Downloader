@@ -6,6 +6,30 @@ use serde_json::{Value, json};
 
 use super::*;
 
+const CLOUD_MIGRATION_HISTORY_LIMIT: usize = 32;
+
+fn cloud_migration_history(
+    migrations: &BTreeMap<String, crate::library_migration::MigrationStatus>,
+) -> Result<(Value, usize)> {
+    use crate::library_migration::MigrationRunStatus;
+
+    let priority = |status: &crate::library_migration::MigrationStatus| match status.status {
+        MigrationRunStatus::Queued | MigrationRunStatus::Running => 0,
+        MigrationRunStatus::Paused | MigrationRunStatus::Failed | MigrationRunStatus::Partial => 1,
+        MigrationRunStatus::Completed | MigrationRunStatus::Stopped => 2,
+    };
+    let mut selected = migrations.values().collect::<Vec<_>>();
+    selected.sort_by(|left, right| {
+        priority(left)
+            .cmp(&priority(right))
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let omitted = selected.len().saturating_sub(CLOUD_MIGRATION_HISTORY_LIMIT);
+    selected.truncate(CLOUD_MIGRATION_HISTORY_LIMIT);
+    Ok((serde_json::to_value(selected)?, omitted))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RegisterLibrary {
@@ -297,8 +321,9 @@ pub(super) async fn attach_library_views(
     let mut library = selected.unwrap_or(legacy);
     library["libraries"] = json!(views);
     library["default_library_id"] = json!(default_id);
-    library["migrations"] =
-        serde_json::to_value(runtime.migrations.lock().await.values().collect::<Vec<_>>())?;
+    let (history, omitted) = cloud_migration_history(&*runtime.migrations.lock().await)?;
+    library["migrations"] = history;
+    library["migration_omitted_count"] = json!(omitted);
     Ok(library)
 }
 
@@ -497,6 +522,53 @@ async fn submit_download(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_migration_history_is_bounded_and_prioritizes_recovery() {
+        let make_status = |id: &str, status: &str, created_at: u64| {
+            serde_json::from_value::<crate::library_migration::MigrationStatus>(json!({
+                "id":id, "preview_id":id, "revision":"1", "status":status,
+                "created_at":created_at,
+                "source_library_id":"source", "target_library_id":"target",
+                "scope":"library", "conflict":"skip", "item_conflicts":{},
+                "include_incomplete_tasks":false, "set_target_default_on_success":false,
+                "default_update_applied":false, "total_items":0, "completed_items":0,
+                "success_count":0, "skipped_count":0, "failed_count":0,
+                "total_files":0, "completed_files":0, "copied_bytes":0, "total_bytes":0,
+                "required_space_bytes":0, "available_space_bytes":0,
+                "incomplete_task_count":0, "staging_bytes":0,
+                "awaiting_task_plans":false, "awaiting_task_commit":false,
+                "warnings":[], "items":[], "task_transfers":[],
+            }))
+            .unwrap()
+        };
+        let mut migrations = BTreeMap::new();
+        for index in 0..40 {
+            let id = format!("completed-{index:02}");
+            migrations.insert(id.clone(), make_status(&id, "completed", index));
+        }
+        for (id, status) in [
+            ("running", "running"),
+            ("paused", "paused"),
+            ("failed", "failed"),
+        ] {
+            migrations.insert(id.into(), make_status(id, status, 0));
+        }
+        let (view, omitted) = cloud_migration_history(&migrations).unwrap();
+        let rows = view.as_array().unwrap();
+        assert_eq!(rows.len(), CLOUD_MIGRATION_HISTORY_LIMIT);
+        assert_eq!(omitted, 11);
+        assert_eq!(rows[0]["id"], "running");
+        assert!(rows.iter().any(|row| row["id"] == "paused"));
+        assert!(rows.iter().any(|row| row["id"] == "failed"));
+        assert!(rows.iter().any(|row| row["id"] == "completed-39"));
+        assert!(!rows.iter().any(|row| row["id"] == "completed-00"));
+        assert_eq!(
+            migrations.len(),
+            43,
+            "projection must retain durable/runtime history"
+        );
+    }
 
     #[test]
     fn nested_library_snapshots_shrink_without_hiding_omission() {

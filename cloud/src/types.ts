@@ -50,6 +50,9 @@ export interface LibraryMigrationPreviewPayload {
   conflict?: ConflictPolicy;
   item_conflicts?: Record<string, ConflictPolicy>;
   set_target_default_on_success?: boolean;
+  supersedes_preview_seq?: number;
+  supersedes_preview_id?: string;
+  supersedes_revision?: string;
 }
 
 export interface FilePreviewPayload {

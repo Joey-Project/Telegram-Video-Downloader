@@ -31,6 +31,12 @@ struct PreviewPayload {
     include_incomplete_tasks: bool,
     #[serde(default)]
     set_target_default_on_success: bool,
+    #[serde(default)]
+    supersedes_preview_seq: Option<u64>,
+    #[serde(default)]
+    supersedes_preview_id: Option<String>,
+    #[serde(default)]
+    supersedes_revision: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +128,42 @@ fn item_ids_for_task(snapshot: &LibrarySnapshot, task: &TaskRecord, root: &Path)
 }
 
 fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<MigrationPreview> {
+    let supersession = match (
+        payload.supersedes_preview_seq,
+        payload.supersedes_preview_id.as_deref(),
+        payload.supersedes_revision.as_deref(),
+    ) {
+        (None, None, None) => None,
+        (Some(seq), Some(id), Some(revision))
+            if seq > 0 && seq <= 9_007_199_254_740_991 && !revision.is_empty() =>
+        {
+            let record = runtime
+                .inbox
+                .record(seq)?
+                .context("the migration preview being refreshed is unavailable")?;
+            if record.request.kind != "library_migration_preview"
+                || record.status != InboxStatus::AwaitingConfirmation
+                || record
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some(id)
+                || record
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("revision"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some(revision)
+            {
+                bail!("the migration preview being refreshed is no longer awaiting confirmation");
+            }
+            Some((seq, id.to_string(), revision.to_string()))
+        }
+        _ => bail!(
+            "supersedes_preview_seq, supersedes_preview_id, and supersedes_revision must be supplied together"
+        ),
+    };
     let source = manager(runtime, &payload.source_library_id)?;
     let target = manager(runtime, &payload.target_library_id)?;
     let snapshot = source.migration_scan()?;
@@ -175,13 +217,13 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
         .iter()
         .flat_map(|impact| impact.published_item_ids.iter().cloned())
         .collect::<HashSet<_>>();
-    let preview = MigrationEngine::new(
+    let engine = MigrationEngine::new(
         payload.source_library_id,
         source,
         payload.target_library_id,
         target,
-    )?
-    .preview(&MigrationRequest {
+    )?;
+    let request = MigrationRequest {
         scope: payload.scope,
         item_ids,
         conflict: payload.conflict.unwrap_or(ConflictPolicy::Skip),
@@ -190,7 +232,13 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
         set_target_default_on_success: payload.set_target_default_on_success,
         task_impacts: impacts,
         warnings,
-    })?;
+    };
+    let preview = match &supersession {
+        Some((_, old_id, old_revision)) => {
+            engine.preview_replacing(&request, old_id, old_revision)?
+        }
+        None => engine.preview(&request)?,
+    };
     if payload.include_incomplete_tasks
         && preview.items.iter().any(|item| {
             task_items.contains(&item.item_id)
@@ -200,6 +248,34 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
         bail!(
             "a conflicting published member of an unfinished task would stay in the source library; choose Keep both or leave unfinished tasks in the source library"
         );
+    }
+    if let Some((seq, id, revision)) = supersession {
+        let mut changed = false;
+        runtime.inbox.update(seq, |record| {
+            if record.request.kind == "library_migration_preview"
+                && record.status == InboxStatus::AwaitingConfirmation
+                && record
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(id.as_str())
+                && record
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("revision"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(revision.as_str())
+            {
+                record.status = InboxStatus::Stale;
+                record.error =
+                    Some("Preview is stale; use the refreshed migration preview.".to_string());
+                changed = true;
+            }
+        })?;
+        if !changed {
+            bail!("the migration preview being refreshed changed before it could be invalidated");
+        }
     }
     Ok(preview)
 }
@@ -248,6 +324,7 @@ async fn dispatch_inner(
             let payload: PreviewPayload = serde_json::from_value(request.payload.clone())?;
             ensure_library_io_available(runtime, &payload.source_library_id).await?;
             ensure_library_io_available(runtime, &payload.target_library_id).await?;
+            let superseded_seq = payload.supersedes_preview_seq;
             let worker = runtime.clone();
             let preview =
                 tokio::task::spawn_blocking(move || build_preview(&worker, payload)).await??;
@@ -255,7 +332,7 @@ async fn dispatch_inner(
                 status: InboxStatus::AwaitingConfirmation,
                 result: Some(serde_json::to_value(preview)?),
                 error: None,
-                related_preview: None,
+                related_preview: superseded_seq.map(|seq| (seq, InboxStatus::Stale)),
             })
         }
         "library_migration_confirm" => {
@@ -387,7 +464,10 @@ async fn ensure_message_context(
 async fn start(runtime: CloudBotRuntime, status: MigrationStatus) {
     if !matches!(
         status.status,
-        MigrationRunStatus::Queued | MigrationRunStatus::Running | MigrationRunStatus::Completed
+        MigrationRunStatus::Queued
+            | MigrationRunStatus::Running
+            | MigrationRunStatus::Stopped
+            | MigrationRunStatus::Completed
     ) {
         return;
     }
@@ -522,6 +602,10 @@ async fn run(runtime: &CloudBotRuntime, initial: MigrationStatus) -> Result<()> 
     let worker = engine.clone();
     let lookup = id.clone();
     let context = tokio::task::spawn_blocking(move || worker.runtime_context(&lookup)).await??;
+    if initial.status == MigrationRunStatus::Stopped {
+        finish_task_transfers(runtime, &engine, &initial).await?;
+        return Ok(());
+    }
     if context
         .as_ref()
         .is_none_or(|context| context.database_epoch != runtime.inbox.database_epoch())
@@ -581,6 +665,22 @@ async fn run(runtime: &CloudBotRuntime, initial: MigrationStatus) -> Result<()> 
         if runtime.epoch_fatal.is_signaled() {
             return Ok(());
         }
+        if initial.set_target_default_on_success
+            && !initial.default_update_resolved
+            && !initial.default_update_applied
+        {
+            let queue = Arc::clone(&runtime.bot.queue);
+            let expected_revision = tokio::task::spawn_blocking(move || {
+                Ok::<_, anyhow::Error>(queue.registry_snapshot()?.revision)
+            })
+            .await??;
+            let worker = engine.clone();
+            let lookup = id.clone();
+            tokio::task::spawn_blocking(move || {
+                worker.bind_default_update_expected_revision(&lookup, expected_revision)
+            })
+            .await??;
+        }
         let worker = engine.clone();
         let lookup = id.clone();
         let lease = Arc::clone(&guards);
@@ -634,18 +734,51 @@ async fn apply_success_default(
 ) -> Result<()> {
     if status.status == MigrationRunStatus::Completed
         && status.set_target_default_on_success
+        && !status.default_update_resolved
         && !status.default_update_applied
     {
+        let id = status.id.clone();
+        let expected_revision = engine.default_update_expected_revision(&id)?;
+        let Some(expected_revision) = expected_revision else {
+            let worker = engine.clone();
+            tokio::task::spawn_blocking(move || {
+                worker.mark_default_update_resolved(
+                    &id,
+                    false,
+                    Some("The default library was not changed because this completed migration has no saved settings revision."),
+                )
+            })
+            .await??;
+            if let Some(status) = read_status(engine, &status.id).await? {
+                publish_status(runtime, status).await;
+            }
+            return Ok(());
+        };
         let queue = Arc::clone(&runtime.bot.queue);
         let target = status.target_library_id.clone();
-        let id = status.id.clone();
-        tokio::task::spawn_blocking(move || {
-            queue.set_default_video_library_for_migration(&target, &id)
+        let migration_id = id.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            queue.set_default_video_library_for_migration_if_revision(
+                &target,
+                &migration_id,
+                expected_revision,
+            )
         })
         .await??;
+        let (applied, warning) = match outcome {
+            crate::media_libraries::MigrationDefaultUpdateOutcome::Applied { .. } => (true, None),
+            crate::media_libraries::MigrationDefaultUpdateOutcome::RevisionChanged { .. } => (
+                false,
+                Some(
+                    "The requested default library was left unchanged because library settings changed during migration.",
+                ),
+            ),
+        };
         let worker = engine.clone();
-        let id = status.id.clone();
-        tokio::task::spawn_blocking(move || worker.mark_default_update_applied(&id)).await??;
+        tokio::task::spawn_blocking(move || {
+            worker.mark_default_update_resolved(&id, applied, warning)
+        })
+        .await??;
         if let Some(status) = read_status(engine, &status.id).await? {
             publish_status(runtime, status).await;
         }

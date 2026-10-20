@@ -25,11 +25,11 @@ use crate::file_provider::{
 };
 use crate::media_libraries::{
     MediaLibrary, MediaLibraryRegistryStore, MediaLibrarySnapshot, MediaLibraryStatus,
-    StagingMigrationControlReceipt, TaskDestination, TaskDestinationTransfer,
-    TaskDestinationTransferPhase, TaskTransferControl, TaskTransferControlKind,
-    TaskTransferEntryKind, TaskTransferFile, TaskTransferPlan, TaskTransferSnapshot,
-    destination_for_library, prepare_library_root, validate_category, validate_name,
-    validate_task_destination,
+    MigrationDefaultUpdateOutcome, StagingMigrationControlReceipt, TaskDestination,
+    TaskDestinationTransfer, TaskDestinationTransferPhase, TaskTransferControl,
+    TaskTransferControlKind, TaskTransferEntryKind, TaskTransferFile, TaskTransferPlan,
+    TaskTransferSnapshot, destination_for_library, prepare_library_root, validate_category,
+    validate_name, validate_task_destination,
 };
 use crate::router::JobRequest;
 use crate::safe_fs::{BoundFile, EntryIdentity, RootedFs};
@@ -399,7 +399,7 @@ pub struct QueueManager {
     #[cfg(test)]
     video: DownloadStore,
     pdf: DownloadStore,
-    _pdf_owner_lock: Option<QueueOwnerLock>,
+    _pdf_owner_lock: Option<Arc<QueueOwnerLock>>,
     video_libraries: RwLock<Vec<RegisteredVideoStore>>,
     media_libraries: Mutex<MediaLibraryRegistryStore>,
     video_statuses: RwLock<BTreeMap<String, MediaLibraryStatus>>,
@@ -415,7 +415,7 @@ struct RegisteredVideoStore {
     library_id: String,
     store: DownloadStore,
     available: bool,
-    _owner_lock: Option<QueueOwnerLock>,
+    _owner_lock: Option<Arc<QueueOwnerLock>>,
 }
 
 struct CancellationRegistration {
@@ -712,7 +712,7 @@ impl QueueManager {
         // settings snapshot and status map, while online roots continue serving their tasks.
         for library in &library_snapshot.libraries {
             let root_binding = media_libraries.root_binding(&library.id);
-            let opened = (|| -> Result<(DownloadStore, Option<QueueOwnerLock>)> {
+            let opened = (|| -> Result<(DownloadStore, Option<Arc<QueueOwnerLock>>)> {
                 let root = coordinate_directory_root(file_provider.as_ref(), &library.root)?;
                 if root_binding.is_some_and(|binding| {
                     binding != (root.root_identity().device(), root.root_identity().inode())
@@ -724,7 +724,7 @@ impl QueueManager {
                     Arc::clone(&file_provider),
                     Arc::clone(&state_change_notify),
                 )?;
-                let owner_lock = Some(store.lock_queue_owner()?);
+                let owner_lock = Some(Arc::new(store.lock_queue_owner()?));
                 let operation_lock = store.lock_queue_operations()?;
                 store.ensure_index()?;
                 store.reconcile_index()?;
@@ -788,20 +788,22 @@ impl QueueManager {
         // output alias instead of creating a second queue or owner lock.
         let pdf_root =
             coordinate_directory_root(file_provider.as_ref(), &config.downloads.pdf_dir)?;
-        let shared_video_store = video_libraries
+        let shared_video = video_libraries
             .iter()
             .find(|registered| registered.store.root.root_identity() == pdf_root.root_identity())
-            .map(|registered| registered.store.clone());
-        let (pdf, pdf_owner_lock) = if let Some(mut store) = shared_video_store {
+            .map(|registered| (registered.store.clone(), registered._owner_lock.clone()));
+        let (pdf, pdf_owner_lock) = if let Some((mut store, owner_lock)) = shared_video {
             store.add_root_alias(pdf_root.logical_root_path());
-            (store, None)
+            let owner_lock = owner_lock
+                .ok_or_else(|| anyhow!("shared video/PDF queue root has no retained owner lock"))?;
+            (store, Some(owner_lock))
         } else {
             let store = DownloadStore::from_root(
                 pdf_root,
                 Arc::clone(&file_provider),
                 Arc::clone(&state_change_notify),
             )?;
-            let owner_lock = Some(store.lock_queue_owner()?);
+            let owner_lock = Some(Arc::new(store.lock_queue_owner()?));
             let operation_lock = store.lock_queue_operations()?;
             store.ensure_index()?;
             store.reconcile_index()?;
@@ -1079,7 +1081,7 @@ impl QueueManager {
             self.set_video_store_available(&library.id, true)?;
             existing
         } else {
-            let opened = (|| -> Result<(DownloadStore, Option<QueueOwnerLock>)> {
+            let opened = (|| -> Result<(DownloadStore, Option<Arc<QueueOwnerLock>>)> {
                 let store = if identity == self.pdf.root.root_identity() {
                     self.pdf.clone()
                 } else {
@@ -1092,7 +1094,7 @@ impl QueueManager {
                 let owner_lock = if store.shares_root(&self.pdf) {
                     None
                 } else {
-                    Some(store.lock_queue_owner()?)
+                    Some(Arc::new(store.lock_queue_owner()?))
                 };
                 let operation_lock = store.lock_queue_operations()?;
                 store.ensure_index()?;
@@ -1262,7 +1264,7 @@ impl QueueManager {
                 Arc::clone(&self.pdf.file_provider),
                 Arc::clone(&self.state_change_notify),
             )?;
-            let owner = store.lock_queue_owner()?;
+            let owner = Arc::new(store.lock_queue_owner()?);
             let operation = store.lock_queue_operations()?;
             store.ensure_index()?;
             store.reconcile_index()?;
@@ -1320,19 +1322,20 @@ impl QueueManager {
         Ok(snapshot)
     }
 
-    pub fn set_default_video_library_for_migration(
+    pub fn set_default_video_library_for_migration_if_revision(
         &self,
         library_id: &str,
         migration_id: &str,
-    ) -> Result<MediaLibrarySnapshot> {
+        expected_revision: u64,
+    ) -> Result<MigrationDefaultUpdateOutcome> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
-        let snapshot = self
+        let outcome = self
             .media_libraries
             .lock()
             .map_err(poisoned_lock)?
-            .set_default_for_migration(library_id, migration_id)?;
+            .set_default_for_migration_if_revision(library_id, migration_id, expected_revision)?;
         self.state_change_notify.notify_one();
-        Ok(snapshot)
+        Ok(outcome)
     }
 
     pub fn set_video_library_category(
@@ -10484,6 +10487,64 @@ mod tests {
     }
 
     #[test]
+    fn removing_shared_video_library_retains_pdf_queue_owner_across_processes() {
+        let temp_root = temp_queue_root("removed-shared-video-pdf-owner");
+        let shared_root = temp_root.join("videos");
+        let archive_root = temp_root.join("archive");
+        fs::create_dir_all(&shared_root).expect("shared queue root should create");
+        fs::create_dir_all(&archive_root).expect("archive root should create");
+
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = shared_root.clone();
+        config.downloads.pdf_dir = shared_root;
+        let queue = QueueManager::open(&config).expect("shared video/PDF root should open");
+        let removed_library_id = queue.registry_snapshot().unwrap().default_library_id;
+        let archive = queue
+            .register_video_library("Archive", &archive_root, None, false, false)
+            .expect("archive library should register");
+        queue
+            .set_default_video_library(&archive.id)
+            .expect("archive should become default before removal");
+        queue
+            .remove_video_library(&removed_library_id)
+            .expect("old shared video library should be removable");
+
+        let mut child = spawn_queue_owner_child(&temp_root, "pdf-shared");
+        let result_path = temp_root.join("owner-pdf-shared-result");
+        wait_for_child_marker(&mut child, &result_path, "second shared-root owner");
+        let output = child
+            .wait_with_output()
+            .expect("shared-root owner output should collect");
+        assert!(
+            output.status.success(),
+            "owner probe failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(&result_path).expect("owner probe should persist its result"),
+            b"busy",
+            "removing video settings must not release the PDF queue owner lock"
+        );
+
+        drop(queue);
+        let mut child = spawn_queue_owner_child(&temp_root, "pdf-shared-released");
+        let result_path = temp_root.join("owner-pdf-shared-released-result");
+        wait_for_child_marker(&mut child, &result_path, "released shared-root owner");
+        let output = child
+            .wait_with_output()
+            .expect("released shared-root owner output should collect");
+        assert!(output.status.success());
+        assert_eq!(
+            fs::read(&result_path).expect("owner probe should persist its result"),
+            b"opened",
+            "the shared PDF queue owner lock should release when its manager drops"
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
     fn second_queue_manager_in_same_process_is_rejected() {
         let temp_root = temp_queue_root("duplicate-queue-owner");
         let video_root = temp_root.join("videos");
@@ -10592,7 +10653,11 @@ mod tests {
             .expect("queue owner child slot must be provided");
         let mut config = AppConfig::for_test();
         config.downloads.video_dir = root.join("videos");
-        config.downloads.pdf_dir = root.join("pdfs");
+        config.downloads.pdf_dir = if slot == "pdf-shared" || slot == "pdf-shared-released" {
+            root.join("videos")
+        } else {
+            root.join("pdfs")
+        };
         let result = match QueueManager::open(&config) {
             Ok(queue) => {
                 drop(queue);

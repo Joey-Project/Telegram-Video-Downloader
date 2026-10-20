@@ -14,5 +14,11 @@ export function setMigrationConflictChoice(
   defaultPolicy?: MigrationConflictPolicy,
 ): Record<string, MigrationConflictPolicy>;
 export function migrationConflictChoicesChanged(original: unknown, draft: unknown): boolean;
-export function buildMigrationPreviewRefreshPayload(result: unknown, itemConflicts: unknown): Record<string, unknown> | null;
+export function buildMigrationPreviewRefreshPayload(
+  result: unknown,
+  itemConflicts: unknown,
+  supersedes: { seq: number; id: string; revision: string },
+): Record<string, unknown> | null;
 export function migrationRefreshMatches(result: unknown, expected: unknown): boolean;
+export function migrationControlActions(migration: unknown): Array<"pause" | "resume" | "stop_remaining" | "retry_failed">;
+export function migrationHistoryNotice(omittedCount: unknown): string;

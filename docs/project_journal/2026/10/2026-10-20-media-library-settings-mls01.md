@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-20
 updated: 2026-10-20
 branch: "codex/media-library-settings"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/47"
 supersedes: []
 superseded_by: ""
 ---
@@ -15,7 +15,7 @@ superseded_by: ""
 ## 摘要
 
 - 记录已确认的 `/settings`、逐次下载目标选择和媒体库迁移体验，范围为单用户、单部署机；保留现有 Cloudflare Worker + D1 与本机主动出站 Rust 架构。
-- 已确认设计于 2026-10-20 完成实现及本地验证；设置、任务目标冻结、媒体/任务迁移和持久恢复均有默认执行的 mock Telegram/cloud E2E。真实云端验证和生产部署单独安排。
+- 已确认设计于 2026-10-20 完成实现及验证；设置、任务目标冻结、媒体/任务迁移和持久恢复均有默认执行的 mock Telegram/cloud E2E。隔离 Cloudflare + Rust 迁移验证也已通过；生产部署另行安排。
 
 ## 已确认范围
 
@@ -102,15 +102,59 @@ superseded_by: ""
 | 范围 | 最终结果 |
 | --- | --- |
 | Rust 1.99.1 格式及差异空白检查 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
-| Rust 全量测试 | `cargo test --all-targets --locked --offline --quiet`：1,103 通过、0 失败、16 个既有忽略项 |
-| Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --all-targets --locked --offline` 通过 |
-| Cloud / Node 25.8.2 | 类型检查通过；98 项测试通过；Wrangler 4.149.0 dry-run 通过，37 个静态资源 |
+| Rust 全量测试 | `cargo test --all-targets --locked --offline --quiet`：1,113 通过、0 失败、16 个既有忽略项 |
+| Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline --bin telegram-video-downloader` 通过 |
+| Cloud / Node 25.8.2 | 类型检查通过；103 项测试通过；Wrangler 4.149.0 dry-run 通过，37 个静态资源 |
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
 - Cargo gate 显式使用本 worktree 的 `target`；未覆盖已安装程序。最终 Rust 日志为 `.codex-tmp/mls01/core-transfer-final-tests.log`、`core-transfer-final-clippy.log` 和 `core-transfer-final-build.log`；Cloud 与服务辅助验证日志也保留于同一忽略目录。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
 - 大片段恢复用例使用 8–16 MiB 的合成文件；独立运行整体耗时约 15 秒。迁移完成等待设为明确的 60 秒上限，以容纳全量测试共享输出槽及调试模式校验开销，并保留超时状态诊断。全量测试随后通过；未改动生产迁移等待逻辑。
 - 测试使用临时本地目录、合成媒体/片段、fake 下载工具及 mock Telegram/cloud。恢复测试通过重建 runtime/queue 和持久状态重放模拟中断；未向真实 Telegram/Cloudflare 发送请求，未操作生产媒体或终止部署进程。
+
+## PR regression coverage
+
+- Restart reconciles task ownership for a migration already persisted as Stopped. A shared
+  video/PDF root retains its PDF owner lock after its video registration is removed; a separate
+  process verifies both contention and eventual release.
+- Migration default updates latch a settings revision once and durably record applied or skipped
+  CAS outcomes. Newer user settings survive execution and registry replay.
+- Conflict refresh durably supersedes the exact old preview, supports interrupted refresh replay,
+  and rejects the old confirmation after reopening the library managers. Failed task
+  handoffs expose retry and stop controls even when media failures are zero.
+- Cloud migration history is capped at 32 entries without deleting local recovery records.
+  Explicit blank download categories remain distinct from omitted categories in Worker validation
+  and Rust dispatch.
+- The new CAS E2E exposed a real missing-directory creation error. The rooted filesystem now
+  receives an absolute child path; nested missing-root creation has a positive regression. The
+  original E2E still requests directory creation rather than pre-creating its fixture.
+- All 16 feature mock E2Es run by default through the existing Rust CI command. The three added
+  recovery cases are `stopped_migration_reconciles_pending_task_transfer_after_restart`,
+  `migration_default_update_preserves_a_newer_user_library_choice`, and
+  `refreshed_migration_preview_stales_old_inbox_receipt_and_confirmation`.
+
+## Isolated Cloudflare and Rust E2E
+
+- A disposable Worker and D1 database ran the current Worker code and migrations `0001`–`0003`.
+  The worktree Rust debug binary used only a private temporary configuration and synthetic media.
+  Its SHA-256 was `ec1f569fa8bd51ac39aa968ac4d0ee696a24ec35e1e6a80ff9fa475a65c1d7e5`.
+- The live probe passed all 21 checks: authenticated owner API and static assets, creation and
+  registration of a missing library directory, default/category changes, scanning, migration
+  preview and confirmation, fixed source/target selection after a default change, and verified
+  MP4/NFO migration with source payload cleanup. Both file hashes were preserved.
+- The two-file synthetic bundle was 1,095 bytes. This exercised actual Worker/D1 requests and
+  Rust filesystem operations; it does not claim physical cross-volume, File Provider, Telegram
+  client/WebView, or real downloader validation. Local feature E2Es mock Telegram; the live probe
+  denied Telegram egress and verified that policy with a rejected CONNECT request.
+- The first runtime start rejected a probe-only two-second polling setting before submitting any
+  action. The probe was corrected to the supported five-second minimum; the complete rerun passed
+  in 14.07 seconds and its runtime exited through SIGINT with all child processes reaped.
+- Final local logs and the sanitized live report are retained under `.codex-tmp/mls01-pr/`:
+  `rust-full-final.log`, `rust-clippy-final.log`, `rust-build-final.log`, and `e2e-report.json`.
+  Production Worker, webhook, LaunchAgent, configuration, credentials, and media were not changed.
+- The disposable Worker and D1 database were deleted after the successful probe. Generated test
+  credentials, runtime configuration, and synthetic media were removed; redacted logs and the
+  sanitized report remain as local evidence.
 
 ## 状态
 

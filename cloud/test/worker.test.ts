@@ -12,6 +12,8 @@ import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "../public/file/s
 import {
   buildMigrationPreviewRefreshPayload,
   migrationConflictChoicesChanged,
+  migrationControlActions,
+  migrationHistoryNotice,
   migrationRefreshMatches,
   setMigrationConflictChoice,
 } from "../public/file/migration-conflicts.js";
@@ -136,7 +138,11 @@ describe("migration conflict choices", () => {
     };
     const draft = setMigrationConflictChoice(preview.item_conflicts, "item-a", "keep_both", "skip");
     expect(migrationConflictChoicesChanged(preview.item_conflicts, draft)).toBe(true);
-    const refresh = buildMigrationPreviewRefreshPayload(preview, draft);
+    const refresh = buildMigrationPreviewRefreshPayload(preview, draft, {
+      seq: 21,
+      id: preview.id,
+      revision: preview.revision,
+    });
     expect(refresh).toEqual({
       source_library_id: "library-source",
       target_library_id: "library-target",
@@ -144,6 +150,9 @@ describe("migration conflict choices", () => {
       include_incomplete_tasks: true,
       conflict: "skip",
       set_target_default_on_success: false,
+      supersedes_preview_seq: 21,
+      supersedes_preview_id: "migration-preview-old",
+      supersedes_revision: "revision-a",
       item_conflicts: { "item-a": "keep_both" },
     });
     expect(migrationRefreshMatches({ ...preview, id: "migration-preview-new", item_conflicts: draft }, refresh)).toBe(true);
@@ -158,11 +167,31 @@ describe("migration conflict choices", () => {
       source_library_id: "library-source",
       target_library_id: "library-target",
       scope: "selected",
+      id: "migration-preview-selected",
+      revision: "revision-selected",
       item_ids: ["item-a", "item-b"],
       conflict: "skip",
       items: [{ item_id: "item-a", conflict: false }, { item_id: "item-b", conflict: true }],
-    }, { "item-a": "keep_both", "item-b": "keep_both" });
+    }, { "item-a": "keep_both", "item-b": "keep_both" }, { seq: 22, id: "migration-preview-selected", revision: "revision-selected" });
     expect(refresh?.item_conflicts).toEqual({ "item-b": "keep_both" });
+    expect(refresh).toMatchObject({
+      supersedes_preview_seq: 22,
+      supersedes_preview_id: "migration-preview-selected",
+      supersedes_revision: "revision-selected",
+    });
+  });
+
+  it("requires the exact current preview identity before making a replacement preview", () => {
+    expect(buildMigrationPreviewRefreshPayload({
+      source_library_id: "library-source",
+      target_library_id: "library-target",
+      scope: "library",
+    }, {}, { seq: 0, id: "old", revision: "rev" })).toBeNull();
+    expect(buildMigrationPreviewRefreshPayload({
+      source_library_id: "library-source",
+      target_library_id: "library-target",
+      scope: "library",
+    }, {}, { seq: 1, id: "", revision: "rev" })).toBeNull();
   });
 
   it("preserves the inbox AUTOINCREMENT high-water mark when a migration rebuild copies no rows", async () => {
@@ -195,6 +224,35 @@ describe("migration conflict choices", () => {
     expect(savedSequence?.seq).toBe(47);
     const next = await testEnv.DB.prepare("INSERT INTO inbox_probe (dedup_key, payload_hash, kind, payload_json, created_at) VALUES ('probe:next', 'hash-next', 'library_scan', '{}', 2) RETURNING seq").first<{ seq: number }>();
     expect(next?.seq).toBeGreaterThan(47);
+  });
+});
+
+describe("migration progress controls and history notice", () => {
+  it("offers recovery controls for task-transfer errors even when no media bundle failed", () => {
+    expect(migrationControlActions({
+      status: "partial",
+      failed_count: 0,
+      task_transfers: [{ error: "queue handoff needs recovery" }],
+    })).toEqual(["stop_remaining", "retry_failed"]);
+    expect(migrationControlActions({
+      status: "failed",
+      failed_count: 0,
+      task_transfers: [{ error: "staged payload transfer failed" }],
+    })).toEqual(["stop_remaining", "retry_failed"]);
+  });
+
+  it("keeps ordinary progress controls and hides terminal controls without recoverable work", () => {
+    expect(migrationControlActions({ status: "running", failed_count: 0 })).toEqual(["pause", "stop_remaining"]);
+    expect(migrationControlActions({ status: "paused", failed_count: 0 })).toEqual(["resume", "stop_remaining"]);
+    expect(migrationControlActions({ status: "partial", failed_count: 0, task_transfers: [] })).toEqual([]);
+    expect(migrationControlActions({ status: "partial", failed_count: 2 })).toEqual(["retry_failed"]);
+  });
+
+  it("shows a positive omitted-history count with wording for any capped migrations", () => {
+    expect(migrationHistoryNotice(0)).toBe("");
+    expect(migrationHistoryNotice(-1)).toBe("");
+    expect(migrationHistoryNotice(32)).toBe("32 additional migrations are not included in this view; local recovery records are retained.");
+    expect(migrationHistoryNotice(1)).toBe("1 additional migration is not included in this view; local recovery records are retained.");
   });
 });
 
@@ -701,6 +759,25 @@ describe("applied media-library snapshot validation", () => {
 
     expect(() => validateSnapshot(snapshot)).toThrow("exactly one registered default library");
   });
+
+  it("accepts the 32-entry migration projection cap with an omitted-count marker", () => {
+    const migrations = Array.from({ length: 32 }, (_, index) => ({ id: `migration-${index}` }));
+    const library = {
+      revision: "library-revision-cap",
+      scanned_at: Math.floor(Date.now() / 1000),
+      root_label: "Videos",
+      items: [],
+      categories: [],
+      warnings: [],
+      ready: true,
+      migrations,
+      migration_omitted_count: 1,
+    };
+    expect(validateSnapshot(localSnapshot({ library })).library.migrations).toHaveLength(32);
+    expect(() => validateSnapshot(localSnapshot({
+      library: { ...library, migrations: [...migrations, { id: "migration-32" }] },
+    }))).toThrow("library.migrations must contain at most 32 entries");
+  });
 });
 
 function snapshotReadRaceDb(db: D1Database, commitNewSnapshot: () => Promise<void>): D1Database {
@@ -1065,7 +1142,9 @@ describe("Mini App identity and actions", () => {
       { kind: "file_confirm", payload: { preview_id: "preview-a", revision: "revision-a", library_id: "library-archive" } },
       { kind: "legacy_import", payload: { text: "older links", library_id: "library-archive" } },
       { kind: "download_submit", payload: { url: "https://www.bilibili.com/video/BV1xx", library_id: "library-archive", category: "Films" } },
-      { kind: "library_migration_preview", payload: { source_library_id: "library-main", target_library_id: "library-archive", scope: "library", include_incomplete_tasks: false, conflict: "skip", item_conflicts: { "item-a": "keep_both" }, set_target_default_on_success: false } },
+      { kind: "download_submit", payload: { url: "https://www.bilibili.com/video/BV1omitted", library_id: "library-archive" } },
+      { kind: "download_submit", payload: { url: "https://www.bilibili.com/video/BV1root", library_id: "library-archive", category: "" } },
+      { kind: "library_migration_preview", payload: { source_library_id: "library-main", target_library_id: "library-archive", scope: "library", include_incomplete_tasks: false, conflict: "skip", item_conflicts: { "item-a": "keep_both" }, set_target_default_on_success: false, supersedes_preview_seq: 19, supersedes_preview_id: "migration-preview-old", supersedes_revision: "revision-old" } },
       { kind: "library_migration_confirm", payload: { preview_id: "migration-preview-a", revision: "revision-a" } },
       { kind: "library_migration_control", payload: { migration_id: "migration-a", control: "resume" } },
     ];
@@ -1084,7 +1163,18 @@ describe("Mini App identity and actions", () => {
     const backlog = await responseJson<{ requests: Array<{ kind: string; payload: Record<string, unknown> }> }>(await localRequests());
     expect(backlog.requests.map((request) => request.kind)).toEqual(actions.map((action) => action.kind));
     expect(backlog.requests[9]?.payload).toMatchObject({ library_id: "library-archive", category: "Films" });
-    expect(backlog.requests[10]?.payload).toMatchObject({ scope: "library", conflict: "skip", item_conflicts: { "item-a": "keep_both" }, include_incomplete_tasks: false });
+    expect(backlog.requests[10]?.payload).toMatchObject({ library_id: "library-archive" });
+    expect(backlog.requests[10]?.payload).not.toHaveProperty("category");
+    expect(backlog.requests[11]?.payload).toMatchObject({ library_id: "library-archive", category: "" });
+    expect(backlog.requests[12]?.payload).toMatchObject({
+      scope: "library",
+      conflict: "skip",
+      item_conflicts: { "item-a": "keep_both" },
+      include_incomplete_tasks: false,
+      supersedes_preview_seq: 19,
+      supersedes_preview_id: "migration-preview-old",
+      supersedes_revision: "revision-old",
+    });
   });
 
   it("rejects unsafe media-library roots, URLs, migration selections, and controls before persistence", async () => {
@@ -1098,6 +1188,9 @@ describe("Mini App identity and actions", () => {
       { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "selected", item_ids: ["item-a"], item_conflicts: { "item-b": "keep_both" } } },
       { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "library", item_conflicts: { "item-a": "overwrite" } } },
       { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "library", item_conflicts: Object.fromEntries(Array.from({ length: WORKER_MAX_MIGRATION_ITEM_CONFLICTS + 1 }, (_, index) => [`item-${index}`, "skip"])) } },
+      { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "library", supersedes_preview_seq: 5 } },
+      { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "library", supersedes_preview_seq: 0, supersedes_preview_id: "preview-a", supersedes_revision: "revision-a" } },
+      { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "library", supersedes_preview_seq: 5, supersedes_preview_id: "preview-a", supersedes_revision: "  " } },
       { kind: "library_migration_control", payload: { migration_id: "migration-a", control: "delete_all" } },
     ];
 

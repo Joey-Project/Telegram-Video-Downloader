@@ -7343,3 +7343,76 @@ async fn unavailable_saved_category_fails_without_losing_fragments_mock_e2e() {
     drop(queue);
     let _ = fs::remove_dir_all(root);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_blank_download_category_targets_library_root_mock_e2e() {
+    let root = temp_cloud_bot_dir("explicit-blank-category");
+    let archive = root.join("archive");
+    fs::create_dir_all(archive.join("Default")).unwrap();
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config.ensure_runtime_dirs().unwrap();
+    install_mock_media_library_video_tools(&root, &mut config);
+    let queue = Arc::new(QueueManager::open(&config).unwrap());
+    let library = queue
+        .register_video_library(
+            "Archive",
+            &archive,
+            Some(Path::new("Default")),
+            false,
+            false,
+        )
+        .unwrap();
+    let inbox = Arc::new(open_runtime_test_inbox(&config.downloads.video_dir).unwrap());
+    let mut runtime = make_runtime(telegram, config, Arc::clone(&queue), inbox);
+    runtime.bot.job_dispatch.download_semaphore = Arc::new(Semaphore::new(0));
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+
+    for (seq, category, expected_category) in
+        [(9_311, Some(""), None), (9_312, None, Some("Default"))]
+    {
+        let mut payload = serde_json::json!({
+            "url":"https://www.youtube.com/watch?v=abcdefghijk",
+            "library_id":library.id,
+        });
+        if let Some(category) = category {
+            payload["category"] = serde_json::json!(category);
+        }
+        let submitted =
+            run_library_management_test_request(&runtime, seq, "download_submit", payload).await;
+        assert_eq!(
+            submitted.status,
+            InboxStatus::Completed,
+            "{:?}",
+            submitted.error
+        );
+        let result = submitted.result.unwrap();
+        let task_id = result["task_ids"][0].as_str().unwrap();
+        let destination = queue.task_destination(task_id).unwrap().unwrap();
+        assert_eq!(destination.library_id, library.id);
+        assert_eq!(
+            destination.category.as_deref(),
+            expected_category.map(Path::new)
+        );
+        let expected_path = expected_category
+            .map(|category| library.root.join(category))
+            .unwrap_or_else(|| library.root.clone());
+        assert_eq!(
+            result["save_path"],
+            expected_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(result["category"], expected_category.unwrap_or_default());
+        queue.cancel(task_id, 123_456_789).unwrap().unwrap();
+    }
+
+    runtime.bot.job_dispatch.download_semaphore.add_permits(2);
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    stop_fake_telegram_api(shutdown, server).await;
+    drop(runtime);
+    drop(queue);
+    let _ = fs::remove_dir_all(root);
+}

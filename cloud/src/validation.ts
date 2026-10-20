@@ -421,6 +421,7 @@ function parseMigrationPreview(value: Record<string, unknown>): Record<string, u
   if (!onlyKeys(value, [
     "source_library_id", "target_library_id", "scope", "item_ids", "include_incomplete_tasks",
     "conflict", "item_conflicts", "set_target_default_on_success",
+    "supersedes_preview_seq", "supersedes_preview_id", "supersedes_revision",
   ])) {
     throw new HttpError(400, "library_migration_preview payload has an invalid shape");
   }
@@ -472,6 +473,23 @@ function parseMigrationPreview(value: Record<string, unknown>): Record<string, u
   const sourceLibraryId = parseLibraryId(value.source_library_id, "source_library_id");
   const targetLibraryId = parseLibraryId(value.target_library_id, "target_library_id");
   if (sourceLibraryId === targetLibraryId) throw new HttpError(400, "source and target libraries must differ");
+  const supersessionFields = ["supersedes_preview_seq", "supersedes_preview_id", "supersedes_revision"] as const;
+  const hasSupersessionField = supersessionFields.map((field) => Object.hasOwn(value, field));
+  const hasSupersession = hasSupersessionField.some(Boolean);
+  if (hasSupersession && !hasSupersessionField.every(Boolean)) {
+    throw new HttpError(400, "all supersedes preview fields must be provided together");
+  }
+  let supersedesPreviewSeq: number | undefined;
+  let supersedesPreviewId: string | undefined;
+  let supersedesRevision: string | undefined;
+  if (hasSupersession) {
+    if (!Number.isSafeInteger(value.supersedes_preview_seq) || (value.supersedes_preview_seq as number) <= 0) {
+      throw new HttpError(400, "supersedes_preview_seq must be a positive safe integer");
+    }
+    supersedesPreviewSeq = value.supersedes_preview_seq as number;
+    supersedesPreviewId = boundedString(value.supersedes_preview_id, "supersedes_preview_id", 128);
+    supersedesRevision = boundedString(value.supersedes_revision, "supersedes_revision", 256);
+  }
   return {
     source_library_id: sourceLibraryId,
     target_library_id: targetLibraryId,
@@ -481,6 +499,11 @@ function parseMigrationPreview(value: Record<string, unknown>): Record<string, u
     conflict,
     ...(itemConflicts === undefined ? {} : { item_conflicts: itemConflicts }),
     set_target_default_on_success: setTargetDefault,
+    ...(hasSupersession ? {
+      supersedes_preview_seq: supersedesPreviewSeq,
+      supersedes_preview_id: supersedesPreviewId,
+      supersedes_revision: supersedesRevision,
+    } : {}),
   };
 }
 
@@ -501,7 +524,7 @@ function parseDownloadSubmit(value: Record<string, unknown>): Record<string, unk
   return {
     url,
     library_id: parseLibraryId(value.library_id),
-    category: value.category === undefined ? "" : parseRelativeDirectory(value.category),
+    ...(value.category === undefined ? {} : { category: parseRelativeDirectory(value.category) }),
   };
 }
 

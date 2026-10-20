@@ -188,6 +188,8 @@ pub(crate) struct MigrationStatus {
     pub(crate) id: String,
     pub(crate) preview_id: String,
     pub(crate) revision: String,
+    #[serde(default)]
+    pub(crate) created_at: u64,
     pub(crate) status: MigrationRunStatus,
     pub(crate) source_library_id: String,
     pub(crate) target_library_id: String,
@@ -198,6 +200,8 @@ pub(crate) struct MigrationStatus {
     pub(crate) include_incomplete_tasks: bool,
     pub(crate) set_target_default_on_success: bool,
     pub(crate) default_update_applied: bool,
+    #[serde(default)]
+    pub(crate) default_update_resolved: bool,
     pub(crate) total_items: usize,
     pub(crate) completed_items: usize,
     pub(crate) success_count: usize,
@@ -308,6 +312,8 @@ struct PreviewDocument {
     request: MigrationRequest,
     preview: MigrationPreview,
     plan: Vec<MigrationPlannedGroup>,
+    #[serde(default)]
+    superseded_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -331,6 +337,10 @@ struct JobDocument {
     task_commit_acked: Vec<String>,
     #[serde(default)]
     default_update_applied: bool,
+    #[serde(default)]
+    default_update_resolved: bool,
+    #[serde(default)]
+    default_update_expected_revision: Option<u64>,
     #[serde(default)]
     runtime_warnings: Vec<String>,
 }
@@ -472,6 +482,24 @@ impl MigrationEngine {
     }
 
     pub(crate) fn preview(&self, request: &MigrationRequest) -> Result<MigrationPreview> {
+        self.preview_inner(request, None)
+    }
+
+    pub(crate) fn preview_replacing(
+        &self,
+        request: &MigrationRequest,
+        old_preview_id: &str,
+        old_revision: &str,
+    ) -> Result<MigrationPreview> {
+        validate_migration_id(old_preview_id)?;
+        self.preview_inner(request, Some((old_preview_id, old_revision)))
+    }
+
+    fn preview_inner(
+        &self,
+        request: &MigrationRequest,
+        supersedes: Option<(&str, &str)>,
+    ) -> Result<MigrationPreview> {
         validate_request(request)?;
         let snapshot = self.source.migration_scan()?;
         let item_ids = selected_item_ids(request, &snapshot)?;
@@ -503,11 +531,79 @@ impl MigrationEngine {
             request: request.clone(),
             preview: preview.clone(),
             plan,
+            superseded_by: None,
         };
-        let bytes = encode_state(&document)?;
-        self.source
-            .migration_write_state(&preview_state_name(&preview.id), &bytes)?;
-        Ok(preview)
+        self.persist_preview_document(document, supersedes)
+    }
+
+    fn persist_preview_document(
+        &self,
+        document: PreviewDocument,
+        supersedes: Option<(&str, &str)>,
+    ) -> Result<MigrationPreview> {
+        let _state_lock = self.source.migration_state_lock()?;
+        if let Some((old_preview_id, old_revision)) = supersedes {
+            if old_preview_id == document.preview.id {
+                bail!("a refreshed preview must have a new migration ID");
+            }
+            if self
+                .source
+                .migration_read_state(&job_state_name(old_preview_id), MAX_STATE_BYTES)?
+                .is_some()
+            {
+                bail!("a confirmed migration cannot be superseded");
+            }
+            let old_bytes = self
+                .source
+                .migration_read_state(&preview_state_name(old_preview_id), MAX_STATE_BYTES)?
+                .ok_or_else(|| anyhow!("the migration preview being refreshed is unavailable"))?;
+            let mut old: PreviewDocument = decode_state(&old_bytes, "migration preview")?;
+            if old.preview.id != old_preview_id || old.preview.revision != old_revision {
+                bail!("the migration preview being refreshed no longer matches its revision");
+            }
+            self.validate_preview_bindings(&old)?;
+            if old.created_at.saturating_add(24 * 60 * 60) < unix_seconds() {
+                bail!("the migration preview being refreshed has expired");
+            }
+            if let Some(existing_id) = old.superseded_by.as_deref()
+                && let Some(existing_bytes) = self
+                    .source
+                    .migration_read_state(&preview_state_name(existing_id), MAX_STATE_BYTES)?
+            {
+                let existing: PreviewDocument =
+                    decode_state(&existing_bytes, "refreshed migration preview")?;
+                self.validate_preview_bindings(&existing)?;
+                if existing.preview.id == existing_id
+                    && existing.request == document.request
+                    && existing.superseded_by.is_none()
+                    && existing.created_at.saturating_add(24 * 60 * 60) >= unix_seconds()
+                    && self
+                        .source
+                        .migration_read_state(&job_state_name(existing_id), MAX_STATE_BYTES)?
+                        .is_none()
+                {
+                    // The first refresh may have been durably saved while its inbox receipt
+                    // was interrupted. Reuse that exact result for an idempotent replay.
+                    return Ok(existing.preview);
+                }
+                bail!("the migration preview being refreshed is already stale");
+            }
+            old.superseded_by = Some(document.preview.id.clone());
+            self.source
+                .migration_write_state(&preview_state_name(old_preview_id), &encode_state(&old)?)?;
+        }
+        if self
+            .source
+            .migration_read_state(&preview_state_name(&document.preview.id), MAX_STATE_BYTES)?
+            .is_some()
+        {
+            bail!("migration preview ID already exists");
+        }
+        self.source.migration_write_state(
+            &preview_state_name(&document.preview.id),
+            &encode_state(&document)?,
+        )?;
+        Ok(document.preview)
     }
 
     /// Confirms a preview by persisting a queued manifest. It performs no media copy, so the
@@ -533,6 +629,9 @@ impl MigrationEngine {
         let document: PreviewDocument = decode_state(&bytes, "migration preview")?;
         if document.preview.id != preview_id || document.preview.revision != revision {
             bail!("migration preview ID or revision does not match confirmation");
+        }
+        if document.superseded_by.is_some() {
+            bail!("migration preview was superseded; confirm the refreshed preview instead");
         }
         self.validate_preview_bindings(&document)?;
         if document.created_at.saturating_add(24 * 60 * 60) < unix_seconds() {
@@ -598,6 +697,8 @@ impl MigrationEngine {
             task_transfers: Vec::new(),
             task_commit_acked: Vec::new(),
             default_update_applied: false,
+            default_update_resolved: false,
+            default_update_expected_revision: None,
             runtime_warnings: Vec::new(),
         };
         let status = status_from_job(&job);
@@ -1161,12 +1262,53 @@ impl MigrationEngine {
         Ok(job.runtime_context)
     }
 
-    /// Records the idempotent registry update after the caller applies it. The registry uses
-    /// the migration ID as its own durable idempotency key, so a crash between the two writes is
-    /// safe to replay.
-    pub(crate) fn mark_default_update_applied(
+    /// Saves the settings revision observed immediately before a bounded execution step. The
+    /// registry CAS later prevents a user change after this point from being overwritten.
+    pub(crate) fn bind_default_update_expected_revision(
         &self,
         migration_id: &str,
+        expected_revision: u64,
+    ) -> Result<()> {
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        if !job.preview.set_target_default_on_success {
+            bail!("migration did not request a default-library update");
+        }
+        if job.default_update_resolved || job.default_update_applied {
+            return Ok(());
+        }
+        if job.default_update_expected_revision.is_some()
+            || !matches!(
+                job.status,
+                MigrationRunStatus::Queued | MigrationRunStatus::Running
+            )
+        {
+            // The first observed settings revision is the compare-and-set baseline. Never
+            // replace it later in the run: that would hide a user's intervening choice.
+            return Ok(());
+        }
+        job.default_update_expected_revision = Some(expected_revision);
+        self.save_job(&job)?;
+        Ok(())
+    }
+
+    pub(crate) fn default_update_expected_revision(
+        &self,
+        migration_id: &str,
+    ) -> Result<Option<u64>> {
+        let job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        Ok(job.default_update_expected_revision)
+    }
+
+    /// Records either a successful settings CAS or a safe skip caused by a newer settings
+    /// revision. Both outcomes are final so restart cannot apply the request later.
+    pub(crate) fn mark_default_update_resolved(
+        &self,
+        migration_id: &str,
+        applied: bool,
+        warning: Option<&str>,
     ) -> Result<MigrationStatus> {
         let _state_lock = self.source.migration_state_lock()?;
         let mut job = self.load_job(migration_id)?;
@@ -1175,8 +1317,12 @@ impl MigrationEngine {
         {
             bail!("migration is not eligible for its requested default-library update");
         }
-        if !job.default_update_applied {
-            job.default_update_applied = true;
+        if !job.default_update_resolved {
+            job.default_update_applied = applied;
+            job.default_update_resolved = true;
+            if let Some(warning) = warning {
+                record_runtime_warning(&mut job, warning);
+            }
             self.save_job(&job)?;
         }
         Ok(status_from_job(&job))
@@ -1996,6 +2142,7 @@ impl MigrationEngine {
             request: job.request.clone(),
             preview: job.preview.clone(),
             plan: job.groups.iter().map(|group| group.plan.clone()).collect(),
+            superseded_by: None,
         };
         self.revalidate_preview(&document, output_lease)
     }
@@ -2258,6 +2405,7 @@ fn status_from_job(job: &JobDocument) -> MigrationStatus {
         id: job.preview.id.clone(),
         preview_id: job.preview.id.clone(),
         revision: job.preview.revision.clone(),
+        created_at: job.created_at,
         status: job.status,
         source_library_id: job.preview.source_library_id.clone(),
         target_library_id: job.preview.target_library_id.clone(),
@@ -2267,6 +2415,7 @@ fn status_from_job(job: &JobDocument) -> MigrationStatus {
         include_incomplete_tasks: job.preview.include_incomplete_tasks,
         set_target_default_on_success: job.preview.set_target_default_on_success,
         default_update_applied: job.default_update_applied,
+        default_update_resolved: job.default_update_resolved || job.default_update_applied,
         total_items: job.groups.len(),
         completed_items,
         success_count,

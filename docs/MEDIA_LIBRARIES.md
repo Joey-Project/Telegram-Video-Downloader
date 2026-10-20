@@ -13,6 +13,9 @@ One library is the default. Changing the default library or category affects fut
 Telegram downloads. Existing tasks retain their saved library and category. The `/file` library
 selector includes historical roots; **Download here** submits a video or collection to the selected
 library/category. PDF destinations retain their existing independent configuration.
+An explicitly empty category selects the library root; an omitted category uses that library's
+configured default. Removing a video registration that shares the PDF root retains PDF queue
+ownership until the process releases the PDF store.
 
 The settings page distinguishes applied local settings from requests waiting for the desktop.
 An offline snapshot is a last known view, not evidence that a requested setting was applied.
@@ -28,6 +31,8 @@ Choose the entire source library or selected media, select the destination libra
 the preview before confirming. Relative categories and collection structure are preserved.
 Video, NFO, danmaku, subtitle, and cover associations move as a bundle. Conflicts default to
 **Skip**; **Keep both** reserves a new bundle name without replacing existing target files.
+Refreshing conflict choices durably supersedes the exact earlier preview. Reloading the Mini App
+cannot make that earlier revision executable again.
 
 The separate **include unfinished tasks** checkbox is shown only when the scope affects such
 tasks and starts unchecked. When checked for a partially selected unfinished collection task,
@@ -60,11 +65,18 @@ it does not promise atomic rollback of an entire batch.
 leaves uncompleted source data available. **Retry failed** retries failed work. The Mini App shows
 actual source and destination locations; Telegram edits one migration status message. Ambiguous
 Telegram delivery is retained without automatically sending a duplicate message.
+Task-transfer failures also expose retry and stop controls, even when no media bundle failed.
+Startup completes or aborts a stopped migration's pending queue handoffs so the affected tasks
+do not remain blocked by an orphaned transfer.
 
 An independent unchecked option can set the target as default after success. That update is
 recorded once so crash recovery cannot overwrite a later user choice. Migration manifests are
 kept in the source library's private metadata directory, independently of cloud receipt retention.
 A cloud database epoch change pauses automatic recovery until a new authorized resume.
+The default update is conditional on the recorded settings revision; a newer settings change
+causes it to be skipped durably. Cloud snapshots include at most 32 migrations, prioritizing active
+and recoverable jobs, then recent completed jobs. The UI reports omitted entries; local manifests
+remain available for recovery.
 
 ## Storage and rollout
 

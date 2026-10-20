@@ -42,9 +42,13 @@ export function migrationConflictChoicesChanged(original, draft) {
   return leftKeys.length !== rightKeys.length || leftKeys.some((key, index) => key !== rightKeys[index] || left[key] !== right[key]);
 }
 
-export function buildMigrationPreviewRefreshPayload(result, itemConflicts) {
+export function buildMigrationPreviewRefreshPayload(result, itemConflicts, supersedes) {
   if (!isRecord(result) || !["library", "selected"].includes(result.scope)) return null;
   if (typeof result.source_library_id !== "string" || typeof result.target_library_id !== "string") return null;
+  if (!isRecord(supersedes)
+    || !Number.isSafeInteger(supersedes.seq) || supersedes.seq <= 0
+    || typeof supersedes.id !== "string" || !supersedes.id.trim()
+    || typeof supersedes.revision !== "string" || !supersedes.revision.trim()) return null;
   const items = Array.isArray(result.items) ? result.items : [];
   const conflictIds = new Set(items.filter((item) => item?.conflict === true).map((item) => item.item_id).filter((id) => typeof id === "string"));
   const normalized = normalizeMigrationItemConflicts(itemConflicts);
@@ -56,6 +60,9 @@ export function buildMigrationPreviewRefreshPayload(result, itemConflicts) {
     include_incomplete_tasks: result.include_incomplete_tasks === true,
     conflict: result.conflict === "keep_both" ? "keep_both" : "skip",
     set_target_default_on_success: result.set_target_default_on_success === true,
+    supersedes_preview_seq: supersedes.seq,
+    supersedes_preview_id: supersedes.id,
+    supersedes_revision: supersedes.revision,
   };
   if (result.scope === "selected") {
     if (!Array.isArray(result.item_ids) || result.item_ids.length === 0) return null;
@@ -78,4 +85,28 @@ export function migrationRefreshMatches(result, expected) {
   const expectedIds = expected.scope === "selected" && Array.isArray(expected.item_ids) ? [...expected.item_ids].sort() : [];
   if (resultIds.length !== expectedIds.length || resultIds.some((id, index) => id !== expectedIds[index])) return false;
   return !migrationConflictChoicesChanged(result.item_conflicts, expected.item_conflicts);
+}
+
+export function migrationControlActions(migration) {
+  if (!isRecord(migration)) return [];
+  const status = migration.status;
+  const active = status === "queued" || status === "running";
+  const paused = status === "paused";
+  const terminalWithTaskError = status === "partial" || status === "failed";
+  const hasTaskTransferError = Array.isArray(migration.task_transfers)
+    && migration.task_transfers.some((transfer) => isRecord(transfer)
+      && typeof transfer.error === "string" && transfer.error.trim().length > 0);
+  const hasFailedMedia = Number.isSafeInteger(migration.failed_count) && migration.failed_count > 0;
+  const actions = [];
+  if (active) actions.push("pause");
+  if (paused) actions.push("resume");
+  if (active || paused || terminalWithTaskError && hasTaskTransferError) actions.push("stop_remaining");
+  if (terminalWithTaskError && (hasFailedMedia || hasTaskTransferError)) actions.push("retry_failed");
+  return actions;
+}
+
+export function migrationHistoryNotice(omittedCount) {
+  if (!Number.isSafeInteger(omittedCount) || omittedCount <= 0) return "";
+  const noun = omittedCount === 1 ? "migration is" : "migrations are";
+  return `${omittedCount} additional ${noun} not included in this view; local recovery records are retained.`;
 }
