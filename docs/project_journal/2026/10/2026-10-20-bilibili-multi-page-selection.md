@@ -22,6 +22,7 @@ superseded_by:
 - `--replay-message` reports video links that require this Telegram-only selection prompt instead of starting an ambiguous download.
 - AV links resolve their BV ID before checking collection membership. Failed Bilibili short-link normalization stops the task rather than falling through to an unconfirmed download.
 - Video-page selection persistence reports File Provider retries so the task does not appear to vanish while its keyboard is pending.
+- Failed short-link tasks retry their terminal status write if File Provider temporarily blocks the queue.
 - README describes the new Telegram prompt. No live Telegram or Bilibili smoke test has been run.
 
 ## Evidence
@@ -30,3 +31,4 @@ superseded_by:
 - `cargo test membership_probe_migrates_legacy_cookie_before_request` passed using a local mock HTTP response.
 - `cargo test video_page_prompt_detection_includes_legacy_aid_and_replay_jobs` passed.
 - `cargo test video_page_selection_keeps_file_provider_retry_notice_visible` passed.
+- `cargo test failed_task_state_retries_file_provider_write_errors` passed.

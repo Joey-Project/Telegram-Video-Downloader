@@ -7160,15 +7160,25 @@ fn queue_or_prompt_job(
                                 error = %redact_sensitive_text(&format!("{error:#}")),
                                 "Bilibili short-link normalization failed; refusing to start an ambiguous download"
                             );
-                            let _ = context.queue.fail_if_generation(
+                            let status_error = fail_task_if_generation_with_retry_delay(
+                                &context.queue,
                                 &task_id,
                                 generation,
                                 truncate(&redact_sensitive_text(&format!("{error:#}"))),
-                            );
+                                context.queue_start_retry_delay,
+                            )
+                            .await;
+                            if let Err(status_error) = status_error {
+                                warn!(
+                                    task_id,
+                                    error = %redact_sensitive_text(&format!("{status_error:#}")),
+                                    "failed to persist Bilibili short-link failure state"
+                                );
+                            }
                             send_or_log(
                                 &context.telegram,
                                 chat_id,
-                                "Could not resolve this Bilibili short link, so no download was started. Please retry the link.".to_string(),
+                                "Could not resolve this Bilibili short link, so no download was started. Its queue status is being saved; check /queue before resending.".to_string(),
                             )
                             .await;
                             return;
@@ -7177,15 +7187,25 @@ fn queue_or_prompt_job(
                 }
                 Err(err) => {
                     warn!(error = %err, "Bilibili short-link normalization could not run because the probe queue closed");
-                    let _ = context.queue.fail_if_generation(
+                    let status_error = fail_task_if_generation_with_retry_delay(
+                        &context.queue,
                         &task_id,
                         generation,
                         truncate(&redact_sensitive_text(&format!("{err:#}"))),
-                    );
+                        context.queue_start_retry_delay,
+                    )
+                    .await;
+                    if let Err(status_error) = status_error {
+                        warn!(
+                            task_id,
+                            error = %redact_sensitive_text(&format!("{status_error:#}")),
+                            "failed to persist Bilibili short-link failure state"
+                        );
+                    }
                     send_or_log(
                         &context.telegram,
                         chat_id,
-                        "Could not resolve this Bilibili short link, so no download was started. Please retry the link.".to_string(),
+                        "Could not resolve this Bilibili short link, so no download was started. Its queue status is being saved; check /queue before resending.".to_string(),
                     )
                     .await;
                     return;
@@ -11862,6 +11882,34 @@ async fn task_if_generation_with_retry_delay(
                 tokio::time::sleep(retry_delay).await;
             }
             Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn fail_task_if_generation_with_retry_delay(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    message: String,
+    retry_delay: Duration,
+) -> Result<Option<TaskRecord>> {
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.fail_if_generation(task_id, generation, message.clone()) {
+            Ok(task) => return Ok(task),
+            Err(error) if is_file_provider_access_error(&error) => {
+                if !reported_file_provider_error {
+                    warn!(
+                        task_id,
+                        generation,
+                        error = %format!("{error:#}"),
+                        "File Provider blocked failed-task persistence; retrying"
+                    );
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -18435,6 +18483,52 @@ mod tests {
         assert!(tasks.iter().any(|task| task.id == "u941-0"));
         assert!(tasks.iter().any(|task| task.id == "u941-1"));
 
+        drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
+    async fn failed_task_state_retries_file_provider_write_errors() {
+        let queue_root = temp_main_test_dir("file-provider-failed-task-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, provider)
+            .expect("queue should open with mocked File Provider access");
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    "file-provider-failed-task".to_string(),
+                    1,
+                    2,
+                    123_456_789,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://example.invalid/video".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        file_provider.fail_next_file_provider_write("temporary queue coordination failure");
+
+        let failed = fail_task_if_generation_with_retry_delay(
+            &queue,
+            "file-provider-failed-task",
+            0,
+            "short-link resolution failed".to_string(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("failed-task persistence should recover")
+        .expect("task generation should still match");
+
+        assert_eq!(failed.status, TaskStatus::Failed);
         drop(queue);
         let _ = fs::remove_dir_all(queue_root);
     }
