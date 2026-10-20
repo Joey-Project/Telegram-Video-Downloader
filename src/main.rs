@@ -179,7 +179,10 @@ struct PendingCollectionDetails {
 #[derive(Debug, Clone)]
 enum BilibiliSelectionPrompt {
     SeasonMedia,
-    UgcMembership(UgcCollectionReference),
+    VideoPages {
+        page: Option<u32>,
+        collection: Option<UgcCollectionReference>,
+    },
     UgcCollection,
 }
 
@@ -7371,16 +7374,26 @@ async fn bilibili_ugc_selection_prompt(
         return Ok(None);
     }
 
+    if bilibili_bvid_from_url(url).is_none() {
+        return Ok(None);
+    }
+
     sync_bilibili_rust_credentials(config).await?;
-    bilibili_ugc_membership_prompt(
+    let page = selection.and_then(|selection| match selection {
+        BilibiliSelection::Page(page) => Some(page),
+        _ => None,
+    });
+    bilibili_video_pages_prompt(
+        page,
         bilibili_core::resolve_video_collection_membership(config, url).await,
     )
 }
 
-fn bilibili_ugc_membership_prompt(
+fn bilibili_video_pages_prompt(
+    page: Option<u32>,
     membership: Result<Option<UgcCollectionReference>>,
 ) -> Result<Option<BilibiliSelectionPrompt>> {
-    membership.map(|reference| reference.map(BilibiliSelectionPrompt::UgcMembership))
+    membership.map(|collection| Some(BilibiliSelectionPrompt::VideoPages { page, collection }))
 }
 
 fn bilibili_membership_probe_failure_message() -> &'static str {
@@ -7437,10 +7450,8 @@ async fn prompt_bilibili_selection(
     let telegram = &context.telegram;
     let queue = &context.queue;
     let retry_delay = context.queue_start_retry_delay;
-    let suppress_extra_file_provider_notice = matches!(
-        &prompt,
-        BilibiliSelectionPrompt::UgcCollection | BilibiliSelectionPrompt::UgcMembership(_)
-    );
+    let suppress_extra_file_provider_notice =
+        !matches!(&prompt, BilibiliSelectionPrompt::SeasonMedia);
     let token = next_bilibili_selection_callback_token(job_id);
     let mut reported_file_provider_error = false;
     let generation = loop {
@@ -9136,6 +9147,8 @@ enum BilibiliSelectionCallbackAction {
     Current,
     Latest,
     All,
+    AllPages,
+    Collection,
     Cancel,
 }
 
@@ -9151,6 +9164,8 @@ fn parse_bilibili_selection_callback_data(data: &str) -> Option<BilibiliSelectio
         "current" => BilibiliSelectionCallbackAction::Current,
         "latest" => BilibiliSelectionCallbackAction::Latest,
         "all" => BilibiliSelectionCallbackAction::All,
+        "all_pages" => BilibiliSelectionCallbackAction::AllPages,
+        "collection" => BilibiliSelectionCallbackAction::Collection,
         "cancel" => BilibiliSelectionCallbackAction::Cancel,
         _ => return None,
     };
@@ -9187,18 +9202,29 @@ fn bilibili_selection_keyboard(
                 web_app: None,
             },
         ]],
-        BilibiliSelectionPrompt::UgcMembership(_) => vec![vec![
-            InlineKeyboardButton {
-                text: "Current video".to_string(),
-                callback_data: bilibili_selection_callback_data(token, "current"),
-                web_app: None,
-            },
-            InlineKeyboardButton {
-                text: "Entire collection".to_string(),
-                callback_data: bilibili_selection_callback_data(token, "all"),
-                web_app: None,
-            },
-        ]],
+        BilibiliSelectionPrompt::VideoPages { page, collection } => {
+            let single_page_label = format!("P{} only", page.unwrap_or(1));
+            let mut rows = vec![vec![
+                InlineKeyboardButton {
+                    text: single_page_label,
+                    callback_data: bilibili_selection_callback_data(token, "current"),
+                    web_app: None,
+                },
+                InlineKeyboardButton {
+                    text: "All P".to_string(),
+                    callback_data: bilibili_selection_callback_data(token, "all_pages"),
+                    web_app: None,
+                },
+            ]];
+            if collection.is_some() {
+                rows.push(vec![InlineKeyboardButton {
+                    text: "Entire collection".to_string(),
+                    callback_data: bilibili_selection_callback_data(token, "collection"),
+                    web_app: None,
+                }]);
+            }
+            rows
+        }
         BilibiliSelectionPrompt::UgcCollection => vec![vec![InlineKeyboardButton {
             text: "Entire collection".to_string(),
             callback_data: bilibili_selection_callback_data(token, "all"),
@@ -9218,11 +9244,19 @@ fn bilibili_selection_message(job_id: u64, prompt: &BilibiliSelectionPrompt) -> 
         BilibiliSelectionPrompt::SeasonMedia => {
             format!("Bilibili season/media link queued as job #{job_id}. Choose what to download:")
         }
-        BilibiliSelectionPrompt::UgcMembership(reference) => format!(
-            "Bilibili UGC collection detected for job #{job_id}: {} ({} items). Choose what to download:",
-            truncate(&reference.title),
-            reference.item_count
-        ),
+        BilibiliSelectionPrompt::VideoPages { page, collection } => {
+            let page_label = format!("P{}", page.unwrap_or(1));
+            match collection {
+                Some(reference) => format!(
+                    "Bilibili video belongs to collection {} ({} items). Choose {page_label}, all P, or the entire collection for job #{job_id}:",
+                    truncate(&reference.title),
+                    reference.item_count
+                ),
+                None => format!(
+                    "Bilibili video queued as job #{job_id}. Choose {page_label} only or all P:"
+                ),
+            }
+        }
         BilibiliSelectionPrompt::UgcCollection => {
             format!(
                 "Bilibili collection link queued as job #{job_id}. Download the entire collection?"
@@ -9245,12 +9279,18 @@ fn apply_bilibili_selection(
             set_bilibili_selection(job, BilibiliSelection::All),
             "all episodes",
         )),
-        (BilibiliSelectionPrompt::UgcMembership(_), BilibiliSelectionCallbackAction::Current) => {
-            Some((confirm_current_bilibili_video(job), "current video"))
+        (BilibiliSelectionPrompt::VideoPages { .. }, BilibiliSelectionCallbackAction::Current) => {
+            Some((confirm_current_bilibili_video(job), "single P"))
+        }
+        (BilibiliSelectionPrompt::VideoPages { .. }, BilibiliSelectionCallbackAction::AllPages) => {
+            Some((set_bilibili_selection(job, BilibiliSelection::All), "all P"))
         }
         (
-            BilibiliSelectionPrompt::UgcMembership(reference),
-            BilibiliSelectionCallbackAction::All,
+            BilibiliSelectionPrompt::VideoPages {
+                collection: Some(reference),
+                ..
+            },
+            BilibiliSelectionCallbackAction::Collection,
         ) => Some((
             JobRequest::Bilibili {
                 url: bilibili_core::ugc_collection_url(reference),
@@ -19626,6 +19666,20 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_bilibili_selection_callback_data("bsel:000000000000002a:all_pages"),
+            Some(BilibiliSelectionCallback {
+                token: 42,
+                action: BilibiliSelectionCallbackAction::AllPages
+            })
+        );
+        assert_eq!(
+            parse_bilibili_selection_callback_data("bsel:000000000000002a:collection"),
+            Some(BilibiliSelectionCallback {
+                token: 42,
+                action: BilibiliSelectionCallbackAction::Collection
+            })
+        );
+        assert_eq!(
             parse_bilibili_selection_callback_data("bsel:000000000000002a:current"),
             Some(BilibiliSelectionCallback {
                 token: 42,
@@ -19700,7 +19754,10 @@ mod tests {
             cover_url: None,
             item_count: 37,
         };
-        let membership_prompt = BilibiliSelectionPrompt::UgcMembership(reference.clone());
+        let membership_prompt = BilibiliSelectionPrompt::VideoPages {
+            page: Some(2),
+            collection: Some(reference.clone()),
+        };
         let membership_keyboard = bilibili_selection_keyboard(42, &membership_prompt);
         let membership_data = membership_keyboard
             .inline_keyboard
@@ -19712,10 +19769,13 @@ mod tests {
             membership_data,
             vec![
                 "bsel:000000000000002a:current",
-                "bsel:000000000000002a:all",
+                "bsel:000000000000002a:all_pages",
+                "bsel:000000000000002a:collection",
                 "bsel:000000000000002a:cancel"
             ]
         );
+        assert_eq!(membership_keyboard.inline_keyboard[0][0].text, "P2 only");
+        assert_eq!(membership_keyboard.inline_keyboard[0][1].text, "All P");
         assert_eq!(
             apply_bilibili_selection(
                 JobRequest::Bilibili {
@@ -19731,7 +19791,7 @@ mod tests {
                     url: "https://www.bilibili.com/video/BV12TRrBcEP8?p=2".to_string(),
                     selection: Some(BilibiliSelection::CurrentPage(2)),
                 },
-                "current video"
+                "single P"
             )
         );
         assert_eq!(
@@ -19741,7 +19801,7 @@ mod tests {
                     selection: None,
                 },
                 &membership_prompt,
-                BilibiliSelectionCallbackAction::All,
+                BilibiliSelectionCallbackAction::Collection,
             )
             .expect("entire collection selection should be available"),
             (
@@ -19753,6 +19813,41 @@ mod tests {
                 "entire collection"
             )
         );
+
+        assert_eq!(
+            apply_bilibili_selection(
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV12TRrBcEP8?p=2".to_string(),
+                    selection: Some(BilibiliSelection::Page(2)),
+                },
+                &membership_prompt,
+                BilibiliSelectionCallbackAction::AllPages,
+            )
+            .expect("all pages should be available for a selected page"),
+            (
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV12TRrBcEP8?p=2".to_string(),
+                    selection: Some(BilibiliSelection::All),
+                },
+                "all P"
+            )
+        );
+
+        let standalone_prompt = BilibiliSelectionPrompt::VideoPages {
+            page: None,
+            collection: None,
+        };
+        let standalone_keyboard = bilibili_selection_keyboard(42, &standalone_prompt);
+        assert_eq!(standalone_keyboard.inline_keyboard[0][0].text, "P1 only");
+        assert_eq!(standalone_keyboard.inline_keyboard[0][1].text, "All P");
+        assert!(matches!(
+            bilibili_video_pages_prompt(None, Ok(None))
+                .expect("a non-collection video should still show the page choice"),
+            Some(BilibiliSelectionPrompt::VideoPages {
+                page: None,
+                collection: None,
+            })
+        ));
 
         let direct_prompt = BilibiliSelectionPrompt::UgcCollection;
         let direct_keyboard = bilibili_selection_keyboard(42, &direct_prompt);
@@ -19770,9 +19865,12 @@ mod tests {
 
     #[test]
     fn membership_probe_error_does_not_fall_back_to_a_single_video() {
-        let error = bilibili_ugc_membership_prompt(Err(anyhow!(
-            "HTTP status client error (412 Precondition Failed)"
-        )))
+        let error = bilibili_video_pages_prompt(
+            None,
+            Err(anyhow!(
+                "HTTP status client error (412 Precondition Failed)"
+            )),
+        )
         .expect_err("a failed membership probe must block automatic download");
 
         assert!(format!("{error:#}").contains("412 Precondition Failed"));
@@ -19853,7 +19951,10 @@ mod tests {
 
         assert!(matches!(
             prompt,
-            BilibiliSelectionPrompt::UgcMembership(reference) if reference.id == 167_822
+            BilibiliSelectionPrompt::VideoPages {
+                collection: Some(reference),
+                ..
+            } if reference.id == 167_822
         ));
         assert!(credential_file.exists());
         assert!(
