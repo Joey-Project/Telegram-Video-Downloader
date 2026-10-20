@@ -102,12 +102,14 @@ superseded_by: ""
 | 范围 | 最终结果 |
 | --- | --- |
 | Rust 1.99.1 格式及差异空白检查 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
-| Rust 全量测试 | `cargo test --all-targets --locked --offline --quiet`：1,120 通过、0 失败、16 个既有忽略项 |
-| Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline --bin telegram-video-downloader` 通过 |
-| Cloud / Node 25.8.2 | 类型检查通过；112 项测试通过；Wrangler 4.149.0 dry-run 通过，39 个静态资源 |
+| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,124 通过、0 失败、16 个既有忽略项 |
+| Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline` 通过 |
+| Cloud / Node 25.8.2 | 类型检查通过；120 项测试通过；Wrangler 4.149.0 dry-run 通过，41 个静态资源 |
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
-- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。本轮回归日志保留于 `.codex-tmp/mls01-review2/`，包括 `full-tests.log`、`snapshot-final-focused.log`、`reporter-focused.log`、`summary-101-focused.log` 和 `cloud-ui-gates.md`。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
+- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 和 `.codex-tmp/mls01-review3/`，后者包含最新队列、重启恢复与生产迁移渲染回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
+- 最新 Rust 验证日志为 `mls01-review3/full-tests-final.log`、`clippy-final.log` 和
+  `build-final.log`；Cloud 的测试、类型检查和 dry-run 日志也在 `mls01-review3/` 下。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
 - 大片段恢复用例使用 8–16 MiB 的合成文件；独立运行整体耗时约 15 秒。迁移完成等待设为明确的 60 秒上限，以容纳全量测试共享输出槽及调试模式校验开销，并保留超时状态诊断。全量测试随后通过；未改动生产迁移等待逻辑。
 - 测试使用临时本地目录、合成媒体/片段、fake 下载工具及 mock Telegram/cloud。恢复测试通过重建 runtime/queue 和持久状态重放模拟中断；未向真实 Telegram/Cloudflare 发送请求，未操作生产媒体或终止部署进程。
@@ -128,7 +130,7 @@ superseded_by: ""
 - The new CAS E2E exposed a real missing-directory creation error. The rooted filesystem now
   receives an absolute child path; nested missing-root creation has a positive regression. The
   original E2E still requests directory creation rather than pre-creating its fixture.
-- All 16 feature mock E2Es run by default through the existing Rust CI command. The three added
+- The original 16 feature mock E2Es run by default through the existing Rust CI command. The three added
   recovery cases are `stopped_migration_reconciles_pending_task_transfer_after_restart`,
   `migration_default_update_preserves_a_newer_user_library_choice`, and
   `refreshed_migration_preview_stales_old_inbox_receipt_and_confirmation`.
@@ -151,6 +153,17 @@ superseded_by: ""
 - The HTTP state-reporter regression compares the complete cached item JSON with only presence
   changed to unavailable, keeping revision and scan time intact; recovery must restore the
   original item hash. Its expected digest uses the same JSON representation as the receiver.
+- Migration rendering preserves the backend's active/recoverable priority before applying its
+  display limit. Production markup is exercised for active, paused, completed, stopped, failed,
+  and partial states so a missing status binding cannot abort the page.
+- Terminal migration status does not permit removing participating libraries while queue handoffs
+  remain pending. The source manifest stays discoverable through restart and acknowledgement.
+- `terminal_migration_keeps_library_registered_until_queue_handoff_ack_after_restart` persists
+  target installation and engine completion with a pending queue token, reopens the runtime,
+  checks the handoff-specific removal refusal, then completes recovery and removes the source
+  registration. The moved task remains failed at its target without an automatic retry.
+- Default-library changes require an available, identity-matched registered root; rejecting a
+  replacement preserves the selected default, settings revision, and original queue data.
 
 ## Isolated Cloudflare and Rust E2E at `08f56d4`
 

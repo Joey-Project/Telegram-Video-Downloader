@@ -27,6 +27,7 @@ import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotR
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
 import { MAX_MIGRATION_TASK_ROWS, incompleteMigrationTaskSummary } from "../public/file/migration-task-summary.js";
+import { MAX_VISIBLE_MIGRATIONS, renderMigrationHistory } from "../public/file/migration-rendering.js";
 import { canOperateOnMediaLibrary, resolveMediaLibrary } from "../public/file/library-view.js";
 import {
   canonicalJson,
@@ -308,6 +309,68 @@ describe("migration progress controls and history notice", () => {
     expect(migrationHistoryNotice(-1)).toBe("");
     expect(migrationHistoryNotice(32)).toBe("32 additional migrations are not included in this view; local recovery records are retained.");
     expect(migrationHistoryNotice(1)).toBe("1 additional migration is not included in this view; local recovery records are retained.");
+  });
+});
+
+describe("migration history rendering", () => {
+  const libraries = [
+    { id: "source", name: "Source <Library>" },
+    { id: "target", name: "Target & Library" },
+  ];
+
+  it.each([
+    ["queued", true, ["pause", "stop_remaining"]],
+    ["running", true, ["pause", "stop_remaining"]],
+    ["paused", true, ["resume", "stop_remaining"]],
+    ["completed", false, []],
+    ["stopped", false, []],
+    ["failed", false, ["retry_failed"]],
+    ["partial", false, ["stop_remaining", "retry_failed"]],
+  ] as const)("renders the production card for wire status %s", (status, pending, controls) => {
+    const migration = {
+      id: `${status}-migration`,
+      status,
+      source_library_id: "source",
+      target_library_id: "target",
+      failed_count: status === "failed" ? 1 : 0,
+      task_transfers: status === "partial" ? [{ error: "Task handoff needs recovery" }] : [],
+    };
+    const markup = renderMigrationHistory({
+      migrations: [migration],
+      libraries,
+      libraryId: "source",
+    });
+
+    expect(markup).toContain("Library migration");
+    expect(markup).toContain("Source &lt;Library&gt; → Target &amp; Library");
+    expect(markup).toContain(`state-pill${pending ? " pending" : ""}`);
+    for (const control of controls) expect(markup).toContain(`data-migration-control="${control}"`);
+    if (controls.length === 0) expect(markup).not.toContain("data-migration-control=");
+  });
+
+  it("renders the first backend-prioritized migrations before older history", () => {
+    expect(MAX_VISIBLE_MIGRATIONS).toBe(8);
+    const migrations = [
+      {
+        id: "prioritized-running",
+        status: "running",
+        source_library_id: "source",
+        target_library_id: "target",
+      },
+      ...Array.from({ length: 8 }, (_, index) => ({
+        id: `historical-${index}`,
+        status: "completed",
+        source_library_id: "source",
+        target_library_id: "target",
+        items: [{ item_id: `history-${index}`, status: "complete" }],
+      })),
+    ];
+    const markup = renderMigrationHistory({ migrations, libraries, libraryId: "source" });
+
+    expect(markup).toContain('data-migration-id="prioritized-running"');
+    expect(markup).toContain("history-0");
+    expect(markup).not.toContain("history-7");
+    expect(markup.indexOf('data-migration-id="prioritized-running"')).toBeLessThan(markup.indexOf("history-0"));
   });
 });
 

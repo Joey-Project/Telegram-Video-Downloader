@@ -5,7 +5,7 @@ import { HttpResponseError } from "./http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limit.js";
 import { MAX_MANUAL_TARGET_OPTIONS, searchPresentManualTargets } from "./manual-target-picker.js";
-import { MAX_MIGRATION_ITEM_CONFLICTS, buildMigrationPreviewRefreshPayload, migrationConflictChoicesChanged, migrationConflictPolicy, migrationControlActions, migrationHistoryNotice, migrationRefreshMatches, normalizeMigrationItemConflicts, setMigrationConflictChoice } from "./migration-conflicts.js";
+import { MAX_MIGRATION_ITEM_CONFLICTS, buildMigrationPreviewRefreshPayload, migrationConflictChoicesChanged, migrationConflictPolicy, migrationRefreshMatches, normalizeMigrationItemConflicts, setMigrationConflictChoice } from "./migration-conflicts.js";
 import { submitLegacyFileImport } from "./legacy-file-import.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
 import { sourceIdUrl } from "./source-links.js";
@@ -13,6 +13,7 @@ import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
 import { validateTargetRelativeDirectory } from "./target-directory.js";
 import { boundedFolderSuggestions, canOperateOnMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary, statusOf } from "./library-view.js";
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
+import { renderMigrationHistory } from "./migration-rendering.js";
 
 const API = "/api";
 const CACHE_KEY = "file-manager.snapshot.v1";
@@ -901,63 +902,16 @@ function renderMigrationPreview(operation) {
   return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Category and collection structure will be preserved. Default conflict choice: ${escapeHtml(result.conflict ?? "skip")}.</p>${offlineMessage}${refreshMessage}${staleMessage}${supersededMessage}${conflictLimit}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${paths || `<div class="preview-line"><span>No media items were found in this selection.</span></div>`}${more}</div><div class="stack-actions">${refreshButton}<button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button></div></article>`;
 }
 
-function renderMigrationProgress(migration) {
-  const status = String(migration.status ?? "unknown");
-  const active = ["queued", "running"].includes(status);
-  const items = Array.isArray(migration.items) ? migration.items : [];
-  const resultRows = items.slice(0, 40).map((item) => {
-    const itemStatus = String(item.status ?? "unknown");
-    const outcome = itemStatus === "complete" ? "Moved · now at target" : itemStatus === "skipped" ? "Skipped · source retained" : itemStatus === "failed" ? "Failed · source retained" : statusText(itemStatus);
-    const source = item.source_path ?? "Source path unavailable";
-    const target = item.target_path ?? "Target path unavailable";
-    const detail = `${source} → ${target}${item.error ? ` · ${item.error}` : ""}`;
-    return `<div class="preview-line"><span>${escapeHtml(item.item_id ?? "Selected item")}<br><span class="field-hint">${escapeHtml(detail)}</span></span><strong class="${itemStatus === "failed" ? "skip" : itemStatus === "complete" ? "move" : ""}">${escapeHtml(outcome)}</strong></div>`;
-  }).join("");
-  const progress = `${Number(migration.completed_items ?? 0).toLocaleString()}/${Number(migration.total_items ?? 0).toLocaleString()} items · ${Number(migration.completed_files ?? 0).toLocaleString()}/${Number(migration.total_files ?? 0).toLocaleString()} files · ${formatBytes(migration.copied_bytes)} / ${formatBytes(migration.total_bytes)}`;
-  const counts = `${Number(migration.success_count ?? 0)} moved · ${Number(migration.skipped_count ?? 0)} skipped · ${Number(migration.failed_count ?? 0)} failed`;
-  const transfers = Array.isArray(migration.task_transfers) ? migration.task_transfers : [];
-  const transferRows = transfers.slice(0, 20).map((transfer, index) => {
-    const files = `${Number(transfer.completed_files ?? 0).toLocaleString()}/${Number(transfer.total_files ?? 0).toLocaleString()} staged files copied`;
-    const transferError = typeof transfer.error === "string" ? transfer.error.slice(0, 240) : "";
-    const stateText = transferError
-      ? `Needs attention · ${transferError}`
-      : transfer.commit_acked === true
-        ? "Task handoff complete"
-        : transfer.copy_complete === true
-          ? "Files copied · finishing task handoff"
-          : "Copying staged task data";
-    return `<div class="preview-line"><span>Unfinished task ${index + 1}<br><span class="field-hint">${escapeHtml(files)}</span></span><strong class="${transferError ? "skip" : transfer.commit_acked === true ? "move" : ""}">${escapeHtml(stateText)}</strong></div>`;
-  }).join("");
-  const transferMore = transfers.length > 20 ? `<p class="field-hint">Showing 20 of ${transfers.length} unfinished task handoffs.</p>` : "";
-  const incompleteTaskCount = Number(migration.incomplete_task_count ?? 0);
-  const taskHandoffStatus = incompleteTaskCount > 0 && transfers.length === 0
-    ? `<div class="preview-line"><span>Unfinished task handoffs<br><span class="field-hint">${escapeHtml(migration.awaiting_task_plans === true ? "Preparing the task transfer plans." : "Waiting for task transfer details.")}</span></span><strong>${incompleteTaskCount.toLocaleString()} task${incompleteTaskCount === 1 ? "" : "s"}</strong></div>`
-    : "";
-  const retryLabel = Number(migration.failed_count ?? 0) > 0 ? "Retry failed items" : "Retry task handoffs";
-  const controlLabels = {
-    pause: "Pause",
-    resume: "Resume",
-    stop_remaining: "Stop remaining",
-    retry_failed: retryLabel,
-  };
-  const controls = migrationControlActions(migration).map((control) =>
-    `<button class="small-button" type="button" data-migration-control="${control}" data-migration-id="${escapeHtml(migration.id)}">${controlLabels[control]}</button>`
-  ).join("");
-  const source = mediaLibraryEntries(state.snapshot).find((entry) => entry.id === migration.source_library_id);
-  const target = mediaLibraryEntries(state.snapshot).find((entry) => entry.id === migration.target_library_id);
-  const visibleItems = items.length > 40 ? `<p class="field-hint">Showing the first 40 of ${items.length} item results.</p>` : "";
-  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Library migration</h3><p>${escapeHtml(source?.name ?? migration.source_library_id)} → ${escapeHtml(target?.name ?? migration.target_library_id)}</p><p>${escapeHtml(progress)}</p><p>${escapeHtml(counts)}</p>${incompleteTaskCount ? `<p>${incompleteTaskCount.toLocaleString()} unfinished task handoff${incompleteTaskCount === 1 ? "" : "s"}</p>` : ""}</div><span class="state-pill${active || paused ? " pending" : ""}">${escapeHtml(statusText(status))}</span></div>${incompleteTaskCount ? `<div class="preview-table task-transfer-list">${taskHandoffStatus}${transferRows}${transferMore}</div>` : ""}<div class="preview-table">${resultRows}${visibleItems}</div>${controls ? `<div class="stack-actions">${controls}</div>` : ""}</article>`;
-}
-
 function renderMigrations() {
   migrationTargetOptions();
   const previews = migrationPreviewEntries();
   byId("migration-preview-list").innerHTML = previews.map(renderMigrationPreview).join("");
-  const migrations = Array.isArray(state.snapshot?.library?.migrations) ? state.snapshot.library.migrations : [];
-  const relevant = migrations.filter((migration) => migration?.source_library_id === activeLibraryId() || migration?.target_library_id === activeLibraryId());
-  const historyNotice = migrationHistoryNotice(state.snapshot?.library?.migration_omitted_count);
-  const historyNoticeMarkup = historyNotice ? `<p class="field-hint">${escapeHtml(historyNotice)}</p>` : "";
-  byId("migration-progress-list").innerHTML = `${historyNoticeMarkup}${relevant.slice(-8).reverse().map(renderMigrationProgress).join("")}`;
+  byId("migration-progress-list").innerHTML = renderMigrationHistory({
+    migrations: state.snapshot?.library?.migrations,
+    libraries: mediaLibraryEntries(state.snapshot),
+    libraryId: activeLibraryId(),
+    omittedCount: state.snapshot?.library?.migration_omitted_count,
+  });
 }
 
 function renderPreviews() {

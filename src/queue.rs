@@ -1186,6 +1186,73 @@ impl QueueManager {
         Ok(())
     }
 
+    /// Verify the registered queue owner before changing which library receives new tasks.
+    /// Root device/inode is the protected property; child entries, media contents, and timestamps
+    /// are intentionally not part of this check so ordinary directory churn remains valid.
+    fn validate_video_library_for_settings_mutation_unlocked(
+        &self,
+        library_id: &str,
+    ) -> Result<()> {
+        let library = self
+            .media_libraries
+            .lock()
+            .map_err(poisoned_lock)?
+            .library(library_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown media library {library_id}"))?;
+
+        let existing_store = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .find(|registered| registered.library_id == library_id)
+            .map(|registered| registered.store.clone());
+        if let Some(store) = existing_store {
+            self.validate_video_library_for_task_unlocked(&store, &library)?;
+        } else {
+            // Offline roots are retained in settings without a live store. Reopening is safe
+            // only because refresh validates any persisted root identity before queue recovery
+            // or owner-lock creation.
+            self.refresh_video_library_unlocked(library.clone())?;
+            self.require_video_library_available(library_id)?;
+            let store = self
+                .video_libraries
+                .read()
+                .map_err(poisoned_lock)?
+                .iter()
+                .find(|registered| registered.library_id == library_id && registered.available)
+                .map(|registered| registered.store.clone())
+                .ok_or_else(|| {
+                    anyhow!("media library {library_id} has no available queue store")
+                })?;
+            self.validate_video_library_for_task_unlocked(&store, &library)?;
+        }
+
+        let store = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .find(|registered| registered.library_id == library_id && registered.available)
+            .map(|registered| registered.store.clone())
+            .ok_or_else(|| anyhow!("media library {library_id} has no available queue store"))?;
+        let current_root =
+            coordinate_directory_root(self.pdf.file_provider.as_ref(), &library.root)?;
+        let identity = current_root.root_identity();
+        let binding = self
+            .media_libraries
+            .lock()
+            .map_err(poisoned_lock)?
+            .root_binding(library_id);
+        if binding != Some((identity.device(), identity.inode()))
+            || store.root.root_identity() != identity
+        {
+            bail!("media library {library_id} root no longer matches its persisted queue identity");
+        }
+        Ok(())
+    }
+
     fn validate_pdf_task_config_root_unlocked(&self) -> Result<()> {
         self.pdf.root.validate_configured_root()?;
         let identity = self.pdf.root.root_identity();
@@ -1542,6 +1609,7 @@ impl QueueManager {
 
     pub fn set_default_video_library(&self, library_id: &str) -> Result<MediaLibrarySnapshot> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        self.validate_video_library_for_settings_mutation_unlocked(library_id)?;
         let snapshot = self
             .media_libraries
             .lock()
@@ -1558,6 +1626,22 @@ impl QueueManager {
         expected_revision: u64,
     ) -> Result<MigrationDefaultUpdateOutcome> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let (resolved, revision_matches) = {
+            let registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+            (
+                registry.resolved_migration_default(migration_id)?,
+                registry.snapshot().revision == expected_revision,
+            )
+        };
+        if let Some(outcome) = resolved {
+            self.state_change_notify.notify_one();
+            return Ok(outcome);
+        }
+        // A stale migration must durably latch its skipped CAS result even when the selected
+        // root is unavailable. Only an operation that can change the default needs root proof.
+        if revision_matches {
+            self.validate_video_library_for_settings_mutation_unlocked(library_id)?;
+        }
         let outcome = self
             .media_libraries
             .lock()
@@ -1786,6 +1870,141 @@ impl QueueManager {
             task_count,
             staging_bytes,
         })
+    }
+
+    /// Check durable queue records for a transfer owned by `migration_id` without reconciling or
+    /// rewriting queue state. Terminal records are included because the engine may still need to
+    /// acknowledge or clean a transfer after its user-facing migration is stopped or completed.
+    /// Any offline, identity-mismatched, or unreadable registered store makes a negative answer
+    /// uncertain and is returned as an error.
+    pub fn has_pending_task_destination_transfer_for_migration(
+        &self,
+        migration_id: &str,
+    ) -> Result<bool> {
+        validate_task_transfer_migration_id(migration_id)?;
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+
+        let (libraries, bindings) = {
+            let registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+            let libraries = registry.snapshot().libraries;
+            let bindings = libraries
+                .iter()
+                .map(|library| (library.id.clone(), registry.root_binding(&library.id)))
+                .collect::<BTreeMap<_, _>>();
+            (libraries, bindings)
+        };
+        let stores = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .map(|registered| {
+                (
+                    registered.library_id.clone(),
+                    (registered.store.clone(), registered.available),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let statuses = self.video_statuses.read().map_err(poisoned_lock)?.clone();
+
+        for library in libraries {
+            let library_id = library.id.clone();
+            let (store, store_available) = stores.get(&library_id).ok_or_else(|| {
+                anyhow!(
+                    "cannot verify migration tokens: media library {library_id} has no queue store"
+                )
+            })?;
+            if !store_available {
+                bail!("cannot verify migration tokens: media library {library_id} is unavailable");
+            }
+            let status = statuses.get(&library_id).ok_or_else(|| {
+                anyhow!("cannot verify migration tokens: media library {library_id} has no availability status")
+            })?;
+            if !status.available {
+                bail!(
+                    "cannot verify migration tokens: media library {library_id} is unavailable: {}",
+                    status
+                        .diagnostic
+                        .as_deref()
+                        .unwrap_or("availability was not confirmed")
+                );
+            }
+            let expected_binding = bindings
+                .get(&library_id)
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "cannot verify migration tokens: media library {library_id} has no persisted root identity"
+                    )
+                })?;
+            let store_identity = store.root.root_identity();
+            if expected_binding != (store_identity.device(), store_identity.inode()) {
+                bail!(
+                    "cannot verify migration tokens: media library {library_id} queue store identity changed"
+                );
+            }
+            let current_root = coordinate_directory_root(
+                self.pdf.file_provider.as_ref(),
+                &library.root,
+            )
+            .with_context(|| {
+                format!(
+                    "cannot verify migration tokens: media library {library_id} root is unavailable"
+                )
+            })?;
+            if current_root.root_identity() != store_identity {
+                bail!(
+                    "cannot verify migration tokens: media library {library_id} path names a different root object"
+                );
+            }
+
+            let index = store
+                .read_index()
+                .with_context(|| format!("failed to inspect {library_id} task index"))?;
+            if index.tasks.len() > MAX_ACTIVE_RECORDS + MAX_HISTORY_INDEX_ENTRIES {
+                bail!(
+                    "cannot verify migration tokens: media library {library_id} task index exceeds its record limit"
+                );
+            }
+            for (task_id, entry) in index.tasks {
+                validate_task_id(&task_id)?;
+                let mut paths = vec![entry.record_path];
+                if let Some(move_target) = entry.move_target
+                    && !paths.contains(&move_target)
+                {
+                    paths.push(move_target);
+                }
+                let mut found_record = false;
+                for path in paths {
+                    let Some(record) = store.read_record(&path).with_context(|| {
+                        format!("failed to inspect task {task_id} in media library {library_id}")
+                    })?
+                    else {
+                        continue;
+                    };
+                    if record.id != task_id || record.chat_id != entry.chat_id {
+                        bail!(
+                            "media library {library_id} task index points to a mismatched record for task {task_id}"
+                        );
+                    }
+                    found_record = true;
+                    if record
+                        .destination_transfer
+                        .as_ref()
+                        .is_some_and(|transfer| transfer.migration_id == migration_id)
+                    {
+                        return Ok(true);
+                    }
+                }
+                if !found_record {
+                    bail!(
+                        "media library {library_id} task index points to missing records for task {task_id}"
+                    );
+                }
+            }
+        }
+        Ok(false)
     }
 
     pub fn begin_task_destination_transfer(
@@ -7438,6 +7657,192 @@ mod tests {
         assert!(!archive_root.join(QUEUE_DIRECTORY).exists());
         drop(queue);
         let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn default_change_rejects_replaced_registered_root_and_preserves_cas_outcomes() {
+        let temp_root = temp_queue_root("default-replaced-root");
+        let config = test_video_config(&temp_root);
+        let archive_root = temp_root.join("archive");
+        let displaced_root = temp_root.join("archive-original");
+        fs::create_dir_all(&archive_root).expect("archive root should create");
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let archive = queue
+            .register_video_library("Archive", &archive_root, None, false, false)
+            .expect("archive library should register");
+        let before = queue
+            .registry_snapshot()
+            .expect("registry snapshot should load");
+
+        fs::rename(&archive_root, &displaced_root).expect("original root should be displaced");
+        fs::create_dir(&archive_root).expect("replacement root should create");
+        fs::write(archive_root.join("keep.txt"), b"replacement sentinel")
+            .expect("replacement sentinel should write");
+
+        assert!(
+            queue
+                .register_video_library("Archive", &archive_root, None, true, false)
+                .is_err(),
+            "duplicate registration must not bypass the root identity gate"
+        );
+        assert!(queue.set_default_video_library(&archive.id).is_err());
+        assert_eq!(
+            queue.registry_snapshot().expect("snapshot should load"),
+            before,
+            "a rejected default change must leave the settings revision and default unchanged"
+        );
+        assert!(displaced_root.join(QUEUE_DIRECTORY).exists());
+        assert_eq!(
+            fs::read_dir(&archive_root)
+                .expect("replacement remains readable")
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("keep.txt")],
+            "default validation must not create queue state in the replacement"
+        );
+
+        assert!(
+            queue
+                .set_default_video_library_for_migration_if_revision(
+                    &archive.id,
+                    "migration-default-replaced-root",
+                    before.revision,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            queue.registry_snapshot().expect("snapshot should load"),
+            before,
+            "a failed identity proof must not resolve or mutate the migration CAS"
+        );
+
+        let stale_outcome = queue
+            .set_default_video_library_for_migration_if_revision(
+                &archive.id,
+                "migration-default-stale-offline",
+                before
+                    .revision
+                    .checked_add(1)
+                    .expect("settings revision has room for a stale test value"),
+            )
+            .expect("stale CAS should latch without requiring an offline root");
+        assert!(matches!(
+            stale_outcome,
+            MigrationDefaultUpdateOutcome::RevisionChanged { .. }
+        ));
+        let newer = temp_root.join("newer");
+        fs::create_dir_all(&newer).expect("new healthy root should create");
+        let newer_library = queue
+            .register_video_library("Newer", &newer, None, false, false)
+            .expect("new library should register");
+        queue
+            .set_default_video_library(&newer_library.id)
+            .expect("healthy new library should become default");
+        let replay = queue
+            .set_default_video_library_for_migration_if_revision(
+                &archive.id,
+                "migration-default-stale-offline",
+                before
+                    .revision
+                    .checked_add(1)
+                    .expect("settings revision has room for a stale test value"),
+            )
+            .expect("resolved stale CAS should replay without touching the old root");
+        let MigrationDefaultUpdateOutcome::RevisionChanged { snapshot } = replay else {
+            panic!("stale migration CAS must keep its resolved skipped outcome");
+        };
+        assert_eq!(snapshot.default_library_id, newer_library.id);
+        assert_eq!(
+            queue.registry_snapshot().unwrap().default_library_id,
+            newer_library.id,
+            "replaying a skipped migration must preserve the user's later default choice"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn default_change_allows_registered_root_child_churn() {
+        let temp_root = temp_queue_root("default-child-churn");
+        let config = test_video_config(&temp_root);
+        let archive_root = temp_root.join("archive");
+        fs::create_dir_all(&archive_root).expect("archive root should create");
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let archive = queue
+            .register_video_library("Archive", &archive_root, None, false, false)
+            .expect("archive library should register");
+
+        fs::create_dir(archive_root.join("added-child")).expect("child should create");
+        fs::write(archive_root.join("normal.txt"), b"benign child churn")
+            .expect("child file should create");
+        fs::remove_dir(archive_root.join("added-child")).expect("child should remove");
+
+        let before = queue.registry_snapshot().unwrap();
+        let changed = queue
+            .set_default_video_library(&archive.id)
+            .expect("same root object should remain usable after child churn");
+        assert_eq!(changed.default_library_id, archive.id);
+        assert_eq!(changed.revision, before.revision + 1);
+        assert_eq!(changed.default_category, None);
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn pending_transfer_query_includes_history_and_refuses_uncertain_stores() {
+        let (directory, _config, queue, target) = task_transfer_fixture("pending-token-query");
+        let id = "pending-token-query-terminal";
+        create_transfer_test_task(&queue, id, TaskStatus::Failed);
+        let transfer = begin_test_transfer(&queue, id, "migration-pending-token-query", &target);
+
+        // Model a durable terminal sidecar left with a transfer token by a crash between queue
+        // handoff and migration ACK. This is not a user action; write through the store primitive
+        // so the fixture exercises the history index path the query must inspect.
+        let (store, mut record, entry) = queue
+            .find_record_entry_unlocked(id)
+            .expect("task lookup should succeed")
+            .expect("task should exist");
+        record.status = TaskStatus::Completed;
+        store
+            .save_mutated_record(record, entry, false)
+            .expect("terminal task should move to its durable history sidecar");
+
+        assert!(
+            queue
+                .has_pending_task_destination_transfer_for_migration(&transfer.migration_id)
+                .expect("pending token should be found in history")
+        );
+        assert!(
+            !queue
+                .has_pending_task_destination_transfer_for_migration("migration-unrelated-query")
+                .expect("all stores should be verifiable for a negative result")
+        );
+
+        let mut stores = queue.video_libraries.write().unwrap();
+        let target_store = stores
+            .iter_mut()
+            .find(|registered| registered.library_id == target.library_id)
+            .expect("target store should be registered");
+        target_store.available = false;
+        drop(stores);
+        queue
+            .video_statuses
+            .write()
+            .unwrap()
+            .get_mut(&target.library_id)
+            .expect("target status should exist")
+            .available = false;
+        assert!(
+            queue
+                .has_pending_task_destination_transfer_for_migration("migration-unrelated-query")
+                .is_err(),
+            "an offline store must not be reported as having no token"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

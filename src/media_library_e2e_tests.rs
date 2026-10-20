@@ -408,6 +408,339 @@ async fn migration_pause_survives_runtime_restart_until_explicit_resume() {
 }
 
 #[tokio::test]
+async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_after_restart() {
+    let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "migration-terminal-pending-handoff-removal",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let task_id = "migration-terminal-pending-handoff-task";
+    let mut task = TaskRecord::new(
+        task_id.into(),
+        2_801,
+        2_801,
+        123_456_789,
+        Some(123_456_789),
+        0,
+        JobRequest::Youtube {
+            url: "https://www.youtube.com/watch?v=abcdefghijk".into(),
+        },
+    );
+    task.status = TaskStatus::Failed;
+    task.error = Some("synthetic interrupted video transfer".to_string());
+    queue
+        .create(task)
+        .expect("failed task should persist in the source queue");
+
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let snapshot = queue
+        .list_incomplete_task_transfer_snapshots(&fixture.source_library_id, 16)
+        .expect("failed task should be included in the migration preview")
+        .into_iter()
+        .find(|snapshot| snapshot.record.id == task_id)
+        .expect("unfinished task should remain bound to the source library");
+    let engine = migration_engine_for_test(
+        &runtime,
+        &fixture.source_library_id,
+        &fixture.target_library_id,
+    );
+    let preview = engine
+        .preview(&crate::library_migration::MigrationRequest {
+            scope: crate::library_migration::MigrationScope::Library,
+            item_ids: Vec::new(),
+            conflict: crate::library::ConflictPolicy::Skip,
+            item_conflicts: Default::default(),
+            include_incomplete_tasks: true,
+            set_target_default_on_success: false,
+            task_impacts: vec![crate::library_migration::MigrationTaskImpact {
+                task_id: snapshot.record.id.clone(),
+                generation: snapshot.record.generation,
+                revision: snapshot.record.revision,
+                staging_bytes: snapshot.staging_bytes,
+                staging_file_count: snapshot.staging_file_count,
+                published_item_ids: Vec::new(),
+            }],
+            warnings: Vec::new(),
+        })
+        .expect("migration preview should bind the unfinished task");
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("confirmed migration should be durable before running");
+    engine
+        .set_runtime_context(
+            &preview.id,
+            crate::library_migration::MigrationRuntimeContext {
+                database_epoch: crate::cloud::TEST_DATABASE_EPOCH.to_string(),
+                preview_seq: 2_801,
+                chat_id: None,
+                message_id: None,
+                delivery: crate::library_migration::MigrationDeliveryState::Pending,
+            },
+        )
+        .expect("migration should carry the current cloud epoch for recovery");
+
+    let target = queue
+        .registry_snapshot()
+        .expect("media library registry should load")
+        .libraries
+        .into_iter()
+        .find(|library| library.id == fixture.target_library_id)
+        .expect("target library should remain registered");
+    let token = queue
+        .begin_task_destination_transfer(
+            &snapshot.record.id,
+            &preview.id,
+            snapshot.record.generation,
+            snapshot.record.revision,
+            crate::media_libraries::TaskDestination {
+                library_id: target.id,
+                root: target.root,
+                category: snapshot.destination.category.clone(),
+            },
+        )
+        .expect("queue should persist the transfer token");
+    queue
+        .wait_for_task_destination_transfer(&token)
+        .await
+        .expect("task writer should settle before plan creation");
+    let plan = queue
+        .task_transfer_plan(&token)
+        .expect("queue should bind the queue transfer plan");
+    engine
+        .attach_task_transfer(&preview.id, plan.clone())
+        .expect("migration should durably attach the transfer plan");
+
+    let migration_id = preview.id.clone();
+    let awaiting_commit = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let worker = engine.clone();
+            let id = migration_id.clone();
+            let status = tokio::task::spawn_blocking(move || worker.step(&id))
+                .await
+                .expect("migration checkpoint should join")
+                .expect("migration checkpoint should succeed");
+            assert_ne!(
+                status.status,
+                crate::library_migration::MigrationRunStatus::Failed,
+                "private task transfer should not fail: {status:?}"
+            );
+            if status.awaiting_task_commit {
+                return status;
+            }
+        }
+    })
+    .await
+    .expect("task transfer should reach its queue commit checkpoint");
+    assert!(awaiting_commit.awaiting_task_commit);
+    let installed = queue
+        .commit_task_destination_transfer(&plan)
+        .expect("target queue record should install before engine acknowledgment");
+    assert_eq!(
+        installed.destination_transfer_phase,
+        Some(crate::media_libraries::TaskDestinationTransferPhase::TargetInstalled)
+    );
+    engine
+        .ack_task_transfer(&preview.id, &token.transfer_id)
+        .expect("engine should persist queue handoff acknowledgment");
+
+    let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let worker = engine.clone();
+            let id = preview.id.clone();
+            let status = tokio::task::spawn_blocking(move || worker.step(&id))
+                .await
+                .expect("post-ack checkpoint should join")
+                .expect("post-ack checkpoint should succeed");
+            if status.status == crate::library_migration::MigrationRunStatus::Completed {
+                return status;
+            }
+            assert_ne!(
+                status.status,
+                crate::library_migration::MigrationRunStatus::Failed,
+                "post-ack migration should remain recoverable: {status:?}"
+            );
+        }
+    })
+    .await
+    .expect("migration should complete before the separate queue token ACK");
+    assert_eq!(
+        terminal.status,
+        crate::library_migration::MigrationRunStatus::Completed
+    );
+    let target_record = queue
+        .get(task_id)
+        .expect("installed target task should load")
+        .expect("task should be stored in the target queue");
+    assert_eq!(
+        target_record
+            .destination_transfer
+            .as_ref()
+            .map(|transfer| transfer.migration_id.as_str()),
+        Some(preview.id.as_str()),
+        "Completed migration must retain the durable queue token until recovery ACK"
+    );
+
+    queue
+        .set_default_video_library(&fixture.target_library_id)
+        .expect("source must no longer be the default before removal");
+    runtime.signal_epoch_fatal();
+    drop(engine);
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+
+    let reopened_queue = Arc::new(
+        QueueManager::open(&fixture.config).expect("queue should reopen after target install"),
+    );
+    let reopened_target_record = reopened_queue
+        .get(task_id)
+        .expect("installed target task should load after restart")
+        .expect("task should remain stored in the target queue");
+    assert_eq!(
+        reopened_target_record
+            .destination
+            .as_ref()
+            .map(|destination| destination.library_id.as_str()),
+        Some(fixture.target_library_id.as_str())
+    );
+    assert_eq!(
+        reopened_target_record
+            .destination_transfer
+            .as_ref()
+            .map(|transfer| transfer.migration_id.as_str()),
+        Some(preview.id.as_str()),
+        "reopened target record must retain the durable migration token"
+    );
+    let reopened_inbox = Arc::new(
+        CloudInbox::open_for_epoch(&fixture.video_root, crate::cloud::TEST_DATABASE_EPOCH)
+            .expect("same-epoch cloud inbox should reopen"),
+    );
+    let reopened_runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&reopened_queue),
+        Arc::clone(&reopened_inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
+
+    let premature_removal = run_library_management_test_request(
+        &reopened_runtime,
+        2_802,
+        "library_remove",
+        serde_json::json!({"library_id": fixture.source_library_id}),
+    )
+    .await;
+    assert_eq!(
+        premature_removal.status,
+        InboxStatus::Failed,
+        "a terminal migration with a pending queue handoff must retain the registration"
+    );
+    assert!(
+        premature_removal
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("task destination handoff")),
+        "removal should identify the pending queue handoff: {:?}",
+        premature_removal.error
+    );
+    assert!(
+        reopened_queue
+            .registry_snapshot()
+            .expect("registry should remain readable")
+            .libraries
+            .iter()
+            .any(|library| library.id == fixture.source_library_id)
+    );
+
+    let migration_watcher = tokio::spawn(crate::library_migration_bot::watch(
+        reopened_runtime.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let current = reopened_queue
+                .get(task_id)
+                .expect("recovered target task should load")
+                .expect("task should remain in the target queue");
+            if current.destination_transfer.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("migration discovery should finish the durable queue handoff ACK");
+    let acknowledged_record = reopened_queue
+        .get(task_id)
+        .expect("acknowledged target task should load")
+        .expect("task should remain stored in the target queue");
+    assert!(acknowledged_record.destination_transfer.is_none());
+    assert!(acknowledged_record.destination_transfer_phase.is_none());
+    assert_eq!(
+        acknowledged_record
+            .destination
+            .as_ref()
+            .map(|destination| destination.library_id.as_str()),
+        Some(fixture.target_library_id.as_str()),
+        "queue ACK should retain the task at its target destination"
+    );
+    assert_eq!(
+        acknowledged_record
+            .destination
+            .as_ref()
+            .map(|destination| destination.root.as_path()),
+        Some(fixture.archive_root.as_path())
+    );
+    assert_eq!(acknowledged_record.status, TaskStatus::Failed);
+
+    let recovered_removal = run_library_management_test_request(
+        &reopened_runtime,
+        2_803,
+        "library_remove",
+        serde_json::json!({"library_id": fixture.source_library_id}),
+    )
+    .await;
+    assert_eq!(
+        recovered_removal.status,
+        InboxStatus::Completed,
+        "source removal should succeed after queue ACK: {:?}",
+        recovered_removal.error
+    );
+    assert!(
+        !reopened_queue
+            .registry_snapshot()
+            .expect("registry should remain readable after removal")
+            .libraries
+            .iter()
+            .any(|library| library.id == fixture.source_library_id)
+    );
+    assert_eq!(
+        reopened_queue
+            .get(task_id)
+            .expect("target task should remain readable after source removal")
+            .expect("queue transfer should retain the target task")
+            .status,
+        TaskStatus::Failed
+    );
+
+    reopened_runtime.signal_epoch_fatal();
+    migration_watcher
+        .await
+        .expect("migration watcher should stop after runtime shutdown");
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(reopened_runtime);
+    drop(reopened_inbox);
+    drop(reopened_queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[tokio::test]
 async fn migration_pauses_when_new_media_appears_before_leased_task_handoff() {
     let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
     let (fixture, queue, inbox) = create_migration_fixture(

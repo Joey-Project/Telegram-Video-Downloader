@@ -93,17 +93,31 @@ pub(super) fn ensure_library_removable(runtime: &CloudBotRuntime, library_id: &s
         return Ok(());
     }
     for library in libraries {
-        let source=manager(runtime,&library.id)
-            .context("all media libraries must be reachable to verify migration dependencies before unregistering")?;
+        let source = manager(runtime, &library.id).context(
+            "all media libraries must be reachable to verify migration dependencies before unregistering",
+        )?;
         for status in MigrationEngine::list_for_source(&source)? {
-            if (status.source_library_id == library_id || status.target_library_id == library_id)
-                && !matches!(
-                    status.status,
-                    MigrationRunStatus::Completed | MigrationRunStatus::Stopped
-                )
-            {
+            if status.source_library_id != library_id && status.target_library_id != library_id {
+                continue;
+            }
+            if !matches!(
+                status.status,
+                MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+            ) {
                 bail!(
                     "finish or stop migration {} before removing this library registration",
+                    status.id
+                );
+            }
+            // This guard runs inside the settings operation's spawn_blocking worker. The queue
+            // scan is bounded and must fail closed when any registered store cannot be proven.
+            if runtime
+                .bot
+                .queue
+                .has_pending_task_destination_transfer_for_migration(&status.id)?
+            {
+                bail!(
+                    "finish the pending task destination handoff for migration {} before removing this library registration",
                     status.id
                 );
             }

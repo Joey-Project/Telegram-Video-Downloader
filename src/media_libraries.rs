@@ -480,30 +480,42 @@ impl MediaLibraryRegistryStore {
         self.commit(next)
     }
 
-    pub(crate) fn set_default_for_migration_if_revision(
-        &mut self,
-        id: &str,
+    /// Resolve a previously completed migration default update without applying it again.
+    /// A replay must preserve the outcome even if a user has since changed the default.
+    pub(crate) fn resolved_migration_default(
+        &self,
         migration_id: &str,
-        expected_revision: u64,
-    ) -> Result<MigrationDefaultUpdateOutcome> {
+    ) -> Result<Option<MigrationDefaultUpdateOutcome>> {
         validate_migration_id(migration_id)?;
         if self
             .applied_migration_defaults
             .iter()
             .any(|applied| applied == migration_id)
         {
-            return Ok(MigrationDefaultUpdateOutcome::Applied {
+            return Ok(Some(MigrationDefaultUpdateOutcome::Applied {
                 snapshot: self.snapshot(),
-            });
+            }));
         }
         if self
             .skipped_migration_defaults
             .iter()
             .any(|skipped| skipped == migration_id)
         {
-            return Ok(MigrationDefaultUpdateOutcome::RevisionChanged {
+            return Ok(Some(MigrationDefaultUpdateOutcome::RevisionChanged {
                 snapshot: self.snapshot(),
-            });
+            }));
+        }
+        Ok(None)
+    }
+
+    pub(crate) fn set_default_for_migration_if_revision(
+        &mut self,
+        id: &str,
+        migration_id: &str,
+        expected_revision: u64,
+    ) -> Result<MigrationDefaultUpdateOutcome> {
+        if let Some(outcome) = self.resolved_migration_default(migration_id)? {
+            return Ok(outcome);
         }
         if self.migration_default_history_len() >= MAX_RESOLVED_MIGRATION_DEFAULTS {
             bail!("media library migration idempotency history is full");

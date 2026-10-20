@@ -28,6 +28,8 @@ Retryable failed video tasks still depend on their registered library. Before a 
 download configuration, the queue revalidates the registered root's saved directory identity;
 a replacement directory at the same pathname is rejected while task and staging records remain
 bound to the original directory.
+Changing the default also requires the registered root to be available and identity-matched;
+rejection preserves the existing default and settings revision.
 
 A failed refresh retains the last successful view for that library and marks it unavailable.
 Cached items stay visible but read-only until a successful scan. Refresh and library switching
@@ -79,6 +81,8 @@ Telegram delivery is retained without automatically sending a duplicate message.
 Task-transfer failures also expose retry and stop controls, even when no media bundle failed.
 Startup completes or aborts a stopped migration's pending queue handoffs so the affected tasks
 do not remain blocked by an orphaned transfer.
+Participating libraries remain registered until pending queue handoffs are acknowledged, even
+when the migration already has a terminal status. This preserves discovery of its source manifest.
 
 An independent unchecked option can set the target as default after success. That update is
 recorded once so crash recovery cannot overwrite a later user choice. Migration manifests are
@@ -86,8 +90,8 @@ kept in the source library's private metadata directory, independently of cloud 
 A cloud database epoch change pauses automatic recovery until a new authorized resume.
 The default update is conditional on the recorded settings revision; a newer settings change
 causes it to be skipped durably. Cloud snapshots include at most 32 migrations, prioritizing active
-and recoverable jobs, then recent completed jobs. The UI reports omitted entries; local manifests
-remain available for recovery.
+and recoverable jobs, then recent completed jobs. The UI displays that priority order and reports
+omitted entries; local manifests remain available for recovery.
 
 ## Storage and rollout
 
