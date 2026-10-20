@@ -121,6 +121,17 @@ pub(super) fn ensure_library_removable(runtime: &CloudBotRuntime, library_id: &s
                     status.id
                 );
             }
+            let engine = engine(
+                runtime,
+                &status.source_library_id,
+                &status.target_library_id,
+            )?;
+            if engine.task_handoff_cleanup_pending(&status.id, library_id)? {
+                bail!(
+                    "finish source staging cleanup for migration {} before removing this library registration",
+                    status.id
+                );
+            }
         }
     }
     Ok(())
@@ -195,7 +206,9 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
         if !affected {
             continue;
         }
-        if task.record.destination_transfer.is_some() {
+        if task.record.destination_transfer.is_some()
+            || task.record.destination_transfer_ack.is_some()
+        {
             bail!(
                 "an affected task already belongs to another migration; finish or stop that migration first"
             );
@@ -380,7 +393,16 @@ async fn dispatch_inner(
                     &persisted.source_library_id,
                     &persisted.target_library_id,
                 )?;
-                let status = engine.confirm(&id, &revision)?;
+                let expected_default_revision = if persisted.set_target_default_on_success {
+                    Some(worker.bot.queue.registry_snapshot()?.revision)
+                } else {
+                    None
+                };
+                let status = engine.confirm_with_default_revision(
+                    &id,
+                    &revision,
+                    expected_default_revision,
+                )?;
                 Ok::<_, anyhow::Error>((engine, status))
             })
             .await??;
@@ -407,16 +429,14 @@ async fn dispatch_inner(
                     &preview.source_library_id,
                     &preview.target_library_id,
                 )?;
-                if matches!(
-                    payload.control,
-                    MigrationControl::Resume | MigrationControl::RetryFailed
-                ) {
-                    let mut context = engine
-                        .runtime_context(&payload.migration_id)?
-                        .context("migration recovery context is missing")?;
-                    context.database_epoch = worker.inbox.database_epoch().to_string();
-                    engine.set_runtime_context(&payload.migration_id, context)?;
-                }
+                let mut context = engine
+                    .runtime_context(&payload.migration_id)?
+                    .context("migration recovery context is missing")?;
+                // Every authenticated management control belongs to the current cloud epoch.
+                // In particular, an explicit stop can authorize terminal queue/source cleanup
+                // after a database epoch rollover.
+                context.database_epoch = worker.inbox.database_epoch().to_string();
+                engine.set_runtime_context(&payload.migration_id, context)?;
                 let status = engine.control(&payload.migration_id, payload.control)?;
                 Ok::<_, anyhow::Error>((engine, status))
             })
@@ -424,9 +444,11 @@ async fn dispatch_inner(
             if status.status == MigrationRunStatus::Stopped
                 && !runtime.migration_runners.lock().await.contains(&status.id)
             {
-                finish_task_transfers(runtime, &engine, &status).await?;
+                let status = finish_task_transfers(runtime, &engine, &status, None).await?;
                 edit_status(runtime, &engine, &status).await?;
+                publish_status(runtime, status).await;
             }
+            let status = read_status(&engine, &status.id).await?.unwrap_or(status);
             publish_status(runtime, status.clone()).await;
             start(runtime.clone(), status.clone()).await;
             Ok(CloudDispatchOutcome {
@@ -616,10 +638,6 @@ async fn run(runtime: &CloudBotRuntime, initial: MigrationStatus) -> Result<()> 
     let worker = engine.clone();
     let lookup = id.clone();
     let context = tokio::task::spawn_blocking(move || worker.runtime_context(&lookup)).await??;
-    if initial.status == MigrationRunStatus::Stopped {
-        finish_task_transfers(runtime, &engine, &initial).await?;
-        return Ok(());
-    }
     if context
         .as_ref()
         .is_none_or(|context| context.database_epoch != runtime.inbox.database_epoch())
@@ -632,15 +650,23 @@ async fn run(runtime: &CloudBotRuntime, initial: MigrationStatus) -> Result<()> 
         publish_status(runtime, status).await;
         return Ok(());
     }
+    if initial.status == MigrationRunStatus::Stopped {
+        let status = finish_task_transfers(runtime, &engine, &initial, None).await?;
+        publish_status(runtime, status).await;
+        return Ok(());
+    }
     if initial.status == MigrationRunStatus::Completed {
-        finish_task_transfers(runtime, &engine, &initial).await?;
-        apply_success_default(runtime, &engine, &initial).await?;
+        let status = finish_task_transfers(runtime, &engine, &initial, None).await?;
+        if status.status == MigrationRunStatus::Completed {
+            apply_success_default(runtime, &engine, &status).await?;
+        }
+        publish_status(runtime, status).await;
         return Ok(());
     }
     // Task writers must acknowledge cancellation before either output lease is acquired.
     if !prepare_task_transfers(runtime, &engine, &initial).await? {
         if let Some(status) = read_status(&engine, &id).await? {
-            finish_task_transfers(runtime, &engine, &status).await?;
+            let status = finish_task_transfers(runtime, &engine, &status, None).await?;
             publish_status(runtime, status).await;
         }
         return Ok(());
@@ -665,7 +691,7 @@ async fn run(runtime: &CloudBotRuntime, initial: MigrationStatus) -> Result<()> 
                 if let Some(status)=read_status(&engine,&id).await?
                     && !matches!(status.status,MigrationRunStatus::Queued|MigrationRunStatus::Running)
                 {
-                    finish_task_transfers(runtime,&engine,&status).await?;
+                    let status = finish_task_transfers(runtime,&engine,&status,None).await?;
                     publish_status(runtime,status).await;
                     return Ok(());
                 }
@@ -678,22 +704,6 @@ async fn run(runtime: &CloudBotRuntime, initial: MigrationStatus) -> Result<()> 
     loop {
         if runtime.epoch_fatal.is_signaled() {
             return Ok(());
-        }
-        if initial.set_target_default_on_success
-            && !initial.default_update_resolved
-            && !initial.default_update_applied
-        {
-            let queue = Arc::clone(&runtime.bot.queue);
-            let expected_revision = tokio::task::spawn_blocking(move || {
-                Ok::<_, anyhow::Error>(queue.registry_snapshot()?.revision)
-            })
-            .await??;
-            let worker = engine.clone();
-            let lookup = id.clone();
-            tokio::task::spawn_blocking(move || {
-                worker.bind_default_update_expected_revision(&lookup, expected_revision)
-            })
-            .await??;
         }
         let worker = engine.clone();
         let lookup = id.clone();
@@ -725,8 +735,12 @@ async fn run(runtime: &CloudBotRuntime, initial: MigrationStatus) -> Result<()> 
             last_edit = Instant::now();
         }
         if terminal {
-            finish_task_transfers(runtime, &engine, &status).await?;
-            apply_success_default(runtime, &engine, &status).await?;
+            let status =
+                finish_task_transfers(runtime, &engine, &status, Some(Arc::clone(&guards))).await?;
+            if status.status == MigrationRunStatus::Completed {
+                apply_success_default(runtime, &engine, &status).await?;
+            }
+            publish_status(runtime, status).await;
             drop(guards);
             runtime.bot.queue.publication_notify().notify_one();
             return Ok(());
@@ -826,11 +840,17 @@ async fn prepare_task_transfers(
     let attached = task_plans(engine, &status.id).await?;
     let worker = engine.clone();
     let id = status.id.clone();
-    let acknowledged = tokio::task::spawn_blocking(move || worker.task_transfer_statuses(&id))
-        .await??
-        .into_iter()
+    let transfer_statuses =
+        tokio::task::spawn_blocking(move || worker.task_transfer_statuses(&id)).await??;
+    let acknowledged = transfer_statuses
+        .iter()
         .filter(|transfer| transfer.commit_acked)
-        .map(|transfer| transfer.transfer_id)
+        .map(|transfer| transfer.transfer_id.as_str())
+        .collect::<HashSet<_>>();
+    let cleanup_completed = transfer_statuses
+        .iter()
+        .filter(|transfer| transfer.source_cleanup_complete)
+        .map(|transfer| transfer.transfer_id.as_str())
         .collect::<HashSet<_>>();
     let worker = runtime.clone();
     let source = status.source_library_id.clone();
@@ -873,15 +893,33 @@ async fn prepare_task_transfers(
             .iter()
             .find(|plan| plan.transfer.task_id == impact.task_id)
         {
+            if cleanup_completed.contains(plan.transfer.transfer_id.as_str()) {
+                continue;
+            }
             let queue = Arc::clone(&runtime.bot.queue);
             let plan = plan.clone();
-            let acknowledged = acknowledged.contains(&plan.transfer.transfer_id);
+            let acknowledged = acknowledged.contains(plan.transfer.transfer_id.as_str());
+            let worker = engine.clone();
             let installed = tokio::task::spawn_blocking(move || {
                 let Some(task) = queue.get(&plan.transfer.task_id)? else {
                     return Ok(false);
                 };
                 if task.destination.as_ref() != Some(&plan.transfer.target) {
                     return Ok(false);
+                }
+                if task.destination_transfer_ack.as_ref() == Some(&plan.transfer) {
+                    if task.destination_transfer.is_some()
+                        || task.destination_transfer_phase.is_some()
+                    {
+                        bail!("queue ACK receipt coexists with an active task transfer token");
+                    }
+                    if !acknowledged {
+                        worker.ack_task_transfer(
+                            &plan.transfer.migration_id,
+                            &plan.transfer.transfer_id,
+                        )?;
+                    }
+                    return Ok::<_, anyhow::Error>(true);
                 }
                 if task.destination_transfer_phase
                     != Some(crate::media_libraries::TaskDestinationTransferPhase::TargetInstalled)
@@ -1093,39 +1131,519 @@ async fn finish_task_transfers(
     runtime: &CloudBotRuntime,
     engine: &MigrationEngine,
     status: &MigrationStatus,
-) -> Result<()> {
+    held_lease: Option<Arc<StdMutex<downloader::VideoMigrationGuard>>>,
+) -> Result<MigrationStatus> {
     if !matches!(
         status.status,
         MigrationRunStatus::Completed | MigrationRunStatus::Stopped
     ) {
-        return Ok(());
+        return Ok(status.clone());
     }
     let worker = engine.clone();
     let id = status.id.clone();
-    let impacts = tokio::task::spawn_blocking(move || worker.task_impacts(&id)).await??;
-    for impact in impacts {
-        let queue = Arc::clone(&runtime.bot.queue);
+    let current_epoch = runtime.inbox.database_epoch().to_string();
+    let authorized = tokio::task::spawn_blocking(move || {
+        Ok::<_, anyhow::Error>(
+            worker
+                .runtime_context(&id)?
+                .is_some_and(|context| context.database_epoch == current_epoch),
+        )
+    })
+    .await??;
+    if !authorized {
+        // A terminal record from another database epoch is visible but cannot authorize queue
+        // rescheduling or destructive source cleanup until a current-epoch control is received.
+        return Ok(status.clone());
+    }
+    let worker = engine.clone();
+    let id = status.id.clone();
+    let (plans, impacts, transfer_statuses) = tokio::task::spawn_blocking(move || {
+        Ok::<_, anyhow::Error>((
+            worker.task_transfer_plans(&id)?,
+            worker.task_impacts(&id)?,
+            worker.task_transfer_statuses(&id)?,
+        ))
+    })
+    .await??;
+    let plan_task_ids = plans
+        .iter()
+        .map(|plan| plan.transfer.task_id.as_str())
+        .collect::<HashSet<_>>();
+
+    // Confirmation may be stopped after `begin_task_destination_transfer` but before its plan
+    // reaches the migration manifest. Such an uninstalled token is safe to abort; a completed
+    // job or an installed target without its exact plan is an attention state, never an inferred
+    // acknowledgment.
+    if status.include_incomplete_tasks {
+        for impact in impacts
+            .iter()
+            .filter(|impact| !plan_task_ids.contains(impact.task_id.as_str()))
+        {
+            let queue = Arc::clone(&runtime.bot.queue);
+            let task_id = impact.task_id.clone();
+            let migration_id = status.id.clone();
+            let stopped = status.status == MigrationRunStatus::Stopped;
+            let resolution = tokio::task::spawn_blocking(move || {
+                let Some(current) = queue.get(&task_id)? else {
+                    return Ok::<_, anyhow::Error>(UnplannedTransferResolution::NoRecord);
+                };
+                let Some(token) = current.destination_transfer.clone() else {
+                    if let Some(receipt) = current.destination_transfer_ack.as_ref() {
+                        return Ok(UnplannedTransferResolution::Attention {
+                            transfer_id: Some(receipt.transfer_id.clone()),
+                            message: "queue handoff receipt has no matching migration file plan".to_string(),
+                        });
+                    }
+                    if stopped {
+                        return Ok(UnplannedTransferResolution::NoRecord);
+                    }
+                    return Ok(UnplannedTransferResolution::Attention {
+                        transfer_id: None,
+                        message: "completed migration has an affected task with no durable transfer plan or queue acknowledgment".to_string(),
+                    });
+                };
+                if token.migration_id != migration_id {
+                    return Ok(UnplannedTransferResolution::Attention {
+                        transfer_id: None,
+                        message: "task transfer is owned by a different migration".to_string(),
+                    });
+                }
+                let installed = current.destination.as_ref() == Some(&token.target)
+                    && current.destination_transfer_phase
+                        == Some(crate::media_libraries::TaskDestinationTransferPhase::TargetInstalled);
+                if stopped && !installed {
+                    return Ok(UnplannedTransferResolution::Aborted(Box::new(
+                        queue.abort_task_destination_transfer(&token)?,
+                    )));
+                }
+                Ok(UnplannedTransferResolution::Attention {
+                    transfer_id: Some(token.transfer_id),
+                    message: "task transfer reached a terminal migration without its exact saved file plan".to_string(),
+                })
+            })
+            .await??;
+            match resolution {
+                UnplannedTransferResolution::Aborted(task) => {
+                    restore_task(runtime, *task).await?;
+                }
+                UnplannedTransferResolution::Attention {
+                    transfer_id: Some(transfer_id),
+                    message,
+                } => {
+                    return mark_task_handoff_attention(
+                        runtime,
+                        engine,
+                        status,
+                        &transfer_id,
+                        &message,
+                    )
+                    .await;
+                }
+                UnplannedTransferResolution::Attention {
+                    transfer_id: None,
+                    message,
+                } => {
+                    return mark_task_handoff_migration_attention(engine, status, &message).await;
+                }
+                UnplannedTransferResolution::NoRecord => {}
+            }
+        }
+    }
+
+    for plan in &plans {
+        let transfer = plan.transfer.clone();
+        let transfer_status = transfer_statuses
+            .iter()
+            .find(|saved| saved.transfer_id == transfer.transfer_id);
+        let Some(transfer_status) = transfer_status else {
+            return mark_task_handoff_attention(
+                runtime,
+                engine,
+                status,
+                &transfer.transfer_id,
+                "migration manifest has no transfer status for its saved task plan",
+            )
+            .await;
+        };
+        let commit_acked = transfer_status.commit_acked;
+        let worker = engine.clone();
         let migration_id = status.id.clone();
-        let completed = status.status == MigrationRunStatus::Completed;
+        let transfer_id = transfer.transfer_id.clone();
+        let queue = Arc::clone(&runtime.bot.queue);
+        let stopped = status.status == MigrationRunStatus::Stopped;
+        let plan = plan.clone();
+        let resolution = tokio::task::spawn_blocking(move || {
+            let final_acknowledged =
+                worker.task_handoff_final_acknowledged(&migration_id, &transfer_id)?;
+            let current = queue.get(&plan.transfer.task_id)?;
+            if final_acknowledged {
+                if let Some(record) = current.as_ref()
+                    && record
+                        .destination_transfer_ack
+                        .as_ref()
+                        .is_some_and(|saved| saved != &plan.transfer)
+                {
+                    return Ok::<_, anyhow::Error>(TaskHandoffResolution::Attention(
+                        "task has a different unconsumed transfer acknowledgment".to_string(),
+                    ));
+                }
+                if current
+                    .as_ref()
+                    .is_some_and(|record| record.destination_transfer.is_some())
+                {
+                    return Ok(TaskHandoffResolution::Attention(
+                        "engine final acknowledgment exists while the queue still has a pending transfer token".to_string(),
+                    ));
+                }
+                return Ok(TaskHandoffResolution::Finalized);
+            }
+            let Some(current) = current else {
+                return Ok(TaskHandoffResolution::Attention(
+                    "task record is absent and no durable queue acknowledgment proves its handoff".to_string(),
+                ));
+            };
+            if let Some(ack) = current.destination_transfer_ack.as_ref()
+                && ack != &plan.transfer
+            {
+                return Ok(TaskHandoffResolution::Attention(
+                    "task has a different unconsumed transfer acknowledgment".to_string(),
+                ));
+            }
+            if let Some(token) = current.destination_transfer.as_ref() {
+                if token != &plan.transfer {
+                    return Ok(TaskHandoffResolution::Attention(
+                        "task destination transfer does not match its saved migration plan".to_string(),
+                    ));
+                }
+                let installed = current.destination.as_ref() == Some(&plan.transfer.target)
+                    && current.destination_transfer_phase
+                        == Some(crate::media_libraries::TaskDestinationTransferPhase::TargetInstalled);
+                if !installed {
+                    if stopped && !commit_acked {
+                        return Ok(TaskHandoffResolution::Aborted(Box::new(
+                            queue.abort_task_destination_transfer(&plan.transfer)?,
+                        )));
+                    }
+                    return Ok(TaskHandoffResolution::Attention(
+                        "completed migration task has not installed its target queue record".to_string(),
+                    ));
+                }
+                if !commit_acked {
+                    queue.verify_task_transfer_plan(&plan)?;
+                    queue.commit_task_destination_transfer(&plan)?;
+                    worker.ack_task_transfer(&migration_id, &transfer_id)?;
+                }
+                let acknowledged = queue
+                    .ack_task_destination_transfer(&plan.transfer)?
+                    .ok_or_else(|| anyhow::anyhow!("target task disappeared during queue acknowledgment"))?;
+                if acknowledged.destination_transfer_ack.as_ref() != Some(&plan.transfer) {
+                    return Ok(TaskHandoffResolution::Attention(
+                        "queue did not retain the exact handoff acknowledgment receipt".to_string(),
+                    ));
+                }
+                worker.ack_task_handoff_final(&migration_id, &transfer_id)?;
+                return Ok(TaskHandoffResolution::Finalized);
+            }
+
+            if current
+                .destination_transfer_ack
+                .as_ref()
+                .is_some_and(|ack| ack == &plan.transfer)
+                && current.destination.as_ref() == Some(&plan.transfer.target)
+            {
+                // The exact receipt survives a crash between queue ACK and engine ACK. It is
+                // sufficient to replay the engine's earlier target-install acknowledgment.
+                if !commit_acked {
+                    worker.ack_task_transfer(&migration_id, &transfer_id)?;
+                }
+                worker.ack_task_handoff_final(&migration_id, &transfer_id)?;
+                return Ok(TaskHandoffResolution::Finalized);
+            }
+
+            if stopped
+                && !commit_acked
+                && current.destination.as_ref() == Some(&plan.transfer.source)
+            {
+                return Ok(TaskHandoffResolution::Aborted(Box::new(Some(current))));
+            }
+            Ok(TaskHandoffResolution::Attention(
+                "task has neither the exact pending transfer nor its durable queue acknowledgment receipt".to_string(),
+            ))
+        })
+        .await??;
+
+        match resolution {
+            TaskHandoffResolution::Aborted(task) => {
+                restore_task(runtime, *task).await?;
+            }
+            TaskHandoffResolution::Attention(message) => {
+                return mark_task_handoff_attention(
+                    runtime,
+                    engine,
+                    status,
+                    &transfer.transfer_id,
+                    &message,
+                )
+                .await;
+            }
+            TaskHandoffResolution::Finalized => {}
+        }
+    }
+
+    let mut current_status = read_status(engine, &status.id)
+        .await?
+        .unwrap_or_else(|| status.clone());
+    let cleanup_pending = match task_handoff_cleanup_pending(engine, &current_status).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            return mark_task_handoff_migration_attention(
+                engine,
+                &current_status,
+                &format!("could not verify whether source staging cleanup remains: {error:#}"),
+            )
+            .await;
+        }
+    };
+    if cleanup_pending {
+        let lease = match held_lease {
+            Some(lease) => lease,
+            None => {
+                match acquire_task_cleanup_lease(runtime, &current_status).await {
+                    Ok(lease) => lease,
+                    Err(_) if runtime.epoch_fatal.is_signaled() => return Ok(current_status),
+                    Err(error) => {
+                        return mark_task_handoff_migration_attention(
+                        engine,
+                        &current_status,
+                        &format!("could not acquire output lease for source staging cleanup: {error:#}"),
+                    )
+                    .await;
+                    }
+                }
+            }
+        };
+        let mut last_update = Instant::now();
+        loop {
+            let pending_statuses = task_transfer_statuses(engine, &current_status.id).await?;
+            let pending_ids = pending_statuses
+                .iter()
+                .filter(|transfer| transfer.commit_acked && !transfer.source_cleanup_complete)
+                .map(|transfer| transfer.transfer_id.clone())
+                .collect::<Vec<_>>();
+            if pending_ids.is_empty() {
+                return mark_task_handoff_migration_attention(
+                    engine,
+                    &current_status,
+                    "migration reports cleanup pending but has no unfinished saved task cleanup checkpoint",
+                )
+                .await;
+            }
+            for transfer_id in pending_ids {
+                let worker = engine.clone();
+                let migration_id = current_status.id.clone();
+                let worker_transfer_id = transfer_id.clone();
+                let lease = Arc::clone(&lease);
+                let result = tokio::task::spawn_blocking(move || {
+                    let lease = lease
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("migration output lease is poisoned"))?;
+                    worker.step_task_source_cleanup_with_output_lease(
+                        &migration_id,
+                        &worker_transfer_id,
+                        &lease,
+                    )
+                })
+                .await?;
+                current_status = match result {
+                    Ok(status) => status,
+                    Err(error) => {
+                        return mark_task_handoff_attention(
+                            runtime,
+                            engine,
+                            &current_status,
+                            &transfer_id,
+                            &format!("source staging cleanup needs attention: {error:#}"),
+                        )
+                        .await;
+                    }
+                };
+                runtime
+                    .migrations
+                    .lock()
+                    .await
+                    .insert(current_status.id.clone(), current_status.clone());
+                if current_status.status == MigrationRunStatus::Partial {
+                    runtime.state_notify.notify_one();
+                    return Ok(current_status);
+                }
+                if last_update.elapsed() >= Duration::from_secs(5) {
+                    runtime.state_notify.notify_one();
+                    edit_status(runtime, engine, &current_status).await?;
+                    last_update = Instant::now();
+                }
+                tokio::task::yield_now().await;
+            }
+            let still_pending = match task_handoff_cleanup_pending(engine, &current_status).await {
+                Ok(pending) => pending,
+                Err(error) => {
+                    return mark_task_handoff_migration_attention(
+                        engine,
+                        &current_status,
+                        &format!("could not verify source staging cleanup progress: {error:#}"),
+                    )
+                    .await;
+                }
+            };
+            if !still_pending {
+                break;
+            }
+            if runtime.epoch_fatal.is_signaled() {
+                return Ok(current_status);
+            }
+        }
+    }
+
+    // Keep each exact queue receipt until all source payload, control, and directory checkpoints
+    // are durable. This keeps normal queue actions and task startup from racing source cleanup.
+    for plan in plans {
+        let queue = Arc::clone(&runtime.bot.queue);
+        let transfer = plan.transfer.clone();
         let task = tokio::task::spawn_blocking(move || {
-            let Some(current) = queue.get(&impact.task_id)? else {
-                return Ok(None);
+            let Some(current) = queue.get(&transfer.task_id)? else {
+                return Ok::<_, anyhow::Error>(None);
             };
-            let Some(token) = current.destination_transfer else {
-                return Ok(None);
-            };
-            if token.migration_id != migration_id {
-                bail!("task transfer belongs to another migration");
+            if current
+                .destination_transfer_ack
+                .as_ref()
+                .is_some_and(|saved| saved == &transfer)
+            {
+                queue.clear_task_destination_transfer_ack(&transfer)?;
+                return queue.get(&transfer.task_id);
             }
-            let installed = current.destination.as_ref() == Some(&token.target);
-            if completed || installed {
-                queue.ack_task_destination_transfer(&token)
-            } else {
-                queue.abort_task_destination_transfer(&token)
+            if current.destination_transfer_ack.is_some() {
+                bail!("task has a different handoff receipt after source cleanup");
             }
+            Ok(None)
         })
         .await??;
         restore_task(runtime, task).await?;
     }
-    Ok(())
+    if let Some(status) = read_status(engine, &status.id).await? {
+        Ok(status)
+    } else {
+        Ok(current_status)
+    }
+}
+
+#[derive(Debug)]
+enum UnplannedTransferResolution {
+    NoRecord,
+    Aborted(Box<Option<TaskRecord>>),
+    Attention {
+        transfer_id: Option<String>,
+        message: String,
+    },
+}
+
+#[derive(Debug)]
+enum TaskHandoffResolution {
+    Finalized,
+    Aborted(Box<Option<TaskRecord>>),
+    Attention(String),
+}
+
+async fn task_transfer_statuses(
+    engine: &MigrationEngine,
+    migration_id: &str,
+) -> Result<Vec<crate::library_migration::MigrationTaskTransferStatus>> {
+    let worker = engine.clone();
+    let id = migration_id.to_string();
+    tokio::task::spawn_blocking(move || worker.task_transfer_statuses(&id)).await?
+}
+
+async fn task_handoff_cleanup_pending(
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+) -> Result<bool> {
+    let worker = engine.clone();
+    let id = status.id.clone();
+    let source_library_id = status.source_library_id.clone();
+    tokio::task::spawn_blocking(move || {
+        worker.task_handoff_cleanup_pending(&id, &source_library_id)
+    })
+    .await?
+}
+
+async fn acquire_task_cleanup_lease(
+    runtime: &CloudBotRuntime,
+    status: &MigrationStatus,
+) -> Result<Arc<StdMutex<downloader::VideoMigrationGuard>>> {
+    let queue = Arc::clone(&runtime.bot.queue);
+    let source = status.source_library_id.clone();
+    let target = status.target_library_id.clone();
+    let roots: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
+        let libraries = queue.registry_snapshot()?.libraries;
+        let mut roots = Vec::with_capacity(2);
+        for id in [&source, &target] {
+            roots.push(
+                libraries
+                    .iter()
+                    .find(|library| library.id == *id)
+                    .map(|library| library.root.clone())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("migration library {id} is no longer registered")
+                    })?,
+            );
+        }
+        roots.sort();
+        roots.dedup();
+        if roots.len() != 2 {
+            bail!("migration cleanup roots no longer identify two distinct libraries");
+        }
+        Ok::<_, anyhow::Error>(roots)
+    })
+    .await??;
+    let guard = tokio::select! {
+        _=runtime.epoch_fatal.notified()=>bail!("application is stopping before task handoff cleanup can acquire its output lease"),
+        result=downloader::hold_video_outputs_for_migration(&roots)=>result?,
+    };
+    Ok(Arc::new(StdMutex::new(guard)))
+}
+
+async fn mark_task_handoff_attention(
+    runtime: &CloudBotRuntime,
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+    transfer_id: &str,
+    message: &str,
+) -> Result<MigrationStatus> {
+    let worker = engine.clone();
+    let migration_id = status.id.clone();
+    let transfer_id = transfer_id.to_string();
+    let message = message.to_string();
+    let status = tokio::task::spawn_blocking(move || {
+        worker.mark_task_handoff_attention(&migration_id, &transfer_id, &message)
+    })
+    .await??;
+    runtime
+        .migrations
+        .lock()
+        .await
+        .insert(status.id.clone(), status.clone());
+    runtime.state_notify.notify_one();
+    Ok(status)
+}
+
+async fn mark_task_handoff_migration_attention(
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+    message: &str,
+) -> Result<MigrationStatus> {
+    let worker = engine.clone();
+    let migration_id = status.id.clone();
+    let message = message.to_string();
+    tokio::task::spawn_blocking(move || {
+        worker.mark_task_handoff_migration_attention(&migration_id, &message)
+    })
+    .await?
 }

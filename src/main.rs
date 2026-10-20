@@ -1203,53 +1203,36 @@ impl CloudStateSnapshot {
     }
 
     fn trim_migrations_for_upload(&mut self, state_version: u64, max_bytes: usize) -> Result<()> {
-        for _ in 0..512 {
+        compact_migration_details_for_upload(&mut self.library)?;
+        // Each pass halves every nonempty detail array. The maximum initial row count
+        // therefore gives a strict pass bound (its bit length), independent of the
+        // number of retained migrations. Sorting happens once before these passes, and
+        // each pass serializes the complete snapshot only once.
+        let maximum_detail_count = self
+            .library
+            .get("migrations")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|migration| {
+                ["items", "task_transfers"].into_iter().filter_map(|field| {
+                    migration
+                        .get(field)
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len)
+                })
+            })
+            .max()
+            .unwrap_or(0);
+        let maximum_reductions =
+            usize::BITS as usize - maximum_detail_count.leading_zeros() as usize;
+        for _ in 0..maximum_reductions {
             if self.encoded_size(state_version)?.saturating_add(1024) <= max_bytes {
                 break;
             }
-            let largest = self
-                .library
-                .get("migrations")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .enumerate()
-                .filter_map(|(index, migration)| {
-                    let items = migration["items"].as_array()?;
-                    (!items.is_empty()).then_some((index, items.len()))
-                })
-                .max_by_key(|(_, count)| *count);
-            let Some((index, count)) = largest else {
+            if !reduce_migration_detail_arrays_one_level(&mut self.library)? {
                 break;
-            };
-            let migration = &mut self.library["migrations"][index];
-            let omitted = migration["omitted_item_details"].as_u64().unwrap_or(0);
-            let items = migration["items"]
-                .as_array_mut()
-                .expect("selected migration has items");
-            items.sort_by_key(|item| match item["status"].as_str() {
-                Some("failed") => 0,
-                Some("complete" | "skipped") => 2,
-                _ => 1,
-            });
-            let retained = count / 2;
-            items.truncate(retained);
-            migration["details_incomplete"] = serde_json::json!(true);
-            migration["omitted_item_details"] =
-                serde_json::json!(omitted.saturating_add((count - retained) as u64));
-            if !migration["warnings"].is_array() {
-                migration["warnings"] = serde_json::json!([]);
             }
-            let warnings = migration["warnings"]
-                .as_array_mut()
-                .expect("migration warnings initialized");
-            warnings.retain(|warning| {
-                !warning.as_str().is_some_and(|text| {
-                    text.starts_with("Cloud snapshot omitted migration item details")
-                })
-            });
-            warnings.insert(0,serde_json::json!("Cloud snapshot omitted migration item details to fit its upload budget; totals and recovery controls remain available. Full results are retained in the source library's private migration record."));
-            compact_cloud_library_warnings(warnings)?;
         }
         Ok(())
     }
@@ -1274,6 +1257,296 @@ impl CloudStateSnapshot {
         };
         runtime.client.post_state(&state).await
     }
+}
+
+const CLOUD_MIGRATION_TRANSFER_DETAIL_LIMIT: usize = 32;
+const CLOUD_MIGRATION_TRANSFER_ERROR_BYTES: usize = 512;
+const CLOUD_MIGRATION_COMPACTION_WARNING: &str = "Cloud snapshot summarized migration details to fit its upload budget; task and conflict counts and recovery controls remain available. Full results are retained in the source library's private migration record.";
+const CLOUD_MIGRATION_COMPACTION_WARNING_PREFIX: &str =
+    "Cloud snapshot summarized migration details";
+
+fn migration_task_transfer_has_error(transfer: &serde_json::Value) -> bool {
+    transfer
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|error| !error.trim().is_empty())
+}
+
+fn migration_task_transfer_is_cleaned(transfer: &serde_json::Value) -> bool {
+    transfer
+        .get("commit_acked")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && transfer
+            .get("source_cleanup_complete")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && !migration_task_transfer_has_error(transfer)
+}
+
+fn migration_task_transfer_priority(transfer: &serde_json::Value) -> u8 {
+    if migration_task_transfer_has_error(transfer) {
+        0
+    } else if migration_task_transfer_is_cleaned(transfer) {
+        2
+    } else {
+        1
+    }
+}
+
+fn migration_task_transfer_error_count(transfers: &[serde_json::Value]) -> u64 {
+    transfers
+        .iter()
+        .filter(|transfer| migration_task_transfer_has_error(transfer))
+        .count() as u64
+}
+
+fn update_migration_transfer_omission_counts(migration: &mut serde_json::Value) {
+    let transfers = migration
+        .get("task_transfers")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let visible_count = transfers.len() as u64;
+    let visible_error_count = migration_task_transfer_error_count(transfers);
+    let total_count = migration["task_transfer_count"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            visible_count.saturating_add(
+                migration["omitted_task_transfer_count"]
+                    .as_u64()
+                    .unwrap_or(0),
+            )
+        })
+        .max(visible_count);
+    let total_error_count = migration["task_transfer_error_count"]
+        .as_u64()
+        .unwrap_or_else(|| {
+            visible_error_count.saturating_add(
+                migration["omitted_task_transfer_error_count"]
+                    .as_u64()
+                    .unwrap_or(0),
+            )
+        })
+        .max(visible_error_count);
+    if total_count > 0 {
+        migration["task_transfer_count"] = serde_json::json!(total_count);
+        migration["omitted_task_transfer_count"] =
+            serde_json::json!(total_count.saturating_sub(visible_count));
+    }
+    if total_error_count > 0 {
+        migration["task_transfer_error_count"] = serde_json::json!(total_error_count);
+        migration["omitted_task_transfer_error_count"] =
+            serde_json::json!(total_error_count.saturating_sub(visible_error_count));
+    }
+}
+
+fn compact_migration_details_for_upload(library: &mut serde_json::Value) -> Result<()> {
+    let Some(migrations) = library
+        .get_mut("migrations")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for migration in migrations {
+        let mut changed = false;
+        let previous_truncated_errors = migration["truncated_task_transfer_error_count"]
+            .as_u64()
+            .unwrap_or(0);
+        let mut newly_truncated_errors = 0_u64;
+
+        let current_transfer_count = migration["task_transfers"]
+            .as_array()
+            .map_or(0, |transfers| transfers.len() as u64);
+        let current_error_count = migration["task_transfers"]
+            .as_array()
+            .map_or(0, |transfers| {
+                migration_task_transfer_error_count(transfers)
+            });
+        if current_transfer_count > 0 || migration.get("task_transfer_count").is_some() {
+            let previous_omitted = migration["omitted_task_transfer_count"]
+                .as_u64()
+                .unwrap_or(0);
+            let total = migration["task_transfer_count"]
+                .as_u64()
+                .unwrap_or_else(|| current_transfer_count.saturating_add(previous_omitted))
+                .max(current_transfer_count);
+            migration["task_transfer_count"] = serde_json::json!(total);
+        }
+        if current_error_count > 0 || migration.get("task_transfer_error_count").is_some() {
+            let previous_omitted = migration["omitted_task_transfer_error_count"]
+                .as_u64()
+                .unwrap_or(0);
+            let total = migration["task_transfer_error_count"]
+                .as_u64()
+                .unwrap_or_else(|| current_error_count.saturating_add(previous_omitted))
+                .max(current_error_count);
+            migration["task_transfer_error_count"] = serde_json::json!(total);
+        }
+
+        if let Some(transfers) = migration
+            .get_mut("task_transfers")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            let original_len = transfers.len();
+            transfers.retain(|transfer| !migration_task_transfer_is_cleaned(transfer));
+            changed |= transfers.len() != original_len;
+            transfers.sort_by_key(migration_task_transfer_priority);
+            if transfers.len() > CLOUD_MIGRATION_TRANSFER_DETAIL_LIMIT {
+                transfers.truncate(CLOUD_MIGRATION_TRANSFER_DETAIL_LIMIT);
+                changed = true;
+            }
+            for transfer in transfers {
+                let Some(error) = transfer.get("error").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if error.len() > CLOUD_MIGRATION_TRANSFER_ERROR_BYTES {
+                    let shortened =
+                        truncate_cloud_warning(error, CLOUD_MIGRATION_TRANSFER_ERROR_BYTES);
+                    transfer["error"] = serde_json::Value::String(shortened);
+                    transfer["error_detail_truncated"] = serde_json::Value::Bool(true);
+                    newly_truncated_errors = newly_truncated_errors.saturating_add(1);
+                    changed = true;
+                }
+            }
+        }
+        if let Some(items) = migration
+            .get_mut("items")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            items.sort_by_key(|item| match item["status"].as_str() {
+                Some("failed") => 0,
+                Some("complete" | "skipped") => 2,
+                _ => 1,
+            });
+        }
+
+        let conflict_override_count = migration["item_conflicts"]
+            .as_object()
+            .map_or(0, |overrides| overrides.len() as u64);
+        let previous_omitted_conflicts = migration["omitted_conflict_override_count"]
+            .as_u64()
+            .unwrap_or(0);
+        let previous_total_conflicts = migration["conflict_override_count"]
+            .as_u64()
+            .unwrap_or_else(|| conflict_override_count.saturating_add(previous_omitted_conflicts));
+        let total_conflicts = previous_total_conflicts.max(conflict_override_count);
+        if total_conflicts > 0 {
+            migration["conflict_override_count"] = serde_json::json!(total_conflicts);
+            migration["omitted_conflict_override_count"] =
+                serde_json::json!(total_conflicts.saturating_sub(conflict_override_count));
+        }
+        if conflict_override_count > 0 {
+            migration["item_conflicts"] = serde_json::json!({});
+            migration["omitted_conflict_override_count"] = serde_json::json!(total_conflicts);
+            changed = true;
+        }
+
+        update_migration_transfer_omission_counts(migration);
+        let truncated_error_count =
+            previous_truncated_errors.saturating_add(newly_truncated_errors);
+        if truncated_error_count > 0 {
+            migration["truncated_task_transfer_error_count"] =
+                serde_json::json!(truncated_error_count);
+        }
+        if changed {
+            migration["details_incomplete"] = serde_json::Value::Bool(true);
+            set_migration_compaction_warning(
+                migration,
+                CLOUD_MIGRATION_COMPACTION_WARNING,
+                CLOUD_MIGRATION_COMPACTION_WARNING_PREFIX,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn reduce_migration_detail_arrays_one_level(library: &mut serde_json::Value) -> Result<bool> {
+    let Some(migrations) = library
+        .get_mut("migrations")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(false);
+    };
+    let mut changed_any = false;
+    for migration in migrations {
+        let mut changed = false;
+        let previous_omitted_items = migration["omitted_item_details"].as_u64().unwrap_or(0);
+        let removed_items = {
+            let items = migration
+                .get_mut("items")
+                .and_then(serde_json::Value::as_array_mut);
+            if let Some(items) = items.filter(|items| !items.is_empty()) {
+                let previous_count = items.len();
+                items.truncate(previous_count / 2);
+                previous_count - items.len()
+            } else {
+                0
+            }
+        };
+        if removed_items > 0 {
+            let omitted = migration["omitted_item_details"].as_u64().unwrap_or(0);
+            migration["omitted_item_details"] = serde_json::json!(
+                previous_omitted_items
+                    .max(omitted)
+                    .saturating_add(removed_items as u64)
+            );
+            changed = true;
+        }
+        let removed_transfers = {
+            let transfers = migration
+                .get_mut("task_transfers")
+                .and_then(serde_json::Value::as_array_mut);
+            if let Some(transfers) = transfers.filter(|transfers| !transfers.is_empty()) {
+                let previous_count = transfers.len();
+                transfers.truncate(previous_count / 2);
+                previous_count - transfers.len()
+            } else {
+                0
+            }
+        };
+        if removed_transfers > 0 {
+            update_migration_transfer_omission_counts(migration);
+            changed = true;
+        }
+        if changed {
+            migration["details_incomplete"] = serde_json::Value::Bool(true);
+            if !migration["warnings"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|warning| {
+                    warning.as_str().is_some_and(|text| {
+                        text.starts_with(CLOUD_MIGRATION_COMPACTION_WARNING_PREFIX)
+                    })
+                })
+            {
+                set_migration_compaction_warning(
+                    migration,
+                    CLOUD_MIGRATION_COMPACTION_WARNING,
+                    CLOUD_MIGRATION_COMPACTION_WARNING_PREFIX,
+                )?;
+            }
+            changed_any = true;
+        }
+    }
+    Ok(changed_any)
+}
+
+fn set_migration_compaction_warning(
+    migration: &mut serde_json::Value,
+    warning: &str,
+    prefix: &str,
+) -> Result<()> {
+    if !migration["warnings"].is_array() {
+        migration["warnings"] = serde_json::json!([]);
+    }
+    let warnings = migration["warnings"]
+        .as_array_mut()
+        .expect("migration warnings initialized");
+    warnings.retain(|entry| !entry.as_str().is_some_and(|text| text.starts_with(prefix)));
+    warnings.insert(0, serde_json::Value::String(warning.to_string()));
+    compact_cloud_library_warnings(warnings).map(|_| ())
 }
 
 struct PendingCloudState {

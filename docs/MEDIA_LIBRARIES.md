@@ -28,8 +28,8 @@ Retryable failed video tasks still depend on their registered library. Before a 
 download configuration, the queue revalidates the registered root's saved directory identity;
 a replacement directory at the same pathname is rejected while task and staging records remain
 bound to the original directory.
-Changing the default also requires the registered root to be available and identity-matched;
-rejection preserves the existing default and settings revision.
+Changing the default or a library's category also requires the registered root to be available
+and identity-matched; rejection preserves the existing settings and revision.
 
 A failed refresh retains the last successful view for that library and marks it unavailable.
 Cached items stay visible but read-only until a successful scan. Refresh and library switching
@@ -73,6 +73,8 @@ size and SHA-256 before publication, publishes without replacement, and checks t
 content, and access policy again before source cleanup. A file/provider error preserves the
 remaining source and checkpoint information. This is a recoverable sequence of file checkpoints;
 it does not promise atomic rollback of an entire batch.
+Publication also recovers an interrupted permission change before the final rename, using the
+saved staging identity and access proof rather than accepting an arbitrary file at that path.
 
 **Pause** preserves checkpoints for continuation. **Stop remaining** keeps completed moves and
 leaves uncompleted source data available. **Retry failed** retries failed work. The Mini App shows
@@ -83,15 +85,25 @@ Startup completes or aborts a stopped migration's pending queue handoffs so the 
 do not remain blocked by an orphaned transfer.
 Participating libraries remain registered until pending queue handoffs are acknowledged, even
 when the migration already has a terminal status. This preserves discovery of its source manifest.
+After queue acknowledgement and verified payload removal, source staging controls and empty job
+directories are cleaned through identity-bound checkpoints. Pending cleanup retains both library
+registrations so restart can resolve either end. Unexpected or replaced entries are preserved
+for inspection.
+An older handoff without verifiable queue acknowledgement remains marked for attention with its
+source controls preserved; a missing queue marker or task is not treated as proof of completion.
 
 An independent unchecked option can set the target as default after success. That update is
 recorded once so crash recovery cannot overwrite a later user choice. Migration manifests are
 kept in the source library's private metadata directory, independently of cloud receipt retention.
 A cloud database epoch change pauses automatic recovery until a new authorized resume.
-The default update is conditional on the recorded settings revision; a newer settings change
-causes it to be skipped durably. Cloud snapshots include at most 32 migrations, prioritizing active
+The default update is conditional on the settings revision durably recorded at confirmation,
+before waiting for task writers or output ownership. A newer settings change causes it to be
+skipped durably. Cloud snapshots include at most 32 migrations, prioritizing active
 and recoverable jobs, then recent completed jobs. The UI displays that priority order and reports
 omitted entries; local manifests remain available for recovery.
+Snapshot upload limits also compact migration item, task-handoff, and conflict-choice details.
+Totals, recovery controls, error counts, bounded error details and omission counts remain
+available; complete records stay in the source library's private migration manifest.
 
 ## Storage and rollout
 

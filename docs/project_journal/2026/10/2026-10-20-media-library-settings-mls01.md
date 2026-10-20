@@ -53,7 +53,7 @@ superseded_by: ""
 
 - 未勾选未完成任务选项时，任务、下载片段和恢复状态继续留在原库，状态保持不变，原库继续登记。
 - 勾选后，先暂停受影响的运行中任务，再通过明确、可验证的检查点迁移片段、恢复状态和任务关联，完成后恢复原任务状态。原运行任务继续，原排队任务回到队列并按正常调度执行，原失败及手动暂停任务保持原状态；迁移操作不将这些状态统一改为运行。
-- 私有暂存片段及恢复信息遵循永久保留约定；显式迁移将片段保留在目标库。先停止写入并固定来源文件计划，复制和验证后重建目标控制绑定，再安装目标队列记录；迁移引擎确认交接后，逐项复验并移除来源 payload。来源控制记录和目录可继续保留为恢复依据；不得盲拷贝旧锁状态来建立目标绑定。
+- 私有暂存片段及恢复信息遵循永久保留约定；显式迁移将片段保留在目标库。先停止写入并固定来源文件计划，复制和验证后重建目标控制绑定，再安装目标队列记录；迁移引擎确认交接后，逐项复验并移除来源 payload。队列确认交接后，再通过对象身份绑定的持久检查点清理来源控制记录和空目录；清理未结束时继续登记来源库。不得盲拷贝旧锁状态来建立目标绑定。
 - 错误或中断必须保留数据与可恢复进度。多文件迁移允许部分完成并可恢复，不承诺全批原子回滚；空库也不会自动取消登记。
 
 ### 执行控制与结果
@@ -102,14 +102,14 @@ superseded_by: ""
 | 范围 | 最终结果 |
 | --- | --- |
 | Rust 1.99.1 格式及差异空白检查 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
-| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,124 通过、0 失败、16 个既有忽略项 |
+| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,135 通过、0 失败、16 个既有忽略项 |
 | Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline` 通过 |
-| Cloud / Node 25.8.2 | 类型检查通过；120 项测试通过；Wrangler 4.149.0 dry-run 通过，41 个静态资源 |
+| Cloud / Node 25.8.2 | 类型检查通过；122 项测试通过；Wrangler 4.149.0 dry-run 通过，41 个静态资源 |
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
-- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 和 `.codex-tmp/mls01-review3/`，后者包含最新队列、重启恢复与生产迁移渲染回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
-- 最新 Rust 验证日志为 `mls01-review3/full-tests-final.log`、`clippy-final.log` 和
-  `build-final.log`；Cloud 的测试、类型检查和 dry-run 日志也在 `mls01-review3/` 下。
+- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/`、`.codex-tmp/mls01-review3/` 和 `.codex-tmp/mls01-review4/`，后者包含最新队列、确认时设置修订、快照压缩与来源清理恢复回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
+- 最新 Rust 验证日志为 `mls01-review4/full-tests-final-02.log`、`clippy-final-03.log` 和
+  `build-final.log`；构建后的测试构造和诊断文字调整未改变生产代码。Cloud 的最终测试、类型检查和 dry-run 日志也在 `mls01-review4/` 下。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
 - 大片段恢复用例使用 8–16 MiB 的合成文件；独立运行整体耗时约 15 秒。迁移完成等待设为明确的 60 秒上限，以容纳全量测试共享输出槽及调试模式校验开销，并保留超时状态诊断。全量测试随后通过；未改动生产迁移等待逻辑。
 - 测试使用临时本地目录、合成媒体/片段、fake 下载工具及 mock Telegram/cloud。恢复测试通过重建 runtime/queue 和持久状态重放模拟中断；未向真实 Telegram/Cloudflare 发送请求，未操作生产媒体或终止部署进程。
@@ -164,6 +164,34 @@ superseded_by: ""
   registration. The moved task remains failed at its target without an automatic retry.
 - Default-library changes require an available, identity-matched registered root; rejecting a
   replacement preserves the selected default, settings revision, and original queue data.
+- Category changes apply the same registered-root identity gate. Ordinary child-entry churn is
+  accepted while a replacement root is rejected without changing the category or revision.
+- The migration's expected default-settings revision is persisted with confirmation, before
+  task quiescence or output-lease waits. Restart and confirmation replay cannot adopt a later
+  explicit user choice as the migration's new baseline.
+- Oversized cloud snapshots compact completed handoffs and conflict choices as well as media
+  details. Omission and error totals survive repeated compaction, recovery controls remain
+  available, and the final hydrated JSON must fit the upload budget.
+- `cloud_snapshot_compacts_large_migration_task_details_with_stable_aggregates` covers
+  task-only history, error samples, conflict overrides and repeated upload reduction;
+  `cloud_snapshot_reduction_converges_across_maximum_migration_history` covers 32 retained
+  migrations with 2,048 media rows and 1,024 task handoffs each. Whole-history halving has a
+  pass bound derived from the largest retained array, with one full serialization per pass.
+- Publication resumes after an interrupted pre-rename mode change only for the checkpointed
+  staging object and verified access proof. Replacements, unexpected modes and additional hard
+  links remain errors.
+- The SafeFs regressions are `migration_publish_recovers_exact_checkpointed_inode_at_final_mode`
+  and `migration_publish_rejects_a_replaced_checkpointed_stage`.
+- A durable final queue-acknowledgement checkpoint authorizes source staging control and empty
+  directory cleanup. Cleanup can resume after restart, preserves unknown objects, and retains
+  both registrations until its manifest no longer needs recovery. A queue acknowledgement
+  receipt bridges a crash before that engine checkpoint without treating task absence as proof.
+- `final_ack_cleanup_replays_owner_and_directory_unlinks_after_restart` covers cleanup intents,
+  source owner/directory removal and replay. `replaced_task_control_and_unplanned_child_are_preserved`
+  checks replacement/unknown-entry preservation, and
+  `legacy_completed_handoff_without_final_ack_keeps_source_controls` checks missing ACK proof.
+  Stop intent survives attention and cleanup-only retry; queued task writers remain blocked
+  until the exact acknowledgement receipt is consumed after cleanup.
 
 ## Isolated Cloudflare and Rust E2E at `08f56d4`
 

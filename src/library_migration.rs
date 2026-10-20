@@ -17,7 +17,10 @@ use crate::file_manager::{
     LibraryManager, MigrationPlanOutcome, MigrationPlannedFile, MigrationPlannedGroup,
 };
 use crate::library::{ConflictPolicy, LibrarySnapshot, Presence};
-use crate::media_libraries::{TaskTransferEntryKind, TaskTransferFile, TaskTransferPlan};
+use crate::media_libraries::{
+    TaskTransferControl, TaskTransferControlKind, TaskTransferEntryKind, TaskTransferFile,
+    TaskTransferPlan,
+};
 use crate::safe_fs::{BoundFileAccessPolicy, EntryIdentity, RootedFs};
 
 const PREVIEW_STATE_PREFIX: &str = "migration-preview-";
@@ -325,6 +328,8 @@ struct JobDocument {
     preview: MigrationPreview,
     request: MigrationRequest,
     status: MigrationRunStatus,
+    #[serde(default)]
+    stop_remaining_latched: bool,
     groups: Vec<GroupCheckpoint>,
     runtime_context: Option<MigrationRuntimeContext>,
     #[serde(default)]
@@ -335,6 +340,8 @@ struct JobDocument {
     task_transfers: Vec<TaskTransferCheckpoint>,
     #[serde(default)]
     task_commit_acked: Vec<String>,
+    #[serde(default)]
+    task_final_queue_acked: Vec<String>,
     #[serde(default)]
     default_update_applied: bool,
     #[serde(default)]
@@ -381,8 +388,18 @@ struct FileCheckpoint {
 struct TaskTransferCheckpoint {
     plan: TaskTransferPlan,
     entries: Vec<TaskFileCheckpoint>,
+    #[serde(default)]
+    controls: Vec<TaskControlCleanupCheckpoint>,
     copy_complete: bool,
     error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct TaskControlCleanupCheckpoint {
+    #[serde(default)]
+    source_cleanup_intent: bool,
+    #[serde(default)]
+    source_removed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -608,7 +625,20 @@ impl MigrationEngine {
 
     /// Confirms a preview by persisting a queued manifest. It performs no media copy, so the
     /// cloud dispatcher can return quickly and let a background loop call `step`.
+    #[cfg(test)]
     pub(crate) fn confirm(&self, preview_id: &str, revision: &str) -> Result<MigrationStatus> {
+        self.confirm_with_default_revision(preview_id, revision, None)
+    }
+
+    /// Confirms a preview and atomically latches the library-registry revision observed by the
+    /// caller immediately before confirmation. Duplicate confirmation returns the saved job
+    /// unchanged, so a replay can never bind a later settings revision.
+    pub(crate) fn confirm_with_default_revision(
+        &self,
+        preview_id: &str,
+        revision: &str,
+        expected_default_revision: Option<u64>,
+    ) -> Result<MigrationStatus> {
         let _state_lock = self.source.migration_state_lock()?;
         let job_name = job_state_name(preview_id);
         if let Some(bytes) = self
@@ -636,6 +666,16 @@ impl MigrationEngine {
         self.validate_preview_bindings(&document)?;
         if document.created_at.saturating_add(24 * 60 * 60) < unix_seconds() {
             bail!("migration preview expired; create a fresh preview");
+        }
+        if document.preview.set_target_default_on_success && expected_default_revision.is_none() {
+            bail!(
+                "a settings revision must be captured before confirming the requested default-library update"
+            );
+        }
+        if !document.preview.set_target_default_on_success && expected_default_revision.is_some() {
+            bail!(
+                "a default-library settings revision was supplied for a migration that did not request a default update"
+            );
         }
 
         let groups = document
@@ -690,15 +730,17 @@ impl MigrationEngine {
             preview: document.preview,
             request: document.request,
             status: MigrationRunStatus::Queued,
+            stop_remaining_latched: false,
             groups,
             runtime_context: None,
             awaiting_task_commit: false,
             execution_revalidated: false,
             task_transfers: Vec::new(),
             task_commit_acked: Vec::new(),
+            task_final_queue_acked: Vec::new(),
             default_update_applied: false,
             default_update_resolved: false,
-            default_update_expected_revision: None,
+            default_update_expected_revision: expected_default_revision,
             runtime_warnings: Vec::new(),
         };
         let status = status_from_job(&job);
@@ -968,6 +1010,7 @@ impl MigrationEngine {
                         | MigrationRunStatus::Partial
                         | MigrationRunStatus::Failed
                 ) {
+                    job.stop_remaining_latched = true;
                     for group in &mut job.groups {
                         if !is_group_terminal(group) {
                             if group.files.iter().all(|file| file.source_removed) {
@@ -992,25 +1035,34 @@ impl MigrationEngine {
                     job.status,
                     MigrationRunStatus::Partial | MigrationRunStatus::Failed
                 ) {
-                    for group in &mut job.groups {
-                        if group.status == MigrationItemPhase::Failed {
-                            group.status = if group.files.iter().all(|file| file.published) {
-                                MigrationItemPhase::CleaningSource
-                            } else if group.files.iter().any(|file| file.verified) {
-                                MigrationItemPhase::Publishing
-                            } else {
-                                MigrationItemPhase::Copying
-                            };
-                            group.error = None;
-                            group.failure_kind = None;
+                    if job.stop_remaining_latched {
+                        // A retry after StopRemaining may reconcile only durable task handoffs.
+                        // Keep every media checkpoint in its stopped state so retry cannot copy
+                        // or remove files the user chose to leave at the source.
+                        if job.groups.iter().all(is_group_terminal) {
+                            job.status = MigrationRunStatus::Stopped;
                         }
-                    }
-                    for transfer in &mut job.task_transfers {
-                        if transfer.error.is_some() {
-                            transfer.error = None;
+                    } else {
+                        for group in &mut job.groups {
+                            if group.status == MigrationItemPhase::Failed {
+                                group.status = if group.files.iter().all(|file| file.published) {
+                                    MigrationItemPhase::CleaningSource
+                                } else if group.files.iter().any(|file| file.verified) {
+                                    MigrationItemPhase::Publishing
+                                } else {
+                                    MigrationItemPhase::Copying
+                                };
+                                group.error = None;
+                                group.failure_kind = None;
+                            }
                         }
+                        for transfer in &mut job.task_transfers {
+                            if transfer.error.is_some() {
+                                transfer.error = None;
+                            }
+                        }
+                        job.status = MigrationRunStatus::Queued;
                     }
-                    job.status = MigrationRunStatus::Queued;
                 }
             }
         }
@@ -1094,6 +1146,9 @@ impl MigrationEngine {
             bail!("task transfer plan byte count does not match its file list");
         }
         validate_task_plan_paths(&plan)?;
+        for control in &plan.controls {
+            validate_task_control_proof(control)?;
+        }
         let entries = plan
             .files
             .iter()
@@ -1116,9 +1171,11 @@ impl MigrationEngine {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let controls = vec![TaskControlCleanupCheckpoint::default(); plan.controls.len()];
         let checkpoint = TaskTransferCheckpoint {
             plan,
             entries,
+            controls,
             copy_complete: false,
             error: None,
         };
@@ -1209,6 +1266,339 @@ impl MigrationEngine {
         Ok(status_from_job(&job))
     }
 
+    /// Records the queue's final token acknowledgment after the coordinator has verified its
+    /// exact transfer receipt. This marker is distinct from `ack_task_transfer`, which only
+    /// acknowledges target-record installation.
+    pub(crate) fn ack_task_handoff_final(
+        &self,
+        migration_id: &str,
+        transfer_id: &str,
+    ) -> Result<MigrationStatus> {
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        if !job
+            .task_transfers
+            .iter()
+            .any(|checkpoint| checkpoint.plan.transfer.transfer_id == transfer_id)
+        {
+            bail!("final task handoff acknowledgment is not bound to this migration");
+        }
+        if !job
+            .task_commit_acked
+            .iter()
+            .any(|saved| saved == transfer_id)
+        {
+            bail!("task handoff cannot be finalized before the target record is installed");
+        }
+        if !job
+            .task_final_queue_acked
+            .iter()
+            .any(|saved| saved == transfer_id)
+        {
+            job.task_final_queue_acked.push(transfer_id.to_string());
+            self.save_job(&job)?;
+        }
+        Ok(status_from_job(&job))
+    }
+
+    pub(crate) fn task_handoff_final_acknowledged(
+        &self,
+        migration_id: &str,
+        transfer_id: &str,
+    ) -> Result<bool> {
+        let job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        Ok(job
+            .task_final_queue_acked
+            .iter()
+            .any(|saved| saved == transfer_id))
+    }
+
+    /// True while either participant library is needed to recover a task handoff or its source
+    /// staging cleanup. This is the durable removal guard after the queue token is cleared.
+    pub(crate) fn task_handoff_cleanup_pending(
+        &self,
+        migration_id: &str,
+        library_id: &str,
+    ) -> Result<bool> {
+        let job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        if !job.request.include_incomplete_tasks
+            || (library_id != job.source.library_id && library_id != job.target.library_id)
+        {
+            return Ok(false);
+        }
+        let stopped_without_cleanup = job.stop_remaining_latched
+            && matches!(
+                job.status,
+                MigrationRunStatus::Stopped | MigrationRunStatus::Partial
+            );
+        if !stopped_without_cleanup
+            && (!all_task_plans_attached(&job) || !all_task_transfers_acked(&job))
+        {
+            return Ok(true);
+        }
+        Ok(job.task_transfers.iter().any(|transfer| {
+            job.task_commit_acked
+                .iter()
+                .any(|id| id == &transfer.plan.transfer.transfer_id)
+                && !transfer_source_cleanup_complete(
+                    transfer,
+                    job.task_final_queue_acked
+                        .iter()
+                        .any(|id| id == &transfer.plan.transfer.transfer_id),
+                )
+        }))
+    }
+
+    /// Marks a handoff that cannot be proven after restart for explicit attention. It retains
+    /// every source control and staging directory and leaves the job terminal until a user retries.
+    pub(crate) fn mark_task_handoff_attention(
+        &self,
+        migration_id: &str,
+        transfer_id: &str,
+        warning: &str,
+    ) -> Result<MigrationStatus> {
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        let transfer = job
+            .task_transfers
+            .iter_mut()
+            .find(|checkpoint| checkpoint.plan.transfer.transfer_id == transfer_id)
+            .ok_or_else(|| anyhow!("task handoff is not bound to this migration"))?;
+        transfer.error = Some(redact_runtime_warning(warning));
+        if job.status == MigrationRunStatus::Stopped {
+            job.stop_remaining_latched = true;
+        }
+        if matches!(
+            job.status,
+            MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+        ) {
+            job.status = MigrationRunStatus::Partial;
+        }
+        record_runtime_warning(&mut job, warning);
+        self.save_job(&job)?;
+        Ok(status_from_job(&job))
+    }
+
+    /// Marks a migration-level handoff gap that has no attached transfer ID for explicit
+    /// attention. This is used for legacy/corrupt checkpoints where inventing queue proof would
+    /// be unsafe; source controls and staging directories remain untouched.
+    pub(crate) fn mark_task_handoff_migration_attention(
+        &self,
+        migration_id: &str,
+        warning: &str,
+    ) -> Result<MigrationStatus> {
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        if job.status == MigrationRunStatus::Stopped {
+            job.stop_remaining_latched = true;
+        }
+        if matches!(
+            job.status,
+            MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+        ) {
+            job.status = MigrationRunStatus::Partial;
+        }
+        record_runtime_warning(&mut job, warning);
+        self.save_job(&job)?;
+        Ok(status_from_job(&job))
+    }
+
+    /// Performs at most one source control or empty-directory cleanup checkpoint. The output
+    /// lease is supplied by the coordinator and must already cover both bound libraries.
+    pub(crate) fn step_task_source_cleanup_with_output_lease(
+        &self,
+        migration_id: &str,
+        transfer_id: &str,
+        lease: &crate::downloader::VideoMigrationGuard,
+    ) -> Result<MigrationStatus> {
+        self.source.migration_validate_output_lease(lease)?;
+        self.target.migration_validate_output_lease(lease)?;
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        let task_index = job
+            .task_transfers
+            .iter()
+            .position(|checkpoint| checkpoint.plan.transfer.transfer_id == transfer_id)
+            .ok_or_else(|| anyhow!("task cleanup is not bound to this migration"))?;
+        if !job
+            .task_final_queue_acked
+            .iter()
+            .any(|saved| saved == transfer_id)
+        {
+            bail!(
+                "task source-control cleanup is not authorized before final queue acknowledgment"
+            );
+        }
+
+        let result = self.step_task_control_and_directory_cleanup(&mut job, task_index);
+        if let Err(error) = result {
+            if job.status == MigrationRunStatus::Stopped {
+                job.stop_remaining_latched = true;
+            }
+            let transfer = &mut job.task_transfers[task_index];
+            transfer.error = Some(redact_runtime_warning(&format!("{error:#}")));
+            record_runtime_warning(
+                &mut job,
+                &format!("task source cleanup needs attention: {error:#}"),
+            );
+            if matches!(
+                job.status,
+                MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+            ) {
+                job.status = MigrationRunStatus::Partial;
+            }
+        } else {
+            let final_acknowledged = job
+                .task_final_queue_acked
+                .iter()
+                .any(|id| id == transfer_id);
+            if transfer_source_cleanup_complete(&job.task_transfers[task_index], final_acknowledged)
+            {
+                // Keep the durable error until the entire exact source cleanup is complete.
+                // This lets a cleanup-only retry clear stale failures without erasing errors
+                // while other controls or directories still need recovery.
+                job.task_transfers[task_index].error = None;
+            }
+            if job.status != MigrationRunStatus::Stopped
+                && job.groups.iter().all(is_group_terminal)
+                && job.task_transfers.iter().all(|transfer| {
+                    transfer.error.is_none()
+                        && transfer_source_cleanup_complete(
+                            transfer,
+                            job.task_final_queue_acked
+                                .iter()
+                                .any(|id| id == &transfer.plan.transfer.transfer_id),
+                        )
+                })
+                && !job
+                    .groups
+                    .iter()
+                    .any(|group| group.status == MigrationItemPhase::Failed)
+            {
+                job.status = MigrationRunStatus::Completed;
+            }
+        }
+        self.save_job(&job)?;
+        Ok(status_from_job(&job))
+    }
+
+    fn step_task_control_and_directory_cleanup(
+        &self,
+        job: &mut JobDocument,
+        task_index: usize,
+    ) -> Result<()> {
+        let transfer = job
+            .task_transfers
+            .get_mut(task_index)
+            .ok_or_else(|| anyhow!("task transfer checkpoint disappeared during cleanup"))?;
+        if !transfer
+            .plan
+            .files
+            .iter()
+            .zip(&transfer.entries)
+            .filter(|(file, _)| file.kind == TaskTransferEntryKind::File)
+            .all(|(_, entry)| entry.source_removed)
+        {
+            return Ok(());
+        }
+        if transfer.controls.len() < transfer.plan.controls.len() {
+            transfer.controls.resize_with(
+                transfer.plan.controls.len(),
+                TaskControlCleanupCheckpoint::default,
+            );
+        }
+        if transfer.controls.len() != transfer.plan.controls.len() {
+            bail!("task control cleanup checkpoint does not match its frozen plan");
+        }
+
+        let control_index = transfer
+            .plan
+            .controls
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !transfer.controls[*index].source_removed)
+            .min_by_key(|(index, control)| (task_control_cleanup_priority(control.kind), *index))
+            .map(|(index, _)| index);
+        if let Some(control_index) = control_index {
+            let control = transfer.plan.controls[control_index].clone();
+            let checkpoint = &mut transfer.controls[control_index];
+            let actual = self
+                .source
+                .migration_task_path_identity(&control.source_relative)?;
+            let expected = EntryIdentity::regular_file(control.device, control.inode);
+            if actual.is_none() {
+                if checkpoint.source_cleanup_intent {
+                    checkpoint.source_removed = true;
+                    return Ok(());
+                }
+                bail!("task staging control disappeared before cleanup intent");
+            }
+            if actual != Some(expected) {
+                bail!("task staging control was replaced before cleanup");
+            }
+            if !checkpoint.source_cleanup_intent {
+                checkpoint.source_cleanup_intent = true;
+                return Ok(());
+            }
+            self.source.migration_task_remove_source_control(&control)?;
+            checkpoint.source_removed = true;
+            return Ok(());
+        }
+
+        let directory_index = transfer
+            .plan
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(index, file)| {
+                file.kind == TaskTransferEntryKind::Directory
+                    && !transfer.entries[*index].source_removed
+            })
+            .max_by_key(|(_, file)| file.source_relative.components().count())
+            .map(|(index, _)| index);
+        if let Some(directory_index) = directory_index {
+            let directory = transfer.plan.files[directory_index].clone();
+            let expected = EntryIdentity::directory(directory.device, directory.inode);
+            let checkpoint = &mut transfer.entries[directory_index];
+            let actual = self
+                .source
+                .migration_task_path_identity(&directory.source_relative)?;
+            if actual.is_none() {
+                if checkpoint.source_cleanup_intent {
+                    checkpoint.source_removed = true;
+                    return Ok(());
+                }
+                bail!("task staging directory disappeared before cleanup intent");
+            }
+            if actual != Some(expected) {
+                bail!("task staging directory was replaced before cleanup");
+            }
+            if !checkpoint.source_cleanup_intent {
+                if !self
+                    .source
+                    .migration_task_source_directory_matches(&directory)?
+                {
+                    bail!(
+                        "task staging directory identity or access policy changed before cleanup"
+                    );
+                }
+                checkpoint.source_cleanup_intent = true;
+                return Ok(());
+            }
+            self.source
+                .migration_task_remove_source_directory(&directory)?;
+            checkpoint.source_removed = true;
+            return Ok(());
+        }
+        Ok(())
+    }
+
     /// Returns durable status using only the source root. The destination may be offline.
     pub(crate) fn list_for_source(source: &LibraryManager) -> Result<Vec<MigrationStatus>> {
         let names = source.migration_state_names()?;
@@ -1260,37 +1650,6 @@ impl MigrationEngine {
         let job: JobDocument = decode_state(&bytes, "migration job")?;
         self.validate_job_bindings(&job)?;
         Ok(job.runtime_context)
-    }
-
-    /// Saves the settings revision observed immediately before a bounded execution step. The
-    /// registry CAS later prevents a user change after this point from being overwritten.
-    pub(crate) fn bind_default_update_expected_revision(
-        &self,
-        migration_id: &str,
-        expected_revision: u64,
-    ) -> Result<()> {
-        let _state_lock = self.source.migration_state_lock()?;
-        let mut job = self.load_job(migration_id)?;
-        self.validate_job_bindings(&job)?;
-        if !job.preview.set_target_default_on_success {
-            bail!("migration did not request a default-library update");
-        }
-        if job.default_update_resolved || job.default_update_applied {
-            return Ok(());
-        }
-        if job.default_update_expected_revision.is_some()
-            || !matches!(
-                job.status,
-                MigrationRunStatus::Queued | MigrationRunStatus::Running
-            )
-        {
-            // The first observed settings revision is the compare-and-set baseline. Never
-            // replace it later in the run: that would hide a user's intervening choice.
-            return Ok(());
-        }
-        job.default_update_expected_revision = Some(expected_revision);
-        self.save_job(&job)?;
-        Ok(())
     }
 
     pub(crate) fn default_update_expected_revision(
@@ -1458,6 +1817,7 @@ impl MigrationEngine {
                             &staging_name,
                             staging_identity,
                             file.plan.proof.size,
+                            None,
                             offset,
                             length,
                         )?;
@@ -1526,6 +1886,7 @@ impl MigrationEngine {
                             staging_identity,
                             &file.plan.target_path,
                             &file.plan.proof,
+                            target_access,
                         )?;
                         if published_identity != target_identity
                             || !self.target.migration_target_matches_exact(
@@ -1773,8 +2134,10 @@ impl MigrationEngine {
                 bail!("task target conflicts with an existing entry before publication");
             }
 
-            let Some(actual_staging_identity) =
-                self.target.migration_staging_identity(&staging_name)?
+            let expected_access = task_transfer_access_policy(&plan_file);
+            let Some(actual_staging_identity) = self
+                .target
+                .migration_staging_identity(&staging_name, expected_access)?
             else {
                 bail!("task migration staging file disappeared before publication");
             };
@@ -1831,6 +2194,7 @@ impl MigrationEngine {
                     &staging_name,
                     staging_identity,
                     plan_file.size_bytes,
+                    Some(task_transfer_access_policy(&plan_file)),
                     offset,
                     length,
                 )?;
@@ -1858,7 +2222,7 @@ impl MigrationEngine {
         }
         if self
             .target
-            .migration_staging_identity(&staging_name)?
+            .migration_staging_entry_identity(&staging_name)?
             .is_some()
         {
             // A stage that exists without a persisted inode checkpoint may be an interrupted
@@ -2548,16 +2912,35 @@ fn task_transfer_statuses_from_job(job: &JobDocument) -> Vec<MigrationTaskTransf
                     .iter()
                     .filter(|file| file.kind == TaskTransferEntryKind::File)
                     .count(),
-                source_cleanup_complete: plan
-                    .files
-                    .iter()
-                    .zip(&checkpoint.entries)
-                    .filter(|(file, _)| file.kind == TaskTransferEntryKind::File)
-                    .all(|(_, entry)| entry.source_removed),
+                source_cleanup_complete: transfer_source_cleanup_complete(
+                    checkpoint,
+                    job.task_final_queue_acked
+                        .iter()
+                        .any(|id| id == &plan.transfer.transfer_id),
+                ),
                 error: checkpoint.error.clone(),
             }
         })
         .collect()
+}
+
+fn transfer_source_cleanup_complete(
+    transfer: &TaskTransferCheckpoint,
+    final_queue_acknowledged: bool,
+) -> bool {
+    final_queue_acknowledged
+        && transfer.plan.files.len() == transfer.entries.len()
+        && transfer
+            .plan
+            .files
+            .iter()
+            .zip(&transfer.entries)
+            .all(|(_, entry)| entry.source_removed)
+        && transfer.plan.controls.len() == transfer.controls.len()
+        && transfer
+            .controls
+            .iter()
+            .all(|control| control.source_removed)
 }
 
 fn is_group_terminal(group: &GroupCheckpoint) -> bool {
@@ -2606,6 +2989,14 @@ fn all_task_payloads_removed(job: &JobDocument) -> bool {
                 .filter(|(file, _)| file.kind == TaskTransferEntryKind::File)
                 .all(|(_, entry)| entry.source_removed)
         })
+}
+
+fn task_control_cleanup_priority(kind: TaskTransferControlKind) -> u8 {
+    match kind {
+        TaskTransferControlKind::Owner => 2,
+        TaskTransferControlKind::Retention => 1,
+        _ => 0,
+    }
 }
 
 fn all_task_plans_attached(job: &JobDocument) -> bool {
@@ -2708,6 +3099,26 @@ fn validate_task_transfer_file_proof(file: &TaskTransferFile) -> Result<()> {
         )
     {
         bail!("empty task transfer file has a nonempty content digest");
+    }
+    Ok(())
+}
+
+fn validate_task_control_proof(control: &TaskTransferControl) -> Result<()> {
+    const MAX_CONTROL_BYTES: u64 = 1024 * 1024;
+    if control.device == 0 || control.inode == 0 {
+        bail!("task transfer control is missing its source identity");
+    }
+    if control.size_bytes > MAX_CONTROL_BYTES {
+        bail!("task transfer control exceeds its bounded cleanup size");
+    }
+    if control.owner != unsafe { libc::geteuid() } as u32
+        || control.mode != 0o600
+        || control.link_count != Some(1)
+    {
+        bail!("task transfer control has an invalid owner, mode, or link count");
+    }
+    if !is_sha256_hex(&control.sha256) {
+        bail!("task transfer control has an invalid SHA-256 proof");
     }
     Ok(())
 }

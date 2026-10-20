@@ -1238,12 +1238,28 @@ impl RootedFs {
         staging_identity: EntryIdentity,
         target_path: &Path,
         expected_size: u64,
-        mode: u16,
+        expected_target_access: BoundFileAccessPolicy,
     ) -> Result<EntryIdentity> {
         let staging_entry = self.bind_entry(staging_path, false)?;
         let staging = self.open_bound_file_if_identity(&staging_entry, staging_identity)?;
         let policy_before = staging.access_policy_snapshot()?;
-        staging.validate_private_single_link(0o600)?;
+        let expected_mode = (expected_target_access.mode & 0o777) as u16;
+        if expected_target_access.link_count != 1
+            || expected_target_access.mode & !0o777 != 0
+            || staging_identity != staging.identity()
+            || policy_before.owner != expected_target_access.owner
+            || policy_before.group != expected_target_access.group
+            || policy_before.link_count != expected_target_access.link_count
+            || policy_before.mode & 0o7000 != 0
+        {
+            bail!(
+                "verified migration staging access policy does not match its saved publication proof"
+            );
+        }
+        let current_mode = (policy_before.mode & 0o777) as u16;
+        if current_mode != 0o600 && current_mode != expected_mode {
+            bail!("verified migration staging mode changed before publication");
+        }
         if staging.byte_len()? != expected_size {
             bail!("verified migration staging file changed size before publication");
         }
@@ -1251,14 +1267,16 @@ impl RootedFs {
         if self.bound_entry_identity(&target_entry)?.is_some() {
             bail!("migration target already exists: {}", target_path.display());
         }
-        staging.set_mode(mode & 0o777)?;
+        if current_mode != expected_mode {
+            staging.set_mode(expected_mode)?;
+        }
         staging.sync_all()?;
         if staging.byte_len()? != expected_size || staging.identity() != staging_identity {
             bail!("verified migration staging object changed before publication");
         }
         let policy_after = staging.access_policy_snapshot()?;
-        if policy_before.owner != policy_after.owner || policy_before.group != policy_after.group {
-            bail!("verified migration staging ownership changed before publication");
+        if policy_after != expected_target_access {
+            bail!("verified migration staging access policy changed before publication");
         }
         if let Err(error) = self.rename_via_bound_parents_noreplace_if_identity(
             &staging_entry,
@@ -6011,5 +6029,215 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_publish_recovers_exact_checkpointed_inode_at_final_mode() {
+        let parent = temp_dir("migration-publish-final-mode-recovery");
+        let source_path = parent.join("source");
+        let target_root_path = parent.join("target");
+        fs::create_dir_all(&target_root_path).expect("target root should create");
+        fs::write(&source_path, b"bounded migration payload").expect("source payload should write");
+        let source_root = RootedFs::new(&parent).expect("source root should bind");
+        let target_root = RootedFs::new(&target_root_path).expect("target root should bind");
+        let source_identity = source_root
+            .entry_identity(&source_path)
+            .expect("source identity should read")
+            .expect("source should exist");
+        let source_entry = source_root
+            .bind_entry(&source_path, false)
+            .expect("source should bind");
+        let source = source_root
+            .open_bound_file_if_identity(&source_entry, source_identity)
+            .expect("source should open by identity");
+        let expected_access = source.access_policy().expect("source policy should read");
+        let size = source.byte_len().expect("source length should read");
+
+        let staging_path = target_root_path.join("migration-stage");
+        let staging_identity = target_root
+            .create_migration_staging_file(&staging_path)
+            .expect("private migration stage should create");
+        let copied = source_root
+            .copy_migration_chunk(
+                &source_path,
+                source_identity,
+                size,
+                expected_access,
+                &target_root,
+                &staging_path,
+                staging_identity,
+                0,
+                size,
+            )
+            .expect("migration payload should copy");
+        assert_eq!(copied.bytes, size);
+        let staging_entry = target_root
+            .bind_entry(&staging_path, false)
+            .expect("stage should bind");
+        let staging = target_root
+            .open_bound_file_read_write_if_identity(&staging_entry, staging_identity)
+            .expect("stage should open by identity");
+        assert_eq!(
+            staging.sha256().expect("copied payload should hash"),
+            copied.sha256,
+            "the persisted copy chunk should be content-verified before publication"
+        );
+
+        let hardlink = target_root_path.join("stage-alias");
+        fs::hard_link(&staging_path, &hardlink).expect("stage hard link should create");
+        let target_path = target_root_path.join("library/published");
+        fs::create_dir_all(target_path.parent().unwrap()).expect("target parent should create");
+        assert!(
+            target_root
+                .publish_migration_staging_file_after_chunk_verification(
+                    &staging_path,
+                    staging_identity,
+                    &target_path,
+                    size,
+                    expected_access,
+                )
+                .is_err(),
+            "a hard-linked staging object must not publish"
+        );
+        fs::remove_file(&hardlink).expect("stage hard link should be removed");
+
+        let unauthorized_mode = (expected_access.mode ^ 0o010) as u16;
+        staging
+            .set_mode(unauthorized_mode)
+            .expect("test should set a different non-private mode");
+        assert!(
+            target_root
+                .publish_migration_staging_file_after_chunk_verification(
+                    &staging_path,
+                    staging_identity,
+                    &target_path,
+                    size,
+                    expected_access,
+                )
+                .is_err(),
+            "an uncheckpointed final mode must not publish"
+        );
+
+        // Simulate a crash after chmod+fsync and before no-replace rename.
+        staging
+            .set_mode(expected_access.mode as u16)
+            .expect("fixture should install the checkpointed final mode");
+        let published = target_root
+            .publish_migration_staging_file_after_chunk_verification(
+                &staging_path,
+                staging_identity,
+                &target_path,
+                size,
+                expected_access,
+            )
+            .expect("exact checkpointed final mode should be resumable");
+        assert_eq!(published, staging_identity);
+        assert_eq!(
+            fs::read(&target_path).expect("published payload should read"),
+            b"bounded migration payload"
+        );
+        let published_entry = target_root
+            .bind_entry(&target_path, false)
+            .expect("published path should bind");
+        let published_file = target_root
+            .open_bound_file_if_identity(&published_entry, staging_identity)
+            .expect("published file should preserve the checkpointed inode");
+        assert_eq!(
+            published_file
+                .access_policy()
+                .expect("published access policy should read"),
+            expected_access
+        );
+        assert!(
+            !staging_path.exists(),
+            "stage should be renamed exactly once"
+        );
+
+        drop(published_file);
+        drop(staging);
+        drop(source);
+        drop(target_root);
+        drop(source_root);
+        fs::remove_dir_all(parent).expect("migration fixture should clean up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_publish_rejects_a_replaced_checkpointed_stage() {
+        let parent = temp_dir("migration-publish-replaced-stage");
+        let source_path = parent.join("source");
+        let target_root_path = parent.join("target");
+        fs::create_dir_all(&target_root_path).expect("target root should create");
+        fs::write(&source_path, b"replacement must not be adopted")
+            .expect("source payload should write");
+        let source_root = RootedFs::new(&parent).expect("source root should bind");
+        let target_root = RootedFs::new(&target_root_path).expect("target root should bind");
+        let source_identity = source_root
+            .entry_identity(&source_path)
+            .expect("source identity should read")
+            .expect("source should exist");
+        let source_entry = source_root
+            .bind_entry(&source_path, false)
+            .expect("source should bind");
+        let source = source_root
+            .open_bound_file_if_identity(&source_entry, source_identity)
+            .expect("source should open by identity");
+        let expected_access = source.access_policy().expect("source policy should read");
+        let size = source.byte_len().expect("source length should read");
+        let staging_path = target_root_path.join("migration-stage");
+        let staging_identity = target_root
+            .create_migration_staging_file(&staging_path)
+            .expect("private migration stage should create");
+        source_root
+            .copy_migration_chunk(
+                &source_path,
+                source_identity,
+                size,
+                expected_access,
+                &target_root,
+                &staging_path,
+                staging_identity,
+                0,
+                size,
+            )
+            .expect("migration payload should copy");
+
+        fs::remove_file(&staging_path).expect("captured stage should be displaced");
+        fs::write(&staging_path, b"replacement must not be adopted")
+            .expect("replacement stage should create");
+        let replacement_identity = target_root
+            .entry_identity(&staging_path)
+            .expect("replacement identity should read")
+            .expect("replacement should exist");
+        assert_ne!(replacement_identity, staging_identity);
+        fs::set_permissions(
+            &staging_path,
+            fs::Permissions::from_mode(expected_access.mode & 0o777),
+        )
+        .expect("replacement should use the expected mode");
+        let target_path = target_root_path.join("library/published");
+        fs::create_dir_all(target_path.parent().unwrap()).expect("target parent should create");
+        assert!(
+            target_root
+                .publish_migration_staging_file_after_chunk_verification(
+                    &staging_path,
+                    staging_identity,
+                    &target_path,
+                    size,
+                    expected_access,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(&staging_path).expect("replacement stage should remain untouched"),
+            b"replacement must not be adopted"
+        );
+        assert!(!target_path.exists(), "replacement must not be published");
+
+        drop(source);
+        drop(target_root);
+        drop(source_root);
+        fs::remove_dir_all(parent).expect("migration fixture should clean up");
     }
 }

@@ -295,6 +295,13 @@ describe("migration progress controls and history notice", () => {
       failed_count: 0,
       task_transfers: [{ error: "staged payload transfer failed" }],
     })).toEqual(["stop_remaining", "retry_failed"]);
+    expect(migrationControlActions({
+      status: "partial",
+      failed_count: 0,
+      task_transfers: [],
+      task_transfer_error_count: 2,
+      omitted_task_transfer_error_count: 2,
+    })).toEqual(["stop_remaining", "retry_failed"]);
   });
 
   it("keeps ordinary progress controls and hides terminal controls without recoverable work", () => {
@@ -371,6 +378,58 @@ describe("migration history rendering", () => {
     expect(markup).toContain("history-0");
     expect(markup).not.toContain("history-7");
     expect(markup.indexOf('data-migration-id="prioritized-running"')).toBeLessThan(markup.indexOf("history-0"));
+  });
+
+  it("renders summarized handoffs and aggregate recovery controls without implying details are pending", () => {
+    const markup = renderMigrationHistory({
+      migrations: [{
+        id: "summarized-task-handoffs",
+        status: "partial",
+        source_library_id: "source",
+        target_library_id: "target",
+        incomplete_task_count: 5,
+        task_transfer_count: 5,
+        task_transfer_error_count: 2,
+        omitted_task_transfer_count: 5,
+        omitted_task_transfer_error_count: 2,
+        omitted_conflict_override_count: 3,
+        task_transfers: [],
+      }],
+      libraries,
+      libraryId: "source",
+    });
+
+    expect(markup).toContain("Task handoff details summarized");
+    expect(markup).toContain("5 details omitted from this cloud view · 2 errors summarized");
+    expect(markup).toContain("3 per-item conflict choices summarized");
+    expect(markup).not.toContain("Waiting for task transfer details.");
+    expect(markup).toContain('data-migration-control="stop_remaining"');
+    expect(markup).toContain('data-migration-control="retry_failed"');
+  });
+
+  it("shows source cleanup progress after queue acknowledgement", () => {
+    const markup = renderMigrationHistory({
+      migrations: [{
+        id: "source-cleanup-pending",
+        status: "running",
+        source_library_id: "source",
+        target_library_id: "target",
+        incomplete_task_count: 1,
+        task_transfer_count: 1,
+        task_transfers: [{
+          task_id: "task-1",
+          commit_acked: true,
+          source_cleanup_complete: false,
+          completed_files: 1,
+          total_files: 1,
+        }],
+      }],
+      libraries,
+      libraryId: "source",
+    });
+
+    expect(markup).toContain("Finishing task handoff and source cleanup");
+    expect(markup).not.toContain(">Task handoff complete<");
   });
 });
 

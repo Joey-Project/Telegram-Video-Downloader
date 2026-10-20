@@ -313,6 +313,11 @@ pub struct TaskRecord {
     pub destination_transfer: Option<TaskDestinationTransfer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination_transfer_phase: Option<TaskDestinationTransferPhase>,
+    /// Exact durable proof that the queue side of the last handoff was acknowledged. Kept until
+    /// the migration engine durably records its final queue acknowledgment and completes source
+    /// staging cleanup, so normal task actions cannot race the cleanup after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) destination_transfer_ack: Option<TaskDestinationTransfer>,
     pub status: TaskStatus,
     #[serde(default)]
     pub cancel_requested: bool,
@@ -472,6 +477,7 @@ impl TaskRecord {
             destination: None,
             destination_transfer: None,
             destination_transfer_phase: None,
+            destination_transfer_ack: None,
             status: TaskStatus::Received,
             cancel_requested: false,
             plan: None,
@@ -1657,6 +1663,7 @@ impl QueueManager {
         category: Option<&Path>,
     ) -> Result<MediaLibrarySnapshot> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        self.validate_video_library_for_settings_mutation_unlocked(library_id)?;
         let snapshot = self
             .media_libraries
             .lock()
@@ -1993,6 +2000,10 @@ impl QueueManager {
                         .destination_transfer
                         .as_ref()
                         .is_some_and(|transfer| transfer.migration_id == migration_id)
+                        || record
+                            .destination_transfer_ack
+                            .as_ref()
+                            .is_some_and(|transfer| transfer.migration_id == migration_id)
                     {
                         return Ok(true);
                     }
@@ -2021,6 +2032,9 @@ impl QueueManager {
             bail!("task {task_id} was not found");
         };
         validate_task_transfer_migration_id(migration_id)?;
+        if record.destination_transfer_ack.is_some() {
+            bail!("task {task_id} is awaiting durable media migration handoff finalization");
+        }
         if let Some(existing) = record.destination_transfer.as_ref() {
             if existing.target == target && existing.migration_id == migration_id {
                 return Ok(existing.clone());
@@ -2115,6 +2129,7 @@ impl QueueManager {
         };
         record.destination_transfer = Some(transfer.clone());
         record.destination_transfer_phase = Some(TaskDestinationTransferPhase::Copying);
+        record.destination_transfer_ack = None;
         let persisted = source_store.save_mutated_record(record, entry, false)?;
         let transfer = persisted
             .destination_transfer
@@ -2436,14 +2451,14 @@ impl QueueManager {
             return Ok(None);
         };
         let Some(current) = record.destination_transfer.as_ref() else {
-            if record.destination.as_ref() == Some(&transfer.target) {
+            if record.destination.as_ref() == Some(&transfer.target)
+                && record.destination_transfer_ack.as_ref() == Some(transfer)
+            {
                 return Ok(Some(record));
             }
-            bail!("task has no matching destination transfer to acknowledge");
+            bail!("task has no exact matching destination transfer acknowledgment");
         };
-        if current.transfer_id != transfer.transfer_id
-            || current.migration_id != transfer.migration_id
-        {
+        if current != transfer {
             bail!("task destination transfer is owned by another migration");
         }
         if record.destination.as_ref() != Some(&transfer.target) {
@@ -2451,9 +2466,34 @@ impl QueueManager {
         }
         let current = current.clone();
         restore_after_task_transfer(&mut record, &current);
+        record.destination_transfer_ack = Some(current);
         let saved = store.save_mutated_record(record, entry, true)?;
-        self.state_change_notify.notify_one();
         Ok(Some(saved))
+    }
+
+    /// Clear the exact handoff receipt only after the migration engine has durably recorded its
+    /// final queue acknowledgment and completed source payload, control, and directory cleanup.
+    /// Until then, the receipt keeps task actions and destination changes blocked across restarts.
+    pub fn clear_task_destination_transfer_ack(
+        &self,
+        transfer: &TaskDestinationTransfer,
+    ) -> Result<()> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let Some((store, mut record, entry)) =
+            self.find_record_entry_unlocked(&transfer.task_id)?
+        else {
+            bail!("task disappeared before its handoff acknowledgment was consumed");
+        };
+        match record.destination_transfer_ack.as_ref() {
+            Some(current) if current == transfer => {
+                record.destination_transfer_ack = None;
+                store.save_mutated_record(record, entry, false)?;
+                self.state_change_notify.notify_one();
+                Ok(())
+            }
+            None => Ok(()),
+            Some(_) => bail!("task has a different destination transfer acknowledgment"),
+        }
     }
 
     pub fn create(&self, mut task: TaskRecord) -> Result<bool> {
@@ -2979,7 +3019,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(false);
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             return Ok(false);
         }
         if record.status != TaskStatus::Queued {
@@ -3001,7 +3041,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             return Ok(None);
         }
         if record.generation != expected_generation || record.status != TaskStatus::Queued {
@@ -3019,7 +3059,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             return Ok(None);
         }
         if record.status != TaskStatus::Running {
@@ -3039,7 +3079,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             return Ok(None);
         }
         if record.generation != expected_generation || record.status != TaskStatus::Running {
@@ -3090,7 +3130,7 @@ impl QueueManager {
             }
             bail!("persistent task {id} was not found");
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             if expected_generation.is_some() {
                 return Ok(None);
             }
@@ -3205,7 +3245,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some() || record.generation != expected_generation {
+        if task_transfer_or_final_ack_pending(&record) || record.generation != expected_generation {
             return Ok(None);
         }
         if record.bilibili_attempt.is_some() {
@@ -3274,7 +3314,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some() || record.generation != expected_generation {
+        if task_transfer_or_final_ack_pending(&record) || record.generation != expected_generation {
             return Ok(None);
         }
         if updates.is_empty() {
@@ -3382,7 +3422,7 @@ impl QueueManager {
         let Some(record) = self.find_record_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some()
+        if task_transfer_or_final_ack_pending(&record)
             || record.generation != expected_generation
             || record.status != TaskStatus::Queued
         {
@@ -3505,7 +3545,7 @@ impl QueueManager {
             }
             bail!("persistent task {id} was missing at completion");
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             return Ok(None);
         }
         if expected_generation.is_some_and(|generation| record.generation != generation) {
@@ -3911,7 +3951,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             return Ok(None);
         }
         if !record.cancel_requested
@@ -3947,7 +3987,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             return Ok(None);
         }
         if record.generation != expected_generation
@@ -4069,7 +4109,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             return Ok(None);
         }
         if !expected_statuses.contains(&record.status) {
@@ -4093,7 +4133,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             return Ok(None);
         }
         if record.generation != expected_generation {
@@ -4118,7 +4158,7 @@ impl QueueManager {
         let Some((store, mut record, entry)) = self.find_record_entry_unlocked(id)? else {
             return Ok(None);
         };
-        if record.destination_transfer.is_some() {
+        if task_transfer_or_final_ack_pending(&record) {
             return Ok(None);
         }
         if record.generation != expected_generation || !expected_statuses.contains(&record.status) {
@@ -4372,7 +4412,7 @@ impl QueueManager {
                 }
             };
             for mut record in records {
-                if record.destination_transfer.is_some() {
+                if task_transfer_or_final_ack_pending(&record) {
                     continue;
                 }
                 store.cleanup_terminal_bilibili_group_receipts(&record);
@@ -5662,10 +5702,21 @@ fn restore_after_task_transfer(record: &mut TaskRecord, transfer: &TaskDestinati
     record.destination_transfer_phase = None;
 }
 
+fn task_transfer_or_final_ack_pending(record: &TaskRecord) -> bool {
+    record.destination_transfer.is_some() || record.destination_transfer_ack.is_some()
+}
+
 fn ensure_task_transfer_not_pending(record: &TaskRecord) -> Result<()> {
     if let Some(transfer) = record.destination_transfer.as_ref() {
         bail!(
             "task {} is reserved by media migration {}; finish or stop that migration first",
+            record.id,
+            transfer.migration_id
+        );
+    }
+    if let Some(transfer) = record.destination_transfer_ack.as_ref() {
+        bail!(
+            "task {} is awaiting durable handoff finalization for media migration {}",
             record.id,
             transfer.migration_id
         );
@@ -7791,15 +7842,97 @@ mod tests {
     }
 
     #[test]
+    fn category_change_rejects_replaced_registered_root_without_mutating_settings() {
+        let temp_root = temp_queue_root("category-replaced-root");
+        let config = test_video_config(&temp_root);
+        let archive_root = temp_root.join("archive");
+        let displaced_root = temp_root.join("archive-original");
+        fs::create_dir_all(&archive_root).expect("archive root should create");
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let archive = queue
+            .register_video_library("Archive", &archive_root, None, false, false)
+            .expect("archive library should register");
+        let before = queue
+            .registry_snapshot()
+            .expect("library settings should load");
+
+        fs::rename(&archive_root, &displaced_root).expect("original root should be displaced");
+        fs::create_dir(&archive_root).expect("replacement root should create");
+        fs::write(archive_root.join("keep.txt"), b"replacement sentinel")
+            .expect("replacement sentinel should write");
+
+        let error = queue
+            .set_video_library_category(&archive.id, Some(Path::new("Shows")))
+            .expect_err("category change must reject a replacement root object");
+        assert!(
+            error.to_string().contains("root") || error.to_string().contains("available"),
+            "unexpected root validation error: {error:#}"
+        );
+        assert_eq!(
+            queue
+                .registry_snapshot()
+                .expect("library settings should remain readable"),
+            before,
+            "rejected category change must preserve settings and revision"
+        );
+        assert!(displaced_root.join(QUEUE_DIRECTORY).exists());
+        assert_eq!(
+            fs::read_dir(&archive_root)
+                .expect("replacement remains readable")
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("keep.txt")],
+            "category validation must not mutate the replacement root"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn category_change_allows_registered_root_child_churn() {
+        let temp_root = temp_queue_root("category-child-churn");
+        let config = test_video_config(&temp_root);
+        let archive_root = temp_root.join("archive");
+        fs::create_dir_all(&archive_root).expect("archive root should create");
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let archive = queue
+            .register_video_library("Archive", &archive_root, None, false, false)
+            .expect("archive library should register");
+
+        fs::create_dir(archive_root.join("added-child")).expect("child should create");
+        fs::write(archive_root.join("normal.txt"), b"benign child churn")
+            .expect("child file should write");
+        fs::remove_dir(archive_root.join("added-child")).expect("child should remove");
+
+        let before = queue
+            .registry_snapshot()
+            .expect("library settings should load");
+        let changed = queue
+            .set_video_library_category(&archive.id, Some(Path::new("Shows")))
+            .expect("same root object should remain usable after child churn");
+        assert_eq!(changed.revision, before.revision + 1);
+        assert_eq!(
+            changed
+                .libraries
+                .iter()
+                .find(|library| library.id == archive.id)
+                .and_then(|library| library.default_category.as_deref()),
+            Some(Path::new("Shows"))
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
     fn pending_transfer_query_includes_history_and_refuses_uncertain_stores() {
         let (directory, _config, queue, target) = task_transfer_fixture("pending-token-query");
         let id = "pending-token-query-terminal";
         create_transfer_test_task(&queue, id, TaskStatus::Failed);
         let transfer = begin_test_transfer(&queue, id, "migration-pending-token-query", &target);
-
-        // Model a durable terminal sidecar left with a transfer token by a crash between queue
-        // handoff and migration ACK. This is not a user action; write through the store primitive
-        // so the fixture exercises the history index path the query must inspect.
+        // Model a terminal sidecar left with its token by a crash. This is not a user action;
+        // write through the store primitive so the fixture exercises the history index path.
         let (store, mut record, entry) = queue
             .find_record_entry_unlocked(id)
             .expect("task lookup should succeed")
@@ -7808,16 +7941,46 @@ mod tests {
         store
             .save_mutated_record(record, entry, false)
             .expect("terminal task should move to its durable history sidecar");
-
         assert!(
             queue
                 .has_pending_task_destination_transfer_for_migration(&transfer.migration_id)
-                .expect("pending token should be found in history")
+                .expect("pending transfer token should be found in history")
         );
         assert!(
             !queue
                 .has_pending_task_destination_transfer_for_migration("migration-unrelated-query")
                 .expect("all stores should be verifiable for a negative result")
+        );
+
+        let receipt_task_id = "pending-token-query-receipt";
+        create_transfer_test_task(&queue, receipt_task_id, TaskStatus::Failed);
+        let receipt_transfer = begin_test_transfer(
+            &queue,
+            receipt_task_id,
+            "migration-pending-receipt-query",
+            &target,
+        );
+        let plan = queue
+            .task_transfer_plan(&receipt_transfer)
+            .expect("empty staging task should have a durable transfer plan");
+        queue
+            .commit_task_destination_transfer(&plan)
+            .expect("target task should install");
+        queue
+            .ack_task_destination_transfer(&plan.transfer)
+            .expect("queue handoff receipt should persist");
+        assert!(
+            queue
+                .has_pending_task_destination_transfer_for_migration(&receipt_transfer.migration_id)
+                .expect("unconsumed queue ACK receipt remains a pending handoff")
+        );
+        queue
+            .clear_task_destination_transfer_ack(&plan.transfer)
+            .expect("completed source cleanup should consume the exact queue receipt");
+        assert!(
+            !queue
+                .has_pending_task_destination_transfer_for_migration(&receipt_transfer.migration_id)
+                .expect("cleared queue receipt should leave no pending handoff")
         );
 
         let mut stores = queue.video_libraries.write().unwrap();
@@ -13585,13 +13748,95 @@ mod tests {
                 .commit_task_destination_transfer(&plan)
                 .expect("target-first queue handoff should install the task");
             let acknowledged = queue
-                .ack_task_destination_transfer(&token)
+                .ack_task_destination_transfer(&plan.transfer)
                 .expect("transfer ACK should persist")
                 .expect("target task should remain present");
             assert_eq!(acknowledged.status, restored_status);
             assert_eq!(acknowledged.error, previous.error);
             assert_eq!(acknowledged.destination.as_ref(), Some(&target));
             assert!(acknowledged.destination_transfer.is_none());
+            assert_eq!(
+                acknowledged.destination_transfer_ack.as_ref(),
+                Some(&plan.transfer),
+                "queue ACK must retain an exact receipt until source cleanup completes"
+            );
+            let acknowledged_json =
+                serde_json::to_value(&acknowledged).expect("acknowledged task should serialize");
+            match restored_status {
+                TaskStatus::Failed => assert!(
+                    queue
+                        .claim_resume_for_chat_if_generation(
+                            &ack_id,
+                            acknowledged.generation,
+                            acknowledged.chat_id,
+                            true,
+                        )
+                        .is_err()
+                ),
+                TaskStatus::Interrupted => assert!(
+                    queue
+                        .claim_resume_for_chat_if_generation(
+                            &ack_id,
+                            acknowledged.generation,
+                            acknowledged.chat_id,
+                            false,
+                        )
+                        .is_err()
+                ),
+                TaskStatus::Queued => assert!(
+                    queue
+                        .begin_run_if_generation(&ack_id, acknowledged.generation)
+                        .expect("run guard should not fail")
+                        .is_none()
+                ),
+                _ => unreachable!("transfer test restores to an actionable or manual state"),
+            }
+            assert!(
+                queue
+                    .cancel_for_chat_if_generation(
+                        &ack_id,
+                        acknowledged.generation,
+                        acknowledged.chat_id,
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                serde_json::to_value(queue.get(&ack_id).unwrap().unwrap()).unwrap(),
+                acknowledged_json,
+                "queued dispatch, resume, and cancel must stay blocked until source cleanup"
+            );
+            assert!(
+                queue
+                    .begin_task_destination_transfer(
+                        &ack_id,
+                        "migration-after-queue-ack",
+                        acknowledged.generation,
+                        acknowledged.revision,
+                        target.clone(),
+                    )
+                    .expect_err("a new transfer must not overwrite an unconsumed ACK receipt")
+                    .to_string()
+                    .contains("finalization")
+            );
+            assert_eq!(
+                queue
+                    .ack_task_destination_transfer(&plan.transfer)
+                    .expect("exact ACK replay should be idempotent")
+                    .as_ref()
+                    .and_then(|record| record.destination_transfer_ack.as_ref()),
+                Some(&plan.transfer)
+            );
+            queue
+                .clear_task_destination_transfer_ack(&plan.transfer)
+                .expect("completed source cleanup should allow exact receipt consumption");
+            assert!(
+                queue
+                    .get(&ack_id)
+                    .unwrap()
+                    .unwrap()
+                    .destination_transfer_ack
+                    .is_none()
+            );
         }
 
         drop(queue);

@@ -93,9 +93,11 @@ export function migrationControlActions(migration) {
   const active = status === "queued" || status === "running";
   const paused = status === "paused";
   const terminalWithTaskError = status === "partial" || status === "failed";
-  const hasTaskTransferError = Array.isArray(migration.task_transfers)
+  const hasReportedTaskTransferErrors = Number.isSafeInteger(migration.task_transfer_error_count)
+    && migration.task_transfer_error_count > 0;
+  const hasTaskTransferError = hasReportedTaskTransferErrors || (Array.isArray(migration.task_transfers)
     && migration.task_transfers.some((transfer) => isRecord(transfer)
-      && typeof transfer.error === "string" && transfer.error.trim().length > 0);
+      && typeof transfer.error === "string" && transfer.error.trim().length > 0));
   const hasFailedMedia = Number.isSafeInteger(migration.failed_count) && migration.failed_count > 0;
   const actions = [];
   if (active) actions.push("pause");

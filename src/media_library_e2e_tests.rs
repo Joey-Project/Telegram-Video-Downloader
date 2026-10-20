@@ -414,6 +414,16 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         "migration-terminal-pending-handoff-removal",
         crate::cloud::TEST_DATABASE_EPOCH,
     );
+    let source_staging = downloader::create_test_retained_video_staging(&fixture.video_root)
+        .expect("retained source staging directory should be created");
+    let source_fragment = source_staging.join("segment.part");
+    fs::write(&source_fragment, b"terminal handoff fragment")
+        .expect("source task fragment should write");
+    let staging_relative = source_staging
+        .strip_prefix(&fixture.video_root)
+        .expect("staging directory should be under the source library")
+        .to_path_buf();
+    let target_staging = fixture.archive_root.join(&staging_relative);
     let task_id = "migration-terminal-pending-handoff-task";
     let mut task = TaskRecord::new(
         task_id.into(),
@@ -428,6 +438,7 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
     );
     task.status = TaskStatus::Failed;
     task.error = Some("synthetic interrupted video transfer".to_string());
+    task.staging_attempts.push(source_staging.clone());
     queue
         .create(task)
         .expect("failed task should persist in the source queue");
@@ -577,6 +588,16 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         .expect("installed target task should load")
         .expect("task should be stored in the target queue");
     assert_eq!(
+        target_record.staging_attempts.first(),
+        Some(&target_staging),
+        "the installed target record should point at the copied staging directory"
+    );
+    assert_eq!(
+        fs::read(target_staging.join("segment.part")).unwrap(),
+        b"terminal handoff fragment",
+        "target fragments must be complete before the queue handoff"
+    );
+    assert_eq!(
         target_record
             .destination_transfer
             .as_ref()
@@ -616,6 +637,16 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         Some(preview.id.as_str()),
         "reopened target record must retain the durable migration token"
     );
+    assert_eq!(
+        reopened_target_record.staging_attempts.first(),
+        Some(&target_staging),
+        "the target queue record must retain the exact rebased staging path"
+    );
+    assert!(source_staging.exists());
+    assert_eq!(
+        fs::read(target_staging.join("segment.part")).unwrap(),
+        b"terminal handoff fragment"
+    );
     let reopened_inbox = Arc::new(
         CloudInbox::open_for_epoch(&fixture.video_root, crate::cloud::TEST_DATABASE_EPOCH)
             .expect("same-epoch cloud inbox should reopen"),
@@ -627,6 +658,10 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         Arc::clone(&reopened_inbox),
     );
     let dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
+    // Hold the process-wide output slot so startup can durably install its exact queue ACK but
+    // cannot yet remove source controls. This proves queue startup remains blocked until the
+    // source cleanup checkpoint completes.
+    let cleanup_blocker = hold_migration_output_slot(&fixture).await;
 
     let premature_removal = run_library_management_test_request(
         &reopened_runtime,
@@ -666,19 +701,56 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
                 .get(task_id)
                 .expect("recovered target task should load")
                 .expect("task should remain in the target queue");
-            if current.destination_transfer.is_none() {
+            if current.destination_transfer.is_none() && current.destination_transfer_ack.is_some()
+            {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("recovery should retain its exact queue ACK while source cleanup waits");
+    assert!(source_staging.exists());
+    assert!(target_staging.join("segment.part").exists());
+    let cleanup_blocked_removal = run_library_management_test_request(
+        &reopened_runtime,
+        2_804,
+        "library_remove",
+        serde_json::json!({"library_id": fixture.source_library_id}),
+    )
+    .await;
+    assert_eq!(cleanup_blocked_removal.status, InboxStatus::Failed);
+    assert!(
+        cleanup_blocked_removal
+            .error
+            .as_deref()
+            .is_some_and(|error| {
+                error.contains("task destination handoff")
+                    || error.contains("source staging cleanup")
+            })
+    );
+    drop(cleanup_blocker);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let current = reopened_queue
+                .get(task_id)
+                .expect("recovered target task should load")
+                .expect("task should remain in the target queue");
+            if current.destination_transfer.is_none() && current.destination_transfer_ack.is_none()
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("migration discovery should finish the durable queue handoff ACK");
+    .expect("migration recovery should finish source cleanup before releasing the task");
     let acknowledged_record = reopened_queue
         .get(task_id)
         .expect("acknowledged target task should load")
         .expect("task should remain stored in the target queue");
     assert!(acknowledged_record.destination_transfer.is_none());
+    assert!(acknowledged_record.destination_transfer_ack.is_none());
     assert!(acknowledged_record.destination_transfer_phase.is_none());
     assert_eq!(
         acknowledged_record
@@ -696,10 +768,60 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         Some(fixture.archive_root.as_path())
     );
     assert_eq!(acknowledged_record.status, TaskStatus::Failed);
+    assert_eq!(
+        acknowledged_record.staging_attempts.first(),
+        Some(&target_staging),
+        "the queue should resume with the rebased target staging path after cleanup"
+    );
+    assert!(
+        !source_staging.exists(),
+        "the exact source job tree should be removed only after the durable final ACK"
+    );
+    assert!(target_staging.join(".owner.json").exists());
+    assert!(target_staging.join(".retained.json").exists());
+    assert_eq!(
+        fs::read(target_staging.join("segment.part")).unwrap(),
+        b"terminal handoff fragment",
+        "source cleanup must preserve the target fragment"
+    );
+    let startup_lease = downloader::hold_video_outputs_for_migration(&[
+        fixture.video_root.clone(),
+        fixture.archive_root.clone(),
+    ])
+    .await
+    .expect("a later startup should acquire both roots without a source staging orphan");
+    drop(startup_lease);
+    assert!(
+        !source_staging.exists(),
+        "startup recovery must not recreate or retain the removed source job tree"
+    );
+
+    let (source_scoped, _) = crate::media_library_bot::scoped_runtime(
+        &reopened_runtime,
+        Some(&fixture.source_library_id),
+    )
+    .expect("source library should remain registered until cleanup is complete");
+    let source_manager = crate::open_cloud_library_manager(
+        &source_scoped.bot,
+        Arc::clone(&reopened_runtime.inbox),
+        None,
+    )
+    .expect("cleaned source manager should reopen");
+    let source_after_cleanup = source_manager
+        .migration_scan()
+        .expect("cleaned source library should reopen without recovery errors");
+    assert!(
+        !source_after_cleanup
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("staging") || warning.contains("recovery")),
+        "startup after source cleanup should not report a staging recovery orphan: {:?}",
+        source_after_cleanup.warnings
+    );
 
     let recovered_removal = run_library_management_test_request(
         &reopened_runtime,
-        2_803,
+        2_805,
         "library_remove",
         serde_json::json!({"library_id": fixture.source_library_id}),
     )
@@ -1983,7 +2105,7 @@ async fn migration_default_update_preserves_a_newer_user_library_choice() {
         .register_video_library("Later default", &later_default_root, None, false, true)
         .expect("later user-selected library should register");
     let runtime = make_runtime(
-        telegram,
+        telegram.clone(),
         fixture.config.clone(),
         Arc::clone(&queue),
         Arc::clone(&inbox),
@@ -2010,6 +2132,10 @@ async fn migration_default_update_preserves_a_newer_user_library_choice() {
         preview_record.error
     );
     let preview = preview_record.result.unwrap();
+    let confirmation_baseline = queue
+        .registry_snapshot()
+        .expect("library settings should load before confirmation")
+        .revision;
     let confirmation = run_library_management_test_request(
         &runtime,
         1_902,
@@ -2034,24 +2160,73 @@ async fn migration_default_update_preserves_a_newer_user_library_choice() {
         &fixture.source_library_id,
         &fixture.target_library_id,
     );
-    let expected_revision = queue
-        .registry_snapshot()
-        .expect("library registry should load")
-        .revision;
-    engine
-        .bind_default_update_expected_revision(&migration_id, expected_revision)
-        .expect("first registry revision should be frozen before execution");
+    assert_eq!(
+        engine
+            .default_update_expected_revision(&migration_id)
+            .expect("confirmation should persist its settings baseline"),
+        Some(confirmation_baseline),
+        "the baseline belongs to the durable confirmation, before runner lease waits"
+    );
     queue
         .set_default_video_library(&later_default.id)
         .expect("user should be able to choose a different default during migration");
+
+    // Simulate process restart while the migration is still waiting for the source/target output
+    // lease. The confirmed settings revision must survive, rather than being rebound to the
+    // already-changed default when the watcher resumes the job.
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    runtime.signal_epoch_fatal();
+    wait_for_migration_runner(&runtime, &migration_id, false).await;
+    drop(engine);
+    drop(runtime);
+    drop(inbox);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(&queue) > 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("detached migration runner should release its queue owner before restart");
+    drop(queue);
+
+    let reopened_queue = Arc::new(
+        QueueManager::open(&fixture.config).expect("queue should reopen after runtime restart"),
+    );
+    let reopened_inbox = Arc::new(
+        CloudInbox::open_for_epoch(&fixture.video_root, crate::cloud::TEST_DATABASE_EPOCH)
+            .expect("same-epoch inbox should reopen"),
+    );
+    let reopened_runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&reopened_queue),
+        Arc::clone(&reopened_inbox),
+    );
+    let reopened_dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
+    let migration_watcher = tokio::spawn(crate::library_migration_bot::watch(
+        reopened_runtime.clone(),
+    ));
+    wait_for_migration_runner(&reopened_runtime, &migration_id, true).await;
+    let reopened_engine = migration_engine_for_test(
+        &reopened_runtime,
+        &fixture.source_library_id,
+        &fixture.target_library_id,
+    );
+    assert_eq!(
+        reopened_engine
+            .default_update_expected_revision(&migration_id)
+            .expect("confirmed revision should survive restart"),
+        Some(confirmation_baseline)
+    );
     drop(output_guard);
 
-    let completed = wait_for_migration_status(&runtime, &migration_id, |status| {
+    let completed = wait_for_migration_status(&reopened_runtime, &migration_id, |status| {
         status.status == crate::library_migration::MigrationRunStatus::Completed
             && status.default_update_resolved
     })
     .await;
-    wait_for_migration_runner(&runtime, &migration_id, false).await;
+    wait_for_migration_runner(&reopened_runtime, &migration_id, false).await;
     assert!(!completed.default_update_applied);
     assert!(
         completed
@@ -2060,7 +2235,7 @@ async fn migration_default_update_preserves_a_newer_user_library_choice() {
             .any(|warning| warning.contains("settings changed"))
     );
     assert_eq!(
-        queue
+        reopened_queue
             .default_video_destination()
             .expect("default destination should still resolve")
             .library_id,
@@ -2068,12 +2243,15 @@ async fn migration_default_update_preserves_a_newer_user_library_choice() {
         "migration CAS must preserve the user's newer default choice"
     );
 
-    runtime.signal_epoch_fatal();
-    dispatcher.abort();
-    let _ = dispatcher.await;
-    drop(runtime);
-    drop(inbox);
-    drop(queue);
+    reopened_runtime.signal_epoch_fatal();
+    migration_watcher
+        .await
+        .expect("migration watcher should stop after runtime shutdown");
+    reopened_dispatcher.abort();
+    let _ = reopened_dispatcher.await;
+    drop(reopened_runtime);
+    drop(reopened_inbox);
+    drop(reopened_queue);
     stop_fake_telegram_api(shutdown, server).await;
     let _ = fs::remove_dir_all(&fixture.root);
 }

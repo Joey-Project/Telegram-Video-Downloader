@@ -34,7 +34,7 @@ use crate::library::{
     MetadataPatchPreview, MetadataStatus, MoveOutcome, MovePreview, MovePreviewItem,
     MoveResultItem, Presence, SourceHint,
 };
-use crate::media_libraries::{TaskTransferEntryKind, TaskTransferFile};
+use crate::media_libraries::{TaskTransferControl, TaskTransferEntryKind, TaskTransferFile};
 use crate::safe_fs::{
     BoundDirectoryCursor, BoundDirectoryCursorEntry, BoundFile, BoundFileAccessPolicy,
     EntryIdentity, MigrationCopyChunk, RootedFs,
@@ -1528,7 +1528,11 @@ impl LibraryManager {
         })
     }
 
-    pub(crate) fn migration_staging_identity(&self, name: &str) -> Result<Option<EntryIdentity>> {
+    pub(crate) fn migration_staging_identity(
+        &self,
+        name: &str,
+        expected_final_access: BoundFileAccessPolicy,
+    ) -> Result<Option<EntryIdentity>> {
         let absolute = self.migration_staging_path(name)?;
         self.coordinate_read(&absolute, |coordinated| {
             if coordinated != absolute {
@@ -1541,9 +1545,8 @@ impl LibraryManager {
             if !identity.is_file() {
                 bail!("migration staging entry is not a regular file");
             }
-            self.root
-                .open_bound_file_if_identity(&entry, identity)?
-                .validate_private_single_link(0o600)?;
+            let file = self.root.open_bound_file_if_identity(&entry, identity)?;
+            validate_migration_publication_staging_access(&file, expected_final_access)?;
             Ok(Some(identity))
         })
     }
@@ -1585,6 +1588,7 @@ impl LibraryManager {
         name: &str,
         expected_identity: EntryIdentity,
         expected_size: u64,
+        expected_final_access: Option<BoundFileAccessPolicy>,
         offset: u64,
         length: u64,
     ) -> Result<String> {
@@ -1600,7 +1604,11 @@ impl LibraryManager {
             let file = self
                 .root
                 .open_bound_file_if_identity(&entry, expected_identity)?;
-            file.validate_private_single_link(0o600)?;
+            if let Some(expected_access) = expected_final_access {
+                validate_migration_publication_staging_access(&file, expected_access)?;
+            } else {
+                file.validate_private_single_link(0o600)?;
+            }
             if file.byte_len()? != expected_size {
                 bail!("migration staging size changed during chunk verification");
             }
@@ -1618,7 +1626,11 @@ impl LibraryManager {
                 reader.seek(SeekFrom::Start(offset))?;
                 reader.read_exact(&mut bytes)?;
             }
-            file.validate_private_single_link(0o600)?;
+            if let Some(expected_access) = expected_final_access {
+                validate_migration_publication_staging_access(&file, expected_access)?;
+            } else {
+                file.validate_private_single_link(0o600)?;
+            }
             if file.byte_len()? != expected_size {
                 bail!("migration staging changed while verifying its content chunk");
             }
@@ -1700,6 +1712,107 @@ impl LibraryManager {
                 .open_bound_directory(&entry, identity)?
                 .access_policy()?;
             Ok(owner == file.owner && group == file.group && mode == file.mode)
+        })
+    }
+
+    /// Removes one exact source control file after the engine has persisted a cleanup intent.
+    /// The digest, inode, owner, group, mode, and hard-link count all come from the frozen queue
+    /// transfer plan; unknown or replaced support files are retained.
+    pub(crate) fn migration_task_remove_source_control(
+        &self,
+        control: &TaskTransferControl,
+    ) -> Result<()> {
+        const MAX_CONTROL_BYTES: u64 = 1024 * 1024;
+        if control.device == 0
+            || control.inode == 0
+            || control.size_bytes > MAX_CONTROL_BYTES
+            || control.owner != unsafe { libc::geteuid() } as u32
+            || control.mode != 0o600
+            || control.link_count != Some(1)
+            || !is_sha256_hex(&control.sha256)
+        {
+            bail!("task staging control proof is incomplete or violates its private access policy");
+        }
+        let absolute = self.migration_task_absolute(&control.source_relative)?;
+        let expected_identity = EntryIdentity::regular_file(control.device, control.inode);
+        let expected_access = BoundFileAccessPolicy {
+            owner: control.owner,
+            group: control.group,
+            mode: control.mode,
+            link_count: 1,
+        };
+        let expected_digest = parse_sha256(&control.sha256)?;
+        self.coordinate_write(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated task staging control changed before cleanup");
+            }
+            let entry = self.root.bind_entry(&absolute, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(expected_identity) {
+                bail!("task staging control identity changed before cleanup");
+            }
+            let source = self
+                .root
+                .open_bound_file_if_identity(&entry, expected_identity)?;
+            validate_task_control_source(
+                &source,
+                control.size_bytes,
+                expected_access,
+                expected_digest,
+            )?;
+            self.root.remove_bound_file_if_identity_with_validation(
+                &entry,
+                expected_identity,
+                || {
+                    validate_task_control_source(
+                        &source,
+                        control.size_bytes,
+                        expected_access,
+                        expected_digest,
+                    )
+                },
+            )
+        })
+    }
+
+    /// Removes only an empty planned source directory with the recorded identity and access
+    /// policy. Directory timestamps and link count are intentionally ignored because child
+    /// cleanup changes both without replacing the directory or changing its permissions.
+    pub(crate) fn migration_task_remove_source_directory(
+        &self,
+        directory: &TaskTransferFile,
+    ) -> Result<()> {
+        if directory.kind != TaskTransferEntryKind::Directory
+            || directory.device == 0
+            || directory.inode == 0
+            || directory.mode & !0o7777 != 0
+            || directory.mode & 0o6000 != 0
+        {
+            bail!("task source directory proof is incomplete or invalid");
+        }
+        let absolute = self.migration_task_absolute(&directory.source_relative)?;
+        let expected_identity = EntryIdentity::directory(directory.device, directory.inode);
+        self.coordinate_write(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated task source directory changed before cleanup");
+            }
+            let entry = self.root.bind_entry(&absolute, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(expected_identity) {
+                bail!("task source directory identity changed before cleanup");
+            }
+            let bound = self.root.open_bound_directory(&entry, expected_identity)?;
+            let (owner, group, mode) = bound.access_policy()?;
+            if owner != directory.owner || group != directory.group || mode != directory.mode {
+                bail!("task source directory access policy changed before cleanup");
+            }
+            if !self
+                .root
+                .list_bound_directory(&entry, expected_identity)?
+                .is_empty()
+            {
+                bail!("task source directory contains unplanned entries and was preserved");
+            }
+            self.root
+                .remove_bound_dir_if_identity(&entry, expected_identity)
         })
     }
 
@@ -1847,6 +1960,7 @@ impl LibraryManager {
     ) -> Result<EntryIdentity> {
         let staging_absolute = self.migration_staging_path(staging_name)?;
         let target_absolute = self.migration_task_absolute(target_relative)?;
+        let expected_access = task_transfer_access_policy(file)?;
         self.coordinate_write(&target_absolute, |coordinated| {
             if coordinated != target_absolute {
                 bail!("coordinated task target changed before publication");
@@ -1866,7 +1980,7 @@ impl LibraryManager {
                     staging_identity,
                     &target_absolute,
                     file.size_bytes,
-                    (file.mode & 0o777) as u16,
+                    expected_access,
                 )
         })
     }
@@ -1996,6 +2110,7 @@ impl LibraryManager {
         staging_identity: EntryIdentity,
         target_path: &str,
         proof: &MigrationFileProof,
+        expected_access: BoundFileAccessPolicy,
     ) -> Result<EntryIdentity> {
         let staging_absolute = self.migration_staging_path(staging_path)?;
         let target_absolute = self.absolute_path(target_path)?;
@@ -2010,7 +2125,7 @@ impl LibraryManager {
                     staging_identity,
                     &target_absolute,
                     proof.size,
-                    (proof.mode & 0o777) as u16,
+                    expected_access,
                 )
         })
     }
@@ -6355,6 +6470,46 @@ fn migration_proof_for_bound_file(file: &BoundFile) -> Result<MigrationFileProof
         birth_nanoseconds: before.birth_nanoseconds,
         sha256,
     })
+}
+
+fn validate_migration_publication_staging_access(
+    file: &BoundFile,
+    expected_final_access: BoundFileAccessPolicy,
+) -> Result<()> {
+    file.validate_identity()?;
+    let actual = file.access_policy()?;
+    let expected_mode = expected_final_access.mode & 0o777;
+    if expected_final_access.link_count != 1
+        || expected_final_access.mode & !0o777 != 0
+        || actual.owner != expected_final_access.owner
+        || actual.group != expected_final_access.group
+        || actual.link_count != expected_final_access.link_count
+        || actual.mode & 0o7000 != 0
+        || (actual.mode & 0o777 != 0o600 && actual.mode & 0o777 != expected_mode)
+    {
+        bail!("migration staging ownership, permissions, or link count changed");
+    }
+    Ok(())
+}
+
+fn validate_task_control_source(
+    file: &BoundFile,
+    expected_size: u64,
+    expected_access: BoundFileAccessPolicy,
+    expected_digest: [u8; 32],
+) -> Result<()> {
+    file.validate_identity()?;
+    if file.byte_len()? != expected_size
+        || file.access_policy()? != expected_access
+        || file.sha256()? != expected_digest
+    {
+        bail!("task staging control content or access policy changed before cleanup");
+    }
+    file.validate_identity()
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn task_transfer_access_policy(file: &TaskTransferFile) -> Result<BoundFileAccessPolicy> {
