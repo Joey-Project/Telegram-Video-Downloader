@@ -36,7 +36,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bbdown_core::{
     AccessKeyLoginTicket, CredentialHealthReport, CredentialHealthScope, CredentialHealthStatus,
-    CredentialKind, CredentialSource, QrLoginKind, QrLoginState, UgcCollectionReference,
+    CredentialKind, CredentialSource, Input, QrLoginKind, QrLoginState, UgcCollectionReference,
 };
 use tokio::sync::{Mutex, Notify, Semaphore, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
@@ -179,7 +179,10 @@ struct PendingCollectionDetails {
 #[derive(Debug, Clone)]
 enum BilibiliSelectionPrompt {
     SeasonMedia,
-    UgcMembership(UgcCollectionReference),
+    VideoPages {
+        page: Option<u32>,
+        collection: Option<UgcCollectionReference>,
+    },
     UgcCollection,
 }
 
@@ -4197,11 +4200,25 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
             let mut failed_jobs = Vec::new();
             for (index, job) in jobs.into_iter().enumerate() {
                 let job_id = index + 1;
-                let job = normalize_bilibili_short_link_job(&config, job).await;
+                let label = job.label();
+                let job = match normalize_bilibili_short_link_job(&config, job).await {
+                    Ok(job) => job,
+                    Err(error) => {
+                        println!(
+                            "Failed replay job #{job_id}: {label}\nCould not resolve this Bilibili short link; no download was started."
+                        );
+                        warn!(
+                            error = %redact_sensitive_text(&format!("{error:#}")),
+                            "replay stopped after Bilibili short-link normalization failed"
+                        );
+                        failed_jobs.push(format!("#{job_id} {label}"));
+                        continue;
+                    }
+                };
                 println!("Queued replay job #{job_id}: {}", job.label());
-                if job.requires_bilibili_selection() {
+                if job.requires_bilibili_selection() || bilibili_video_pages_prompt_required(&job) {
                     println!(
-                        "Failed replay job #{job_id}: {}\nBilibili ss/md links require a Telegram selection prompt.",
+                        "Failed replay job #{job_id}: {}\nThis Bilibili link requires a Telegram selection prompt.",
                         job.label()
                     );
                     failed_jobs.push(format!("#{job_id} {}", job.label()));
@@ -7132,13 +7149,66 @@ fn queue_or_prompt_job(
                 .await
             {
                 Ok(permit) => {
-                    let job = normalize_bilibili_short_link_job(context.config.as_ref(), job).await;
+                    let normalized =
+                        normalize_bilibili_short_link_job(context.config.as_ref(), job).await;
                     drop(permit);
-                    job
+                    match normalized {
+                        Ok(job) => job,
+                        Err(error) => {
+                            warn!(
+                                task_id,
+                                error = %redact_sensitive_text(&format!("{error:#}")),
+                                "Bilibili short-link normalization failed; refusing to start an ambiguous download"
+                            );
+                            send_or_log(
+                                &context.telegram,
+                                chat_id,
+                                "Could not resolve this Bilibili short link, so no download was started. Its queue status is being saved; check /queue before resending.".to_string(),
+                            )
+                            .await;
+                            let status_error = fail_task_if_generation_with_retry_delay(
+                                &context.queue,
+                                &task_id,
+                                generation,
+                                truncate(&redact_sensitive_text(&format!("{error:#}"))),
+                                context.queue_start_retry_delay,
+                            )
+                            .await;
+                            if let Err(status_error) = status_error {
+                                warn!(
+                                    task_id,
+                                    error = %redact_sensitive_text(&format!("{status_error:#}")),
+                                    "failed to persist Bilibili short-link failure state"
+                                );
+                            }
+                            return;
+                        }
+                    }
                 }
                 Err(err) => {
-                    warn!(error = %err, "Bilibili short-link normalization skipped because the probe queue closed");
-                    job
+                    warn!(error = %err, "Bilibili short-link normalization could not run because the probe queue closed");
+                    send_or_log(
+                        &context.telegram,
+                        chat_id,
+                        "Could not resolve this Bilibili short link, so no download was started. Its queue status is being saved; check /queue before resending.".to_string(),
+                    )
+                    .await;
+                    let status_error = fail_task_if_generation_with_retry_delay(
+                        &context.queue,
+                        &task_id,
+                        generation,
+                        truncate(&redact_sensitive_text(&format!("{err:#}"))),
+                        context.queue_start_retry_delay,
+                    )
+                    .await;
+                    if let Err(status_error) = status_error {
+                        warn!(
+                            task_id,
+                            error = %redact_sensitive_text(&format!("{status_error:#}")),
+                            "failed to persist Bilibili short-link failure state"
+                        );
+                    }
+                    return;
                 }
             }
         } else {
@@ -7371,40 +7441,64 @@ async fn bilibili_ugc_selection_prompt(
         return Ok(None);
     }
 
+    if !matches!(Input::parse(url), Ok(Input::Bvid(_) | Input::Aid(_))) {
+        return Ok(None);
+    }
+
     sync_bilibili_rust_credentials(config).await?;
-    bilibili_ugc_membership_prompt(
+    let page = selection.and_then(|selection| match selection {
+        BilibiliSelection::Page(page) => Some(page),
+        _ => None,
+    });
+    bilibili_video_pages_prompt(
+        page,
         bilibili_core::resolve_video_collection_membership(config, url).await,
     )
 }
 
-fn bilibili_ugc_membership_prompt(
+fn bilibili_video_pages_prompt_required(job: &JobRequest) -> bool {
+    let JobRequest::Bilibili { url, selection } = job else {
+        return false;
+    };
+    if !matches!(selection, None | Some(BilibiliSelection::Page(_))) {
+        return false;
+    }
+    matches!(Input::parse(url), Ok(Input::Bvid(_) | Input::Aid(_)))
+}
+
+fn bilibili_video_pages_prompt(
+    page: Option<u32>,
     membership: Result<Option<UgcCollectionReference>>,
 ) -> Result<Option<BilibiliSelectionPrompt>> {
-    membership.map(|reference| reference.map(BilibiliSelectionPrompt::UgcMembership))
+    membership.map(|collection| Some(BilibiliSelectionPrompt::VideoPages { page, collection }))
 }
 
 fn bilibili_membership_probe_failure_message() -> &'static str {
     "Could not verify whether this Bilibili video belongs to a collection. No download was started; please retry the link."
 }
 
-async fn normalize_bilibili_short_link_job(config: &AppConfig, job: JobRequest) -> JobRequest {
+fn should_suppress_selection_file_provider_notice(prompt: &BilibiliSelectionPrompt) -> bool {
+    matches!(prompt, BilibiliSelectionPrompt::UgcCollection)
+}
+
+async fn normalize_bilibili_short_link_job(
+    config: &AppConfig,
+    job: JobRequest,
+) -> Result<JobRequest> {
     let JobRequest::Bilibili { url, selection } = job else {
-        return job;
+        return Ok(job);
     };
     if !is_b23_short_link_url(&url) {
-        return JobRequest::Bilibili { url, selection };
+        return Ok(JobRequest::Bilibili { url, selection });
     }
 
-    match bilibili_core::resolve_b23_short_link(config, &url).await {
-        Ok(resolved_url) => apply_bilibili_short_link_resolution(selection, resolved_url),
-        Err(err) => {
-            warn!(
-                error = %redact_sensitive_text(&format!("{err:#}")),
-                "Bilibili short-link normalization failed; preserving the original URL"
-            );
-            JobRequest::Bilibili { url, selection }
-        }
-    }
+    let resolved_url = bilibili_core::resolve_b23_short_link(config, &url)
+        .await
+        .context("failed to normalize Bilibili short link")?;
+    Ok(apply_bilibili_short_link_resolution(
+        selection,
+        resolved_url,
+    ))
 }
 
 fn apply_bilibili_short_link_resolution(
@@ -7437,10 +7531,8 @@ async fn prompt_bilibili_selection(
     let telegram = &context.telegram;
     let queue = &context.queue;
     let retry_delay = context.queue_start_retry_delay;
-    let suppress_extra_file_provider_notice = matches!(
-        &prompt,
-        BilibiliSelectionPrompt::UgcCollection | BilibiliSelectionPrompt::UgcMembership(_)
-    );
+    let suppress_extra_file_provider_notice =
+        should_suppress_selection_file_provider_notice(&prompt);
     let token = next_bilibili_selection_callback_token(job_id);
     let mut reported_file_provider_error = false;
     let generation = loop {
@@ -9136,6 +9228,8 @@ enum BilibiliSelectionCallbackAction {
     Current,
     Latest,
     All,
+    AllPages,
+    Collection,
     Cancel,
 }
 
@@ -9151,6 +9245,8 @@ fn parse_bilibili_selection_callback_data(data: &str) -> Option<BilibiliSelectio
         "current" => BilibiliSelectionCallbackAction::Current,
         "latest" => BilibiliSelectionCallbackAction::Latest,
         "all" => BilibiliSelectionCallbackAction::All,
+        "all_pages" => BilibiliSelectionCallbackAction::AllPages,
+        "collection" => BilibiliSelectionCallbackAction::Collection,
         "cancel" => BilibiliSelectionCallbackAction::Cancel,
         _ => return None,
     };
@@ -9187,18 +9283,29 @@ fn bilibili_selection_keyboard(
                 web_app: None,
             },
         ]],
-        BilibiliSelectionPrompt::UgcMembership(_) => vec![vec![
-            InlineKeyboardButton {
-                text: "Current video".to_string(),
-                callback_data: bilibili_selection_callback_data(token, "current"),
-                web_app: None,
-            },
-            InlineKeyboardButton {
-                text: "Entire collection".to_string(),
-                callback_data: bilibili_selection_callback_data(token, "all"),
-                web_app: None,
-            },
-        ]],
+        BilibiliSelectionPrompt::VideoPages { page, collection } => {
+            let single_page_label = format!("P{} only", page.unwrap_or(1));
+            let mut rows = vec![vec![
+                InlineKeyboardButton {
+                    text: single_page_label,
+                    callback_data: bilibili_selection_callback_data(token, "current"),
+                    web_app: None,
+                },
+                InlineKeyboardButton {
+                    text: "All P".to_string(),
+                    callback_data: bilibili_selection_callback_data(token, "all_pages"),
+                    web_app: None,
+                },
+            ]];
+            if collection.is_some() {
+                rows.push(vec![InlineKeyboardButton {
+                    text: "Entire collection".to_string(),
+                    callback_data: bilibili_selection_callback_data(token, "collection"),
+                    web_app: None,
+                }]);
+            }
+            rows
+        }
         BilibiliSelectionPrompt::UgcCollection => vec![vec![InlineKeyboardButton {
             text: "Entire collection".to_string(),
             callback_data: bilibili_selection_callback_data(token, "all"),
@@ -9218,11 +9325,19 @@ fn bilibili_selection_message(job_id: u64, prompt: &BilibiliSelectionPrompt) -> 
         BilibiliSelectionPrompt::SeasonMedia => {
             format!("Bilibili season/media link queued as job #{job_id}. Choose what to download:")
         }
-        BilibiliSelectionPrompt::UgcMembership(reference) => format!(
-            "Bilibili UGC collection detected for job #{job_id}: {} ({} items). Choose what to download:",
-            truncate(&reference.title),
-            reference.item_count
-        ),
+        BilibiliSelectionPrompt::VideoPages { page, collection } => {
+            let page_label = format!("P{}", page.unwrap_or(1));
+            match collection {
+                Some(reference) => format!(
+                    "Bilibili video belongs to collection {} ({} items). Choose {page_label}, all P, or the entire collection for job #{job_id}:",
+                    truncate(&reference.title),
+                    reference.item_count
+                ),
+                None => format!(
+                    "Bilibili video queued as job #{job_id}. Choose {page_label} only or all P:"
+                ),
+            }
+        }
         BilibiliSelectionPrompt::UgcCollection => {
             format!(
                 "Bilibili collection link queued as job #{job_id}. Download the entire collection?"
@@ -9245,12 +9360,18 @@ fn apply_bilibili_selection(
             set_bilibili_selection(job, BilibiliSelection::All),
             "all episodes",
         )),
-        (BilibiliSelectionPrompt::UgcMembership(_), BilibiliSelectionCallbackAction::Current) => {
-            Some((confirm_current_bilibili_video(job), "current video"))
+        (BilibiliSelectionPrompt::VideoPages { .. }, BilibiliSelectionCallbackAction::Current) => {
+            Some((confirm_current_bilibili_video(job), "single P"))
+        }
+        (BilibiliSelectionPrompt::VideoPages { .. }, BilibiliSelectionCallbackAction::AllPages) => {
+            Some((set_bilibili_selection(job, BilibiliSelection::All), "all P"))
         }
         (
-            BilibiliSelectionPrompt::UgcMembership(reference),
-            BilibiliSelectionCallbackAction::All,
+            BilibiliSelectionPrompt::VideoPages {
+                collection: Some(reference),
+                ..
+            },
+            BilibiliSelectionCallbackAction::Collection,
         ) => Some((
             JobRequest::Bilibili {
                 url: bilibili_core::ugc_collection_url(reference),
@@ -11761,6 +11882,34 @@ async fn task_if_generation_with_retry_delay(
                 tokio::time::sleep(retry_delay).await;
             }
             Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn fail_task_if_generation_with_retry_delay(
+    queue: &QueueManager,
+    task_id: &str,
+    generation: u64,
+    message: String,
+    retry_delay: Duration,
+) -> Result<Option<TaskRecord>> {
+    let mut reported_file_provider_error = false;
+    loop {
+        match queue.fail_if_generation(task_id, generation, message.clone()) {
+            Ok(task) => return Ok(task),
+            Err(error) if is_file_provider_access_error(&error) => {
+                if !reported_file_provider_error {
+                    warn!(
+                        task_id,
+                        generation,
+                        error = %format!("{error:#}"),
+                        "File Provider blocked failed-task persistence; retrying"
+                    );
+                    reported_file_provider_error = true;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -18339,6 +18488,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_task_state_retries_file_provider_write_errors() {
+        let queue_root = temp_main_test_dir("file-provider-failed-task-retry");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = queue_root.join("videos");
+        config.downloads.pdf_dir = queue_root.join("pdfs");
+        fs::create_dir_all(&config.downloads.video_dir).expect("video root should create");
+        fs::create_dir_all(&config.downloads.pdf_dir).expect("PDF root should create");
+
+        let file_provider = Arc::new(MockQueueFileProvider::default());
+        let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, provider)
+            .expect("queue should open with mocked File Provider access");
+        assert!(
+            queue
+                .create(TaskRecord::new(
+                    "file-provider-failed-task".to_string(),
+                    1,
+                    2,
+                    123_456_789,
+                    Some(701),
+                    0,
+                    JobRequest::Youtube {
+                        url: "https://example.invalid/video".to_string(),
+                    },
+                ))
+                .expect("task should persist")
+        );
+        file_provider.fail_next_file_provider_write("temporary queue coordination failure");
+
+        let failed = fail_task_if_generation_with_retry_delay(
+            &queue,
+            "file-provider-failed-task",
+            0,
+            "short-link resolution failed".to_string(),
+            Duration::ZERO,
+        )
+        .await
+        .expect("failed-task persistence should recover")
+        .expect("task generation should still match");
+
+        assert_eq!(failed.status, TaskStatus::Failed);
+        drop(queue);
+        let _ = fs::remove_dir_all(queue_root);
+    }
+
+    #[tokio::test]
     async fn file_provider_queue_read_failure_is_actionable_and_retryable_e2e() {
         let queue_root = temp_main_test_dir("file-provider-queue-read-e2e");
         let mut config = AppConfig::for_test();
@@ -19626,6 +19821,20 @@ mod tests {
             })
         );
         assert_eq!(
+            parse_bilibili_selection_callback_data("bsel:000000000000002a:all_pages"),
+            Some(BilibiliSelectionCallback {
+                token: 42,
+                action: BilibiliSelectionCallbackAction::AllPages
+            })
+        );
+        assert_eq!(
+            parse_bilibili_selection_callback_data("bsel:000000000000002a:collection"),
+            Some(BilibiliSelectionCallback {
+                token: 42,
+                action: BilibiliSelectionCallbackAction::Collection
+            })
+        );
+        assert_eq!(
             parse_bilibili_selection_callback_data("bsel:000000000000002a:current"),
             Some(BilibiliSelectionCallback {
                 token: 42,
@@ -19700,7 +19909,10 @@ mod tests {
             cover_url: None,
             item_count: 37,
         };
-        let membership_prompt = BilibiliSelectionPrompt::UgcMembership(reference.clone());
+        let membership_prompt = BilibiliSelectionPrompt::VideoPages {
+            page: Some(2),
+            collection: Some(reference.clone()),
+        };
         let membership_keyboard = bilibili_selection_keyboard(42, &membership_prompt);
         let membership_data = membership_keyboard
             .inline_keyboard
@@ -19712,10 +19924,13 @@ mod tests {
             membership_data,
             vec![
                 "bsel:000000000000002a:current",
-                "bsel:000000000000002a:all",
+                "bsel:000000000000002a:all_pages",
+                "bsel:000000000000002a:collection",
                 "bsel:000000000000002a:cancel"
             ]
         );
+        assert_eq!(membership_keyboard.inline_keyboard[0][0].text, "P2 only");
+        assert_eq!(membership_keyboard.inline_keyboard[0][1].text, "All P");
         assert_eq!(
             apply_bilibili_selection(
                 JobRequest::Bilibili {
@@ -19731,7 +19946,7 @@ mod tests {
                     url: "https://www.bilibili.com/video/BV12TRrBcEP8?p=2".to_string(),
                     selection: Some(BilibiliSelection::CurrentPage(2)),
                 },
-                "current video"
+                "single P"
             )
         );
         assert_eq!(
@@ -19741,7 +19956,7 @@ mod tests {
                     selection: None,
                 },
                 &membership_prompt,
-                BilibiliSelectionCallbackAction::All,
+                BilibiliSelectionCallbackAction::Collection,
             )
             .expect("entire collection selection should be available"),
             (
@@ -19753,6 +19968,41 @@ mod tests {
                 "entire collection"
             )
         );
+
+        assert_eq!(
+            apply_bilibili_selection(
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV12TRrBcEP8?p=2".to_string(),
+                    selection: Some(BilibiliSelection::Page(2)),
+                },
+                &membership_prompt,
+                BilibiliSelectionCallbackAction::AllPages,
+            )
+            .expect("all pages should be available for a selected page"),
+            (
+                JobRequest::Bilibili {
+                    url: "https://www.bilibili.com/video/BV12TRrBcEP8?p=2".to_string(),
+                    selection: Some(BilibiliSelection::All),
+                },
+                "all P"
+            )
+        );
+
+        let standalone_prompt = BilibiliSelectionPrompt::VideoPages {
+            page: None,
+            collection: None,
+        };
+        let standalone_keyboard = bilibili_selection_keyboard(42, &standalone_prompt);
+        assert_eq!(standalone_keyboard.inline_keyboard[0][0].text, "P1 only");
+        assert_eq!(standalone_keyboard.inline_keyboard[0][1].text, "All P");
+        assert!(matches!(
+            bilibili_video_pages_prompt(None, Ok(None))
+                .expect("a non-collection video should still show the page choice"),
+            Some(BilibiliSelectionPrompt::VideoPages {
+                page: None,
+                collection: None,
+            })
+        ));
 
         let direct_prompt = BilibiliSelectionPrompt::UgcCollection;
         let direct_keyboard = bilibili_selection_keyboard(42, &direct_prompt);
@@ -19769,10 +20019,59 @@ mod tests {
     }
 
     #[test]
+    fn video_page_prompt_detection_includes_legacy_aid_and_replay_jobs() {
+        for url in [
+            "https://www.bilibili.com/video/BV12TRrBcEP8",
+            "https://www.bilibili.com/video/BV12TRrBcEP8?p=2",
+            "https://www.bilibili.com/video/av123?p=2",
+        ] {
+            assert!(
+                bilibili_video_pages_prompt_required(&JobRequest::Bilibili {
+                    url: url.to_string(),
+                    selection: bilibili_selection_from_url(url),
+                }),
+                "expected a Telegram selection prompt for {url}"
+            );
+        }
+
+        assert!(!bilibili_video_pages_prompt_required(
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8".to_string(),
+                selection: Some(BilibiliSelection::All),
+            }
+        ));
+        assert!(!bilibili_video_pages_prompt_required(
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ep123".to_string(),
+                selection: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn video_page_selection_keeps_file_provider_retry_notice_visible() {
+        assert!(!should_suppress_selection_file_provider_notice(
+            &BilibiliSelectionPrompt::VideoPages {
+                page: Some(2),
+                collection: None,
+            }
+        ));
+        assert!(!should_suppress_selection_file_provider_notice(
+            &BilibiliSelectionPrompt::SeasonMedia
+        ));
+        assert!(should_suppress_selection_file_provider_notice(
+            &BilibiliSelectionPrompt::UgcCollection
+        ));
+    }
+
+    #[test]
     fn membership_probe_error_does_not_fall_back_to_a_single_video() {
-        let error = bilibili_ugc_membership_prompt(Err(anyhow!(
-            "HTTP status client error (412 Precondition Failed)"
-        )))
+        let error = bilibili_video_pages_prompt(
+            None,
+            Err(anyhow!(
+                "HTTP status client error (412 Precondition Failed)"
+            )),
+        )
         .expect_err("a failed membership probe must block automatic download");
 
         assert!(format!("{error:#}").contains("412 Precondition Failed"));
@@ -19853,7 +20152,10 @@ mod tests {
 
         assert!(matches!(
             prompt,
-            BilibiliSelectionPrompt::UgcMembership(reference) if reference.id == 167_822
+            BilibiliSelectionPrompt::VideoPages {
+                collection: Some(reference),
+                ..
+            } if reference.id == 167_822
         ));
         assert!(credential_file.exists());
         assert!(
