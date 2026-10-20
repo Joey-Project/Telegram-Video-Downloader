@@ -57,7 +57,8 @@
           <section id="view-library" class="view-panel">
             <div class="toolbar">
               <label class="search-box"><span aria-hidden="true">⌕</span><input id="search-input" type="search" placeholder="Search titles, folders, or IDs" autocomplete="off" aria-label="Search library"></label>
-              <select id="category-filter" class="select-control" aria-label="Filter by folder"><option value="">All folders</option></select>
+              <input id="category-filter" class="select-control" type="search" list="category-folders" placeholder="All folders" autocomplete="off" aria-label="Filter by folder">
+              <datalist id="category-folders"></datalist>
               <select id="status-filter" class="select-control" aria-label="Filter by file status"><option value="">All statuses</option><option value="present">Available</option><option value="unavailable">Unavailable</option><option value="missing">Missing</option><option value="unknown">Unknown</option></select>
               <button id="select-visible" class="quiet-button" type="button">Select visible</button>
             </div>

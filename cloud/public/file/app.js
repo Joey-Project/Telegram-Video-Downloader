@@ -10,6 +10,7 @@ import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewableP
 import { sourceIdUrl } from "./source-links.js";
 import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
 import { validateTargetRelativeDirectory } from "./target-directory.js";
+import { boundedFolderSuggestions, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, needsOrganizing, paginateLibraryItems, statusOf } from "./library-view.js";
 
 const API = "/api";
 const CACHE_KEY = "file-manager.snapshot.v1";
@@ -19,9 +20,11 @@ const POLL_MS = 12_000;
 
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, selected: new Set(), quarantinedActionIds: new Set(), view: "library", query: "", detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, selected: new Set(), quarantinedActionIds: new Set(), view: "library", query: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false };
 
 const byId = (id) => document.getElementById(id);
+let cachedFolderLibrary = null;
+let cachedFolders = [];
 const formatBytes = (value) => {
   const bytes = Number(value);
   if (!Number.isFinite(bytes) || bytes < 0) return "Size unavailable";
@@ -47,18 +50,6 @@ const timeAgo = (value, unit = "milliseconds") => {
   if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)} hr ago`;
   return `${Math.floor(seconds / 86400)} days ago`;
-};
-const statusOf = (item) => String(item?.presence ?? "unknown").toLowerCase();
-const needsOrganizing = (item) => {
-  const confidence = String(item?.confidence ?? "low").toLowerCase();
-  const metadata = String(item?.metadata_status ?? "unknown").toLowerCase();
-  const hasCollection = Boolean(item?.collection && (typeof item.collection === "string" ? item.collection.trim() : item.collection.title));
-  return confidence !== "high" || metadata !== "complete" || !hasCollection || ["missing", "unavailable"].includes(statusOf(item));
-};
-const itemFolder = (item) => {
-  const path = String(item?.relative_path ?? "").replaceAll("\\", "/");
-  const slash = path.lastIndexOf("/");
-  return slash < 0 ? "" : path.slice(0, slash);
 };
 const libraryItems = () => Array.isArray(state.snapshot?.library?.items) ? state.snapshot.library.items : [];
 const snapshotValue = () => state.snapshot ?? { synced: false, stale: true, library: null, previews: [], operations: [], tasks: [], settings: {} };
@@ -288,28 +279,29 @@ function selectionLimitMessage(omittedCount = 0) {
 }
 
 function allFolders() {
-  const folders = new Set(Array.isArray(state.snapshot?.library?.categories) ? state.snapshot.library.categories : []);
+  const library = state.snapshot?.library ?? null;
+  if (library === cachedFolderLibrary) return cachedFolders;
+  const folders = new Set(Array.isArray(library?.categories) ? library.categories : []);
   for (const item of libraryItems()) if (itemFolder(item)) folders.add(itemFolder(item));
-  return [...folders].filter((folder) => typeof folder === "string").sort((a, b) => a.localeCompare(b));
+  cachedFolderLibrary = library;
+  cachedFolders = [...folders].filter((folder) => typeof folder === "string").sort((a, b) => a.localeCompare(b));
+  return cachedFolders;
 }
 
 function filteredItems() {
-  const query = state.query.trim().toLocaleLowerCase();
-  const category = byId("category-filter").value;
-  const status = byId("status-filter").value;
-  return libraryItems().filter((item) => {
-    const text = [item.title, item.relative_path, item.id, ...(Array.isArray(item.source_ids) ? item.source_ids : [])].join(" ").toLocaleLowerCase();
-    return (!query || text.includes(query)) && (!category || itemFolder(item) === category) && (!status || statusOf(item) === status);
-  }).sort((left, right) => String(left.title ?? left.relative_path ?? "").localeCompare(String(right.title ?? right.relative_path ?? "")));
+  return filterLibraryItems(libraryItems(), {
+    query: state.query,
+    category: byId("category-filter").value,
+    status: byId("status-filter").value,
+  });
 }
 
 function renderFilters() {
-  const select = byId("category-filter");
-  const current = select.value;
   const folders = allFolders();
-  select.innerHTML = `<option value="">All folders</option>${folders.map((folder) => `<option value="${escapeHtml(folder)}">${escapeHtml(folder || "Library root")}</option>`).join("")}`;
-  if (folders.includes(current)) select.value = current;
-  byId("known-folders").innerHTML = folders.map((folder) => `<option value="${escapeHtml(folder)}"></option>`).join("");
+  const categorySuggestions = boundedFolderSuggestions(folders, byId("category-filter").value);
+  const destinationSuggestions = boundedFolderSuggestions(folders, byId("target-dir").value);
+  byId("category-folders").innerHTML = categorySuggestions.map((folder) => `<option value="${escapeHtml(folder)}"></option>`).join("");
+  byId("known-folders").innerHTML = destinationSuggestions.map((folder) => `<option value="${escapeHtml(folder)}"></option>`).join("");
 }
 
 function itemRow(item) {
@@ -327,25 +319,41 @@ function itemRow(item) {
   </article>`;
 }
 
-function renderGroupedItems(container, items) {
-  const groups = new Map();
-  for (const item of items) {
-    const collection = typeof item.collection === "string" ? item.collection : item.collection?.title;
-    const key = collection || "Uncollected";
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(item);
-  }
-  container.innerHTML = [...groups.entries()].map(([title, entries], index) => {
+function libraryPageMarkup(page, scope) {
+  if (page.pageCount <= 1) return "";
+  const previous = page.page > 0
+    ? `<button class="quiet-button" type="button" data-library-page="${scope}" data-page-direction="-1">Previous</button>`
+    : `<button class="quiet-button" type="button" disabled>Previous</button>`;
+  const next = page.page + 1 < page.pageCount
+    ? `<button class="quiet-button" type="button" data-library-page="${scope}" data-page-direction="1">Next</button>`
+    : `<button class="quiet-button" type="button" disabled>Next</button>`;
+  const label = scope === "needs" ? "Needs organizing pages" : "Library pages";
+  return `<nav class="toolbar library-pagination" aria-label="${label}">${previous}<span class="field-hint">Page ${page.page + 1} of ${page.pageCount} · items ${page.start + 1}–${page.end} of ${page.total.toLocaleString()}</span>${next}</nav>`;
+}
+
+function renderGroupedItems(container, items, page, scope) {
+  const groups = groupLibraryItems(items);
+  const renderedGroups = groups.map(({ title, items: entries }, index) => {
     const selectableEntries = presentMediaItems(entries);
     const groupIds = selectableEntries.map((item) => String(item.id));
     const allSelected = groupIds.length > 0 && groupIds.every((id) => state.selected.has(id));
     const someSelected = groupIds.some((id) => state.selected.has(id));
     return `<details class="collection-group" ${index < 3 ? "open" : ""}>
-      <summary><input class="group-check" type="checkbox" aria-label="Select all available ${escapeHtml(title)} items" data-select-group="${escapeHtml(title)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${selectableEntries.length ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count">${entries.length} file${entries.length === 1 ? "" : "s"}</span></summary>
+      <summary><input class="group-check" type="checkbox" aria-label="Select available ${escapeHtml(title)} items on this page" data-select-group="${escapeHtml(title)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${selectableEntries.length ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count">${entries.length} file${entries.length === 1 ? "" : "s"} on this page</span></summary>
       <div class="collection-items">${entries.map(itemRow).join("")}</div>
     </details>`;
   }).join("");
+  container.innerHTML = `${renderedGroups}${libraryPageMarkup(page, scope)}`;
   container.querySelectorAll("[data-partial]").forEach((checkbox) => { checkbox.indeterminate = true; });
+}
+
+function pageItemsForScope(scope) {
+  const filtered = filteredItems();
+  const scopedItems = scope === "needs" ? filtered.filter(needsOrganizing) : filtered;
+  const pageKey = scope === "needs" ? "needsPage" : "libraryPage";
+  const page = paginateLibraryItems(scopedItems, state[pageKey]);
+  state[pageKey] = page.page;
+  return page.items;
 }
 
 function renderLibrary() {
@@ -353,10 +361,14 @@ function renderLibrary() {
   for (const id of state.selected) if (!availableIds.has(id)) state.selected.delete(id);
   renderFilters();
   const items = filteredItems();
-  const list = byId("library-list");
-  renderGroupedItems(list, items);
   const needsItems = items.filter(needsOrganizing);
-  renderGroupedItems(byId("needs-list"), needsItems);
+  const libraryPage = paginateLibraryItems(items, state.libraryPage);
+  const needsPage = paginateLibraryItems(needsItems, state.needsPage);
+  state.libraryPage = libraryPage.page;
+  state.needsPage = needsPage.page;
+  const list = byId("library-list");
+  renderGroupedItems(list, libraryPage.items, libraryPage, "library");
+  renderGroupedItems(byId("needs-list"), needsPage.items, needsPage, "needs");
   const synced = state.snapshot?.synced === true;
   const firstScanPending = synced && (state.snapshot.library?.ready === false || Number(state.snapshot.library?.scanned_at) === 0);
   byId("library-empty").classList.toggle("hidden", !synced || libraryItems().length > 0 && !firstScanPending);
@@ -374,19 +386,19 @@ function renderLibrary() {
     list.innerHTML = "";
     byId("library-empty").classList.add("hidden");
   }
-  const visible = items.length;
   const total = libraryItems().length;
   byId("library-count").textContent = synced && !firstScanPending ? String(total) : "—";
   byId("library-summary").textContent = firstScanPending
     ? "Your computer is connected, but the first scan has not completed."
     : state.snapshot?.synced
-    ? `${visible.toLocaleString()} shown of ${total.toLocaleString()} item${total === 1 ? "" : "s"}${state.selected.size ? ` · ${state.selected.size} selected${state.selected.size >= MAX_SELECTED_ITEMS ? ` · selection limit ${MAX_SELECTED_ITEMS}; deselect to add more` : ""}` : ""}`
+    ? `${items.length.toLocaleString()} matching item${items.length === 1 ? "" : "s"} · ${items.length ? `showing ${libraryPage.start + 1}–${libraryPage.end} on page ${libraryPage.page + 1} of ${Math.max(1, libraryPage.pageCount)}` : "no matches"} · ${total.toLocaleString()} in library${state.selected.size ? ` · ${state.selected.size} selected${state.selected.size >= MAX_SELECTED_ITEMS ? ` · selection limit ${MAX_SELECTED_ITEMS}; deselect to add more` : ""}` : ""}`
     : "A first scan has not completed yet.";
-  byId("needs-count").textContent = synced && !firstScanPending ? String(libraryItems().filter(needsOrganizing).length) : "—";
+  const needsTotal = libraryItems().filter(needsOrganizing).length;
+  byId("needs-count").textContent = synced && !firstScanPending ? String(needsTotal) : "—";
   byId("needs-summary").textContent = firstScanPending
     ? "Needs organizing will appear after the first scan completes."
     : state.snapshot?.synced
-    ? `${needsItems.length.toLocaleString()} item${needsItems.length === 1 ? "" : "s"} shown for review · ${libraryItems().filter(needsOrganizing).length.toLocaleString()} need attention in total`
+    ? `${needsItems.length.toLocaleString()} matching item${needsItems.length === 1 ? "" : "s"} · ${needsItems.length ? `showing ${needsPage.start + 1}–${needsPage.end} on page ${needsPage.page + 1} of ${Math.max(1, needsPage.pageCount)}` : "no matches"} · ${needsTotal.toLocaleString()} need attention in total`
     : "Needs organizing will appear after the first scan.";
   byId("needs-empty").classList.toggle("hidden", !synced || firstScanPending || needsItems.length > 0);
   byId("needs-list").classList.toggle("hidden", !synced || firstScanPending || needsItems.length === 0);
@@ -746,8 +758,8 @@ function previewSelectedLegacy() {
 }
 
 function selectVisible() {
-  const filtered = filteredItems();
-  const visible = presentMediaItems(state.view === "needs" ? filtered.filter(needsOrganizing) : filtered);
+  const scope = state.view === "needs" ? "needs" : "library";
+  const visible = presentMediaItems(pageItemsForScope(scope));
   const allSelected = visible.length > 0 && visible.every((item) => state.selected.has(String(item.id)));
   const omittedCount = updateSelectedItems(visible.map((item) => String(item.id)), !allSelected);
   renderLibrary();
@@ -758,11 +770,12 @@ function bindEvents() {
   byId("refresh-button").addEventListener("click", () => refreshState());
   byId("scan-button").addEventListener("click", () => submitAction("library_scan", {}));
   document.querySelectorAll("[data-scan]").forEach((button) => button.addEventListener("click", () => submitAction("library_scan", {})));
-  byId("search-input").addEventListener("input", (event) => { state.query = event.target.value; renderLibrary(); });
-  byId("category-filter").addEventListener("change", renderLibrary);
-  byId("status-filter").addEventListener("change", renderLibrary);
+  byId("search-input").addEventListener("input", (event) => { state.query = event.target.value; state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
+  byId("category-filter").addEventListener("input", () => { state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
+  byId("status-filter").addEventListener("change", () => { state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
   byId("select-visible").addEventListener("click", selectVisible);
-  byId("root-target").addEventListener("click", () => { byId("target-dir").value = ""; byId("target-dir").focus(); });
+  byId("target-dir").addEventListener("input", renderFilters);
+  byId("root-target").addEventListener("click", () => { byId("target-dir").value = ""; renderFilters(); byId("target-dir").focus(); });
   byId("preview-move").addEventListener("click", () => {
     if (state.selected.size > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} videos per request.`);
     const { directory, error } = validateTargetRelativeDirectory(byId("target-dir").value);
@@ -833,9 +846,9 @@ function bindEvents() {
     const groupCheckbox = event.target.closest("[data-select-group]");
     if (groupCheckbox) {
       const groupTitle = groupCheckbox.dataset.selectGroup;
-      const filtered = filteredItems();
-      const visibleItems = presentMediaItems(state.view === "needs" ? filtered.filter(needsOrganizing) : filtered);
-      const groupItems = visibleItems.filter((item) => (item.collection?.title ?? item.collection ?? "Uncollected") === groupTitle);
+      const scope = state.view === "needs" ? "needs" : "library";
+      const visibleItems = pageItemsForScope(scope);
+      const groupItems = presentMediaItems(visibleItems.filter((item) => (item.collection?.title ?? item.collection ?? "Uncollected") === groupTitle));
       const omittedCount = updateSelectedItems(groupItems.map((item) => String(item.id)), groupCheckbox.checked);
       renderLibrary();
       if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
@@ -855,6 +868,14 @@ function bindEvents() {
     if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
   });
   document.body.addEventListener("click", (event) => {
+    const libraryPageButton = event.target.closest("[data-library-page]");
+    if (libraryPageButton) {
+      const scope = libraryPageButton.dataset.libraryPage === "needs" ? "needs" : "library";
+      const pageKey = scope === "needs" ? "needsPage" : "libraryPage";
+      state[pageKey] += Number(libraryPageButton.dataset.pageDirection);
+      renderLibrary();
+      return;
+    }
     const pageButton = event.target.closest("[data-legacy-page]");
     if (pageButton) {
       state.legacyPage += Number(pageButton.dataset.legacyPage);

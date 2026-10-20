@@ -22,8 +22,7 @@ const PREVIEW_DETAILS_OMITTED_REASON: &str =
 const PREVIEW_DETAILS_UNAVAILABLE_REASON: &str =
     "Preview details are unavailable in this cloud snapshot. Reload the preview before confirming.";
 const PREVIEWS_OMITTED_REASON: &str = "Some pending previews were omitted from this snapshot. Refresh pending previews before confirming.";
-
-/// Build the bounded operation receipt list, keeping the newest full results first.
+/// Build the bounded operation receipt list, reserving space for the newest usable legacy import.
 pub(crate) fn operation_snapshots(records: &[&InboxRecord]) -> Result<Vec<Value>> {
     let mut selected = records
         .iter()
@@ -42,42 +41,89 @@ pub(crate) fn operation_snapshots(records: &[&InboxRecord]) -> Result<Vec<Value>
     let mut total_bytes = array_json_size(&snapshots, MAX_OPERATION_SNAPSHOT_BYTES)
         .ok_or_else(|| anyhow!("compact cloud operation receipts exceed their size budget"))?;
 
-    // Restore complete results from newest to oldest while there is room. This keeps the most
-    // useful recent interaction, including legacy-import mapping candidates, available.
+    // Reserve the newest restorable completed import before large newer receipts can consume the
+    // budget. If it cannot fit, try older complete imports before falling back to recency.
+    let mut prioritized_legacy_import = None;
     for (index, record) in selected.iter().enumerate().rev() {
-        let full = operation_snapshot(record, true);
-        let compact_size = json_size_within(&snapshots[index], MAX_OPERATION_SNAPSHOT_BYTES);
-        let full_size = json_size_within(&full, MAX_OPERATION_SNAPSHOT_BYTES);
-        let (Some(compact_size), Some(full_size)) = (compact_size, full_size) else {
+        if !is_usable_completed_legacy_import_record(record) {
             continue;
-        };
-        let replaced_size = total_bytes.saturating_sub(compact_size);
-        let next_total = replaced_size.saturating_add(full_size);
-        if next_total <= MAX_OPERATION_SNAPSHOT_BYTES {
-            snapshots[index] = full;
-            total_bytes = next_total;
         }
+        if restore_full_operation_if_fits(index, record, &mut snapshots, &mut total_bytes) {
+            prioritized_legacy_import = Some(index);
+            break;
+        }
+    }
+
+    // Allocate the remaining budget to other full results newest first.
+    for (index, record) in selected.iter().enumerate().rev() {
+        if Some(index) == prioritized_legacy_import {
+            continue;
+        }
+        restore_full_operation_if_fits(index, record, &mut snapshots, &mut total_bytes);
     }
 
     Ok(snapshots)
 }
 
+fn restore_full_operation_if_fits(
+    index: usize,
+    record: &InboxRecord,
+    snapshots: &mut [Value],
+    total_bytes: &mut usize,
+) -> bool {
+    let full = operation_snapshot(record, true);
+    let compact_size = json_size_within(&snapshots[index], MAX_OPERATION_SNAPSHOT_BYTES);
+    let full_size = json_size_within(&full, MAX_OPERATION_SNAPSHOT_BYTES);
+    let (Some(compact_size), Some(full_size)) = (compact_size, full_size) else {
+        return false;
+    };
+    let replaced_size = (*total_bytes).saturating_sub(compact_size);
+    let next_total = replaced_size.saturating_add(full_size);
+    if next_total <= MAX_OPERATION_SNAPSHOT_BYTES {
+        snapshots[index] = full;
+        *total_bytes = next_total;
+        true
+    } else {
+        false
+    }
+}
+
+fn is_usable_completed_legacy_import_record(record: &InboxRecord) -> bool {
+    record.request.kind == "legacy_import"
+        && record.status == InboxStatus::Completed
+        && record
+            .result
+            .as_ref()
+            .is_some_and(is_usable_legacy_import_result)
+}
+
+fn is_usable_legacy_import_result(result: &Value) -> bool {
+    let has_hints = result
+        .get("hints")
+        .and_then(Value::as_array)
+        .is_some_and(|hints| !hints.is_empty());
+    let has_candidates = result.get("candidates").and_then(Value::as_array).is_some();
+    let result_marked_incomplete = ["incomplete", "details_incomplete", "result_truncated"]
+        .iter()
+        .any(|field| result.get(field).and_then(Value::as_bool) == Some(true));
+    has_hints && has_candidates && !result_marked_incomplete
+}
+
 /// Compact large historical receipts after an upload-size rejection.
 ///
-/// The newest legacy-import result is kept intact because its candidates are the manual mapping
-/// entry point in the Mini App. Other details are replaced with a small identity summary.
+/// The newest usable completed legacy-import result stays intact because its hints are the manual
+/// mapping entry point in the Mini App. Failed or explicitly incomplete imports do not reserve the
+/// budget. Other details are replaced with a small identity summary.
 pub(crate) fn compact_operation_receipts(operations: &mut [Value]) -> bool {
     let latest_legacy_import = operations
         .iter()
         .enumerate()
-        .filter_map(|(index, operation)| {
-            let fields = operation.as_object()?;
-            (fields.get("kind").and_then(Value::as_str) == Some("legacy_import")).then(|| {
-                (
-                    index,
-                    fields.get("seq").and_then(Value::as_u64).unwrap_or(0),
-                )
-            })
+        .filter(|&(_, operation)| is_usable_completed_legacy_import_snapshot(operation))
+        .map(|(index, operation)| {
+            (
+                index,
+                operation.get("seq").and_then(Value::as_u64).unwrap_or(0),
+            )
         })
         .max_by_key(|(_, seq)| *seq)
         .map(|(index, _)| index);
@@ -116,6 +162,17 @@ pub(crate) fn compact_operation_receipts(operations: &mut [Value]) -> bool {
     }
 
     changed
+}
+
+fn is_usable_completed_legacy_import_snapshot(operation: &Value) -> bool {
+    operation.get("kind").and_then(Value::as_str) == Some("legacy_import")
+        && operation.get("status").and_then(Value::as_str) == Some("completed")
+        && !["details_incomplete", "result_truncated"]
+            .iter()
+            .any(|field| operation.get(field).and_then(Value::as_bool) == Some(true))
+        && operation
+            .get("result")
+            .is_some_and(is_usable_legacy_import_result)
 }
 
 /// Build the latest active previews, with exact incomplete placeholders for omitted details.
@@ -512,6 +569,23 @@ mod tests {
         }
     }
 
+    fn legacy_import_result(payload_bytes: Option<usize>, warnings: &[&str]) -> Value {
+        let candidates = payload_bytes
+            .map(|payload_bytes| {
+                vec![json!({
+                    "hint_index": 0,
+                    "item_id": "item-1",
+                    "payload": "x".repeat(payload_bytes),
+                })]
+            })
+            .unwrap_or_default();
+        json!({
+            "hints": [{"hint_index": 0, "title": "Star Wars", "source_ids": []}],
+            "candidates": candidates,
+            "warnings": warnings,
+        })
+    }
+
     fn object_size(value: &Value) -> usize {
         serde_json::to_vec(value)
             .expect("JSON value should serialize")
@@ -611,6 +685,315 @@ mod tests {
                 .iter()
                 .any(|operation| operation["result_truncated"] == true)
         );
+    }
+
+    #[test]
+    fn reserves_latest_complete_legacy_import_before_newer_large_confirm_receipts() {
+        let mut records = vec![record(
+            1,
+            "legacy_import",
+            InboxStatus::Completed,
+            Some(legacy_import_result(Some(900 * 1024), &[])),
+            None,
+        )];
+        records.extend((2..=5).map(|seq| {
+            record(
+                seq,
+                "file_confirm",
+                InboxStatus::Completed,
+                Some(json!({"payload": "x".repeat(700 * 1024)})),
+                None,
+            )
+        }));
+        let refs = records.iter().collect::<Vec<_>>();
+
+        let operations = operation_snapshots(&refs).expect("operations should be built");
+        let encoded = serde_json::to_vec(&operations).expect("operations should serialize");
+
+        assert!(encoded.len() <= MAX_OPERATION_SNAPSHOT_BYTES);
+        assert_eq!(operations.len(), 5);
+        assert_eq!(operations[0]["seq"], 1);
+        assert_eq!(operations[0]["kind"], "legacy_import");
+        assert_eq!(
+            operations[0]["result"]["candidates"][0]["payload"]
+                .as_str()
+                .unwrap()
+                .len(),
+            900 * 1024
+        );
+        assert_ne!(operations[0]["details_incomplete"], true);
+        assert_ne!(operations[0]["result_truncated"], true);
+        assert!(
+            operations[1..]
+                .iter()
+                .any(|operation| operation["details_incomplete"] == true)
+        );
+    }
+
+    #[test]
+    fn failed_and_explicitly_incomplete_imports_do_not_take_priority() {
+        let records = [
+            record(
+                1,
+                "legacy_import",
+                InboxStatus::Completed,
+                Some(legacy_import_result(Some(850 * 1024), &[])),
+                None,
+            ),
+            record(
+                2,
+                "legacy_import",
+                InboxStatus::Failed,
+                Some(legacy_import_result(Some(800 * 1024), &[])),
+                Some("import failed".to_string()),
+            ),
+            record(
+                3,
+                "legacy_import",
+                InboxStatus::Completed,
+                Some({
+                    let mut result = legacy_import_result(Some(800 * 1024), &[]);
+                    result["details_incomplete"] = Value::Bool(true);
+                    result
+                }),
+                None,
+            ),
+            record(
+                4,
+                "file_confirm",
+                InboxStatus::Completed,
+                Some(json!({"payload": "x".repeat(700 * 1024)})),
+                None,
+            ),
+            record(
+                5,
+                "file_confirm",
+                InboxStatus::Completed,
+                Some(json!({"payload": "x".repeat(700 * 1024)})),
+                None,
+            ),
+        ];
+        let refs = records.iter().collect::<Vec<_>>();
+
+        let operations = operation_snapshots(&refs).expect("operations should be built");
+        let encoded = serde_json::to_vec(&operations).expect("operations should serialize");
+
+        assert!(encoded.len() <= MAX_OPERATION_SNAPSHOT_BYTES);
+        assert_eq!(operations[0]["seq"], 1);
+        assert_eq!(operations[0]["status"], "completed");
+        assert_eq!(
+            operations[0]["result"]["candidates"][0]["payload"]
+                .as_str()
+                .unwrap()
+                .len(),
+            850 * 1024
+        );
+        assert_eq!(operations[1]["status"], "failed");
+        assert_eq!(operations[1]["details_incomplete"], true);
+        assert_eq!(operations[2]["status"], "completed");
+        assert_eq!(operations[2]["details_incomplete"], true);
+        assert_eq!(operations[2]["result_truncated"], true);
+    }
+
+    #[test]
+    fn prioritizes_title_only_legacy_import_with_no_candidates_at_the_budget_boundary() {
+        let mut title_result = legacy_import_result(None, &[]);
+        title_result["hints"] = Value::Array(
+            (0..8)
+                .map(|hint_index| {
+                    let title = format!("Star Wars {hint_index} {}", "x".repeat(380));
+                    assert!(title.chars().count() <= 500);
+                    json!({
+                        "hint_index": hint_index,
+                        "title": title,
+                        "source_ids": [],
+                    })
+                })
+                .collect(),
+        );
+        let title_only = record(
+            1,
+            "legacy_import",
+            InboxStatus::Completed,
+            Some(title_result),
+            None,
+        );
+        let compact_confirms = [2, 3].map(|seq| {
+            record(
+                seq,
+                "file_confirm",
+                InboxStatus::Completed,
+                Some(json!({"payload": ""})),
+                None,
+            )
+        });
+        let base_records = [&title_only, &compact_confirms[0], &compact_confirms[1]];
+        let base_snapshots = base_records
+            .iter()
+            .map(|record| operation_snapshot(record, false))
+            .collect::<Vec<_>>();
+        let initial_bytes = array_json_size(&base_snapshots, MAX_OPERATION_SNAPSHOT_BYTES)
+            .expect("compact receipts should fit");
+        let title_full_bytes = json_size_within(
+            &operation_snapshot(&title_only, true),
+            MAX_OPERATION_SNAPSHOT_BYTES,
+        )
+        .unwrap();
+        let title_compact_bytes =
+            json_size_within(&base_snapshots[0], MAX_OPERATION_SNAPSHOT_BYTES).unwrap();
+        let confirm_full_base_bytes = json_size_within(
+            &operation_snapshot(&compact_confirms[0], true),
+            MAX_OPERATION_SNAPSHOT_BYTES,
+        )
+        .unwrap();
+        let confirm_compact_bytes =
+            json_size_within(&base_snapshots[1], MAX_OPERATION_SNAPSHOT_BYTES).unwrap();
+        let two_confirm_payload_bytes = MAX_OPERATION_SNAPSHOT_BYTES
+            .saturating_sub(1)
+            .saturating_sub(initial_bytes)
+            .saturating_add(confirm_compact_bytes.saturating_mul(2))
+            .saturating_sub(confirm_full_base_bytes.saturating_mul(2));
+        let payload_bytes = two_confirm_payload_bytes / 2;
+        assert!(payload_bytes > 0);
+        let confirm_records = [2, 3].map(|seq| {
+            record(
+                seq,
+                "file_confirm",
+                InboxStatus::Completed,
+                Some(json!({"payload": "x".repeat(payload_bytes)})),
+                None,
+            )
+        });
+        let refs = [&title_only, &confirm_records[0], &confirm_records[1]];
+        let mut confirms_full_without_import = vec![
+            base_snapshots[0].clone(),
+            operation_snapshot(&confirm_records[0], true),
+            operation_snapshot(&confirm_records[1], true),
+        ];
+        assert!(
+            array_json_size(&confirms_full_without_import, MAX_OPERATION_SNAPSHOT_BYTES).is_some()
+        );
+        confirms_full_without_import[0] = operation_snapshot(&title_only, true);
+        assert!(
+            array_json_size(&confirms_full_without_import, MAX_OPERATION_SNAPSHOT_BYTES).is_none()
+        );
+
+        let operations = operation_snapshots(&refs).expect("operations should be built");
+        let encoded = serde_json::to_vec(&operations).expect("operations should serialize");
+
+        assert!(encoded.len() <= MAX_OPERATION_SNAPSHOT_BYTES);
+        assert_eq!(
+            operations[0]["result"]["hints"].as_array().unwrap().len(),
+            8
+        );
+        assert!(
+            operations[0]["result"]["hints"][0]["title"]
+                .as_str()
+                .unwrap()
+                .starts_with("Star Wars 0 ")
+        );
+        assert_eq!(operations[0]["result"]["candidates"], json!([]));
+        assert_ne!(operations[0]["details_incomplete"], true);
+        assert_eq!(
+            operations[1..]
+                .iter()
+                .filter(|operation| operation["details_incomplete"] != true)
+                .count(),
+            1
+        );
+        assert!(title_full_bytes > title_compact_bytes);
+    }
+
+    #[test]
+    fn compact_receipts_keep_the_latest_usable_import_over_failed_and_incomplete_imports() {
+        let records = [
+            record(
+                1,
+                "legacy_import",
+                InboxStatus::Completed,
+                Some(legacy_import_result(Some(300 * 1024), &[])),
+                None,
+            ),
+            record(
+                2,
+                "legacy_import",
+                InboxStatus::Failed,
+                Some(legacy_import_result(Some(200 * 1024), &[])),
+                Some("import failed".to_string()),
+            ),
+            record(
+                3,
+                "legacy_import",
+                InboxStatus::Completed,
+                Some({
+                    let mut result = legacy_import_result(Some(200 * 1024), &[]);
+                    result["result_truncated"] = Value::Bool(true);
+                    result
+                }),
+                None,
+            ),
+        ];
+        let refs = records.iter().collect::<Vec<_>>();
+        let mut operations = operation_snapshots(&refs).expect("operations should be built");
+
+        assert!(compact_operation_receipts(&mut operations));
+
+        let encoded = serde_json::to_vec(&operations).expect("operations should serialize");
+        assert!(encoded.len() <= MAX_COMPACT_OPERATION_ARRAY_BYTES);
+        assert_eq!(operations[0]["status"], "completed");
+        assert_eq!(
+            operations[0]["result"]["candidates"][0]["payload"]
+                .as_str()
+                .unwrap()
+                .len(),
+            300 * 1024
+        );
+        assert_ne!(operations[0]["details_incomplete"], true);
+        assert_eq!(operations[1]["status"], "failed");
+        assert_eq!(operations[1]["details_incomplete"], true);
+        assert_eq!(operations[2]["details_incomplete"], true);
+        assert_eq!(operations[2]["result_truncated"], true);
+    }
+
+    #[test]
+    fn keeps_a_usable_truncated_hint_prefix_with_its_warning() {
+        let warning = "Legacy import output was truncated to fit the local receipt size limit. The first 1 of 2 hints and their candidates remain available; re-import a smaller selection to access omitted hints.";
+        let import = record(
+            1,
+            "legacy_import",
+            InboxStatus::Completed,
+            Some(legacy_import_result(Some(900 * 1024), &[warning])),
+            None,
+        );
+        let newer_confirm = record(
+            2,
+            "file_confirm",
+            InboxStatus::Completed,
+            Some(json!({"payload": "x".repeat(1300 * 1024)})),
+            None,
+        );
+
+        let operations =
+            operation_snapshots(&[&import, &newer_confirm]).expect("operations should be built");
+        let encoded = serde_json::to_vec(&operations).expect("operations should serialize");
+
+        assert!(encoded.len() <= MAX_OPERATION_SNAPSHOT_BYTES);
+        assert_eq!(operations[0]["status"], "completed");
+        assert_eq!(
+            operations[0]["result"]["hints"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            operations[0]["result"]["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(operations[0]["result"]["warnings"][0], warning);
+        assert_ne!(operations[0]["details_incomplete"], true);
+        assert_ne!(operations[0]["result_truncated"], true);
+        assert_eq!(operations[1]["details_incomplete"], true);
     }
 
     #[test]

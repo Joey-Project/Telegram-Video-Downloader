@@ -4216,7 +4216,7 @@ impl LibraryManager {
                                 sidecar_title_present |= nfo_title.is_some();
                                 nfo_source_id_present |= !nfo_ids.is_empty();
                                 source_ids.extend(nfo_ids);
-                                if let Some(value) = xml_tag_text(&text, "set")
+                                if let Some(value) = nfo_collection_title(&text)
                                     && !value.trim().is_empty()
                                 {
                                     collection = Some(CollectionMetadata {
@@ -6725,6 +6725,110 @@ fn xml_tag_text(content: &str, name: &str) -> Option<String> {
     )
 }
 
+fn nfo_collection_title(content: &str) -> Option<String> {
+    let set = xml_element_span(content, "set", 0)?;
+    if set.self_closing {
+        return None;
+    }
+    let children = direct_xml_child_summary(content, set).ok()?;
+    if let Some(name) = children.matching {
+        if children.duplicate_matching || direct_xml_child_summary(content, name).ok()?.count > 0 {
+            return None;
+        }
+        return Some(
+            xml_text_content(&content[name.open_end..name.close_start])
+                .trim()
+                .to_string(),
+        );
+    }
+    if children.count != 0 {
+        return None;
+    }
+    Some(
+        xml_text_content(&content[set.open_end..set.close_start])
+            .trim()
+            .to_string(),
+    )
+}
+
+struct DirectXmlChildSummary {
+    count: usize,
+    matching: Option<XmlElementSpan>,
+    duplicate_matching: bool,
+}
+
+fn direct_xml_child_summary(
+    content: &str,
+    parent: XmlElementSpan,
+) -> Result<DirectXmlChildSummary> {
+    let mut summary = DirectXmlChildSummary {
+        count: 0,
+        matching: None,
+        duplicate_matching: false,
+    };
+    if parent.self_closing {
+        return Ok(summary);
+    }
+
+    let mut open_names = Vec::new();
+    let mut cursor = parent.open_end;
+    while let Some(markup) = xml_next_markup(content, cursor) {
+        if markup.start >= parent.close_start {
+            break;
+        }
+        if markup.end > parent.close_start {
+            bail!("NFO child markup crosses its parent closing tag");
+        }
+        cursor = markup.end;
+        match markup.kind {
+            XmlMarkupKind::Start => {
+                if open_names.is_empty() {
+                    summary.count = summary.count.saturating_add(1);
+                    if markup.name.eq_ignore_ascii_case("name") {
+                        if summary.matching.is_some() {
+                            summary.duplicate_matching = true;
+                        } else {
+                            let child = xml_element_span(content, "name", markup.start)
+                                .filter(|span| span.open_start == markup.start)
+                                .ok_or_else(|| {
+                                    anyhow!("NFO collection name has no matching close")
+                                })?;
+                            if child.close_end > parent.close_start {
+                                bail!("NFO collection name crosses its parent closing tag");
+                            }
+                            summary.matching = Some(child);
+                        }
+                    }
+                }
+                if !markup.self_closing {
+                    open_names.push(markup.name);
+                }
+            }
+            XmlMarkupKind::End => {
+                let Some(open_name) = open_names.pop() else {
+                    bail!("NFO collection contains an unmatched closing tag");
+                };
+                if !open_name.eq_ignore_ascii_case(markup.name) {
+                    bail!("NFO collection contains mismatched nested tags");
+                }
+            }
+            XmlMarkupKind::Opaque => {
+                bail!("NFO collection contains unreadable markup");
+            }
+            _ => {}
+        }
+    }
+    if !open_names.is_empty() {
+        bail!("NFO collection contains an unclosed child tag");
+    }
+    Ok(summary)
+}
+
+fn xml_has_inner_markup(content: &str, element: XmlElementSpan) -> bool {
+    xml_next_markup(content, element.open_end)
+        .is_some_and(|markup| markup.start < element.close_start)
+}
+
 fn xml_attribute(tag: &str, attribute: &str) -> Option<String> {
     let markup = xml_next_markup(tag, 0)?;
     if markup.kind != XmlMarkupKind::Start {
@@ -7187,8 +7291,15 @@ fn metadata_field_changes(before: Option<&str>, after: &str) -> Vec<MetadataFiel
     ]
     .into_iter()
     .filter_map(|(field, tag)| {
-        let after = xml_tag_text(after, tag)?;
-        let before = before.and_then(|xml| xml_tag_text(xml, tag));
+        let read_value = |xml: &str| {
+            if field == "collection" {
+                nfo_collection_title(xml)
+            } else {
+                xml_tag_text(xml, tag)
+            }
+        };
+        let after = read_value(after)?;
+        let before = before.and_then(read_value);
         (before.as_deref() != Some(after.as_str())).then_some(MetadataFieldChange {
             field: field.to_string(),
             before,
@@ -7226,8 +7337,8 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
     }
     if let Some(collection) = &patch.collection {
         if !collection.title.trim().is_empty() {
-            if xml_tag_text(&output, "set").is_some() {
-                output = replace_xml_element(&output, "set", collection.title.trim())?;
+            if xml_element_span(&output, "set", 0).is_some() {
+                output = replace_nfo_collection_title(&output, collection.title.trim())?;
             } else {
                 nodes.push(format!(
                     "  <set>{}</set>",
@@ -7286,9 +7397,37 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
     Ok(inserted)
 }
 
+fn replace_nfo_collection_title(content: &str, value: &str) -> Result<String> {
+    let set = xml_element_span(content, "set", 0)
+        .ok_or_else(|| anyhow!("NFO collection element disappeared"))?;
+    if set.self_closing {
+        return replace_xml_element_span(content, set, value);
+    }
+
+    let children = direct_xml_child_summary(content, set)?;
+    if children.duplicate_matching {
+        bail!("NFO collection has multiple direct <name> elements; refusing ambiguous patch");
+    }
+    if let Some(name) = children.matching {
+        if direct_xml_child_summary(content, name)?.count > 0 || xml_has_inner_markup(content, name)
+        {
+            bail!("NFO collection name is complex; refusing to discard nested markup");
+        }
+        return replace_xml_element_span(content, name, value);
+    }
+    if children.count == 0 && !xml_has_inner_markup(content, set) {
+        return replace_xml_element_span(content, set, value);
+    }
+    bail!("NFO collection has complex children but no unique <name>; refusing to discard them")
+}
+
 fn replace_xml_element(content: &str, name: &str, value: &str) -> Result<String> {
     let element = xml_element_span(content, name, 0)
         .ok_or_else(|| anyhow!("NFO element disappeared or has no matching close"))?;
+    replace_xml_element_span(content, element, value)
+}
+
+fn replace_xml_element_span(content: &str, element: XmlElementSpan, value: &str) -> Result<String> {
     if element.self_closing {
         let slash = self_closing_xml_tag_slash(content, element.open_start, element.open_end - 1)
             .ok_or_else(|| anyhow!("NFO self-closing element has no closing slash"))?;
@@ -8286,7 +8425,7 @@ fn parse_legacy_import(input: &str) -> LegacyImportReport {
     'blocks: for block in &text_blocks {
         // The import byte limit bounds total scanning, while repeated rows do not consume the
         // unique-hint allowance.
-        for line in block.lines() {
+        for line in block.split(['\r', '\n']) {
             let ids = extract_source_ids(line);
             let title = title_hint_from_line(line);
             if ids.is_empty() && title.is_none() {
@@ -9129,6 +9268,21 @@ mod tests {
         let nfo = "<movie><title><![CDATA[Rock & Roll]]></title><uniqueid type=\"bilibili-cid\"><![CDATA[123456789]]></uniqueid></movie>";
         assert_eq!(xml_tag_text(nfo, "title").as_deref(), Some("Rock & Roll"));
         assert_eq!(nfo_source_ids(nfo), vec!["cid123456789"]);
+    }
+
+    #[test]
+    fn nfo_collection_title_reads_scalar_and_nested_cdata_names() {
+        assert_eq!(
+            nfo_collection_title("<movie><set><![CDATA[Scalar Series]]></set></movie>").as_deref(),
+            Some("Scalar Series")
+        );
+        assert_eq!(
+            nfo_collection_title(
+                "<movie><set><name><![CDATA[Nested Series]]></name><overview>Keep me</overview></set></movie>"
+            )
+            .as_deref(),
+            Some("Nested Series")
+        );
     }
 
     #[test]
@@ -11778,6 +11932,26 @@ mod tests {
     }
 
     #[test]
+    fn legacy_import_splits_lf_crlf_and_bare_cr_without_merging_hints() {
+        let report = parse_legacy_import(
+            "Title: First\rBV1abcdefgh\r\nTitle: 星河🙂\ncid12345678\rThird - ep123456789",
+        );
+
+        assert_eq!(report.hints.len(), 5);
+        assert_eq!(report.hints[0].title.as_deref(), Some("First"));
+        assert!(report.hints[0].source_ids.is_empty());
+        assert_eq!(report.hints[1].title, None);
+        assert_eq!(report.hints[1].source_ids, ["BV1abcdefgh"]);
+        assert_eq!(report.hints[2].title.as_deref(), Some("星河🙂"));
+        assert!(report.hints[2].source_ids.is_empty());
+        assert_eq!(report.hints[3].title, None);
+        assert_eq!(report.hints[3].source_ids, ["cid12345678"]);
+        assert_eq!(report.hints[4].title.as_deref(), Some("Third"));
+        assert_eq!(report.hints[4].source_ids, ["ep123456789"]);
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
     fn round7_metadata_patch_validation_uses_scalar_limits_for_titles() {
         for scalar in ["a", "界", "🙂"] {
             let accepted_title = scalar.repeat(MAX_METADATA_TITLE_CHARS);
@@ -12485,6 +12659,109 @@ mod tests {
                 .status,
             BatchStatus::Complete
         );
+    }
+
+    #[test]
+    fn confirmed_collection_patch_preserves_kodi_set_children_and_rescans_name() {
+        let root = TemporaryRoot::new("kodi-structured-set-patch");
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let original_nfo = "<movie><title>Episode</title><uniqueid type=\"bilibili-cid\">12345678</uniqueid><set source=\"library\"><name lang=\"en\">Old Series</name><overview xml:lang=\"en\">Keep this overview.</overview><future key=\"opaque\">Keep this node.</future></set><setid>old-series</setid></movie>";
+        let nfo_path = root.path().join("clip.nfo");
+        fs::write(&nfo_path, original_nfo).expect("NFO fixture should write");
+        fs::set_permissions(&nfo_path, fs::Permissions::from_mode(0o600))
+            .expect("NFO fixture should become private");
+
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let item = item_at(&snapshot, "clip.mp4");
+        assert_eq!(
+            item.collection
+                .as_ref()
+                .map(|collection| collection.title.as_str()),
+            Some("Old Series"),
+            "the collection title should come from Kodi's direct set/name child"
+        );
+        let patch = MetadataPatch {
+            item_id: item.id.clone(),
+            title: None,
+            source_ids: Vec::new(),
+            collection: Some(CollectionMetadata {
+                id: Some("new-series".to_string()),
+                title: "New Series".to_string(),
+                kind: "bilibili_collection".to_string(),
+                order: None,
+                part_id: None,
+            }),
+        };
+
+        let preview = manager
+            .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
+            .expect("structured collection metadata preview should succeed");
+        assert!(preview.metadata_patches[0].changed);
+        assert!(
+            preview.metadata_patches[0]
+                .changes
+                .contains(&MetadataFieldChange {
+                    field: "collection".to_string(),
+                    before: Some("Old Series".to_string()),
+                    after: "New Series".to_string(),
+                })
+        );
+        assert_eq!(fs::read_to_string(&nfo_path).unwrap(), original_nfo);
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed collection patch should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+
+        let patched = fs::read_to_string(&nfo_path).expect("patched NFO should read");
+        assert!(patched.contains("<set source=\"library\">"));
+        assert!(patched.contains("<name lang=\"en\">New Series</name>"));
+        assert!(patched.contains("<overview xml:lang=\"en\">Keep this overview.</overview>"));
+        assert!(patched.contains("<future key=\"opaque\">Keep this node.</future>"));
+        assert!(!patched.contains("<set>New Series</set>"));
+
+        let rescanned = manager.scan(&[]).expect("updated collection should rescan");
+        assert_eq!(
+            item_at(&rescanned, "clip.mp4").collection,
+            Some(CollectionMetadata {
+                id: Some("new-series".to_string()),
+                title: "New Series".to_string(),
+                kind: "bilibili_collection".to_string(),
+                order: None,
+                part_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn collection_patch_rejects_ambiguous_or_complex_kodi_names() {
+        let patch = MetadataPatch {
+            item_id: "item".to_string(),
+            title: None,
+            source_ids: Vec::new(),
+            collection: Some(CollectionMetadata {
+                id: None,
+                title: "New Series".to_string(),
+                kind: "bilibili_collection".to_string(),
+                order: None,
+                part_id: None,
+            }),
+        };
+        for original in [
+            "<movie><set><name>First</name><name>Second</name></set></movie>",
+            "<movie><set><name>Old <em>Series</em></name><overview>Keep me</overview></set></movie>",
+            "<movie><set><overview>Keep me</overview><future>Opaque</future></set></movie>",
+        ] {
+            let original = original.to_string();
+            let before = original.clone();
+            assert!(
+                append_metadata_patch(&original, &patch).is_err(),
+                "ambiguous or nested collection structure must fail closed: {original}"
+            );
+            assert_eq!(original, before);
+        }
     }
 
     #[test]

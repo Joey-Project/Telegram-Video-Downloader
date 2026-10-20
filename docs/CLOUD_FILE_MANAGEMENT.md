@@ -79,6 +79,10 @@ Each legacy hint can select at most one target video in a mapping request. The M
 
 The mapping panel uses the newest completed import with usable hint and candidate details, so a later failed or incomplete import does not hide earlier mappings. Automatic candidates and manual alternatives share bounded pages of 50 mapping rows. Selections and field choices survive page changes, and a preview includes selected mappings from every page. Every hint offers a manual target, including hints with an automatic candidate; choosing an alternative replaces that hint's previous selection.
 
+Library and Needs Organizing views each render at most 50 media rows per page, including rows inside collection groups. Search and filtering apply to the full uploaded library before pagination. Page changes preserve selections; visible and group selection controls apply only to the displayed page.
+
+Folder filters and destination paths accept a typed path. Their suggestions search the complete directory list while rendering at most 100 matches per input; refreshing suggestions does not replace an entered value. A path outside the initial suggestions remains reachable by typing it.
+
 A manual metadata patch without `hint_index` does not require an earlier legacy import. It must still select a present library item and pass the persisted preview and explicit confirmation checks. A patch with an explicit hint index must match a completed legacy import and its current candidate mapping.
 
 The Worker rejects reserved private-directory prefixes in every target path component, including uppercase, mixed-case, and supported HFS-ignorable aliases, before enqueueing a preview request. This comparison does not rewrite the actual target path.
@@ -86,6 +90,8 @@ The Worker rejects reserved private-directory prefixes in every target path comp
 Destination directories use a limit of 1,024 UTF-8 bytes in the Mini App, Worker, and Rust validator. Every component also has an independent limit of 255 UTF-8 bytes; an overlong component is rejected before creating a confirmable preview. The empty directory still selects the root. Before confirmation, the preview lists each media and related file's exact source and target paths; attachment counts do not replace those paths.
 
 Imported and submitted metadata titles, including collection titles, share a limit of 500 Unicode scalar values after trimming. This counts each Unicode code point rather than UTF-8 bytes or UTF-16 code units; CJK characters and supplementary-plane emoji have the same length policy in the importer, Worker, and local dispatcher. Legacy JSON text collection keeps one running UTF-8 byte budget and skips empty strings.
+
+Legacy text records accept LF, CRLF, and standalone carriage-return separators. Source IDs and titles are extracted independently from each record.
 
 Legacy text accepts line feeds, carriage returns, and tabs within its 256 KiB decoded UTF-8 limit. Other unsafe control characters and malformed Unicode are rejected. The separately bounded action JSON envelope allows legal escaped encodings of text within that limit.
 
@@ -115,7 +121,7 @@ A state-version conflict returns the current stored version in `X-Cloud-State-Ve
 
 HTTP 400 state responses also retain the pending content and version with retry backoff. The Worker can reject a temporarily future `reported_at`; refreshing that timestamp on each attempt lets the unchanged snapshot recover after the local clock is corrected.
 
-Operation history and active previews have separate encoded-byte budgets. Recent import details remain available for manual mapping; older oversized results carry explicit truncation warnings. An incomplete preview cannot be confirmed. A 413 response first compacts operation details, then reduces the library only if necessary, without silently describing a reduced snapshot as complete. Authentication failures remain eligible for backed-off retry after configuration is corrected.
+Operation history and active previews have separate encoded-byte budgets. The newest usable completed legacy import gets first priority when restoring operation details, before newer confirmation results consume the remaining budget. Older oversized results carry explicit truncation warnings. An incomplete preview cannot be confirmed. A 413 response first compacts operation details, then reduces the library only if necessary, without silently describing a reduced snapshot as complete. Authentication failures remain eligible for backed-off retry after configuration is corrected.
 
 Upload reduction also bounds warning text and category paths, including snapshots with zero or one media item. Omitted categories are reported in warnings; shortened paths are never offered as real destinations. The uploaded snapshot is marked incomplete, while the full local library remains available.
 
@@ -162,6 +168,7 @@ Task status and progress use a separate notification, coalesced over two seconds
 - Bilibili tasks can publish verified episodes before the whole task completes. Their source hints use only each verified entry's own stable ID and durable output paths/hashes, retaining its original episode index. Failed or pending entries are not advertised as published. Legacy completed tasks without per-entry attempt records retain the original whole-task hint path. A receipt is a source hint, not proof that the file's current content is intact.
 - A newly persisted verified episode receipt notifies the debounced library scanner; ordinary progress updates do not. A partial task keeps its existing retry/history semantics, independently of whether its published episodes appear in the library.
 - Queue-derived titles, source IDs, and collection metadata survive identity-preserving moves and index reloads. A different file at the old path does not inherit that identity. YouTube source IDs use `youtube:<video-id>`; NFO collection IDs and kinds survive metadata updates. Fully populated recognized NFO metadata is marked complete.
+- Structured Kodi collection metadata keeps its `<set>` container, attributes, and unknown children when changing its nested `<name>`. Ambiguous or unsupported structures fail before a metadata write; a subsequent scan reads the collection name without folding unrelated child text into the title.
 - Hint-path aliases use each component's parent-directory naming policy, including case, Unicode normalization, and HFS-ignorable characters when supported by that filesystem. Physical identity checks remain required; sensitive volumes do not gain blanket case or normalization equivalence.
 - Confirmed missing history is capped at 1,024 records and pruned further when necessary to fit the 16 MiB index budget. Present or unavailable records are not discarded to make room for missing history. The index remains rebuildable.
 - Persisted present-item records omit rebuildable attachment lists; the current snapshot keeps those lists for previews. If the remaining live index still exceeds 16 MiB, the scan returns the updated snapshot with a persistence warning and preserves the previous valid index. New associations in that scan are not reported as durably saved. Later scans remain available and retry persistence; the fallback does not delete media files or discard the previously persisted queue provenance.
