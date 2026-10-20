@@ -7160,6 +7160,12 @@ fn queue_or_prompt_job(
                                 error = %redact_sensitive_text(&format!("{error:#}")),
                                 "Bilibili short-link normalization failed; refusing to start an ambiguous download"
                             );
+                            send_or_log(
+                                &context.telegram,
+                                chat_id,
+                                "Could not resolve this Bilibili short link, so no download was started. Its queue status is being saved; check /queue before resending.".to_string(),
+                            )
+                            .await;
                             let status_error = fail_task_if_generation_with_retry_delay(
                                 &context.queue,
                                 &task_id,
@@ -7175,18 +7181,18 @@ fn queue_or_prompt_job(
                                     "failed to persist Bilibili short-link failure state"
                                 );
                             }
-                            send_or_log(
-                                &context.telegram,
-                                chat_id,
-                                "Could not resolve this Bilibili short link, so no download was started. Its queue status is being saved; check /queue before resending.".to_string(),
-                            )
-                            .await;
                             return;
                         }
                     }
                 }
                 Err(err) => {
                     warn!(error = %err, "Bilibili short-link normalization could not run because the probe queue closed");
+                    send_or_log(
+                        &context.telegram,
+                        chat_id,
+                        "Could not resolve this Bilibili short link, so no download was started. Its queue status is being saved; check /queue before resending.".to_string(),
+                    )
+                    .await;
                     let status_error = fail_task_if_generation_with_retry_delay(
                         &context.queue,
                         &task_id,
@@ -7202,12 +7208,6 @@ fn queue_or_prompt_job(
                             "failed to persist Bilibili short-link failure state"
                         );
                     }
-                    send_or_log(
-                        &context.telegram,
-                        chat_id,
-                        "Could not resolve this Bilibili short link, so no download was started. Its queue status is being saved; check /queue before resending.".to_string(),
-                    )
-                    .await;
                     return;
                 }
             }

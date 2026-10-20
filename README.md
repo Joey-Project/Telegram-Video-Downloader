@@ -127,10 +127,10 @@ https://m.bilibili.com/opus/1206098216310800386?share_source=COPY
 本地重放一条 Telegram 文本、不走真实 Telegram API：
 
 ```sh
-cargo run -- --replay-message config.toml "Title https://b23.tv/..."
+cargo run -- --replay-message config.toml "https://youtu.be/..."
 ```
 
-`ss/md` 番剧系列入口需要 Telegram inline keyboard 选择，`--replay-message` 不会替你默认选择；本地重放请使用具体 `ep` 链接。
+`--replay-message` 不会模拟 Telegram 的选择按钮。Bilibili BV/AV 视频链接（包括带 `?p=N` 的链接）以及 `ss/md` 系列入口都需要在 bot 对话中完成选择；系列重放可使用具体 `ep` 链接。
 
 ## macOS 自启动
 

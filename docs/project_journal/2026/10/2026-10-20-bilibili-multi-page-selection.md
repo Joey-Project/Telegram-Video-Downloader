@@ -23,6 +23,7 @@ superseded_by:
 - AV links resolve their BV ID before checking collection membership. Failed Bilibili short-link normalization stops the task rather than falling through to an unconfirmed download.
 - Video-page selection persistence reports File Provider retries so the task does not appear to vanish while its keyboard is pending.
 - Failed short-link tasks retry their terminal status write if File Provider temporarily blocks the queue.
+- Short-link failure notification is sent before that retry loop, and README now documents that replay mode cannot handle Telegram-only Bilibili choices.
 - README describes the new Telegram prompt. No live Telegram or Bilibili smoke test has been run.
 
 ## Evidence
