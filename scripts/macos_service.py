@@ -1066,6 +1066,7 @@ class Deployment:
         self.repo = absolute(args.repo, Path.cwd())
         self.readiness_mode = "telegram"
         self.launchd_cloud_shared_secret = None
+        self.config_has_cloud_shared_secret = False
         self.input_binary = absolute(args.binary, Path.cwd()) if args.binary else None
         self.binary = self.home / ".local/lib/telegram-video-downloader/bin" / EXECUTABLE
         self.backups = self.home / ".local/lib/telegram-video-downloader/backups"
@@ -1167,10 +1168,16 @@ class Deployment:
             raise InstallError("cloud configuration must be a TOML table")
         self.readiness_mode = "cloud" if cloud_config is not None else "telegram"
         self.launchd_cloud_shared_secret = None
+        configured_shared_secret = (
+            cloud_config.get("shared_secret") if self.readiness_mode == "cloud" else None
+        )
+        self.config_has_cloud_shared_secret = (
+            isinstance(configured_shared_secret, str) and bool(configured_shared_secret.strip())
+        )
         if self.readiness_mode == "cloud":
             shared_secret = os.environ.get(LAUNCHD_CLOUD_SHARED_SECRET)
-            # Match the runtime's non-empty bearer requirement without replacing a
-            # valid value already saved in an existing plist with an empty override.
+            # A non-empty installer value wins; otherwise a configured secret removes any
+            # persisted override so the runtime resolves the same source as this installer.
             if shared_secret is not None and shared_secret.strip():
                 self.launchd_cloud_shared_secret = shared_secret
         auth = self.document.get("bilibili", {}).get("auth", {})
@@ -1253,9 +1260,15 @@ class Deployment:
         if self.old_plist:
             document = copy.deepcopy(self.old_plist)
             document["ProgramArguments"][0] = str(self.binary)
-            if self.launchd_cloud_shared_secret is not None:
+            if (
+                self.launchd_cloud_shared_secret is not None
+                or self.config_has_cloud_shared_secret
+            ):
                 environment = dict(document.get("EnvironmentVariables", {}))
-                environment[LAUNCHD_CLOUD_SHARED_SECRET] = self.launchd_cloud_shared_secret
+                if self.launchd_cloud_shared_secret is not None:
+                    environment[LAUNCHD_CLOUD_SHARED_SECRET] = self.launchd_cloud_shared_secret
+                else:
+                    environment.pop(LAUNCHD_CLOUD_SHARED_SECRET, None)
                 document["EnvironmentVariables"] = environment
             return plistlib.dumps(document)
         environment = {

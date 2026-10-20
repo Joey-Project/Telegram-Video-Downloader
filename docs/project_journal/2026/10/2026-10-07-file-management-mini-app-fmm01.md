@@ -26,7 +26,7 @@ superseded_by: ""
 - Cloudflare 等待卡片重复问题已修复。2026-10-19 的类型检查、75 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 1020 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录、来源匹配和有界状态清理，以及 YouTube legacy 提取、纯标题导入、目标目录深度、确认恢复提示、导入来源恢复、队列快照、hint 唯一映射、长附件名改名、零条目上传缩减和预览 anchor 可用性覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
 - 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `afbf09300bf5ac7c0dbdc11ac5d1e10f934336fb` 的 master 更新，包含 ASS 弹幕显示默认值、恢复工作流收尾、Cargo 输出目录之外的签名服务安装流程及切换记录，并补齐 Cloud 模式的服务就绪兼容。本分支未安装或重启 bot，也未修改其他 worktree；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
-- Python 3.14.5 的 98 项服务单测、隔离 shell 集成测试、shell 语法检查和 ShellCheck 均通过，覆盖私有 shared secret 传递和回滚；测试使用临时 HOME 和模拟系统命令，不安装或重启实际服务。CI 已纳入 Python 与 shell 服务测试。
+- Python 3.14.5 的 101 项服务单测、隔离 shell 集成测试与 shell 语法检查均通过，覆盖私有 shared secret 传递、来源切换和回滚；此前 shell 修改也已通过 ShellCheck。测试使用临时 HOME 和模拟系统命令，不安装或重启实际服务。CI 已纳入 Python 与 shell 服务测试。
 
 ### 2026-10-19 Isolated integration validation
 
@@ -36,6 +36,7 @@ superseded_by: ""
 
 ### 2026-10-20 Recovery boundaries
 
+- The macOS installer removes a persisted Cloud shared-secret environment override when the configuration provides the secret and the installer has no non-empty replacement environment value. Explicit environment replacements still take precedence, environment-only upgrades retain their saved value, and unrelated environment entries are preserved.
 - Local validation passed with 1,034 Rust tests, 0 failures, and 16 ignored tests; 78 Cloud tests passed. Formatting, all-target compilation, strict Clippy, the debug build, Cloud typechecking, and the Wrangler dry-run also passed. HTTP retry regressions compare actual request timestamps instead of short negative timing windows, preserving the configured 100 ms retry and 500 ms exhaustion-backoff assertions under concurrent test scheduling.
 - State uploads keep their pending content and version after HTTP 400, refresh the timestamp on each attempt, and use backoff so correcting clock skew can recover without another library change.
 - Cloud previews check the complete prospective inbox receipt before saving descriptor anchors or a manifest. Oversized selections receive an actionable split request; smaller previews retain the normal confirmation flow.

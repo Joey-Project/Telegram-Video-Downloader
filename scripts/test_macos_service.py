@@ -1886,6 +1886,90 @@ class InstallationTest(unittest.TestCase):
                 )
                 self.assertNotIn(SYNTHETIC_CLOUD_SECRET_OLD, json.dumps(plan))
 
+    def test_configured_cloud_secret_removes_old_plist_override_without_installer_secret(self):
+        self.config.write_text(
+            f'[cloud]\nshared_secret = "{SYNTHETIC_CLOUD_SECRET_NEW}"\n', encoding="utf-8"
+        )
+        self.config.chmod(0o600)
+        old_environment = {
+            **self.original_plist["EnvironmentVariables"],
+            service.LAUNCHD_CLOUD_SHARED_SECRET: SYNTHETIC_CLOUD_SECRET_OLD,
+        }
+        self.plist.write_bytes(
+            plistlib.dumps({**self.original_plist, "EnvironmentVariables": old_environment})
+        )
+        cases = [("unset", None), ("empty", ""), ("whitespace", " \t\n ")]
+        for label, value in cases:
+            with self.subTest(environment=label):
+                if value is None:
+                    with mock.patch.dict(os.environ):
+                        os.environ.pop(service.LAUNCHD_CLOUD_SHARED_SECRET, None)
+                        deployment = self.deployment()
+                        plan = self.audit(deployment)
+                        document = plistlib.loads(deployment.new_plist())
+                else:
+                    with mock.patch.dict(
+                        os.environ, {service.LAUNCHD_CLOUD_SHARED_SECRET: value}
+                    ):
+                        deployment = self.deployment()
+                        plan = self.audit(deployment)
+                        document = plistlib.loads(deployment.new_plist())
+                environment = document["EnvironmentVariables"]
+                self.assertNotIn(service.LAUNCHD_CLOUD_SHARED_SECRET, environment)
+                self.assertEqual(
+                    environment["PATH"], self.original_plist["EnvironmentVariables"]["PATH"]
+                )
+                self.assertNotIn(SYNTHETIC_CLOUD_SECRET_OLD, json.dumps(document))
+                self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(plan))
+
+    def test_explicit_cloud_environment_secret_overrides_configured_secret(self):
+        self.config.write_text(
+            f'[cloud]\nshared_secret = "{SYNTHETIC_CLOUD_SECRET_OLD}"\n', encoding="utf-8"
+        )
+        self.config.chmod(0o600)
+        old_environment = {
+            **self.original_plist["EnvironmentVariables"],
+            service.LAUNCHD_CLOUD_SHARED_SECRET: SYNTHETIC_CLOUD_SECRET_OLD,
+        }
+        self.plist.write_bytes(
+            plistlib.dumps({**self.original_plist, "EnvironmentVariables": old_environment})
+        )
+        with mock.patch.dict(
+            os.environ, {service.LAUNCHD_CLOUD_SHARED_SECRET: SYNTHETIC_CLOUD_SECRET_NEW}
+        ):
+            deployment = self.deployment()
+            plan = self.audit(deployment)
+            document = plistlib.loads(deployment.new_plist())
+
+        self.assertEqual(
+            document["EnvironmentVariables"][service.LAUNCHD_CLOUD_SHARED_SECRET],
+            SYNTHETIC_CLOUD_SECRET_NEW,
+        )
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_OLD, json.dumps(plan))
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_NEW, json.dumps(plan))
+
+    def test_non_cloud_mode_preserves_existing_plist_cloud_secret(self):
+        self.config.write_text("[telegram]\n", encoding="utf-8")
+        self.config.chmod(0o600)
+        old_environment = {
+            **self.original_plist["EnvironmentVariables"],
+            service.LAUNCHD_CLOUD_SHARED_SECRET: SYNTHETIC_CLOUD_SECRET_OLD,
+        }
+        self.plist.write_bytes(
+            plistlib.dumps({**self.original_plist, "EnvironmentVariables": old_environment})
+        )
+        with mock.patch.dict(os.environ):
+            os.environ.pop(service.LAUNCHD_CLOUD_SHARED_SECRET, None)
+            deployment = self.deployment()
+            plan = self.audit(deployment)
+            document = plistlib.loads(deployment.new_plist())
+
+        self.assertEqual(
+            document["EnvironmentVariables"][service.LAUNCHD_CLOUD_SHARED_SECRET],
+            SYNTHETIC_CLOUD_SECRET_OLD,
+        )
+        self.assertNotIn(SYNTHETIC_CLOUD_SECRET_OLD, json.dumps(plan))
+
     def test_first_cloud_install_writes_environment_secret_to_private_new_plist(self):
         self.plist.unlink()
         self.config.write_text("[cloud]\n", encoding="utf-8")
