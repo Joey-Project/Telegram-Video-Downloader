@@ -529,6 +529,14 @@ impl BoundFile {
             Err(err) => Err(errno_to_io(err)).context("failed to lock bound file"),
         }
     }
+
+    pub(crate) fn unlock_exclusive(&self) -> Result<()> {
+        self.validate_identity()?;
+        rustix::fs::flock(self.fd.as_ref(), FlockOperation::Unlock)
+            .map_err(errno_to_io)
+            .context("failed to unlock bound file")?;
+        self.validate_identity()
+    }
 }
 
 impl BoundDirectory {

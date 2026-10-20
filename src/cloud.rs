@@ -1103,6 +1103,24 @@ enum InboxRecordRead {
     },
 }
 
+struct CloudInboxOwnerLock {
+    file: BoundFile,
+    owner_process_id: u32,
+}
+
+impl Drop for CloudInboxOwnerLock {
+    fn drop(&mut self) {
+        // A forked child can temporarily retain a CLOEXEC duplicate until exec. Explicitly
+        // releasing the flock when the last local inbox clone drops avoids extending ownership
+        // past the lifetime of the local runtime while preserving exclusivity between clones.
+        // Arc counts are copied, not shared, across fork; only the process that acquired the
+        // lease may release it.
+        if std::process::id() == self.owner_process_id {
+            let _ = self.file.unlock_exclusive();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CloudInbox {
     root: RootedFs,
@@ -1113,7 +1131,7 @@ pub struct CloudInbox {
     database_epoch: String,
     directory: PathBuf,
     directory_identity: EntryIdentity,
-    _owner_lock: BoundFile,
+    _owner_lock: Arc<CloudInboxOwnerLock>,
     operation_lock: Arc<Mutex<()>>,
     pending_sequences: Arc<Mutex<BTreeSet<u64>>>,
     state_index: Arc<Mutex<InboxStateIndex>>,
@@ -2476,7 +2494,7 @@ fn create_owner_lock(
     directory: &Path,
     root: &RootedFs,
     file_provider: &Arc<dyn QueueFileProvider>,
-) -> Result<BoundFile> {
+) -> Result<Arc<CloudInboxOwnerLock>> {
     let lock_path = directory.join(CLOUD_INBOX_OWNER_LOCK);
     let mut lock_file = None;
     let mut access = |coordinated_path: &Path| -> Result<()> {
@@ -2500,7 +2518,10 @@ fn create_owner_lock(
         if !file.try_lock_exclusive()? {
             bail!("cloud inbox already has a live local owner");
         }
-        lock_file = Some(file);
+        lock_file = Some(Arc::new(CloudInboxOwnerLock {
+            file,
+            owner_process_id: std::process::id(),
+        }));
         Ok(())
     };
     file_provider
@@ -2927,6 +2948,42 @@ mod tests {
         drop(inbox);
         let reloaded = CloudInbox::open(&root).expect("inbox should reopen");
         assert_eq!(reloaded.pending().expect("pending should reload").len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inbox_owner_lock_releases_on_last_clone_even_with_a_duplicate_descriptor() {
+        let root = temp_root("owner-lock-last-clone");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let inbox_clone = inbox.clone();
+        let duplicate_fd = inbox
+            ._owner_lock
+            .file
+            .duplicate_std_file()
+            .expect("owner lock descriptor should duplicate");
+        let inherited_guard_copy = CloudInboxOwnerLock {
+            file: inbox._owner_lock.file.clone(),
+            owner_process_id: std::process::id().wrapping_add(1),
+        };
+        drop(inherited_guard_copy);
+
+        let error = CloudInbox::open(&root)
+            .err()
+            .expect("dropping a foreign-process guard copy must not unlock the owner");
+        assert!(format!("{error:#}").contains("already has a live local owner"));
+
+        drop(inbox);
+        let error = CloudInbox::open(&root)
+            .err()
+            .expect("a live inbox clone must continue to hold ownership");
+        assert!(format!("{error:#}").contains("already has a live local owner"));
+
+        drop(inbox_clone);
+        let reopened = CloudInbox::open(&root)
+            .expect("last local owner should unlock even while a duplicate fd remains open");
+        drop(reopened);
+        drop(duplicate_fd);
         let _ = fs::remove_dir_all(root);
     }
 
