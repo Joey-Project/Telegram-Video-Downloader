@@ -192,11 +192,7 @@ pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
         )
         .await;
         if let Err(error) = result {
-            runtime
-                .library_unavailable
-                .lock()
-                .await
-                .insert(library.id, redact_sensitive_text(&format!("{error:#}")));
+            warn!(library_id = %library.id, error = %redact_sensitive_text(&format!("{error:#}")), "media-library refresh failed");
         }
     }
     *runtime.library_scan_warning.lock().await = runtime
@@ -270,6 +266,45 @@ pub(super) async fn attach_library_views(
     let availability = runtime.bot.queue.video_library_statuses()?;
     let default_id = applied["default_library_id"].as_str().unwrap_or_default();
     let original_id = original_library_id(runtime).ok();
+    let task_summaries = if runtime.bot.config.telegram.allow_all_chats {
+        BTreeMap::new()
+    } else {
+        let library_ids = applied["libraries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|descriptor| descriptor["id"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        let allowed_chat_ids = runtime.bot.config.telegram.allowed_chat_ids.clone();
+        let queue = Arc::clone(&runtime.bot.queue);
+        match tokio::task::spawn_blocking(move || {
+            let mut summaries = BTreeMap::new();
+            for library_id in library_ids {
+                let summary = queue.incomplete_task_transfer_summary(
+                    &library_id,
+                    &allowed_chat_ids,
+                );
+                match summary {
+                    Ok(summary) => {
+                        summaries.insert(library_id, Some(summary));
+                    }
+                    Err(error) => {
+                        warn!(library_id = %library_id, error = %redact_sensitive_text(&format!("{error:#}")), "could not summarize incomplete media-library tasks");
+                        summaries.insert(library_id, None);
+                    }
+                }
+            }
+            summaries
+        })
+        .await
+        {
+            Ok(summaries) => summaries,
+            Err(error) => {
+                warn!(error = %error, "incomplete task summary worker failed");
+                BTreeMap::new()
+            }
+        }
+    };
     let mut views = Vec::new();
     let mut selected = None;
     for descriptor in applied["libraries"].as_array().into_iter().flatten() {
@@ -312,6 +347,14 @@ pub(super) async fn attach_library_views(
         view["scanned_at"] = snapshot["scanned_at"].clone();
         view["free_bytes"] = json!(status.and_then(|status| status.available_space_bytes));
         view["total_bytes"] = Value::Null;
+        let task_summary = task_summaries.get(id).and_then(Option::as_ref);
+        view["incomplete_task_count"] = task_summary
+            .map(|summary| json!(summary.task_count))
+            .unwrap_or(Value::Null);
+        view["staging_bytes"] = task_summary
+            .and_then(|summary| summary.staging_bytes)
+            .map(|bytes| json!(bytes))
+            .unwrap_or(Value::Null);
         view["snapshot"] = snapshot.clone();
         if id == default_id {
             selected = Some(snapshot);

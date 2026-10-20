@@ -11,7 +11,8 @@ import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewableP
 import { sourceIdUrl } from "./source-links.js";
 import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
 import { validateTargetRelativeDirectory } from "./target-directory.js";
-import { boundedFolderSuggestions, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary, statusOf } from "./library-view.js";
+import { boundedFolderSuggestions, canOperateOnMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary, statusOf } from "./library-view.js";
+import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
 
 const API = "/api";
 const CACHE_KEY = "file-manager.snapshot.v1";
@@ -59,6 +60,11 @@ const activeLibraryId = () => activeLibrary().id;
 const libraryItems = () => Array.isArray(activeLibrarySnapshot()?.items) ? activeLibrarySnapshot().items : [];
 const snapshotValue = () => state.snapshot ?? { synced: false, stale: true, library: null, previews: [], operations: [], tasks: [], settings: {} };
 
+function libraryCanOperate(libraryId = activeLibraryId()) {
+  const descriptor = mediaLibraryEntries(state.snapshot).find((entry) => entry.id === libraryId);
+  return canOperateOnMediaLibrary(descriptor);
+}
+
 function normalizeLibraryContext() {
   const entries = mediaLibraryEntries(state.snapshot);
   const valid = entries.some((entry) => entry.id === state.libraryId);
@@ -103,7 +109,7 @@ function renderDownloadStatus() {
   const submit = byId("download-submit");
   if (!status || !submit) return;
   const submission = state.downloadSubmission;
-  submit.disabled = Boolean(submission);
+  submit.disabled = Boolean(submission) || !libraryCanOperate(byId("download-library-select")?.value || activeLibraryId());
   if (submission?.seq !== null && submission?.seq !== undefined) {
     const pending = (Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : [])
       .find((request) => request.seq === submission.seq);
@@ -153,7 +159,7 @@ function settleDownloadSubmission() {
 
 function activeLibraryOptions(selectedId = activeLibraryId()) {
   return mediaLibraryEntries(state.snapshot).map((entry) =>
-    `<option value="${escapeHtml(entry.id)}" ${entry.id === selectedId ? "selected" : ""}>${escapeHtml(entry.name)}${entry.is_default === true ? " · default" : ""}</option>`,
+    `<option value="${escapeHtml(entry.id)}" ${entry.id === selectedId ? "selected" : ""} ${libraryCanOperate(entry.id) ? "" : "disabled"}>${escapeHtml(entry.name)}${entry.is_default === true ? " · default" : ""}${libraryCanOperate(entry.id) ? "" : " · offline"}</option>`,
   ).join("");
 }
 
@@ -169,6 +175,7 @@ function updateDownloadFormOptions() {
     .slice(0, 100)
     .map((folder) => `<option value="${escapeHtml(folder)}"></option>`)
     .join("");
+  renderDownloadStatus();
 }
 
 function openDownloadForm({ updateUrl = true } = {}) {
@@ -420,6 +427,32 @@ async function drainActionQueue({ quiet = false } = {}) {
 
 async function submitAction(kind, payload, { onQueued } = {}) {
   if (!mayDispatchActions(state)) return false;
+  const unavailableLibraryAction = (() => {
+    if (["file_preview", "legacy_import"].includes(kind)) {
+      return !libraryCanOperate(String(payload?.library_id ?? activeLibraryId()));
+    }
+    if (kind === "download_submit") return !libraryCanOperate(String(payload?.library_id ?? ""));
+    if (kind === "library_migration_preview") {
+      return !libraryCanOperate(String(payload?.source_library_id ?? ""))
+        || !libraryCanOperate(String(payload?.target_library_id ?? ""));
+    }
+    if (kind === "file_confirm") {
+      const preview = previews().find((entry) => entry.id === payload?.preview_id);
+      return preview ? !libraryCanOperate(String(preview.library_id || activeLibraryId())) : false;
+    }
+    if (kind === "library_migration_confirm") {
+      const preview = migrationPreviewEntries().find((entry) => entry.id === payload?.preview_id);
+      const result = preview?.result ?? {};
+      const sourceId = String(result.source_library_id ?? preview?.source_library_id ?? activeLibraryId());
+      const targetId = String(result.target_library_id ?? preview?.target_library_id ?? "");
+      return !libraryCanOperate(sourceId) || Boolean(targetId && !libraryCanOperate(targetId));
+    }
+    return false;
+  })();
+  if (unavailableLibraryAction) {
+    showToast("This library is offline or showing a saved scan. Reconnect it and refresh before changing files.");
+    return false;
+  }
   if (kind === "file_preview") {
     for (const field of ["item_ids", "metadata_patches"]) {
       if (Array.isArray(payload?.[field]) && payload[field].length > MAX_SELECTED_ITEMS) {
@@ -497,7 +530,7 @@ function renderFilters() {
   byId("known-folders").innerHTML = destinationSuggestions.map((folder) => `<option value="${escapeHtml(folder)}"></option>`).join("");
 }
 
-function itemRow(item) {
+function itemRow(item, selectionEnabled = true) {
   const id = String(item.id ?? "");
   const selected = state.selected.has(id);
   const presence = statusOf(item);
@@ -505,7 +538,7 @@ function itemRow(item) {
   const dims = item.width && item.height ? `${escapeHtml(item.width)} × ${escapeHtml(item.height)}` : "";
   const codec = item.codec ? escapeHtml(item.codec) : "";
   return `<article class="library-row${selected ? " selected" : ""}" data-item-row="${escapeHtml(id)}">
-    <input class="row-check" type="checkbox" aria-label="Select ${escapeHtml(item.title ?? item.relative_path)}" data-select-item="${escapeHtml(id)}" ${selected ? "checked" : ""} ${isPresentMedia(item) ? "" : "disabled"}>
+    <input class="row-check" type="checkbox" aria-label="Select ${escapeHtml(item.title ?? item.relative_path)}" data-select-item="${escapeHtml(id)}" ${selected ? "checked" : ""} ${isPresentMedia(item) && selectionEnabled ? "" : "disabled"}>
     <div class="media-icon" aria-hidden="true">▣</div>
     <div class="media-main"><div class="media-title"><span>${escapeHtml(item.title || item.relative_path || "Untitled video")}</span></div><div class="media-path">${escapeHtml(item.relative_path || "Path unavailable")}</div></div>
     <div class="media-meta"><span><i class="status-dot ${escapeHtml(presence)}"></i>${displayStatus}</span><span>${formatBytes(item.bytes)}</span>${dims ? `<span>${dims}</span>` : ""}${codec ? `<span>${codec}</span>` : ""}<button class="details-button" type="button" data-details="${escapeHtml(id)}">Details</button></div>
@@ -524,7 +557,7 @@ function libraryPageMarkup(page, scope) {
   return `<nav class="toolbar library-pagination" aria-label="${label}">${previous}<span class="field-hint">Page ${page.page + 1} of ${page.pageCount} · items ${page.start + 1}–${page.end} of ${page.total.toLocaleString()}</span>${next}</nav>`;
 }
 
-function renderGroupedItems(container, items, page, scope) {
+function renderGroupedItems(container, items, page, scope, selectionEnabled = true) {
   const groups = groupLibraryItems(items);
   const renderedGroups = groups.map(({ title, items: entries }, index) => {
     const selectableEntries = presentMediaItems(entries);
@@ -532,8 +565,8 @@ function renderGroupedItems(container, items, page, scope) {
     const allSelected = groupIds.length > 0 && groupIds.every((id) => state.selected.has(id));
     const someSelected = groupIds.some((id) => state.selected.has(id));
     return `<details class="collection-group" ${index < 3 ? "open" : ""}>
-      <summary><input class="group-check" type="checkbox" aria-label="Select available ${escapeHtml(title)} items on this page" data-select-group="${escapeHtml(title)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${selectableEntries.length ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count">${entries.length} file${entries.length === 1 ? "" : "s"} on this page</span></summary>
-      <div class="collection-items">${entries.map(itemRow).join("")}</div>
+      <summary><input class="group-check" type="checkbox" aria-label="Select available ${escapeHtml(title)} items on this page" data-select-group="${escapeHtml(title)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${selectableEntries.length && selectionEnabled ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count">${entries.length} file${entries.length === 1 ? "" : "s"} on this page</span></summary>
+      <div class="collection-items">${entries.map((item) => itemRow(item, selectionEnabled)).join("")}</div>
     </details>`;
   }).join("");
   container.innerHTML = `${renderedGroups}${libraryPageMarkup(page, scope)}`;
@@ -552,6 +585,7 @@ function pageItemsForScope(scope) {
 function renderLibrary() {
   renderLibrarySelector();
   const library = activeLibrarySnapshot();
+  const canOperate = libraryCanOperate();
   const availableIds = new Set(presentMediaItems(libraryItems()).map((item) => String(item.id)));
   for (const id of state.selected) if (!availableIds.has(id)) state.selected.delete(id);
   renderFilters();
@@ -562,8 +596,8 @@ function renderLibrary() {
   state.libraryPage = libraryPage.page;
   state.needsPage = needsPage.page;
   const list = byId("library-list");
-  renderGroupedItems(list, libraryPage.items, libraryPage, "library");
-  renderGroupedItems(byId("needs-list"), needsPage.items, needsPage, "needs");
+  renderGroupedItems(list, libraryPage.items, libraryPage, "library", canOperate);
+  renderGroupedItems(byId("needs-list"), needsPage.items, needsPage, "needs", canOperate);
   const synced = state.snapshot?.synced === true;
   const firstScanPending = synced && (library?.ready === false || Number(library?.scanned_at) === 0);
   const localOffline = mediaLibraryAvailability(activeLibrary().descriptor) === "offline";
@@ -605,7 +639,14 @@ function renderLibrary() {
     : "Needs organizing will appear after the first scan.";
   byId("needs-empty").classList.toggle("hidden", !synced || firstScanPending || needsItems.length > 0);
   byId("needs-list").classList.toggle("hidden", !synced || firstScanPending || needsItems.length === 0);
-  byId("preview-move").disabled = state.selected.size === 0;
+  byId("download-here").disabled = !canOperate;
+  byId("select-visible").disabled = !canOperate;
+  byId("target-dir").disabled = !canOperate;
+  byId("root-target").disabled = !canOperate;
+  byId("rename-toggle").disabled = !canOperate;
+  byId("conflict-select").disabled = !canOperate;
+  byId("preview-move").disabled = !canOperate || state.selected.size === 0;
+  byId("import-legacy").disabled = !canOperate;
 }
 
 function operationTitle(operation) {
@@ -691,31 +732,26 @@ function describePreview(preview) {
 
 function incompleteTaskSummary(libraryId) {
   const descriptor = mediaLibraryEntries(state.snapshot).find((entry) => entry.id === libraryId);
-  const reportedCount = Number(descriptor?.incomplete_task_count);
-  const reportedBytes = Number(descriptor?.staging_bytes);
-  if (Number.isSafeInteger(reportedCount) && reportedCount >= 0) {
-    return { count: reportedCount, bytes: Number.isSafeInteger(reportedBytes) && reportedBytes >= 0 ? reportedBytes : 0 };
-  }
-  const incomplete = (Array.isArray(state.snapshot?.tasks) ? state.snapshot.tasks : []).filter((task) => {
-    const taskLibraryId = task?.library_id ?? task?.destination?.library_id ?? task?.target?.library_id;
-    const status = String(task?.status ?? "").toLowerCase();
-    return taskLibraryId === libraryId && !["completed", "succeeded", "cancelled", "canceled"].includes(status);
-  });
-  const bytes = incomplete.reduce((total, task) => {
-    const value = Number(task?.staging_bytes ?? task?.partial_bytes ?? task?.downloaded_bytes ?? 0);
-    return Number.isSafeInteger(value) && value > 0 ? total + value : total;
-  }, 0);
-  return { count: incomplete.length, bytes };
+  return incompleteMigrationTaskSummary(descriptor, state.snapshot?.tasks, libraryId);
 }
 
 function migrationTargetOptions() {
   const sourceId = activeLibraryId();
   const entries = mediaLibraryEntries(state.snapshot).filter((entry) => entry.id !== sourceId);
   byId("migration-target").innerHTML = entries.map((entry) =>
-    `<option value="${escapeHtml(entry.id)}">${escapeHtml(entry.name)} · ${escapeHtml(entry.root ?? "root unavailable")}</option>`,
+    `<option value="${escapeHtml(entry.id)}" ${libraryCanOperate(entry.id) ? "" : "disabled"}>${escapeHtml(entry.name)} · ${escapeHtml(entry.root ?? "root unavailable")}${libraryCanOperate(entry.id) ? "" : " · offline"}</option>`,
   ).join("");
-  byId("migration-target").disabled = entries.length === 0;
-  byId("migration-preview").disabled = entries.length === 0;
+  const availableTargets = entries.filter((entry) => libraryCanOperate(entry.id));
+  const sourceAvailable = libraryCanOperate(sourceId);
+  if (!availableTargets.some((entry) => entry.id === byId("migration-target").value)) {
+    byId("migration-target").value = availableTargets[0]?.id ?? "";
+  }
+  byId("migration-target").disabled = availableTargets.length === 0 || !sourceAvailable;
+  byId("migration-scope").disabled = !sourceAvailable;
+  byId("migration-include-tasks").disabled = !sourceAvailable;
+  byId("migration-set-default").disabled = !sourceAvailable;
+  byId("migration-conflict").disabled = !sourceAvailable;
+  byId("migration-preview").disabled = availableTargets.length === 0 || !sourceAvailable;
   byId("migration-source").textContent = `Source: ${libraryLabel(sourceId)} · Choose the source in the library selector above.`;
   const selectionSize = state.selected.size;
   byId("migration-selection-count").textContent = selectionSize
@@ -723,9 +759,11 @@ function migrationTargetOptions() {
     : "Select media in the Library view first to migrate a selected subset.";
   const taskSummary = incompleteTaskSummary(sourceId);
   byId("migration-task-option").classList.toggle("hidden", taskSummary.count === 0);
-  byId("migration-task-count").textContent = `${taskSummary.count} unfinished task${taskSummary.count === 1 ? "" : "s"} · ${formatBytes(taskSummary.bytes)} staged data. This option is off by default.`;
+  const countLabel = taskSummary.countIsLowerBound ? `At least ${taskSummary.count}` : String(taskSummary.count);
+  const byteLabel = taskSummary.bytes === null ? "staged data size unknown" : `${formatBytes(taskSummary.bytes)} staged data`;
+  byId("migration-task-count").textContent = `${countLabel} unfinished task${taskSummary.count === 1 ? "" : "s"} · ${byteLabel}. This option is off by default.`;
   const selectedScope = byId("migration-scope").value === "selected";
-  byId("migration-preview").disabled = entries.length === 0 || selectedScope && selectionSize === 0;
+  byId("migration-preview").disabled = !sourceAvailable || availableTargets.length === 0 || selectedScope && selectionSize === 0;
 }
 
 function migrationPreviewEntries() {
@@ -801,6 +839,10 @@ function renderMigrationPreview(operation) {
   const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
   const id = String(result.id ?? result.preview_id ?? operation?.preview_id ?? operation?.id ?? "");
   const revision = String(result.revision ?? operation?.revision ?? "");
+  const sourceLibraryId = String(result.source_library_id ?? operation?.source_library_id ?? activeLibraryId());
+  const sourceAvailable = libraryCanOperate(sourceLibraryId);
+  const targetLibraryId = String(result.target_library_id ?? operation?.target_library_id ?? "");
+  const targetAvailable = !targetLibraryId || libraryCanOperate(targetLibraryId);
   if (operation?.incomplete || !Array.isArray(result.items)) {
     return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>${escapeHtml(operation?.reason ?? "Preview details are unavailable in this cloud snapshot. Request a fresh preview before confirming.")}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
   }
@@ -823,7 +865,7 @@ function renderMigrationPreview(operation) {
     const labels = nested.slice(0, 12).map((file) => `${escapeHtml(file.source_path ?? "Source unavailable")} → ${escapeHtml(file.target_path ?? "Target unavailable")}`);
     const path = `${escapeHtml(item.source_path ?? "Source unavailable")} → ${escapeHtml(item.target_path ?? "Target unavailable")}`;
     const choice = conflict
-      ? `<label class="migration-conflict-choice">${escapeHtml(itemId)} conflict<select class="select-control" data-migration-conflict-item="${escapeHtml(itemId)}" data-migration-preview-id="${escapeHtml(id)}" aria-label="Conflict handling for ${escapeHtml(itemId)}" ${refreshPending ? "disabled" : ""}><option value="skip" ${policy === "skip" ? "selected" : ""}>Skip</option><option value="keep_both" ${policy === "keep_both" ? "selected" : ""}>Keep both</option></select></label>`
+      ? `<label class="migration-conflict-choice">${escapeHtml(itemId)} conflict<select class="select-control" data-migration-conflict-item="${escapeHtml(itemId)}" data-migration-preview-id="${escapeHtml(id)}" aria-label="Conflict handling for ${escapeHtml(itemId)}" ${refreshPending || !sourceAvailable || !targetAvailable ? "disabled" : ""}><option value="skip" ${policy === "skip" ? "selected" : ""}>Skip</option><option value="keep_both" ${policy === "keep_both" ? "selected" : ""}>Keep both</option></select></label>`
       : `<strong class="${item.outcome === "skip" || item.status === "skipped" ? "skip" : "move"}">${outcome}</strong>`;
     return `<div class="preview-line${conflict ? " migration-conflict-line" : ""}"><span>${path}${labels.length ? `<br><span class="field-hint">${labels.join("<br>")}</span>` : ""}</span>${choice}</div>`;
   }).join("");
@@ -832,8 +874,11 @@ function renderMigrationPreview(operation) {
   const summary = `${Number(result.item_count ?? files.length).toLocaleString()} media items · ${Number(result.file_count ?? 0).toLocaleString()} files · ${formatBytes(result.total_bytes)} total`;
   const space = `Required space ${formatBytes(result.required_space_bytes)} · Available ${formatBytes(result.available_space_bytes)} · ${Number(result.conflict_count ?? 0)} conflict${Number(result.conflict_count ?? 0) === 1 ? "" : "s"}`;
   const taskBytes = result.incomplete_task_bytes ?? result.staging_bytes;
+  const taskBytesLabel = taskBytes === null || taskBytes === undefined
+    ? "staged data size unknown"
+    : `${formatBytes(taskBytes)} staged data`;
   const tasks = Number(result.incomplete_task_count ?? 0) > 0
-    ? `<p>${Number(result.incomplete_task_count).toLocaleString()} unfinished tasks · ${formatBytes(taskBytes)} staged data ${result.include_incomplete_tasks === true ? "included" : "left in the source"}</p>`
+    ? `<p>${Number(result.incomplete_task_count).toLocaleString()} unfinished tasks · ${taskBytesLabel} ${result.include_incomplete_tasks === true ? "included" : "left in the source"}</p>`
     : "";
   const refreshMessage = refreshPending
     ? `<p class="field-hint" role="status">Waiting for the updated preview from your computer. This preview cannot be confirmed.</p>`
@@ -844,15 +889,16 @@ function renderMigrationPreview(operation) {
   const supersededMessage = state.migrationConflictInvalidated.has(id) && !draft
     ? `<p class="field-hint" role="status">This preview was superseded by a refreshed preview and cannot be confirmed.</p>`
     : "";
-  const canConfirm = Boolean(id && revision) && !invalidated;
+  const canConfirm = Boolean(id && revision) && !invalidated && sourceAvailable && targetAvailable;
   const canRefresh = Boolean(id && revision && draft && choicesChanged && !refreshPending);
   const refreshButton = canRefresh
-    ? `<button class="small-button" type="button" data-migration-refresh-conflicts="${escapeHtml(id)}">Refresh preview</button>`
+    ? `<button class="small-button" type="button" data-migration-refresh-conflicts="${escapeHtml(id)}" ${sourceAvailable && targetAvailable ? "" : "disabled"}>Refresh preview</button>`
     : "";
   const conflictLimit = Number(result.conflict_count ?? files.filter((item) => item?.conflict === true).length) > MAX_MIGRATION_ITEM_CONFLICTS
     ? `<p class="field-hint">This preview has more than ${MAX_MIGRATION_ITEM_CONFLICTS.toLocaleString()} conflicting bundles. Refresh with the global choice to review a supported subset.</p>`
     : "";
-  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Category and collection structure will be preserved. Default conflict choice: ${escapeHtml(result.conflict ?? "skip")}.</p>${refreshMessage}${staleMessage}${supersededMessage}${conflictLimit}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${paths || `<div class="preview-line"><span>No media items were found in this selection.</span></div>`}${more}</div><div class="stack-actions">${refreshButton}<button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button></div></article>`;
+  const offlineMessage = sourceAvailable && targetAvailable ? "" : `<p class="field-hint">The source or target library is offline or showing a saved scan. Reconnect it and refresh before starting the migration.</p>`;
+  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Category and collection structure will be preserved. Default conflict choice: ${escapeHtml(result.conflict ?? "skip")}.</p>${offlineMessage}${refreshMessage}${staleMessage}${supersededMessage}${conflictLimit}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${paths || `<div class="preview-line"><span>No media items were found in this selection.</span></div>`}${more}</div><div class="stack-actions">${refreshButton}<button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button></div></article>`;
 }
 
 function renderMigrationProgress(migration) {
@@ -926,7 +972,10 @@ function renderPreviews() {
     const hasMetadataChanges = hasMetadataPreviewChanges(preview);
     const hasMoveItems = Array.isArray(preview.items) && preview.items.length > 0;
     const title = hasMetadataChanges && hasMoveItems ? "Move and update metadata" : hasMetadataChanges ? "Update metadata" : "Move files";
-    return `<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(preview.target_relative_dir ?? "Metadata only · file locations stay the same")} · Conflict: ${escapeHtml(preview.conflict ?? "skip")}</p></div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${describePreview(preview)}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}" data-library-id="${escapeHtml(entry.library_id || activeLibraryId())}">Confirm changes</button></div></article>`;
+    const libraryId = entry.library_id || activeLibraryId();
+    const canConfirm = libraryCanOperate(libraryId);
+    const offlineMessage = canConfirm ? "" : `<p class="field-hint">This library is offline or showing a saved scan. Reconnect it and refresh before confirming.</p>`;
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(preview.target_relative_dir ?? "Metadata only · file locations stay the same")} · Conflict: ${escapeHtml(preview.conflict ?? "skip")}</p>${offlineMessage}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${describePreview(preview)}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}" data-library-id="${escapeHtml(libraryId)}" ${canConfirm ? "" : "disabled"}>Confirm changes</button></div></article>`;
   }).join("");
   if (!pending.length) byId("preview-list").innerHTML = "";
 }
@@ -1011,7 +1060,7 @@ function renderLegacyMappings() {
   const pagination = page.pageCount > 1 ? `<div class="mapping-pagination" aria-label="Legacy mapping pages">${previousPage}<span>Page ${page.page + 1} of ${page.pageCount}</span>${nextPage}</div>` : "";
   const newerImportNotice = importSelection.latest !== operation ? `<p class="warning-text">A newer legacy import did not save a complete successful report. Showing the latest completed import; see request history for the newer result.</p>` : "";
   const emptyMessage = hints.length === 0 ? `<p class="field-hint">No hints or possible media matches were found.</p>` : "";
-  container.innerHTML = `<p class="mapping-title">Choose a video for each legacy hint</p>${newerImportNotice}${warnings.length ? `<p class="warning-text">${warnings.map(escapeHtml).join(" · ")}</p>` : ""}<p class="field-hint">${displayedRange}</p>${rows.length ? rows.join("") : emptyMessage}${pagination}<div class="mapping-actions"><button id="preview-metadata" class="primary-button" type="button" ${choices.length ? "" : "disabled"}>Preview selected updates <span aria-hidden="true">→</span></button></div>`;
+  container.innerHTML = `<p class="mapping-title">Choose a video for each legacy hint</p>${newerImportNotice}${warnings.length ? `<p class="warning-text">${warnings.map(escapeHtml).join(" · ")}</p>` : ""}<p class="field-hint">${displayedRange}</p>${rows.length ? rows.join("") : emptyMessage}${pagination}<div class="mapping-actions"><button id="preview-metadata" class="primary-button" type="button" ${choices.length && libraryCanOperate() ? "" : "disabled"}>Preview selected updates <span aria-hidden="true">→</span></button></div>`;
   for (const key of state.legacySelection.keys()) if (!validKeys.has(key)) state.legacySelection.delete(key);
 }
 
@@ -1205,6 +1254,7 @@ function previewSelectedLegacy() {
 }
 
 function selectVisible() {
+  if (!libraryCanOperate()) return showToast("This library is offline or showing a saved scan. Reconnect it before selecting files to change.");
   const scope = state.view === "needs" ? "needs" : "library";
   const visible = presentMediaItems(pageItemsForScope(scope));
   const allSelected = visible.length > 0 && visible.every((item) => state.selected.has(String(item.id)));
@@ -1247,6 +1297,7 @@ function bindEvents() {
     if (byId("download-category").value) url.searchParams.set("category", byId("download-category").value);
     else url.searchParams.delete("category");
     window.history.replaceState(null, "", url.toString());
+    renderDownloadStatus();
   });
   byId("download-category").addEventListener("input", () => {
     byId("download-category").dataset.userEdited = "true";
@@ -1293,6 +1344,7 @@ function bindEvents() {
   byId("target-dir").addEventListener("input", renderFilters);
   byId("root-target").addEventListener("click", () => { byId("target-dir").value = ""; renderFilters(); byId("target-dir").focus(); });
   byId("preview-move").addEventListener("click", () => {
+    if (!libraryCanOperate()) return showToast("This library is offline or showing a saved scan. Reconnect it before changing files.");
     if (state.selected.size > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} videos per request.`);
     const { directory, error } = validateTargetRelativeDirectory(byId("target-dir").value);
     if (error) return showToast(error);
@@ -1300,6 +1352,7 @@ function bindEvents() {
   });
   byId("legacy-text").addEventListener("input", (event) => { byId("legacy-size").textContent = `${new TextEncoder().encode(event.target.value).byteLength.toLocaleString()} / 256 KB`; });
   byId("import-legacy").addEventListener("click", async () => {
+    if (!libraryCanOperate()) return showToast("This library is offline or showing a saved scan. Reconnect it before importing metadata.");
     let text = byId("legacy-text").value;
     const fileInput = byId("legacy-file");
     if (!text && fileInput?.files?.[0]) {
@@ -1386,6 +1439,7 @@ function bindEvents() {
     }
     const groupCheckbox = event.target.closest("[data-select-group]");
     if (groupCheckbox) {
+      if (!libraryCanOperate()) { renderLibrary(); return; }
       const groupTitle = groupCheckbox.dataset.selectGroup;
       const scope = state.view === "needs" ? "needs" : "library";
       const visibleItems = pageItemsForScope(scope);
@@ -1397,6 +1451,7 @@ function bindEvents() {
     }
     const checkbox = event.target.closest("[data-select-item]");
     if (!checkbox) return;
+    if (!libraryCanOperate()) { renderLibrary(); return; }
     const itemId = checkbox.dataset.selectItem;
     const item = libraryItems().find((entry) => String(entry.id) === String(itemId));
     if (!isPresentMedia(item)) {
@@ -1413,6 +1468,11 @@ function bindEvents() {
     if (migrationRefresh) {
       const previewId = migrationRefresh.dataset.migrationRefreshConflicts;
       const operation = migrationPreviewEntries().find((entry) => entry.id === previewId);
+      const sourceLibraryId = String(operation?.result?.source_library_id ?? operation?.source_library_id ?? activeLibraryId());
+      if (!libraryCanOperate(sourceLibraryId)) {
+        showToast("This source library is offline or showing a saved scan. Reconnect it before refreshing the preview.");
+        return;
+      }
       const draft = state.migrationConflictDrafts.get(previewId);
       const payload = buildMigrationPreviewRefreshPayload(operation?.result, draft?.itemConflicts, {
         seq: operation?.seq,
@@ -1498,6 +1558,10 @@ function bindEvents() {
     if (details) { state.detailId = details.dataset.details; renderDetail(); return; }
     const confirm = event.target.closest("[data-confirm]");
     if (confirm) {
+      if (!libraryCanOperate(confirm.dataset.libraryId || activeLibraryId())) {
+        showToast("This library is offline or showing a saved scan. Reconnect it and refresh before confirming.");
+        return;
+      }
       const matchingPreview = previews().find((entry) => entry.id === confirm.dataset.confirm && entry.revision === confirm.dataset.revision);
       if (!matchingPreview || isIncompletePreview(matchingPreview)) {
         showToast("This preview is incomplete. Request a fresh preview before confirming.");
@@ -1511,6 +1575,13 @@ function bindEvents() {
     if (migrationConfirm) {
       const previewId = migrationConfirm.dataset.migrationConfirm;
       const matchingPreview = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === migrationConfirm.dataset.revision);
+      const result = matchingPreview?.result ?? {};
+      const sourceId = String(result.source_library_id ?? matchingPreview?.source_library_id ?? activeLibraryId());
+      const targetId = String(result.target_library_id ?? matchingPreview?.target_library_id ?? "");
+      if (!libraryCanOperate(sourceId) || targetId && !libraryCanOperate(targetId)) {
+        showToast("The source or target library is offline or showing a saved scan. Reconnect it and refresh before starting the migration.");
+        return;
+      }
       const saved = normalizeMigrationItemConflicts(matchingPreview?.result?.item_conflicts);
       const draft = state.migrationConflictDrafts.get(previewId);
       if (!matchingPreview || state.migrationConflictInvalidated.has(previewId) || draft && migrationConflictChoicesChanged(saved, draft.itemConflicts)) {

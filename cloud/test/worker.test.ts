@@ -26,6 +26,8 @@ import { renderMovePreviewItems } from "../public/file/preview-rendering.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "../public/file/snapshot-session.js";
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
+import { MAX_MIGRATION_TASK_ROWS, incompleteMigrationTaskSummary } from "../public/file/migration-task-summary.js";
+import { canOperateOnMediaLibrary, resolveMediaLibrary } from "../public/file/library-view.js";
 import {
   canonicalJson,
   MAX_ACTION_BODY_BYTES,
@@ -50,6 +52,59 @@ const botToken = syntheticCredentials.botToken.value;
 const workerUrl = "https://worker.test";
 const textEncoder = new TextEncoder();
 const testDatabaseEpoch = "0123456789abcdef0123456789abcdef";
+
+describe("incomplete migration task summary", () => {
+  const tasks = [
+    { kind: "video", library_id: "source", status: "queued", staging_bytes: 10 },
+    { kind: "video", library_id: "source", status: "failed", partial_bytes: 20 },
+    { kind: "video", library_id: "source", status: "interrupted", downloaded_bytes: 30 },
+    { kind: "video", destination: { library_id: "source" }, status: "failed", staging_bytes: 40 },
+    { kind: "video", library_id: "other", status: "queued", staging_bytes: 50 },
+    { kind: "pdf", library_id: "source", status: "queued", staging_bytes: 60 },
+    { kind: "video", library_id: "source", status: "completed", staging_bytes: 70 },
+    { kind: "video", library_id: "source", status: "cancelled", staging_bytes: 80 },
+  ];
+
+  it("counts only unfinished video tasks frozen to the selected source library", () => {
+    expect(incompleteMigrationTaskSummary({ id: "source", incomplete_task_count: null, staging_bytes: null }, tasks)).toEqual({
+      count: 4,
+      bytes: 100,
+      countIsLowerBound: false,
+    });
+  });
+
+  it("treats a reported zero as authoritative while missing or null fields use task rows", () => {
+    expect(incompleteMigrationTaskSummary({ id: "source", incomplete_task_count: 0, staging_bytes: 0 }, tasks)).toEqual({
+      count: 0,
+      bytes: 0,
+      countIsLowerBound: false,
+    });
+    expect(incompleteMigrationTaskSummary({ id: "source" }, tasks).count).toBe(4);
+    expect(incompleteMigrationTaskSummary({ id: "source", incomplete_task_count: null }, tasks).count).toBe(4);
+    expect(incompleteMigrationTaskSummary({ id: "source", incomplete_task_count: "0" }, tasks).count).toBe(4);
+  });
+
+  it("does not present missing or incomplete staged-byte estimates as zero", () => {
+    const rows = [{ kind: "video", library_id: "source", status: "failed" }];
+    expect(incompleteMigrationTaskSummary({ id: "source", incomplete_task_count: 1, staging_bytes: null }, rows).bytes).toBeNull();
+    expect(incompleteMigrationTaskSummary({ id: "source" }, rows).bytes).toBeNull();
+    expect(incompleteMigrationTaskSummary({ id: "source" }, []).bytes).toBe(0);
+  });
+
+  it("caps fallback work to the bounded task projection and marks a lower-bound count", () => {
+    const rows = Array.from({ length: MAX_MIGRATION_TASK_ROWS + 1 }, () => ({
+      kind: "video",
+      library_id: "source",
+      status: "queued",
+      staging_bytes: 1,
+    }));
+    expect(incompleteMigrationTaskSummary({ id: "source" }, rows)).toEqual({
+      count: MAX_MIGRATION_TASK_ROWS,
+      bytes: null,
+      countIsLowerBound: true,
+    });
+  });
+});
 
 describe("metadata preview details", () => {
   it("shows only concrete known-field changes and the source IDs to add", () => {
@@ -512,6 +567,9 @@ describe("owner snapshot session", () => {
         items: [{ id: "cached", presence: "unavailable" }],
       },
     });
+    const cachedArchive = resolveMediaLibrary(accepted.snapshot, "archive");
+    expect(cachedArchive.snapshot?.items).toMatchObject([{ id: "cached", presence: "unavailable" }]);
+    expect(canOperateOnMediaLibrary(cachedArchive.descriptor)).toBe(false);
     expect(libraries.find((entry) => entry.id === "moved")).toMatchObject({
       root: "/Volumes/NewArchive",
       snapshot: null,
@@ -551,6 +609,13 @@ describe("owner snapshot session", () => {
       snapshot: { scanned_at: 456, items: [{ id: "new", presence: "present" }] },
     });
     expect(snapshotLibraries(recovered)[0]?.snapshot_stale).toBeUndefined();
+    expect(canOperateOnMediaLibrary(snapshotLibraries(recovered)[0] as { id: string; availability?: string; snapshot_stale?: boolean })).toBe(true);
+  });
+
+  it("keeps older unknown-availability descriptors operable for compatibility", () => {
+    expect(canOperateOnMediaLibrary({ id: "legacy" })).toBe(true);
+    expect(canOperateOnMediaLibrary({ id: "offline", availability: "unavailable" })).toBe(false);
+    expect(canOperateOnMediaLibrary({ id: "stale", snapshot_stale: true })).toBe(false);
   });
 
   it("drains saved actions after a quiet poll recovers owner verification", async () => {
@@ -731,14 +796,39 @@ describe("applied media-library snapshot validation", () => {
         categories: [],
         warnings: [],
         libraries: [
-          { ...descriptors[0], availability: "available", media_count: 0, snapshot: { items: [], categories: [] } },
-          { ...descriptors[1], availability: "offline", media_count: 12, snapshot: null },
+          { ...descriptors[0], availability: "available", media_count: 0, incomplete_task_count: 0, staging_bytes: 0, snapshot: { items: [], categories: [] } },
+          { ...descriptors[1], availability: "offline", media_count: 12, incomplete_task_count: null, staging_bytes: null, snapshot: null },
         ],
         migrations: [],
       },
     });
 
     expect(validateSnapshot(snapshot).settings.applied?.default_library_id).toBe("main");
+  });
+
+  it.each([
+    { incomplete_task_count: "0" },
+    { incomplete_task_count: -1 },
+    { staging_bytes: 1.5 },
+    { staging_bytes: Number.MAX_SAFE_INTEGER + 1 },
+  ])("rejects invalid per-library task summary fields %#", (summary) => {
+    expect(() => validateSnapshot(localSnapshot({
+      library: {
+        revision: "library-summary-invalid",
+        scanned_at: 1,
+        items: [],
+        categories: [],
+        warnings: [],
+        libraries: [{
+          id: "main",
+          name: "Main",
+          root: "/Volumes/Main",
+          default_category: "",
+          availability: "available",
+          ...summary,
+        }],
+      },
+    }))).toThrow(/incomplete_task_count|staging_bytes/u);
   });
 
   it("rejects duplicate or inconsistent default flags in applied library settings", () => {

@@ -595,7 +595,7 @@ function validateLibraryDescriptors(library: Record<string, unknown>): void {
         !["available", "unavailable", "offline", "unknown"].includes(String(candidate.availability))) {
         throw new HttpError(400, `library.libraries[${index}].availability is invalid`);
       }
-      for (const field of ["media_count", "scanned_at", "free_bytes", "total_bytes"]) {
+      for (const field of ["media_count", "scanned_at", "free_bytes", "total_bytes", "incomplete_task_count", "staging_bytes"]) {
         const fieldValue = candidate[field];
         if (fieldValue !== undefined && fieldValue !== null &&
           (!Number.isSafeInteger(fieldValue) || (fieldValue as number) < 0)) {

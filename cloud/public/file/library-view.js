@@ -60,6 +60,10 @@ export function mediaLibraryAvailability(descriptor) {
   return "unknown";
 }
 
+export function canOperateOnMediaLibrary(descriptor) {
+  return mediaLibraryAvailability(descriptor) !== "offline" && descriptor?.snapshot_stale !== true;
+}
+
 export function operationLibraryId(operation) {
   const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
   const nested = result.operation && typeof result.operation === "object" ? result.operation : {};

@@ -26,6 +26,7 @@ export function mediaLibraryEntries(ownerSnapshot: unknown): MediaLibraryDescrip
 export function defaultMediaLibraryId(ownerSnapshot: unknown): string;
 export function resolveMediaLibrary(ownerSnapshot: unknown, requestedId?: string): MediaLibrarySnapshot;
 export function mediaLibraryAvailability(descriptor: MediaLibraryDescriptor | null | undefined): "available" | "offline" | "unknown";
+export function canOperateOnMediaLibrary(descriptor: MediaLibraryDescriptor | null | undefined): boolean;
 export function operationLibraryId(operation: Record<string, unknown> | null | undefined): string;
 export function operationMatchesLibrary(operation: Record<string, unknown> | null | undefined, libraryId: string): boolean;
 export function filterLibraryItems<T extends LibraryViewItem>(

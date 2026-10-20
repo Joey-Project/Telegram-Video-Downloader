@@ -104,6 +104,12 @@ impl TaskStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncompleteTaskTransferSummary {
+    pub task_count: usize,
+    pub staging_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PlanSize {
     pub subject: String,
@@ -913,6 +919,21 @@ impl QueueManager {
         }
     }
 
+    fn require_video_library_available(&self, library_id: &str) -> Result<()> {
+        let statuses = self.video_statuses.read().map_err(poisoned_lock)?;
+        let status = statuses
+            .get(library_id)
+            .ok_or_else(|| anyhow!("media library {library_id} has no availability status"))?;
+        if status.available {
+            return Ok(());
+        }
+        let detail = status
+            .diagnostic
+            .as_deref()
+            .unwrap_or("media library is currently unavailable");
+        bail!("media library {library_id} is unavailable: {detail}");
+    }
+
     #[cfg(test)]
     pub fn default_video_config(&self, base: &AppConfig) -> Result<AppConfig> {
         let destination = self.default_video_destination()?;
@@ -953,35 +974,243 @@ impl QueueManager {
 
     pub fn task_config(&self, base: &AppConfig, task_id: &str) -> Result<Option<AppConfig>> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
-        let Some((store, record, _)) = self.find_record_entry_unlocked(task_id)? else {
+        let Some((store, record)) = self.find_record_entry_read_only_unlocked(task_id)? else {
+            self.ensure_task_config_lookup_complete_unlocked(task_id)?;
             return Ok(None);
         };
         if matches!(record.job, JobRequest::Pdf { .. }) {
+            self.validate_pdf_task_config_root_unlocked()?;
             return Ok(Some(base.clone()));
         }
-        let destination = match record.destination {
-            Some(destination) => destination,
-            None => {
-                let libraries = self.media_libraries.lock().map_err(poisoned_lock)?;
-                let library = libraries
-                    .snapshot()
+        let (destination, library) = match record.destination {
+            Some(destination) => {
+                let library = self
+                    .registry_snapshot()?
                     .libraries
                     .into_iter()
-                    .find(|library| library.root == store.root_path)
+                    .find(|library| library.id == destination.library_id)
                     .ok_or_else(|| {
                         anyhow!(
-                            "legacy task {} belongs to an unregistered video root",
+                            "task {} destination refers to an unregistered media library",
                             record.id
                         )
                     })?;
-                TaskDestination {
-                    library_id: library.id,
-                    root: store.root_path,
-                    category: None,
+                if !same_trusted_root_path(&destination.root, &library.root)? {
+                    bail!(
+                        "task {} destination root no longer matches its registered media library",
+                        record.id
+                    );
                 }
+                (destination, library)
+            }
+            None => {
+                let library = self.library_for_legacy_task_store(&store)?;
+                (
+                    TaskDestination {
+                        library_id: library.id.clone(),
+                        root: store.root_path.clone(),
+                        category: None,
+                    },
+                    library,
+                )
             }
         };
+
+        self.validate_video_library_for_task_unlocked(&store, &library)?;
         Ok(Some(config_for_destination(base, &destination)))
+    }
+
+    fn find_record_entry_read_only_unlocked(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(DownloadStore, TaskRecord)>> {
+        let registered = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .map(|registered| (registered.library_id.clone(), registered.store.clone()))
+            .collect::<Vec<_>>();
+        let mut pdf_is_video_root = false;
+        let mut first_video_read_error = None;
+        for (library_id, store) in registered {
+            pdf_is_video_root |= store.shares_root(&self.pdf);
+            match store.peek_task(task_id) {
+                Ok(Some((record, _))) => return Ok(Some((store, record))),
+                Ok(None) => {}
+                Err(error) => {
+                    self.note_video_store_read_error(&library_id, &store, &error);
+                    if first_video_read_error.is_none() {
+                        first_video_read_error = Some(error.context(format!(
+                            "failed to read task {task_id} from media library {library_id}"
+                        )));
+                    }
+                }
+            }
+        }
+        if !pdf_is_video_root {
+            match self.pdf.peek_task(task_id) {
+                Ok(Some((record, _))) => return Ok(Some((self.pdf.clone(), record))),
+                Ok(None) => {}
+                Err(error) if first_video_read_error.is_none() => {
+                    first_video_read_error = Some(
+                        error.context(format!("failed to read task {task_id} from the PDF queue")),
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        if let Some(error) = first_video_read_error {
+            return Err(error.context("task lookup could not be completed across queue roots"));
+        }
+        Ok(None)
+    }
+
+    fn ensure_task_config_lookup_complete_unlocked(&self, task_id: &str) -> Result<()> {
+        if let Some((library_id, diagnostic)) = self
+            .video_statuses
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .find(|(_, status)| !status.available)
+            .map(|(library_id, status)| {
+                (
+                    library_id.clone(),
+                    status
+                        .diagnostic
+                        .clone()
+                        .unwrap_or_else(|| "media library is unavailable".to_string()),
+                )
+            })
+        {
+            bail!(
+                "cannot determine whether task {task_id} exists while media library {library_id} is unavailable: {diagnostic}"
+            );
+        }
+        Ok(())
+    }
+
+    fn library_for_legacy_task_store(&self, store: &DownloadStore) -> Result<MediaLibrary> {
+        let identity = store.root.root_identity();
+        let registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+        for library in registry.snapshot().libraries {
+            match registry.root_binding(&library.id) {
+                Some((device, inode))
+                    if (device, inode) == (identity.device(), identity.inode()) =>
+                {
+                    return Ok(library);
+                }
+                Some(_) => {}
+                None if same_trusted_root_path(&library.root, &store.root_path)? => {
+                    return Ok(library);
+                }
+                None => {}
+            }
+        }
+        bail!("legacy task queue root is not bound to a registered media library")
+    }
+
+    fn validate_video_library_for_task_unlocked(
+        &self,
+        store: &DownloadStore,
+        library: &MediaLibrary,
+    ) -> Result<()> {
+        let store_identity = store.root.root_identity();
+        let binding = self
+            .media_libraries
+            .lock()
+            .map_err(poisoned_lock)?
+            .root_binding(&library.id);
+        match binding {
+            Some((device, inode))
+                if (device, inode) != (store_identity.device(), store_identity.inode()) =>
+            {
+                bail!(
+                    "media library {} queue root no longer matches its persisted object identity",
+                    library.id
+                );
+            }
+            Some(_) => {}
+            None => {
+                // Legacy registries without an inode binding may be adopted only after a fresh
+                // coordinated lookup confirms the already-open queue root. This check happens
+                // before refresh can recover or create queue state.
+                let current =
+                    coordinate_directory_root(self.pdf.file_provider.as_ref(), &library.root)?;
+                if current.root_identity() != store_identity {
+                    bail!(
+                        "media library {} path no longer names its open queue root",
+                        library.id
+                    );
+                }
+                self.media_libraries
+                    .lock()
+                    .map_err(poisoned_lock)?
+                    .bind_root_identity(
+                        &library.id,
+                        store_identity.device(),
+                        store_identity.inode(),
+                    )?;
+            }
+        }
+
+        // Refresh first re-coordinates the registered path and compares it with the persisted
+        // device/inode before opening an owner lock or touching queue indexes. It intentionally
+        // ignores child contents and mutable timestamps.
+        self.refresh_video_library_unlocked(library.clone())?;
+        self.require_video_library_available(&library.id)?;
+        let current_binding = self
+            .media_libraries
+            .lock()
+            .map_err(poisoned_lock)?
+            .root_binding(&library.id);
+        if current_binding != Some((store_identity.device(), store_identity.inode())) {
+            bail!(
+                "media library {} queue root no longer matches its persisted object identity",
+                library.id
+            );
+        }
+        let current_store_identity = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .find(|registered| registered.library_id == library.id)
+            .map(|registered| registered.store.root.root_identity());
+        if current_store_identity != Some(store_identity) {
+            bail!(
+                "media library {} queue store is unavailable or bound to a different root object",
+                library.id
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_pdf_task_config_root_unlocked(&self) -> Result<()> {
+        self.pdf.root.validate_configured_root()?;
+        let identity = self.pdf.root.root_identity();
+        let library = {
+            let registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+            registry.snapshot().libraries.into_iter().find(|library| {
+                registry.root_binding(&library.id) == Some((identity.device(), identity.inode()))
+            })
+        };
+        if let Some(library) = library {
+            self.refresh_video_library_unlocked(library.clone())?;
+            self.require_video_library_available(&library.id)?;
+            let binding = self
+                .media_libraries
+                .lock()
+                .map_err(poisoned_lock)?
+                .root_binding(&library.id);
+            if binding != Some((identity.device(), identity.inode())) {
+                bail!(
+                    "PDF queue root no longer matches registered media library {} identity",
+                    library.id
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn video_library_statuses(&self) -> Result<BTreeMap<String, MediaLibraryStatus>> {
@@ -1380,21 +1609,25 @@ impl QueueManager {
             return self.registry_snapshot();
         };
         let store = self
-            .video_stores()?
-            .into_iter()
-            .find(|store| store.root_path == library.root)
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .find(|registered| registered.library_id == library_id && registered.available)
+            .map(|registered| registered.store.clone())
             .ok_or_else(|| {
                 anyhow!("media library is offline; task dependencies cannot be checked")
             })?;
+        let legacy_root_matches = same_trusted_root_path(&store.root_path, &library.root)?;
         if store.list_records()?.iter().any(|record| {
-            record.status.is_unfinished()
-                && !matches!(record.job, JobRequest::Pdf { .. })
+            !record.status.is_history()
+                && !matches!(&record.job, JobRequest::Pdf { .. })
                 && record.destination.as_ref().map_or_else(
-                    || store.root_path == library.root,
+                    || legacy_root_matches,
                     |destination| destination.library_id == library_id,
                 )
         }) {
-            bail!("media library still has unfinished tasks that depend on it");
+            bail!("media library still has video tasks that depend on it");
         }
         let snapshot = self
             .media_libraries
@@ -1437,7 +1670,8 @@ impl QueueManager {
                 && if let Some(destination) = &record.destination {
                     destination.library_id == source_library_id
                 } else {
-                    store.root_path == library.root && !matches!(record.job, JobRequest::Pdf { .. })
+                    store.root_path == library.root
+                        && !matches!(&record.job, JobRequest::Pdf { .. })
                 }
         }) {
             if snapshots.len() >= limit {
@@ -1461,6 +1695,97 @@ impl QueueManager {
             });
         }
         Ok(snapshots)
+    }
+
+    /// Return the bounded, authorized summary used by cloud settings projections. The task set
+    /// is counted from active queue-index entries only; history sidecars are intentionally out of
+    /// scope. A per-task staging estimate failure keeps the task count but makes the aggregate
+    /// byte estimate unknown.
+    pub fn incomplete_task_transfer_summary(
+        &self,
+        library_id: &str,
+        allowed_chat_ids: &[i64],
+    ) -> Result<IncompleteTaskTransferSummary> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        if allowed_chat_ids.is_empty() {
+            return Ok(IncompleteTaskTransferSummary {
+                task_count: 0,
+                staging_bytes: Some(0),
+            });
+        }
+        let library = self
+            .registry_snapshot()?
+            .libraries
+            .into_iter()
+            .find(|library| library.id == library_id)
+            .ok_or_else(|| anyhow!("unknown media library {library_id}"))?;
+        let store = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .find(|registered| registered.library_id == library_id && registered.available)
+            .map(|registered| registered.store.clone())
+            .ok_or_else(|| anyhow!("media library {library_id} is currently unavailable"))?;
+
+        let store_identity = store.root.root_identity();
+        let binding = self
+            .media_libraries
+            .lock()
+            .map_err(poisoned_lock)?
+            .root_binding(library_id);
+        if binding != Some((store_identity.device(), store_identity.inode())) {
+            bail!("media library {library_id} queue root identity is unavailable or changed");
+        }
+        let current_root =
+            coordinate_directory_root(self.pdf.file_provider.as_ref(), &library.root)?;
+        if current_root.root_identity() != store_identity {
+            bail!("media library {library_id} path now names a different root object");
+        }
+
+        let records = store.active_records_for_chats_complete(allowed_chat_ids)?;
+        let mut task_count = 0_usize;
+        let mut staging_bytes = Some(0_u64);
+        for record in records {
+            if record.status.is_history() || matches!(&record.job, JobRequest::Pdf { .. }) {
+                continue;
+            }
+            match record.destination.as_ref() {
+                Some(destination) if destination.library_id == library_id => {
+                    if !same_trusted_root_path(&destination.root, &library.root)? {
+                        bail!(
+                            "task {} destination root does not match media library {library_id}",
+                            record.id
+                        );
+                    }
+                }
+                Some(_) => continue,
+                None => {
+                    // A legacy record is owned by the active queue store that supplied it.
+                    // Compare object identity rather than path spelling so trusted macOS aliases
+                    // keep the same ownership semantics.
+                    if store.root.root_identity() != current_root.root_identity() {
+                        bail!(
+                            "legacy task {} has an unverified media library root",
+                            record.id
+                        );
+                    }
+                }
+            }
+            task_count += 1;
+            if staging_bytes.is_some() {
+                match estimate_record_staging(&store.root, &store.root_path, &record) {
+                    Ok((bytes, _)) => {
+                        staging_bytes = staging_bytes.and_then(|total| total.checked_add(bytes));
+                    }
+                    Err(_) => staging_bytes = None,
+                }
+            }
+        }
+        Ok(IncompleteTaskTransferSummary {
+            task_count,
+            staging_bytes,
+        })
     }
 
     pub fn begin_task_destination_transfer(
@@ -3965,6 +4290,11 @@ fn config_for_destination(base: &AppConfig, destination: &TaskDestination) -> Ap
     config
 }
 
+fn same_trusted_root_path(left: &Path, right: &Path) -> Result<bool> {
+    Ok(crate::media_libraries::normalize_trusted_macos_alias(left)?
+        == crate::media_libraries::normalize_trusted_macos_alias(right)?)
+}
+
 fn preserve_configured_root_alias(base: &AppConfig, canonical_root: &Path) -> PathBuf {
     let configured = base.video_storage_root();
     if std::fs::canonicalize(configured).is_ok_and(|resolved| resolved == canonical_root) {
@@ -5812,6 +6142,19 @@ impl DownloadStore {
         chat_ids: &[i64],
         max_records: usize,
     ) -> Result<Vec<TaskRecord>> {
+        self.active_summary_records_for_chats_inner(chat_ids, max_records, false)
+    }
+
+    fn active_records_for_chats_complete(&self, chat_ids: &[i64]) -> Result<Vec<TaskRecord>> {
+        self.active_summary_records_for_chats_inner(chat_ids, MAX_ACTIVE_RECORDS, true)
+    }
+
+    fn active_summary_records_for_chats_inner(
+        &self,
+        chat_ids: &[i64],
+        max_records: usize,
+        reject_overflow: bool,
+    ) -> Result<Vec<TaskRecord>> {
         if chat_ids.is_empty() || max_records == 0 {
             return Ok(Vec::new());
         }
@@ -5834,6 +6177,9 @@ impl DownloadStore {
                     && entry.record_path.parent() == Some(self.queue_dir.as_path())
             })
             .collect::<Vec<_>>();
+        if reject_overflow && candidates.len() > max_records {
+            bail!("task queue exceeds its {max_records}-record summary limit");
+        }
         // The index's updated_at value is maintained with each record write. Task IDs provide
         // the same stable within-store tie order as StoreIndex's BTreeMap iteration.
         candidates.sort_by(|(left_id, left), (right_id, right)| {
@@ -5876,6 +6222,32 @@ impl DownloadStore {
             bail!("task index points to a mismatched record for task {id}");
         }
         Ok(Some((record, entry)))
+    }
+
+    /// Read a single task through the persisted index without scanning the queue directory or
+    /// reconciling pending moves. Callers which need to validate a library's persisted root
+    /// identity first use this to avoid recovery/index writes against an unverified path.
+    fn peek_task(&self, id: &str) -> Result<Option<(TaskRecord, TaskIndexEntry)>> {
+        let index = self.read_index()?;
+        let Some(entry) = index.tasks.get(id).cloned() else {
+            return Ok(None);
+        };
+        let mut paths = vec![entry.record_path.clone()];
+        if let Some(target) = &entry.move_target {
+            paths.push(target.clone());
+        }
+        // During terminal sidecar migration, the index may durably name both the original and
+        // target paths. Prefer whichever file exists without replaying the move or rewriting the
+        // index before task_config has revalidated the registered root identity.
+        for path in paths {
+            if let Some(record) = self.read_record(&path)? {
+                if record.id != id || record.chat_id != entry.chat_id {
+                    bail!("task index points to a mismatched record for task {id}");
+                }
+                return Ok(Some((record, entry)));
+            }
+        }
+        bail!("task index points to missing records for task {id}")
     }
 
     fn save_mutated_record(
@@ -6845,6 +7217,476 @@ mod tests {
         let second_destination = queue.task_destination(second_id).unwrap().unwrap();
         assert_eq!(second_destination.library_id, archive_id);
         assert_eq!(queue.list(123_456_789, false, 0).unwrap().len(), 2);
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn removing_library_blocks_failed_video_tasks_but_ignores_terminal_and_pdf_tasks() {
+        let temp_root = temp_queue_root("remove-library-task-dependencies");
+        let shared_root = temp_root.join("videos");
+        let archive_root = temp_root.join("archive");
+        fs::create_dir_all(&shared_root).expect("shared root should create");
+        fs::create_dir_all(&archive_root).expect("archive root should create");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = shared_root.clone();
+        config.downloads.pdf_dir = shared_root.clone();
+
+        let queue = QueueManager::open(&config).expect("shared queue root should open");
+        let removed_library_id = queue.registry_snapshot().unwrap().default_library_id;
+        let removed_library = queue
+            .registry_snapshot()
+            .unwrap()
+            .libraries
+            .into_iter()
+            .find(|library| library.id == removed_library_id)
+            .expect("configured library should be registered");
+        queue
+            .register_video_library("Archive", &archive_root, None, true, false)
+            .expect("archive library should become the default");
+
+        let mut failed = test_task(
+            "remove-library-failed-video",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=remove-failed".to_string(),
+            },
+        );
+        failed.destination = Some(TaskDestination {
+            library_id: removed_library_id.clone(),
+            root: removed_library.root.clone(),
+            category: None,
+        });
+        assert!(queue.create(failed).unwrap());
+        queue
+            .update("remove-library-failed-video", false, |record| {
+                record.status = TaskStatus::Failed;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut completed = test_task(
+            "remove-library-completed-video",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=remove-completed".to_string(),
+            },
+        );
+        completed.destination = Some(TaskDestination {
+            library_id: removed_library_id.clone(),
+            root: removed_library.root.clone(),
+            category: None,
+        });
+        assert!(queue.create(completed).unwrap());
+        queue
+            .update("remove-library-completed-video", false, |record| {
+                record.status = TaskStatus::Completed;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut cancelled = test_task(
+            "remove-library-cancelled-video",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=remove-cancelled".to_string(),
+            },
+        );
+        cancelled.destination = Some(TaskDestination {
+            library_id: removed_library_id.clone(),
+            root: removed_library.root.clone(),
+            category: None,
+        });
+        assert!(queue.create(cancelled).unwrap());
+        queue
+            .update("remove-library-cancelled-video", false, |record| {
+                record.status = TaskStatus::Cancelled;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            queue
+                .create(test_task(
+                    "remove-library-failed-pdf",
+                    JobRequest::Pdf {
+                        url: "https://example.invalid/remove.pdf".to_string(),
+                    },
+                ))
+                .unwrap()
+        );
+        queue
+            .update("remove-library-failed-pdf", false, |record| {
+                record.status = TaskStatus::Failed;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = queue
+            .remove_video_library(&removed_library_id)
+            .expect_err("failed video task remains retryable and must retain its library");
+        assert!(error.to_string().contains("video tasks"));
+        assert!(
+            queue
+                .registry_snapshot()
+                .unwrap()
+                .libraries
+                .iter()
+                .any(|library| library.id == removed_library_id)
+        );
+
+        queue
+            .update("remove-library-failed-video", false, |record| {
+                record.status = TaskStatus::Cancelled;
+                Ok(())
+            })
+            .unwrap();
+        let mut legacy = test_task(
+            "remove-library-legacy-failed-video",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=remove-legacy".to_string(),
+            },
+        );
+        legacy.destination = Some(TaskDestination {
+            library_id: removed_library_id.clone(),
+            root: removed_library.root.clone(),
+            category: None,
+        });
+        assert!(queue.create(legacy).unwrap());
+        queue
+            .update("remove-library-legacy-failed-video", false, |record| {
+                record.status = TaskStatus::Failed;
+                record.destination = None;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            queue
+                .remove_video_library(&removed_library_id)
+                .expect_err("legacy failed video task still depends on its original root")
+                .to_string()
+                .contains("video tasks")
+        );
+
+        queue
+            .update("remove-library-legacy-failed-video", false, |record| {
+                record.status = TaskStatus::Completed;
+                Ok(())
+            })
+            .unwrap();
+        queue
+            .remove_video_library(&removed_library_id)
+            .expect("completed/cancelled video and failed PDF tasks do not depend on the library");
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn task_config_rejects_replaced_registered_root_without_writing_replacement() {
+        let temp_root = temp_queue_root("task-config-replaced-root");
+        let config = test_video_config(&temp_root);
+        let archive_root = temp_root.join("archive");
+        let displaced_root = temp_root.join("archive-original");
+        fs::create_dir_all(&archive_root).expect("archive root should create");
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let archive = queue
+            .register_video_library("Archive", &archive_root, None, true, false)
+            .expect("archive library should register");
+        let mut task = test_task(
+            "task-config-replaced-root",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=replaced-root".to_string(),
+            },
+        );
+        task.destination = Some(TaskDestination {
+            library_id: archive.id.clone(),
+            root: archive.root.clone(),
+            category: None,
+        });
+        assert!(queue.create(task).expect("task should persist"));
+        let old_record_path = displaced_root
+            .join(QUEUE_DIRECTORY)
+            .join("task-task-config-replaced-root.json");
+        let original_record_path = archive_root
+            .join(QUEUE_DIRECTORY)
+            .join("task-task-config-replaced-root.json");
+        let original_record = fs::read(&original_record_path).expect("record should exist");
+
+        fs::rename(&archive_root, &displaced_root).expect("original library should be renamed");
+        fs::create_dir(&archive_root).expect("replacement path should create");
+        fs::write(archive_root.join("keep.txt"), b"replacement sentinel")
+            .expect("replacement sentinel should write");
+
+        let error = queue
+            .task_config(&config, "task-config-replaced-root")
+            .expect_err("task config must reject a replacement root object");
+        assert!(
+            error.to_string().contains("root")
+                || error.to_string().contains("available")
+                || error.to_string().contains("configured output"),
+            "unexpected root validation error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(old_record_path).expect("original task record should remain intact"),
+            original_record,
+        );
+        let replacement_entries = fs::read_dir(&archive_root)
+            .expect("replacement should remain readable")
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replacement_entries,
+            vec![std::ffi::OsString::from("keep.txt")]
+        );
+        assert!(!archive_root.join(QUEUE_DIRECTORY).exists());
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn task_config_allows_child_directory_churn_and_legacy_destinations() {
+        let temp_root = temp_queue_root("task-config-child-churn");
+        let config = test_video_config(&temp_root);
+        let archive_root = temp_root.join("archive");
+        fs::create_dir_all(archive_root.join("Shows"))
+            .expect("category and archive roots should create");
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let archive = queue
+            .register_video_library(
+                "Archive",
+                &archive_root,
+                Some(Path::new("Shows")),
+                true,
+                false,
+            )
+            .expect("archive library should register");
+
+        let mut current = test_task(
+            "task-config-child-churn",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=child-churn".to_string(),
+            },
+        );
+        current.destination = Some(TaskDestination {
+            library_id: archive.id.clone(),
+            root: archive.root.clone(),
+            category: Some(PathBuf::from("Shows")),
+        });
+        assert!(queue.create(current).unwrap());
+        fs::create_dir(archive_root.join("unrelated-new-child"))
+            .expect("unrelated child should be added");
+        fs::write(archive_root.join("unrelated.txt"), b"normal child churn")
+            .expect("unrelated child file should be added");
+        fs::remove_dir(archive_root.join("unrelated-new-child"))
+            .expect("unrelated child directory should be removed");
+        let config_for_current = queue
+            .task_config(&config, "task-config-child-churn")
+            .expect("normal child churn should not invalidate root identity")
+            .expect("task config should exist");
+        assert_eq!(
+            config_for_current.downloads.video_dir,
+            archive_root.join("Shows")
+        );
+
+        let mut legacy = test_task(
+            "task-config-legacy-destination",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=legacy-destination".to_string(),
+            },
+        );
+        legacy.destination = Some(TaskDestination {
+            library_id: archive.id.clone(),
+            root: archive.root.clone(),
+            category: Some(PathBuf::from("Shows")),
+        });
+        assert!(queue.create(legacy).unwrap());
+        queue
+            .update("task-config-legacy-destination", false, |record| {
+                record.destination = None;
+                Ok(())
+            })
+            .expect("legacy destination shape should persist");
+        let legacy_config = queue
+            .task_config(&config, "task-config-legacy-destination")
+            .expect("legacy destination should resolve through its bound queue root")
+            .expect("legacy task config should exist");
+        assert_eq!(legacy_config.video_storage_root(), archive_root);
+        assert_eq!(legacy_config.downloads.video_dir, archive_root);
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn task_config_reads_known_task_during_pending_history_sidecar_move_without_replaying_it() {
+        let temp_root = temp_queue_root("task-config-pending-sidecar-move");
+        let config = test_video_config(&temp_root);
+        let queue = QueueManager::open(&config).expect("queue should open");
+        assert!(
+            queue
+                .create(test_task(
+                    "task-config-pending-sidecar-move",
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=pending-sidecar-move".to_string(),
+                    },
+                ))
+                .unwrap()
+        );
+        let store = queue
+            .video_stores()
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("configured video store should exist");
+        let mut index = store.read_index().unwrap();
+        let entry = index
+            .tasks
+            .get_mut("task-config-pending-sidecar-move")
+            .expect("task should be indexed");
+        let source_path = entry.record_path.clone();
+        let target_path = store
+            .terminal_history_path("task-config-pending-sidecar-move")
+            .unwrap();
+        let mut record = store.read_record(&source_path).unwrap().unwrap();
+        record.status = TaskStatus::Completed;
+        store.write_record(&source_path, &record).unwrap();
+        entry.move_target = Some(target_path.clone());
+        store.write_index(&index).unwrap();
+
+        queue
+            .task_config(&config, "task-config-pending-sidecar-move")
+            .expect("indexed task should remain visible during sidecar move recovery")
+            .expect("task config should resolve from the existing source record");
+        let after = store.read_index().unwrap();
+        assert_eq!(
+            after.tasks["task-config-pending-sidecar-move"].move_target,
+            Some(target_path.clone()),
+            "task_config must not replay the pending index move"
+        );
+        assert!(source_path.exists());
+        assert!(!target_path.exists());
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn incomplete_task_transfer_summary_counts_authorized_failed_and_legacy_tasks() {
+        let temp_root = temp_queue_root("incomplete-task-transfer-summary");
+        let shared_root = temp_root.join("shared");
+        fs::create_dir_all(&shared_root).expect("shared root should create");
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = shared_root.clone();
+        config.downloads.pdf_dir = shared_root;
+        let queue = QueueManager::open(&config).expect("shared queue root should open");
+        let library_id = queue.registry_snapshot().unwrap().default_library_id;
+        let destination = queue
+            .default_video_destination()
+            .expect("default library destination should resolve");
+
+        let mut failed = test_task(
+            "summary-failed-video",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=summary-failed".to_string(),
+            },
+        );
+        failed.destination = Some(destination.clone());
+        assert!(queue.create(failed).unwrap());
+        queue
+            .update("summary-failed-video", false, |record| {
+                record.status = TaskStatus::Failed;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut legacy = test_task(
+            "summary-legacy-video",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=summary-legacy".to_string(),
+            },
+        );
+        legacy.destination = Some(destination.clone());
+        assert!(queue.create(legacy).unwrap());
+        queue
+            .update("summary-legacy-video", false, |record| {
+                record.status = TaskStatus::Failed;
+                record.destination = None;
+                record
+                    .staging_attempts
+                    .push(PathBuf::from("/outside/staging/job-bad"));
+                Ok(())
+            })
+            .unwrap();
+
+        let pdf = test_task(
+            "summary-failed-pdf",
+            JobRequest::Pdf {
+                url: "https://example.invalid/summary.pdf".to_string(),
+            },
+        );
+        assert!(queue.create(pdf).unwrap());
+        queue
+            .update("summary-failed-pdf", false, |record| {
+                record.status = TaskStatus::Failed;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut completed = test_task(
+            "summary-completed-video",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=summary-completed".to_string(),
+            },
+        );
+        completed.destination = Some(destination.clone());
+        assert!(queue.create(completed).unwrap());
+        queue
+            .update("summary-completed-video", false, |record| {
+                record.status = TaskStatus::Completed;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut cancelled = test_task(
+            "summary-cancelled-video",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=summary-cancelled".to_string(),
+            },
+        );
+        cancelled.destination = Some(destination);
+        assert!(queue.create(cancelled).unwrap());
+        queue
+            .update("summary-cancelled-video", false, |record| {
+                record.status = TaskStatus::Cancelled;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut unauthorized = test_task(
+            "summary-unauthorized-video",
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=summary-unauthorized".to_string(),
+            },
+        );
+        unauthorized.chat_id = 999;
+        unauthorized.destination = Some(queue.default_video_destination().unwrap());
+        assert!(queue.create(unauthorized).unwrap());
+        queue
+            .update("summary-unauthorized-video", false, |record| {
+                record.status = TaskStatus::Failed;
+                Ok(())
+            })
+            .unwrap();
+
+        let summary = queue
+            .incomplete_task_transfer_summary(&library_id, &[123_456_789])
+            .expect("authorized bounded summary should resolve");
+        assert_eq!(summary.task_count, 2, "failed and legacy video tasks count");
+        assert_eq!(
+            summary.staging_bytes, None,
+            "bad staging estimate is unknown"
+        );
+
+        let unauthorized_summary = queue
+            .incomplete_task_transfer_summary(&library_id, &[999])
+            .expect("authorized chat filter should resolve");
+        assert_eq!(unauthorized_summary.task_count, 1);
+        assert_eq!(unauthorized_summary.staging_bytes, Some(0));
         drop(queue);
         let _ = fs::remove_dir_all(temp_root);
     }

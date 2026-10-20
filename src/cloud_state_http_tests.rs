@@ -197,6 +197,25 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
         presence: Presence::Present,
     });
     cached_snapshot.warnings = vec!["existing library warning".to_string()];
+    let mut unavailable_projection = serde_json::to_value(&cached_snapshot)
+        .expect("cached library snapshot should serialize");
+    for item in unavailable_projection["items"]
+        .as_array_mut()
+        .expect("cached snapshot items should be an array")
+    {
+        item["presence"] = serde_json::Value::String("unavailable".to_string());
+    }
+    let unavailable_projection_hash = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(
+                unavailable_projection["items"]
+                    .as_array()
+                    .expect("unavailable projected items should remain an array")
+            )
+            .expect("unavailable projected items should serialize"),
+        )
+    );
     *runtime.library_snapshot.lock().await = Some(cached_snapshot.clone());
 
     let reporter = tokio::spawn(cloud_state_reporter_with_heartbeat(
@@ -230,7 +249,13 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
     assert_eq!(posts[1]["library_item_count"], 1);
     assert_eq!(
         posts[1]["library_items_hash"],
-        posts[0]["library_items_hash"]
+        unavailable_projection_hash,
+        "the cached media metadata should remain intact while unavailable presence is projected"
+    );
+    assert_ne!(
+        posts[1]["library_items_hash"],
+        posts[0]["library_items_hash"],
+        "the unavailable projection should mark cached items as unavailable"
     );
     assert_eq!(posts[1]["library_warning_count"], 2);
     assert_eq!(posts[1]["library_incomplete"], true);

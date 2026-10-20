@@ -7102,6 +7102,8 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
 }
 #[path = "media_library_e2e_tests.rs"]
 mod media_library_e2e_tests;
+#[path = "media_library_snapshot_e2e_tests.rs"]
+mod media_library_snapshot_e2e_tests;
 
 #[tokio::test]
 async fn media_library_migration_uses_per_bundle_conflict_choices_mock_e2e() {

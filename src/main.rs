@@ -508,6 +508,12 @@ enum CloudLibrarySnapshotUpdate {
     PreserveWithWarning(String),
 }
 
+#[derive(Clone, Copy)]
+enum CloudLibraryFailurePolicy {
+    MarkUnavailable,
+    PreserveAvailability,
+}
+
 /// Serializes each library scan through publishing its snapshot or failure warning.
 /// The scan itself runs on a blocking thread, but the async guard stays held until the
 /// result is visible to the cloud state reporter.
@@ -519,9 +525,10 @@ async fn run_cloud_library_operation<T>(
 where
     T: Send + 'static,
 {
-    run_cloud_library_operation_with_snapshot_update(
+    run_cloud_library_operation_with_snapshot_update_and_policy(
         runtime,
         failure_context,
+        CloudLibraryFailurePolicy::MarkUnavailable,
         move |context, inbox| {
             operation(context, inbox)
                 .map(|(value, snapshot)| (value, CloudLibrarySnapshotUpdate::Publish(snapshot)))
@@ -540,19 +547,56 @@ async fn run_cloud_library_operation_with_snapshot_update<T>(
 where
     T: Send + 'static,
 {
+    run_cloud_library_operation_with_snapshot_update_and_policy(
+        runtime,
+        failure_context,
+        CloudLibraryFailurePolicy::PreserveAvailability,
+        operation,
+    )
+    .await
+}
+
+async fn run_cloud_library_operation_preserving_availability<T>(
+    runtime: &CloudBotRuntime,
+    failure_context: &'static str,
+    operation: impl FnOnce(BotContext, Arc<CloudInbox>) -> Result<(T, LibrarySnapshot)> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    run_cloud_library_operation_with_snapshot_update_and_policy(
+        runtime,
+        failure_context,
+        CloudLibraryFailurePolicy::PreserveAvailability,
+        move |context, inbox| {
+            operation(context, inbox)
+                .map(|(value, snapshot)| (value, CloudLibrarySnapshotUpdate::Publish(snapshot)))
+        },
+    )
+    .await
+}
+
+async fn run_cloud_library_operation_with_snapshot_update_and_policy<T>(
+    runtime: &CloudBotRuntime,
+    failure_context: &'static str,
+    failure_policy: CloudLibraryFailurePolicy,
+    operation: impl FnOnce(BotContext, Arc<CloudInbox>) -> Result<(T, CloudLibrarySnapshotUpdate)>
+    + Send
+    + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
     }
-    if let Some(library) = runtime
-        .bot
-        .queue
-        .registry_snapshot()?
-        .libraries
-        .iter()
-        .find(|library| {
-            media_library_bot::same_root(&library.root, &runtime.bot.config.downloads.video_dir)
-        })
-    {
+    let settings = runtime.bot.queue.registry_snapshot()?;
+    let selected_library = settings.libraries.iter().find(|library| {
+        media_library_bot::same_root(&library.root, &runtime.bot.config.downloads.video_dir)
+    });
+    let selected_library_id = selected_library.map(|library| library.id.clone());
+    let default_library_id = settings.default_library_id;
+    if let Some(library) = selected_library {
         library_migration_bot::ensure_library_io_available(runtime, &library.id).await?;
     }
     let _publication_guard = runtime.library_scan_publication_gate.lock().await;
@@ -571,52 +615,93 @@ where
         Ok(Ok((value, snapshot_update))) => {
             match snapshot_update {
                 CloudLibrarySnapshotUpdate::Publish(snapshot) => {
-                    if let Ok(settings) = runtime.bot.queue.registry_snapshot()
-                        && let Some(library) = settings.libraries.iter().find(|library| {
-                            media_library_bot::same_root(
-                                &library.root,
-                                &runtime.bot.config.downloads.video_dir,
-                            )
-                        })
-                    {
+                    if let Some(library_id) = selected_library_id.as_ref() {
                         runtime
                             .library_snapshots
                             .lock()
                             .await
-                            .insert(library.id.clone(), snapshot.clone());
-                        runtime.library_unavailable.lock().await.remove(&library.id);
-                        if library.id == settings.default_library_id {
+                            .insert(library_id.clone(), snapshot.clone());
+                        runtime.library_unavailable.lock().await.remove(library_id);
+                        if library_id == &default_library_id {
                             *runtime.library_snapshot.lock().await = Some(snapshot);
+                            let warning = runtime
+                                .library_unavailable
+                                .lock()
+                                .await
+                                .get(library_id)
+                                .cloned();
+                            *runtime.library_scan_warning.lock().await = warning;
                         }
                     } else {
                         *runtime.library_snapshot.lock().await = Some(snapshot);
+                        *runtime.library_scan_warning.lock().await = None;
                     }
-                    *runtime.library_scan_warning.lock().await = None;
                 }
                 CloudLibrarySnapshotUpdate::PreserveWithWarning(warning) => {
-                    let warning = redact_sensitive_text(&warning);
-                    *runtime.library_scan_warning.lock().await = Some(truncate_cloud_warning(
-                        &warning,
-                        CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES,
-                    ));
+                    let warning = bounded_cloud_library_warning(&warning);
+                    if let Some(library_id) = selected_library_id.as_ref() {
+                        runtime
+                            .library_unavailable
+                            .lock()
+                            .await
+                            .insert(library_id.clone(), warning.clone());
+                        if library_id == &default_library_id {
+                            *runtime.library_scan_warning.lock().await = Some(warning);
+                        }
+                    } else {
+                        *runtime.library_scan_warning.lock().await = Some(warning);
+                    }
                 }
             }
             runtime.state_notify.notify_one();
             Ok(value)
         }
         Ok(Err(error)) => {
-            *runtime.library_scan_warning.lock().await =
-                Some(redact_sensitive_text(&format!("{error:#}")));
+            if matches!(failure_policy, CloudLibraryFailurePolicy::MarkUnavailable) {
+                let warning = bounded_cloud_library_warning(&format!("{error:#}"));
+                if let Some(library_id) = selected_library_id.as_ref() {
+                    runtime
+                        .library_unavailable
+                        .lock()
+                        .await
+                        .insert(library_id.clone(), warning.clone());
+                    if library_id == &default_library_id {
+                        *runtime.library_scan_warning.lock().await = Some(warning);
+                    }
+                } else {
+                    *runtime.library_scan_warning.lock().await = Some(warning);
+                }
+            }
             runtime.state_notify.notify_one();
             Err(error).with_context(|| failure_context)
         }
         Err(error) => {
-            *runtime.library_scan_warning.lock().await =
-                Some(redact_sensitive_text(&format!("{error:#}")));
+            if matches!(failure_policy, CloudLibraryFailurePolicy::MarkUnavailable) {
+                let warning = bounded_cloud_library_warning(&format!("{error:#}"));
+                if let Some(library_id) = selected_library_id.as_ref() {
+                    runtime
+                        .library_unavailable
+                        .lock()
+                        .await
+                        .insert(library_id.clone(), warning.clone());
+                    if library_id == &default_library_id {
+                        *runtime.library_scan_warning.lock().await = Some(warning);
+                    }
+                } else {
+                    *runtime.library_scan_warning.lock().await = Some(warning);
+                }
+            }
             runtime.state_notify.notify_one();
             Err(error)
         }
     }
+}
+
+fn bounded_cloud_library_warning(warning: &str) -> String {
+    truncate_cloud_warning(
+        &redact_sensitive_text(warning),
+        CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES,
+    )
 }
 
 fn truncate_cloud_warning(text: &str, max_bytes: usize) -> String {
@@ -1924,7 +2009,22 @@ fn cloud_task_summaries(
     }
     let records = queue
         .active_records_for_chats(&config.telegram.allowed_chat_ids, CLOUD_TASK_SUMMARY_LIMIT)?;
-    cloud_task_summaries_from_records(&records)
+    let mut summaries = cloud_task_summaries_from_records(&records)?;
+    for (record, summary) in records.iter().zip(&mut summaries) {
+        if !matches!(&record.job, JobRequest::Pdf { .. }) && summary["library_id"].is_null() {
+            match queue.task_destination(&record.id) {
+                Ok(Some(destination)) => {
+                    summary["library_id"] = serde_json::json!(destination.library_id)
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(task_id = %record.id, error = %redact_sensitive_text(&format!("{error:#}")), "could not resolve a legacy task media library");
+                }
+            }
+        }
+    }
+    validate_cloud_task_summary_budget(&summaries)?;
+    Ok(summaries)
 }
 
 fn cloud_task_summaries_from_records(records: &[TaskRecord]) -> Result<Vec<serde_json::Value>> {
@@ -1948,6 +2048,12 @@ fn cloud_task_summaries_from_records(records: &[TaskRecord]) -> Result<Vec<serde
         };
         let summary = serde_json::json!({
             "id": &record.id,
+            "kind": if matches!(&record.job, JobRequest::Pdf { .. }) { "pdf" } else { "video" },
+            "library_id": if matches!(&record.job, JobRequest::Pdf { .. }) {
+                serde_json::Value::Null
+            } else {
+                record.destination.as_ref().map(|destination| serde_json::json!(destination.library_id.as_str())).unwrap_or(serde_json::Value::Null)
+            },
             "status": record.status,
             "label": label,
             "label_truncated": label_truncated,
@@ -1974,6 +2080,22 @@ fn cloud_task_summaries_from_records(records: &[TaskRecord]) -> Result<Vec<serde
         );
     }
     Ok(summaries)
+}
+
+fn validate_cloud_task_summary_budget(summaries: &[serde_json::Value]) -> Result<()> {
+    for summary in summaries {
+        if serde_json::to_vec(summary)?.len() > CLOUD_TASK_SUMMARY_ENTRY_LIMIT_BYTES {
+            bail!(
+                "cloud task summary identity exceeds the {CLOUD_TASK_SUMMARY_ENTRY_LIMIT_BYTES}-byte per-entry limit"
+            );
+        }
+    }
+    if serde_json::to_vec(summaries)?.len() > CLOUD_TASK_SUMMARIES_LIMIT_BYTES {
+        bail!(
+            "cloud task summaries exceed the {CLOUD_TASK_SUMMARIES_LIMIT_BYTES}-byte aggregate limit"
+        );
+    }
+    Ok(())
 }
 
 fn bounded_cloud_task_text(value: &str, max_bytes: usize) -> (String, bool) {
@@ -2782,7 +2904,7 @@ async fn dispatch_cloud_management(
                 Vec::new()
             };
             let receipt_seq = request.seq;
-            let preview = run_cloud_library_operation(
+            let preview = run_cloud_library_operation_preserving_availability(
                 runtime,
                 "file preview worker failed",
                 move |context, inbox| {
@@ -3008,7 +3130,7 @@ async fn dispatch_cloud_management(
                 ));
             }
             let text = payload.text;
-            let (report, library_revision) = run_cloud_library_operation(
+            let (report, library_revision) = run_cloud_library_operation_preserving_availability(
                 runtime,
                 "legacy import worker failed",
                 move |context, inbox| {
@@ -13482,6 +13604,18 @@ mod tests {
                     .expect("summary fixture task should persist")
             );
         }
+
+        let library_id = queue
+            .default_video_destination()
+            .expect("default library destination should resolve")
+            .library_id;
+        let transfer_summary = queue
+            .incomplete_task_transfer_summary(&library_id, &[123_456_789])
+            .expect("per-library transfer summary should include all active tasks");
+        assert_eq!(
+            transfer_summary.task_count, 101,
+            "per-library task count must not inherit the cloud summary cap"
+        );
 
         let summaries = cloud_task_summaries(&config, &queue)
             .expect("cloud summaries should load across queue pages");

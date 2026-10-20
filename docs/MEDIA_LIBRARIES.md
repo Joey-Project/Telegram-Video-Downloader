@@ -24,6 +24,14 @@ read-only while unavailable, and replaces it after a successful scan. A fresh pa
 cached view reports the library as unavailable rather than inventing its contents.
 Removing a registration preserves files and requires that dependent tasks and migrations have
 been resolved. A library is never unregistered automatically after migration.
+Retryable failed video tasks still depend on their registered library. Before a task resolves its
+download configuration, the queue revalidates the registered root's saved directory identity;
+a replacement directory at the same pathname is rejected while task and staging records remain
+bound to the original directory.
+
+A failed refresh retains the last successful view for that library and marks it unavailable.
+Cached items stay visible but read-only until a successful scan. Refresh and library switching
+remain available so the user can recover or inspect another library.
 
 ## Moving a library
 
@@ -39,6 +47,9 @@ tasks and starts unchecked. When checked for a partially selected unfinished col
 the preview expands to all of that task's published members. Sizes of active staging files are
 estimates until writers stop. If the task publishes additional media outside the approved scope,
 create a fresh preview.
+Task summaries include their frozen library identity and media kind. Per-library counts include
+retryable failed tasks and do not depend on the truncated global task list; PDF and terminal
+completed/cancelled tasks do not make the video-task migration option appear.
 
 Without that checkbox, task records, fragments, recovery information, and their task states stay
 in the source library. With it, affected writers pause and release their output ownership before
