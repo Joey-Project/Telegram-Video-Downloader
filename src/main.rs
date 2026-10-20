@@ -36,7 +36,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bbdown_core::{
     AccessKeyLoginTicket, CredentialHealthReport, CredentialHealthScope, CredentialHealthStatus,
-    CredentialKind, CredentialSource, QrLoginKind, QrLoginState, UgcCollectionReference,
+    CredentialKind, CredentialSource, Input, QrLoginKind, QrLoginState, UgcCollectionReference,
 };
 use tokio::sync::{Mutex, Notify, Semaphore, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout as tokio_timeout};
@@ -4202,9 +4202,9 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
                 let job_id = index + 1;
                 let job = normalize_bilibili_short_link_job(&config, job).await;
                 println!("Queued replay job #{job_id}: {}", job.label());
-                if job.requires_bilibili_selection() {
+                if job.requires_bilibili_selection() || bilibili_video_pages_prompt_required(&job) {
                     println!(
-                        "Failed replay job #{job_id}: {}\nBilibili ss/md links require a Telegram selection prompt.",
+                        "Failed replay job #{job_id}: {}\nThis Bilibili link requires a Telegram selection prompt.",
                         job.label()
                     );
                     failed_jobs.push(format!("#{job_id} {}", job.label()));
@@ -7374,7 +7374,7 @@ async fn bilibili_ugc_selection_prompt(
         return Ok(None);
     }
 
-    if bilibili_bvid_from_url(url).is_none() {
+    if !matches!(Input::parse(url), Ok(Input::Bvid(_) | Input::Aid(_))) {
         return Ok(None);
     }
 
@@ -7387,6 +7387,16 @@ async fn bilibili_ugc_selection_prompt(
         page,
         bilibili_core::resolve_video_collection_membership(config, url).await,
     )
+}
+
+fn bilibili_video_pages_prompt_required(job: &JobRequest) -> bool {
+    let JobRequest::Bilibili { url, selection } = job else {
+        return false;
+    };
+    if !matches!(selection, None | Some(BilibiliSelection::Page(_))) {
+        return false;
+    }
+    matches!(Input::parse(url), Ok(Input::Bvid(_) | Input::Aid(_)))
 }
 
 fn bilibili_video_pages_prompt(
@@ -19861,6 +19871,36 @@ mod tests {
             direct_data,
             vec!["bsel:000000000000002a:all", "bsel:000000000000002a:cancel"]
         );
+    }
+
+    #[test]
+    fn video_page_prompt_detection_includes_legacy_aid_and_replay_jobs() {
+        for url in [
+            "https://www.bilibili.com/video/BV12TRrBcEP8",
+            "https://www.bilibili.com/video/BV12TRrBcEP8?p=2",
+            "https://www.bilibili.com/video/av123?p=2",
+        ] {
+            assert!(
+                bilibili_video_pages_prompt_required(&JobRequest::Bilibili {
+                    url: url.to_string(),
+                    selection: bilibili_selection_from_url(url),
+                }),
+                "expected a Telegram selection prompt for {url}"
+            );
+        }
+
+        assert!(!bilibili_video_pages_prompt_required(
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/video/BV12TRrBcEP8".to_string(),
+                selection: Some(BilibiliSelection::All),
+            }
+        ));
+        assert!(!bilibili_video_pages_prompt_required(
+            &JobRequest::Bilibili {
+                url: "https://www.bilibili.com/bangumi/play/ep123".to_string(),
+                selection: None,
+            }
+        ));
     }
 
     #[test]
