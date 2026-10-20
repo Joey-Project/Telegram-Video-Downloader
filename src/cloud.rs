@@ -676,6 +676,10 @@ pub struct InboxRecord {
     pub request: CloudRequest,
     pub status: InboxStatus,
     pub attempts: u32,
+    /// Local epoch seconds when this request was first durably received.
+    /// Older receipts omit this field; `None` means the original local time is unknown.
+    #[serde(default)]
+    pub received_at: Option<u64>,
     pub updated_at: u64,
     #[serde(default)]
     pub next_attempt_at: u64,
@@ -692,9 +696,9 @@ struct InboxStateIndex {
     awaiting_previews: BTreeSet<u64>,
     awaiting_preview_sequences: BTreeMap<String, BTreeSet<u64>>,
     awaiting_preview_id_by_sequence: BTreeMap<u64, String>,
-    awaiting_preview_expiry_millis_by_sequence: BTreeMap<u64, u64>,
-    active_confirmations: BTreeMap<String, BTreeSet<(u64, u64)>>,
-    active_confirmation_by_sequence: BTreeMap<u64, (String, u64)>,
+    awaiting_preview_expiry_seconds_by_sequence: BTreeMap<u64, u64>,
+    active_confirmations: BTreeMap<String, BTreeSet<(Option<u64>, u64)>>,
+    active_confirmation_by_sequence: BTreeMap<u64, (String, Option<u64>)>,
 }
 
 impl InboxStateIndex {
@@ -729,8 +733,8 @@ impl InboxStateIndex {
                         .insert(record.request.seq);
                     self.awaiting_preview_id_by_sequence
                         .insert(record.request.seq, preview_id.to_string());
-                    self.awaiting_preview_expiry_millis_by_sequence
-                        .insert(record.request.seq, inbox_preview_expiry_millis(record));
+                    self.awaiting_preview_expiry_seconds_by_sequence
+                        .insert(record.request.seq, inbox_preview_expiry_seconds(record));
                 }
             } else {
                 self.awaiting_previews.remove(&record.request.seq);
@@ -748,14 +752,14 @@ impl InboxStateIndex {
                 .and_then(Value::as_str)
                 .filter(|id| preview_identifier_is_indexable(id))
         {
-            let created_at_millis = record.request.created_at;
+            let received_at_seconds = record.received_at;
             self.active_confirmations
                 .entry(preview_id.to_string())
                 .or_default()
-                .insert((created_at_millis, record.request.seq));
+                .insert((received_at_seconds, record.request.seq));
             self.active_confirmation_by_sequence.insert(
                 record.request.seq,
-                (preview_id.to_string(), created_at_millis),
+                (preview_id.to_string(), received_at_seconds),
             );
         }
     }
@@ -768,7 +772,8 @@ impl InboxStateIndex {
     }
 
     fn unindex_preview_associations(&mut self, seq: u64) {
-        self.awaiting_preview_expiry_millis_by_sequence.remove(&seq);
+        self.awaiting_preview_expiry_seconds_by_sequence
+            .remove(&seq);
         if let Some(preview_id) = self.awaiting_preview_id_by_sequence.remove(&seq) {
             let remove_preview = self
                 .awaiting_preview_sequences
@@ -781,14 +786,14 @@ impl InboxStateIndex {
                 self.awaiting_preview_sequences.remove(&preview_id);
             }
         }
-        if let Some((preview_id, created_at_millis)) =
+        if let Some((preview_id, received_at_seconds)) =
             self.active_confirmation_by_sequence.remove(&seq)
         {
             let remove_preview =
                 self.active_confirmations
                     .get_mut(&preview_id)
                     .is_some_and(|confirmations| {
-                        confirmations.remove(&(created_at_millis, seq));
+                        confirmations.remove(&(received_at_seconds, seq));
                         confirmations.is_empty()
                     });
             if remove_preview {
@@ -803,28 +808,30 @@ impl InboxStateIndex {
             .and_then(|sequences| sequences.last().copied())
     }
 
-    fn has_active_confirmation_before(&self, preview_id: &str, expires_at_millis: u64) -> bool {
+    fn has_active_confirmation_before(&self, preview_id: &str, expires_at_seconds: u64) -> bool {
         self.active_confirmations
             .get(preview_id)
             .is_some_and(|confirmations| {
                 confirmations
-                    .range(..(expires_at_millis, 0))
+                    // Unknown legacy receipt time is retained conservatively. For known
+                    // timestamps, only a confirmation received strictly before expiry counts.
+                    .range(..(Some(expires_at_seconds), 0))
                     .next()
                     .is_some()
             })
     }
 
     fn has_preexpiry_confirmation_for_preview(&self, preview_id: &str) -> Option<bool> {
-        let expiry_millis = self
+        let expiry_seconds = self
             .awaiting_preview_sequence(preview_id)
             .and_then(|sequence| {
-                self.awaiting_preview_expiry_millis_by_sequence
+                self.awaiting_preview_expiry_seconds_by_sequence
                     .get(&sequence)
                     .copied()
             });
-        match expiry_millis {
-            Some(expiry_millis) => {
-                Some(self.has_active_confirmation_before(preview_id, expiry_millis))
+        match expiry_seconds {
+            Some(expiry_seconds) => {
+                Some(self.has_active_confirmation_before(preview_id, expiry_seconds))
             }
             None if self
                 .active_confirmations
@@ -935,11 +942,10 @@ fn inbox_abandoned_preview_expired(record: &InboxRecord, now: u64) -> bool {
             >= CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION.as_secs()
 }
 
-fn inbox_preview_expiry_millis(record: &InboxRecord) -> u64 {
+fn inbox_preview_expiry_seconds(record: &InboxRecord) -> u64 {
     record
         .updated_at
         .saturating_add(CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION.as_secs())
-        .saturating_mul(1_000)
 }
 
 impl InboxRecord {
@@ -1232,12 +1238,14 @@ impl CloudInbox {
             return Err(CloudInboxSequenceConflict { seq: request.seq }.into());
         }
         self.require_initial_recovery_complete_before_write()?;
+        let received_at = now_seconds();
         let record = InboxRecord {
             schema_version: INBOX_RECORD_VERSION,
             request,
             status: InboxStatus::Pending,
             attempts: 0,
-            updated_at: now_seconds(),
+            received_at: Some(received_at),
+            updated_at: received_at,
             next_attempt_at: 0,
             error: None,
             result: None,
@@ -1358,12 +1366,14 @@ impl CloudInbox {
     }
 
     /// Resolve one active preview through the recovery-built preview index and re-read only its
-    /// durable inbox record. The confirmation's original epoch-millisecond creation time prevents
-    /// a new action submitted after preview expiry from extending the preview's lifetime.
+    /// durable inbox records. Both the preview expiry and confirmation receipt time are local
+    /// epoch seconds; the Worker-provided request creation time is deliberately not used because
+    /// it may come from a skewed clock. Legacy confirmation receipts without a local receive time
+    /// remain recoverable and conservatively protect their preview until they become terminal.
     pub fn awaiting_confirmation_record(
         &self,
         preview_id: &str,
-        confirmation_created_at_millis: u64,
+        confirmation_seq: u64,
     ) -> Result<Option<InboxRecord>> {
         if !preview_identifier_is_indexable(preview_id) {
             return Ok(None);
@@ -1374,6 +1384,24 @@ impl CloudInbox {
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
         if !self.recover_interrupted_requests()? {
             bail!("cloud inbox startup recovery is still in progress");
+        }
+        let Some(confirmation) = self.read_record_path(&self.record_path(confirmation_seq))? else {
+            return Ok(None);
+        };
+        if confirmation.request.seq != confirmation_seq
+            || confirmation.request.kind != "file_confirm"
+            || !matches!(
+                confirmation.status,
+                InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
+            )
+            || confirmation
+                .request
+                .payload
+                .get("preview_id")
+                .and_then(Value::as_str)
+                != Some(preview_id)
+        {
+            return Ok(None);
         }
         let sequence = self
             .state_index
@@ -1393,7 +1421,10 @@ impl CloudInbox {
         {
             bail!("indexed cloud preview request {sequence} no longer matches its index");
         }
-        if confirmation_created_at_millis >= inbox_preview_expiry_millis(&record) {
+        if confirmation
+            .received_at
+            .is_some_and(|received_at| received_at >= inbox_preview_expiry_seconds(&record))
+        {
             return Ok(None);
         }
         Ok(Some(record))
@@ -2295,7 +2326,7 @@ impl CloudInbox {
             .state_index
             .lock()
             .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
-        Ok(!index.has_active_confirmation_before(preview_id, inbox_preview_expiry_millis(record)))
+        Ok(!index.has_active_confirmation_before(preview_id, inbox_preview_expiry_seconds(record)))
     }
 
     fn require_initial_recovery_complete_before_write(&self) -> Result<()> {
@@ -2672,6 +2703,7 @@ mod tests {
             request: legacy_import_request(seq, "legacy mappings"),
             status,
             attempts: 1,
+            received_at: None,
             updated_at,
             next_attempt_at: 0,
             error: None,
@@ -2701,6 +2733,7 @@ mod tests {
             request: cloud_request,
             status: InboxStatus::AwaitingConfirmation,
             attempts: 1,
+            received_at: Some(updated_at),
             updated_at,
             next_attempt_at: 0,
             error: None,
@@ -2716,17 +2749,19 @@ mod tests {
         seq: u64,
         preview_id: &str,
         status: InboxStatus,
-        created_at_millis: u64,
+        worker_created_at_millis: u64,
+        received_at_seconds: Option<u64>,
     ) -> InboxRecord {
         let mut cloud_request = request(seq, "confirm");
         cloud_request.kind = "file_confirm".to_string();
         cloud_request.payload = json!({"preview_id": preview_id, "revision": "revision-1"});
-        cloud_request.created_at = created_at_millis;
+        cloud_request.created_at = worker_created_at_millis;
         InboxRecord {
             schema_version: INBOX_RECORD_VERSION,
             request: cloud_request,
             status,
             attempts: 1,
+            received_at: received_at_seconds,
             updated_at: now_seconds(),
             next_attempt_at: 0,
             error: None,
@@ -2745,6 +2780,7 @@ mod tests {
                 request: preview,
                 status: InboxStatus::AwaitingConfirmation,
                 attempts: 0,
+                received_at: Some(1),
                 updated_at: 1,
                 next_attempt_at: 0,
                 error: None,
@@ -2759,6 +2795,7 @@ mod tests {
                 request: operation,
                 status: InboxStatus::Completed,
                 attempts: 1,
+                received_at: Some(2),
                 updated_at: 2,
                 next_attempt_at: 0,
                 error: None,
@@ -2831,6 +2868,7 @@ mod tests {
             request: request(900, "unknown schema"),
             status: InboxStatus::Pending,
             attempts: 0,
+            received_at: None,
             updated_at: now_seconds(),
             next_attempt_at: 0,
             error: None,
@@ -3123,6 +3161,7 @@ mod tests {
                 request: cloud_request,
                 status,
                 attempts: 0,
+                received_at: Some(updated_at),
                 updated_at,
                 next_attempt_at: 0,
                 error: None,
@@ -3215,6 +3254,7 @@ mod tests {
             request: request(127, "materialized during startup recovery"),
             status: InboxStatus::Pending,
             attempts: 0,
+            received_at: Some(now_seconds()),
             updated_at: now_seconds(),
             next_attempt_at: 0,
             error: None,
@@ -3391,7 +3431,7 @@ mod tests {
         let old = now.saturating_sub(age);
         let expires_at_seconds =
             old.saturating_add(CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION.as_secs());
-        let expires_at_millis = expires_at_seconds.saturating_mul(1_000);
+        let worker_expiry_millis = expires_at_seconds.saturating_mul(1_000);
 
         for (seq, preview_id) in [
             (1, "pending-preview"),
@@ -3409,8 +3449,13 @@ mod tests {
             (4, "processing-preview", InboxStatus::Processing),
             (6, "retryable-preview", InboxStatus::Retryable),
         ] {
-            let confirmation =
-                confirmation_inbox_record(seq, preview_id, status, expires_at_millis - 1);
+            let confirmation = confirmation_inbox_record(
+                seq,
+                preview_id,
+                status,
+                worker_expiry_millis - 1,
+                Some(expires_at_seconds - 1),
+            );
             inbox
                 .write_record_path(&inbox.record_path(seq), &confirmation)
                 .expect("confirmation fixture should persist");
@@ -3442,7 +3487,7 @@ mod tests {
                 .expect("cloud inbox state index lock should be available")
                 .has_active_confirmation_before(
                     "processing-preview",
-                    inbox_preview_expiry_millis(&processing_preview),
+                    inbox_preview_expiry_seconds(&processing_preview),
                 ),
             "the persisted Processing confirmation must be present in the active index"
         );
@@ -3451,6 +3496,15 @@ mod tests {
                 .inbox_record_retention_expired(&processing_preview)
                 .expect("Processing confirmation should protect its expired preview"),
             "a persisted Processing confirmation must protect the preview receipt"
+        );
+        let durable_processing_confirmation = reopened
+            .record(4)
+            .expect("Processing confirmation should be readable")
+            .expect("Processing confirmation should remain durable");
+        assert_eq!(
+            durable_processing_confirmation.received_at,
+            Some(expires_at_seconds - 1),
+            "recovery must not replace the immutable local receive time"
         );
         for _ in 0..8 {
             let _ = reopened
@@ -3473,40 +3527,17 @@ mod tests {
                 .initial_complete,
             "all preview and confirmation records must be indexed before lookup"
         );
-        for preview_id in ["pending-preview", "processing-preview", "retryable-preview"] {
+        for (preview_id, confirmation_seq) in [
+            ("pending-preview", 2),
+            ("processing-preview", 4),
+            ("retryable-preview", 6),
+        ] {
             let record = reopened
-                .awaiting_confirmation_record(preview_id, expires_at_millis - 1)
+                .awaiting_confirmation_record(preview_id, confirmation_seq)
                 .expect("indexed preview lookup should succeed")
                 .expect("pre-expiry confirmation should retain its preview");
             assert_eq!(record.status, InboxStatus::AwaitingConfirmation);
-            assert!(
-                reopened
-                    .awaiting_confirmation_record(preview_id, expires_at_millis)
-                    .expect("lookup should reject a confirmation at the expiry boundary")
-                    .is_none(),
-                "a confirmation at the exact millisecond expiry boundary must be rejected"
-            );
-            assert!(
-                reopened
-                    .awaiting_confirmation_record(preview_id, expires_at_millis + 1)
-                    .expect("lookup should reject a post-expiry confirmation")
-                    .is_none(),
-                "a confirmation after the millisecond expiry boundary must be rejected"
-            );
         }
-        assert!(
-            reopened
-                .awaiting_confirmation_record("retryable-preview", expires_at_millis)
-                .expect("lookup should reject a post-expiry confirmation")
-                .is_none(),
-            "a newly submitted confirmation must not extend the preview retention window"
-        );
-        assert!(
-            reopened
-                .awaiting_confirmation_record("abandoned-preview", now_millis())
-                .expect("lookup should safely expire an abandoned preview")
-                .is_none()
-        );
         assert!(
             reopened
                 .record(7)
@@ -3553,10 +3584,10 @@ mod tests {
             .expect("completed confirmation should leave the active index");
         assert!(
             reopened
-                .awaiting_confirmation_record("retryable-preview", expires_at_millis - 1)
-                .expect("cleanup should run after the last active confirmation completes")
+                .awaiting_confirmation_record("retryable-preview", 6)
+                .expect("lookup should reject a terminal confirmation")
                 .is_none(),
-            "a preview should expire after its last pre-boundary active confirmation is terminal"
+            "terminal confirmations must no longer resolve an active preview"
         );
         assert!(
             reopened
@@ -3573,6 +3604,215 @@ mod tests {
                 "pending or processing confirmation {seq} must keep its preview receipt"
             );
         }
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn confirmation_expiry_uses_local_receipt_time_under_worker_clock_skew() {
+        let root = temp_root("inbox-confirmation-clock-domain");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let now = now_seconds();
+        let retention = CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION.as_secs();
+        let preview_updated_at = now.saturating_sub(retention.saturating_add(10));
+        let preview_expiry = inbox_preview_expiry_seconds(&preview_inbox_record(
+            1,
+            "worker-ahead-preview",
+            preview_updated_at,
+        ));
+
+        for (seq, preview_id) in [
+            (1, "worker-ahead-preview"),
+            (3, "worker-behind-preview"),
+            (5, "legacy-unknown-preview"),
+            (7, "boundary-preview"),
+        ] {
+            inbox
+                .write_record_path(
+                    &inbox.record_path(seq),
+                    &preview_inbox_record(seq, preview_id, preview_updated_at),
+                )
+                .expect("expired preview fixture should persist");
+        }
+
+        let worker_ahead_created_at = preview_expiry
+            .saturating_add(8 * 24 * 60 * 60)
+            .saturating_mul(1_000);
+        let worker_ahead = confirmation_inbox_record(
+            2,
+            "worker-ahead-preview",
+            InboxStatus::Pending,
+            worker_ahead_created_at,
+            Some(preview_expiry - 1),
+        );
+        inbox
+            .write_record_path(&inbox.record_path(2), &worker_ahead)
+            .expect("pre-expiry confirmation fixture should persist");
+
+        let worker_behind_received_at = preview_expiry.saturating_add(1);
+        let worker_behind_created_at = worker_behind_received_at
+            .saturating_sub(8 * 24 * 60 * 60)
+            .saturating_mul(1_000);
+        let worker_behind = confirmation_inbox_record(
+            4,
+            "worker-behind-preview",
+            InboxStatus::Retryable,
+            worker_behind_created_at,
+            Some(worker_behind_received_at),
+        );
+        inbox
+            .write_record_path(&inbox.record_path(4), &worker_behind)
+            .expect("post-expiry confirmation fixture should persist");
+
+        let at_expiry = confirmation_inbox_record(
+            8,
+            "boundary-preview",
+            InboxStatus::Pending,
+            preview_expiry
+                .saturating_sub(8 * 24 * 60 * 60)
+                .saturating_mul(1_000),
+            Some(preview_expiry),
+        );
+        inbox
+            .write_record_path(&inbox.record_path(8), &at_expiry)
+            .expect("expiry-boundary confirmation fixture should persist");
+
+        // A legacy active confirmation has no immutable local receive time. Its updated_at may
+        // have been refreshed during recovery, so it must remain unknown rather than be inferred
+        // from that mutable field or the Worker clock.
+        let mut legacy_confirmation = confirmation_inbox_record(
+            6,
+            "legacy-unknown-preview",
+            InboxStatus::Processing,
+            now_millis(),
+            None,
+        );
+        legacy_confirmation.updated_at = now;
+        inbox
+            .write_record_path(&inbox.record_path(6), &legacy_confirmation)
+            .expect("legacy confirmation fixture should persist");
+        let legacy_path = inbox.record_path(6);
+        let mut legacy_json: Value = serde_json::from_slice(
+            &fs::read(&legacy_path).expect("legacy confirmation bytes should be readable"),
+        )
+        .expect("legacy confirmation should be JSON");
+        legacy_json
+            .as_object_mut()
+            .expect("legacy confirmation should be an object")
+            .remove("received_at");
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec(&legacy_json).expect("legacy confirmation should encode"),
+        )
+        .expect("fixture should omit the newly introduced receipt-time field");
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        finish_initial_recovery(&reopened);
+        let ahead_confirmation = reopened
+            .record(2)
+            .expect("confirmation should be readable")
+            .expect("confirmation should remain persisted");
+        assert_eq!(ahead_confirmation.received_at, Some(preview_expiry - 1));
+        assert!(
+            ahead_confirmation
+                .request
+                .created_at
+                .saturating_sub(preview_expiry.saturating_mul(1_000))
+                > 7_u64 * 24 * 60 * 60 * 1_000
+        );
+        let ahead_preview = reopened
+            .record(1)
+            .expect("preview should be readable")
+            .expect("pre-expiry confirmation should retain its preview");
+        assert!(
+            !reopened
+                .inbox_record_retention_expired(&ahead_preview)
+                .expect("active confirmation retention should be checked"),
+            "an active pre-expiry confirmation must protect its expired preview"
+        );
+
+        let behind_confirmation = reopened
+            .record(4)
+            .expect("confirmation should be readable")
+            .expect("confirmation should remain persisted");
+        assert!(
+            behind_confirmation
+                .request
+                .created_at
+                .saturating_add(7_u64 * 24 * 60 * 60 * 1_000)
+                < worker_behind_received_at.saturating_mul(1_000)
+        );
+        let behind_preview = reopened
+            .record(3)
+            .expect("preview should be readable")
+            .expect("preview receipt should remain for retention evaluation");
+        assert!(
+            reopened
+                .inbox_record_retention_expired(&behind_preview)
+                .expect("expired preview cleanup should be evaluated"),
+            "a post-expiry confirmation must not protect the preview receipt"
+        );
+
+        let boundary_preview = reopened
+            .record(7)
+            .expect("boundary preview should be readable")
+            .expect("boundary preview receipt should remain for retention evaluation");
+        assert!(
+            reopened
+                .inbox_record_retention_expired(&boundary_preview)
+                .expect("expiry-boundary cleanup should be evaluated"),
+            "a confirmation received exactly at expiry must not protect the preview"
+        );
+
+        let legacy_preview = reopened
+            .record(5)
+            .expect("legacy preview should be readable")
+            .expect("unknown-time active confirmation should protect the preview");
+        assert!(
+            !reopened
+                .inbox_record_retention_expired(&legacy_preview)
+                .expect("legacy retention should be checked conservatively"),
+            "an active confirmation with unknown receipt time must conservatively protect its preview"
+        );
+
+        assert!(
+            reopened
+                .awaiting_confirmation_record("worker-ahead-preview", 2)
+                .expect("lookup should use the local receipt clock")
+                .is_some(),
+            "a confirmation received locally before expiry must survive a Worker clock over seven days ahead"
+        );
+        assert!(
+            reopened
+                .awaiting_confirmation_record("worker-behind-preview", 4)
+                .expect("lookup should use the local receipt clock")
+                .is_none(),
+            "a confirmation received locally after expiry must be rejected despite a Worker clock over seven days behind"
+        );
+        assert!(
+            reopened
+                .awaiting_confirmation_record("boundary-preview", 8)
+                .expect("expiry-boundary confirmation should be checked locally")
+                .is_none(),
+            "a confirmation received exactly at local expiry must be rejected"
+        );
+
+        let recovered_legacy_confirmation = reopened
+            .record(6)
+            .expect("legacy confirmation should be readable")
+            .expect("legacy confirmation should remain recoverable");
+        assert_eq!(recovered_legacy_confirmation.received_at, None);
+        assert_eq!(recovered_legacy_confirmation.status, InboxStatus::Pending);
+        assert!(
+            reopened
+                .awaiting_confirmation_record("legacy-unknown-preview", 6)
+                .expect("unknown-time legacy receipt should remain recoverable")
+                .is_some(),
+            "recovery must not expire a legacy confirmation using its mutable updated_at"
+        );
+
         drop(reopened);
         let _ = fs::remove_dir_all(root);
     }
@@ -3788,16 +4028,52 @@ mod tests {
     }
 
     #[test]
-    fn current_worker_epoch_millis_resolves_a_fresh_confirmation_preview() {
-        let root = temp_root("inbox-worker-confirmation-millis");
+    fn persisted_confirmation_uses_immutable_local_receipt_time() {
+        let root = temp_root("inbox-local-confirmation-receipt");
         fs::create_dir_all(&root).expect("root should create");
         let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let mut preview_request = request(1, "preview");
+        preview_request.kind = "file_preview".to_string();
+        preview_request.payload = json!({});
         inbox
-            .write_record_path(
-                &inbox.record_path(1),
-                &preview_inbox_record(1, "fresh-preview", now_seconds()),
-            )
+            .persist(preview_request)
             .expect("fresh preview fixture should persist");
+        inbox
+            .update(1, |record| {
+                record.status = InboxStatus::AwaitingConfirmation;
+                record.result = Some(json!({
+                    "preview_id": "fresh-preview",
+                    "revision": "revision-1",
+                    "preview": {"id": "fresh-preview", "revision": "revision-1"}
+                }));
+            })
+            .expect("preview should become confirmable");
+        let mut confirmation_request = request(2, "confirm");
+        confirmation_request.kind = "file_confirm".to_string();
+        confirmation_request.payload =
+            json!({"preview_id": "fresh-preview", "revision": "revision-1"});
+        confirmation_request.created_at = now_millis();
+        inbox
+            .persist(confirmation_request)
+            .expect("confirmation should persist");
+        let original_received_at = inbox
+            .record(2)
+            .expect("confirmation receipt should be readable")
+            .expect("confirmation receipt should exist")
+            .received_at
+            .expect("new receipts should record a local receive time");
+        inbox
+            .update(2, |record| record.status = InboxStatus::Processing)
+            .expect("confirmation should enter processing");
+        assert_eq!(
+            inbox
+                .record(2)
+                .expect("processing receipt should be readable")
+                .expect("processing receipt should exist")
+                .received_at,
+            Some(original_received_at),
+            "status transitions must preserve the original local receive time"
+        );
         drop(inbox);
 
         let reopened = CloudInbox::open(&root).expect("inbox should reopen");
@@ -3823,10 +4099,19 @@ mod tests {
             "the preview index must be complete before resolving confirmation"
         );
         let record = reopened
-            .awaiting_confirmation_record("fresh-preview", now_millis())
-            .expect("current Worker timestamp should resolve the preview")
-            .expect("a fresh preview must accept a current Worker confirmation");
+            .awaiting_confirmation_record("fresh-preview", 2)
+            .expect("confirmation receipt should resolve the preview")
+            .expect("a locally fresh confirmation must resolve the preview");
         assert_eq!(record.status, InboxStatus::AwaitingConfirmation);
+        assert_eq!(
+            reopened
+                .record(2)
+                .expect("recovered confirmation should be readable")
+                .expect("recovered confirmation should exist")
+                .received_at,
+            Some(original_received_at),
+            "startup recovery must preserve the original local receive time"
+        );
         drop(reopened);
         let _ = fs::remove_dir_all(root);
     }
@@ -3913,6 +4198,7 @@ mod tests {
             },
             status: InboxStatus::AwaitingConfirmation,
             attempts: 1,
+            received_at: Some(1),
             updated_at: 1,
             next_attempt_at: 0,
             error: None,
@@ -3927,6 +4213,7 @@ mod tests {
                 request: management,
                 status: InboxStatus::Completed,
                 attempts: 1,
+                received_at: Some(seq),
                 updated_at: seq,
                 next_attempt_at: 0,
                 error: None,

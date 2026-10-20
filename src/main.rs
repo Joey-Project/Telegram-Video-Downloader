@@ -104,6 +104,11 @@ static PENDING_COLLECTION_DETAILS: OnceLock<Mutex<HashMap<u64, PendingCollection
     OnceLock::new();
 const CLOUD_STATE_UPLOAD_SOFT_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const CLOUD_STATE_PREVIEW_ENTRY_LIMIT: usize = 100;
+const CLOUD_TASK_SUMMARY_LIMIT: usize = 100;
+const CLOUD_TASK_SUMMARY_LABEL_LIMIT_BYTES: usize = 1024;
+const CLOUD_TASK_SUMMARY_ERROR_LIMIT_BYTES: usize = 2 * 1024;
+const CLOUD_TASK_SUMMARY_ENTRY_LIMIT_BYTES: usize = 8 * 1024;
+const CLOUD_TASK_SUMMARIES_LIMIT_BYTES: usize = 1024 * 1024;
 const CLOUD_QUEUE_STATE_COALESCE: Duration = Duration::from_secs(2);
 const CLOUD_LIBRARY_WARNING_COUNT_LIMIT: usize = 64;
 const CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES: usize = 1024;
@@ -1711,24 +1716,84 @@ fn cloud_task_summaries(
     if config.telegram.allow_all_chats {
         return Ok(Vec::new());
     }
-    const MAX_SUMMARY_TASKS: usize = 100;
-    let records =
-        queue.active_records_for_chats(&config.telegram.allowed_chat_ids, MAX_SUMMARY_TASKS)?;
-    records
-        .into_iter()
-        .map(|record| {
-            Ok(serde_json::json!({
-                "id": record.id,
-                "status": record.status,
-                "label": record.plan.as_ref().and_then(|plan| plan.title.clone()).unwrap_or_else(|| record.job.label().to_string()),
-                "media_entries_total": record.media_entries_total,
-                "media_entries_completed": record.media_entries_completed,
-                "media_entries_failed": record.media_entries_failed,
-                "updated_at": record.updated_at,
-                "error": record.error.map(|error| redact_sensitive_text(&error)),
-            }))
-        })
-        .collect()
+    let records = queue
+        .active_records_for_chats(&config.telegram.allowed_chat_ids, CLOUD_TASK_SUMMARY_LIMIT)?;
+    cloud_task_summaries_from_records(&records)
+}
+
+fn cloud_task_summaries_from_records(records: &[TaskRecord]) -> Result<Vec<serde_json::Value>> {
+    let mut summaries = Vec::with_capacity(records.len().min(CLOUD_TASK_SUMMARY_LIMIT));
+    for record in records.iter().take(CLOUD_TASK_SUMMARY_LIMIT) {
+        let raw_label = record
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.title.as_deref())
+            .unwrap_or_else(|| record.job.label());
+        let (label, label_truncated) =
+            bounded_cloud_task_text(raw_label, CLOUD_TASK_SUMMARY_LABEL_LIMIT_BYTES);
+        let (error, error_truncated) = match record.error.as_deref() {
+            Some(error) => {
+                let redacted = redact_sensitive_text(error);
+                let (bounded, truncated) =
+                    bounded_cloud_task_text(&redacted, CLOUD_TASK_SUMMARY_ERROR_LIMIT_BYTES);
+                (Some(bounded), truncated)
+            }
+            None => (None, false),
+        };
+        let summary = serde_json::json!({
+            "id": &record.id,
+            "status": record.status,
+            "label": label,
+            "label_truncated": label_truncated,
+            "media_entries_total": record.media_entries_total,
+            "media_entries_completed": record.media_entries_completed,
+            "media_entries_failed": record.media_entries_failed,
+            "updated_at": record.updated_at,
+            "error": error,
+            "error_truncated": error_truncated,
+        });
+        let entry_bytes = serde_json::to_vec(&summary)?.len();
+        if entry_bytes > CLOUD_TASK_SUMMARY_ENTRY_LIMIT_BYTES {
+            bail!(
+                "cloud task summary identity exceeds the {CLOUD_TASK_SUMMARY_ENTRY_LIMIT_BYTES}-byte per-entry limit"
+            );
+        }
+        summaries.push(summary);
+    }
+
+    let encoded_bytes = serde_json::to_vec(&summaries)?.len();
+    if encoded_bytes > CLOUD_TASK_SUMMARIES_LIMIT_BYTES {
+        bail!(
+            "cloud task summaries exceed the {CLOUD_TASK_SUMMARIES_LIMIT_BYTES}-byte aggregate limit"
+        );
+    }
+    Ok(summaries)
+}
+
+fn bounded_cloud_task_text(value: &str, max_bytes: usize) -> (String, bool) {
+    const TRUNCATION_MARKER: &str = "…";
+
+    let mut output = String::with_capacity(value.len().min(max_bytes));
+    let mut truncated = false;
+    for character in value.chars() {
+        let normalized = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if output.len().saturating_add(normalized.len_utf8()) > max_bytes {
+            truncated = true;
+            break;
+        }
+        output.push(normalized);
+    }
+    if truncated {
+        while output.len().saturating_add(TRUNCATION_MARKER.len()) > max_bytes {
+            output.pop();
+        }
+        output.push_str(TRUNCATION_MARKER);
+    }
+    (output, truncated)
 }
 
 async fn cloud_rest_fallback(runtime: CloudBotRuntime, poll_seconds: u64) {
@@ -2506,7 +2571,7 @@ async fn dispatch_cloud_management(
             let Some(preview_record) = cloud_awaiting_confirmation_record(
                 runtime,
                 payload.preview_id.clone(),
-                request.created_at,
+                request.seq,
             )
             .await?
             else {
@@ -3109,11 +3174,11 @@ async fn cloud_unconfirmable_preview_ids(
 async fn cloud_awaiting_confirmation_record(
     runtime: &CloudBotRuntime,
     preview_id: String,
-    confirmation_created_at: u64,
+    confirmation_seq: u64,
 ) -> Result<Option<InboxRecord>> {
     let inbox = Arc::clone(&runtime.inbox);
     tokio::task::spawn_blocking(move || {
-        inbox.awaiting_confirmation_record(&preview_id, confirmation_created_at)
+        inbox.awaiting_confirmation_record(&preview_id, confirmation_seq)
     })
     .await
     .context("cloud inbox preview lookup worker failed")?
@@ -12917,6 +12982,93 @@ mod tests {
 
         drop(queue);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloud_task_summaries_bound_large_text_and_json_escaping() {
+        let records = (0..CLOUD_TASK_SUMMARY_LIMIT)
+            .map(|ordinal| {
+                let mut record = TaskRecord::new(
+                    format!("cloud-bounded-task-{ordinal:03}"),
+                    ordinal as i64,
+                    ordinal as i64,
+                    123_456_789,
+                    Some(123_456_789),
+                    ordinal,
+                    JobRequest::Youtube {
+                        url: format!("https://example.invalid/watch/{ordinal}"),
+                    },
+                );
+                record.status = TaskStatus::Running;
+                record.plan = Some(PlanValidationSnapshot {
+                    title: Some(format!(
+                        "Task {ordinal:03} 🛰️ {}",
+                        "\u{0001}".repeat(64 * 1024)
+                    )),
+                    ..PlanValidationSnapshot::default()
+                });
+                record.error = Some(format!(
+                    "worker\tfailed: {}",
+                    "\"\\\u{0001}".repeat(32 * 1024)
+                ));
+                record
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            records[0]
+                .plan
+                .as_ref()
+                .unwrap()
+                .title
+                .as_ref()
+                .unwrap()
+                .len()
+                > 64 * 1024
+        );
+        assert!(records[0].error.as_ref().unwrap().len() > 64 * 1024);
+        let summaries = cloud_task_summaries_from_records(&records)
+            .expect("pathological task text should be bounded for cloud publication");
+        let encoded = serde_json::to_vec(&summaries).expect("summaries should remain valid JSON");
+
+        assert_eq!(summaries.len(), CLOUD_TASK_SUMMARY_LIMIT);
+        assert!(
+            encoded.len() <= CLOUD_TASK_SUMMARIES_LIMIT_BYTES,
+            "aggregate summaries must stay within their exact encoded-byte budget"
+        );
+        for (ordinal, summary) in summaries.iter().enumerate() {
+            let entry = serde_json::to_vec(summary).expect("each task summary should serialize");
+            assert!(entry.len() <= CLOUD_TASK_SUMMARY_ENTRY_LIMIT_BYTES);
+            assert_eq!(summary["id"].as_str(), Some(records[ordinal].id.as_str()));
+            assert_eq!(summary["status"], "running");
+            assert_eq!(summary["label_truncated"], true);
+            assert_eq!(summary["error_truncated"], true);
+
+            let label = summary["label"].as_str().expect("label should remain text");
+            assert!(label.len() <= CLOUD_TASK_SUMMARY_LABEL_LIMIT_BYTES);
+            assert!(label.starts_with(&format!("Task {ordinal:03}")));
+            assert!(label.contains("🛰️"), "valid Unicode should be preserved");
+            assert!(label.ends_with('…'), "truncated labels should be marked");
+            assert!(!label.chars().any(char::is_control));
+
+            let error = summary["error"].as_str().expect("error should remain text");
+            assert!(error.len() <= CLOUD_TASK_SUMMARY_ERROR_LIMIT_BYTES);
+            assert!(error.starts_with("worker failed: "));
+            assert!(error.ends_with('…'), "truncated errors should be marked");
+            assert!(!error.chars().any(char::is_control));
+        }
+
+        assert!(
+            records[0]
+                .plan
+                .as_ref()
+                .unwrap()
+                .title
+                .as_ref()
+                .unwrap()
+                .contains('\u{0001}'),
+            "summary truncation must not mutate the queue task record"
+        );
     }
 
     #[test]

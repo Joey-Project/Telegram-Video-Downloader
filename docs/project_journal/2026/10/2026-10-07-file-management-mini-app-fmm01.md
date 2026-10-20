@@ -36,11 +36,13 @@ superseded_by: ""
 
 ### 2026-10-20 Recovery boundaries
 
-- Local validation passed with 1,031 Rust tests, 0 failures, and 16 ignored tests; 78 Cloud tests passed. Formatting, all-target compilation, strict Clippy, the debug build, Cloud typechecking, and the Wrangler dry-run also passed. HTTP retry regressions compare actual request timestamps instead of short negative timing windows, preserving the configured 100 ms retry and 500 ms exhaustion-backoff assertions under concurrent test scheduling.
+- Local validation passed with 1,034 Rust tests, 0 failures, and 16 ignored tests; 78 Cloud tests passed. Formatting, all-target compilation, strict Clippy, the debug build, Cloud typechecking, and the Wrangler dry-run also passed. HTTP retry regressions compare actual request timestamps instead of short negative timing windows, preserving the configured 100 ms retry and 500 ms exhaustion-backoff assertions under concurrent test scheduling.
 - State uploads keep their pending content and version after HTTP 400, refresh the timestamp on each attempt, and use backoff so correcting clock skew can recover without another library change.
 - Cloud previews check the complete prospective inbox receipt before saving descriptor anchors or a manifest. Oversized selections receive an actionable split request; smaller previews retain the normal confirmation flow.
 - The local inbox is scoped to an authenticated D1 epoch. A replacement database gets a separate local namespace; legacy and retired records keep their original paths and inode bindings. A same-epoch sequence collision conditionally rotates the cloud epoch using the current server request identity, then stops the runtime for a fresh start. ACK transactions compare the complete server request identity as well as the epoch, including when a restore occurs between persistence and ACK. Stale ACK and state writes are rejected transactionally. Retired records conservatively protect existing private preview manifests from cleanup.
-- Active task summaries select candidates from the committed queue index before reading task records, so retained history does not trigger repeated record reads under the global queue operation lock. Record access still uses the existing File Provider and identity checks; startup and retry paths retain their existing orphan recovery.
+- Active task summaries select candidates from the committed queue index before reading task records, so retained history does not trigger repeated record reads under the global queue operation lock. Startup reconciliation repairs indexed active records from their durable revision and timestamps, then persists terminal move intents before renaming completed or cancelled records into history. Ordinary queries keep their bounded record reads and existing File Provider and identity checks.
+- Cloud task summaries retain task identities, statuses, and counts while bounding display labels and redacted errors to 1 KiB and 2 KiB of UTF-8 text. Actual JSON encoding is limited to 8 KiB per summary and 1 MiB per task array, including escaping overhead; truncated text is marked and the complete queue records remain unchanged.
+- Confirmation receipts persist an immutable local receipt timestamp. Preview expiry and confirmation admission use local seconds, independently of the Worker's request clock; processing and restart recovery do not reset receipt time. Legacy active confirmations without a local receipt timestamp conservatively retain their recovery and preview protection.
 - Legacy title hints normalize Unicode whitespace to single spaces before candidate matching and enforce the same control-character and length limits as metadata patches. Tabs in imported titles therefore cannot create mapping actions that the Worker permanently rejects.
 
 ### 2026-10-18 审查修复
@@ -71,7 +73,7 @@ superseded_by: ""
 - 精确路径匹配不再遍历同一对象的全部历史别名；部分扫描按对象缓存尚未消费的候选，延期保护登记也只做一次。确定性访问次数回归用于限制大量硬链接时的候选查找工作，避免按路径反复遍历同一候选列表。
 - 文件已枚举但暂时无法打开时，安全匹配的旧记录保留稳定 ID 并标为不可用，不发布重复的临时记录或误报缺失；不同替换对象不继承旧队列元数据。队列提示路径按每个组件父目录的实际文件系统命名规则比较，包含受支持的大小写、Unicode 规范化及 HFS 忽略字符行为。
 - 初始扫描、下载发布扫描及管理操作共用本机扫描与发布锁，从阻塞扫描开始前持有到快照和警告发布结束，使较早扫描的异步恢复不会覆盖后续结果；失败警告也遵守相同顺序。
-- 预览按七天窗口停止接受新确认，过期前已提交且仍待处理、执行中或可重试的确认保留关联预览收件记录及实际私有预览文件供恢复；扫描与执行中的清理都在删除前复查活动确认，收件恢复未完成或查询失败时保留。过期预览在状态视图中显示失效，放弃确认的记录仍可清理。确认按 preview ID 索引查单条持久记录；云端毫秒请求时间与本地秒级过期时间在比较前显式统一单位。
+- 预览按七天窗口停止接受新确认，本机在过期前已持久接收且仍待处理、执行中或可重试的确认保留关联预览收件记录及实际私有预览文件供恢复；扫描与执行中的清理都在删除前复查活动确认，收件恢复未完成或查询失败时保留。过期预览在状态视图中显示失效，放弃确认的记录仍可清理。确认按 preview ID 和已落盘的确认序号查询；有效期比较统一使用不可变的本机秒级收件时间，不使用 Worker 请求时间或重试更新时间，缺少该时间的旧活动确认保守保留。
 - 刷新失败时保留旧条目、revision 及原扫描时间，并立即同步脱敏警告；成功扫描后同步清除警告。上传缩减同时约束警告文本及分类目录，即使只有零或一个视频也可压缩，缺省分类以警告说明，不把截短路径作为可选目录。
 - Mini App 静默轮询恢复身份校验后也会补发已保存请求。跨设备移动在预览阶段按每个媒体及附件检查源描述符与目标已存在父目录的设备，混合批中任一不支持的跨卷改名会阻止生成确认预览；跳过及原地不动项保持原语义。
 - 云端以同一 D1 事务读取快照元信息及内容分片，返回前复验存储哈希，避免并发发布时混合旧版本与新内容；回归覆盖分片数量相同及变化时的状态和文件库读取。
@@ -154,7 +156,7 @@ superseded_by: ""
 - 已接受使用休眠 WebSocket 通知本机的方向：Rust 主动连接 SQLite-backed Durable Object；Worker 先持久保存需要本机处理的新请求，再调用该对象唤醒并发送通知。Telegram 请求和 Mini App 操作共用该入口；只读云端查询不必唤醒本机通知对象。
 - Rust 的状态回写和 Telegram 出站回复不经过通知对象。D1 不会因写入而自动唤醒该对象；状态经固定 Worker API 回写，不向本机运行时分发 Cloudflare 数据库管理 token。连接建立、关闭和应用消息也可能唤醒对象，协议 ping/pong 不打断休眠。断线、漏通知或通知失败时从持久收件箱补领，不删除已保存请求。
 - Cloudflare Free 是偏好；超出额度时暂停新操作并向用户提示。
-- 上述 Worker、D1 migration、静态 `/file` 页面、Rust API 与本地持久收件均已在分支中实现。它们仍处于本地代码和模拟测试阶段，不代表已经创建或部署生产资源。
+- 上述 Worker、D1 migration、静态 `/file` 页面、Rust API 与本地持久收件均已实现，并接受本地、mock 及隔离真实 Cloudflare 验证。隔离测试不代表已经创建或部署生产资源。
 
 ### 已确认的单人单机鉴权
 

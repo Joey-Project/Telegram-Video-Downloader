@@ -1662,14 +1662,11 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
         Arc::clone(&queue),
         Arc::clone(&inbox),
     );
-    let indexed_preview = cloud_awaiting_confirmation_record(
-        &runtime,
-        "retryable-preview".to_string(),
-        confirmation_created_at,
-    )
-    .await
-    .expect("indexed preview lookup should succeed after terminal history")
-    .expect("the active preview should remain indexed");
+    let indexed_preview =
+        cloud_awaiting_confirmation_record(&runtime, "retryable-preview".to_string(), 84)
+            .await
+            .expect("indexed preview lookup should succeed after terminal history")
+            .expect("the active preview should remain indexed");
     assert_eq!(indexed_preview.request.seq, 83);
 
     persist_cloud_retry_receipt(
@@ -1815,9 +1812,8 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
         .expect("preview should await confirmation");
 
     let preview_updated_at = now_seconds().saturating_sub(PREVIEW_RETENTION_SECONDS + 1);
-    let preview_expires_at_millis = preview_updated_at
-        .saturating_add(PREVIEW_RETENTION_SECONDS)
-        .saturating_mul(1_000);
+    let preview_expires_at_seconds = preview_updated_at.saturating_add(PREVIEW_RETENTION_SECONDS);
+    let preview_expires_at_millis = preview_expires_at_seconds.saturating_mul(1_000);
     let preview_receipt_path = runtime_test_request_path(
         &config.downloads.video_dir,
         crate::cloud::TEST_DATABASE_EPOCH,
@@ -1855,6 +1851,24 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
         .expect("confirmation should enter processing before restart");
     drop(inbox);
 
+    // Persist a local receive time just before expiry, then reopen so the recovered index is
+    // built from the same durable fixture. Production sets this timestamp once when persisting.
+    let confirmation_receipt_path = runtime_test_request_path(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+        84,
+    );
+    let mut confirmation_receipt: InboxRecord = serde_json::from_slice(
+        &fs::read(&confirmation_receipt_path).expect("confirmation receipt should read"),
+    )
+    .expect("confirmation receipt should parse");
+    confirmation_receipt.received_at = Some(preview_expires_at_seconds.saturating_sub(1));
+    fs::write(
+        &confirmation_receipt_path,
+        serde_json::to_vec(&confirmation_receipt).expect("pre-expiry receipt should encode"),
+    )
+    .expect("pre-expiry local receive time should persist");
+
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should recover"),
     );
@@ -1874,6 +1888,11 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
         pending_confirmation.expect("restarted confirmation should return to Pending");
     assert_eq!(pending_confirmation.status, InboxStatus::Pending);
     assert!(pending_confirmation.request.created_at < preview_expires_at_millis);
+    assert_eq!(
+        pending_confirmation.received_at,
+        Some(preview_expires_at_seconds.saturating_sub(1)),
+        "recovery should preserve the pre-expiry local receive timestamp"
+    );
 
     let scan_manager = LibraryManager::open_with_provider_and_preview_cleanup_gate(
         &config.downloads.video_dir,

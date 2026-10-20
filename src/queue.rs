@@ -3188,7 +3188,7 @@ impl DownloadStore {
     fn list_records(&self) -> Result<Vec<TaskRecord>> {
         let mut index = self.read_index()?;
         let original_index = index.clone();
-        self.scan_active_records(&mut index)?;
+        self.scan_active_records(&mut index, false)?;
         self.reconcile_move_targets(&mut index)?;
         if index != original_index {
             self.write_index(&index)?;
@@ -3258,7 +3258,7 @@ impl DownloadStore {
     fn get_task(&self, id: &str) -> Result<Option<(TaskRecord, TaskIndexEntry)>> {
         let mut index = self.read_index()?;
         let original_index = index.clone();
-        self.scan_active_records(&mut index)?;
+        self.scan_active_records(&mut index, false)?;
         self.reconcile_move_targets(&mut index)?;
         if index != original_index {
             self.write_index(&index)?;
@@ -3342,7 +3342,13 @@ impl DownloadStore {
 
     fn reconcile_index(&self) -> Result<()> {
         let mut index = self.read_index()?;
-        self.scan_active_records(&mut index)?;
+        let original_index = index.clone();
+        self.scan_active_records(&mut index, true)?;
+        // Persist repaired metadata and any terminal move intent before moving files. This keeps
+        // the existing crash-safe intent -> rename -> final-index sequence intact.
+        if index != original_index {
+            self.write_index(&index)?;
+        }
         self.reconcile_move_targets(&mut index)?;
         self.write_index(&index)
     }
@@ -3363,7 +3369,11 @@ impl DownloadStore {
         Ok(())
     }
 
-    fn scan_active_records(&self, index: &mut StoreIndex) -> Result<()> {
+    fn scan_active_records(
+        &self,
+        index: &mut StoreIndex,
+        reconcile_indexed_records: bool,
+    ) -> Result<()> {
         let entries = self.list_coordinated_queue_directory()?;
         if entries.len() > MAX_ACTIVE_RECORDS {
             bail!("task queue contains more than {MAX_ACTIVE_RECORDS} entries");
@@ -3379,10 +3389,36 @@ impl DownloadStore {
                 continue;
             };
             validate_task_id(id)?;
-            if !identity.is_file() || index.tasks.contains_key(id) {
+            if !identity.is_file() {
                 continue;
             }
             let path = self.task_path(id)?;
+            if let Some(entry) = index.tasks.get_mut(id) {
+                // Ordinary lookups keep the established bounded behavior and only discover
+                // orphan records. During startup reconciliation, repair index metadata from
+                // each already-indexed active queue file. This single bounded directory pass
+                // prevents stale terminal timestamps from occupying every summary slot.
+                if reconcile_indexed_records
+                    && entry.record_path == path
+                    && entry.move_target.is_none()
+                    && let Some(record) = self.read_record(&path)?
+                {
+                    if record.id != id || record.chat_id != entry.chat_id {
+                        bail!("task index points to a mismatched record for task {id}");
+                    }
+                    entry.revision = record.revision;
+                    entry.updated_at = record.updated_at;
+                    if record.status.is_history() {
+                        entry.move_target = Some(self.terminal_history_path(&record.id)?);
+                    }
+                    let activity = index
+                        .chat_activity
+                        .entry(record.chat_id.to_string())
+                        .or_default();
+                    activity.revision = activity.revision.max(record.activity_revision);
+                }
+                continue;
+            }
             if let Some(record) = self.read_record(&path)? {
                 if record.id != id {
                     bail!(
@@ -8982,6 +9018,167 @@ mod tests {
         assert_eq!(pdf_index.tasks.len(), 2);
 
         drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn startup_reconciles_terminal_records_before_bounded_active_summary() {
+        const STALE_TERMINAL_COUNT: usize = 120;
+
+        let directory = temp_queue_root("startup-reconcile-terminal-active-index");
+        let config = test_video_config(&directory);
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let queue = QueueManager::open_with_file_provider(&config, provider.clone())
+            .expect("queue should open");
+
+        let mut index = queue.video.read_index().expect("queue index should load");
+        for number in 0..STALE_TERMINAL_COUNT {
+            let id = format!("stale-terminal-{number:03}");
+            let mut record = test_task(
+                &id,
+                JobRequest::Youtube {
+                    url: format!("https://example.invalid/{id}"),
+                },
+            );
+            record.status = if number % 2 == 0 {
+                TaskStatus::Completed
+            } else {
+                TaskStatus::Cancelled
+            };
+            record.revision = 2;
+            record.updated_at = 30_000 + number as u64;
+            let path = queue
+                .video
+                .task_path(&id)
+                .expect("active task path should be valid");
+            queue
+                .video
+                .write_record(&path, &record)
+                .expect("terminal record should persist before its stale index update");
+            index.tasks.insert(
+                id,
+                TaskIndexEntry {
+                    chat_id: record.chat_id,
+                    record_path: path,
+                    move_target: None,
+                    revision: 1,
+                    // The index still reflects its older active state. These 120 entries sort
+                    // ahead of the live task and would fill the summary's 100-record read cap.
+                    updated_at: 20_000 + number as u64,
+                },
+            );
+        }
+
+        let mut active = test_task(
+            "still-active-after-terminal-crash",
+            JobRequest::Youtube {
+                url: "https://example.invalid/still-active-after-terminal-crash".to_string(),
+            },
+        );
+        active.status = TaskStatus::Queued;
+        active.updated_at = 10_000;
+        let active_path = queue
+            .video
+            .task_path(&active.id)
+            .expect("active task path should be valid");
+        queue
+            .video
+            .write_record(&active_path, &active)
+            .expect("active task should persist");
+        index.tasks.insert(
+            active.id.clone(),
+            TaskIndexEntry {
+                chat_id: active.chat_id,
+                record_path: active_path,
+                move_target: None,
+                revision: active.revision,
+                updated_at: active.updated_at,
+            },
+        );
+        queue
+            .video
+            .write_index(&index)
+            .expect("crash-state index should persist");
+
+        assert!(
+            queue
+                .active_records_for_chats(&[123_456_789], 1)
+                .expect("pre-restart bounded summary should load")
+                .is_empty(),
+            "stale terminal entries reproduce the crash window by occupying the one-record cap"
+        );
+        drop(queue);
+
+        let reopened = QueueManager::open_with_file_provider(&config, provider.clone())
+            .expect("startup should reconcile the durable terminal records");
+        let repaired = reopened
+            .video
+            .read_index()
+            .expect("reconciled index should load");
+        for number in 0..STALE_TERMINAL_COUNT {
+            let id = format!("stale-terminal-{number:03}");
+            let entry = repaired
+                .tasks
+                .get(&id)
+                .expect("terminal task should remain available in history");
+            assert_eq!(
+                entry.record_path,
+                reopened
+                    .video
+                    .terminal_history_path(&id)
+                    .expect("history path should be valid")
+            );
+            assert_eq!(entry.move_target, None);
+            assert_eq!(entry.revision, 2);
+            assert_eq!(entry.updated_at, 30_000 + number as u64);
+        }
+
+        let reads_before_summary = provider.read_paths();
+        let visible = reopened
+            .active_records_for_chats(&[123_456_789], 1)
+            .expect("repaired active summary should load");
+        let reads_after_summary = provider.read_paths();
+        let summary_reads = &reads_after_summary[reads_before_summary.len()..];
+        let task_reads = summary_reads
+            .iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("task-"))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            visible
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["still-active-after-terminal-crash"]
+        );
+        assert_eq!(
+            task_reads.len(),
+            1,
+            "summary should read only its one selected task"
+        );
+        assert!(task_reads.iter().all(|path| {
+            path.parent() == Some(reopened.video.queue_dir.as_path())
+                || path.parent() == Some(reopened.pdf.queue_dir.as_path())
+        }));
+        assert!(
+            task_reads.iter().all(|path| {
+                path.parent()
+                    != Some(
+                        reopened
+                            .video
+                            .queue_dir
+                            .join(TERMINAL_HISTORY_DIRECTORY)
+                            .as_path(),
+                    )
+            }),
+            "bounded active summaries must not read terminal history records"
+        );
+
+        drop(reopened);
         let _ = fs::remove_dir_all(directory);
     }
 

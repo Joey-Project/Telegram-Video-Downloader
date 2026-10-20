@@ -504,6 +504,7 @@ mod tests {
             },
             status,
             attempts: 1,
+            received_at: None,
             updated_at: seq * 10 + 1,
             next_attempt_at: 0,
             error,
