@@ -843,6 +843,7 @@ struct BuiltLibraryItem {
 struct ScanBuildState<'a> {
     started_at: Instant,
     timed_out: &'a mut bool,
+    migration_incomplete_paths: &'a mut BTreeSet<String>,
     warnings: &'a mut Vec<String>,
     expire_after_attachment_count: &'a mut Option<usize>,
 }
@@ -851,6 +852,9 @@ struct ScanBuildState<'a> {
 #[derive(Default)]
 struct ScanTestHooks {
     incomplete_directories: BTreeSet<String>,
+    max_entries: Option<usize>,
+    max_media_items: Option<usize>,
+    scope_unknown: bool,
     expire_after_built_item: bool,
     expire_after_attachment_count: Option<usize>,
     index_budget: Option<usize>,
@@ -1007,6 +1011,10 @@ struct ScanWalk {
     started_at: Instant,
     timed_out: bool,
     incomplete_scan: bool,
+    migration_incomplete_paths: BTreeSet<String>,
+    scope_unknown: bool,
+    max_entries: usize,
+    max_media_items: usize,
 }
 
 impl Default for ScanWalk {
@@ -1021,6 +1029,10 @@ impl Default for ScanWalk {
             started_at: Instant::now(),
             timed_out: false,
             incomplete_scan: false,
+            migration_incomplete_paths: BTreeSet::new(),
+            scope_unknown: false,
+            max_entries: MAX_ENTRIES,
+            max_media_items: MAX_MEDIA_ITEMS,
         }
     }
 }
@@ -1087,6 +1099,16 @@ pub(crate) struct MigrationPlannedGroup {
     pub(crate) outcome: MigrationPlanOutcome,
     pub(crate) conflict: bool,
     pub(crate) files: Vec<MigrationPlannedFile>,
+}
+
+/// Completeness proof for a migration scan. This stays internal so public snapshot JSON is stable.
+#[derive(Debug, Clone)]
+pub(crate) struct MigrationScanResult {
+    pub(crate) snapshot: LibrarySnapshot,
+    pub(crate) complete: bool,
+    /// Relative directory boundaries plus individual unreadable paths used only for migrations.
+    pub(crate) incomplete_directories: BTreeSet<String>,
+    pub(crate) scope_unknown: bool,
 }
 
 struct StoreGuards {
@@ -1190,21 +1212,31 @@ impl LibraryManager {
         self.root.root_identity()
     }
 
+    #[cfg(test)]
     pub(crate) fn migration_scan(&self) -> Result<LibrarySnapshot> {
         self.scan(&[])
     }
 
-    pub(crate) fn migration_scan_with_output_lease(
+    pub(crate) fn migration_scan_with_completeness(&self) -> Result<MigrationScanResult> {
+        let _process_guard = self
+            .in_process_lock
+            .lock()
+            .map_err(|_| anyhow!("media-library lock is poisoned"))?;
+        let _disk_guard = self.lock_store()?;
+        self.scan_locked_with_completeness(&[])
+    }
+
+    pub(crate) fn migration_scan_with_output_lease_and_completeness(
         &self,
         lease: &crate::downloader::VideoMigrationGuard,
-    ) -> Result<LibrarySnapshot> {
+    ) -> Result<MigrationScanResult> {
         lease.validate_for_root(&self.root)?;
         let _process_guard = self
             .in_process_lock
             .lock()
             .map_err(|_| anyhow!("media-library lock is poisoned"))?;
         let _library_guard = self.lock_library()?;
-        self.scan_locked(&[])
+        self.scan_locked_with_completeness(&[])
     }
 
     pub(crate) fn migration_validate_output_lease(
@@ -2538,7 +2570,7 @@ impl LibraryManager {
     }
 
     #[cfg(test)]
-    fn mark_next_scan_directory_incomplete(&self, directory: &str) {
+    pub(crate) fn mark_next_scan_directory_incomplete(&self, directory: &str) {
         self.scan_test_hooks
             .lock()
             .expect("scan test-hook lock should remain healthy")
@@ -2547,7 +2579,31 @@ impl LibraryManager {
     }
 
     #[cfg(test)]
-    fn expire_next_scan_after_built_item(&self) {
+    pub(crate) fn limit_next_scan_entries_to(&self, limit: usize) {
+        self.scan_test_hooks
+            .lock()
+            .expect("scan test-hook lock should remain healthy")
+            .max_entries = Some(limit);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn limit_next_scan_media_items_to(&self, limit: usize) {
+        self.scan_test_hooks
+            .lock()
+            .expect("scan test-hook lock should remain healthy")
+            .max_media_items = Some(limit);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_next_scan_scope_unknown(&self) {
+        self.scan_test_hooks
+            .lock()
+            .expect("scan test-hook lock should remain healthy")
+            .scope_unknown = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_next_scan_after_built_item(&self) {
         self.scan_test_hooks
             .lock()
             .expect("scan test-hook lock should remain healthy")
@@ -4698,6 +4754,11 @@ impl LibraryManager {
     }
 
     fn scan_locked(&self, hints: &[SourceHint]) -> Result<LibrarySnapshot> {
+        self.scan_locked_with_completeness(hints)
+            .map(|result| result.snapshot)
+    }
+
+    fn scan_locked_with_completeness(&self, hints: &[SourceHint]) -> Result<MigrationScanResult> {
         #[cfg(test)]
         self.scan_attempts.fetch_add(1, Ordering::Relaxed);
         let operation_state_warnings = self.prune_persisted_operation_states();
@@ -4711,6 +4772,12 @@ impl LibraryManager {
                 .map_err(|_| anyhow!("scan test-hook lock is poisoned"))?;
             std::mem::take(&mut *hooks)
         };
+        #[cfg(test)]
+        {
+            walk.max_entries = test_hooks.max_entries.unwrap_or(MAX_ENTRIES);
+            walk.max_media_items = test_hooks.max_media_items.unwrap_or(MAX_MEDIA_ITEMS);
+            walk.scope_unknown = test_hooks.scope_unknown;
+        }
         #[cfg(test)]
         let identity_reconciliation_steps = test_hooks.identity_reconciliation_steps.as_ref();
         #[cfg(test)]
@@ -4737,8 +4804,8 @@ impl LibraryManager {
         }
         walk.files
             .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        if walk.files.len() > MAX_ENTRIES {
-            for file in walk.files.iter().skip(MAX_ENTRIES) {
+        if walk.files.len() > walk.max_entries {
+            for file in walk.files.iter().skip(walk.max_entries) {
                 let parent = Path::new(&file.relative_path)
                     .parent()
                     .unwrap_or_else(|| Path::new(""))
@@ -4746,10 +4813,12 @@ impl LibraryManager {
                     .into_owned();
                 walk.incomplete_directories.insert(parent);
             }
-            walk.files.truncate(MAX_ENTRIES);
+            walk.files.truncate(walk.max_entries);
             walk.incomplete_scan = true;
-            walk.warnings
-                .push(format!("scan stopped at the {MAX_ENTRIES}-entry limit"));
+            walk.warnings.push(format!(
+                "scan stopped at the {}-entry limit",
+                walk.max_entries
+            ));
         }
 
         let sidecars = SidecarIndex::build(
@@ -4771,11 +4840,12 @@ impl LibraryManager {
         let mut incomplete_attachment_media = 0usize;
         #[cfg(test)]
         let mut expire_after_built_item = test_hooks.expire_after_built_item;
-        for file in walk
+        let primary_files = walk
             .files
             .iter()
             .filter(|file| is_primary_media(&file.relative_path))
-        {
+            .collect::<Vec<_>>();
+        for (primary_index, file) in primary_files.iter().enumerate() {
             if walk.timed_out || walk.started_at.elapsed() >= SCAN_TIMEOUT {
                 walk.timed_out = true;
                 if !walk
@@ -4785,12 +4855,21 @@ impl LibraryManager {
                 {
                     walk.warnings.push("scan stopped at the 120-second scan budget; unvisited paths were not marked missing".to_string());
                 }
+                for unvisited in &primary_files[primary_index..] {
+                    walk.migration_incomplete_paths
+                        .insert(unvisited.relative_path.clone());
+                }
                 break;
             }
-            if videos.len() >= MAX_MEDIA_ITEMS {
+            if videos.len() >= walk.max_media_items {
                 walk.incomplete_scan = true;
+                for unvisited in &primary_files[primary_index..] {
+                    walk.migration_incomplete_paths
+                        .insert(unvisited.relative_path.clone());
+                }
                 walk.warnings.push(format!(
-                    "scan stopped at the {MAX_MEDIA_ITEMS}-media-item limit"
+                    "scan stopped at the {}-media-item limit",
+                    walk.max_media_items
                 ));
                 break;
             }
@@ -4804,12 +4883,17 @@ impl LibraryManager {
                 &mut ScanBuildState {
                     started_at: walk.started_at,
                     timed_out: &mut walk.timed_out,
+                    migration_incomplete_paths: &mut walk.migration_incomplete_paths,
                     warnings: &mut walk.warnings,
                     expire_after_attachment_count: &mut expire_after_attachment_count,
                 },
             );
             match built_result {
                 Ok(Some(built)) => {
+                    if built.item.presence == Presence::Unavailable {
+                        walk.migration_incomplete_paths
+                            .insert(file.relative_path.clone());
+                    }
                     if !attachments_complete {
                         incomplete_attachment_media = incomplete_attachment_media.saturating_add(1);
                     }
@@ -4833,7 +4917,13 @@ impl LibraryManager {
                         }
                     }
                 }
-                Ok(None) => continue,
+                Ok(None) => {
+                    if walk.timed_out {
+                        walk.migration_incomplete_paths
+                            .insert(file.relative_path.clone());
+                    }
+                    continue;
+                }
                 Err(error) => {
                     let metadata_status = if is_file_provider_access_error(&error) {
                         MetadataStatus::ProviderUnavailable
@@ -4841,6 +4931,8 @@ impl LibraryManager {
                         MetadataStatus::Unreadable
                     };
                     unreadable_media.insert(file.relative_path.clone(), metadata_status);
+                    walk.migration_incomplete_paths
+                        .insert(file.relative_path.clone());
                     walk.warnings.push(format!(
                         "skipped unreadable media entry {}: {error:#}",
                         file.relative_path
@@ -5176,6 +5268,20 @@ impl LibraryManager {
         }
 
         videos.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        for item in &videos {
+            if item.presence == Presence::Unavailable {
+                walk.migration_incomplete_paths
+                    .insert(item.relative_path.clone());
+            }
+        }
+        let mut incomplete_directories = walk.incomplete_directories.clone();
+        incomplete_directories.extend(walk.migration_incomplete_paths.iter().cloned());
+        let scope_unknown = walk.scope_unknown
+            || ((walk.timed_out || walk.incomplete_scan) && incomplete_directories.is_empty());
+        let complete = !walk.timed_out
+            && !walk.incomplete_scan
+            && incomplete_directories.is_empty()
+            && !scope_unknown;
         let categories = walk.root_categories.clone();
         let revision = snapshot_revision(&videos)?;
         if !self.write_index(&persisted_index, index_budget)? {
@@ -5203,7 +5309,12 @@ impl LibraryManager {
             .lock()
             .map_err(|_| anyhow!("media-library snapshot lock is poisoned"))? =
             Some(snapshot.clone());
-        Ok(snapshot)
+        Ok(MigrationScanResult {
+            snapshot,
+            complete,
+            incomplete_directories,
+            scope_unknown,
+        })
     }
 
     fn resolve_hint_paths_for_scan(
@@ -5458,11 +5569,13 @@ impl LibraryManager {
                 }
                 self.walk_directory(&child_relative, depth + 1, walk)?;
             } else if identity.is_file() {
-                if walk.files.len() >= MAX_ENTRIES {
+                if walk.files.len() >= walk.max_entries {
                     walk.incomplete_scan = true;
                     walk.incomplete_directories.insert(relative_string.clone());
-                    walk.warnings
-                        .push(format!("scan stopped at the {MAX_ENTRIES}-entry limit"));
+                    walk.warnings.push(format!(
+                        "scan stopped at the {}-entry limit",
+                        walk.max_entries
+                    ));
                     return Ok(());
                 }
                 walk.files.push(ScannedFile {
@@ -5492,6 +5605,8 @@ impl LibraryManager {
                 } else {
                     MetadataStatus::Unreadable
                 };
+                scan.migration_incomplete_paths
+                    .insert(media.relative_path.clone());
                 scan.warnings.push(format!(
                     "media unavailable at {}: {error:#}",
                     media.relative_path
@@ -5608,6 +5723,10 @@ impl LibraryManager {
                         }
                         Err(error) => {
                             sidecar_unreadable = true;
+                            if is_file_provider_access_error(&error) {
+                                scan.migration_incomplete_paths
+                                    .insert(attachment.to_string());
+                            }
                             scan.warnings
                                 .push(format!("NFO unavailable at {attachment}: {error:#}"));
                         }
@@ -5634,6 +5753,10 @@ impl LibraryManager {
                     Ok(None) => {}
                     Err(error) => {
                         sidecar_unreadable = true;
+                        if is_file_provider_access_error(&error) {
+                            scan.migration_incomplete_paths
+                                .insert(attachment.to_string());
+                        }
                         scan.warnings.push(format!(
                             "metadata sidecar unavailable at {attachment}: {error:#}"
                         ));
@@ -11813,6 +11936,28 @@ mod tests {
             index.records[&old_id].queue_metadata.title.as_deref(),
             Some("Old queue title")
         );
+
+        provider_impl.fail_next_media_read();
+        let migration_scan = manager
+            .migration_scan_with_completeness()
+            .expect("migration scan should report the replacement read failure");
+        assert!(!migration_scan.complete);
+        assert!(migration_scan.incomplete_directories.contains("clip.mp4"));
+        assert_eq!(
+            item_at(&migration_scan.snapshot, "clip.mp4").presence,
+            Presence::Unavailable
+        );
+        assert_eq!(
+            migration_scan
+                .snapshot
+                .items
+                .iter()
+                .find(|item| item.id == old_id)
+                .expect("old history should remain in the migration snapshot")
+                .presence,
+            Presence::Missing,
+            "migration completeness must not rewrite the ordinary missing-history result"
+        );
         assert!(!index.records.contains_key(&replacement.id));
     }
 
@@ -11926,6 +12071,223 @@ mod tests {
                 .all(|path| root.path().join(path).is_file()),
             "the complete media, NFO, and subtitle should all move together"
         );
+    }
+
+    #[test]
+    fn migration_scan_completeness_localizes_incomplete_directory() {
+        let root = TemporaryRoot::new("migration-scan-completeness-directory");
+        let incomplete = root.path().join("Incomplete");
+        let complete = root.path().join("Complete");
+        fs::create_dir(&incomplete).expect("incomplete fixture directory should create");
+        fs::create_dir(&complete).expect("complete fixture directory should create");
+        fs::write(incomplete.join("clip.mp4"), b"incomplete media")
+            .expect("incomplete media fixture should write");
+        fs::write(complete.join("clip.mp4"), b"complete media")
+            .expect("complete media fixture should write");
+
+        let manager = manager(&root);
+        manager
+            .scan(&[])
+            .expect("baseline scan should index both media rows");
+        manager.mark_next_scan_directory_incomplete("Incomplete");
+
+        let result = manager
+            .migration_scan_with_completeness()
+            .expect("partial scan should return a bounded completeness proof");
+
+        assert!(!result.complete);
+        assert!(!result.scope_unknown);
+        assert!(result.incomplete_directories.contains("Incomplete"));
+        assert_eq!(
+            item_at(&result.snapshot, "Incomplete/clip.mp4").presence,
+            Presence::Unavailable
+        );
+        assert_eq!(
+            item_at(&result.snapshot, "Complete/clip.mp4").presence,
+            Presence::Present,
+            "an unrelated fully enumerated subtree remains usable"
+        );
+    }
+
+    #[test]
+    fn migration_scan_completeness_localizes_entry_and_media_limits() {
+        let root = TemporaryRoot::new("migration-scan-completeness-limits");
+        let first = root.path().join("A");
+        let second = root.path().join("B");
+        fs::create_dir(&first).expect("first fixture directory should create");
+        fs::create_dir(&second).expect("second fixture directory should create");
+        fs::write(first.join("clip.mp4"), b"first media")
+            .expect("first media fixture should write");
+        fs::write(second.join("clip.mp4"), b"second media")
+            .expect("second media fixture should write");
+
+        let manager = manager(&root);
+        manager
+            .scan(&[])
+            .expect("baseline scan should index both media rows");
+
+        manager.limit_next_scan_entries_to(1);
+        let entry_limited = manager
+            .migration_scan_with_completeness()
+            .expect("entry-limited scan should return its path proof");
+        assert!(!entry_limited.complete);
+        assert!(!entry_limited.scope_unknown);
+        assert!(
+            !entry_limited.incomplete_directories.is_empty(),
+            "the directory containing entries past the lowered limit must be named"
+        );
+
+        manager
+            .scan(&[])
+            .expect("a full scan should restore the media rows before the next limit");
+        manager.limit_next_scan_media_items_to(1);
+        let media_limited = manager
+            .migration_scan_with_completeness()
+            .expect("media-limited scan should return its path proof");
+        assert!(!media_limited.complete);
+        assert!(!media_limited.scope_unknown);
+        assert!(media_limited.incomplete_directories.contains("B/clip.mp4"));
+        assert_eq!(
+            item_at(&media_limited.snapshot, "A/clip.mp4").presence,
+            Presence::Present
+        );
+        assert_eq!(
+            item_at(&media_limited.snapshot, "B/clip.mp4").presence,
+            Presence::Unavailable
+        );
+    }
+
+    #[test]
+    fn migration_scan_completeness_localizes_timeout_and_reports_unknown_scope() {
+        let root = TemporaryRoot::new("migration-scan-completeness-timeout");
+        let first = root.path().join("A");
+        let second = root.path().join("B");
+        fs::create_dir(&first).expect("first fixture directory should create");
+        fs::create_dir(&second).expect("second fixture directory should create");
+        fs::write(first.join("clip.mp4"), b"first media")
+            .expect("first media fixture should write");
+        fs::write(second.join("clip.mp4"), b"second media")
+            .expect("second media fixture should write");
+
+        let manager = manager(&root);
+        manager
+            .scan(&[])
+            .expect("baseline scan should index both media rows");
+        manager.expire_next_scan_after_built_item();
+        let timed_out = manager
+            .migration_scan_with_completeness()
+            .expect("timed-out scan should return its path proof");
+        assert!(!timed_out.complete);
+        assert!(!timed_out.scope_unknown);
+        assert!(timed_out.incomplete_directories.contains("B/clip.mp4"));
+        assert_eq!(
+            item_at(&timed_out.snapshot, "A/clip.mp4").presence,
+            Presence::Present
+        );
+        assert_eq!(
+            item_at(&timed_out.snapshot, "B/clip.mp4").presence,
+            Presence::Unavailable
+        );
+
+        manager.mark_next_scan_scope_unknown();
+        let unknown = manager
+            .migration_scan_with_completeness()
+            .expect("injected unlocalized interruption should return a proof");
+        assert!(!unknown.complete);
+        assert!(unknown.scope_unknown);
+        assert!(unknown.incomplete_directories.is_empty());
+    }
+
+    #[test]
+    fn migration_scan_completeness_blocks_provider_unavailable_paths() {
+        let root = TemporaryRoot::new("migration-scan-completeness-provider");
+        let category = root.path().join("Category");
+        fs::create_dir(&category).expect("fixture category should create");
+        let media_path = category.join("clip.mp4");
+        let nfo_path = category.join("clip.nfo");
+        fs::write(&media_path, b"fixture media").expect("media fixture should write");
+        fs::write(&nfo_path, "<movie><title>Fixture</title></movie>")
+            .expect("NFO fixture should write");
+        let provider_impl = Arc::new(FailOneMediaReadProvider::new(media_path.clone()));
+        let provider: Arc<dyn QueueFileProvider> = provider_impl.clone();
+        let manager = LibraryManager::open_with_provider(root.path(), provider)
+            .expect("library manager should open against the injected provider");
+        manager
+            .scan(&[])
+            .expect("baseline scan should index the media and sidecar");
+
+        provider_impl.fail_next_media_read();
+        let unreadable_media = manager
+            .migration_scan_with_completeness()
+            .expect("provider media failure should return a partial scan");
+        assert!(!unreadable_media.complete);
+        assert!(!unreadable_media.scope_unknown);
+        assert!(
+            unreadable_media
+                .incomplete_directories
+                .contains("Category/clip.mp4")
+        );
+        assert_eq!(
+            item_at(&unreadable_media.snapshot, "Category/clip.mp4").presence,
+            Presence::Unavailable
+        );
+
+        manager
+            .scan(&[])
+            .expect("a readable scan should restore the metadata fixture");
+        provider_impl.fail_next_media_read_at(&nfo_path);
+        let unreadable_sidecar = manager
+            .migration_scan_with_completeness()
+            .expect("provider sidecar failure should return a partial scan");
+        assert!(!unreadable_sidecar.complete);
+        assert!(
+            unreadable_sidecar
+                .incomplete_directories
+                .contains("Category/clip.nfo")
+        );
+        assert_eq!(
+            item_at(&unreadable_sidecar.snapshot, "Category/clip.mp4").presence,
+            Presence::Present,
+            "metadata access failure must not be confused with the media itself disappearing"
+        );
+
+        manager
+            .scan(&[])
+            .expect("a readable scan should restore the sidecar state");
+        provider_impl.fail_next_media_read_at(&category);
+        let unreadable_directory = manager
+            .migration_scan_with_completeness()
+            .expect("provider directory failure should return a partial scan");
+        assert!(!unreadable_directory.complete);
+        assert!(!unreadable_directory.scope_unknown);
+        assert!(
+            unreadable_directory
+                .incomplete_directories
+                .contains("Category")
+        );
+        assert_eq!(
+            item_at(&unreadable_directory.snapshot, "Category/clip.mp4").presence,
+            Presence::Unavailable
+        );
+    }
+
+    #[test]
+    fn migration_scan_completeness_does_not_require_optional_metadata() {
+        let root = TemporaryRoot::new("migration-scan-completeness-optional-metadata");
+        fs::write(root.path().join("clip.mp4"), b"fixture media")
+            .expect("media fixture should write");
+        let manager = manager(&root);
+
+        let result = manager
+            .migration_scan_with_completeness()
+            .expect("scan without optional metadata should complete");
+
+        assert!(result.complete);
+        assert!(!result.scope_unknown);
+        assert!(result.incomplete_directories.is_empty());
+        let item = item_at(&result.snapshot, "clip.mp4");
+        assert_eq!(item.presence, Presence::Present);
+        assert_eq!(item.confidence, Confidence::Low);
     }
 
     #[test]
@@ -12166,6 +12528,38 @@ mod tests {
                 .iter()
                 .any(|item| item.relative_path == "z-alias.mp4"),
             "the unbuilt tail must not be published as a confirmed media item"
+        );
+
+        manager.expire_next_scan_after_built_item();
+        let migration_scan = manager
+            .migration_scan_with_completeness()
+            .expect("migration scan should preserve timeout scope without changing presence");
+        assert!(!migration_scan.complete);
+        assert!(!migration_scan.scope_unknown);
+        assert!(
+            migration_scan
+                .incomplete_directories
+                .contains("z-alias.mp4")
+        );
+        let migration_renamed = item_at(&migration_scan.snapshot, "a-renamed.mp4");
+        assert_ne!(
+            migration_renamed.id, old_id,
+            "the unbuilt hard-link alias must still prevent old identity reuse"
+        );
+        assert_eq!(
+            migration_renamed.presence,
+            Presence::Present,
+            "the built item remains present while only the unbuilt tail is migration-incomplete"
+        );
+        assert_eq!(
+            migration_scan
+                .snapshot
+                .items
+                .iter()
+                .find(|item| item.id == old_id)
+                .expect("old identity history should remain visible")
+                .presence,
+            Presence::Unavailable
         );
     }
 

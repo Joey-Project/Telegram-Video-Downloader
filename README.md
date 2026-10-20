@@ -76,6 +76,8 @@ Per-entry Bilibili attempt state is saved in batches at that same configured int
 
 Bilibili all-episode and missing-episode jobs keep one queue item and execute episodes independently. Each successful episode is muxed, verified, and published before the next episode starts. Temporary episode errors receive at most two additional attempts; HTTP 403 retries resolve a fresh play plan using the configured resolver. Retry progress edits the existing message at the configured interval. Exhausted episode errors record the episode number, stage, error, and attempt count, then allow later episodes to proceed. Authentication, local storage, permission, and filesystem identity failures pause the group instead.
 
+Normal Bilibili video links ask whether to download one page or all pages, including links with an explicit `?p=N`. The single-page choice uses the linked page, or P1 when the link has no page selector. If the video belongs to a UGC collection, the same prompt also offers the entire collection. Direct collection links continue to ask for confirmation before downloading the collection.
+
 Live episode progress keeps the season-wide completed, already-present, failed, and remaining counts above the current episode and stage. A single episode's stream estimate is labeled separately. Merge progress does not show a download speed of zero, and internal worker logs and terminal color sequences are excluded from the progress display.
 
 Before each Bilibili episode download, the bot checks the output filesystem's available space against the selected stream sizes plus temporary mux output. It checks actual input sizes again before mux and preserves a 256 MiB margin for task state and sidecars through publication. The worker monitor stops further writes if that margin is exhausted. These checks do not reserve space, and other applications, unknown stream sizes, or quotas can still cause writes to fail. Disk-space failures pause the group and retain completed media. If the queue cannot save the paused state, the bot reports that separately and retries after space is freed; Resume appears only after the paused state is durably saved.
@@ -127,10 +129,10 @@ https://m.bilibili.com/opus/1206098216310800386?share_source=COPY
 本地重放一条 Telegram 文本、不走真实 Telegram API：
 
 ```sh
-cargo run -- --replay-message config.toml "Title https://b23.tv/..."
+cargo run -- --replay-message config.toml "https://youtu.be/..."
 ```
 
-`ss/md` 番剧系列入口需要 Telegram inline keyboard 选择，`--replay-message` 不会替你默认选择；本地重放请使用具体 `ep` 链接。
+`--replay-message` 不会模拟 Telegram 的选择按钮。Bilibili BV/AV 视频链接（包括带 `?p=N` 的链接）以及 `ss/md` 系列入口都需要在 bot 对话中完成选择；系列重放可使用具体 `ep` 链接。
 
 ## macOS 自启动
 

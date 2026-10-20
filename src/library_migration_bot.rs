@@ -3,11 +3,12 @@
 use std::sync::Mutex as StdMutex;
 
 use super::*;
+use crate::file_manager::MigrationScanResult;
 use crate::library::Presence;
 use crate::library_migration::{
     MigrationControl, MigrationDeliveryState, MigrationEngine, MigrationPreview, MigrationRequest,
     MigrationRunStatus, MigrationRuntimeContext, MigrationScope, MigrationStatus,
-    MigrationTaskImpact,
+    MigrationTaskImpact, validate_migration_scan_paths,
 };
 use crate::media_libraries::TaskDestination;
 use serde::Deserialize;
@@ -143,13 +144,50 @@ pub(super) fn ensure_library_removable(runtime: &CloudBotRuntime, library_id: &s
     Ok(())
 }
 
-fn item_ids_for_task(snapshot: &LibrarySnapshot, task: &TaskRecord, root: &Path) -> Vec<String> {
+fn task_published_relative_paths(task: &TaskRecord, root: &Path) -> Vec<String> {
     let mut paths = published_primary_relative_paths(task, root);
     if let Some(attempt) = task.bilibili_attempt.as_ref() {
         for entry in &attempt.entries {
             paths.extend(published_entry_primary_relative_paths(entry, root));
         }
     }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn validate_task_scan_scope(
+    scan: &MigrationScanResult,
+    scope: &MigrationScope,
+    task: &TaskRecord,
+    root: &Path,
+) -> Result<()> {
+    let paths = task_published_relative_paths(task, root);
+    validate_migration_scan_paths(scan, scope, paths.iter().map(String::as_str))
+}
+
+fn validate_task_transfer_scan_scope(
+    scan: &MigrationScanResult,
+    scope: &MigrationScope,
+    plan: &crate::media_libraries::TaskTransferPlan,
+) -> Result<()> {
+    let paths = plan
+        .published_path_rewrites
+        .keys()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&plan.source_root)
+                .context("published task path is outside its frozen source root")?;
+            relative
+                .to_str()
+                .context("published task path is not valid UTF-8")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_migration_scan_paths(scan, scope, paths)
+}
+
+fn item_ids_for_task(snapshot: &LibrarySnapshot, task: &TaskRecord, root: &Path) -> Vec<String> {
+    let paths = task_published_relative_paths(task, root);
     snapshot
         .items
         .iter()
@@ -197,7 +235,9 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
     };
     let source = manager(runtime, &payload.source_library_id)?;
     let target = manager(runtime, &payload.target_library_id)?;
-    let snapshot = source.migration_scan()?;
+    let scan = source.migration_scan_with_completeness()?;
+    validate_migration_scan_paths(&scan, &payload.scope, std::iter::empty())?;
+    let snapshot = &scan.snapshot;
     let tasks = runtime
         .bot
         .queue
@@ -206,12 +246,14 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
     let mut impacts = Vec::new();
     let mut expanded = false;
     for task in tasks {
-        let published = item_ids_for_task(&snapshot, &task.record, &task.destination.root);
+        let paths = task_published_relative_paths(&task.record, &task.destination.root);
+        let published = item_ids_for_task(snapshot, &task.record, &task.destination.root);
         let affected = payload.scope == MigrationScope::Library
             || published.iter().any(|id| selected.contains(id));
         if !affected {
             continue;
         }
+        validate_migration_scan_paths(&scan, &payload.scope, paths.iter().map(String::as_str))?;
         if task.record.destination_transfer.is_some()
             || task.record.destination_transfer_ack.is_some()
         {
@@ -1079,8 +1121,8 @@ async fn prepare_task_transfers(
     let worker = runtime.clone();
     let source = status.source_library_id.clone();
     let target_id = status.target_library_id.clone();
-    let (snapshot, tasks, target) = tokio::task::spawn_blocking(move || {
-        let snapshot = manager(&worker, &source)?.migration_scan()?;
+    let (scan, tasks, target) = tokio::task::spawn_blocking(move || {
+        let scan = manager(&worker, &source)?.migration_scan_with_completeness()?;
         let tasks = worker
             .bot
             .queue
@@ -1093,9 +1135,16 @@ async fn prepare_task_transfers(
             .into_iter()
             .find(|library| library.id == target_id)
             .context("target library is no longer registered")?;
-        Ok::<_, anyhow::Error>((snapshot, tasks, target))
+        Ok::<_, anyhow::Error>((scan, tasks, target))
     })
     .await??;
+    validate_migration_scan_paths(&scan, &status.scope, std::iter::empty())?;
+    let approved_paths = status
+        .items
+        .iter()
+        .flat_map(|item| item.files.iter().map(|file| file.source_path.as_str()));
+    validate_migration_scan_paths(&scan, &status.scope, approved_paths)?;
+    let snapshot = &scan.snapshot;
     let approved: HashSet<_> = status
         .items
         .iter()
@@ -1120,6 +1169,7 @@ async fn prepare_task_transfers(
             if cleanup_completed.contains(plan.transfer.transfer_id.as_str()) {
                 continue;
             }
+            validate_task_transfer_scan_scope(&scan, &status.scope, plan)?;
             let queue = Arc::clone(&runtime.bot.queue);
             let plan = plan.clone();
             let acknowledged = acknowledged.contains(plan.transfer.transfer_id.as_str());
@@ -1165,11 +1215,12 @@ async fn prepare_task_transfers(
             .iter()
             .find(|task| task.record.id == impact.task_id)
             .context("an unfinished task changed or completed; create a fresh migration preview")?;
+        validate_task_scan_scope(&scan, &status.scope, &task.record, &task.destination.root)?;
         if task.record.destination_transfer.is_none() && task.record.generation != impact.generation
         {
             bail!("unfinished task generation changed; create a fresh migration preview");
         }
-        let current_ids = item_ids_for_task(&snapshot, &task.record, &task.destination.root);
+        let current_ids = item_ids_for_task(snapshot, &task.record, &task.destination.root);
         if current_ids.iter().any(|id| !approved.contains(id.as_str())) {
             bail!(
                 "an unfinished task published media outside the approved preview; create a fresh preview"
@@ -1224,14 +1275,20 @@ async fn attach_task_plans(
     let attached = task_plans(engine, &status.id).await?;
     let worker = runtime.clone();
     let source_id = status.source_library_id.clone();
-    let snapshot = tokio::task::spawn_blocking(move || {
+    let scan = tokio::task::spawn_blocking(move || {
         let source = manager(&worker, &source_id)?;
         let lease = output_lease
             .lock()
             .map_err(|_| anyhow::anyhow!("migration output lease is poisoned"))?;
-        source.migration_scan_with_output_lease(&lease)
+        source.migration_scan_with_output_lease_and_completeness(&lease)
     })
     .await??;
+    let plan_paths = status
+        .items
+        .iter()
+        .flat_map(|item| item.files.iter().map(|file| file.source_path.as_str()));
+    validate_migration_scan_paths(&scan, &status.scope, plan_paths)?;
+    let snapshot = &scan.snapshot;
     let approved = status
         .items
         .iter()
@@ -1265,15 +1322,18 @@ async fn attach_task_plans(
         .root
         .clone();
     for impact in impacts {
-        if attached
+        if let Some(plan) = attached
             .iter()
-            .any(|plan| plan.transfer.task_id == impact.task_id)
+            .find(|plan| plan.transfer.task_id == impact.task_id)
         {
+            validate_task_transfer_scan_scope(&scan, &status.scope, plan)?;
             continue;
         }
         let queue = Arc::clone(&runtime.bot.queue);
         let id = impact.task_id.clone();
-        let snapshot = snapshot.clone();
+        let snapshot = scan.snapshot.clone();
+        let scan = scan.clone();
+        let scope = status.scope.clone();
         let approved = approved.clone();
         let source = source_root.clone();
         let rewrites = status
@@ -1292,6 +1352,7 @@ async fn attach_task_plans(
             let task = queue
                 .get(&id)?
                 .context("task disappeared while migration was acquiring output leases")?;
+            validate_task_scan_scope(&scan, &scope, &task, &source)?;
             if item_ids_for_task(&snapshot, &task, &source)
                 .iter()
                 .any(|id| !approved.contains(id))
@@ -1870,4 +1931,102 @@ async fn mark_task_handoff_migration_attention(
         worker.mark_task_handoff_migration_attention(&migration_id, &message)
     })
     .await?
+}
+
+#[cfg(test)]
+mod completeness_tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    fn scan(complete: bool, incomplete: &[&str], scope_unknown: bool) -> MigrationScanResult {
+        MigrationScanResult {
+            snapshot: LibrarySnapshot {
+                revision: "revision".to_string(),
+                scanned_at: 0,
+                root_label: "source".to_string(),
+                items: Vec::new(),
+                categories: Vec::new(),
+                warnings: Vec::new(),
+            },
+            complete,
+            incomplete_directories: incomplete
+                .iter()
+                .map(|path| (*path).to_string())
+                .collect::<BTreeSet<_>>(),
+            scope_unknown,
+        }
+    }
+
+    fn task_with_published_path(path: &str) -> TaskRecord {
+        let mut task = TaskRecord::new(
+            "task-1".to_string(),
+            1,
+            1,
+            42,
+            None,
+            0,
+            JobRequest::Youtube {
+                url: "https://youtu.be/fixture".to_string(),
+            },
+        );
+        task.primary_media_hashes
+            .insert(path.to_string(), "fixture-hash".to_string());
+        task
+    }
+
+    #[test]
+    fn migration_bot_task_scan_rejects_published_paths_in_incomplete_subtrees() {
+        let task = task_with_published_path("Selected/clip.mp4");
+        let scan = scan(false, &["Selected"], false);
+
+        let error = validate_task_scan_scope(
+            &scan,
+            &MigrationScope::Selected,
+            &task,
+            Path::new("/source"),
+        )
+        .expect_err("a published task path inside an incomplete subtree must fail closed");
+        assert!(error.to_string().contains("incomplete source directory"));
+    }
+
+    #[test]
+    fn migration_bot_task_scan_allows_unrelated_incomplete_subtrees_by_component() {
+        let task = task_with_published_path("Selected-archive/clip.mp4");
+        let scan = scan(false, &["Selected"], false);
+
+        validate_task_scan_scope(
+            &scan,
+            &MigrationScope::Selected,
+            &task,
+            Path::new("/source"),
+        )
+        .expect("an incomplete sibling path must not overlap by string prefix");
+    }
+
+    #[test]
+    fn migration_bot_task_scan_requires_complete_library_and_known_selected_scope() {
+        let task = task_with_published_path("Selected/clip.mp4");
+        let localized = scan(false, &["Unrelated"], false);
+        assert!(
+            validate_task_scan_scope(
+                &localized,
+                &MigrationScope::Library,
+                &task,
+                Path::new("/source"),
+            )
+            .is_err()
+        );
+
+        let unknown = scan(false, &[], true);
+        assert!(
+            validate_task_scan_scope(
+                &unknown,
+                &MigrationScope::Selected,
+                &task,
+                Path::new("/source"),
+            )
+            .is_err()
+        );
+    }
 }

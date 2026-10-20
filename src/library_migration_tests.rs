@@ -451,7 +451,7 @@ fn uncheckpointed_orphan_stage_is_preserved_and_retried_at_a_fresh_name() {
 }
 
 #[test]
-fn refreshing_preview_durably_supersedes_the_old_revision() {
+fn refreshing_preview_writes_candidate_before_supersession_and_recovers_after_restart() {
     let source_root = TestRoot::new("superseded-preview-source");
     let target_root = TestRoot::new("superseded-preview-target");
     let source_path = source_root.path().join("clip.mp4");
@@ -497,37 +497,122 @@ fn refreshing_preview_durably_supersedes_the_old_revision() {
         .preview(&request)
         .expect("first preview should be created");
 
-    let mut invalid_refresh = request.clone();
-    invalid_refresh.item_ids = vec!["missing-item".to_string()];
+    let old_snapshot = engine
+        .source
+        .migration_read_state_snapshot(&preview_state_name(&old.id), MAX_STATE_BYTES)
+        .expect("old preview snapshot should read")
+        .expect("old preview should remain persisted");
+    let old_document: PreviewDocument = decode_state(&old_snapshot.contents, "migration preview")
+        .expect("old preview should decode");
+    let refresh_identity = engine
+        .preview_refresh_identity(
+            &request,
+            &old_document.source,
+            &old_document.target,
+            &old.id,
+            &old.revision,
+            &old_snapshot.proof.sha256,
+        )
+        .expect("refresh identity should be deterministic");
+
+    engine.set_test_preview_refresh_fault(PreviewRefreshFault::BeforeCandidateWrite);
     assert!(
         engine
-            .preview_replacing(&invalid_refresh, &old.id, &old.revision)
+            .preview_replacing(&request, &old.id, &old.revision)
             .is_err()
     );
-    let mut old_document: PreviewDocument = decode_state(
-        &engine
-            .source
-            .migration_read_state(&preview_state_name(&old.id), MAX_STATE_BYTES)
-            .expect("old preview should remain readable")
-            .expect("old preview should remain persisted"),
-        "migration preview",
-    )
-    .expect("old preview should decode");
-    old_document.superseded_by = Some("missing-refresh-document".to_string());
-    engine
+    let after_write_failure = engine
         .source
-        .migration_write_state(
-            &preview_state_name(&old.id),
-            &encode_state(&old_document).unwrap(),
+        .migration_read_state_snapshot(&preview_state_name(&old.id), MAX_STATE_BYTES)
+        .expect("old preview should remain readable after candidate write failure")
+        .expect("old preview should remain persisted after candidate write failure");
+    assert_eq!(after_write_failure.proof.sha256, old_snapshot.proof.sha256);
+    assert!(
+        engine
+            .source
+            .migration_read_state(
+                &preview_state_name(&refresh_identity.candidate_id),
+                MAX_STATE_BYTES
+            )
+            .expect("candidate lookup should succeed")
+            .is_none()
+    );
+    assert_eq!(
+        preview_confirmability_for_inbox_key(&engine.source, &old.id, &old.revision),
+        MigrationPreviewConfirmability::Confirmable,
+        "a failed new-preview write must leave the prior preview confirmable"
+    );
+
+    engine.set_test_preview_refresh_fault(PreviewRefreshFault::AfterCandidateWrite);
+    assert!(
+        engine
+            .preview_replacing(&request, &old.id, &old.revision)
+            .is_err()
+    );
+    let old_after_candidate = engine
+        .source
+        .migration_read_state_snapshot(&preview_state_name(&old.id), MAX_STATE_BYTES)
+        .expect("old preview should remain readable after candidate checkpoint")
+        .expect("old preview should remain persisted after candidate checkpoint");
+    assert_eq!(old_after_candidate.proof.sha256, old_snapshot.proof.sha256);
+    let candidate_before_restart = engine
+        .source
+        .migration_read_state_snapshot(
+            &preview_state_name(&refresh_identity.candidate_id),
+            MAX_STATE_BYTES,
         )
-        .expect("simulated crash tombstone should persist");
+        .expect("candidate snapshot should read after simulated interruption")
+        .expect("candidate should have been written before interruption");
+    assert_eq!(
+        preview_confirmability_for_inbox_key(
+            &engine.source,
+            &refresh_identity.candidate_id,
+            PREVIEW_REVISION,
+        ),
+        MigrationPreviewConfirmability::DefinitelyUnconfirmable,
+        "a candidate cannot be confirmed until its old-preview tombstone is durable"
+    );
+
+    drop(engine);
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should reopen after simulated restart"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should reopen after simulated restart"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should reopen after simulated restart");
     let refreshed = engine
         .preview_replacing(&request, &old.id, &old.revision)
-        .expect("a retry should recover from a tombstone whose new document was not saved");
-    assert_ne!(refreshed.id, old.id);
+        .expect("retry should finish the candidate-first supersession after restart");
+    assert_eq!(refreshed.id, refresh_identity.candidate_id);
+    let candidate_after_replay = engine
+        .source
+        .migration_read_state_snapshot(
+            &preview_state_name(&refresh_identity.candidate_id),
+            MAX_STATE_BYTES,
+        )
+        .expect("replayed candidate snapshot should read")
+        .expect("replayed candidate should remain persisted");
+    assert_eq!(
+        candidate_after_replay.contents,
+        candidate_before_restart.contents
+    );
+    assert_ne!(
+        candidate_after_replay.proof.inode, candidate_before_restart.proof.inode,
+        "replay should atomically re-persist the exact candidate before tombstoning its parent"
+    );
     let replayed = engine
         .preview_replacing(&request, &old.id, &old.revision)
-        .expect("an inbox replay should reuse the exact persisted refresh receipt");
+        .expect("an inbox replay should reuse the exact durable refresh receipt");
     assert_eq!(replayed.id, refreshed.id);
     let compacted: PreviewDocument = decode_state(
         &engine
@@ -543,6 +628,18 @@ fn refreshing_preview_durably_supersedes_the_old_revision() {
         compacted.superseded_by.as_deref(),
         Some(refreshed.id.as_str())
     );
+    assert_eq!(
+        compacted.superseded_preview_sha256.as_deref(),
+        Some(old_snapshot.proof.sha256.as_str())
+    );
+    assert_eq!(
+        preview_confirmability_for_inbox_key(&engine.source, &old.id, &old.revision),
+        MigrationPreviewConfirmability::DefinitelyUnconfirmable
+    );
+    assert_eq!(
+        preview_confirmability_for_inbox_key(&engine.source, &refreshed.id, &refreshed.revision,),
+        MigrationPreviewConfirmability::Confirmable
+    );
     let stale = engine
         .confirm(&old.id, &old.revision)
         .expect_err("the superseded preview must no longer confirm");
@@ -554,6 +651,269 @@ fn refreshing_preview_durably_supersedes_the_old_revision() {
             .status,
         MigrationRunStatus::Queued
     );
+}
+
+#[test]
+fn migration_preview_applies_scan_completeness_to_the_requested_scope() {
+    let source_root = TestRoot::new("scan-completeness-preview-source");
+    let target_root = TestRoot::new("scan-completeness-preview-target");
+    for directory in ["A", "AB", "B"] {
+        fs::create_dir(source_root.path().join(directory)).expect("source category should create");
+        fs::write(
+            source_root.path().join(directory).join("clip.mp4"),
+            MEDIA_BYTES,
+        )
+        .expect("synthetic media should write");
+    }
+    fs::write(
+        source_root.path().join("AB").join("clip.nfo"),
+        "<movie><title>Fixture</title></movie>",
+    )
+    .expect("synthetic sidecar should write");
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let baseline = engine
+        .source
+        .migration_scan_with_completeness()
+        .expect("baseline source scan should complete");
+    let item_id = |path: &str| {
+        baseline
+            .snapshot
+            .items
+            .iter()
+            .find(|item| item.relative_path == path && item.presence == Presence::Present)
+            .expect("fixture media should be indexed")
+            .id
+            .clone()
+    };
+    let selected_request = |id: String| MigrationRequest {
+        scope: MigrationScope::Selected,
+        item_ids: vec![id],
+        conflict: ConflictPolicy::Skip,
+        item_conflicts: BTreeMap::new(),
+        include_incomplete_tasks: false,
+        set_target_default_on_success: false,
+        task_impacts: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    // A known incomplete sibling directory must not be confused with a path that merely shares
+    // its textual prefix. The selected bundle includes both the video and its sidecar.
+    engine.source.mark_next_scan_directory_incomplete("A");
+    let selected_sibling = engine
+        .preview(&selected_request(item_id("AB/clip.mp4")))
+        .expect("a complete selected bundle outside the incomplete sibling should preview");
+    assert_eq!(selected_sibling.item_count, 1);
+    assert_eq!(selected_sibling.file_count, 2);
+
+    engine.source.mark_next_scan_directory_incomplete("AB");
+    let incomplete_bundle = engine
+        .source
+        .migration_scan_with_completeness()
+        .expect("injected incomplete bundle scan should return its scope proof");
+    assert!(
+        validate_migration_scan_paths(
+            &incomplete_bundle,
+            &MigrationScope::Selected,
+            ["AB/clip.mp4", "AB/clip.nfo"],
+        )
+        .is_err()
+    );
+    assert!(
+        validate_migration_scan_paths(
+            &incomplete_bundle,
+            &MigrationScope::Selected,
+            ["ABad/clip.mp4"],
+        )
+        .is_ok(),
+        "directory checks must compare path components, not string prefixes"
+    );
+
+    engine.source.mark_next_scan_directory_incomplete("AB");
+    assert!(
+        engine
+            .preview(&selected_request(item_id("AB/clip.mp4")))
+            .is_err(),
+        "a selected bundle in an incomplete directory must be refused"
+    );
+
+    engine.source.mark_next_scan_scope_unknown();
+    let unknown_scope = engine
+        .preview(&selected_request(item_id("A/clip.mp4")))
+        .expect_err("a selected preview must fail when scan truncation has unknown scope");
+    assert!(
+        unknown_scope
+            .to_string()
+            .contains("source scan scope is incomplete")
+    );
+
+    engine.source.mark_next_scan_directory_incomplete("B");
+    let whole_library = engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Library,
+            item_ids: Vec::new(),
+            conflict: ConflictPolicy::Skip,
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect_err("whole-library preview must reject a partial source scan");
+    assert!(whole_library.to_string().contains("complete source scan"));
+}
+
+#[test]
+fn whole_library_execution_revalidates_scan_completeness_before_copy() {
+    let source_root = TestRoot::new("scan-completeness-execution-source");
+    let target_root = TestRoot::new("scan-completeness-execution-target");
+    for directory in ["A", "B"] {
+        fs::create_dir(source_root.path().join(directory)).expect("source category should create");
+        fs::write(
+            source_root.path().join(directory).join("clip.mp4"),
+            MEDIA_BYTES,
+        )
+        .expect("synthetic media should write");
+    }
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let preview = engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Library,
+            item_ids: Vec::new(),
+            conflict: ConflictPolicy::Skip,
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("complete library should preview");
+    let status = engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("complete preview should confirm");
+    engine.source.mark_next_scan_directory_incomplete("B");
+    let error = engine
+        .step(&status.id)
+        .expect_err("execution must revalidate whole-library completeness");
+    assert!(error.to_string().contains("complete source scan"));
+
+    let job = engine
+        .load_job(&status.id)
+        .expect("job should remain durable");
+    assert!(!job.execution_revalidated);
+    assert_eq!(job.status, MigrationRunStatus::Queued);
+    assert!(
+        job.groups
+            .iter()
+            .all(|group| group.status == MigrationItemPhase::Copying)
+    );
+    assert!(source_root.path().join("A/clip.mp4").exists());
+    assert!(source_root.path().join("B/clip.mp4").exists());
+    assert!(!target_root.path().join("A/clip.mp4").exists());
+    assert!(!target_root.path().join("B/clip.mp4").exists());
+}
+
+#[test]
+fn selected_execution_revalidates_the_entire_bundle_directory_before_copy() {
+    let source_root = TestRoot::new("scan-completeness-selected-source");
+    let target_root = TestRoot::new("scan-completeness-selected-target");
+    let category = source_root.path().join("Category");
+    fs::create_dir(&category).expect("source category should create");
+    fs::write(category.join("clip.mp4"), MEDIA_BYTES).expect("synthetic media should write");
+    fs::write(
+        category.join("clip.nfo"),
+        "<movie><title>Fixture</title></movie>",
+    )
+    .expect("synthetic sidecar should write");
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let baseline = engine
+        .source
+        .migration_scan_with_completeness()
+        .expect("baseline source scan should complete");
+    let item_id = baseline
+        .snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "Category/clip.mp4")
+        .expect("selected video should be indexed")
+        .id
+        .clone();
+    let preview = engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Selected,
+            item_ids: vec![item_id],
+            conflict: ConflictPolicy::Skip,
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("selected bundle should preview from a complete scan");
+    let status = engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("selected preview should confirm");
+    engine
+        .source
+        .mark_next_scan_directory_incomplete("Category");
+    let error = engine
+        .step(&status.id)
+        .expect_err("selected execution must reject an incomplete bundle directory");
+    assert!(error.to_string().contains("incomplete source directory"));
+
+    let job = engine
+        .load_job(&status.id)
+        .expect("job should remain durable");
+    assert!(!job.execution_revalidated);
+    assert_eq!(job.status, MigrationRunStatus::Queued);
+    assert!(category.join("clip.mp4").exists());
+    assert!(category.join("clip.nfo").exists());
+    assert!(!target_root.path().join("Category/clip.mp4").exists());
+    assert!(!target_root.path().join("Category/clip.nfo").exists());
 }
 
 #[test]

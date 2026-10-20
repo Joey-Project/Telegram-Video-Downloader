@@ -102,13 +102,13 @@ superseded_by: ""
 | 范围 | 最终结果 |
 | --- | --- |
 | Rust 1.99.1 格式及差异空白检查 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
-| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,158 通过、0 失败、16 个既有忽略项 |
+| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,176 通过、0 失败、16 个既有忽略项 |
 | Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline --bin telegram-video-downloader` 通过 |
 | Cloud / Node 25.8.2 | 类型检查通过；139 项测试通过；Wrangler 4.149.0 dry-run 通过，43 个静态资源 |
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
-- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review7/`；后者记录根目录替换拒绝、同一根恢复及动态空闲空间的完整快照比较。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
-- 最新 Rust 验证日志为 `mls01-review7/full-all-targets-final.log`、`clippy-all-targets-final.log` 和 `build-bot-final.log`。
+- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review8/`；后者记录 17 项定向回归、根目录入队复验、离线恢复、预览持久化顺序及扫描完整性检查。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
+- 最新 Rust 验证日志为 `mls01-review8/full-review8-final3.log`、`clippy-review8-final3.log` 和 `build-review8-final3.log`。
   Cloud 的最终测试、类型检查和 dry-run 日志分别为同目录下的 `cloud-npm-test.log`、
   `cloud-typecheck.log` 和 `cloud-build-dry-run.log`。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
@@ -145,6 +145,31 @@ superseded_by: ""
 - A failed library scan retains its cached snapshot and marks only that library unavailable.
   Data-changing controls remain read-only until a successful refresh, while scanning and library
   switching remain available. Preview validation errors do not mark a library offline.
+- Migration scans now return an internal completeness proof without changing the public snapshot.
+  Whole-library previews require a complete bounded scan; selected bundles are rejected only when
+  their media or attachment paths intersect a known incomplete directory or unreadable path, or
+  when the scan cannot localize its scope. Provider-unavailable reads, entry/media limits, and the time budget are
+  incomplete; missing optional metadata and low-confidence metadata are not. Scanner regressions:
+  `migration_scan_completeness_localizes_incomplete_directory`,
+  `migration_scan_completeness_localizes_entry_and_media_limits`,
+  `migration_scan_completeness_localizes_timeout_and_reports_unknown_scope`,
+  `migration_scan_completeness_blocks_provider_unavailable_paths`, and
+  `migration_scan_completeness_does_not_require_optional_metadata`.
+- Migration completeness keeps separate path markers so root-level unreadable files and unbuilt
+  timeout tails do not alter public Presence, missing-history, hardlink or rename reconciliation.
+  Existing replacement and hardlink-tail regressions retain their original snapshot assertions and
+  also verify the exact migration blockers.
+- Migration task membership and post-confirm scope expansion also use the same completeness proof.
+  Whole-library task moves require complete scans; selected moves reject affected published paths
+  within incomplete directories while allowing component-distinct unaffected subtrees.
+- Enqueue revalidates the selected library root identity before queue state is written. A newly
+  connected independent queue store remains unavailable until startup recovery finishes and its
+  root identity is verified.
+- Conflict refresh writes the replacement preview durably before superseding the prior revision;
+  restart replay preserves that order and keeps the old confirmation stale.
+- The current master's Bilibili page-selection flow keeps the task-specific download context.
+  `bilibili_page_choice_keeps_frozen_destination_after_default_switch` verifies that selection and
+  queue reopening preserve the original library root and category after changing the default.
 - `cloud_snapshot_projects_video_library_ids_and_authorized_incomplete_counts` exercises the
   production snapshot builder with legacy, failed, PDF, malformed-staging, and unauthorized-chat
   records; `failed_non_default_library_open_keeps_cache_unavailable_until_scoped_recovery`

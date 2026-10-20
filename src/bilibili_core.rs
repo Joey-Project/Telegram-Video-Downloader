@@ -7,13 +7,13 @@ use bbdown_core::{
     AccessKeyLoginConfig, AccessKeyLoginCredentials, AccessKeyLoginTicket, BiliClient,
     ClientConfig, CredentialHealthReport, CredentialProfileSelection, CredentialSource,
     CredentialStore, Credentials, DanmakuFormat, DownloadMode, DownloadOptions, EndpointConfig,
-    MediaHostOptions, MuxOptions, PlayurlMode, RestrictedArea, RestrictedAreaConfig,
+    Input, MediaHostOptions, MuxOptions, PlayurlMode, RestrictedArea, RestrictedAreaConfig,
     RestrictedAreaProxy, RestrictedAreaProxyKind, RetryPolicy, Selection, StreamSelection,
     UgcCollectionKind, UgcCollectionReference,
 };
 
 use crate::config::AppConfig;
-use crate::router::{BilibiliSelection, bilibili_bvid_from_url};
+use crate::router::BilibiliSelection;
 use reqwest::redirect::Policy;
 use url::Url;
 
@@ -167,10 +167,20 @@ pub async fn resolve_video_collection_membership(
     config: &AppConfig,
     raw_url: &str,
 ) -> Result<Option<UgcCollectionReference>> {
-    let Some(bvid) = bilibili_bvid_from_url(raw_url) else {
-        return Ok(None);
-    };
     let client = client(config)?;
+    let bvid = match Input::parse(raw_url) {
+        Ok(Input::Bvid(bvid)) => bvid,
+        Ok(Input::Aid(_)) => match client
+            .resolve_input(raw_url, Some(Selection::Current))
+            .await?
+        {
+            bbdown_core::ResolvedContent::Video(video) => video
+                .bvid
+                .context("Bilibili video metadata did not include its BV ID")?,
+            _ => bail!("Bilibili aid did not resolve to a video"),
+        },
+        _ => return Ok(None),
+    };
     client
         .resolve_video_collection_membership(&bvid)
         .await
@@ -1069,6 +1079,86 @@ mod tests {
             request
                 .to_ascii_lowercase()
                 .contains("cookie: sessdata=membership-test")
+        );
+        let _ = std::fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collection_membership_resolves_legacy_aid_to_bvid() -> anyhow::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let directory = std::env::temp_dir().join(format!(
+            "telegram-video-downloader-membership-aid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("test client should connect");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .await
+                        .expect("test request should be readable");
+                    assert_ne!(read, 0, "test request must include HTTP headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(request).expect("request should be UTF-8");
+                let body = if request.starts_with("GET /x/tag/archive/tags?") {
+                    r#"{"code":0,"data":[]}"#
+                } else {
+                    r#"{"code":0,"data":{"aid":170001,"bvid":"BV1aid","title":"Aid test","owner":{"mid":210798,"name":"Satori"},"pages":[{"page":1,"cid":9988,"part":"P1"}],"ugc_season":{"id":167822,"title":"Piano collection","cover":"https://example.invalid/season.jpg","mid":210798,"intro":"Test collection","ep_count":37,"season_type":1}}}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("test response should be writable");
+                requests.push(request.lines().next().unwrap_or_default().to_string());
+            }
+            requests
+        });
+
+        let mut config = crate::config::AppConfig::for_test();
+        config.bilibili.auth.credential_file = directory.join("credentials.json");
+        config.bilibili.global_args = vec![format!("--api-base=http://{address}")];
+
+        let membership =
+            resolve_video_collection_membership(&config, "https://www.bilibili.com/video/av170001")
+                .await?
+                .expect("aid response should describe a collection");
+        let requests = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("test client should finish")
+            .expect("test server should not panic");
+
+        assert_eq!(membership.id, 167_822);
+        assert!(requests.iter().any(|line| line.contains("view?aid=170001")));
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.starts_with("GET /x/tag/archive/tags?"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|line| line.contains("view?bvid=BV1aid"))
         );
         let _ = std::fs::remove_dir_all(directory);
         Ok(())

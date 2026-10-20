@@ -12,10 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::file_manager::{
     LibraryManager, MigrationPlanOutcome, MigrationPlannedFile, MigrationPlannedGroup,
-    MigrationStateFileProof,
+    MigrationScanResult, MigrationStateFileProof,
 };
 use crate::library::{ConflictPolicy, LibrarySnapshot, Presence};
 use crate::media_libraries::{
@@ -304,9 +305,11 @@ pub(crate) struct MigrationEngine {
     source: Arc<LibraryManager>,
     target_library_id: String,
     target: Arc<LibraryManager>,
+    #[cfg(test)]
+    test_preview_refresh_fault: Arc<Mutex<Option<PreviewRefreshFault>>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct RootBinding {
     library_id: String,
     root: PathBuf,
@@ -341,6 +344,41 @@ struct PreviewDocument {
     plan: Vec<MigrationPlannedGroup>,
     #[serde(default)]
     superseded_by: Option<String>,
+    #[serde(default)]
+    superseded_preview_sha256: Option<String>,
+    #[serde(default)]
+    supersedes: Option<PreviewSupersession>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PreviewSupersession {
+    old_preview_id: String,
+    old_revision: String,
+    old_preview_sha256: String,
+    identity_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct PreviewRefreshIdentity {
+    candidate_id: String,
+    supersession: PreviewSupersession,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreviewRefreshFault {
+    BeforeCandidateWrite,
+    AfterCandidateWrite,
+}
+
+#[derive(Serialize)]
+struct PreviewRefreshHashInput<'a> {
+    format_version: u32,
+    source: &'a RootBinding,
+    target: &'a RootBinding,
+    old_preview_id: &'a str,
+    old_revision: &'a str,
+    old_preview_sha256: &'a str,
+    request: &'a MigrationRequest,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -351,6 +389,8 @@ struct JobDocument {
     target: RootBinding,
     preview: MigrationPreview,
     request: MigrationRequest,
+    #[serde(default)]
+    confirmed_preview_supersession: Option<PreviewSupersession>,
     status: MigrationRunStatus,
     #[serde(default)]
     stop_remaining_latched: bool,
@@ -521,6 +561,8 @@ impl MigrationEngine {
             source,
             target_library_id,
             target,
+            #[cfg(test)]
+            test_preview_refresh_fault: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -544,8 +586,20 @@ impl MigrationEngine {
         supersedes: Option<(&str, &str)>,
     ) -> Result<MigrationPreview> {
         validate_request(request)?;
-        let snapshot = self.source.migration_scan()?;
-        let item_ids = selected_item_ids(request, &snapshot)?;
+        let refresh = supersedes
+            .map(|(old_preview_id, old_revision)| {
+                self.prepare_preview_refresh(request, old_preview_id, old_revision)
+            })
+            .transpose()?;
+        if let Some((identity, Some(existing))) = refresh.as_ref() {
+            let _ = identity;
+            return Ok(existing.clone());
+        }
+
+        let scan = self.source.migration_scan_with_completeness()?;
+        validate_migration_scan_scope(request, &scan, None)?;
+        let snapshot = &scan.snapshot;
+        let item_ids = selected_item_ids(request, snapshot)?;
         let selected = item_ids.iter().map(String::as_str).collect::<HashSet<_>>();
         if request
             .item_conflicts
@@ -559,13 +613,21 @@ impl MigrationEngine {
         } else {
             self.source.plan_migration_groups(
                 &self.target,
-                &snapshot,
+                snapshot,
                 &item_ids,
                 request.conflict,
                 &request.item_conflicts,
             )?
         };
+        validate_migration_scan_scope(request, &scan, Some(&plan))?;
         let (preview, plan) = self.make_preview(request, item_ids, plan)?;
+        let mut preview = preview;
+        let supersession = refresh
+            .as_ref()
+            .map(|(identity, _)| identity.supersession.clone());
+        if let Some((identity, _)) = refresh.as_ref() {
+            preview.id = identity.candidate_id.clone();
+        }
         let document = PreviewDocument {
             format_version: 1,
             created_at: unix_seconds(),
@@ -575,16 +637,156 @@ impl MigrationEngine {
             preview: preview.clone(),
             plan,
             superseded_by: None,
+            superseded_preview_sha256: None,
+            supersedes: supersession,
         };
-        self.persist_preview_document(document, supersedes)
+        self.persist_preview_document(document, refresh.as_ref().map(|(identity, _)| identity))
+    }
+
+    fn prepare_preview_refresh(
+        &self,
+        request: &MigrationRequest,
+        old_preview_id: &str,
+        old_revision: &str,
+    ) -> Result<(PreviewRefreshIdentity, Option<MigrationPreview>)> {
+        let _state_lock = self.source.migration_state_lock()?;
+        if self
+            .source
+            .migration_read_state(&job_state_name(old_preview_id), MAX_STATE_BYTES)?
+            .is_some()
+        {
+            bail!("a confirmed migration cannot be superseded");
+        }
+        let old_snapshot = self
+            .source
+            .migration_read_state_snapshot(&preview_state_name(old_preview_id), MAX_STATE_BYTES)?
+            .ok_or_else(|| anyhow!("the migration preview being refreshed is unavailable"))?;
+        let old: PreviewDocument = decode_state(&old_snapshot.contents, "migration preview")?;
+        if old.preview.id != old_preview_id || old.preview.revision != old_revision {
+            bail!("the migration preview being refreshed no longer matches its revision");
+        }
+        self.validate_preview_bindings(&old)?;
+        if old.created_at.saturating_add(PREVIEW_RETENTION_SECONDS) < unix_seconds() {
+            bail!("the migration preview being refreshed has expired");
+        }
+
+        let old_preview_sha256 = match old.superseded_by.as_deref() {
+            Some(_) => old
+                .superseded_preview_sha256
+                .clone()
+                .ok_or_else(|| anyhow!("the superseded preview is missing its durable proof"))?,
+            None => old_snapshot.proof.sha256.clone(),
+        };
+        let identity = self.preview_refresh_identity(
+            request,
+            &old.source,
+            &old.target,
+            old_preview_id,
+            old_revision,
+            &old_preview_sha256,
+        )?;
+        let existing = self.finish_refresh_supersession_if_candidate_exists(
+            &old_snapshot,
+            &old,
+            request,
+            &identity,
+        )?;
+        Ok((identity, existing))
     }
 
     fn persist_preview_document(
         &self,
         document: PreviewDocument,
-        supersedes: Option<(&str, &str)>,
+        refresh: Option<&PreviewRefreshIdentity>,
     ) -> Result<MigrationPreview> {
         let _state_lock = self.source.migration_state_lock()?;
+        if let Some(refresh) = refresh {
+            if document.preview.id != refresh.candidate_id
+                || document.supersedes.as_ref() != Some(&refresh.supersession)
+            {
+                bail!("refreshed preview does not match its deterministic identity");
+            }
+            if let Some(job_bytes) = self
+                .source
+                .migration_read_state(&job_state_name(&refresh.candidate_id), MAX_STATE_BYTES)?
+            {
+                let job: JobDocument = decode_state(&job_bytes, "refreshed migration job")?;
+                self.validate_job_bindings(&job)?;
+                if job.request != document.request
+                    || job.confirmed_preview_supersession.as_ref() != Some(&refresh.supersession)
+                {
+                    bail!("the refreshed migration ID is bound to another request");
+                }
+                return Ok(job.preview);
+            }
+            if let Some(candidate_bytes) = self
+                .source
+                .migration_read_state(&preview_state_name(&refresh.candidate_id), MAX_STATE_BYTES)?
+            {
+                let candidate: PreviewDocument =
+                    decode_state(&candidate_bytes, "refreshed migration preview")?;
+                self.validate_refresh_candidate(&candidate, &document.request, refresh)?;
+                let (old_snapshot, old) = self.read_refresh_parent_unchecked(refresh)?;
+                return self
+                    .finish_refresh_supersession_if_candidate_exists(
+                        &old_snapshot,
+                        &old,
+                        &document.request,
+                        refresh,
+                    )?
+                    .ok_or_else(|| anyhow!("the durable refresh candidate disappeared"));
+            }
+
+            if self
+                .source
+                .migration_read_state(
+                    &job_state_name(&refresh.supersession.old_preview_id),
+                    MAX_STATE_BYTES,
+                )?
+                .is_some()
+            {
+                bail!("a confirmed migration cannot be superseded");
+            }
+            let (old_snapshot, old) = self.read_refresh_parent(refresh)?;
+            self.ensure_refresh_parent_is_current(&old_snapshot, &old, refresh)?;
+            if self.take_preview_refresh_fault(PreviewRefreshFault::BeforeCandidateWrite) {
+                bail!("injected migration preview candidate write failure");
+            }
+            self.source.migration_write_state(
+                &preview_state_name(&refresh.candidate_id),
+                &encode_state(&document)?,
+            )?;
+            if self.take_preview_refresh_fault(PreviewRefreshFault::AfterCandidateWrite) {
+                bail!("injected interruption after durable migration preview candidate write");
+            }
+
+            // Re-read the parent and confirmation state after the candidate is durable. If a
+            // concurrent confirm or replacement changed it, leave the candidate unconfirmable.
+            if self
+                .source
+                .migration_read_state(
+                    &job_state_name(&refresh.supersession.old_preview_id),
+                    MAX_STATE_BYTES,
+                )?
+                .is_some()
+            {
+                bail!("a confirmed migration cannot be superseded");
+            }
+            let (current_snapshot, current) = self.read_refresh_parent(refresh)?;
+            self.ensure_refresh_parent_is_current(&current_snapshot, &current, refresh)?;
+            if current_snapshot.proof != old_snapshot.proof {
+                bail!("the migration preview being refreshed changed during refresh");
+            }
+            self.commit_preview_supersession(
+                &refresh.supersession.old_preview_id,
+                &refresh.supersession.old_revision,
+                &current_snapshot,
+                &current,
+                refresh,
+            )?;
+            return Ok(document.preview);
+        }
+
         if self
             .source
             .migration_read_state(&preview_state_name(&document.preview.id), MAX_STATE_BYTES)?
@@ -592,68 +794,311 @@ impl MigrationEngine {
         {
             bail!("migration preview ID already exists");
         }
-        if let Some((old_preview_id, old_revision)) = supersedes {
-            if old_preview_id == document.preview.id {
-                bail!("a refreshed preview must have a new migration ID");
-            }
-            if self
-                .source
-                .migration_read_state(&job_state_name(old_preview_id), MAX_STATE_BYTES)?
-                .is_some()
-            {
-                bail!("a confirmed migration cannot be superseded");
-            }
-            let old_snapshot = self
-                .source
-                .migration_read_state_snapshot(
-                    &preview_state_name(old_preview_id),
-                    MAX_STATE_BYTES,
-                )?
-                .ok_or_else(|| anyhow!("the migration preview being refreshed is unavailable"))?;
-            let mut old: PreviewDocument =
-                decode_state(&old_snapshot.contents, "migration preview")?;
-            if old.preview.id != old_preview_id || old.preview.revision != old_revision {
-                bail!("the migration preview being refreshed no longer matches its revision");
-            }
-            self.validate_preview_bindings(&old)?;
-            if old.created_at.saturating_add(24 * 60 * 60) < unix_seconds() {
-                bail!("the migration preview being refreshed has expired");
-            }
-            if let Some(existing_id) = old.superseded_by.as_deref()
-                && let Some(existing_bytes) = self
-                    .source
-                    .migration_read_state(&preview_state_name(existing_id), MAX_STATE_BYTES)?
-            {
-                let existing: PreviewDocument =
-                    decode_state(&existing_bytes, "refreshed migration preview")?;
-                self.validate_preview_bindings(&existing)?;
-                if existing.preview.id == existing_id
-                    && existing.request == document.request
-                    && existing.superseded_by.is_none()
-                    && existing.created_at.saturating_add(24 * 60 * 60) >= unix_seconds()
-                    && self
-                        .source
-                        .migration_read_state(&job_state_name(existing_id), MAX_STATE_BYTES)?
-                        .is_none()
-                {
-                    // The first refresh may have been durably saved while its inbox receipt
-                    // was interrupted. Reuse that exact result for an idempotent replay.
-                    return Ok(existing.preview);
-                }
-                bail!("the migration preview being refreshed is already stale");
-            }
-            compact_superseded_preview(&mut old, &document.preview.id);
-            self.source.migration_replace_state_if_unchanged(
-                &preview_state_name(old_preview_id),
-                &old_snapshot,
-                &encode_state(&old)?,
-            )?;
-        }
         self.source.migration_write_state(
             &preview_state_name(&document.preview.id),
             &encode_state(&document)?,
         )?;
         Ok(document.preview)
+    }
+
+    fn read_refresh_parent(
+        &self,
+        refresh: &PreviewRefreshIdentity,
+    ) -> Result<(crate::file_manager::MigrationStateSnapshot, PreviewDocument)> {
+        let (old_snapshot, old) = self.read_refresh_parent_unchecked(refresh)?;
+        self.ensure_refresh_parent_is_current(&old_snapshot, &old, refresh)?;
+        Ok((old_snapshot, old))
+    }
+
+    fn read_refresh_parent_unchecked(
+        &self,
+        refresh: &PreviewRefreshIdentity,
+    ) -> Result<(crate::file_manager::MigrationStateSnapshot, PreviewDocument)> {
+        let old_snapshot = self
+            .source
+            .migration_read_state_snapshot(
+                &preview_state_name(&refresh.supersession.old_preview_id),
+                MAX_STATE_BYTES,
+            )?
+            .ok_or_else(|| anyhow!("the migration preview being refreshed is unavailable"))?;
+        let old: PreviewDocument = decode_state(&old_snapshot.contents, "migration preview")?;
+        self.validate_preview_bindings(&old)?;
+        Ok((old_snapshot, old))
+    }
+
+    fn ensure_refresh_parent_is_current(
+        &self,
+        old_snapshot: &crate::file_manager::MigrationStateSnapshot,
+        old: &PreviewDocument,
+        refresh: &PreviewRefreshIdentity,
+    ) -> Result<()> {
+        if old.preview.id != refresh.supersession.old_preview_id
+            || old.preview.revision != refresh.supersession.old_revision
+            || old.superseded_by.is_some()
+            || old_snapshot.proof.sha256 != refresh.supersession.old_preview_sha256
+        {
+            bail!("the migration preview being refreshed is no longer unchanged");
+        }
+        if old.created_at.saturating_add(PREVIEW_RETENTION_SECONDS) < unix_seconds() {
+            bail!("the migration preview being refreshed has expired");
+        }
+        Ok(())
+    }
+
+    fn validate_refresh_candidate(
+        &self,
+        candidate: &PreviewDocument,
+        request: &MigrationRequest,
+        refresh: &PreviewRefreshIdentity,
+    ) -> Result<()> {
+        self.validate_preview_bindings(candidate)?;
+        let candidate_hash = preview_refresh_hash(
+            &candidate.request,
+            &candidate.source,
+            &candidate.target,
+            &refresh.supersession.old_preview_id,
+            &refresh.supersession.old_revision,
+            &refresh.supersession.old_preview_sha256,
+        )?;
+        if candidate.format_version != 1
+            || candidate.preview.id != refresh.candidate_id
+            || candidate.request != *request
+            || candidate.superseded_by.is_some()
+            || candidate.supersedes.as_ref() != Some(&refresh.supersession)
+            || candidate_hash != refresh.supersession.identity_sha256
+            || refresh.candidate_id != refresh_candidate_id(&candidate_hash)
+            || candidate
+                .created_at
+                .saturating_add(PREVIEW_RETENTION_SECONDS)
+                < unix_seconds()
+        {
+            bail!("the durable refresh candidate does not match its request provenance");
+        }
+        if self
+            .source
+            .migration_read_state(&job_state_name(&refresh.candidate_id), MAX_STATE_BYTES)?
+            .is_some()
+        {
+            bail!("the refresh candidate was already confirmed");
+        }
+        Ok(())
+    }
+
+    fn load_and_redurabilize_refresh_candidate(
+        &self,
+        request: &MigrationRequest,
+        refresh: &PreviewRefreshIdentity,
+    ) -> Result<PreviewDocument> {
+        let name = preview_state_name(&refresh.candidate_id);
+        let snapshot = self
+            .source
+            .migration_read_state_snapshot(&name, MAX_STATE_BYTES)?
+            .ok_or_else(|| anyhow!("the durable refresh candidate disappeared"))?;
+        let candidate: PreviewDocument =
+            decode_state(&snapshot.contents, "refreshed migration preview")?;
+        self.validate_refresh_candidate(&candidate, request, refresh)?;
+
+        // A prior atomic write may have returned an error after exchanging the file but before
+        // syncing its parent directory. A readable candidate is therefore not sufficient proof
+        // that it survives a crash. Replace the exact snapshot with identical bytes; success from
+        // this path includes file and parent-directory sync before we supersede the old preview.
+        self.source
+            .migration_replace_state_if_unchanged(&name, &snapshot, &snapshot.contents)?;
+        let durable = self
+            .source
+            .migration_read_state_snapshot(&name, MAX_STATE_BYTES)?
+            .ok_or_else(|| anyhow!("the refreshed migration preview disappeared after sync"))?;
+        if durable.contents != snapshot.contents {
+            bail!("the refreshed migration preview changed while establishing durability");
+        }
+        Ok(candidate)
+    }
+
+    fn validate_committed_refresh_supersession(&self, candidate: &PreviewDocument) -> Result<()> {
+        let Some(supersession) = candidate.supersedes.as_ref() else {
+            return Ok(());
+        };
+        let expected_hash = preview_refresh_hash(
+            &candidate.request,
+            &candidate.source,
+            &candidate.target,
+            &supersession.old_preview_id,
+            &supersession.old_revision,
+            &supersession.old_preview_sha256,
+        )?;
+        if expected_hash != supersession.identity_sha256
+            || candidate.preview.id != refresh_candidate_id(&expected_hash)
+        {
+            bail!("refreshed migration preview identity does not match its provenance");
+        }
+        let old_bytes = self
+            .source
+            .migration_read_state(
+                &preview_state_name(&supersession.old_preview_id),
+                MAX_STATE_BYTES,
+            )?
+            .ok_or_else(|| anyhow!("the refresh supersession checkpoint is unavailable"))?;
+        let old: PreviewDocument = decode_state(&old_bytes, "superseded migration preview")?;
+        self.validate_preview_bindings(&old)?;
+        if old.preview.id != supersession.old_preview_id
+            || old.preview.revision != supersession.old_revision
+            || old.superseded_by.as_deref() != Some(candidate.preview.id.as_str())
+            || old.superseded_preview_sha256.as_deref()
+                != Some(supersession.old_preview_sha256.as_str())
+            || old.source != candidate.source
+            || old.target != candidate.target
+            || !preview_is_compact_tombstone(&old)
+        {
+            bail!("the refresh supersession checkpoint is not durably committed");
+        }
+        Ok(())
+    }
+
+    fn commit_preview_supersession(
+        &self,
+        old_preview_id: &str,
+        old_revision: &str,
+        old_snapshot: &crate::file_manager::MigrationStateSnapshot,
+        old: &PreviewDocument,
+        refresh: &PreviewRefreshIdentity,
+    ) -> Result<()> {
+        if self
+            .source
+            .migration_read_state(&job_state_name(old_preview_id), MAX_STATE_BYTES)?
+            .is_some()
+        {
+            bail!("a confirmed migration cannot be superseded");
+        }
+        if old.preview.id != old_preview_id
+            || old.preview.revision != old_revision
+            || old.superseded_by.is_some()
+            || old_snapshot.proof.sha256 != refresh.supersession.old_preview_sha256
+        {
+            bail!("the migration preview being refreshed changed before supersession");
+        }
+        let candidate_bytes = self
+            .source
+            .migration_read_state(&preview_state_name(&refresh.candidate_id), MAX_STATE_BYTES)?
+            .ok_or_else(|| anyhow!("the durable refresh candidate disappeared"))?;
+        let candidate: PreviewDocument =
+            decode_state(&candidate_bytes, "refreshed migration preview")?;
+        self.validate_refresh_candidate(&candidate, &candidate.request, refresh)?;
+        let mut superseded = old.clone();
+        compact_superseded_preview(
+            &mut superseded,
+            &refresh.candidate_id,
+            &refresh.supersession.old_preview_sha256,
+        );
+        self.source.migration_replace_state_if_unchanged(
+            &preview_state_name(old_preview_id),
+            old_snapshot,
+            &encode_state(&superseded)?,
+        )
+    }
+
+    fn preview_refresh_identity(
+        &self,
+        request: &MigrationRequest,
+        source: &RootBinding,
+        target: &RootBinding,
+        old_preview_id: &str,
+        old_revision: &str,
+        old_preview_sha256: &str,
+    ) -> Result<PreviewRefreshIdentity> {
+        let hash = preview_refresh_hash(
+            request,
+            source,
+            target,
+            old_preview_id,
+            old_revision,
+            old_preview_sha256,
+        )?;
+        Ok(PreviewRefreshIdentity {
+            candidate_id: refresh_candidate_id(&hash),
+            supersession: PreviewSupersession {
+                old_preview_id: old_preview_id.to_string(),
+                old_revision: old_revision.to_string(),
+                old_preview_sha256: old_preview_sha256.to_string(),
+                identity_sha256: hash,
+            },
+        })
+    }
+
+    fn finish_refresh_supersession_if_candidate_exists(
+        &self,
+        old_snapshot: &crate::file_manager::MigrationStateSnapshot,
+        old: &PreviewDocument,
+        request: &MigrationRequest,
+        refresh: &PreviewRefreshIdentity,
+    ) -> Result<Option<MigrationPreview>> {
+        if let Some(superseded_by) = old.superseded_by.as_deref() {
+            if superseded_by != refresh.candidate_id {
+                bail!("the migration preview being refreshed is already stale");
+            }
+            if old.superseded_preview_sha256.as_deref()
+                != Some(refresh.supersession.old_preview_sha256.as_str())
+            {
+                bail!("the superseded preview proof does not match the refresh candidate");
+            }
+            let Some(job_bytes) = self
+                .source
+                .migration_read_state(&job_state_name(&refresh.candidate_id), MAX_STATE_BYTES)?
+            else {
+                let candidate = self.load_and_redurabilize_refresh_candidate(request, refresh)?;
+                return Ok(Some(candidate.preview));
+            };
+            let job: JobDocument = decode_state(&job_bytes, "refreshed migration job")?;
+            self.validate_job_bindings(&job)?;
+            if job.preview.id != refresh.candidate_id
+                || job.request != *request
+                || job.confirmed_preview_supersession.as_ref() != Some(&refresh.supersession)
+            {
+                bail!("the confirmed refresh does not match its durable provenance");
+            }
+            return Ok(Some(job.preview));
+        }
+
+        if self
+            .source
+            .migration_read_state(&preview_state_name(&refresh.candidate_id), MAX_STATE_BYTES)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let candidate = self.load_and_redurabilize_refresh_candidate(request, refresh)?;
+        self.commit_preview_supersession(
+            &refresh.supersession.old_preview_id,
+            &refresh.supersession.old_revision,
+            old_snapshot,
+            old,
+            refresh,
+        )?;
+        Ok(Some(candidate.preview))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_preview_refresh_fault(&self, fault: PreviewRefreshFault) {
+        if let Ok(mut configured) = self.test_preview_refresh_fault.lock() {
+            *configured = Some(fault);
+        }
+    }
+
+    #[cfg(test)]
+    fn take_preview_refresh_fault(&self, expected: PreviewRefreshFault) -> bool {
+        let Ok(mut configured) = self.test_preview_refresh_fault.lock() else {
+            return false;
+        };
+        if *configured == Some(expected) {
+            *configured = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(test))]
+    fn take_preview_refresh_fault(&self, _expected: PreviewRefreshFault) -> bool {
+        false
     }
 
     /// Confirms a preview by persisting a queued manifest. It performs no media copy, so the
@@ -698,6 +1143,7 @@ impl MigrationEngine {
             bail!("migration preview was superseded; confirm the refreshed preview instead");
         }
         self.validate_preview_bindings(&document)?;
+        self.validate_committed_refresh_supersession(&document)?;
         if document.created_at.saturating_add(24 * 60 * 60) < unix_seconds() {
             bail!("migration preview expired; create a fresh preview");
         }
@@ -763,6 +1209,7 @@ impl MigrationEngine {
             target: document.target,
             preview: document.preview,
             request: document.request,
+            confirmed_preview_supersession: document.supersedes,
             status: MigrationRunStatus::Queued,
             stop_remaining_latched: false,
             groups,
@@ -1807,7 +2254,7 @@ impl MigrationEngine {
         } else if let Some(superseded_by) = document.superseded_by.clone()
             && !preview_is_compact_tombstone(&document)
         {
-            compact_superseded_preview(&mut document, &superseded_by);
+            compact_superseded_preview(&mut document, &superseded_by, &snapshot.proof.sha256);
             match source.migration_replace_state_if_unchanged(
                 &candidate_name,
                 &snapshot,
@@ -2731,10 +3178,14 @@ impl MigrationEngine {
         if document.preview.required_space_bytes > available {
             bail!("insufficient target free space for the confirmed migration plan");
         }
-        let snapshot = match output_lease {
-            Some(lease) => self.source.migration_scan_with_output_lease(lease)?,
-            None => self.source.migration_scan()?,
+        let scan = match output_lease {
+            Some(lease) => self
+                .source
+                .migration_scan_with_output_lease_and_completeness(lease)?,
+            None => self.source.migration_scan_with_completeness()?,
         };
+        validate_migration_scan_scope(&document.request, &scan, Some(&document.plan))?;
+        let snapshot = &scan.snapshot;
         for group in &document.plan {
             let current_item = snapshot
                 .items
@@ -2797,6 +3248,8 @@ impl MigrationEngine {
             preview: job.preview.clone(),
             plan: job.groups.iter().map(|group| group.plan.clone()).collect(),
             superseded_by: None,
+            superseded_preview_sha256: None,
+            supersedes: job.confirmed_preview_supersession.clone(),
         };
         self.revalidate_preview(&document, output_lease)
     }
@@ -2963,8 +3416,133 @@ fn selected_item_ids(
     }
 }
 
-fn compact_superseded_preview(document: &mut PreviewDocument, superseded_by: &str) {
+fn validate_migration_scan_scope(
+    request: &MigrationRequest,
+    scan: &MigrationScanResult,
+    plan: Option<&[MigrationPlannedGroup]>,
+) -> Result<()> {
+    let relative_paths = plan
+        .into_iter()
+        .flatten()
+        .flat_map(|group| group.files.iter().map(|file| file.source_path.as_str()));
+    validate_migration_scan_paths(scan, &request.scope, relative_paths)
+}
+
+pub(crate) fn validate_migration_scan_paths<'a, I>(
+    scan: &MigrationScanResult,
+    scope: &MigrationScope,
+    relative_paths: I,
+) -> Result<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    match scope {
+        MigrationScope::Library if !scan.complete => {
+            bail!("whole-library migration requires a complete source scan")
+        }
+        MigrationScope::Selected if scan.scope_unknown => {
+            bail!(
+                "selected migration cannot be verified because the source scan scope is incomplete"
+            )
+        }
+        _ => {}
+    }
+
+    if *scope == MigrationScope::Selected {
+        for path in relative_paths {
+            if scan
+                .incomplete_directories
+                .iter()
+                .any(|directory| source_path_is_in_incomplete_directory(path, directory))
+            {
+                bail!("selected media bundle intersects an incomplete source directory: {path}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn source_path_is_in_incomplete_directory(source_path: &str, directory: &str) -> bool {
+    let source = Path::new(source_path);
+    let incomplete = Path::new(directory);
+    let source_is_safe = source
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)));
+    let incomplete_is_safe = incomplete
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)));
+    if !source_is_safe || !incomplete_is_safe || incomplete.as_os_str().is_empty() {
+        return true;
+    }
+    source.starts_with(incomplete)
+}
+
+fn preview_refresh_hash(
+    request: &MigrationRequest,
+    source: &RootBinding,
+    target: &RootBinding,
+    old_preview_id: &str,
+    old_revision: &str,
+    old_preview_sha256: &str,
+) -> Result<String> {
+    if !is_sha256_hex(old_preview_sha256) {
+        bail!("the preview being refreshed has an invalid content proof");
+    }
+    canonical_sha256(&PreviewRefreshHashInput {
+        format_version: 1,
+        source,
+        target,
+        old_preview_id,
+        old_revision,
+        old_preview_sha256,
+        request,
+    })
+}
+
+fn refresh_candidate_id(identity_sha256: &str) -> String {
+    // Keep the callback/job identifier compact while retaining a 128-bit collision-resistant
+    // prefix. The persisted full digest and request provenance are checked before reuse.
+    format!("refresh-{}", &identity_sha256[..32])
+}
+
+fn canonical_sha256<T: Serialize>(value: &T) -> Result<String> {
+    let value = serde_json::to_value(value).context("failed to encode refresh identity")?;
+    let canonical = canonicalize_json(value);
+    let bytes =
+        serde_json::to_vec(&canonical).context("failed to canonicalize refresh identity")?;
+    if bytes.len() > MAX_STATE_BYTES {
+        bail!("migration preview refresh identity exceeds its bounded size");
+    }
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    Ok(format_sha256(&digest))
+}
+
+fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let sorted = object.into_iter().collect::<BTreeMap<_, _>>();
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in sorted {
+                canonical.insert(key, canonicalize_json(value));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonicalize_json).collect())
+        }
+        scalar => scalar,
+    }
+}
+
+fn compact_superseded_preview(
+    document: &mut PreviewDocument,
+    superseded_by: &str,
+    original_sha256: &str,
+) {
+    document.created_at = unix_seconds();
     document.superseded_by = Some(superseded_by.to_string());
+    document.superseded_preview_sha256 = Some(original_sha256.to_string());
+    document.supersedes = None;
     document.plan.clear();
     document.request.item_ids.clear();
     document.request.item_conflicts.clear();
@@ -2986,6 +3564,8 @@ fn compact_superseded_preview(document: &mut PreviewDocument, superseded_by: &st
 
 fn preview_is_compact_tombstone(document: &PreviewDocument) -> bool {
     document.superseded_by.is_some()
+        && document.superseded_preview_sha256.is_some()
+        && document.supersedes.is_none()
         && document.plan.is_empty()
         && document.request.item_ids.is_empty()
         && document.request.item_conflicts.is_empty()
@@ -3063,10 +3643,54 @@ fn preview_confirmability_for_inbox_key(
         {
             return Ok(MigrationPreviewConfirmability::DefinitelyUnconfirmable);
         }
+        if !preview_refresh_supersession_is_committed(source, &document)? {
+            return Ok(MigrationPreviewConfirmability::DefinitelyUnconfirmable);
+        }
         Ok(MigrationPreviewConfirmability::Confirmable)
     })();
 
     checked.unwrap_or(MigrationPreviewConfirmability::Unknown)
+}
+
+fn preview_refresh_supersession_is_committed(
+    source: &LibraryManager,
+    candidate: &PreviewDocument,
+) -> Result<bool> {
+    let Some(supersession) = candidate.supersedes.as_ref() else {
+        return Ok(true);
+    };
+    let expected_hash = preview_refresh_hash(
+        &candidate.request,
+        &candidate.source,
+        &candidate.target,
+        &supersession.old_preview_id,
+        &supersession.old_revision,
+        &supersession.old_preview_sha256,
+    )?;
+    if expected_hash != supersession.identity_sha256
+        || candidate.preview.id != refresh_candidate_id(&expected_hash)
+    {
+        return Ok(false);
+    }
+    let Some(snapshot) = source.migration_read_state_snapshot(
+        &preview_state_name(&supersession.old_preview_id),
+        MAX_STATE_BYTES,
+    )?
+    else {
+        return Ok(false);
+    };
+    let old: PreviewDocument = decode_state(&snapshot.contents, "superseded migration preview")?;
+    Ok(old.format_version == 1
+        && old.preview.id == supersession.old_preview_id
+        && old.preview.revision == supersession.old_revision
+        && old.superseded_by.as_deref() == Some(candidate.preview.id.as_str())
+        && old.superseded_preview_sha256.as_deref()
+            == Some(supersession.old_preview_sha256.as_str())
+        && old.source == candidate.source
+        && old.target == candidate.target
+        && source_binding_matches(source, &old.source)
+        && root_binding_shape_is_valid(&old.target)
+        && preview_is_compact_tombstone(&old))
 }
 
 fn root_binding_shape_is_valid(binding: &RootBinding) -> bool {

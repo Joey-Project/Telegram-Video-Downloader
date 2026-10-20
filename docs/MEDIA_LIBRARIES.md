@@ -28,6 +28,8 @@ Retryable failed video tasks still depend on their registered library. Before a 
 download configuration, the queue revalidates the registered root's saved directory identity;
 a replacement directory at the same pathname is rejected while task and staging records remain
 bound to the original directory.
+The selected root is checked again before enqueue writes queue state, so a replacement between
+configuration lookup and task creation cannot redirect durable task records.
 Changing the default or a library's category also requires the registered root to be available
 and identity-matched; rejection preserves the existing settings and revision.
 Registration stores the identity of the directory opened during preparation with the new entry.
@@ -49,8 +51,16 @@ Choose the entire source library or selected media, select the destination libra
 the preview before confirming. Relative categories and collection structure are preserved.
 Video, NFO, danmaku, subtitle, and cover associations move as a bundle. Conflicts default to
 **Skip**; **Keep both** reserves a new bundle name without replacing existing target files.
+Migration previews use an internal completeness proof from the bounded source scan. A
+whole-library preview requires the scan to finish without entry or media limits, timeout, or
+unavailable media, sidecar, or directory reads. For a selected migration, a localized incomplete
+directory blocks only bundles whose primary or attachment paths are inside it, while an unreadable
+individual media or sidecar path blocks only bundles containing that path. If the scan cannot
+localize the incomplete scope, selected migration fails closed. Missing optional metadata and
+low-confidence metadata do not by themselves make a scan incomplete.
 Refreshing conflict choices durably supersedes the exact earlier preview. Reloading the Mini App
-cannot make that earlier revision executable again.
+cannot make that earlier revision executable again. A refreshed candidate is durable before the
+old revision is superseded; interrupted refreshes replay from those durable records after restart.
 Expired, superseded and confirmed preview documents are retired through bounded cleanup.
 Confirmation keeps the durable job plan and replay information needed for recovery; retiring a
 preview does not remove media, retained download fragments or an active migration's checkpoints.
@@ -99,6 +109,8 @@ Telegram delivery is retained without automatically sending a duplicate message.
 Task-transfer failures also expose retry and stop controls, even when no media bundle failed.
 Startup completes or aborts a stopped migration's pending queue handoffs so the affected tasks
 do not remain blocked by an orphaned transfer.
+When a new independent queue store reconnects, its library remains unavailable until the existing
+startup recovery pass finishes and the saved root identity is verified.
 Participating libraries remain registered until pending queue handoffs are acknowledged, even
 when the migration already has a terminal status. This preserves discovery of its source manifest.
 After queue acknowledgement and verified payload removal, source staging controls and empty job

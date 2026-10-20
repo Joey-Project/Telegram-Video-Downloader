@@ -1406,6 +1406,13 @@ impl QueueManager {
                     .lock()
                     .map_err(poisoned_lock)?
                     .bind_root_identity(&library.id, identity.device(), identity.inode())?;
+                // A root that was unavailable during QueueManager::open was not included in
+                // startup recovery. Recover only this newly opened, independently owned store
+                // before publishing it as available. Existing stores may have live workers, and
+                // a PDF-shared store was already covered by startup recovery.
+                if !store.shares_root(&self.pdf) {
+                    self.recover_interrupted_tasks_in_store(&store)?;
+                }
                 Ok((store, owner_lock))
             })();
             match opened {
@@ -2498,23 +2505,52 @@ impl QueueManager {
             snapshot.sanitize_errors();
         }
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
-        if !matches!(task.job, JobRequest::Pdf { .. }) {
+        let video_library = if !matches!(task.job, JobRequest::Pdf { .. }) {
             let libraries = self.media_libraries.lock().map_err(poisoned_lock)?;
             if task.destination.is_none() {
                 task.destination = Some(libraries.default_destination()?);
             }
-            validate_task_destination(
-                &libraries.snapshot(),
-                task.destination
-                    .as_ref()
-                    .expect("video task destination was frozen"),
-            )?;
-        }
+            let destination = task
+                .destination
+                .as_ref()
+                .expect("video task destination was frozen");
+            let snapshot = libraries.snapshot();
+            validate_task_destination(&snapshot, destination)?;
+            Some(
+                snapshot
+                    .libraries
+                    .into_iter()
+                    .find(|library| library.id == destination.library_id)
+                    .ok_or_else(|| {
+                        anyhow!("task {} destination library is not registered", task.id)
+                    })?,
+            )
+        } else {
+            None
+        };
+        // Check the registered path against the selected open queue store before any duplicate
+        // lookup can reconcile or write queue indexes. This catches a same-path root replacement
+        // that happened after the last settings refresh.
+        let selected_store = if let Some(library) = video_library.as_ref() {
+            let store = self.store_for_task(&task)?;
+            self.validate_video_library_for_task_unlocked(&store, library)?;
+            Some(store)
+        } else {
+            None
+        };
         if self.find_record_unlocked(&task.id)?.is_some() {
             return Ok(false);
         }
-        let store = self.store_for_task(&task)?;
+        let store = match selected_store {
+            Some(store) => store,
+            None => self.pdf.clone(),
+        };
         let _operation = store.lock_queue_operations()?;
+        // Revalidate while holding the destination queue-operation lock immediately before the
+        // first task/index write. Root identity is inode-bound; ordinary child churn is allowed.
+        if let Some(library) = video_library.as_ref() {
+            self.validate_video_library_for_task_unlocked(&store, library)?;
+        }
         store.create_task(&mut task)?;
         self.state_change_notify.notify_one();
         Ok(true)
@@ -4408,38 +4444,56 @@ impl QueueManager {
                     continue;
                 }
             };
-            for mut record in records {
-                if task_transfer_or_final_ack_pending(&record) {
+            self.recover_interrupted_task_records_in_store(&store, records)?;
+        }
+        Ok(())
+    }
+
+    fn recover_interrupted_tasks_in_store(&self, store: &DownloadStore) -> Result<()> {
+        if let Err(error) = crate::downloader::recover_bilibili_group_receipt_removals(&store.root)
+        {
+            tracing::warn!(error = %error, root = %store.root_path.display(), "failed to recover interrupted Bilibili receipt cleanup; retained for retry");
+        }
+        let records = store.list_records()?;
+        self.recover_interrupted_task_records_in_store(store, records)
+    }
+
+    fn recover_interrupted_task_records_in_store(
+        &self,
+        store: &DownloadStore,
+        records: Vec<TaskRecord>,
+    ) -> Result<()> {
+        for mut record in records {
+            if task_transfer_or_final_ack_pending(&record) {
+                continue;
+            }
+            store.cleanup_terminal_bilibili_group_receipts(&record);
+            if record.status.is_unfinished()
+                && !matches!(
+                    record.status,
+                    TaskStatus::Interrupted | TaskStatus::PartiallyCompleted
+                )
+            {
+                let Some((current, entry)) = store.get_task(&record.id)? else {
                     continue;
+                };
+                record = current;
+                if record.cancel_requested {
+                    record.status = TaskStatus::Cancelled;
+                    record.cancel_requested = false;
+                    record.error = None;
+                } else {
+                    record.status = TaskStatus::Interrupted;
+                    record.cancel_requested = false;
+                    record.error = Some("Task was interrupted by process restart.".to_string());
                 }
-                store.cleanup_terminal_bilibili_group_receipts(&record);
-                if record.status.is_unfinished()
-                    && !matches!(
-                        record.status,
-                        TaskStatus::Interrupted | TaskStatus::PartiallyCompleted
-                    )
-                {
-                    let Some((current, entry)) = store.get_task(&record.id)? else {
-                        continue;
-                    };
-                    record = current;
-                    if record.cancel_requested {
-                        record.status = TaskStatus::Cancelled;
-                        record.cancel_requested = false;
-                        record.error = None;
-                    } else {
-                        record.status = TaskStatus::Interrupted;
-                        record.cancel_requested = false;
-                        record.error = Some("Task was interrupted by process restart.".to_string());
-                    }
-                    let outcome = if record.status == TaskStatus::Cancelled {
-                        BilibiliAttemptOutcome::Cancelled
-                    } else {
-                        BilibiliAttemptOutcome::Interrupted
-                    };
-                    finish_bilibili_attempt(&mut record, outcome);
-                    store.save_mutated_record(record, entry, true)?;
-                }
+                let outcome = if record.status == TaskStatus::Cancelled {
+                    BilibiliAttemptOutcome::Cancelled
+                } else {
+                    BilibiliAttemptOutcome::Interrupted
+                };
+                finish_bilibili_attempt(&mut record, outcome);
+                store.save_mutated_record(record, entry, true)?;
             }
         }
         Ok(())
@@ -7704,6 +7758,244 @@ mod tests {
         );
         assert!(!archive_root.join(QUEUE_DIRECTORY).exists());
         drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn create_default_video_task_rejects_replaced_root_before_any_queue_write() {
+        let temp_root = temp_queue_root("create-default-replaced-root");
+        let config = test_video_config(&temp_root);
+        let video_root = config.downloads.video_dir.clone();
+        let displaced_root = temp_root.join("videos-original");
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let provider_trait: Arc<dyn QueueFileProvider> = provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, provider_trait)
+            .expect("queue should open");
+        let destination = queue
+            .default_video_destination()
+            .expect("default destination should resolve");
+        let index_path = video_root.join(QUEUE_DIRECTORY).join(INDEX_FILE);
+        let index_before = fs::read(&index_path).expect("queue index should exist");
+
+        fs::rename(&video_root, &displaced_root).expect("original root should be displaced");
+        fs::create_dir(&video_root).expect("replacement root should be created");
+        fs::write(video_root.join("keep.txt"), b"replacement sentinel")
+            .expect("replacement sentinel should be written");
+        let writes_before_create = provider.write_paths();
+
+        let error = queue
+            .create(test_task(
+                "task-create-default-replaced-root",
+                JobRequest::Youtube {
+                    url: "https://www.youtube.com/watch?v=default-root-replacement".to_string(),
+                },
+            ))
+            .expect_err("default enqueue must reject a replacement root");
+        assert!(
+            error.to_string().contains("root") || error.to_string().contains("available"),
+            "unexpected root validation error: {error:#}"
+        );
+        assert_eq!(
+            provider.write_paths(),
+            writes_before_create,
+            "root identity rejection must happen before any coordinated queue write"
+        );
+        assert_eq!(
+            fs::read(displaced_root.join(QUEUE_DIRECTORY).join(INDEX_FILE))
+                .expect("old queue index should remain readable"),
+            index_before,
+            "the stale bound queue must not be modified"
+        );
+        assert!(
+            !displaced_root
+                .join(QUEUE_DIRECTORY)
+                .join("task-task-create-default-replaced-root.json")
+                .exists(),
+            "the rejected task must not be written to the displaced root"
+        );
+        assert_eq!(
+            fs::read_dir(&video_root)
+                .expect("replacement should remain readable")
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("keep.txt")],
+            "the replacement must not receive queue files"
+        );
+
+        fs::remove_dir_all(&video_root).expect("replacement should be removed for recovery test");
+        fs::rename(&displaced_root, &video_root).expect("original root should be restored");
+        fs::create_dir(video_root.join("benign-child-churn"))
+            .expect("benign child churn should succeed");
+        queue
+            .refresh_video_library(&destination.library_id)
+            .expect("the original root should become available again");
+        assert!(
+            queue
+                .create(test_task(
+                    "task-create-default-restored-root",
+                    JobRequest::Youtube {
+                        url: "https://www.youtube.com/watch?v=restored-root".to_string(),
+                    },
+                ))
+                .expect("the restored root should accept a task"),
+            "the restored original root should accept the default enqueue"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn reopening_an_offline_video_library_recovers_interrupted_tasks_before_availability() {
+        let temp_root = temp_queue_root("reconnect-recovers-interrupted-tasks");
+        let config = test_video_config(&temp_root);
+        let video_root = config.downloads.video_dir.clone();
+        let offline_accessor = temp_root.join("provider-offline");
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let provider_trait: Arc<dyn QueueFileProvider> = provider.clone();
+        let fragment = video_root
+            .join(VIDEO_STAGING_DIRECTORY)
+            .join("job-reconnect-fragment")
+            .join("segment.part");
+        fs::create_dir_all(fragment.parent().expect("fragment should have a parent"))
+            .expect("staging directory should be created");
+        fs::set_permissions(
+            fragment.parent().expect("fragment should have a parent"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("staging directory should be private");
+        fs::write(&fragment, b"retained download fragment").expect("fragment should be written");
+        fs::set_permissions(&fragment, fs::Permissions::from_mode(0o600))
+            .expect("fragment should be private");
+
+        let preparing_id = "reconnect-preparing";
+        let running_id = "reconnect-running";
+        let verifying_id = "reconnect-verifying";
+        let queued_id = "reconnect-queued";
+        let failed_id = "reconnect-failed";
+        let original_plan = PlanValidationSnapshot {
+            stable_media_ids: vec!["media-stable-id".to_string()],
+            title: Some("Preserved plan".to_string()),
+            ..PlanValidationSnapshot::default()
+        };
+        let expected_generation;
+        {
+            let queue = QueueManager::open_with_file_provider(&config, Arc::clone(&provider_trait))
+                .expect("online queue should open");
+            for id in [preparing_id, running_id, verifying_id, queued_id, failed_id] {
+                assert!(
+                    queue
+                        .create(test_task(
+                            id,
+                            JobRequest::Youtube {
+                                url: format!("https://www.youtube.com/watch?v={id}"),
+                            },
+                        ))
+                        .expect("test task should persist")
+                );
+            }
+            queue
+                .set_status(preparing_id, TaskStatus::Preparing, None)
+                .expect("preparing task should persist");
+            queue
+                .set_status(running_id, TaskStatus::Interrupted, None)
+                .expect("running task should first become resumable");
+            let resumed = queue
+                .claim_resume(running_id, false)
+                .expect("interrupted task should be resumable")
+                .expect("task should resume");
+            assert_eq!(resumed.status, TaskStatus::Preparing);
+            expected_generation = resumed.generation;
+            queue
+                .set_status(running_id, TaskStatus::Running, None)
+                .expect("running task should persist");
+            queue
+                .set_plan_if_generation(running_id, expected_generation, original_plan.clone())
+                .expect("plan should persist for the running generation");
+            queue
+                .set_status(verifying_id, TaskStatus::Running, None)
+                .expect("verifying task should first run");
+            queue
+                .begin_verification(verifying_id)
+                .expect("verification transition should succeed")
+                .expect("running task should begin verification");
+            queue
+                .set_status(queued_id, TaskStatus::Queued, None)
+                .expect("queued task should persist");
+            queue
+                .set_status(
+                    failed_id,
+                    TaskStatus::Failed,
+                    Some("keep this failure".to_string()),
+                )
+                .expect("failed task should persist");
+        }
+
+        provider.rewrite_paths_under(&video_root, &offline_accessor);
+        let reopened = QueueManager::open_with_file_provider(&config, provider_trait)
+            .expect("manager should start with the video root offline");
+        let default_id = reopened
+            .registry_snapshot()
+            .expect("library registry should remain readable while its default is offline")
+            .default_library_id;
+        assert!(
+            !reopened
+                .video_library_statuses()
+                .expect("library statuses should load")[&default_id]
+                .available,
+            "offline library must remain registered but unavailable"
+        );
+
+        provider.rewrite_paths_under(&video_root, &video_root);
+        reopened
+            .refresh_video_library(&default_id)
+            .expect("reconnected root should open and recover before publication");
+        assert!(
+            reopened
+                .video_library_statuses()
+                .expect("library statuses should load")[&default_id]
+                .available,
+            "library should be marked available after recovery"
+        );
+
+        for id in [preparing_id, running_id, verifying_id, queued_id] {
+            let recovered = reopened
+                .get(id)
+                .expect("recovered task should load")
+                .expect("task should remain present");
+            assert_eq!(
+                recovered.status,
+                TaskStatus::Interrupted,
+                "the existing restart semantics should interrupt active task {id}"
+            );
+        }
+        let recovered_running = reopened
+            .get(running_id)
+            .expect("running record should load")
+            .expect("running record should remain present");
+        assert_eq!(recovered_running.generation, expected_generation);
+        assert_eq!(recovered_running.plan, Some(original_plan.clone()));
+        assert_eq!(
+            fs::read(&fragment).expect("staging fragment should remain available"),
+            b"retained download fragment",
+            "reopen recovery must preserve the existing fragment bytes"
+        );
+        let recovered_failed = reopened
+            .get(failed_id)
+            .expect("failed record should load")
+            .expect("failed record should remain present");
+        assert_eq!(recovered_failed.status, TaskStatus::Failed);
+        assert_eq!(recovered_failed.error.as_deref(), Some("keep this failure"));
+
+        let resumed = reopened
+            .claim_resume(running_id, false)
+            .expect("recovered task should be resumable")
+            .expect("interrupted task should resume");
+        assert_eq!(resumed.status, TaskStatus::Preparing);
+        assert_eq!(resumed.generation, expected_generation + 1);
+        assert_eq!(resumed.plan, Some(original_plan));
+
+        drop(reopened);
         let _ = fs::remove_dir_all(temp_root);
     }
 
