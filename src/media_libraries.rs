@@ -7,13 +7,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::safe_fs::RootedFs;
+use crate::safe_fs::{EntryIdentity, RootedFs};
 
 pub const MAX_MEDIA_LIBRARIES: usize = 16;
 const MAX_REGISTRY_BYTES: usize = 64 * 1024;
 const MAX_RESOLVED_MIGRATION_DEFAULTS: usize = 10_000;
+const MAX_MIGRATION_DEFAULT_ARCHIVE_BYTES: usize = 4 * 1024 * 1024;
 const REGISTRY_FILE: &str = ".telegram-video-downloader-media-libraries.json";
 const REGISTRY_TEMP_PREFIX: &str = ".telegram-video-downloader-media-libraries.tmp";
+const DEFAULT_ARCHIVE_FILE: &str = ".telegram-video-downloader-media-library-defaults.json";
+const DEFAULT_ARCHIVE_TEMP_PREFIX: &str = ".telegram-video-downloader-media-defaults.tmp";
 static REGISTRY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -191,6 +194,35 @@ struct RegistryDocument {
     applied_migration_defaults: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     skipped_migration_defaults: Vec<String>,
+    #[serde(default)]
+    archived_migration_default_count: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    archived_migration_default_sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MigrationDefaultResolution {
+    Applied,
+    RevisionChanged,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct MigrationDefaultArchiveEntry {
+    migration_id: String,
+    outcome: MigrationDefaultResolution,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct MigrationDefaultArchiveDocument {
+    version: u32,
+    entries: Vec<MigrationDefaultArchiveEntry>,
+}
+
+struct LoadedMigrationDefaultArchive {
+    entries: Vec<MigrationDefaultArchiveEntry>,
+    bytes: Option<Vec<u8>>,
+    identity: Option<EntryIdentity>,
 }
 
 pub(crate) struct MediaLibraryRegistryStore {
@@ -199,6 +231,11 @@ pub(crate) struct MediaLibraryRegistryStore {
     snapshot: MediaLibrarySnapshot,
     applied_migration_defaults: Vec<String>,
     skipped_migration_defaults: Vec<String>,
+    archived_migration_default_count: usize,
+    archived_migration_default_sha256: String,
+    archived_migration_defaults: Vec<MigrationDefaultArchiveEntry>,
+    archived_migration_default_bytes: Option<Vec<u8>>,
+    archived_migration_default_identity: Option<EntryIdentity>,
 }
 
 impl MediaLibraryRegistryStore {
@@ -220,38 +257,65 @@ impl MediaLibraryRegistryStore {
                 .ok_or_else(|| anyhow!("media library settings path has no filename"))?,
         );
 
-        let (snapshot, applied_migration_defaults, skipped_migration_defaults) =
-            if let Some(bytes) = read_private_registry(&rooted, &path)? {
-                let document: RegistryDocument = serde_json::from_slice(&bytes)
-                    .context("invalid media library settings document")?;
-                if document.version != 1 {
-                    bail!(
-                        "unsupported media library settings version {}",
-                        document.version
-                    );
-                }
-                let snapshot = snapshot_from_document(&document)?;
-                validate_migration_id_history(
-                    &document.applied_migration_defaults,
-                    &document.skipped_migration_defaults,
-                )?;
-                (
-                    snapshot,
-                    document.applied_migration_defaults,
-                    document.skipped_migration_defaults,
-                )
-            } else {
-                let library = library_from_existing_root("Default", configured_video_root, None)?;
-                let snapshot = MediaLibrarySnapshot {
-                    revision: 1,
-                    default_library_id: library.id.clone(),
-                    default_category: None,
-                    libraries: vec![library],
-                };
-                validate_registry_shape(&snapshot)?;
-                write_private_registry(&rooted, &path, &snapshot, &[], &[])?;
-                (snapshot, Vec::new(), Vec::new())
+        let (
+            snapshot,
+            applied_migration_defaults,
+            skipped_migration_defaults,
+            archived_migration_default_count,
+            archived_migration_default_sha256,
+            archived_migration_defaults,
+            archived_migration_default_bytes,
+            archived_migration_default_identity,
+        ) = if let Some(bytes) = read_private_registry(&rooted, &path)? {
+            let document: RegistryDocument = serde_json::from_slice(&bytes)
+                .context("invalid media library settings document")?;
+            if document.version != 1 {
+                bail!(
+                    "unsupported media library settings version {}",
+                    document.version
+                );
+            }
+            let snapshot = snapshot_from_document(&document)?;
+            validate_migration_id_history(
+                &document.applied_migration_defaults,
+                &document.skipped_migration_defaults,
+            )?;
+            let archive = load_migration_default_archive(&rooted, &path, &document)?;
+            (
+                snapshot,
+                document.applied_migration_defaults,
+                document.skipped_migration_defaults,
+                document.archived_migration_default_count,
+                document.archived_migration_default_sha256,
+                archive.entries,
+                archive.bytes,
+                archive.identity,
+            )
+        } else {
+            let archive_path = migration_default_archive_path(&path)?;
+            if rooted.open_bound_file(&archive_path)?.is_some() {
+                bail!("media library migration archive exists without its registry");
+            }
+            let library = library_from_existing_root("Default", configured_video_root, None)?;
+            let snapshot = MediaLibrarySnapshot {
+                revision: 1,
+                default_library_id: library.id.clone(),
+                default_category: None,
+                libraries: vec![library],
             };
+            validate_registry_shape(&snapshot)?;
+            write_private_registry(&rooted, &path, &snapshot, &[], &[], 0, "")?;
+            (
+                snapshot,
+                Vec::new(),
+                Vec::new(),
+                0,
+                String::new(),
+                Vec::new(),
+                None,
+                None,
+            )
+        };
 
         Ok(Self {
             fs: rooted,
@@ -259,6 +323,11 @@ impl MediaLibraryRegistryStore {
             snapshot,
             applied_migration_defaults,
             skipped_migration_defaults,
+            archived_migration_default_count,
+            archived_migration_default_sha256,
+            archived_migration_defaults,
+            archived_migration_default_bytes,
+            archived_migration_default_identity,
         })
     }
 
@@ -321,17 +390,12 @@ impl MediaLibraryRegistryStore {
         library.root_device = Some(device);
         library.root_inode = Some(inode);
         validate_registry_shape(&next)?;
-        write_private_registry(
-            &self.fs,
-            &self.path,
-            &next,
-            &self.applied_migration_defaults,
-            &self.skipped_migration_defaults,
-        )?;
+        self.write_registry_snapshot(&next, None)?;
         self.snapshot = next;
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn add(
         &mut self,
         name: &str,
@@ -346,6 +410,43 @@ impl MediaLibraryRegistryStore {
         let canonical_root = prepare_library_root(root, create_directory)?;
         let root_id = RootedFs::new(&canonical_root)?.root_identity();
 
+        self.add_prepared_root(&name, canonical_root, category, set_default, root_id)
+    }
+
+    /// Register a root whose directory descriptor and queue ownership were already prepared by
+    /// `QueueManager`. The persisted binding comes from that descriptor; a final pathname check
+    /// rejects replacement before the single registry commit that may also change the default.
+    pub(crate) fn add_with_root_identity(
+        &mut self,
+        name: &str,
+        root: &Path,
+        default_category: Option<&Path>,
+        set_default: bool,
+        opened_identity: EntryIdentity,
+    ) -> Result<MediaLibrary> {
+        let name = validate_name(name)?;
+        let category = validate_category(default_category)?;
+        self.preflight_add(&name, root, category.as_deref(), false)?;
+        let canonical_root = prepare_library_root(root, false)?;
+        self.add_prepared_root(
+            &name,
+            canonical_root,
+            category,
+            set_default,
+            opened_identity,
+        )
+    }
+
+    fn add_prepared_root(
+        &mut self,
+        name: &str,
+        canonical_root: PathBuf,
+        category: Option<PathBuf>,
+        set_default: bool,
+        root_id: EntryIdentity,
+    ) -> Result<MediaLibrary> {
+        let name = name.to_string();
+
         if let Some(existing) = self
             .snapshot
             .libraries
@@ -356,26 +457,59 @@ impl MediaLibraryRegistryStore {
             })
             .cloned()
         {
-            if existing
-                .root_device
-                .zip(existing.root_inode)
-                .is_some_and(|binding| binding != (root_id.device(), root_id.inode()))
-            {
-                bail!("registered media library path now names a different root object");
-            }
-            if existing.name == name && existing.default_category == category {
-                if set_default {
-                    self.set_default(&existing.id)?;
+            match (existing.root_device, existing.root_inode) {
+                (Some(device), Some(inode))
+                    if (device, inode) == (root_id.device(), root_id.inode()) => {}
+                (Some(_), Some(_)) => {
+                    bail!("registered media library path now names a different root object");
                 }
-                return Ok(self
-                    .library(&existing.id)
-                    .expect("existing library remains registered")
-                    .clone());
+                (None, None) => {}
+                (Some(_), None) | (None, Some(_)) => {
+                    bail!("registered media library root identity binding is incomplete");
+                }
             }
-            bail!(
-                "media library root is already registered as {}",
-                existing.name
-            );
+            if existing.name != name || existing.default_category != category {
+                bail!(
+                    "media library root is already registered as {}",
+                    existing.name
+                );
+            }
+
+            self.ensure_root_path_matches_identity(&canonical_root, root_id)?;
+            let mut next = self.snapshot.clone();
+            let registered = next
+                .libraries
+                .iter_mut()
+                .find(|library| library.id == existing.id)
+                .expect("existing library remains registered");
+            registered.root_device = Some(root_id.device());
+            registered.root_inode = Some(root_id.inode());
+            let default_changed = set_default
+                && (next.default_library_id != existing.id
+                    || next.default_category != existing.default_category);
+            let binding_changed = (existing.root_device, existing.root_inode)
+                != (Some(root_id.device()), Some(root_id.inode()));
+            if !binding_changed && !default_changed {
+                return Ok(existing);
+            }
+            if set_default {
+                next.default_library_id = existing.id.clone();
+                next.default_category = existing.default_category.clone();
+            }
+            if default_changed {
+                next.revision = self
+                    .snapshot
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("media library settings revision overflow"))?;
+            }
+            validate_registry_shape(&next)?;
+            self.write_registry_snapshot(&next, Some((&canonical_root, root_id)))?;
+            self.snapshot = next;
+            return Ok(self
+                .library(&existing.id)
+                .expect("existing library remains registered")
+                .clone());
         }
 
         if self.snapshot.libraries.len() >= MAX_MEDIA_LIBRARIES {
@@ -421,15 +555,26 @@ impl MediaLibraryRegistryStore {
         if self.library(&library.id).is_some() {
             bail!("media library identifier collision");
         }
-
         let mut next = self.snapshot.clone();
         next.libraries.push(library.clone());
         if set_default {
             next.default_library_id = library.id.clone();
             next.default_category = library.default_category.clone();
         }
-        self.commit(next)?;
+        self.commit_with_root_identity(next, &library.root, root_id)?;
         Ok(library)
+    }
+
+    fn ensure_root_path_matches_identity(
+        &self,
+        canonical_root: &Path,
+        expected: EntryIdentity,
+    ) -> Result<()> {
+        let current = RootedFs::new(canonical_root)?.root_identity();
+        if current != expected {
+            bail!("media library root identity changed during registration");
+        }
+        Ok(())
     }
 
     /// Validate a registration request before a caller creates the requested directory or
@@ -487,25 +632,43 @@ impl MediaLibraryRegistryStore {
         migration_id: &str,
     ) -> Result<Option<MigrationDefaultUpdateOutcome>> {
         validate_migration_id(migration_id)?;
-        if self
+        self.validate_migration_default_archive_on_disk()?;
+        let applied_inline = self
             .applied_migration_defaults
             .iter()
-            .any(|applied| applied == migration_id)
-        {
-            return Ok(Some(MigrationDefaultUpdateOutcome::Applied {
-                snapshot: self.snapshot(),
-            }));
-        }
-        if self
+            .any(|applied| applied == migration_id);
+        let skipped_inline = self
             .skipped_migration_defaults
             .iter()
-            .any(|skipped| skipped == migration_id)
-        {
-            return Ok(Some(MigrationDefaultUpdateOutcome::RevisionChanged {
+            .any(|skipped| skipped == migration_id);
+        let inline = match (applied_inline, skipped_inline) {
+            (true, true) => bail!("media library migration id has conflicting resolutions"),
+            (true, false) => Some(MigrationDefaultResolution::Applied),
+            (false, true) => Some(MigrationDefaultResolution::RevisionChanged),
+            (false, false) => None,
+        };
+        let archived = self
+            .archived_migration_defaults
+            .binary_search_by(|entry| entry.migration_id.as_str().cmp(migration_id))
+            .ok()
+            .map(|index| self.archived_migration_defaults[index].outcome);
+        let outcome = match (inline, archived) {
+            (Some(inline), Some(archived)) if inline != archived => {
+                bail!("media library migration archive conflicts with inline history");
+            }
+            (Some(outcome), _) | (None, Some(outcome)) => Some(outcome),
+            (None, None) => None,
+        };
+        Ok(outcome.map(|outcome| match outcome {
+            MigrationDefaultResolution::Applied => MigrationDefaultUpdateOutcome::Applied {
                 snapshot: self.snapshot(),
-            }));
-        }
-        Ok(None)
+            },
+            MigrationDefaultResolution::RevisionChanged => {
+                MigrationDefaultUpdateOutcome::RevisionChanged {
+                    snapshot: self.snapshot(),
+                }
+            }
+        }))
     }
 
     pub(crate) fn set_default_for_migration_if_revision(
@@ -517,62 +680,165 @@ impl MediaLibraryRegistryStore {
         if let Some(outcome) = self.resolved_migration_default(migration_id)? {
             return Ok(outcome);
         }
-        if self.migration_default_history_len() >= MAX_RESOLVED_MIGRATION_DEFAULTS {
+        if self.migration_default_history_len().saturating_add(1) > MAX_RESOLVED_MIGRATION_DEFAULTS
+        {
             bail!("media library migration idempotency history is full");
         }
 
-        if self.snapshot.revision != expected_revision {
-            let mut skipped = self.skipped_migration_defaults.clone();
-            skipped.push(migration_id.to_string());
-            write_private_registry(
-                &self.fs,
-                &self.path,
-                &self.snapshot,
-                &self.applied_migration_defaults,
-                &skipped,
-            )?;
-            self.skipped_migration_defaults = skipped;
-            return Ok(MigrationDefaultUpdateOutcome::RevisionChanged {
-                snapshot: self.snapshot(),
-            });
-        }
-
-        let library = self
-            .library(id)
-            .ok_or_else(|| anyhow!("unknown media library {id}"))?;
-        validate_registered_root_for_use(&library.root)?;
-
         let mut next = self.snapshot.clone();
-        next.default_library_id = library.id.clone();
-        next.default_category = library.default_category.clone();
-        if next.default_library_id != self.snapshot.default_library_id
-            || next.default_category != self.snapshot.default_category
-        {
-            next.revision = self
-                .snapshot
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("media library settings revision overflow"))?;
+        let resolution = if self.snapshot.revision != expected_revision {
+            MigrationDefaultResolution::RevisionChanged
+        } else {
+            let library = self
+                .library(id)
+                .ok_or_else(|| anyhow!("unknown media library {id}"))?;
+            validate_registered_root_for_use(&library.root)?;
+            next.default_library_id = library.id.clone();
+            next.default_category = library.default_category.clone();
+            if next.default_library_id != self.snapshot.default_library_id
+                || next.default_category != self.snapshot.default_category
+            {
+                next.revision = self
+                    .snapshot
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("media library settings revision overflow"))?;
+            }
+            MigrationDefaultResolution::Applied
+        };
+
+        let mut prior_inline = self
+            .applied_migration_defaults
+            .iter()
+            .map(|migration_id| MigrationDefaultArchiveEntry {
+                migration_id: migration_id.clone(),
+                outcome: MigrationDefaultResolution::Applied,
+            })
+            .chain(self.skipped_migration_defaults.iter().map(|migration_id| {
+                MigrationDefaultArchiveEntry {
+                    migration_id: migration_id.clone(),
+                    outcome: MigrationDefaultResolution::RevisionChanged,
+                }
+            }))
+            .collect::<Vec<_>>();
+        prior_inline.sort_by(|left, right| left.migration_id.cmp(&right.migration_id));
+        let mut archived = self.archived_migration_defaults.clone();
+        for entry in prior_inline {
+            match archived
+                .binary_search_by(|existing| existing.migration_id.cmp(&entry.migration_id))
+            {
+                Ok(index) if archived[index].outcome == entry.outcome => {}
+                Ok(_) => bail!("media library migration archive conflicts with inline history"),
+                Err(index) => archived.insert(index, entry),
+            }
         }
-        let mut applied = self.applied_migration_defaults.clone();
-        applied.push(migration_id.to_string());
+        let archived_count = archived.len();
+        validate_migration_default_count(archived_count, 1)?;
+        let archive_bytes = if archived.is_empty() {
+            None
+        } else {
+            Some(encode_migration_default_archive(&archived)?)
+        };
+        let archive_sha256 = archive_bytes.as_deref().map(sha256_hex).unwrap_or_default();
+        let applied = if resolution == MigrationDefaultResolution::Applied {
+            vec![migration_id.to_string()]
+        } else {
+            Vec::new()
+        };
+        let skipped = if resolution == MigrationDefaultResolution::RevisionChanged {
+            vec![migration_id.to_string()]
+        } else {
+            Vec::new()
+        };
         validate_registry_shape(&next)?;
-        write_private_registry(
-            &self.fs,
-            &self.path,
-            &next,
-            &applied,
-            &self.skipped_migration_defaults,
-        )?;
+        let registry_bytes =
+            encode_private_registry(&next, &applied, &skipped, archived_count, &archive_sha256)?;
+
+        // Archive prior exact outcomes first. If the main settings replacement is interrupted,
+        // the still-inline entries let open() verify and recognize this duplicate archive tail.
+        if let Some(archive_bytes) = archive_bytes {
+            self.write_migration_default_archive(archived, archive_bytes)?;
+        } else {
+            self.archived_migration_defaults = archived;
+        }
+        self.validate_migration_default_archive_on_disk()?;
+        write_private_registry_bytes(&self.fs, &self.path, &registry_bytes)?;
         self.snapshot = next;
         self.applied_migration_defaults = applied;
-        Ok(MigrationDefaultUpdateOutcome::Applied {
-            snapshot: self.snapshot(),
+        self.skipped_migration_defaults = skipped;
+        self.archived_migration_default_count = archived_count;
+        self.archived_migration_default_sha256 = archive_sha256;
+        Ok(match resolution {
+            MigrationDefaultResolution::Applied => MigrationDefaultUpdateOutcome::Applied {
+                snapshot: self.snapshot(),
+            },
+            MigrationDefaultResolution::RevisionChanged => {
+                MigrationDefaultUpdateOutcome::RevisionChanged {
+                    snapshot: self.snapshot(),
+                }
+            }
         })
     }
 
     fn migration_default_history_len(&self) -> usize {
-        self.applied_migration_defaults.len() + self.skipped_migration_defaults.len()
+        self.archived_migration_default_count
+            .saturating_add(self.applied_migration_defaults.len())
+            .saturating_add(self.skipped_migration_defaults.len())
+    }
+
+    fn write_migration_default_archive(
+        &mut self,
+        entries: Vec<MigrationDefaultArchiveEntry>,
+        bytes: Vec<u8>,
+    ) -> Result<()> {
+        self.validate_migration_default_archive_on_disk()?;
+        if self.archived_migration_default_bytes.as_deref() == Some(bytes.as_slice()) {
+            self.archived_migration_defaults = entries;
+            return Ok(());
+        }
+        let archive_path = migration_default_archive_path(&self.path)?;
+        write_private_migration_archive(
+            &self.fs,
+            &archive_path,
+            self.archived_migration_default_identity,
+            &bytes,
+        )?;
+        let file = self
+            .fs
+            .open_bound_file(&archive_path)?
+            .ok_or_else(|| anyhow!("migration default archive disappeared after writing"))?;
+        file.validate_private_single_link(0o600)
+            .context("media library migration archive must be private and single-linked")?;
+        if file.read_limited(MAX_MIGRATION_DEFAULT_ARCHIVE_BYTES)? != bytes {
+            bail!("media library migration archive changed after writing");
+        }
+        self.archived_migration_default_identity = Some(file.identity());
+        self.archived_migration_default_bytes = Some(bytes);
+        self.archived_migration_defaults = entries;
+        Ok(())
+    }
+
+    fn validate_migration_default_archive_on_disk(&self) -> Result<()> {
+        let path = migration_default_archive_path(&self.path)?;
+        match (
+            self.fs.open_bound_file(&path)?,
+            self.archived_migration_default_identity,
+            self.archived_migration_default_bytes.as_deref(),
+        ) {
+            (None, None, None) => Ok(()),
+            (Some(file), Some(expected_identity), Some(expected_bytes)) => {
+                file.validate_private_single_link(0o600)
+                    .context("media library migration archive must be private and single-linked")?;
+                if file.identity() != expected_identity {
+                    bail!("media library migration archive identity changed");
+                }
+                if file.read_limited(MAX_MIGRATION_DEFAULT_ARCHIVE_BYTES)? != expected_bytes {
+                    bail!("media library migration archive content changed");
+                }
+                Ok(())
+            }
+            _ => bail!("media library migration archive no longer matches its verified state"),
+        }
     }
 
     pub(crate) fn set_category(
@@ -641,21 +907,56 @@ impl MediaLibraryRegistryStore {
     }
 
     fn commit(&mut self, mut next: MediaLibrarySnapshot) -> Result<MediaLibrarySnapshot> {
+        self.commit_inner(&mut next, None)?;
+        self.snapshot = next;
+        Ok(self.snapshot())
+    }
+
+    fn commit_with_root_identity(
+        &mut self,
+        mut next: MediaLibrarySnapshot,
+        root_path: &Path,
+        root_identity: EntryIdentity,
+    ) -> Result<MediaLibrarySnapshot> {
+        self.commit_inner(&mut next, Some((root_path, root_identity)))?;
+        self.snapshot = next;
+        Ok(self.snapshot())
+    }
+
+    fn commit_inner(
+        &self,
+        next: &mut MediaLibrarySnapshot,
+        root_identity: Option<(&Path, EntryIdentity)>,
+    ) -> Result<()> {
         next.revision = self
             .snapshot
             .revision
             .checked_add(1)
             .ok_or_else(|| anyhow!("media library settings revision overflow"))?;
-        validate_registry_shape(&next)?;
-        write_private_registry(
-            &self.fs,
-            &self.path,
-            &next,
+        validate_registry_shape(next)?;
+        self.write_registry_snapshot(next, root_identity)
+    }
+
+    fn write_registry_snapshot(
+        &self,
+        snapshot: &MediaLibrarySnapshot,
+        root_identity: Option<(&Path, EntryIdentity)>,
+    ) -> Result<()> {
+        self.validate_migration_default_archive_on_disk()?;
+        let bytes = encode_private_registry(
+            snapshot,
             &self.applied_migration_defaults,
             &self.skipped_migration_defaults,
+            self.archived_migration_default_count,
+            &self.archived_migration_default_sha256,
         )?;
-        self.snapshot = next;
-        Ok(self.snapshot())
+        if let Some((root_path, identity)) = root_identity {
+            // This is deliberately the last pathname-based operation before the registry's
+            // atomic replacement. Persisted identity always comes from the prepared directory,
+            // never from a fresh identity read here.
+            self.ensure_root_path_matches_identity(root_path, identity)?;
+        }
+        write_private_registry_bytes(&self.fs, &self.path, &bytes)
     }
 }
 
@@ -1203,7 +1504,187 @@ fn document_from_snapshot(snapshot: &MediaLibrarySnapshot) -> RegistryDocument {
         libraries: snapshot.libraries.clone(),
         applied_migration_defaults: Vec::new(),
         skipped_migration_defaults: Vec::new(),
+        archived_migration_default_count: 0,
+        archived_migration_default_sha256: String::new(),
     }
+}
+
+fn migration_default_archive_path(registry_path: &Path) -> Result<PathBuf> {
+    let parent = registry_path
+        .parent()
+        .ok_or_else(|| anyhow!("media library settings path has no parent"))?;
+    Ok(parent.join(DEFAULT_ARCHIVE_FILE))
+}
+
+fn load_migration_default_archive(
+    root: &RootedFs,
+    registry_path: &Path,
+    registry: &RegistryDocument,
+) -> Result<LoadedMigrationDefaultArchive> {
+    let inline = inline_migration_default_entries(
+        &registry.applied_migration_defaults,
+        &registry.skipped_migration_defaults,
+    );
+    validate_migration_default_count(registry.archived_migration_default_count, inline.len())?;
+    if registry.archived_migration_default_count == 0 {
+        if !registry.archived_migration_default_sha256.is_empty() {
+            bail!("media library migration archive has a digest without archived entries");
+        }
+    } else {
+        validate_sha256_hex(&registry.archived_migration_default_sha256)?;
+    }
+
+    let archive_path = migration_default_archive_path(registry_path)?;
+    let Some(file) = root.open_bound_file(&archive_path)? else {
+        if registry.archived_migration_default_count == 0
+            && registry.archived_migration_default_sha256.is_empty()
+        {
+            return Ok(LoadedMigrationDefaultArchive {
+                entries: Vec::new(),
+                bytes: None,
+                identity: None,
+            });
+        }
+        bail!("media library migration archive is missing despite its registry binding");
+    };
+    file.validate_private_single_link(0o600)
+        .context("media library migration archive must be private and single-linked")?;
+    if file.byte_len()? > MAX_MIGRATION_DEFAULT_ARCHIVE_BYTES as u64 {
+        bail!("media library migration archive exceeds its size limit");
+    }
+    let bytes = file.read_limited(MAX_MIGRATION_DEFAULT_ARCHIVE_BYTES)?;
+    let archive_document: MigrationDefaultArchiveDocument =
+        serde_json::from_slice(&bytes).context("invalid media library migration archive")?;
+    if archive_document.version != 1 {
+        bail!("unsupported media library migration archive version");
+    }
+    validate_migration_archive_entries(&archive_document.entries)?;
+    if serde_json::to_vec(&archive_document)? != bytes {
+        bail!("media library migration archive is not canonically encoded");
+    }
+    if archive_document.entries.len() > MAX_RESOLVED_MIGRATION_DEFAULTS {
+        bail!("media library migration archive exceeds its entry limit");
+    }
+    if archive_document.entries.is_empty()
+        && registry.archived_migration_default_count == 0
+        && registry.archived_migration_default_sha256.is_empty()
+    {
+        bail!("media library migration archive exists without a committed or pending outcome");
+    }
+
+    let archive_sha = sha256_hex(&bytes);
+    let mut previous_archive = archive_document.entries.clone();
+    let mut inline_matches = 0;
+    for inline_entry in &inline {
+        match previous_archive
+            .binary_search_by(|entry| entry.migration_id.cmp(&inline_entry.migration_id))
+        {
+            Ok(index) if previous_archive[index].outcome == inline_entry.outcome => {
+                inline_matches += 1;
+            }
+            Ok(_) => bail!("media library migration archive conflicts with inline history"),
+            Err(_) => {}
+        }
+    }
+
+    let normal_archive = archive_sha == registry.archived_migration_default_sha256
+        && archive_document.entries.len() == registry.archived_migration_default_count
+        && inline_matches == 0;
+    if !normal_archive {
+        // The archive is written before the registry is compacted. In that crash window, remove
+        // the exact duplicate inline tail and verify that the prior archive still matches.
+        for inline_entry in &inline {
+            if let Ok(index) = previous_archive
+                .binary_search_by(|entry| entry.migration_id.cmp(&inline_entry.migration_id))
+            {
+                previous_archive.remove(index);
+            }
+        }
+        let prior_bytes = encode_migration_default_archive(&previous_archive)?;
+        let prior_matches = if registry.archived_migration_default_count == 0 {
+            registry.archived_migration_default_sha256.is_empty() && previous_archive.is_empty()
+        } else {
+            previous_archive.len() == registry.archived_migration_default_count
+                && sha256_hex(&prior_bytes) == registry.archived_migration_default_sha256
+        };
+        if !prior_matches || inline_matches != inline.len() {
+            bail!("media library migration archive does not match its registry binding");
+        }
+    }
+
+    Ok(LoadedMigrationDefaultArchive {
+        entries: archive_document.entries,
+        bytes: Some(bytes),
+        identity: Some(file.identity()),
+    })
+}
+
+fn inline_migration_default_entries(
+    applied: &[String],
+    skipped: &[String],
+) -> Vec<MigrationDefaultArchiveEntry> {
+    let mut entries = applied
+        .iter()
+        .map(|migration_id| MigrationDefaultArchiveEntry {
+            migration_id: migration_id.clone(),
+            outcome: MigrationDefaultResolution::Applied,
+        })
+        .chain(
+            skipped
+                .iter()
+                .map(|migration_id| MigrationDefaultArchiveEntry {
+                    migration_id: migration_id.clone(),
+                    outcome: MigrationDefaultResolution::RevisionChanged,
+                }),
+        )
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.migration_id.cmp(&right.migration_id));
+    entries
+}
+
+fn validate_migration_archive_entries(entries: &[MigrationDefaultArchiveEntry]) -> Result<()> {
+    let mut previous = None;
+    for entry in entries {
+        validate_migration_id(&entry.migration_id)?;
+        if previous.is_some_and(|previous: &str| previous >= entry.migration_id.as_str()) {
+            bail!("media library migration archive has duplicate or unsorted IDs");
+        }
+        previous = Some(entry.migration_id.as_str());
+    }
+    Ok(())
+}
+
+fn validate_migration_default_count(archived: usize, inline: usize) -> Result<()> {
+    if archived.saturating_add(inline) > MAX_RESOLVED_MIGRATION_DEFAULTS {
+        bail!("media library migration idempotency history exceeds its limit");
+    }
+    Ok(())
+}
+
+fn encode_migration_default_archive(entries: &[MigrationDefaultArchiveEntry]) -> Result<Vec<u8>> {
+    validate_migration_archive_entries(entries)?;
+    let document = MigrationDefaultArchiveDocument {
+        version: 1,
+        entries: entries.to_vec(),
+    };
+    let bytes = serde_json::to_vec(&document)
+        .context("failed to encode media library migration archive")?;
+    if bytes.len() > MAX_MIGRATION_DEFAULT_ARCHIVE_BYTES {
+        bail!("media library migration archive exceeds its size limit");
+    }
+    Ok(bytes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex_prefix(&digest, 64)
+}
+
+fn validate_sha256_hex(value: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("media library migration archive digest is malformed");
+    }
+    Ok(())
 }
 
 fn read_private_registry(root: &RootedFs, path: &Path) -> Result<Option<Vec<u8>>> {
@@ -1224,15 +1705,51 @@ fn write_private_registry(
     snapshot: &MediaLibrarySnapshot,
     applied_migration_defaults: &[String],
     skipped_migration_defaults: &[String],
+    archived_migration_default_count: usize,
+    archived_migration_default_sha256: &str,
 ) -> Result<()> {
+    let bytes = encode_private_registry(
+        snapshot,
+        applied_migration_defaults,
+        skipped_migration_defaults,
+        archived_migration_default_count,
+        archived_migration_default_sha256,
+    )?;
+    write_private_registry_bytes(root, path, &bytes)
+}
+
+fn encode_private_registry(
+    snapshot: &MediaLibrarySnapshot,
+    applied_migration_defaults: &[String],
+    skipped_migration_defaults: &[String],
+    archived_migration_default_count: usize,
+    archived_migration_default_sha256: &str,
+) -> Result<Vec<u8>> {
     validate_migration_id_history(applied_migration_defaults, skipped_migration_defaults)?;
+    validate_migration_default_count(
+        archived_migration_default_count,
+        applied_migration_defaults.len() + skipped_migration_defaults.len(),
+    )?;
+    if archived_migration_default_count == 0 {
+        if !archived_migration_default_sha256.is_empty() {
+            bail!("media library migration archive has a digest without archived entries");
+        }
+    } else {
+        validate_sha256_hex(archived_migration_default_sha256)?;
+    }
     let mut document = document_from_snapshot(snapshot);
     document.applied_migration_defaults = applied_migration_defaults.to_vec();
     document.skipped_migration_defaults = skipped_migration_defaults.to_vec();
+    document.archived_migration_default_count = archived_migration_default_count;
+    document.archived_migration_default_sha256 = archived_migration_default_sha256.to_string();
     let bytes = serde_json::to_vec(&document).context("failed to encode media library settings")?;
     if bytes.len() > MAX_REGISTRY_BYTES {
         bail!("media library settings exceeds its size limit");
     }
+    Ok(bytes)
+}
+
+fn write_private_registry_bytes(root: &RootedFs, path: &Path, bytes: &[u8]) -> Result<()> {
     let temp = temporary_sibling(path);
     if let Some(file) = root.open_bound_file(path)? {
         file.validate_private_single_link(0o600)
@@ -1242,13 +1759,51 @@ fn write_private_registry(
             &entry,
             file.identity(),
             &temp,
-            &bytes,
+            bytes,
             0o600,
         )?;
     } else {
-        let (source, identity) = root.create_new_bound_file(&temp, &bytes, 0o600)?;
+        let (source, identity) = root.create_new_bound_file(&temp, bytes, 0o600)?;
         let destination = root.bind_entry(path, false)?;
         root.rename_via_bound_parents_noreplace_if_identity(&source, &destination, identity)?;
+    }
+    Ok(())
+}
+
+fn write_private_migration_archive(
+    root: &RootedFs,
+    path: &Path,
+    expected_identity: Option<EntryIdentity>,
+    bytes: &[u8],
+) -> Result<()> {
+    if bytes.len() > MAX_MIGRATION_DEFAULT_ARCHIVE_BYTES {
+        bail!("media library migration archive exceeds its size limit");
+    }
+    let temp = temporary_archive_sibling(path);
+    match root.open_bound_file(path)? {
+        Some(file) => {
+            file.validate_private_single_link(0o600)
+                .context("media library migration archive must be private and single-linked")?;
+            if expected_identity != Some(file.identity()) {
+                bail!("media library migration archive identity changed before replacement");
+            }
+            let entry = root.bind_entry(path, false)?;
+            root.replace_bound_file_atomically_if_identity(
+                &entry,
+                file.identity(),
+                &temp,
+                bytes,
+                0o600,
+            )?;
+        }
+        None => {
+            if expected_identity.is_some() {
+                bail!("media library migration archive disappeared before replacement");
+            }
+            let (source, identity) = root.create_new_bound_file(&temp, bytes, 0o600)?;
+            let destination = root.bind_entry(path, false)?;
+            root.rename_via_bound_parents_noreplace_if_identity(&source, &destination, identity)?;
+        }
     }
     Ok(())
 }
@@ -1258,6 +1813,15 @@ fn temporary_sibling(path: &Path) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!(
         "{REGISTRY_TEMP_PREFIX}-{}-{sequence}",
+        std::process::id()
+    ))
+}
+
+fn temporary_archive_sibling(path: &Path) -> PathBuf {
+    let sequence = REGISTRY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!(
+        "{DEFAULT_ARCHIVE_TEMP_PREFIX}-{}-{sequence}",
         std::process::id()
     ))
 }
@@ -1452,6 +2016,275 @@ mod tests {
             MigrationDefaultUpdateOutcome::RevisionChanged { .. }
         ));
         assert_eq!(reopened.snapshot().default_library_id, source_id);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn migration_default_history_rotates_to_exact_archive_and_replays_after_user_change() {
+        let directory = test_dir("migration-default-archive-many");
+        let source_root = directory.join("videos");
+        let archive_root = directory.join("archive");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&archive_root).unwrap();
+        let mut registry = MediaLibraryRegistryStore::open(None, &source_root).unwrap();
+        let source_id = registry.snapshot().default_library_id;
+        let archive = registry
+            .add("Archive", &archive_root, None, false, false)
+            .unwrap();
+
+        for index in 0..360 {
+            let migration_id = format!("migration-{index:04}-{}", "x".repeat(100));
+            let revision = registry.snapshot().revision;
+            if index % 2 == 0 {
+                let outcome = registry
+                    .set_default_for_migration_if_revision(
+                        &archive.id,
+                        &migration_id,
+                        revision.saturating_add(1),
+                    )
+                    .unwrap();
+                assert!(matches!(
+                    outcome,
+                    MigrationDefaultUpdateOutcome::RevisionChanged { .. }
+                ));
+            } else {
+                let target = if registry.snapshot().default_library_id == source_id {
+                    &archive.id
+                } else {
+                    &source_id
+                };
+                let outcome = registry
+                    .set_default_for_migration_if_revision(target, &migration_id, revision)
+                    .unwrap();
+                assert!(matches!(
+                    outcome,
+                    MigrationDefaultUpdateOutcome::Applied { .. }
+                ));
+            }
+        }
+
+        let registry_bytes = read_private_registry(&registry.fs, &registry.path)
+            .unwrap()
+            .unwrap();
+        assert!(registry_bytes.len() < MAX_REGISTRY_BYTES);
+        assert_eq!(registry.applied_migration_defaults.len(), 1);
+        assert!(registry.skipped_migration_defaults.is_empty());
+        assert_eq!(registry.archived_migration_default_count, 359);
+        let archive_counts = registry.archived_migration_defaults.iter().fold(
+            (0, 0),
+            |(applied, skipped), entry| match entry.outcome {
+                MigrationDefaultResolution::Applied => (applied + 1, skipped),
+                MigrationDefaultResolution::RevisionChanged => (applied, skipped + 1),
+            },
+        );
+        assert_eq!(archive_counts, (179, 180));
+
+        registry.set_default(&source_id).unwrap();
+        let selected_default = registry.snapshot().default_library_id.clone();
+        let mut reopened = MediaLibraryRegistryStore::open(None, &source_root).unwrap();
+        let replay = reopened
+            .set_default_for_migration_if_revision(
+                &archive.id,
+                &format!("migration-0000-{}", "x".repeat(100)),
+                0,
+            )
+            .unwrap();
+        assert!(matches!(
+            replay,
+            MigrationDefaultUpdateOutcome::RevisionChanged { .. }
+        ));
+        assert_eq!(reopened.snapshot().default_library_id, selected_default);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn archive_before_registry_crash_survives_user_commit_and_later_compaction() {
+        let directory = test_dir("migration-default-archive-crash");
+        let source_root = directory.join("videos");
+        let archive_root = directory.join("archive");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&archive_root).unwrap();
+        let mut registry = MediaLibraryRegistryStore::open(None, &source_root).unwrap();
+        let source_id = registry.snapshot().default_library_id;
+        let archive = registry
+            .add("Archive", &archive_root, None, false, false)
+            .unwrap();
+
+        let old_revision = registry.snapshot().revision;
+        registry
+            .set_default_for_migration_if_revision(
+                &archive.id,
+                "migration-inline-old",
+                old_revision,
+            )
+            .unwrap();
+        let archive_entries = inline_migration_default_entries(
+            &registry.applied_migration_defaults,
+            &registry.skipped_migration_defaults,
+        );
+        let archive_bytes = encode_migration_default_archive(&archive_entries).unwrap();
+        let archive_path = migration_default_archive_path(&registry.path).unwrap();
+        write_private_migration_archive(&registry.fs, &archive_path, None, &archive_bytes)
+            .expect("simulate durable archive write before registry compaction");
+        drop(registry);
+
+        let mut reopened = MediaLibraryRegistryStore::open(None, &source_root)
+            .expect("reopen must recognize the exact duplicated inline/archive tail");
+        assert!(matches!(
+            reopened
+                .resolved_migration_default("migration-inline-old")
+                .unwrap(),
+            Some(MigrationDefaultUpdateOutcome::Applied { .. })
+        ));
+        reopened.set_default(&source_id).unwrap();
+        reopened
+            .set_category(&archive.id, Some(Path::new("Kids")))
+            .unwrap();
+        let expected_revision = reopened.snapshot().revision;
+        reopened
+            .set_default_for_migration_if_revision(
+                &archive.id,
+                "migration-after-crash",
+                expected_revision,
+            )
+            .unwrap();
+        reopened.set_default(&source_id).unwrap();
+        drop(reopened);
+
+        let mut final_registry = MediaLibraryRegistryStore::open(None, &source_root).unwrap();
+        assert!(matches!(
+            final_registry
+                .resolved_migration_default("migration-inline-old")
+                .unwrap(),
+            Some(MigrationDefaultUpdateOutcome::Applied { .. })
+        ));
+        let default_before_replay = final_registry.snapshot().default_library_id.clone();
+        final_registry
+            .set_default_for_migration_if_revision(&archive.id, "migration-inline-old", 0)
+            .unwrap();
+        assert_eq!(
+            final_registry.snapshot().default_library_id,
+            default_before_replay
+        );
+        assert_eq!(final_registry.archived_migration_default_count, 1);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_unreadable_or_conflicting_archive_fails_closed_without_rewriting_registry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_dir("migration-default-archive-integrity");
+        let source_root = directory.join("videos");
+        let archive_root = directory.join("archive");
+        fs::create_dir_all(&source_root).unwrap();
+        fs::create_dir_all(&archive_root).unwrap();
+        let mut registry = MediaLibraryRegistryStore::open(None, &source_root).unwrap();
+        let archive = registry
+            .add("Archive", &archive_root, None, false, false)
+            .unwrap();
+        let revision = registry.snapshot().revision;
+        registry
+            .set_default_for_migration_if_revision(&archive.id, "migration-one", revision)
+            .unwrap();
+        registry
+            .set_default_for_migration_if_revision(
+                &registry.snapshot().default_library_id,
+                "migration-two",
+                revision.saturating_add(1),
+            )
+            .unwrap();
+        let registry_path = registry.path.clone();
+        let archive_path = migration_default_archive_path(&registry.path).unwrap();
+        let main_bytes = fs::read(&registry_path).unwrap();
+        drop(registry);
+
+        let original_archive = fs::read(&archive_path).unwrap();
+        let mut permissions = fs::metadata(&archive_path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&archive_path, permissions).unwrap();
+        assert!(MediaLibraryRegistryStore::open(None, &source_root).is_err());
+        assert_eq!(fs::read(&archive_path).unwrap(), original_archive);
+        assert_eq!(fs::read(&registry_path).unwrap(), main_bytes);
+
+        let mut permissions = fs::metadata(&archive_path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&archive_path, permissions).unwrap();
+        let mut changed: MigrationDefaultArchiveDocument =
+            serde_json::from_slice(&original_archive).unwrap();
+        changed.entries[0].outcome = match changed.entries[0].outcome {
+            MigrationDefaultResolution::Applied => MigrationDefaultResolution::RevisionChanged,
+            MigrationDefaultResolution::RevisionChanged => MigrationDefaultResolution::Applied,
+        };
+        let conflicting_bytes = serde_json::to_vec(&changed).unwrap();
+        fs::write(&archive_path, &conflicting_bytes).unwrap();
+        assert!(MediaLibraryRegistryStore::open(None, &source_root).is_err());
+        assert_eq!(fs::read(&archive_path).unwrap(), conflicting_bytes);
+        assert_eq!(fs::read(&registry_path).unwrap(), main_bytes);
+
+        fs::remove_file(&archive_path).unwrap();
+        assert!(MediaLibraryRegistryStore::open(None, &source_root).is_err());
+        assert_eq!(fs::read(&registry_path).unwrap(), main_bytes);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepared_root_identity_rejects_replacement_and_allows_child_churn() {
+        let directory = test_dir("prepared-root-binding");
+        let videos = directory.join("videos");
+        let archive_root = directory.join("archive");
+        let candidate_root = directory.join("candidate");
+        let original_candidate = directory.join("candidate-original");
+        fs::create_dir_all(&videos).unwrap();
+        fs::create_dir_all(&archive_root).unwrap();
+        fs::create_dir_all(&candidate_root).unwrap();
+        let mut registry = MediaLibraryRegistryStore::open(None, &videos).unwrap();
+
+        let archive_identity = RootedFs::new(&archive_root).unwrap().root_identity();
+        let child = archive_root.join("ordinary-child");
+        fs::create_dir(&child).unwrap();
+        fs::remove_dir(&child).unwrap();
+        let library = registry
+            .add_with_root_identity("Archive", &archive_root, None, false, archive_identity)
+            .unwrap();
+        assert_eq!(
+            registry.root_binding(&library.id),
+            Some((archive_identity.device(), archive_identity.inode()))
+        );
+        assert_eq!(
+            registry.snapshot().default_library_id,
+            registry.snapshot().libraries[0].id
+        );
+
+        let old_identity = RootedFs::new(&candidate_root).unwrap().root_identity();
+        fs::rename(&candidate_root, &original_candidate).unwrap();
+        fs::create_dir(&candidate_root).unwrap();
+        fs::write(
+            candidate_root.join("keep.txt"),
+            b"replacement stays untouched",
+        )
+        .unwrap();
+        let before_rejected_default = registry.snapshot();
+        let replacement_identity = RootedFs::new(&candidate_root).unwrap().root_identity();
+        assert_ne!(replacement_identity, old_identity);
+        let error = registry
+            .add_with_root_identity("Replacement", &candidate_root, None, true, old_identity)
+            .expect_err("registration must reject a replaced pathname before committing default");
+        assert!(format!("{error:#}").contains("identity changed during registration"));
+        assert_eq!(registry.snapshot(), before_rejected_default);
+        assert_eq!(
+            registry.snapshot().default_library_id,
+            before_rejected_default.libraries[0].id
+        );
+        assert_eq!(
+            fs::read(candidate_root.join("keep.txt")).unwrap(),
+            b"replacement stays untouched"
+        );
+
+        let reopened = MediaLibraryRegistryStore::open(None, &videos).unwrap();
+        assert_eq!(reopened.snapshot(), before_rejected_default);
         let _ = fs::remove_dir_all(directory);
     }
 

@@ -311,6 +311,19 @@ describe("migration progress controls and history notice", () => {
     expect(migrationControlActions({ status: "partial", failed_count: 2 })).toEqual(["retry_failed"]);
   });
 
+  it("offers terminal finalization only when completed or stopped work reports pending cleanup", () => {
+    expect(migrationControlActions({ status: "completed", terminal_finalization_pending: true }))
+      .toEqual(["finalize_terminal"]);
+    expect(migrationControlActions({ status: "stopped", terminal_finalization_pending: true }))
+      .toEqual(["finalize_terminal"]);
+    expect(migrationControlActions({ status: "completed", terminal_finalization_pending: false })).toEqual([]);
+    expect(migrationControlActions({ status: "stopped", terminal_finalization_pending: true, task_transfers: [] }))
+      .toEqual(["finalize_terminal"]);
+    expect(migrationControlActions({ status: "running", terminal_finalization_pending: true }))
+      .toEqual(["pause", "stop_remaining"]);
+    expect(migrationControlActions({ status: "completed", terminal_finalization_pending: 1 })).toEqual([]);
+  });
+
   it("shows a positive omitted-history count with wording for any capped migrations", () => {
     expect(migrationHistoryNotice(0)).toBe("");
     expect(migrationHistoryNotice(-1)).toBe("");
@@ -353,6 +366,80 @@ describe("migration history rendering", () => {
     expect(markup).toContain(`state-pill${pending ? " pending" : ""}`);
     for (const control of controls) expect(markup).toContain(`data-migration-control="${control}"`);
     if (controls.length === 0) expect(markup).not.toContain("data-migration-control=");
+  });
+
+  it.each([
+    ["completed", true],
+    ["stopped", true],
+  ] as const)("renders the authenticated terminal finalization control for %s only when pending", (status, pending) => {
+    const migration = {
+      id: `terminal-${status}`,
+      status,
+      terminal_finalization_pending: pending,
+      source_library_id: "source",
+      target_library_id: "target",
+      failed_count: 0,
+      task_transfers: [],
+      items: [],
+    };
+    const markup = renderMigrationHistory({ migrations: [migration], libraries, libraryId: "source" });
+    expect(markup).toContain('data-migration-control="finalize_terminal"');
+    expect(markup).toContain("Finish pending finalization");
+  });
+
+  it("does not expose terminal finalization for resolved or active migrations", () => {
+    const markup = renderMigrationHistory({
+      migrations: [
+        { id: "resolved", status: "completed", terminal_finalization_pending: false, source_library_id: "source", target_library_id: "target" },
+        { id: "stopped-resolved", status: "stopped", terminal_finalization_pending: false, source_library_id: "source", target_library_id: "target" },
+        { id: "active", status: "running", terminal_finalization_pending: true, source_library_id: "source", target_library_id: "target" },
+      ],
+      libraries,
+      libraryId: "source",
+    });
+    expect(markup).not.toContain('data-migration-control="finalize_terminal"');
+  });
+
+  it.each([
+    "Migration needs attention: the participating queue stores could not be checked.",
+    "Migration needs attention: the queue transfer state is unavailable.",
+    "Migration needs attention: terminal finalization could not finish.",
+  ])("renders persisted terminal attention warning: %s", (warning) => {
+    const markup = renderMigrationHistory({
+      migrations: [{
+        id: "terminal-attention",
+        status: "completed",
+        terminal_finalization_pending: true,
+        warnings: [warning],
+        source_library_id: "source",
+        target_library_id: "target",
+        items: [],
+      }],
+      libraries,
+      libraryId: "source",
+    });
+    expect(markup).toContain("Migration needs attention:");
+    expect(markup).toContain(warning);
+  });
+
+  it("bounds and escapes terminal finalization warning detail", () => {
+    const longWarning = `Migration needs attention: <unsafe> ${"x".repeat(800)}`;
+    const markup = renderMigrationHistory({
+      migrations: [{
+        id: "terminal-attention-long",
+        status: "stopped",
+        terminal_finalization_pending: true,
+        warnings: [longWarning],
+        source_library_id: "source",
+        target_library_id: "target",
+        items: [],
+      }],
+      libraries,
+      libraryId: "source",
+    });
+    expect(markup).toContain("&lt;unsafe&gt;");
+    expect(markup).not.toContain(longWarning);
+    expect(markup).toContain("…");
   });
 
   it("renders the first backend-prioritized migrations before older history", () => {
@@ -1359,6 +1446,7 @@ describe("Mini App identity and actions", () => {
       { kind: "library_migration_preview", payload: { source_library_id: "library-main", target_library_id: "library-archive", scope: "library", include_incomplete_tasks: false, conflict: "skip", item_conflicts: { "item-a": "keep_both" }, set_target_default_on_success: false, supersedes_preview_seq: 19, supersedes_preview_id: "migration-preview-old", supersedes_revision: "revision-old" } },
       { kind: "library_migration_confirm", payload: { preview_id: "migration-preview-a", revision: "revision-a" } },
       { kind: "library_migration_control", payload: { migration_id: "migration-a", control: "resume" } },
+      { kind: "library_migration_control", payload: { migration_id: "migration-terminal", control: "finalize_terminal" } },
     ];
 
     for (const [index, action] of actions.entries()) {

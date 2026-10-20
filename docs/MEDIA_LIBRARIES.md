@@ -30,6 +30,8 @@ a replacement directory at the same pathname is rejected while task and staging 
 bound to the original directory.
 Changing the default or a library's category also requires the registered root to be available
 and identity-matched; rejection preserves the existing settings and revision.
+Registration stores the identity of the directory opened during preparation with the new entry.
+A replacement detected before that commit leaves the registry, default and revision unchanged.
 
 A failed refresh retains the last successful view for that library and marks it unavailable.
 Cached items stay visible but read-only until a successful scan. Refresh and library switching
@@ -43,6 +45,9 @@ Video, NFO, danmaku, subtitle, and cover associations move as a bundle. Conflict
 **Skip**; **Keep both** reserves a new bundle name without replacing existing target files.
 Refreshing conflict choices durably supersedes the exact earlier preview. Reloading the Mini App
 cannot make that earlier revision executable again.
+Expired, superseded and confirmed preview documents are retired through bounded cleanup.
+Confirmation keeps the durable job plan and replay information needed for recovery; retiring a
+preview does not remove media, retained download fragments or an active migration's checkpoints.
 
 The separate **include unfinished tasks** checkbox is shown only when the scope affects such
 tasks and starts unchecked. When checked for a partially selected unfinished collection task,
@@ -96,6 +101,10 @@ An independent unchecked option can set the target as default after success. Tha
 recorded once so crash recovery cannot overwrite a later user choice. Migration manifests are
 kept in the source library's private metadata directory, independently of cloud receipt retention.
 A cloud database epoch change pauses automatic recovery until a new authorized resume.
+Completed or stopped jobs with pending queue/source cleanup expose an explicit finalization
+control after such a change. Completed jobs can also finish an unresolved default update.
+This authorization preserves stopped work and does not restart uninstalled media or task plans;
+fully finalized history does not show the control.
 The default update is conditional on the settings revision durably recorded at confirmation,
 before waiting for task writers or output ownership. A newer settings change causes it to be
 skipped durably. Cloud snapshots include at most 32 migrations, prioritizing active
@@ -104,6 +113,10 @@ omitted entries; local manifests remain available for recovery.
 Snapshot upload limits also compact migration item, task-handoff, and conflict-choice details.
 Totals, recovery controls, error counts, bounded error details and omission counts remain
 available; complete records stay in the source library's private migration manifest.
+The registry keeps recent default-update results within its serialized byte limit. Older exact
+outcomes are durably saved in a separate bounded private archive before removal from the registry document,
+so replay of an old migration still preserves later user choices. Conflicting or unreadable
+receipts require attention rather than being treated as an absent result.
 
 ## Storage and rollout
 

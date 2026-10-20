@@ -770,6 +770,22 @@ pub struct LibraryManager {
     scan_attempts: AtomicUsize,
 }
 
+/// Exact proof for a private durable migration state file. The access policy is always
+/// revalidated as owner-private mode 0600 with one link when applying this proof.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct MigrationStateFileProof {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) size_bytes: u64,
+    pub(crate) sha256: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MigrationStateSnapshot {
+    pub(crate) proof: MigrationStateFileProof,
+    pub(crate) contents: Vec<u8>,
+}
+
 pub(crate) enum PreviewCleanupOutcome {
     Removed,
     Retained,
@@ -2162,6 +2178,179 @@ impl LibraryManager {
     pub(crate) fn migration_read_state(&self, name: &str, limit: usize) -> Result<Option<Vec<u8>>> {
         let path = self.migration_state_path(name)?;
         self.read_private_file(&path, limit)
+    }
+
+    pub(crate) fn migration_read_state_snapshot(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Option<MigrationStateSnapshot>> {
+        let path = self.migration_state_path(name)?;
+        self.coordinate_read(&path, |coordinated| {
+            self.validate_library_directory()?;
+            let Some(file) = self.root.open_bound_file(coordinated)? else {
+                return Ok(None);
+            };
+            validate_private_migration_state_file(&file)?;
+            let identity = file.identity();
+            let contents = file.read_limited(limit)?;
+            if file.byte_len()? != contents.len() as u64 {
+                bail!("media-library state file changed while reading its snapshot");
+            }
+            let repeated = file.read_limited(limit)?;
+            validate_private_migration_state_file(&file)?;
+            if repeated != contents {
+                bail!("media-library state content changed while reading its snapshot");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(identity) {
+                bail!("media-library state identity changed while reading its snapshot");
+            }
+            Ok(Some(MigrationStateSnapshot {
+                proof: MigrationStateFileProof {
+                    device: identity.device(),
+                    inode: identity.inode(),
+                    size_bytes: contents.len() as u64,
+                    sha256: sha256_bytes(&contents),
+                },
+                contents,
+            }))
+        })
+    }
+
+    pub(crate) fn migration_replace_state_if_unchanged(
+        &self,
+        name: &str,
+        snapshot: &MigrationStateSnapshot,
+        contents: &[u8],
+    ) -> Result<()> {
+        let path = self.migration_state_path(name)?;
+        if contents.len() > 64 * 1024 * 1024 {
+            bail!("migration state file exceeds its size limit");
+        }
+        if snapshot.proof.size_bytes != snapshot.contents.len() as u64
+            || sha256_bytes(&snapshot.contents) != snapshot.proof.sha256
+        {
+            bail!("migration state snapshot has an invalid content proof");
+        }
+        self.coordinate_write(&path, |coordinated| {
+            self.validate_library_directory()?;
+            let file = self
+                .root
+                .open_bound_file(coordinated)?
+                .ok_or_else(|| anyhow!("migration state file disappeared before replacement"))?;
+            validate_private_migration_state_file(&file)?;
+            let expected = EntryIdentity::regular_file(snapshot.proof.device, snapshot.proof.inode);
+            if file.identity() != expected
+                || file.byte_len()? != snapshot.proof.size_bytes
+                || sha256_bytes(&file.read_limited(64 * 1024 * 1024)?) != snapshot.proof.sha256
+            {
+                bail!("migration state file identity or content changed before replacement");
+            }
+            let entry = self.root.bind_entry(coordinated, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(expected) {
+                bail!("migration state file was replaced before atomic update");
+            }
+            let verify_bytes = usize::try_from(snapshot.proof.size_bytes)
+                .context("migration state snapshot size does not fit in memory")?;
+            let temporary = private_temp_sibling(coordinated);
+            let expected_replacement_hash = sha256_bytes(contents);
+            let mut verify_original = |staged_entry: &crate::safe_fs::BoundEntry,
+                                       staged_file: &BoundFile,
+                                       staged_identity: EntryIdentity|
+             -> Result<()> {
+                // SafeFs invokes this callback with the newly staged replacement. Revalidate
+                // the captured original through its already-open handle, and separately bind
+                // the staged inode/content to the requested replacement bytes.
+                validate_private_migration_state_file(&file)?;
+                if file.identity() != expected
+                    || file.byte_len()? != snapshot.proof.size_bytes
+                    || sha256_bytes(&file.read_limited(64 * 1024 * 1024)?) != snapshot.proof.sha256
+                {
+                    bail!("migration state file changed during atomic update");
+                }
+                validate_private_migration_state_file(staged_file)?;
+                let staged_contents = staged_file.read_limited(contents.len())?;
+                if staged_entry.path() != temporary
+                    || staged_identity != staged_file.identity()
+                    || !staged_identity.is_file()
+                    || self.root.bound_entry_identity(staged_entry)? != Some(staged_identity)
+                    || staged_file.byte_len()? != contents.len() as u64
+                    || staged_contents != contents
+                    || sha256_bytes(&staged_contents) != expected_replacement_hash
+                {
+                    bail!("staged migration state replacement changed before atomic update");
+                }
+                Ok(())
+            };
+            let (_, new_identity) = self
+                .root
+                .replace_bound_file_atomically_if_identity_with_checkpoint(
+                    &entry,
+                    expected,
+                    &temporary,
+                    contents,
+                    0o600,
+                    verify_bytes,
+                    &mut verify_original,
+                )?;
+            let current = self
+                .root
+                .open_bound_file(coordinated)?
+                .ok_or_else(|| anyhow!("updated migration state file disappeared"))?;
+            if current.identity() != new_identity {
+                bail!("updated migration state file identity changed after replacement");
+            }
+            validate_private_migration_state_file(&current)?;
+            if current.read_limited(contents.len())? != contents {
+                bail!("updated migration state content changed after replacement");
+            }
+            Ok(())
+        })
+    }
+
+    /// Removes a state file only when it is still the exact private file described by a
+    /// previously persisted proof. Missing files are an idempotent success (`false`).
+    pub(crate) fn migration_remove_state_if_proof(
+        &self,
+        name: &str,
+        proof: &MigrationStateFileProof,
+    ) -> Result<bool> {
+        let path = self.migration_state_path(name)?;
+        if proof.size_bytes > 64 * 1024 * 1024
+            || proof.device == 0
+            || proof.inode == 0
+            || proof.sha256.len() != 64
+            || !proof.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("migration state removal proof exceeds its size limit");
+        }
+        self.coordinate_write(&path, |coordinated| {
+            self.validate_library_directory()?;
+            let Some(file) = self.root.open_bound_file(coordinated)? else {
+                return Ok(false);
+            };
+            validate_private_migration_state_file(&file)?;
+            let expected = EntryIdentity::regular_file(proof.device, proof.inode);
+            let verify = || -> Result<()> {
+                validate_private_migration_state_file(&file)?;
+                if file.identity() != expected
+                    || file.byte_len()? != proof.size_bytes
+                    || sha256_bytes(&file.read_limited(64 * 1024 * 1024)?) != proof.sha256
+                {
+                    bail!("migration state file no longer matches its retirement proof");
+                }
+                Ok(())
+            };
+            verify()?;
+            let entry = self.root.bind_entry(coordinated, false)?;
+            if self.root.bound_entry_identity(&entry)? != Some(expected) {
+                bail!("migration state file was replaced before retirement");
+            }
+            self.root
+                .remove_bound_file_if_identity_with_validation(&entry, expected, verify)?;
+            Ok(true)
+        })
     }
 
     pub(crate) fn migration_write_state(&self, name: &str, contents: &[u8]) -> Result<()> {
@@ -6996,6 +7185,16 @@ fn sha256_bound_file(file: &BoundFile) -> Result<String> {
 
 fn sha256_bytes(bytes: &[u8]) -> String {
     hex_digest(Sha256::digest(bytes).as_slice())
+}
+
+fn validate_private_migration_state_file(file: &BoundFile) -> Result<()> {
+    file.validate_private_single_link(0o600)
+        .context("media-library state file must be owner-private")?;
+    let policy = file.access_policy()?;
+    if policy.mode != 0o600 || policy.link_count != 1 {
+        bail!("media-library state file access policy is not exactly private mode 0600");
+    }
+    Ok(())
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

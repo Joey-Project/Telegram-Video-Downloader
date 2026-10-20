@@ -126,6 +126,12 @@ pub(super) fn ensure_library_removable(runtime: &CloudBotRuntime, library_id: &s
                 &status.source_library_id,
                 &status.target_library_id,
             )?;
+            if status.terminal_finalization_pending {
+                bail!(
+                    "finish pending terminal migration finalization for migration {} before removing this library registration",
+                    status.id
+                );
+            }
             if engine.task_handoff_cleanup_pending(&status.id, library_id)? {
                 bail!(
                     "finish source staging cleanup for migration {} before removing this library registration",
@@ -307,13 +313,47 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
     Ok(preview)
 }
 
-async fn publish_status(runtime: &CloudBotRuntime, status: MigrationStatus) {
+async fn publish_status(runtime: &CloudBotRuntime, mut status: MigrationStatus) {
+    if matches!(
+        status.status,
+        MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+    ) {
+        let queue = Arc::clone(&runtime.bot.queue);
+        let migration_id = status.id.clone();
+        match tokio::task::spawn_blocking(move || {
+            queue.has_pending_task_destination_transfer_for_migration(&migration_id)
+        })
+        .await
+        {
+            Ok(Ok(pending)) => status.terminal_finalization_pending |= pending,
+            Ok(Err(error)) => {
+                warn!(error=%redact_sensitive_text(&format!("{error:#}")), migration_id=%status.id, "could not verify terminal migration queue handoff state");
+                mark_terminal_finalization_attention(&mut status);
+            }
+            Err(error) => {
+                warn!(error=%redact_sensitive_text(&format!("{error:#}")), migration_id=%status.id, "could not join terminal migration queue handoff check");
+                mark_terminal_finalization_attention(&mut status);
+            }
+        }
+    }
+    store_status(runtime, status).await;
+}
+
+async fn store_status(runtime: &CloudBotRuntime, status: MigrationStatus) {
     runtime
         .migrations
         .lock()
         .await
         .insert(status.id.clone(), status);
     runtime.state_notify.notify_one();
+}
+
+fn mark_terminal_finalization_attention(status: &mut MigrationStatus) {
+    status.terminal_finalization_pending = true;
+    const WARNING: &str = "Migration needs attention: the participating queue stores could not be checked. Retry terminal finalization after they are available.";
+    if !status.warnings.iter().any(|warning| warning == WARNING) {
+        status.warnings.push(WARNING.to_string());
+    }
 }
 
 fn locate_preview(runtime: &CloudBotRuntime, id: &str) -> Result<MigrationPreview> {
@@ -421,27 +461,31 @@ async fn dispatch_inner(
         }
         "library_migration_control" => {
             let payload: ControlPayload = serde_json::from_value(request.payload.clone())?;
+            if payload.control == MigrationControl::FinalizeTerminal {
+                return finalize_terminal_control(runtime, payload.migration_id).await;
+            }
             let worker = runtime.clone();
-            let (engine, status) = tokio::task::spawn_blocking(move || {
+            let current_epoch = runtime.inbox.database_epoch().to_string();
+            let (engine, status, terminal_noop) = tokio::task::spawn_blocking(move || {
                 let preview = locate_preview(&worker, &payload.migration_id)?;
                 let engine = engine(
                     &worker,
                     &preview.source_library_id,
                     &preview.target_library_id,
                 )?;
-                let mut context = engine
-                    .runtime_context(&payload.migration_id)?
-                    .context("migration recovery context is missing")?;
-                // Every authenticated management control belongs to the current cloud epoch.
-                // In particular, an explicit stop can authorize terminal queue/source cleanup
-                // after a database epoch rollover.
-                context.database_epoch = worker.inbox.database_epoch().to_string();
-                engine.set_runtime_context(&payload.migration_id, context)?;
-                let status = engine.control(&payload.migration_id, payload.control)?;
-                Ok::<_, anyhow::Error>((engine, status))
+                // Status validation, epoch refresh, and the control update share the engine's
+                // migration lock so a concurrent terminal checkpoint cannot turn a stale
+                // ordinary control into terminal finalization authorization.
+                let (status, terminal_noop) = engine.control_in_epoch(
+                    &payload.migration_id,
+                    payload.control,
+                    &current_epoch,
+                )?;
+                Ok::<_, anyhow::Error>((engine, status, terminal_noop))
             })
             .await??;
-            if status.status == MigrationRunStatus::Stopped
+            if !terminal_noop
+                && status.status == MigrationRunStatus::Stopped
                 && !runtime.migration_runners.lock().await.contains(&status.id)
             {
                 let status = finish_task_transfers(runtime, &engine, &status, None).await?;
@@ -450,7 +494,9 @@ async fn dispatch_inner(
             }
             let status = read_status(&engine, &status.id).await?.unwrap_or(status);
             publish_status(runtime, status.clone()).await;
-            start(runtime.clone(), status.clone()).await;
+            if !terminal_noop {
+                start(runtime.clone(), status.clone()).await;
+            }
             Ok(CloudDispatchOutcome {
                 status: InboxStatus::Completed,
                 result: Some(json!({"migration":status})),
@@ -460,6 +506,174 @@ async fn dispatch_inner(
         }
         _ => unreachable!(),
     }
+}
+
+async fn finalize_terminal_control(
+    runtime: &CloudBotRuntime,
+    migration_id: String,
+) -> Result<CloudDispatchOutcome> {
+    let worker = runtime.clone();
+    let worker_id = migration_id.clone();
+    let current_epoch = runtime.inbox.database_epoch().to_string();
+    let (engine, mut status, queue_pending, queue_warning, engine_pending, authorization_current) =
+        tokio::task::spawn_blocking(move || {
+            let preview = locate_preview(&worker, &worker_id)?;
+            let engine = engine(
+                &worker,
+                &preview.source_library_id,
+                &preview.target_library_id,
+            )?;
+            let current = engine
+                .status(&worker_id)?
+                .context("migration status is unavailable")?;
+            if !matches!(
+                current.status,
+                MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+            ) {
+                bail!("terminal finalization is available only for completed or stopped migrations");
+            }
+            let (queue_pending, queue_warning) = match worker
+                .bot
+                .queue
+                .has_pending_task_destination_transfer_for_migration(&worker_id)
+            {
+                Ok(pending) => (pending, None),
+                Err(error) => {
+                    warn!(error=%redact_sensitive_text(&format!("{error:#}")), migration_id=%worker_id, "could not verify queue state before terminal migration finalization");
+                    // Even when the engine has pending default/cleanup work, queue state must
+                    // be checked successfully before refreshing the epoch. This keeps an
+                    // unavailable queue from authorizing any terminal side effect.
+                    let warning = "Migration needs attention: the queue transfer state is unavailable. Retry terminal finalization after queue storage is available.";
+                    let status = engine.record_finalization_warning(&worker_id, warning)?;
+                    return Ok::<_, anyhow::Error>((
+                        engine,
+                        status,
+                        false,
+                        Some(warning.to_string()),
+                        current.terminal_finalization_pending,
+                        false,
+                    ));
+                }
+            };
+            let engine_pending = current.terminal_finalization_pending;
+            let mut status = engine
+                .reauthorize_terminal_finalization(&worker_id, &current_epoch, queue_pending)?
+                .context("no terminal migration finalization is pending")?;
+            if let Some(warning) = queue_warning.as_deref() {
+                status = engine.record_finalization_warning(&worker_id, warning)?;
+                status.terminal_finalization_pending = true;
+            }
+            status.terminal_finalization_pending |= queue_pending;
+            Ok::<_, anyhow::Error>((
+                engine,
+                status,
+                queue_pending,
+                queue_warning,
+                engine_pending,
+                true,
+            ))
+        })
+        .await??;
+
+    if let Some(warning) = queue_warning.as_deref() {
+        if status.warnings.iter().all(|saved| saved != warning) {
+            status.warnings.push(warning.to_string());
+        }
+        status.terminal_finalization_pending = true;
+    }
+    store_status(runtime, status.clone()).await;
+
+    let should_finalize = authorization_current && (engine_pending || queue_pending);
+    if should_finalize {
+        let inserted = runtime
+            .migration_runners
+            .lock()
+            .await
+            .insert(migration_id.clone());
+        if inserted {
+            let worker_runtime = runtime.clone();
+            let worker_engine = engine.clone();
+            let worker_status = status.clone();
+            let worker_id = migration_id.clone();
+            tokio::spawn(async move {
+                run_terminal_finalizer(
+                    worker_runtime,
+                    worker_engine,
+                    worker_status,
+                    worker_id.clone(),
+                )
+                .await;
+            });
+        }
+    }
+
+    Ok(CloudDispatchOutcome {
+        status: InboxStatus::Completed,
+        result: Some(json!({"migration":status,"accepted":true})),
+        error: None,
+        related_preview: None,
+    })
+}
+
+async fn run_terminal_finalizer(
+    runtime: CloudBotRuntime,
+    engine: MigrationEngine,
+    initial: MigrationStatus,
+    migration_id: String,
+) {
+    let result = async {
+        let mut status = finish_task_transfers(&runtime, &engine, &initial, None).await?;
+        if status.status == MigrationRunStatus::Completed {
+            apply_success_default(&runtime, &engine, &status).await?;
+        }
+        if let Some(current) = read_status(&engine, &migration_id).await? {
+            status = current;
+        }
+        edit_status(&runtime, &engine, &status).await?;
+        publish_status(&runtime, status).await;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(error) = result {
+        let warning = redact_sensitive_text(&format!(
+            "Migration needs attention: terminal finalization could not finish: {error:#}"
+        ));
+        warn!(migration_id=%migration_id,error=%warning,"terminal migration finalization needs attention");
+        let worker = engine.clone();
+        let id = migration_id.clone();
+        let saved = warning.clone();
+        let saved_status =
+            tokio::task::spawn_blocking(move || worker.record_finalization_warning(&id, &saved))
+                .await;
+        let mut status = match saved_status {
+            Ok(Ok(status)) => status,
+            Ok(Err(save_error)) => {
+                warn!(migration_id=%migration_id,error=%redact_sensitive_text(&format!("{save_error:#}")),"could not persist terminal finalization warning");
+                read_status(&engine, &migration_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(initial)
+            }
+            Err(join_error) => {
+                warn!(migration_id=%migration_id,error=%redact_sensitive_text(&format!("{join_error:#}")),"could not join terminal finalization warning update");
+                read_status(&engine, &migration_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(initial)
+            }
+        };
+        if !status.warnings.contains(&warning) {
+            status.warnings.push(warning);
+        }
+        status.terminal_finalization_pending = true;
+        edit_status(&runtime, &engine, &status).await.ok();
+        publish_status(&runtime, status).await;
+    }
+
+    runtime.migration_runners.lock().await.remove(&migration_id);
 }
 
 async fn ensure_message_context(
@@ -563,6 +777,16 @@ async fn discover(runtime: &CloudBotRuntime) -> Result<()> {
         let mut statuses = Vec::new();
         for library in worker.bot.queue.registry_snapshot()?.libraries {
             if let Ok(source) = manager(&worker, &library.id) {
+                match MigrationEngine::maintain_source(&source) {
+                    Ok(report) => {
+                        if let Some(warning) = report.warning {
+                            warn!(library_id=%library.id, warning=%warning, "media-library preview maintenance needs attention");
+                        }
+                    }
+                    Err(error) => {
+                        warn!(library_id=%library.id, error=%redact_sensitive_text(&format!("{error:#}")), "media-library preview maintenance could not complete");
+                    }
+                }
                 statuses.extend(MigrationEngine::list_for_source(&source)?);
             }
         }

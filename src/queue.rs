@@ -1551,12 +1551,6 @@ impl QueueManager {
             bail!("registered root identity no longer matches its open queue store");
         }
         let prepared_store = if existing_store.is_some() {
-            self.set_video_store_available(
-                &existing_library
-                    .expect("registered store belongs to a library")
-                    .id,
-                true,
-            )?;
             None
         } else if root_identity == self.pdf.root.root_identity() {
             bail!("video media libraries may not alias the configured PDF root");
@@ -1574,17 +1568,20 @@ impl QueueManager {
             Some((store, Some(owner)))
         };
 
-        let library = self.media_libraries.lock().map_err(poisoned_lock)?.add(
-            &name,
-            &canonical_root,
-            default_category.as_deref(),
-            set_default,
-            false,
-        )?;
-        self.media_libraries
+        let library = self
+            .media_libraries
             .lock()
             .map_err(poisoned_lock)?
-            .bind_root_identity(&library.id, root_identity.device(), root_identity.inode())?;
+            .add_with_root_identity(
+                &name,
+                &canonical_root,
+                default_category.as_deref(),
+                set_default,
+                root_identity,
+            )?;
+        if existing_store.is_some() {
+            self.set_video_store_available(&library.id, true)?;
+        }
         if let Some((store, owner_lock)) = prepared_store {
             self.video_libraries
                 .write()

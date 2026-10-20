@@ -2,6 +2,7 @@ import { migrationControlActions, migrationHistoryNotice } from "./migration-con
 import { escapeHtml } from "./preview-rendering.js";
 
 export const MAX_VISIBLE_MIGRATIONS = 8;
+const MAX_FINALIZATION_WARNING_CHARS = 320;
 
 function formatBytes(value) {
   const bytes = Number(value);
@@ -21,6 +22,16 @@ function statusText(value) {
 
 function countValue(value, fallback = 0) {
   return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
+}
+
+function finalizationAttentionWarning(migration) {
+  if (migration.terminal_finalization_pending !== true || !Array.isArray(migration.warnings)) return null;
+  const warning = migration.warnings.find((value) => typeof value === "string"
+    && value.startsWith("Migration needs attention:"));
+  if (!warning) return null;
+  return warning.length > MAX_FINALIZATION_WARNING_CHARS
+    ? `${warning.slice(0, MAX_FINALIZATION_WARNING_CHARS)}…`
+    : warning;
 }
 
 function renderMigrationProgress(migration, libraries) {
@@ -72,11 +83,13 @@ function renderMigrationProgress(migration, libraries) {
     ? `<div class="preview-line"><span>Unfinished task handoffs<br><span class="field-hint">${escapeHtml(migration.awaiting_task_plans === true ? "Preparing the task transfer plans." : "Waiting for task transfer details.")}</span></span><strong>${incompleteTaskCount.toLocaleString()} task${incompleteTaskCount === 1 ? "" : "s"}</strong></div>`
     : "";
   const retryLabel = Number(migration.failed_count ?? 0) > 0 ? "Retry failed items" : "Retry task handoffs";
+  const finalizationAttention = finalizationAttentionWarning(migration);
   const controlLabels = {
     pause: "Pause",
     resume: "Resume",
     stop_remaining: "Stop remaining",
     retry_failed: retryLabel,
+    finalize_terminal: "Finish pending finalization",
   };
   const controls = migrationControlActions(migration).map((control) =>
     `<button class="small-button" type="button" data-migration-control="${control}" data-migration-id="${escapeHtml(migration.id)}">${controlLabels[control]}</button>`
@@ -85,7 +98,7 @@ function renderMigrationProgress(migration, libraries) {
   const target = libraries.find((entry) => entry.id === migration.target_library_id);
   const visibleItems = items.length > 40 ? `<p class="field-hint">Showing the first 40 of ${items.length} item results.</p>` : "";
   const showTaskTransfers = incompleteTaskCount > 0 || taskTransferCount > 0 || omittedTransferCount > 0;
-  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Library migration</h3><p>${escapeHtml(source?.name ?? migration.source_library_id)} → ${escapeHtml(target?.name ?? migration.target_library_id)}</p><p>${escapeHtml(progress)}</p><p>${escapeHtml(counts)}</p>${incompleteTaskCount ? `<p>${incompleteTaskCount.toLocaleString()} unfinished task handoff${incompleteTaskCount === 1 ? "" : "s"}</p>` : ""}</div><span class="state-pill${active || paused ? " pending" : ""}">${escapeHtml(statusText(status))}</span></div>${showTaskTransfers ? `<div class="preview-table task-transfer-list">${taskHandoffStatus}${transferRows}${transferOmission}${transferMore}</div>` : ""}<div class="preview-table">${resultRows}${visibleItems}</div>${controls ? `<div class="stack-actions">${controls}</div>` : ""}</article>`;
+  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Library migration</h3><p>${escapeHtml(source?.name ?? migration.source_library_id)} → ${escapeHtml(target?.name ?? migration.target_library_id)}</p><p>${escapeHtml(progress)}</p><p>${escapeHtml(counts)}</p>${incompleteTaskCount ? `<p>${incompleteTaskCount.toLocaleString()} unfinished task handoff${incompleteTaskCount === 1 ? "" : "s"}</p>` : ""}${finalizationAttention ? `<p class="field-hint">${escapeHtml(finalizationAttention)}</p>` : ""}</div><span class="state-pill${active || paused ? " pending" : ""}">${escapeHtml(statusText(status))}</span></div>${showTaskTransfers ? `<div class="preview-table task-transfer-list">${taskHandoffStatus}${transferRows}${transferOmission}${transferMore}</div>` : ""}<div class="preview-table">${resultRows}${visibleItems}</div>${controls ? `<div class="stack-actions">${controls}</div>` : ""}</article>`;
 }
 
 export function renderMigrationHistory({ migrations, libraries = [], libraryId, omittedCount }) {

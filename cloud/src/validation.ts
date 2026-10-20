@@ -681,7 +681,7 @@ export function validateActionRequest(value: unknown): ActionRequest {
         throw new HttpError(400, "library_migration_control payload has an invalid shape");
       }
       const control = value.payload.control;
-      if (!["pause", "resume", "stop_remaining", "retry_failed"].includes(String(control))) {
+      if (!["pause", "resume", "stop_remaining", "retry_failed", "finalize_terminal"].includes(String(control))) {
         throw new HttpError(400, "control is not supported");
       }
       payload = {

@@ -4,10 +4,10 @@
 //! each copy is staged and verified before publication, every member of a media bundle is
 //! published before source cleanup starts, and the primary media file is removed last.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::file_manager::{
     LibraryManager, MigrationPlanOutcome, MigrationPlannedFile, MigrationPlannedGroup,
+    MigrationStateFileProof,
 };
 use crate::library::{ConflictPolicy, LibrarySnapshot, Presence};
 use crate::media_libraries::{
@@ -32,6 +33,19 @@ const COPY_CHUNK_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 const PREVIEW_REVISION: &str = "1";
 static MIGRATION_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+type PreviewMaintenanceCursor = Mutex<HashMap<(u64, u64, PathBuf), String>>;
+static PREVIEW_MAINTENANCE_CURSOR: OnceLock<PreviewMaintenanceCursor> = OnceLock::new();
+
+const PREVIEW_RETENTION_SECONDS: u64 = 24 * 60 * 60;
+const PREVIEW_MAINTENANCE_WARNING_BYTES: usize = 512;
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PreviewMaintenanceReport {
+    pub(crate) examined: bool,
+    pub(crate) retired: bool,
+    pub(crate) compacted: bool,
+    pub(crate) warning: Option<String>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +91,7 @@ pub(crate) enum MigrationControl {
     Resume,
     StopRemaining,
     RetryFailed,
+    FinalizeTerminal,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -205,6 +220,8 @@ pub(crate) struct MigrationStatus {
     pub(crate) default_update_applied: bool,
     #[serde(default)]
     pub(crate) default_update_resolved: bool,
+    #[serde(default)]
+    pub(crate) terminal_finalization_pending: bool,
     pub(crate) total_items: usize,
     pub(crate) completed_items: usize,
     pub(crate) success_count: usize,
@@ -348,6 +365,8 @@ struct JobDocument {
     default_update_resolved: bool,
     #[serde(default)]
     default_update_expected_revision: Option<u64>,
+    #[serde(default)]
+    confirmed_preview_proof: Option<MigrationStateFileProof>,
     #[serde(default)]
     runtime_warnings: Vec<String>,
 }
@@ -559,6 +578,13 @@ impl MigrationEngine {
         supersedes: Option<(&str, &str)>,
     ) -> Result<MigrationPreview> {
         let _state_lock = self.source.migration_state_lock()?;
+        if self
+            .source
+            .migration_read_state(&preview_state_name(&document.preview.id), MAX_STATE_BYTES)?
+            .is_some()
+        {
+            bail!("migration preview ID already exists");
+        }
         if let Some((old_preview_id, old_revision)) = supersedes {
             if old_preview_id == document.preview.id {
                 bail!("a refreshed preview must have a new migration ID");
@@ -570,11 +596,15 @@ impl MigrationEngine {
             {
                 bail!("a confirmed migration cannot be superseded");
             }
-            let old_bytes = self
+            let old_snapshot = self
                 .source
-                .migration_read_state(&preview_state_name(old_preview_id), MAX_STATE_BYTES)?
+                .migration_read_state_snapshot(
+                    &preview_state_name(old_preview_id),
+                    MAX_STATE_BYTES,
+                )?
                 .ok_or_else(|| anyhow!("the migration preview being refreshed is unavailable"))?;
-            let mut old: PreviewDocument = decode_state(&old_bytes, "migration preview")?;
+            let mut old: PreviewDocument =
+                decode_state(&old_snapshot.contents, "migration preview")?;
             if old.preview.id != old_preview_id || old.preview.revision != old_revision {
                 bail!("the migration preview being refreshed no longer matches its revision");
             }
@@ -605,16 +635,12 @@ impl MigrationEngine {
                 }
                 bail!("the migration preview being refreshed is already stale");
             }
-            old.superseded_by = Some(document.preview.id.clone());
-            self.source
-                .migration_write_state(&preview_state_name(old_preview_id), &encode_state(&old)?)?;
-        }
-        if self
-            .source
-            .migration_read_state(&preview_state_name(&document.preview.id), MAX_STATE_BYTES)?
-            .is_some()
-        {
-            bail!("migration preview ID already exists");
+            compact_superseded_preview(&mut old, &document.preview.id);
+            self.source.migration_replace_state_if_unchanged(
+                &preview_state_name(old_preview_id),
+                &old_snapshot,
+                &encode_state(&old)?,
+            )?;
         }
         self.source.migration_write_state(
             &preview_state_name(&document.preview.id),
@@ -645,18 +671,19 @@ impl MigrationEngine {
             .source
             .migration_read_state(&job_name, MAX_STATE_BYTES)?
         {
-            let job: JobDocument = decode_state(&bytes, "migration job")?;
+            let mut job: JobDocument = decode_state(&bytes, "migration job")?;
             self.validate_job_bindings(&job)?;
             if job.preview.id != preview_id || job.preview.revision != revision {
                 bail!("migration preview ID or revision does not match confirmation");
             }
+            self.retry_confirmed_preview_retirement(&mut job)?;
             return Ok(status_from_job(&job));
         }
-        let bytes = self
+        let snapshot = self
             .source
-            .migration_read_state(&preview_state_name(preview_id), MAX_STATE_BYTES)?
+            .migration_read_state_snapshot(&preview_state_name(preview_id), MAX_STATE_BYTES)?
             .ok_or_else(|| anyhow!("migration preview expired or does not exist"))?;
-        let document: PreviewDocument = decode_state(&bytes, "migration preview")?;
+        let document: PreviewDocument = decode_state(&snapshot.contents, "migration preview")?;
         if document.preview.id != preview_id || document.preview.revision != revision {
             bail!("migration preview ID or revision does not match confirmation");
         }
@@ -741,12 +768,36 @@ impl MigrationEngine {
             default_update_applied: false,
             default_update_resolved: false,
             default_update_expected_revision: expected_default_revision,
+            confirmed_preview_proof: Some(snapshot.proof),
             runtime_warnings: Vec::new(),
         };
         let status = status_from_job(&job);
         job.status = status.status;
         self.save_job(&job)?;
-        Ok(status)
+        self.retry_confirmed_preview_retirement(&mut job)?;
+        Ok(status_from_job(&job))
+    }
+
+    fn retry_confirmed_preview_retirement(&self, job: &mut JobDocument) -> Result<()> {
+        let Some(proof) = job.confirmed_preview_proof.as_ref() else {
+            return Ok(());
+        };
+        let previous_warnings = job.runtime_warnings.clone();
+        if let Err(error) = self
+            .source
+            .migration_remove_state_if_proof(&preview_state_name(&job.preview.id), proof)
+        {
+            record_runtime_warning(
+                job,
+                &format!(
+                    "confirmed preview retained because its saved retirement proof did not match: {error:#}"
+                ),
+            );
+            if job.runtime_warnings != previous_warnings {
+                self.save_job(job)?;
+            }
+        }
+        Ok(())
     }
 
     /// Performs at most one copy chunk, verification, publication, or source cleanup checkpoint.
@@ -987,87 +1038,48 @@ impl MigrationEngine {
         let _state_lock = self.source.migration_state_lock()?;
         let mut job = self.load_job(migration_id)?;
         self.validate_job_bindings(&job)?;
-        match control {
-            MigrationControl::Pause => {
-                if matches!(
-                    job.status,
-                    MigrationRunStatus::Queued | MigrationRunStatus::Running
-                ) {
-                    job.status = MigrationRunStatus::Paused;
-                }
-            }
-            MigrationControl::Resume => {
-                if job.status == MigrationRunStatus::Paused {
-                    job.status = MigrationRunStatus::Queued;
-                }
-            }
-            MigrationControl::StopRemaining => {
-                if matches!(
-                    job.status,
-                    MigrationRunStatus::Queued
-                        | MigrationRunStatus::Running
-                        | MigrationRunStatus::Paused
-                        | MigrationRunStatus::Partial
-                        | MigrationRunStatus::Failed
-                ) {
-                    job.stop_remaining_latched = true;
-                    for group in &mut job.groups {
-                        if !is_group_terminal(group) {
-                            if group.files.iter().all(|file| file.source_removed) {
-                                group.status = MigrationItemPhase::Complete;
-                                group.error = None;
-                                group.failure_kind = None;
-                            } else if group.files.iter().any(|file| file.source_removed) {
-                                group.status = MigrationItemPhase::Failed;
-                                group.failure_kind = Some(MigrationFailureKind::CleanupFailed);
-                                group.error = Some("stopped after partial source cleanup; published targets and remaining source files are preserved".to_string());
-                            } else {
-                                group.status = MigrationItemPhase::Skipped;
-                                group.error = Some("stopped; source files remain in the original library; any already published target copies are preserved".to_string());
-                            }
-                        }
-                    }
-                    job.status = MigrationRunStatus::Stopped;
-                }
-            }
-            MigrationControl::RetryFailed => {
-                if matches!(
-                    job.status,
-                    MigrationRunStatus::Partial | MigrationRunStatus::Failed
-                ) {
-                    if job.stop_remaining_latched {
-                        // A retry after StopRemaining may reconcile only durable task handoffs.
-                        // Keep every media checkpoint in its stopped state so retry cannot copy
-                        // or remove files the user chose to leave at the source.
-                        if job.groups.iter().all(is_group_terminal) {
-                            job.status = MigrationRunStatus::Stopped;
-                        }
-                    } else {
-                        for group in &mut job.groups {
-                            if group.status == MigrationItemPhase::Failed {
-                                group.status = if group.files.iter().all(|file| file.published) {
-                                    MigrationItemPhase::CleaningSource
-                                } else if group.files.iter().any(|file| file.verified) {
-                                    MigrationItemPhase::Publishing
-                                } else {
-                                    MigrationItemPhase::Copying
-                                };
-                                group.error = None;
-                                group.failure_kind = None;
-                            }
-                        }
-                        for transfer in &mut job.task_transfers {
-                            if transfer.error.is_some() {
-                                transfer.error = None;
-                            }
-                        }
-                        job.status = MigrationRunStatus::Queued;
-                    }
-                }
-            }
-        }
+        apply_control_to_job(&mut job, control)?;
         self.save_job(&job)?;
         Ok(status_from_job(&job))
+    }
+
+    /// Applies an ordinary control and refreshes its cloud epoch in one durable state-lock
+    /// critical section. A runner may finish between a caller's status read and control action;
+    /// this method therefore rechecks terminal state while holding the mutation lock and treats
+    /// a terminal job as a no-op without renewing its authority.
+    pub(crate) fn control_in_epoch(
+        &self,
+        migration_id: &str,
+        control: MigrationControl,
+        current_epoch: &str,
+    ) -> Result<(MigrationStatus, bool)> {
+        if current_epoch.trim().is_empty() {
+            bail!("current management database epoch is empty");
+        }
+        if control == MigrationControl::FinalizeTerminal {
+            bail!("terminal finalization must use the dedicated terminal recovery API");
+        }
+
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        if matches!(
+            job.status,
+            MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+        ) {
+            return Ok((status_from_job(&job), true));
+        }
+
+        // Apply first so an invalid control can never renew the saved epoch. The state lock
+        // remains held through both the control and the context update.
+        apply_control_to_job(&mut job, control)?;
+        let context = job
+            .runtime_context
+            .as_mut()
+            .ok_or_else(|| anyhow!("migration recovery context is missing"))?;
+        context.database_epoch = current_epoch.to_string();
+        self.save_job(&job)?;
+        Ok((status_from_job(&job), false))
     }
 
     pub(crate) fn status(&self, migration_id: &str) -> Result<Option<MigrationStatus>> {
@@ -1408,8 +1420,9 @@ impl MigrationEngine {
         Ok(status_from_job(&job))
     }
 
-    /// Performs at most one source control or empty-directory cleanup checkpoint. The output
-    /// lease is supplied by the coordinator and must already cover both bound libraries.
+    /// Performs at most one payload, control, or empty-directory cleanup checkpoint after the
+    /// exact final queue acknowledgment. The output lease is supplied by the coordinator and
+    /// must already cover both bound libraries.
     pub(crate) fn step_task_source_cleanup_with_output_lease(
         &self,
         migration_id: &str,
@@ -1436,7 +1449,19 @@ impl MigrationEngine {
             );
         }
 
-        let result = self.step_task_control_and_directory_cleanup(&mut job, task_index);
+        let payload_index = job.task_transfers[task_index]
+            .plan
+            .files
+            .iter()
+            .zip(&job.task_transfers[task_index].entries)
+            .position(|(file, checkpoint)| {
+                file.kind == TaskTransferEntryKind::File && !checkpoint.source_removed
+            });
+        let result = if let Some(file_index) = payload_index {
+            self.step_task_payload_cleanup(&mut job, task_index, file_index)
+        } else {
+            self.step_task_control_and_directory_cleanup(&mut job, task_index)
+        };
         if let Err(error) = result {
             if job.status == MigrationRunStatus::Stopped {
                 job.stop_remaining_latched = true;
@@ -1624,6 +1649,174 @@ impl MigrationEngine {
         Ok(statuses)
     }
 
+    /// Examines at most one deterministically rotating source preview on each discovery pass.
+    /// Expired previews are removed only after their age, source binding, private-file policy,
+    /// inode, and content proof are validated. Superseded previews are compacted to a small
+    /// rejection tombstone until expiry. Candidate-local problems are diagnostic and do not make
+    /// unrelated previews unusable.
+    pub(crate) fn maintain_source(
+        source: &Arc<LibraryManager>,
+    ) -> Result<PreviewMaintenanceReport> {
+        let _state_lock = source.migration_state_lock()?;
+        let mut names = source.migration_state_names()?;
+        names.retain(|name| name.starts_with(PREVIEW_STATE_PREFIX) && name.ends_with(STATE_SUFFIX));
+        names.sort();
+        let mut report = PreviewMaintenanceReport::default();
+        if names.is_empty() {
+            return Ok(report);
+        }
+
+        let root_identity = source.migration_root_identity();
+        let cursor = PREVIEW_MAINTENANCE_CURSOR.get_or_init(|| Mutex::new(HashMap::new()));
+        let candidate_name = {
+            let mut cursors = cursor
+                .lock()
+                .map_err(|_| anyhow!("preview maintenance cursor is poisoned"))?;
+            let key = (
+                root_identity.device(),
+                root_identity.inode(),
+                source.migration_root_path().to_path_buf(),
+            );
+            let last = cursors.get(&key);
+            let next = last.map_or(0, |last| {
+                names.partition_point(|candidate| candidate <= last)
+            });
+            let index = if next >= names.len() { 0 } else { next };
+            let candidate = names[index].clone();
+            cursors.insert(key, candidate.clone());
+            candidate
+        };
+        report.examined = true;
+        let Some(preview_id) = candidate_name
+            .strip_prefix(PREVIEW_STATE_PREFIX)
+            .and_then(|name| name.strip_suffix(STATE_SUFFIX))
+        else {
+            report.warning = Some("preview maintenance skipped an invalid state filename".into());
+            return Ok(report);
+        };
+        if let Err(error) = validate_migration_id(preview_id) {
+            report.warning = Some(bounded_maintenance_warning(&format!(
+                "preview maintenance retained an invalid candidate: {error:#}"
+            )));
+            return Ok(report);
+        }
+
+        let job_bytes =
+            match source.migration_read_state(&job_state_name(preview_id), MAX_STATE_BYTES) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    report.warning = Some(bounded_maintenance_warning(&format!(
+                        "preview maintenance could not verify its confirmed job: {error:#}"
+                    )));
+                    return Ok(report);
+                }
+            };
+        if let Some(job_bytes) = job_bytes {
+            let job: JobDocument = match decode_state(&job_bytes, "migration job") {
+                Ok(job) => job,
+                Err(error) => {
+                    report.warning = Some(bounded_maintenance_warning(&format!(
+                        "preview maintenance retained a preview with an unreadable job: {error:#}"
+                    )));
+                    return Ok(report);
+                }
+            };
+            if job.preview.id != preview_id
+                || job.preview.source_library_id != job.source.library_id
+                || job.preview.target_library_id != job.target.library_id
+                || !source_binding_matches(source, &job.source)
+                || !root_binding_shape_is_valid(&job.target)
+            {
+                report.warning = Some(
+                    "preview maintenance retained a confirmed preview with a mismatched job binding"
+                        .into(),
+                );
+                return Ok(report);
+            }
+            let Some(proof) = job.confirmed_preview_proof.as_ref() else {
+                report.warning = Some(
+                    "preview maintenance retained a legacy confirmed preview without a retirement proof"
+                        .into(),
+                );
+                return Ok(report);
+            };
+            match source.migration_remove_state_if_proof(&candidate_name, proof) {
+                Ok(removed) => report.retired = removed,
+                Err(error) => {
+                    report.warning = Some(bounded_maintenance_warning(&format!(
+                        "preview maintenance retained a confirmed preview after proof mismatch: {error:#}"
+                    )));
+                }
+            }
+            return Ok(report);
+        }
+
+        let snapshot = match source.migration_read_state_snapshot(&candidate_name, MAX_STATE_BYTES)
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => return Ok(report),
+            Err(error) => {
+                report.warning = Some(bounded_maintenance_warning(&format!(
+                    "preview maintenance retained an unreadable preview: {error:#}"
+                )));
+                return Ok(report);
+            }
+        };
+        let mut document: PreviewDocument =
+            match decode_state(&snapshot.contents, "migration preview") {
+                Ok(document) => document,
+                Err(error) => {
+                    report.warning = Some(bounded_maintenance_warning(&format!(
+                        "preview maintenance retained a malformed preview: {error:#}"
+                    )));
+                    return Ok(report);
+                }
+            };
+        if document.preview.id != preview_id
+            || document.preview.source_library_id != document.source.library_id
+            || document.preview.target_library_id != document.target.library_id
+            || !source_binding_matches(source, &document.source)
+            || !root_binding_shape_is_valid(&document.target)
+        {
+            report.warning = Some(
+                "preview maintenance retained a preview with a mismatched ID or source binding"
+                    .into(),
+            );
+            return Ok(report);
+        }
+        if document
+            .created_at
+            .saturating_add(PREVIEW_RETENTION_SECONDS)
+            < unix_seconds()
+        {
+            match source.migration_remove_state_if_proof(&candidate_name, &snapshot.proof) {
+                Ok(removed) => report.retired = removed,
+                Err(error) => {
+                    report.warning = Some(bounded_maintenance_warning(&format!(
+                        "preview maintenance retained an expired preview after proof mismatch: {error:#}"
+                    )));
+                }
+            }
+        } else if let Some(superseded_by) = document.superseded_by.clone()
+            && !preview_is_compact_tombstone(&document)
+        {
+            compact_superseded_preview(&mut document, &superseded_by);
+            match source.migration_replace_state_if_unchanged(
+                &candidate_name,
+                &snapshot,
+                &encode_state(&document)?,
+            ) {
+                Ok(()) => report.compacted = true,
+                Err(error) => {
+                    report.warning = Some(bounded_maintenance_warning(&format!(
+                        "preview maintenance retained a superseded preview after proof mismatch: {error:#}"
+                    )));
+                }
+            }
+        }
+        Ok(report)
+    }
+
     pub(crate) fn set_runtime_context(
         &self,
         migration_id: &str,
@@ -1634,6 +1827,64 @@ impl MigrationEngine {
         self.validate_job_bindings(&job)?;
         job.runtime_context = Some(context);
         self.save_job(&job)?;
+        Ok(status_from_job(&job))
+    }
+
+    /// Reauthorizes terminal recovery for a new inbox epoch without reopening media execution.
+    /// `queue_pending` must come from the queue's exact migration-token scan; it covers the
+    /// crash window where a queue handoff exists before this manifest records its ACK.
+    pub(crate) fn reauthorize_terminal_finalization(
+        &self,
+        migration_id: &str,
+        current_epoch: &str,
+        queue_pending: bool,
+    ) -> Result<Option<MigrationStatus>> {
+        if current_epoch.trim().is_empty() {
+            bail!("current management database epoch is empty");
+        }
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        if !matches!(
+            job.status,
+            MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+        ) {
+            bail!("terminal finalization can only reauthorize completed or stopped migrations");
+        }
+        if !terminal_finalization_pending(&job) && !queue_pending {
+            // A replay after successful finalization is a harmless terminal no-op.
+            return Ok(Some(status_from_job(&job)));
+        }
+        let context = job
+            .runtime_context
+            .as_mut()
+            .ok_or_else(|| anyhow!("terminal migration is missing its durable runtime context"))?;
+        if context.database_epoch != current_epoch {
+            context.database_epoch = current_epoch.to_string();
+            self.save_job(&job)?;
+        }
+        Ok(Some(status_from_job(&job)))
+    }
+
+    pub(crate) fn record_finalization_warning(
+        &self,
+        migration_id: &str,
+        warning: &str,
+    ) -> Result<MigrationStatus> {
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        if !matches!(
+            job.status,
+            MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+        ) {
+            bail!("finalization warnings can only be recorded for terminal migrations");
+        }
+        let previous_warnings = job.runtime_warnings.clone();
+        record_runtime_warning(&mut job, warning);
+        if job.runtime_warnings != previous_warnings {
+            self.save_job(&job)?;
+        }
         Ok(status_from_job(&job))
     }
 
@@ -1711,35 +1962,46 @@ impl MigrationEngine {
         source: &LibraryManager,
         preview_id: &str,
     ) -> Result<Option<PersistedMigrationPreview>> {
+        if let Some(bytes) =
+            source.migration_read_state(&job_state_name(preview_id), MAX_STATE_BYTES)?
+        {
+            let job: JobDocument = decode_state(&bytes, "migration job")?;
+            if job.preview.id != preview_id
+                || job.preview.source_library_id != job.source.library_id
+                || job.preview.target_library_id != job.target.library_id
+                || !root_binding_shape_is_valid(&job.target)
+            {
+                bail!("persisted migration job ID or library binding does not match its filename");
+            }
+            if !source_binding_matches(source, &job.source) {
+                bail!("persisted migration source binding no longer matches this library");
+            }
+            return Ok(Some(persisted_preview(job.preview, job.source, job.target)));
+        }
         let Some(bytes) =
             source.migration_read_state(&preview_state_name(preview_id), MAX_STATE_BYTES)?
         else {
             return Ok(None);
         };
         let document: PreviewDocument = decode_state(&bytes, "migration preview")?;
-        if document.preview.id != preview_id {
-            bail!("persisted migration preview ID does not match its filename");
-        }
-        let source_identity = source.migration_root_identity();
-        if document.source.root != source.migration_root_path()
-            || document.source.device != source_identity.device()
-            || document.source.inode != source_identity.inode()
+        if document.preview.id != preview_id
+            || document.preview.source_library_id != document.source.library_id
+            || document.preview.target_library_id != document.target.library_id
+            || !root_binding_shape_is_valid(&document.target)
         {
+            bail!("persisted migration preview ID or library binding does not match its filename");
+        }
+        if !source_binding_matches(source, &document.source) {
             bail!("persisted migration source binding no longer matches this library");
         }
-        Ok(Some(PersistedMigrationPreview {
-            preview: document.preview,
-            bindings: PersistedMigrationBindings {
-                source_library_id: document.source.library_id,
-                source_root: document.source.root,
-                source_device: document.source.device,
-                source_inode: document.source.inode,
-                target_library_id: document.target.library_id,
-                target_root: document.target.root,
-                target_device: document.target.device,
-                target_inode: document.target.inode,
-            },
-        }))
+        if document.superseded_by.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(persisted_preview(
+            document.preview,
+            document.source,
+            document.target,
+        )))
     }
 
     fn step_group(&self, group: &mut GroupCheckpoint, allow_cleanup: bool) -> Result<()> {
@@ -2532,8 +2794,12 @@ impl MigrationEngine {
     }
 
     fn validate_preview_bindings(&self, document: &PreviewDocument) -> Result<()> {
-        if document.source.library_id != self.source_library_id
+        if !root_binding_shape_is_valid(&document.source)
+            || !root_binding_shape_is_valid(&document.target)
+            || document.source.library_id != self.source_library_id
             || document.target.library_id != self.target_library_id
+            || document.preview.source_library_id != document.source.library_id
+            || document.preview.target_library_id != document.target.library_id
             || document.source.root != self.source.migration_root_path()
             || document.target.root != self.target.migration_root_path()
             || document.source.device != self.source.migration_root_identity().device()
@@ -2547,8 +2813,12 @@ impl MigrationEngine {
     }
 
     fn validate_job_bindings(&self, job: &JobDocument) -> Result<()> {
-        if job.source.library_id != self.source_library_id
+        if !root_binding_shape_is_valid(&job.source)
+            || !root_binding_shape_is_valid(&job.target)
+            || job.source.library_id != self.source_library_id
             || job.target.library_id != self.target_library_id
+            || job.preview.source_library_id != job.source.library_id
+            || job.preview.target_library_id != job.target.library_id
             || job.source.root != self.source.migration_root_path()
             || job.target.root != self.target.migration_root_path()
             || job.source.device != self.source.migration_root_identity().device()
@@ -2663,6 +2933,209 @@ fn selected_item_ids(
             Ok(ids)
         }
     }
+}
+
+fn compact_superseded_preview(document: &mut PreviewDocument, superseded_by: &str) {
+    document.superseded_by = Some(superseded_by.to_string());
+    document.plan.clear();
+    document.request.item_ids.clear();
+    document.request.item_conflicts.clear();
+    document.request.task_impacts.clear();
+    document.request.warnings.clear();
+    document.preview.item_ids.clear();
+    document.preview.item_conflicts.clear();
+    document.preview.item_count = 0;
+    document.preview.file_count = 0;
+    document.preview.total_bytes = 0;
+    document.preview.required_space_bytes = 0;
+    document.preview.available_space_bytes = 0;
+    document.preview.conflict_count = 0;
+    document.preview.incomplete_task_count = 0;
+    document.preview.staging_bytes = 0;
+    document.preview.warnings.clear();
+    document.preview.items.clear();
+}
+
+fn preview_is_compact_tombstone(document: &PreviewDocument) -> bool {
+    document.superseded_by.is_some()
+        && document.plan.is_empty()
+        && document.request.item_ids.is_empty()
+        && document.request.item_conflicts.is_empty()
+        && document.request.task_impacts.is_empty()
+        && document.request.warnings.is_empty()
+        && document.preview.item_ids.is_empty()
+        && document.preview.item_conflicts.is_empty()
+        && document.preview.item_count == 0
+        && document.preview.file_count == 0
+        && document.preview.total_bytes == 0
+        && document.preview.required_space_bytes == 0
+        && document.preview.available_space_bytes == 0
+        && document.preview.conflict_count == 0
+        && document.preview.incomplete_task_count == 0
+        && document.preview.staging_bytes == 0
+        && document.preview.warnings.is_empty()
+        && document.preview.items.is_empty()
+}
+
+fn source_binding_matches(source: &LibraryManager, binding: &RootBinding) -> bool {
+    let identity = source.migration_root_identity();
+    root_binding_shape_is_valid(binding)
+        && binding.root == source.migration_root_path()
+        && binding.device == identity.device()
+        && binding.inode == identity.inode()
+}
+
+fn root_binding_shape_is_valid(binding: &RootBinding) -> bool {
+    !binding.library_id.is_empty()
+        && binding.library_id.len() <= 128
+        && !binding.library_id.chars().any(char::is_control)
+        && binding.root.is_absolute()
+        && binding.device != 0
+        && binding.inode != 0
+}
+
+fn persisted_preview(
+    preview: MigrationPreview,
+    source: RootBinding,
+    target: RootBinding,
+) -> PersistedMigrationPreview {
+    PersistedMigrationPreview {
+        preview,
+        bindings: PersistedMigrationBindings {
+            source_library_id: source.library_id,
+            source_root: source.root,
+            source_device: source.device,
+            source_inode: source.inode,
+            target_library_id: target.library_id,
+            target_root: target.root,
+            target_device: target.device,
+            target_inode: target.inode,
+        },
+    }
+}
+
+fn bounded_maintenance_warning(warning: &str) -> String {
+    let mut warning = redact_runtime_warning(warning);
+    if warning.len() > PREVIEW_MAINTENANCE_WARNING_BYTES {
+        let mut boundary = PREVIEW_MAINTENANCE_WARNING_BYTES;
+        while !warning.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        warning.truncate(boundary);
+    }
+    warning
+}
+
+fn apply_control_to_job(job: &mut JobDocument, control: MigrationControl) -> Result<()> {
+    match control {
+        MigrationControl::Pause => {
+            if matches!(
+                job.status,
+                MigrationRunStatus::Queued | MigrationRunStatus::Running
+            ) {
+                job.status = MigrationRunStatus::Paused;
+            }
+        }
+        MigrationControl::Resume => {
+            if job.status == MigrationRunStatus::Paused {
+                job.status = MigrationRunStatus::Queued;
+            }
+        }
+        MigrationControl::StopRemaining => {
+            if matches!(
+                job.status,
+                MigrationRunStatus::Queued
+                    | MigrationRunStatus::Running
+                    | MigrationRunStatus::Paused
+                    | MigrationRunStatus::Partial
+                    | MigrationRunStatus::Failed
+            ) {
+                job.stop_remaining_latched = true;
+                for group in &mut job.groups {
+                    if !is_group_terminal(group) {
+                        if group.files.iter().all(|file| file.source_removed) {
+                            group.status = MigrationItemPhase::Complete;
+                            group.error = None;
+                            group.failure_kind = None;
+                        } else if group.files.iter().any(|file| file.source_removed) {
+                            group.status = MigrationItemPhase::Failed;
+                            group.failure_kind = Some(MigrationFailureKind::CleanupFailed);
+                            group.error = Some("stopped after partial source cleanup; published targets and remaining source files are preserved".to_string());
+                        } else {
+                            group.status = MigrationItemPhase::Skipped;
+                            group.error = Some("stopped; source files remain in the original library; any already published target copies are preserved".to_string());
+                        }
+                    }
+                }
+                job.status = MigrationRunStatus::Stopped;
+            }
+        }
+        MigrationControl::RetryFailed => {
+            if matches!(
+                job.status,
+                MigrationRunStatus::Partial | MigrationRunStatus::Failed
+            ) {
+                if job.stop_remaining_latched {
+                    // A retry after StopRemaining may reconcile only durable task handoffs.
+                    // Keep every media checkpoint in its stopped state so retry cannot copy
+                    // or remove files the user chose to leave at the source.
+                    if job.groups.iter().all(is_group_terminal) {
+                        job.status = MigrationRunStatus::Stopped;
+                    }
+                } else {
+                    for group in &mut job.groups {
+                        if group.status == MigrationItemPhase::Failed {
+                            group.status = if group.files.iter().all(|file| file.published) {
+                                MigrationItemPhase::CleaningSource
+                            } else if group.files.iter().any(|file| file.verified) {
+                                MigrationItemPhase::Publishing
+                            } else {
+                                MigrationItemPhase::Copying
+                            };
+                            group.error = None;
+                            group.failure_kind = None;
+                        }
+                    }
+                    for transfer in &mut job.task_transfers {
+                        if transfer.error.is_some() {
+                            transfer.error = None;
+                        }
+                    }
+                    job.status = MigrationRunStatus::Queued;
+                }
+            }
+        }
+        MigrationControl::FinalizeTerminal => {
+            bail!("terminal finalization must use the dedicated terminal recovery API");
+        }
+    }
+    Ok(())
+}
+
+fn terminal_finalization_pending(job: &JobDocument) -> bool {
+    if !matches!(
+        job.status,
+        MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+    ) {
+        return false;
+    }
+    let handoff_cleanup_pending = job.task_transfers.iter().any(|transfer| {
+        let transfer_id = &transfer.plan.transfer.transfer_id;
+        job.task_commit_acked
+            .iter()
+            .any(|acked| acked == transfer_id)
+            && !transfer_source_cleanup_complete(
+                transfer,
+                job.task_final_queue_acked
+                    .iter()
+                    .any(|acked| acked == transfer_id),
+            )
+    });
+    let default_update_pending = job.status == MigrationRunStatus::Completed
+        && job.preview.set_target_default_on_success
+        && !job.default_update_resolved
+        && !job.default_update_applied;
+    handoff_cleanup_pending || default_update_pending
 }
 
 fn status_from_job(job: &JobDocument) -> MigrationStatus {
@@ -2780,6 +3253,7 @@ fn status_from_job(job: &JobDocument) -> MigrationStatus {
         set_target_default_on_success: job.preview.set_target_default_on_success,
         default_update_applied: job.default_update_applied,
         default_update_resolved: job.default_update_resolved || job.default_update_applied,
+        terminal_finalization_pending: terminal_finalization_pending(job),
         total_items: job.groups.len(),
         completed_items,
         success_count,

@@ -93,6 +93,7 @@ export function migrationControlActions(migration) {
   const active = status === "queued" || status === "running";
   const paused = status === "paused";
   const terminalWithTaskError = status === "partial" || status === "failed";
+  const terminal = status === "completed" || status === "stopped";
   const hasReportedTaskTransferErrors = Number.isSafeInteger(migration.task_transfer_error_count)
     && migration.task_transfer_error_count > 0;
   const hasTaskTransferError = hasReportedTaskTransferErrors || (Array.isArray(migration.task_transfers)
@@ -104,6 +105,7 @@ export function migrationControlActions(migration) {
   if (paused) actions.push("resume");
   if (active || paused || terminalWithTaskError && hasTaskTransferError) actions.push("stop_remaining");
   if (terminalWithTaskError && (hasFailedMedia || hasTaskTransferError)) actions.push("retry_failed");
+  if (terminal && migration.terminal_finalization_pending === true) actions.push("finalize_terminal");
   return actions;
 }
 

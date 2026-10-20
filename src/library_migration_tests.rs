@@ -198,6 +198,53 @@ impl Fixture {
     }
 }
 
+fn unconfirmed_preview(label: &str) -> (TestRoot, TestRoot, MigrationEngine, MigrationPreview) {
+    let source_root = TestRoot::new(&format!("{label}-source"));
+    let target_root = TestRoot::new(&format!("{label}-target"));
+    fs::write(source_root.path().join("clip.mp4"), MEDIA_BYTES)
+        .expect("synthetic media should write");
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let snapshot = engine
+        .source
+        .migration_scan()
+        .expect("source library should scan");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4" && item.presence == Presence::Present)
+        .expect("synthetic media should be indexed")
+        .id
+        .clone();
+    let preview = engine
+        .preview(&MigrationRequest {
+            scope: MigrationScope::Selected,
+            item_ids: vec![item_id],
+            conflict: ConflictPolicy::Skip,
+            item_conflicts: BTreeMap::new(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("preview should be created");
+    (source_root, target_root, engine, preview)
+}
+
 fn replace_with_same_bytes(path: &Path) {
     let replacement = path.with_extension("replacement");
     fs::write(&replacement, MEDIA_BYTES).expect("replacement file should write");
@@ -384,6 +431,20 @@ fn refreshing_preview_durably_supersedes_the_old_revision() {
         .preview_replacing(&request, &old.id, &old.revision)
         .expect("an inbox replay should reuse the exact persisted refresh receipt");
     assert_eq!(replayed.id, refreshed.id);
+    let compacted: PreviewDocument = decode_state(
+        &engine
+            .source
+            .migration_read_state(&preview_state_name(&old.id), MAX_STATE_BYTES)
+            .expect("superseded preview should remain readable")
+            .expect("superseded preview tombstone should remain persisted"),
+        "migration preview tombstone",
+    )
+    .expect("superseded preview tombstone should decode");
+    assert!(preview_is_compact_tombstone(&compacted));
+    assert_eq!(
+        compacted.superseded_by.as_deref(),
+        Some(refreshed.id.as_str())
+    );
     let stale = engine
         .confirm(&old.id, &old.revision)
         .expect_err("the superseded preview must no longer confirm");
@@ -394,6 +455,230 @@ fn refreshing_preview_durably_supersedes_the_old_revision() {
             .expect("the refreshed preview should remain confirmable")
             .status,
         MigrationRunStatus::Queued
+    );
+}
+
+#[test]
+fn confirmation_retires_preview_after_job_save_and_replay_uses_job_fallback() {
+    let fixture = Fixture::new("confirmed-preview-retirement");
+    let job = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("confirmed migration job should remain durable");
+    let preview_name = preview_state_name(&fixture.migration_id);
+    assert!(job.confirmed_preview_proof.is_some());
+    assert!(
+        fixture
+            .engine
+            .source
+            .migration_read_state(&preview_name, MAX_STATE_BYTES)
+            .expect("preview lookup should work")
+            .is_none()
+    );
+
+    let replay = fixture
+        .engine
+        .confirm(&fixture.migration_id, &job.preview.revision)
+        .expect("duplicate confirmation should replay from the durable job");
+    assert_eq!(replay.status, MigrationRunStatus::Queued);
+    let located =
+        MigrationEngine::find_preview_for_source(&fixture.engine.source, &fixture.migration_id)
+            .expect("job fallback should validate")
+            .expect("confirmed job should remain discoverable after preview retirement");
+    assert_eq!(located.preview.id, fixture.migration_id);
+    assert_eq!(located.bindings.target_library_id, "target-library");
+    assert!(
+        fixture
+            .engine
+            .source
+            .migration_read_state(&job_state_name(&fixture.migration_id), MAX_STATE_BYTES)
+            .expect("job lookup should work")
+            .is_some()
+    );
+}
+
+#[test]
+fn preview_maintenance_retires_expired_candidates_and_rotates_past_malformed_files() {
+    let (_source_root, _target_root, engine, preview) =
+        unconfirmed_preview("preview-maintenance-rotation");
+    let malformed_name = "migration-preview-000-malformed.json";
+    engine
+        .source
+        .migration_write_state(malformed_name, b"not a preview document")
+        .expect("malformed candidate should be private and persisted");
+
+    let stale_id = "zzz-expired-candidate";
+    let preview_bytes = engine
+        .source
+        .migration_read_state(&preview_state_name(&preview.id), MAX_STATE_BYTES)
+        .expect("preview read should succeed")
+        .expect("preview should exist");
+    let mut expired: PreviewDocument =
+        decode_state(&preview_bytes, "migration preview").expect("preview should decode");
+    expired.preview.id = stale_id.to_string();
+    expired.created_at = unix_seconds().saturating_sub(PREVIEW_RETENTION_SECONDS + 1);
+    let expired_name = preview_state_name(stale_id);
+    engine
+        .source
+        .migration_write_state(&expired_name, &encode_state(&expired).unwrap())
+        .expect("expired candidate should be private and persisted");
+
+    let mut saw_malformed = false;
+    let mut retired_expired = false;
+    for _ in 0..3 {
+        let report = MigrationEngine::maintain_source(&engine.source)
+            .expect("one bounded preview maintenance pass should finish");
+        assert!(report.examined);
+        saw_malformed |= report
+            .warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("malformed preview"));
+        retired_expired |= report.retired;
+    }
+    assert!(
+        saw_malformed,
+        "malformed candidates should be diagnosed and retained"
+    );
+    assert!(
+        retired_expired,
+        "rotation should reach the later expired candidate"
+    );
+    assert!(
+        engine
+            .source
+            .migration_read_state(&expired_name, MAX_STATE_BYTES)
+            .expect("expired candidate lookup should succeed")
+            .is_none()
+    );
+    assert!(
+        engine
+            .source
+            .migration_read_state(malformed_name, MAX_STATE_BYTES)
+            .expect("malformed candidate lookup should succeed")
+            .is_some()
+    );
+}
+
+#[test]
+fn preview_retirement_proof_preserves_same_content_replacement() {
+    let (_source_root, _target_root, engine, preview) =
+        unconfirmed_preview("preview-retirement-replacement");
+    let name = preview_state_name(&preview.id);
+    let snapshot = engine
+        .source
+        .migration_read_state_snapshot(&name, MAX_STATE_BYTES)
+        .expect("preview snapshot should read")
+        .expect("preview should exist");
+    engine
+        .source
+        .migration_write_state(&name, &snapshot.contents)
+        .expect("same-content replacement should install as a new state inode");
+    let replacement = engine
+        .source
+        .migration_read_state_snapshot(&name, MAX_STATE_BYTES)
+        .expect("replacement snapshot should read")
+        .expect("replacement should exist");
+    assert_ne!(snapshot.proof.inode, replacement.proof.inode);
+    assert_eq!(snapshot.proof.sha256, replacement.proof.sha256);
+    assert!(
+        engine
+            .source
+            .migration_remove_state_if_proof(&name, &snapshot.proof)
+            .is_err()
+    );
+    assert_eq!(
+        engine
+            .source
+            .migration_read_state(&name, MAX_STATE_BYTES)
+            .expect("replacement should remain readable")
+            .expect("replacement must be retained"),
+        snapshot.contents
+    );
+}
+
+#[test]
+fn confirmed_preview_replay_keeps_a_later_replacement_file() {
+    let (_source_root, _target_root, engine, preview) =
+        unconfirmed_preview("confirmed-preview-replacement");
+    let name = preview_state_name(&preview.id);
+    let original = engine
+        .source
+        .migration_read_state(&name, MAX_STATE_BYTES)
+        .expect("preview should read")
+        .expect("preview should exist");
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("confirmation should persist the job before retiring preview");
+    engine
+        .source
+        .migration_write_state(&name, &original)
+        .expect("replacement state should install under the retired name");
+    let replacement = engine
+        .source
+        .migration_read_state_snapshot(&name, MAX_STATE_BYTES)
+        .expect("replacement should read")
+        .expect("replacement should exist");
+    let replay = engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("confirmation replay should remain idempotent");
+    assert_eq!(replay.status, MigrationRunStatus::Queued);
+    assert!(
+        engine
+            .source
+            .migration_read_state(&name, MAX_STATE_BYTES)
+            .expect("replacement should remain readable")
+            .is_some()
+    );
+    assert_ne!(
+        replacement.proof.inode,
+        engine
+            .load_job(&preview.id)
+            .expect("confirmed job should remain")
+            .confirmed_preview_proof
+            .unwrap()
+            .inode
+    );
+}
+
+#[test]
+fn preview_maintenance_retains_expired_candidate_with_changed_access_policy() {
+    let (_source_root, _target_root, engine, preview) =
+        unconfirmed_preview("preview-maintenance-access-policy");
+    let name = preview_state_name(&preview.id);
+    let bytes = engine
+        .source
+        .migration_read_state(&name, MAX_STATE_BYTES)
+        .expect("preview should read")
+        .expect("preview should exist");
+    let mut document: PreviewDocument =
+        decode_state(&bytes, "migration preview").expect("preview should decode");
+    document.created_at = unix_seconds().saturating_sub(PREVIEW_RETENTION_SECONDS + 1);
+    let expired_bytes = encode_state(&document).expect("expired preview should encode");
+    engine
+        .source
+        .migration_write_state(&name, &expired_bytes)
+        .expect("expired preview should persist");
+    let path = engine
+        .source
+        .migration_root_path()
+        .join(".telegram-video-downloader-library")
+        .join(&name);
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+        .expect("fixture should change the preview access mode");
+
+    let report = MigrationEngine::maintain_source(&engine.source)
+        .expect("maintenance should report a candidate-local access failure");
+    assert!(report.warning.is_some());
+    assert_eq!(
+        fs::read(&path).expect("unreadable preview should remain"),
+        expired_bytes
+    );
+    assert_eq!(
+        fs::metadata(&path)
+            .expect("preview metadata should remain")
+            .mode()
+            & 0o777,
+        0o644
     );
 }
 
@@ -417,6 +702,198 @@ fn default_library_revision_latches_once_for_the_migration_run() {
             .expect("saved CAS revision should load"),
         Some(17)
     );
+}
+
+#[test]
+fn terminal_finalization_updates_only_epoch_and_preserves_default_baseline() {
+    let fixture = Fixture::with_default_update("terminal-finalization-default", true);
+    let completed = fixture.drive_to_completion();
+    assert!(completed.terminal_finalization_pending);
+    assert!(
+        fixture
+            .engine
+            .reauthorize_terminal_finalization(&fixture.migration_id, "epoch-after-restart", false)
+            .is_err(),
+        "pending terminal work without runtime context must fail closed"
+    );
+    fixture
+        .engine
+        .set_runtime_context(
+            &fixture.migration_id,
+            MigrationRuntimeContext {
+                database_epoch: "old-epoch".to_string(),
+                preview_seq: 9,
+                chat_id: Some(55),
+                message_id: Some(88),
+                delivery: MigrationDeliveryState::Sent,
+            },
+        )
+        .expect("terminal runtime context should persist");
+
+    let reauthorized = fixture
+        .engine
+        .reauthorize_terminal_finalization(&fixture.migration_id, "epoch-after-restart", false)
+        .expect("terminal epoch refresh should succeed")
+        .expect("terminal job should still exist");
+    assert_eq!(reauthorized.status, MigrationRunStatus::Completed);
+    assert!(reauthorized.terminal_finalization_pending);
+    let job = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("terminal job should remain durable");
+    assert_eq!(
+        job.runtime_context.as_ref().unwrap().database_epoch,
+        "epoch-after-restart"
+    );
+    assert_eq!(job.default_update_expected_revision, Some(17));
+    assert!(!job.default_update_resolved);
+    assert!(!job.stop_remaining_latched);
+
+    fixture
+        .engine
+        .mark_default_update_resolved(&fixture.migration_id, false, Some("newer setting won"))
+        .expect("default decision should resolve once");
+    let settled = fixture
+        .engine
+        .reauthorize_terminal_finalization(&fixture.migration_id, "later-epoch", false)
+        .expect("settled terminal replay should be harmless")
+        .expect("job should remain available");
+    assert_eq!(settled.status, MigrationRunStatus::Completed);
+    assert!(!settled.terminal_finalization_pending);
+    assert_eq!(
+        fixture
+            .engine
+            .runtime_context(&fixture.migration_id)
+            .expect("runtime context should load")
+            .unwrap()
+            .database_epoch,
+        "epoch-after-restart",
+        "settled no-op must not refresh terminal context again"
+    );
+}
+
+#[test]
+fn ordinary_control_in_epoch_is_atomic_and_terminal_replay_keeps_saved_epoch() {
+    let fixture = Fixture::new("ordinary-control-epoch");
+    fixture
+        .engine
+        .set_runtime_context(
+            &fixture.migration_id,
+            MigrationRuntimeContext {
+                database_epoch: "initial-epoch".to_string(),
+                preview_seq: 11,
+                chat_id: Some(55),
+                message_id: Some(90),
+                delivery: MigrationDeliveryState::Sent,
+            },
+        )
+        .expect("runtime context should persist");
+
+    let (paused, terminal_noop) = fixture
+        .engine
+        .control_in_epoch(
+            &fixture.migration_id,
+            MigrationControl::Pause,
+            "current-epoch",
+        )
+        .expect("ordinary control and epoch refresh should persist together");
+    assert!(!terminal_noop);
+    assert_eq!(paused.status, MigrationRunStatus::Paused);
+    assert_eq!(
+        fixture
+            .engine
+            .runtime_context(&fixture.migration_id)
+            .expect("runtime context should load")
+            .unwrap()
+            .database_epoch,
+        "current-epoch"
+    );
+
+    let (queued, terminal_noop) = fixture
+        .engine
+        .control_in_epoch(
+            &fixture.migration_id,
+            MigrationControl::Resume,
+            "current-epoch",
+        )
+        .expect("resume should remain an ordinary nonterminal control");
+    assert!(!terminal_noop);
+    assert_eq!(queued.status, MigrationRunStatus::Queued);
+    assert_eq!(
+        fixture.drive_to_completion().status,
+        MigrationRunStatus::Completed
+    );
+
+    let (completed, terminal_noop) = fixture
+        .engine
+        .control_in_epoch(
+            &fixture.migration_id,
+            MigrationControl::Pause,
+            "retired-epoch",
+        )
+        .expect("a stale ordinary control should be a terminal no-op");
+    assert!(terminal_noop);
+    assert_eq!(completed.status, MigrationRunStatus::Completed);
+    assert_eq!(
+        fixture
+            .engine
+            .runtime_context(&fixture.migration_id)
+            .expect("terminal runtime context should load")
+            .unwrap()
+            .database_epoch,
+        "current-epoch",
+        "ordinary terminal controls must not renew the saved epoch"
+    );
+    assert!(
+        fixture
+            .engine
+            .control_in_epoch(
+                &fixture.migration_id,
+                MigrationControl::FinalizeTerminal,
+                "retired-epoch",
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn stopped_terminal_finalization_requires_queue_proof_and_keeps_stop_latch() {
+    let fixture = Fixture::new("terminal-finalization-stopped");
+    let stopped = fixture
+        .engine
+        .control(&fixture.migration_id, MigrationControl::StopRemaining)
+        .expect("migration should stop before execution");
+    assert_eq!(stopped.status, MigrationRunStatus::Stopped);
+    fixture
+        .engine
+        .set_runtime_context(
+            &fixture.migration_id,
+            MigrationRuntimeContext {
+                database_epoch: "old-epoch".to_string(),
+                preview_seq: 10,
+                chat_id: Some(55),
+                message_id: Some(89),
+                delivery: MigrationDeliveryState::Sent,
+            },
+        )
+        .expect("stopped runtime context should persist");
+    let reauthorized = fixture
+        .engine
+        .reauthorize_terminal_finalization(&fixture.migration_id, "new-epoch", true)
+        .expect("fresh queue proof should authorize terminal cleanup")
+        .expect("stopped migration should remain available");
+    assert_eq!(reauthorized.status, MigrationRunStatus::Stopped);
+    assert!(!reauthorized.terminal_finalization_pending);
+    let job = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("stopped job should remain durable");
+    assert!(job.stop_remaining_latched);
+    assert_eq!(
+        job.runtime_context.as_ref().unwrap().database_epoch,
+        "new-epoch"
+    );
+    assert!(job.groups.iter().all(is_group_terminal));
 }
 
 #[test]
@@ -1201,6 +1678,109 @@ async fn final_ack_cleanup_replays_owner_and_directory_unlinks_after_restart() {
         fs::read(fixture.task_payload_target()).expect("target fragment should remain"),
         b"synthetic retained fragment"
     );
+}
+
+#[tokio::test]
+async fn stopped_final_ack_cleanup_removes_verified_payload_without_resuming_media() {
+    let fixture = TaskCleanupFixture::new("stopped-final-ack-payload-cleanup");
+    fixture.copy_and_ack();
+    fixture.mark_stopped_with_cleanup_error();
+    let lease = fixture.output_lease().await;
+    let unrelated = fixture
+        .staging_path
+        .parent()
+        .expect("owned job should be below the staging root")
+        .join("unrelated-migration-sibling");
+    fs::write(&unrelated, b"preserve this unrelated sibling")
+        .expect("unrelated staging sibling should write");
+
+    let mut status = fixture
+        .engine
+        .status(&fixture.migration_id)
+        .expect("migration status should read")
+        .expect("migration should exist");
+    for _ in 0..24 {
+        status = fixture.cleanup_step(&lease);
+        assert_eq!(
+            status.status,
+            MigrationRunStatus::Stopped,
+            "final-ACK cleanup must preserve the user's stop intent"
+        );
+        if status.task_transfers[0].source_cleanup_complete {
+            break;
+        }
+    }
+
+    assert!(status.task_transfers[0].source_cleanup_complete);
+    assert_eq!(status.total_items, 0);
+    assert_eq!(status.completed_items, 0);
+    assert_eq!(status.success_count, 0);
+    assert_eq!(status.failed_count, 0);
+    assert!(!fixture.payload_path.exists());
+    assert!(!fixture.staging_path.exists());
+    assert_eq!(
+        fs::read(fixture.task_payload_target()).expect("verified target payload should remain"),
+        b"synthetic retained fragment"
+    );
+    assert_eq!(
+        fs::read(&unrelated).expect("unrelated sibling must be retained"),
+        b"preserve this unrelated sibling"
+    );
+    let job = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("stopped migration should remain durable");
+    assert!(job.stop_remaining_latched);
+    assert!(
+        job.groups.is_empty(),
+        "cleanup must not resume media groups"
+    );
+    assert!(
+        !fixture
+            .engine
+            .task_handoff_cleanup_pending(&fixture.migration_id, "source-library")
+            .expect("completed source cleanup should no longer be pending")
+    );
+}
+
+#[tokio::test]
+async fn stopped_final_ack_cleanup_preserves_a_replaced_source_payload() {
+    let fixture = TaskCleanupFixture::new("stopped-final-ack-payload-replacement");
+    fixture.copy_and_ack();
+    fixture.mark_stopped_with_cleanup_error();
+    let lease = fixture.output_lease().await;
+
+    let first = fixture.cleanup_step(&lease);
+    assert_eq!(first.status, MigrationRunStatus::Stopped);
+    let job = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("cleanup intent should be durable");
+    assert!(job.task_transfers[0].entries[fixture.payload_index].source_cleanup_intent);
+    assert!(!job.task_transfers[0].entries[fixture.payload_index].source_removed);
+
+    let replacement = fixture.payload_path.with_extension("replacement");
+    fs::write(&replacement, b"replacement source fragment")
+        .expect("replacement fragment should write");
+    fs::rename(&replacement, &fixture.payload_path)
+        .expect("replacement fragment should install at the source path");
+    let status = fixture.cleanup_step(&lease);
+    assert_eq!(status.status, MigrationRunStatus::Partial);
+    assert!(
+        status.task_transfers[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("replaced"))
+    );
+    assert_eq!(
+        fs::read(&fixture.payload_path).expect("replacement source must be preserved"),
+        b"replacement source fragment"
+    );
+    assert_eq!(
+        fs::read(fixture.task_payload_target()).expect("verified target remains available"),
+        b"synthetic retained fragment"
+    );
+    assert!(fixture.staging_path.exists());
 }
 
 #[tokio::test]

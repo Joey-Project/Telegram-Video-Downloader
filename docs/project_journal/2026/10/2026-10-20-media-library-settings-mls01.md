@@ -102,14 +102,15 @@ superseded_by: ""
 | 范围 | 最终结果 |
 | --- | --- |
 | Rust 1.99.1 格式及差异空白检查 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
-| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,135 通过、0 失败、16 个既有忽略项 |
+| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,151 通过、0 失败、16 个既有忽略项 |
 | Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline` 通过 |
-| Cloud / Node 25.8.2 | 类型检查通过；122 项测试通过；Wrangler 4.149.0 dry-run 通过，41 个静态资源 |
+| Cloud / Node 25.8.2 | 类型检查通过；130 项测试通过；Wrangler 4.149.0 dry-run 通过，41 个静态资源 |
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
-- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/`、`.codex-tmp/mls01-review3/` 和 `.codex-tmp/mls01-review4/`，后者包含最新队列、确认时设置修订、快照压缩与来源清理恢复回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
-- 最新 Rust 验证日志为 `mls01-review4/full-tests-final-02.log`、`clippy-final-03.log` 和
-  `build-final.log`；构建后的测试构造和诊断文字调整未改变生产代码。Cloud 的最终测试、类型检查和 dry-run 日志也在 `mls01-review4/` 下。
+- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review5/`，后者包含默认设置归档、登记目录身份、预览生命周期及终态恢复回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
+- 最新 Rust 验证日志为 `mls01-review5/full-tests.log`、`clippy.log` 和 `build.log`。
+  Cloud 的最终测试、类型检查和 dry-run 日志分别为同目录下的 `cloud-npm-test.log`、
+  `cloud-typecheck.log` 和 `cloud-build-dry-run.log`。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
 - 大片段恢复用例使用 8–16 MiB 的合成文件；独立运行整体耗时约 15 秒。迁移完成等待设为明确的 60 秒上限，以容纳全量测试共享输出槽及调试模式校验开销，并保留超时状态诊断。全量测试随后通过；未改动生产迁移等待逻辑。
 - 测试使用临时本地目录、合成媒体/片段、fake 下载工具及 mock Telegram/cloud。恢复测试通过重建 runtime/queue 和持久状态重放模拟中断；未向真实 Telegram/Cloudflare 发送请求，未操作生产媒体或终止部署进程。
@@ -192,6 +193,30 @@ superseded_by: ""
   `legacy_completed_handoff_without_final_ack_keeps_source_controls` checks missing ACK proof.
   Stop intent survives attention and cleanup-only retry; queued task writers remain blocked
   until the exact acknowledgement receipt is consumed after cleanup.
+- Terminal recovery has an explicit authenticated finalization control after a database epoch
+  change. Queue token/receipt proof supplements the engine's saved checkpoints, including an
+  installed target whose engine acknowledgement was interrupted. Ordinary stale controls do not
+  renew terminal authority; stopped work retains its stop intent.
+- Terminal finalization runs as a tracked background operation. A held output lease must leave
+  cloud command dispatch responsive. Pending default resolution also retains both participating
+  library registrations until its durable outcome is known.
+  The default-run mock E2Es are
+  `completed_default_finalization_requires_new_epoch_authorization_and_blocks_removal` and
+  `stopped_target_installed_handoff_reauthorizes_once_and_keeps_dispatch_responsive`.
+  After the exact final queue ACK, stopped handoffs advance verified source-payload cleanup
+  before controls and directories, without advancing stopped media groups. Replacement and
+  unrelated-sibling regressions protect retained data on this terminal-only path.
+- Default-update history is rotated out of the 64 KiB registry into a separate bounded exact
+  archive. The registry binds its expected count and SHA-256; an archive-only interrupted write
+  is recoverable only from exact duplicate outcomes still present inline. Unknown, missing or
+  conflicting archive state does not authorize another default update.
+- Registration commits the prepared directory identity with its entry and optional default
+  update. A replacement detected before commit preserves registry/default/revision, while
+  ordinary child-entry changes remain accepted.
+- Preview maintenance examines one rotating candidate per source at a time. Expired documents
+  are retired, superseded plans are compacted, and confirmed previews are retired after a
+  durable job exists. Confirm replay and controls use that validated job; replaced or unreadable
+  documents remain preserved with bounded diagnostics.
 
 ## Isolated Cloudflare and Rust E2E at `08f56d4`
 
