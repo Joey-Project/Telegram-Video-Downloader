@@ -4200,7 +4200,21 @@ async fn replay_message(config_path: PathBuf, text: String) -> Result<()> {
             let mut failed_jobs = Vec::new();
             for (index, job) in jobs.into_iter().enumerate() {
                 let job_id = index + 1;
-                let job = normalize_bilibili_short_link_job(&config, job).await;
+                let label = job.label();
+                let job = match normalize_bilibili_short_link_job(&config, job).await {
+                    Ok(job) => job,
+                    Err(error) => {
+                        println!(
+                            "Failed replay job #{job_id}: {label}\nCould not resolve this Bilibili short link; no download was started."
+                        );
+                        warn!(
+                            error = %redact_sensitive_text(&format!("{error:#}")),
+                            "replay stopped after Bilibili short-link normalization failed"
+                        );
+                        failed_jobs.push(format!("#{job_id} {label}"));
+                        continue;
+                    }
+                };
                 println!("Queued replay job #{job_id}: {}", job.label());
                 if job.requires_bilibili_selection() || bilibili_video_pages_prompt_required(&job) {
                     println!(
@@ -7135,13 +7149,46 @@ fn queue_or_prompt_job(
                 .await
             {
                 Ok(permit) => {
-                    let job = normalize_bilibili_short_link_job(context.config.as_ref(), job).await;
+                    let normalized =
+                        normalize_bilibili_short_link_job(context.config.as_ref(), job).await;
                     drop(permit);
-                    job
+                    match normalized {
+                        Ok(job) => job,
+                        Err(error) => {
+                            warn!(
+                                task_id,
+                                error = %redact_sensitive_text(&format!("{error:#}")),
+                                "Bilibili short-link normalization failed; refusing to start an ambiguous download"
+                            );
+                            let _ = context.queue.fail_if_generation(
+                                &task_id,
+                                generation,
+                                truncate(&redact_sensitive_text(&format!("{error:#}"))),
+                            );
+                            send_or_log(
+                                &context.telegram,
+                                chat_id,
+                                "Could not resolve this Bilibili short link, so no download was started. Please retry the link.".to_string(),
+                            )
+                            .await;
+                            return;
+                        }
+                    }
                 }
                 Err(err) => {
-                    warn!(error = %err, "Bilibili short-link normalization skipped because the probe queue closed");
-                    job
+                    warn!(error = %err, "Bilibili short-link normalization could not run because the probe queue closed");
+                    let _ = context.queue.fail_if_generation(
+                        &task_id,
+                        generation,
+                        truncate(&redact_sensitive_text(&format!("{err:#}"))),
+                    );
+                    send_or_log(
+                        &context.telegram,
+                        chat_id,
+                        "Could not resolve this Bilibili short link, so no download was started. Please retry the link.".to_string(),
+                    )
+                    .await;
+                    return;
                 }
             }
         } else {
@@ -7410,24 +7457,28 @@ fn bilibili_membership_probe_failure_message() -> &'static str {
     "Could not verify whether this Bilibili video belongs to a collection. No download was started; please retry the link."
 }
 
-async fn normalize_bilibili_short_link_job(config: &AppConfig, job: JobRequest) -> JobRequest {
+fn should_suppress_selection_file_provider_notice(prompt: &BilibiliSelectionPrompt) -> bool {
+    matches!(prompt, BilibiliSelectionPrompt::UgcCollection)
+}
+
+async fn normalize_bilibili_short_link_job(
+    config: &AppConfig,
+    job: JobRequest,
+) -> Result<JobRequest> {
     let JobRequest::Bilibili { url, selection } = job else {
-        return job;
+        return Ok(job);
     };
     if !is_b23_short_link_url(&url) {
-        return JobRequest::Bilibili { url, selection };
+        return Ok(JobRequest::Bilibili { url, selection });
     }
 
-    match bilibili_core::resolve_b23_short_link(config, &url).await {
-        Ok(resolved_url) => apply_bilibili_short_link_resolution(selection, resolved_url),
-        Err(err) => {
-            warn!(
-                error = %redact_sensitive_text(&format!("{err:#}")),
-                "Bilibili short-link normalization failed; preserving the original URL"
-            );
-            JobRequest::Bilibili { url, selection }
-        }
-    }
+    let resolved_url = bilibili_core::resolve_b23_short_link(config, &url)
+        .await
+        .context("failed to normalize Bilibili short link")?;
+    Ok(apply_bilibili_short_link_resolution(
+        selection,
+        resolved_url,
+    ))
 }
 
 fn apply_bilibili_short_link_resolution(
@@ -7461,7 +7512,7 @@ async fn prompt_bilibili_selection(
     let queue = &context.queue;
     let retry_delay = context.queue_start_retry_delay;
     let suppress_extra_file_provider_notice =
-        !matches!(&prompt, BilibiliSelectionPrompt::SeasonMedia);
+        should_suppress_selection_file_provider_notice(&prompt);
     let token = next_bilibili_selection_callback_token(job_id);
     let mut reported_file_provider_error = false;
     let generation = loop {
@@ -19900,6 +19951,22 @@ mod tests {
                 url: "https://www.bilibili.com/bangumi/play/ep123".to_string(),
                 selection: None,
             }
+        ));
+    }
+
+    #[test]
+    fn video_page_selection_keeps_file_provider_retry_notice_visible() {
+        assert!(!should_suppress_selection_file_provider_notice(
+            &BilibiliSelectionPrompt::VideoPages {
+                page: Some(2),
+                collection: None,
+            }
+        ));
+        assert!(!should_suppress_selection_file_provider_notice(
+            &BilibiliSelectionPrompt::SeasonMedia
+        ));
+        assert!(should_suppress_selection_file_provider_notice(
+            &BilibiliSelectionPrompt::UgcCollection
         ));
     }
 
