@@ -595,19 +595,26 @@ where
         media_library_bot::same_root(&library.root, &runtime.bot.config.downloads.video_dir)
     });
     let selected_library_id = selected_library.map(|library| library.id.clone());
+    let selected_queue_library_id = selected_library_id
+        .as_deref()
+        .context("library operation has no registered queue store for its root")?
+        .to_string();
     let default_library_id = settings.default_library_id;
-    if let Some(library) = selected_library {
-        library_migration_bot::ensure_library_io_available(runtime, &library.id).await?;
-    }
+    library_migration_bot::ensure_library_io_available(runtime, &selected_queue_library_id).await?;
     let _publication_guard = runtime.library_scan_publication_gate.lock().await;
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
     }
     let context = runtime.bot.clone();
     let inbox = Arc::clone(&runtime.inbox);
-    let worker = tokio::task::spawn_blocking(move || operation(context, inbox))
-        .await
-        .with_context(|| failure_context);
+    let queue = Arc::clone(&runtime.bot.queue);
+    let selected_library_id_for_worker = selected_queue_library_id;
+    let worker = tokio::task::spawn_blocking(move || {
+        refresh_and_require_library_queue_available(&queue, &selected_library_id_for_worker)?;
+        operation(context, inbox)
+    })
+    .await
+    .with_context(|| failure_context);
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
     }
@@ -702,6 +709,25 @@ fn bounded_cloud_library_warning(warning: &str) -> String {
         &redact_sensitive_text(warning),
         CLOUD_LIBRARY_WARNING_TEXT_LIMIT_BYTES,
     )
+}
+
+fn refresh_and_require_library_queue_available(
+    queue: &QueueManager,
+    library_id: &str,
+) -> Result<()> {
+    queue.refresh_video_library(library_id)?;
+    let statuses = queue.video_library_statuses()?;
+    let status = statuses
+        .get(library_id)
+        .with_context(|| format!("media library {library_id} has no queue availability status"))?;
+    if !status.available {
+        let diagnostic = status
+            .diagnostic
+            .as_deref()
+            .unwrap_or("registered queue root is unavailable");
+        bail!("media library {library_id} is unavailable: {diagnostic}");
+    }
+    Ok(())
 }
 
 fn truncate_cloud_warning(text: &str, max_bytes: usize) -> String {

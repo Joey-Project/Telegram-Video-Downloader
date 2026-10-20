@@ -32,6 +32,12 @@ Changing the default or a library's category also requires the registered root t
 and identity-matched; rejection preserves the existing settings and revision.
 Registration stores the identity of the directory opened during preparation with the new entry.
 A replacement detected before that commit leaves the registry, default and revision unchanged.
+Before a scoped cloud management operation opens its library manager, dispatch refreshes the selected
+registration and checks that its saved root identity still matches an available queue store. A missing
+status, unavailable root or identity mismatch fails closed before scanning or writing library metadata;
+the selected library is marked unavailable and its cached view stays read-only. Ordinary child-entry
+changes do not invalidate the root. A scoped refresh can restore service when the original bound root
+returns, while a replacement at the same path remains rejected.
 
 A failed refresh retains the last successful view for that library and marks it unavailable.
 Cached items stay visible but read-only until a successful scan. Refresh and library switching

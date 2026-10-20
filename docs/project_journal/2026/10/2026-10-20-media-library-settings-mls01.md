@@ -102,13 +102,13 @@ superseded_by: ""
 | 范围 | 最终结果 |
 | --- | --- |
 | Rust 1.99.1 格式及差异空白检查 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
-| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,157 通过、0 失败、16 个既有忽略项 |
-| Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline` 通过 |
+| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,158 通过、0 失败、16 个既有忽略项 |
+| Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline --bin telegram-video-downloader` 通过 |
 | Cloud / Node 25.8.2 | 类型检查通过；139 项测试通过；Wrangler 4.149.0 dry-run 通过，43 个静态资源 |
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
-- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review6/`，后者包含恢复历史优先级、预览到期状态及大型预览摘要回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
-- 最新 Rust 验证日志为 `mls01-review6/full-tests.log`、`clippy-final.log` 和 `build.log`。
+- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review7/`；后者记录根目录替换拒绝、同一根恢复及动态空闲空间的完整快照比较。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
+- 最新 Rust 验证日志为 `mls01-review7/full-all-targets-final.log`、`clippy-all-targets-final.log` 和 `build-bot-final.log`。
   Cloud 的最终测试、类型检查和 dry-run 日志分别为同目录下的 `cloud-npm-test.log`、
   `cloud-typecheck.log` 和 `cloud-build-dry-run.log`。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
@@ -167,6 +167,16 @@ superseded_by: ""
   replacement preserves the selected default, settings revision, and original queue data.
 - Category changes apply the same registered-root identity gate. Ordinary child-entry churn is
   accepted while a replacement root is rejected without changing the category or revision.
+- Before a scoped cloud management closure opens a library manager, dispatch refreshes the selected
+  registration and verifies its saved root identity and availability. Missing, unavailable or
+  replaced roots fail before scan or library-metadata writes and mark only that library unavailable;
+  child-entry churn remains supported, and a scoped refresh recovers when the original bound root
+  returns. `media_library_dispatch_rejects_replaced_roots_and_recovers_scoped_roots` covers these
+  cases, including scan/file-preview refusal without replacement metadata and successful recovery.
+- The HTTP recovery regression compares complete state content after normalizing only freshly
+  sampled per-library `free_bytes`. Cached media, revision, scan time, warnings and all other fields
+  remain exact; availability must recover, and refreshed capacity must be numeric. A fresh sample
+  may be equal to the earlier capacity or differ as parallel tests allocate space on the same volume.
 - The migration's expected default-settings revision is persisted with confirmation, before
   task quiescence or output-lease waits. Restart and confirmation replay cannot adopt a later
   explicit user choice as the migration's new baseline.

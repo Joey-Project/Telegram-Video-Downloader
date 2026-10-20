@@ -599,9 +599,60 @@ async fn spawn_fake_cloud_api_with_epoch(
                                         .context("fake state content should serialize")?
                                 )
                             );
+                            let mut stable_content = content.clone();
+                            if let Some(descriptors) =
+                                stable_content["library"]["libraries"].as_array_mut()
+                            {
+                                for descriptor in descriptors {
+                                    if let Some(fields) = descriptor.as_object_mut() {
+                                        fields.remove("free_bytes");
+                                    }
+                                }
+                            }
+                            let stable_content_hash = format!(
+                                "{:x}",
+                                Sha256::digest(
+                                    serde_json::to_vec(&stable_content)
+                                        .context("normalized fake state should serialize")?
+                                )
+                            );
+                            let state_field_hashes = content
+                                .as_object()
+                                .map(|fields| {
+                                    fields
+                                        .iter()
+                                        .map(|(key, value)| {
+                                            let encoded = serde_json::to_vec(value)
+                                                .context("fake state field should serialize")?;
+                                            let hash = format!("{:x}", Sha256::digest(encoded));
+                                            Ok((
+                                                key.clone(),
+                                                serde_json::Value::String(hash),
+                                            ))
+                                        })
+                                        .collect::<Result<serde_json::Map<String, serde_json::Value>>>()
+                                })
+                                .transpose()?
+                                .unwrap_or_default();
                             let library_hash = format!("{:x}", Sha256::digest(
                                 serde_json::to_vec(library).context("fake state library should serialize")?
                             ));
+                            let library_descriptor_status = library["libraries"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|descriptor| serde_json::json!({
+                                    "id": descriptor["id"],
+                                    "availability": descriptor["availability"],
+                                    "media_count": descriptor["media_count"],
+                                    "scanned_at": descriptor["scanned_at"],
+                                    "free_bytes": descriptor["free_bytes"],
+                                    "incomplete_task_count": descriptor["incomplete_task_count"],
+                                    "staging_bytes": descriptor["staging_bytes"],
+                                    "snapshot_ready": descriptor["snapshot"]["ready"],
+                                    "snapshot_incomplete": descriptor["snapshot"]["incomplete"],
+                                }))
+                                .collect::<Vec<_>>();
                             let operations = &request.body["operations"];
                             let operations_bytes = serde_json::to_vec(operations)
                                 .context("fake state operations should serialize")?;
@@ -636,7 +687,10 @@ async fn spawn_fake_cloud_api_with_epoch(
                                 "reported_at": request.body["reported_at"],
                                 "revision": request.body["revision"],
                                 "content_hash": content_hash,
+                                "stable_content_hash": stable_content_hash,
+                                "state_field_hashes": state_field_hashes,
                                 "library_hash": library_hash,
+                                "library_descriptor_status": library_descriptor_status,
                                 "library_ready": library["ready"],
                                 "library_incomplete": library["incomplete"],
                                 "library_warnings": library_warning_sample,
@@ -1506,6 +1560,195 @@ async fn media_library_settings_and_scoped_file_management_mock_e2e() {
         archive.join("Documentaries")
     );
     drop(reopened);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn media_library_dispatch_rejects_replaced_roots_and_recovers_scoped_roots() {
+    let root = temp_cloud_bot_dir("media-library-root-replacement-dispatch");
+    let video_root = root.join("videos");
+    let archive_root = root.join("archive");
+    let displaced_root = root.join("archive-displaced");
+    let replacement_root = root.join("archive-replacement");
+    let pdf_root = root.join("pdfs");
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = video_root.clone();
+    config.downloads.pdf_dir = pdf_root;
+    config
+        .ensure_runtime_dirs()
+        .expect("test roots should create");
+    fs::create_dir(&archive_root).expect("archive root should create");
+    fs::write(archive_root.join("original.mp4"), b"original root media")
+        .expect("original media should write");
+    let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let library_id = queue
+        .register_video_library("Archive", &archive_root, None, false, false)
+        .expect("secondary library should register")
+        .id;
+    let inbox = Arc::new(open_runtime_test_inbox(&video_root).expect("test inbox should open"));
+    let runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+
+    let baseline = run_library_management_test_request(
+        &runtime,
+        781,
+        "library_scan",
+        serde_json::json!({"library_id": library_id}),
+    )
+    .await;
+    assert_eq!(
+        baseline.status,
+        InboxStatus::Completed,
+        "{:?}",
+        baseline.error
+    );
+    let baseline_item_id = baseline.result.as_ref().unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "original.mp4")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    fs::write(archive_root.join("added-after-scan.mp4"), b"child churn")
+        .expect("ordinary child churn should be allowed");
+    let after_child_churn = run_library_management_test_request(
+        &runtime,
+        782,
+        "library_scan",
+        serde_json::json!({"library_id": library_id}),
+    )
+    .await;
+    assert_eq!(
+        after_child_churn.status,
+        InboxStatus::Completed,
+        "same-root child changes must not trip the identity guard: {:?}",
+        after_child_churn.error
+    );
+
+    fs::rename(&archive_root, &displaced_root).expect("original root should be displaced");
+    fs::create_dir(&archive_root).expect("replacement should occupy the registered path");
+    fs::write(
+        archive_root.join("replacement.mp4"),
+        b"replacement root media",
+    )
+    .expect("replacement media should write");
+
+    let rejected_scan = run_library_management_test_request(
+        &runtime,
+        783,
+        "library_scan",
+        serde_json::json!({"library_id": library_id}),
+    )
+    .await;
+    assert_eq!(rejected_scan.status, InboxStatus::Failed);
+    assert!(rejected_scan.error.as_deref().is_some_and(|error| {
+        error.contains("unavailable") || error.contains("different root object")
+    }));
+    assert!(
+        !archive_root
+            .join(".telegram-video-downloader-library")
+            .exists(),
+        "rejected scan must not create library metadata on the replacement inode"
+    );
+    assert!(
+        !archive_root
+            .join(".telegram-video-downloader-queue")
+            .exists(),
+        "rejected scan must not initialize a queue on the replacement inode"
+    );
+
+    let rejected_preview = run_library_management_test_request(
+        &runtime,
+        784,
+        "file_preview",
+        serde_json::json!({
+            "library_id": library_id,
+            "item_ids": [baseline_item_id],
+            "target_relative_dir": "organized",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(rejected_preview.status, InboxStatus::Failed);
+    assert!(rejected_preview.error.as_deref().is_some_and(|error| {
+        error.contains("unavailable") || error.contains("different root object")
+    }));
+    assert!(
+        !archive_root
+            .join(".telegram-video-downloader-library")
+            .exists(),
+        "rejected file preview must not create preview/recovery metadata on the replacement inode"
+    );
+    assert!(
+        !archive_root
+            .join(".telegram-video-downloader-queue")
+            .exists(),
+        "rejected file preview must not initialize a queue on the replacement inode"
+    );
+    assert_eq!(
+        fs::read(archive_root.join("replacement.mp4")).unwrap(),
+        b"replacement root media",
+        "the rejection path must leave replacement contents unchanged"
+    );
+
+    fs::rename(&archive_root, &replacement_root).expect("replacement should be moved aside");
+    fs::rename(&displaced_root, &archive_root).expect("original root object should be restored");
+    let recovered_scan = run_library_management_test_request(
+        &runtime,
+        785,
+        "library_scan",
+        serde_json::json!({"library_id": library_id}),
+    )
+    .await;
+    assert_eq!(
+        recovered_scan.status,
+        InboxStatus::Completed,
+        "restoring the same bound root should recover a scoped scan: {:?}",
+        recovered_scan.error
+    );
+    let recovered_item_id = recovered_scan.result.as_ref().unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "original.mp4")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let recovered_preview = run_library_management_test_request(
+        &runtime,
+        786,
+        "file_preview",
+        serde_json::json!({
+            "library_id": library_id,
+            "item_ids": [recovered_item_id],
+            "target_relative_dir": "organized",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(
+        recovered_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "scoped preview should work after the original root recovers: {:?}",
+        recovered_preview.error
+    );
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
     stop_fake_telegram_api(shutdown, server).await;
     let _ = fs::remove_dir_all(root);
 }

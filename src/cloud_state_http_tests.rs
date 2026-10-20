@@ -197,8 +197,8 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
         presence: Presence::Present,
     });
     cached_snapshot.warnings = vec!["existing library warning".to_string()];
-    let mut unavailable_projection = serde_json::to_value(&cached_snapshot)
-        .expect("cached library snapshot should serialize");
+    let mut unavailable_projection =
+        serde_json::to_value(&cached_snapshot).expect("cached library snapshot should serialize");
     for item in unavailable_projection["items"]
         .as_array_mut()
         .expect("cached snapshot items should be an array")
@@ -248,17 +248,19 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
     );
     assert_eq!(posts[1]["library_item_count"], 1);
     assert_eq!(
-        posts[1]["library_items_hash"],
-        unavailable_projection_hash,
+        posts[1]["library_items_hash"], unavailable_projection_hash,
         "the cached media metadata should remain intact while unavailable presence is projected"
     );
     assert_ne!(
-        posts[1]["library_items_hash"],
-        posts[0]["library_items_hash"],
+        posts[1]["library_items_hash"], posts[0]["library_items_hash"],
         "the unavailable projection should mark cached items as unavailable"
     );
     assert_eq!(posts[1]["library_warning_count"], 2);
     assert_eq!(posts[1]["library_incomplete"], true);
+    assert_eq!(
+        posts[1]["library_descriptor_status"][0]["availability"],
+        "unavailable"
+    );
     assert!(
         posts[1]["library_scan_warning"]
             .as_str()
@@ -299,7 +301,54 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
     assert_eq!(posts[2]["library_warning_count"], 1);
     assert_eq!(posts[2]["library_scan_warning"], serde_json::Value::Null);
     assert_eq!(posts[2]["library_warnings"][0], "existing library warning");
-    assert_eq!(posts[2]["content_hash"], posts[0]["content_hash"]);
+    assert_eq!(
+        posts[2]["library_descriptor_status"][0]["availability"],
+        "available"
+    );
+    assert!(
+        posts[2]["library_descriptor_status"][0]["free_bytes"]
+            .as_u64()
+            .is_some()
+    );
+    let initial_field_hashes = posts[0]["state_field_hashes"]
+        .as_object()
+        .expect("initial state field hashes should be an object");
+    let recovered_field_hashes = posts[2]["state_field_hashes"]
+        .as_object()
+        .expect("recovered state field hashes should be an object");
+    let changed_fields = initial_field_hashes
+        .iter()
+        .filter(|(key, value)| recovered_field_hashes.get(*key) != Some(*value))
+        .map(|(key, _)| key.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        changed_fields.is_empty() || (changed_fields.len() == 1 && changed_fields[0] == "library"),
+        "recovery may only refresh the library component's free-space metadata; changed fields: {changed_fields:?}"
+    );
+    assert_eq!(
+        posts[2]["stable_content_hash"], posts[0]["stable_content_hash"],
+        "all state content other than dynamic per-library free-space metadata should match"
+    );
+    let mut initial_descriptor_status = posts[0]["library_descriptor_status"].clone();
+    let mut recovered_descriptor_status = posts[2]["library_descriptor_status"].clone();
+    for descriptors in [
+        &mut initial_descriptor_status,
+        &mut recovered_descriptor_status,
+    ] {
+        for descriptor in descriptors
+            .as_array_mut()
+            .expect("descriptor status should be an array")
+        {
+            descriptor
+                .as_object_mut()
+                .expect("descriptor status should be an object")
+                .remove("free_bytes");
+        }
+    }
+    assert_eq!(
+        recovered_descriptor_status, initial_descriptor_status,
+        "availability and all stable per-library descriptor fields should recover unchanged"
+    );
 
     reporter.abort();
     let _ = reporter.await;
