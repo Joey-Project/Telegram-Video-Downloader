@@ -1,5 +1,5 @@
 import { appendAction, removeQueuedAction, shouldRetryActionFailure } from "./action-queue.js";
-import { filterPresentLegacyCandidates, getOrCreateLegacySelection, hasDuplicateLegacyHintSelection, updateLegacySelection } from "./legacy-mapping-state.js";
+import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
@@ -19,7 +19,7 @@ const POLL_MS = 12_000;
 
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, selected: new Set(), quarantinedActionIds: new Set(), view: "library", query: "", detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, selected: new Set(), quarantinedActionIds: new Set(), view: "library", query: "", detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false };
 
 const byId = (id) => document.getElementById(id);
 const formatBytes = (value) => {
@@ -489,28 +489,35 @@ function renderPreviews() {
 }
 
 function renderLegacyMappings() {
-  const operation = [...legacyOperations()].reverse()[0];
-  state.legacyOperation = operation ?? null;
+  const importSelection = selectLegacyImportForMapping(legacyOperations());
+  const operation = importSelection.usable ? importSelection.operation : null;
   const container = byId("legacy-mappings");
-  if (!operation) {
+  state.legacyOperation = operation;
+  if (!importSelection.latest) {
     container.classList.add("hidden");
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
+    return;
+  }
+  if (!operation) {
+    const latest = importSelection.latest;
+    const detailsWarning = operationDetailsWarning(latest);
+    const failure = typeof latest.error === "string" && latest.error ? `${latest.error} ` : "";
+    state.legacyOperationKey = null;
+    state.legacyPage = 0;
+    container.classList.remove("hidden");
+    container.innerHTML = `<p class="warning-text">${escapeHtml(detailsWarning || `The latest legacy import is ${statusText(latest.status)}.${failure} A completed, complete import report is required before mapping hints.`)}</p>`;
     state.manualPickerKey = null;
     state.manualPickerQuery = "";
     return;
   }
   const incompleteWarning = operationDetailsWarning(operation);
-  if (incompleteWarning) {
+  if (incompleteWarning || !Array.isArray(operation.result?.hints) || !Array.isArray(operation.result?.candidates)) {
     state.legacyOperation = null;
     state.legacyOperationKey = null;
+    state.legacyPage = 0;
     container.classList.remove("hidden");
-    container.innerHTML = `<p class="warning-text">${escapeHtml(incompleteWarning)}</p>`;
-    state.manualPickerKey = null;
-    state.manualPickerQuery = "";
-    return;
-  }
-  if (!Array.isArray(operation.result?.hints) || !Array.isArray(operation.result?.candidates)) {
-    state.legacyOperation = null;
-    container.classList.add("hidden");
+    container.innerHTML = `<p class="warning-text">${escapeHtml(incompleteWarning || "The saved legacy import report is incomplete. Submit the import again to review the full report.")}</p>`;
     state.manualPickerKey = null;
     state.manualPickerQuery = "";
     return;
@@ -519,44 +526,50 @@ function renderLegacyMappings() {
   if (state.legacyOperationKey !== operationKey) {
     state.legacyOperationKey = operationKey;
     state.legacySelection = new Map();
+    state.legacyPage = 0;
     state.manualPickerKey = null;
     state.manualPickerQuery = "";
   }
   const hints = operation.result.hints;
-  const candidates = filterPresentLegacyCandidates(operation.result.candidates, libraryItems());
+  const choices = buildLegacyMappingChoices(operationKey, hints, operation.result.candidates, libraryItems());
+  const page = paginateLegacyMappingChoices(choices, state.legacyPage, LEGACY_MAPPING_PAGE_SIZE);
+  state.legacyPage = page.page;
   const warnings = Array.isArray(operation.result.warnings) ? operation.result.warnings : [];
-  const matchedHintIndexes = new Set(candidates.map((candidate) => Number(candidate.hint_index)));
-  const manualHints = hints.map((hint, hintIndex) => ({ hint, hintIndex })).filter(({ hintIndex }) => !matchedHintIndexes.has(hintIndex));
-  const manualKeys = new Set(manualHints.map(({ hintIndex }) => `${operationKey}:manual:${hintIndex}`));
+  const validKeys = new Set(choices.map((choice) => choice.key));
+  const manualKeys = new Set(choices.filter((choice) => choice.kind === "manual").map((choice) => choice.key));
   if (state.manualPickerKey && !manualKeys.has(state.manualPickerKey)) {
     state.manualPickerKey = null;
     state.manualPickerQuery = "";
   }
   container.classList.remove("hidden");
-  const candidateKeys = new Set();
-  const candidateRows = candidates.map((candidate, index) => {
-    const hintIndex = Number(candidate.hint_index);
-    const hint = hints[hintIndex] ?? {};
-    const candidateKey = `${operationKey}:${hintIndex}:${candidate.item_id}:${index}`;
-    candidateKeys.add(candidateKey);
+  const rows = page.choices.map((choice) => {
+    const { hint, hintIndex } = choice;
     const sourceIds = Array.isArray(hint.source_ids) ? hint.source_ids : [];
     const collection = hint.collection && typeof hint.collection === "object" ? hint.collection.title : "";
-    const selection = getOrCreateLegacySelection(state.legacySelection, candidateKey, { selected: false, title: Boolean(hint.title), source_ids: sourceIds.length > 0, collection: Boolean(collection) });
-    return `<div class="mapping-row"><div class="mapping-row-head"><input type="checkbox" aria-label="Apply legacy hint to ${escapeHtml(candidate.title ?? candidate.relative_path)}" data-map-select="${escapeHtml(candidateKey)}" data-hint-index="${hintIndex}" data-item-id="${escapeHtml(candidate.item_id)}" ${selection.selected ? "checked" : ""}><div><div class="mapping-name">${escapeHtml(hint.title || candidate.title || "Legacy source links")} → ${escapeHtml(candidate.title || candidate.relative_path || candidate.item_id)}</div><div class="mapping-path">${escapeHtml(candidate.relative_path ?? "Path unavailable")} · ${escapeHtml(candidate.match_kind ?? "candidate match")}${candidate.ambiguous ? " · check this match" : ""}</div></div></div><div class="mapping-fields"><label><input type="checkbox" data-map-field="title" data-map-key="${escapeHtml(candidateKey)}" ${selection.title ? "checked" : ""} ${hint.title ? "" : "disabled"}> Title</label><label><input type="checkbox" data-map-field="source_ids" data-map-key="${escapeHtml(candidateKey)}" ${selection.source_ids ? "checked" : ""} ${sourceIds.length ? "" : "disabled"}> ${sourceIds.length} source link${sourceIds.length === 1 ? "" : "s"}</label><label><input type="checkbox" data-map-field="collection" data-map-key="${escapeHtml(candidateKey)}" ${selection.collection ? "checked" : ""} ${collection ? "" : "disabled"}> Collection</label></div>${candidate.requires_confirmation || hint.requires_confirmation ? `<p class="mapping-help">This match needs your confirmation. Review the item path and proposed fields before continuing.</p>` : ""}</div>`;
-  });
-  const manualRows = manualHints.map(({ hint, hintIndex }) => {
-    const manualKey = `${operationKey}:manual:${hintIndex}`;
-    candidateKeys.add(manualKey);
-    const sourceIds = Array.isArray(hint.source_ids) ? hint.source_ids : [];
-    const collection = hint.collection && typeof hint.collection === "object" ? hint.collection.title : "";
-    const selection = getOrCreateLegacySelection(state.legacySelection, manualKey, { selected: false, item_id: "", title: Boolean(hint.title), source_ids: sourceIds.length > 0, collection: Boolean(collection) });
-    const pickerOpen = state.manualPickerKey === manualKey;
-    const picker = pickerOpen ? manualTargetPickerMarkup(manualKey, selection, hintIndex) : "";
+    const selection = getOrCreateLegacySelection(state.legacySelection, choice.key, {
+      selected: false, hintIndex, manual: choice.kind === "manual", item_id: "",
+      title: Boolean(hint.title), source_ids: sourceIds.length > 0, collection: Boolean(collection),
+    });
+    if (choice.kind === "candidate") {
+      const candidate = choice.candidate;
+      const candidateError = typeof candidate.error === "string" ? candidate.error : typeof candidate.error_message === "string" ? candidate.error_message : "";
+      return `<div class="mapping-row"><div class="mapping-row-head"><input type="checkbox" aria-label="Apply legacy hint to ${escapeHtml(candidate.title ?? candidate.relative_path)}" data-map-select="${escapeHtml(choice.key)}" data-hint-index="${hintIndex}" data-item-id="${escapeHtml(candidate.item_id)}" ${selection.selected ? "checked" : ""}><div><div class="mapping-name">${escapeHtml(hint.title || candidate.title || "Legacy source links")} → ${escapeHtml(candidate.title || candidate.relative_path || candidate.item_id)}</div><div class="mapping-path">${escapeHtml(candidate.relative_path ?? "Path unavailable")} · ${escapeHtml(candidate.match_kind ?? "candidate match")}${candidate.ambiguous ? " · check this match" : ""}</div>${candidateError ? `<p class="mapping-help">${escapeHtml(candidateError)}</p>` : ""}</div></div><div class="mapping-fields"><label><input type="checkbox" data-map-field="title" data-map-key="${escapeHtml(choice.key)}" ${selection.title ? "checked" : ""} ${hint.title ? "" : "disabled"}> Title</label><label><input type="checkbox" data-map-field="source_ids" data-map-key="${escapeHtml(choice.key)}" ${selection.source_ids ? "checked" : ""} ${sourceIds.length ? "" : "disabled"}> ${sourceIds.length} source link${sourceIds.length === 1 ? "" : "s"}</label><label><input type="checkbox" data-map-field="collection" data-map-key="${escapeHtml(choice.key)}" ${selection.collection ? "checked" : ""} ${collection ? "" : "disabled"}> Collection</label></div>${candidate.requires_confirmation || hint.requires_confirmation ? `<p class="mapping-help">This match needs your confirmation. Review the item path and proposed fields before continuing.</p>` : ""}<div class="mapping-actions"><button class="small-button" type="button" data-open-manual-hint="${hintIndex}">Choose a different video</button></div></div>`;
+    }
+    const pickerOpen = state.manualPickerKey === choice.key;
+    const picker = pickerOpen ? manualTargetPickerMarkup(choice.key, selection, hintIndex) : "";
     const selectedTarget = selection.item_id ? `<p class="mapping-path">Selected video ID: ${escapeHtml(selection.item_id)}</p>` : "";
-    return `<div class="mapping-row manual-mapping"><div class="mapping-row-head"><input type="checkbox" aria-label="Apply this legacy hint after manually choosing a video" data-map-select="${escapeHtml(manualKey)}" data-manual="true" data-hint-index="${hintIndex}" ${selection.selected ? "checked" : ""}><div><div class="mapping-name">${escapeHtml(hint.title || "Legacy hint without a reliable match")}</div><div class="mapping-path">No reliable automatic match · choose a present video manually</div></div></div><button class="small-button" type="button" data-manual-picker-toggle="${escapeHtml(manualKey)}" aria-expanded="${pickerOpen}">${selection.item_id ? "Change selected video" : "Choose a video"}</button>${pickerOpen ? picker : selectedTarget}<div class="mapping-fields"><label><input type="checkbox" data-map-field="title" data-map-key="${escapeHtml(manualKey)}" ${selection.title ? "checked" : ""} ${hint.title ? "" : "disabled"}> Title</label><label><input type="checkbox" data-map-field="source_ids" data-map-key="${escapeHtml(manualKey)}" ${selection.source_ids ? "checked" : ""} ${sourceIds.length ? "" : "disabled"}> ${sourceIds.length} source link${sourceIds.length === 1 ? "" : "s"}</label><label><input type="checkbox" data-map-field="collection" data-map-key="${escapeHtml(manualKey)}" ${selection.collection ? "checked" : ""} ${collection ? "" : "disabled"}> Collection</label></div><p class="mapping-help">This is a manual association. Review the selected path and the generated metadata preview before confirming.</p></div>`;
+    const description = choice.hasCandidate ? "Manual replacement for the automatic match" : "No reliable automatic match · choose a present video manually";
+    const pickerLabel = selection.item_id ? "Change selected video" : choice.hasCandidate ? "Choose a different video" : "Choose a video";
+    return `<div class="mapping-row manual-mapping"><div class="mapping-row-head"><input type="checkbox" aria-label="Apply this legacy hint after manually choosing a video" data-map-select="${escapeHtml(choice.key)}" data-manual="true" data-hint-index="${hintIndex}" ${selection.selected ? "checked" : ""}><div><div class="mapping-name">${escapeHtml(hint.title || "Legacy hint without a reliable match")}</div><div class="mapping-path">${description}</div></div></div><button class="small-button" type="button" data-manual-picker-toggle="${escapeHtml(choice.key)}" aria-expanded="${pickerOpen}">${pickerLabel}</button>${pickerOpen ? picker : selectedTarget}<div class="mapping-fields"><label><input type="checkbox" data-map-field="title" data-map-key="${escapeHtml(choice.key)}" ${selection.title ? "checked" : ""} ${hint.title ? "" : "disabled"}> Title</label><label><input type="checkbox" data-map-field="source_ids" data-map-key="${escapeHtml(choice.key)}" ${selection.source_ids ? "checked" : ""} ${sourceIds.length ? "" : "disabled"}> ${sourceIds.length} source link${sourceIds.length === 1 ? "" : "s"}</label><label><input type="checkbox" data-map-field="collection" data-map-key="${escapeHtml(choice.key)}" ${selection.collection ? "checked" : ""} ${collection ? "" : "disabled"}> Collection</label></div><p class="mapping-help">This is a manual association. Review the selected path and generated metadata preview before continuing.</p></div>`;
   });
-  container.innerHTML = `<p class="mapping-title">Choose a video for each legacy hint</p>${warnings.length ? `<p class="warning-text">${warnings.map(escapeHtml).join(" · ")}</p>` : ""}${candidateRows.length ? candidateRows.join("") : ""}${manualRows.length ? `<p class="mapping-title manual-heading">No reliable match</p>${manualRows.join("")}` : candidates.length ? "" : `<p class="field-hint">No hints or possible media matches were found.</p>`}<div class="mapping-actions"><button id="preview-metadata" class="primary-button" type="button" ${candidateRows.length || manualRows.length ? "" : "disabled"}>Preview selected updates <span aria-hidden="true">→</span></button></div>`;
-  for (const key of state.legacySelection.keys()) if (!candidateKeys.has(key)) state.legacySelection.delete(key);
+  const displayedRange = page.total ? `Showing rows ${page.start + 1}–${page.end} of ${page.total.toLocaleString()} · ${hints.length.toLocaleString()} hints total` : `${hints.length.toLocaleString()} hints · no current mapping choices`;
+  const previousPage = page.page > 0 ? `<button class="quiet-button" type="button" data-legacy-page="-1">Previous</button>` : `<button class="quiet-button" type="button" disabled>Previous</button>`;
+  const nextPage = page.page + 1 < page.pageCount ? `<button class="quiet-button" type="button" data-legacy-page="1">Next</button>` : `<button class="quiet-button" type="button" disabled>Next</button>`;
+  const pagination = page.pageCount > 1 ? `<div class="mapping-pagination" aria-label="Legacy mapping pages">${previousPage}<span>Page ${page.page + 1} of ${page.pageCount}</span>${nextPage}</div>` : "";
+  const newerImportNotice = importSelection.latest !== operation ? `<p class="warning-text">A newer legacy import did not save a complete successful report. Showing the latest completed import; see request history for the newer result.</p>` : "";
+  const emptyMessage = hints.length === 0 ? `<p class="field-hint">No hints or possible media matches were found.</p>` : "";
+  container.innerHTML = `<p class="mapping-title">Choose a video for each legacy hint</p>${newerImportNotice}${warnings.length ? `<p class="warning-text">${warnings.map(escapeHtml).join(" · ")}</p>` : ""}<p class="field-hint">${displayedRange}</p>${rows.length ? rows.join("") : emptyMessage}${pagination}<div class="mapping-actions"><button id="preview-metadata" class="primary-button" type="button" ${choices.length ? "" : "disabled"}>Preview selected updates <span aria-hidden="true">→</span></button></div>`;
+  for (const key of state.legacySelection.keys()) if (!validKeys.has(key)) state.legacySelection.delete(key);
 }
 
 function manualTargetPickerContents(selection) {
@@ -705,41 +718,31 @@ function render() {
 function previewSelectedLegacy() {
   const operation = state.legacyOperation;
   if (!operation) return;
-  const hints = operation.result.hints;
-  const selections = [...document.querySelectorAll("[data-map-select]:checked")];
-  if (!selections.length) return showToast("Select at least one explicit hint-to-video match.");
-  if (selections.length > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} metadata matches per request.`);
-  if (hasDuplicateLegacyHintSelection(
-    selections.map((selected) => ({ hintIndex: selected.dataset.hintIndex })),
-  )) {
-    return showToast("Choose at most one video for each legacy hint. Uncheck the current match before choosing another.");
-  }
-  const patches = [];
-  const usedItems = new Set();
-  for (const selected of selections) {
-    const hintIndex = Number(selected.dataset.hintIndex);
-    const key = selected.dataset.mapSelect;
-    const selection = state.legacySelection.get(key);
-    const itemId = selected.dataset.manual === "true" ? selection?.item_id : selected.dataset.itemId;
-    const hint = hints[hintIndex];
-    if (selected.dataset.manual === "true" && !itemId) return showToast("Choose a present video for every manual match.");
-    if (!hint || !itemId) continue;
-    if (!libraryItems().some((item) => String(item?.id ?? "") === String(itemId) && statusOf(item) === "present")) {
-      return showToast("This video is no longer present. Choose a current video manually.");
-    }
-    if (usedItems.has(itemId)) return showToast("Choose each video once; combine its changes in one mapping.");
-    usedItems.add(itemId);
-    if (!selection) continue;
-    const patch = { item_id: itemId };
-    if (selected.dataset.manual !== "true") patch.hint_index = hintIndex;
-    if (selection.title && hint.title) patch.title = hint.title;
-    if (selection.source_ids && Array.isArray(hint.source_ids) && hint.source_ids.length) patch.source_ids = hint.source_ids;
-    if (selection.collection && hint.collection) patch.collection = hint.collection;
-    if (hasMetadataPatchFields(patch)) patches.push(patch);
-  }
-  if (!patches.length) return showToast("Choose at least one metadata field to apply.");
-  if (patches.length > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} metadata matches per request.`);
-  submitAction("file_preview", { metadata_patches: patches, rename: false, conflict: "skip" });
+  const choices = buildLegacyMappingChoices(
+    state.legacyOperationKey,
+    operation.result.hints,
+    operation.result.candidates,
+    libraryItems(),
+  );
+  const result = buildLegacyMetadataPatches({
+    hints: operation.result.hints,
+    choices,
+    selections: state.legacySelection,
+    items: libraryItems(),
+    limit: MAX_SELECTED_ITEMS,
+  });
+  const messages = {
+    "empty-selection": "Select at least one explicit hint-to-video match.",
+    "selection-limit": `Choose at most ${MAX_SELECTED_ITEMS} metadata matches per request.`,
+    "duplicate-hint": "Choose at most one video for each legacy hint.",
+    "manual-target-required": "Choose a present video for every manual match.",
+    "target-not-present": "This video is no longer present. Choose a current video manually.",
+    "duplicate-target": "Choose each video once; combine its changes in one mapping.",
+    "invalid-hint": "This legacy hint is no longer available. Refresh the import report.",
+    "empty-fields": "Choose at least one metadata field to apply.",
+  };
+  if (result.error) return showToast(messages[result.error] ?? "Review the selected legacy mappings.");
+  submitAction("file_preview", { metadata_patches: result.patches, rename: false, conflict: "skip" });
 }
 
 function selectVisible() {
@@ -809,26 +812,20 @@ function bindEvents() {
     const manualTarget = event.target.closest("[data-manual-target]");
     if (mapCheckbox || mapField || manualTarget) {
       const key = mapCheckbox?.dataset.mapSelect ?? mapField?.dataset.mapKey ?? manualTarget?.dataset.manualTarget;
-      if (mapCheckbox?.checked) {
-        const selectedHints = [...document.querySelectorAll("[data-map-select]:checked")]
-          .filter((checkbox) => checkbox !== mapCheckbox)
-          .map((checkbox) => ({ hintIndex: checkbox.dataset.hintIndex }));
-        if (hasDuplicateLegacyHintSelection([...selectedHints, { hintIndex: mapCheckbox.dataset.hintIndex }])) {
+      if (mapCheckbox) {
+        const result = selectLegacyMappingChoice(
+          state.legacySelection,
+          key,
+          Number(mapCheckbox.dataset.hintIndex),
+          mapCheckbox.checked,
+          MAX_SELECTED_ITEMS,
+        );
+        if (!result.ok) {
           mapCheckbox.checked = false;
-          showToast("Choose at most one video for each legacy hint. Uncheck the current match before choosing another.");
-          return;
-        }
-        const existingKeys = [...document.querySelectorAll("[data-map-select]:checked")]
-          .filter((checkbox) => checkbox !== mapCheckbox)
-          .map((checkbox) => checkbox.dataset.mapSelect);
-        const result = updateSelectionWithinLimit(existingKeys, [key], true);
-        if (result.omittedCount > 0) {
-          mapCheckbox.checked = false;
-          showToast(selectionLimitMessage(result.omittedCount));
-          return;
+          if (result.reason === "limit") showToast(selectionLimitMessage(1));
+          else showToast("This legacy mapping is no longer available. Refresh the import report.");
         }
       }
-      if (mapCheckbox) updateLegacySelection(state.legacySelection, key, { selected: mapCheckbox.checked });
       if (mapField) updateLegacySelection(state.legacySelection, key, { [mapField.dataset.mapField]: mapField.checked });
       if (manualTarget) updateLegacySelection(state.legacySelection, key, { item_id: manualTarget.value });
       return;
@@ -858,6 +855,33 @@ function bindEvents() {
     if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
   });
   document.body.addEventListener("click", (event) => {
+    const pageButton = event.target.closest("[data-legacy-page]");
+    if (pageButton) {
+      state.legacyPage += Number(pageButton.dataset.legacyPage);
+      renderLegacyMappings();
+      return;
+    }
+    const manualHintButton = event.target.closest("[data-open-manual-hint]");
+    if (manualHintButton && state.legacyOperation) {
+      const operationKey = state.legacyOperationKey;
+      const hintIndex = Number(manualHintButton.dataset.openManualHint);
+      const choices = buildLegacyMappingChoices(
+        operationKey,
+        state.legacyOperation.result.hints,
+        state.legacyOperation.result.candidates,
+        libraryItems(),
+      );
+      const manualKey = `${operationKey}:manual:${hintIndex}`;
+      const manualIndex = choices.findIndex((choice) => choice.key === manualKey);
+      if (manualIndex >= 0) {
+        state.legacyPage = Math.floor(manualIndex / LEGACY_MAPPING_PAGE_SIZE);
+        state.manualPickerKey = manualKey;
+        state.manualPickerQuery = "";
+        renderLegacyMappings();
+        byId("legacy-mappings").querySelector("[data-manual-picker-search]")?.focus();
+      }
+      return;
+    }
     const manualPickerToggle = event.target.closest("[data-manual-picker-toggle]");
     if (manualPickerToggle) {
       const key = manualPickerToggle.dataset.manualPickerToggle;

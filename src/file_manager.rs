@@ -818,11 +818,19 @@ struct BuiltLibraryItem {
     fingerprint: Option<FileFingerprint>,
 }
 
+struct ScanBuildState<'a> {
+    started_at: Instant,
+    timed_out: &'a mut bool,
+    warnings: &'a mut Vec<String>,
+    expire_after_attachment_count: &'a mut Option<usize>,
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct ScanTestHooks {
     incomplete_directories: BTreeSet<String>,
     expire_after_built_item: bool,
+    expire_after_attachment_count: Option<usize>,
     index_budget: Option<usize>,
     identity_reconciliation_steps: Option<Arc<AtomicUsize>>,
 }
@@ -1183,6 +1191,14 @@ impl LibraryManager {
             .lock()
             .expect("scan test-hook lock should remain healthy")
             .expire_after_built_item = true;
+    }
+
+    #[cfg(test)]
+    fn expire_next_scan_after_attachments(&self, count: usize) {
+        self.scan_test_hooks
+            .lock()
+            .expect("scan test-hook lock should remain healthy")
+            .expire_after_attachment_count = Some(count.max(1));
     }
 
     #[cfg(test)]
@@ -3338,8 +3354,12 @@ impl LibraryManager {
         let identity_reconciliation_steps = test_hooks.identity_reconciliation_steps.as_ref();
         #[cfg(test)]
         let index_budget = test_hooks.index_budget.unwrap_or(INDEX_LIMIT);
+        #[cfg(test)]
+        let mut expire_after_attachment_count = test_hooks.expire_after_attachment_count;
         #[cfg(not(test))]
         let index_budget = INDEX_LIMIT;
+        #[cfg(not(test))]
+        let mut expire_after_attachment_count = None;
         walk.warnings.extend(operation_state_warnings);
         if let Some(warning) = index_warning {
             walk.warnings.push(warning);
@@ -3416,15 +3436,19 @@ impl LibraryManager {
             let attachments_complete = !walk
                 .incomplete_directories
                 .contains(parent_relative(&file.relative_path));
-            match self.build_item(
+            let built_result = self.build_item(
                 file,
                 &sidecars,
                 attachments_complete,
-                walk.started_at,
-                &mut walk.timed_out,
-                &mut walk.warnings,
-            ) {
-                Ok(built) => {
+                &mut ScanBuildState {
+                    started_at: walk.started_at,
+                    timed_out: &mut walk.timed_out,
+                    warnings: &mut walk.warnings,
+                    expire_after_attachment_count: &mut expire_after_attachment_count,
+                },
+            );
+            match built_result {
+                Ok(Some(built)) => {
                     if !attachments_complete {
                         incomplete_attachment_media = incomplete_attachment_media.saturating_add(1);
                     }
@@ -3448,6 +3472,7 @@ impl LibraryManager {
                         }
                     }
                 }
+                Ok(None) => continue,
                 Err(error) => {
                     let metadata_status = if is_file_provider_access_error(&error) {
                         MetadataStatus::ProviderUnavailable
@@ -4094,10 +4119,8 @@ impl LibraryManager {
         media: &ScannedFile,
         sidecars: &SidecarIndex,
         attachments_complete: bool,
-        scan_started_at: Instant,
-        scan_timed_out: &mut bool,
-        warnings: &mut Vec<String>,
-    ) -> Result<BuiltLibraryItem> {
+        scan: &mut ScanBuildState<'_>,
+    ) -> Result<Option<BuiltLibraryItem>> {
         let absolute = self.absolute_path(&media.relative_path)?;
         let opened = self.read_media_file(&absolute);
         let opened_file = match opened {
@@ -4108,12 +4131,12 @@ impl LibraryManager {
                 } else {
                     MetadataStatus::Unreadable
                 };
-                warnings.push(format!(
+                scan.warnings.push(format!(
                     "media unavailable at {}: {error:#}",
                     media.relative_path
                 ));
                 let id = physical_item_id_from_identity(media.identity, &media.relative_path);
-                return Ok(BuiltLibraryItem {
+                return Ok(Some(BuiltLibraryItem {
                     item: LibraryItem {
                         id,
                         title: title_from_path(&media.relative_path),
@@ -4133,7 +4156,7 @@ impl LibraryManager {
                     },
                     sidecar_title_present: false,
                     fingerprint: None,
-                });
+                }));
             }
         };
         let (fingerprint, opened_presence) = match opened_file.as_ref() {
@@ -4171,61 +4194,62 @@ impl LibraryManager {
         let mut sidecar_unreadable = false;
         let attachments = sidecars.attached_files(media);
         for attachment in &attachments {
-            if scan_started_at.elapsed() >= SCAN_TIMEOUT {
-                *scan_timed_out = true;
-                warnings.push("scan stopped at the 120-second scan budget; unvisited paths were not marked missing".to_string());
-                break;
+            if scan.started_at.elapsed() >= SCAN_TIMEOUT {
+                *scan.timed_out = true;
+                push_scan_timeout_warning(scan.warnings);
+                return Ok(None);
             }
             let lower = attachment.to_ascii_lowercase();
             if lower.ends_with(".nfo") {
-                if authoritative_nfo_path.as_deref() != Some(attachment.as_str()) {
-                    continue;
-                }
-                let path = self.absolute_path(attachment)?;
-                match self.read_file(&path, SIDE_CAR_LIMIT) {
-                    Ok(Some(contents)) => match String::from_utf8(contents) {
-                        Ok(text) => {
-                            let nfo_title = xml_tag_text(&text, "title")
-                                .filter(|value| !value.trim().is_empty());
-                            let nfo_ids = nfo_source_ids(&text);
-                            if let Some(value) = &nfo_title {
-                                title = value.trim().to_string();
+                if authoritative_nfo_path.as_deref() == Some(attachment.as_str()) {
+                    let path = self.absolute_path(attachment)?;
+                    match self.read_file(&path, SIDE_CAR_LIMIT) {
+                        Ok(Some(contents)) => match String::from_utf8(contents) {
+                            Ok(text) => {
+                                let nfo_title = xml_tag_text(&text, "title")
+                                    .filter(|value| !value.trim().is_empty());
+                                let nfo_ids = nfo_source_ids(&text);
+                                if let Some(value) = &nfo_title {
+                                    title = value.trim().to_string();
+                                }
+                                nfo_title_present |= nfo_title.is_some();
+                                sidecar_title_present |= nfo_title.is_some();
+                                nfo_source_id_present |= !nfo_ids.is_empty();
+                                source_ids.extend(nfo_ids);
+                                if let Some(value) = xml_tag_text(&text, "set")
+                                    && !value.trim().is_empty()
+                                {
+                                    collection = Some(CollectionMetadata {
+                                        id: xml_tag_text(&text, "setid")
+                                            .filter(|value| !value.trim().is_empty()),
+                                        title: value.trim().to_string(),
+                                        kind: xml_tag_text(&text, "settype")
+                                            .filter(|value| !value.trim().is_empty())
+                                            .unwrap_or_else(|| "nfo_set".to_string()),
+                                        order: xml_tag_text(&text, "episode")
+                                            .and_then(|value| value.parse().ok()),
+                                        part_id: xml_tag_text(&text, "partid"),
+                                    });
+                                }
+                                metadata_status = MetadataStatus::Partial;
                             }
-                            nfo_title_present |= nfo_title.is_some();
-                            sidecar_title_present |= nfo_title.is_some();
-                            nfo_source_id_present |= !nfo_ids.is_empty();
-                            source_ids.extend(nfo_ids);
-                            if let Some(value) = xml_tag_text(&text, "set")
-                                && !value.trim().is_empty()
-                            {
-                                collection = Some(CollectionMetadata {
-                                    id: xml_tag_text(&text, "setid")
-                                        .filter(|value| !value.trim().is_empty()),
-                                    title: value.trim().to_string(),
-                                    kind: xml_tag_text(&text, "settype")
-                                        .filter(|value| !value.trim().is_empty())
-                                        .unwrap_or_else(|| "nfo_set".to_string()),
-                                    order: xml_tag_text(&text, "episode")
-                                        .and_then(|value| value.parse().ok()),
-                                    part_id: xml_tag_text(&text, "partid"),
-                                });
+                            Err(_) => {
+                                sidecar_unreadable = true;
+                                scan.warnings
+                                    .push(format!("NFO is not UTF-8: {attachment}"));
                             }
-                            metadata_status = MetadataStatus::Partial;
-                        }
-                        Err(_) => {
+                        },
+                        Ok(None) => {
                             sidecar_unreadable = true;
-                            warnings.push(format!("NFO is not UTF-8: {attachment}"));
+                            scan.warnings.push(format!(
+                                "authoritative NFO disappeared during scan: {attachment}"
+                            ));
                         }
-                    },
-                    Ok(None) => {
-                        sidecar_unreadable = true;
-                        warnings.push(format!(
-                            "authoritative NFO disappeared during scan: {attachment}"
-                        ));
-                    }
-                    Err(error) => {
-                        sidecar_unreadable = true;
-                        warnings.push(format!("NFO unavailable at {attachment}: {error:#}"));
+                        Err(error) => {
+                            sidecar_unreadable = true;
+                            scan.warnings
+                                .push(format!("NFO unavailable at {attachment}: {error:#}"));
+                        }
                     }
                 }
             } else if lower.ends_with(".json") {
@@ -4249,12 +4273,33 @@ impl LibraryManager {
                     Ok(None) => {}
                     Err(error) => {
                         sidecar_unreadable = true;
-                        warnings.push(format!(
+                        scan.warnings.push(format!(
                             "metadata sidecar unavailable at {attachment}: {error:#}"
                         ));
                     }
                 }
             }
+
+            let forced_timeout =
+                if (*scan.expire_after_attachment_count).is_some_and(|remaining| remaining <= 1) {
+                    *scan.expire_after_attachment_count = None;
+                    true
+                } else if let Some(remaining) = scan.expire_after_attachment_count.as_mut() {
+                    *remaining -= 1;
+                    false
+                } else {
+                    false
+                };
+            if forced_timeout || scan.started_at.elapsed() >= SCAN_TIMEOUT {
+                *scan.timed_out = true;
+                push_scan_timeout_warning(scan.warnings);
+                return Ok(None);
+            }
+        }
+        if scan.started_at.elapsed() >= SCAN_TIMEOUT {
+            *scan.timed_out = true;
+            push_scan_timeout_warning(scan.warnings);
+            return Ok(None);
         }
         source_ids = normalize_source_ids(source_ids);
         let confidence = if !source_ids.is_empty() && metadata_status == MetadataStatus::Partial {
@@ -4272,25 +4317,26 @@ impl LibraryManager {
             metadata_status = MetadataStatus::Partial;
         }
 
-        let media_specs =
-            if opened_presence == Presence::Present && scan_started_at.elapsed() < SCAN_TIMEOUT {
-                opened_file
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("media descriptor disappeared during scan"))
-                    .and_then(probe_media)
-                    .unwrap_or_else(|error| {
-                        warnings.push(format!(
-                            "ffprobe unavailable for {}: {error:#}",
-                            media.relative_path
-                        ));
-                        MediaSpecs::default()
-                    })
-            } else {
-                if scan_started_at.elapsed() >= SCAN_TIMEOUT {
-                    *scan_timed_out = true;
-                }
-                MediaSpecs::default()
-            };
+        let media_specs = if opened_presence == Presence::Present {
+            opened_file
+                .as_ref()
+                .ok_or_else(|| anyhow!("media descriptor disappeared during scan"))
+                .and_then(probe_media)
+                .unwrap_or_else(|error| {
+                    scan.warnings.push(format!(
+                        "ffprobe unavailable for {}: {error:#}",
+                        media.relative_path
+                    ));
+                    MediaSpecs::default()
+                })
+        } else {
+            MediaSpecs::default()
+        };
+        if scan.started_at.elapsed() >= SCAN_TIMEOUT {
+            *scan.timed_out = true;
+            push_scan_timeout_warning(scan.warnings);
+            return Ok(None);
+        }
         let bytes = fingerprint.as_ref().map(|value| value.size).unwrap_or(0);
         let library_attachments = attachments
             .iter()
@@ -4299,7 +4345,7 @@ impl LibraryManager {
                 kind: attachment_kind(path).to_string(),
             })
             .collect();
-        Ok(BuiltLibraryItem {
+        Ok(Some(BuiltLibraryItem {
             item: LibraryItem {
                 id,
                 title,
@@ -4319,7 +4365,7 @@ impl LibraryManager {
             },
             sidecar_title_present,
             fingerprint,
-        })
+        }))
     }
 
     fn absolute_path(&self, relative: &str) -> Result<PathBuf> {
@@ -6475,6 +6521,18 @@ fn unobserved_record_status(
         });
     }
     None
+}
+
+fn push_scan_timeout_warning(warnings: &mut Vec<String>) {
+    if !warnings
+        .iter()
+        .any(|warning| warning.contains("120-second scan budget"))
+    {
+        warnings.push(
+            "scan stopped at the 120-second scan budget; unvisited paths were not marked missing"
+                .to_string(),
+        );
+    }
 }
 
 fn snapshot_revision(items: &[LibraryItem]) -> Result<String> {
@@ -10192,6 +10250,185 @@ mod tests {
                 .iter()
                 .all(|path| root.path().join(path).is_file()),
             "the complete media, NFO, and subtitle should all move together"
+        );
+    }
+
+    #[test]
+    fn timeout_during_sidecar_loop_preserves_prior_metadata_until_full_rescan() {
+        let root = TemporaryRoot::new("timeout-sidecar-preserves-prior-metadata");
+        fs::write(root.path().join("clip.mp4"), b"stable clip media")
+            .expect("clip media fixture should write");
+        fs::write(root.path().join("z-later.mp4"), b"later media")
+            .expect("later media fixture should write");
+        let manager = manager(&root);
+        let prior_collection = CollectionMetadata {
+            id: Some("queue-season".to_string()),
+            title: "Queue collection".to_string(),
+            kind: "queue".to_string(),
+            order: Some(7),
+            part_id: Some("queue-part".to_string()),
+        };
+        let hints = vec![
+            SourceHint {
+                source_ids: vec!["youtube:abcdefghijk".to_string()],
+                title: Some("Queue clip title".to_string()),
+                relative_path: Some("clip.mp4".to_string()),
+                collection: Some(prior_collection.clone()),
+                origin: HintOrigin::Queue,
+                requires_confirmation: false,
+            },
+            SourceHint {
+                source_ids: vec!["av123456789".to_string()],
+                title: Some("Queue later title".to_string()),
+                relative_path: Some("z-later.mp4".to_string()),
+                collection: None,
+                origin: HintOrigin::Queue,
+                requires_confirmation: false,
+            },
+        ];
+        let initial = manager
+            .scan(&hints)
+            .expect("initial queue-aware scan should complete");
+        let prior_clip = item_at(&initial, "clip.mp4").clone();
+        let prior_later = item_at(&initial, "z-later.mp4").clone();
+        assert_eq!(prior_clip.title, "Queue clip title");
+        assert_eq!(prior_clip.collection, Some(prior_collection.clone()));
+        assert_eq!(prior_clip.source_ids, vec!["youtube:abcdefghijk"]);
+
+        fs::write(
+            root.path().join("clip.json"),
+            r#"{"title":"Partial JSON title","bvid":"BV1xx411c7mD","ugc_season":{"id":99,"title":"Partial collection"}}"#,
+        )
+        .expect("earlier-sorting JSON sidecar should write");
+        fs::write(
+            root.path().join("clip.nfo"),
+            "<movie><title>Fresh NFO title</title><uniqueid type=\"bilibili-cid\">222222222</uniqueid><setid>fresh-season</setid><set>Fresh collection</set><settype>season</settype><episode>2</episode></movie>",
+        )
+        .expect("later-sorting NFO sidecar should write");
+        manager.expire_next_scan_after_attachments(1);
+
+        let partial = manager
+            .scan(&[])
+            .expect("an attachment-loop timeout should publish a usable partial snapshot");
+        assert!(partial.warnings.iter().any(|warning| {
+            warning.contains("120-second scan budget")
+                && warning.contains("unvisited paths were not marked missing")
+        }));
+        let timed_out_clip = item_at(&partial, "clip.mp4");
+        assert_eq!(timed_out_clip.id, prior_clip.id);
+        assert_eq!(timed_out_clip.presence, Presence::Unavailable);
+        assert_eq!(timed_out_clip.title, prior_clip.title);
+        assert_eq!(timed_out_clip.source_ids, prior_clip.source_ids);
+        assert_eq!(timed_out_clip.collection, prior_clip.collection);
+        assert_eq!(timed_out_clip.attachments, prior_clip.attachments);
+
+        let unvisited = item_at(&partial, "z-later.mp4");
+        assert_eq!(unvisited.id, prior_later.id);
+        assert_eq!(unvisited.presence, Presence::Unavailable);
+        assert_eq!(unvisited.title, prior_later.title);
+        assert_eq!(unvisited.source_ids, prior_later.source_ids);
+        assert_eq!(unvisited.collection, prior_later.collection);
+
+        let index = manager
+            .read_index()
+            .expect("timed-out scan should leave a readable index");
+        let clip_record = &index.records[&prior_clip.id];
+        assert_eq!(clip_record.item.title, prior_clip.title);
+        assert_eq!(clip_record.item.source_ids, prior_clip.source_ids);
+        assert_eq!(clip_record.item.collection, prior_clip.collection);
+        assert_eq!(clip_record.item.presence, Presence::Unavailable);
+        assert_eq!(
+            clip_record.queue_metadata.title.as_deref(),
+            Some("Queue clip title")
+        );
+        assert_eq!(clip_record.queue_metadata.source_ids, prior_clip.source_ids);
+        assert_eq!(
+            clip_record.queue_metadata.collection,
+            Some(prior_collection)
+        );
+
+        let preview = manager.build_and_persist_preview(
+            &partial,
+            PreviewBuildRequest {
+                item_ids: std::slice::from_ref(&timed_out_clip.id),
+                target_relative_dir: Some("Moved"),
+                rename: false,
+                conflict: ConflictPolicy::Skip,
+                patches: &[],
+            },
+            &mut |target_path| manager.target_parent_device(target_path),
+        );
+        assert!(
+            preview.is_err(),
+            "a timed-out item must not be editable through a move preview"
+        );
+        assert_eq!(persisted_preview_count(&manager), 0);
+
+        let recovered = manager
+            .scan(&[])
+            .expect("a later complete scan should process all sidecars");
+        let recovered_clip = item_at(&recovered, "clip.mp4");
+        assert_eq!(recovered_clip.id, prior_clip.id);
+        assert_eq!(recovered_clip.presence, Presence::Present);
+        assert_eq!(recovered_clip.title, "Fresh NFO title");
+        assert!(
+            recovered_clip
+                .source_ids
+                .contains(&"cid222222222".to_string())
+        );
+        assert_eq!(
+            recovered_clip
+                .collection
+                .as_ref()
+                .map(|value| value.title.as_str()),
+            Some("Fresh collection")
+        );
+    }
+
+    #[test]
+    fn timeout_after_final_attachment_does_not_publish_new_media() {
+        let root = TemporaryRoot::new("timeout-final-attachment-new-media");
+        fs::write(root.path().join("new.mp4"), b"new media")
+            .expect("new media fixture should write");
+        fs::write(
+            root.path().join("new.nfo"),
+            "<movie><title>New complete title</title><uniqueid type=\"bilibili-cid\">333333333</uniqueid><set>New collection</set></movie>",
+        )
+        .expect("sole NFO attachment should write");
+        let manager = manager(&root);
+        manager.expire_next_scan_after_attachments(1);
+
+        let timed_out = manager
+            .scan(&[])
+            .expect("a timeout after the final attachment should leave a usable snapshot");
+        assert!(timed_out.warnings.iter().any(|warning| {
+            warning.contains("120-second scan budget")
+                && warning.contains("unvisited paths were not marked missing")
+        }));
+        assert!(
+            timed_out.items.is_empty(),
+            "a first-seen item that hit the scan deadline must not be published"
+        );
+        assert!(
+            manager
+                .read_index()
+                .expect("timed-out scan should leave a readable index")
+                .records
+                .is_empty(),
+            "a partial first-seen item must not become a durable index record"
+        );
+        assert_eq!(persisted_preview_count(&manager), 0);
+
+        let complete = manager
+            .scan(&[])
+            .expect("the next complete scan should discover the media normally");
+        let item = item_at(&complete, "new.mp4");
+        assert_eq!(item.presence, Presence::Present);
+        assert_eq!(item.title, "New complete title");
+        assert!(item.source_ids.contains(&"cid333333333".to_string()));
+        assert_eq!(
+            item.collection.as_ref().map(|value| value.title.as_str()),
+            Some("New collection")
         );
     }
 
