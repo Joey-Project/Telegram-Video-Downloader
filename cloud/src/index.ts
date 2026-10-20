@@ -1,12 +1,24 @@
 import type { InboxEnvelope } from "./types";
 import { HttpError } from "./types";
 import { requireConfiguredOwnerUserId, requireLocalAuthorization, requireOwner, requireWebhookAuthorization } from "./security";
-import { acknowledge, emptySnapshot, enqueue, getPending, getPendingSummary, readSnapshot, storeSnapshot } from "./store";
+import {
+  acknowledge,
+  assertDatabaseEpoch,
+  type AcknowledgedReceipt,
+  createDatabaseEpoch,
+  emptySnapshot,
+  enqueue,
+  getPendingPage,
+  getPendingSummary,
+  isDatabaseEpoch,
+  readSnapshot,
+  rotateDatabaseEpochOnSequenceConflict,
+  storeSnapshot,
+} from "./store";
 import {
   MAX_ACTION_BODY_BYTES,
   MAX_STATE_BODY_BYTES,
   MAX_WEBHOOK_BODY_BYTES,
-  parseAckSeqs,
   parseLimit,
   readJsonBody,
   isOwnerPrivateTelegramUpdate,
@@ -18,6 +30,48 @@ export { NotificationHub } from "./notification_hub";
 
 const NOTIFIER_ID = "telegram-single-owner";
 const CLOUD_REQUEST_PAGE_SIZE = 100;
+const MAX_ACK_RECEIPTS = 500;
+const MAX_ACK_BODY_BYTES = 128 * 1024;
+const MAX_EPOCH_ROTATION_REQUEST_ID_LENGTH = 256;
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/u;
+const REQUEST_KINDS = new Set(["telegram", "library_scan", "file_preview", "file_confirm", "legacy_import"]);
+
+function parseAckReceipts(value: unknown): AcknowledgedReceipt[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new HttpError(400, "Acknowledgment body must be an object");
+  }
+  const receiptsValue = (value as Record<string, unknown>).receipts;
+  if (!Array.isArray(receiptsValue) || receiptsValue.length > MAX_ACK_RECEIPTS) {
+    throw new HttpError(400, "Acknowledgment receipts must contain at most 500 entries");
+  }
+  const seen = new Set<number>();
+  const receipts: AcknowledgedReceipt[] = [];
+  for (const candidate of receiptsValue) {
+    if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) {
+      throw new HttpError(400, "Acknowledgment receipt must be an object");
+    }
+    const record = candidate as Record<string, unknown>;
+    const { seq, request_id: requestId, payload_hash: payloadHash, kind, created_at: createdAt } = record;
+    if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0 ||
+      typeof requestId !== "string" || requestId.length === 0 ||
+      new TextEncoder().encode(requestId).byteLength > MAX_EPOCH_ROTATION_REQUEST_ID_LENGTH ||
+      typeof payloadHash !== "string" || !SHA256_HEX_PATTERN.test(payloadHash) ||
+      typeof kind !== "string" || !REQUEST_KINDS.has(kind) ||
+      typeof createdAt !== "number" || !Number.isSafeInteger(createdAt) || createdAt <= 0 ||
+      seen.has(seq)) {
+      throw new HttpError(400, "Acknowledgment receipt is malformed or duplicated");
+    }
+    seen.add(seq);
+    receipts.push({
+      seq,
+      request_id: requestId,
+      payload_hash: payloadHash,
+      kind: kind as AcknowledgedReceipt["kind"],
+      created_at: createdAt,
+    });
+  }
+  return receipts;
+}
 
 function json(data: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return Response.json(data, {
@@ -62,26 +116,72 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
 async function handleLocalRequests(request: Request, env: Env): Promise<Response> {
   requireLocalAuthorization(request, env);
   const limit = parseLimit(new URL(request.url).searchParams.get("limit"), CLOUD_REQUEST_PAGE_SIZE);
-  return json({ requests: await getPending(env.DB, limit) });
+  const page = await getPendingPage(env.DB, limit);
+  const expectedEpoch = request.headers.get("X-Cloud-Database-Epoch");
+  if (expectedEpoch !== null) {
+    if (!isDatabaseEpoch(expectedEpoch)) throw new HttpError(400, "Cloud database epoch is invalid");
+    if (expectedEpoch !== page.database_epoch) {
+      throw new HttpError(409, "Cloud database epoch changed", undefined, page.database_epoch);
+    }
+  }
+  return json(page);
 }
 
 async function handleLocalAck(request: Request, env: Env): Promise<Response> {
   requireLocalAuthorization(request, env);
-  const seqs = parseAckSeqs(await readJsonBody(request, 32 * 1024));
-  return json({ acked: await acknowledge(env.DB, seqs) });
+  const databaseEpoch = await assertDatabaseEpoch(env.DB, request.headers.get("X-Cloud-Database-Epoch"));
+  const receipts = parseAckReceipts(await readJsonBody(request, MAX_ACK_BODY_BYTES));
+  return json({ acked: await acknowledge(env.DB, receipts, databaseEpoch) });
 }
 
 async function handleLocalState(request: Request, env: Env): Promise<Response> {
   requireLocalAuthorization(request, env);
+  const databaseEpoch = await assertDatabaseEpoch(env.DB, request.headers.get("X-Cloud-Database-Epoch"));
   const snapshot = validateSnapshot(await readJsonBody(request, MAX_STATE_BODY_BYTES));
   const now = Date.now();
   if (snapshot.reported_at > now + 60_000) throw new HttpError(400, "reported_at is too far in the future");
-  await storeSnapshot(env.DB, snapshot);
+  await storeSnapshot(env.DB, snapshot, databaseEpoch);
   return json({ stored: true, last_seen: now });
+}
+
+async function handleLocalEpochRotation(request: Request, env: Env): Promise<Response> {
+  requireLocalAuthorization(request, env);
+  const expectedEpoch = request.headers.get("X-Cloud-Database-Epoch");
+  await assertDatabaseEpoch(env.DB, expectedEpoch);
+  const body = await readJsonBody(request, 8 * 1024);
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    throw new HttpError(400, "Epoch rotation request must be an object");
+  }
+  const record = body as Record<string, unknown>;
+  const seq = record.seq;
+  const requestId = record.request_id;
+  const payloadHash = record.payload_hash;
+  const kind = record.kind;
+  const createdAt = record.created_at;
+  if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0 ||
+    typeof requestId !== "string" || requestId.length === 0 || requestId.length > MAX_EPOCH_ROTATION_REQUEST_ID_LENGTH ||
+    typeof payloadHash !== "string" || !SHA256_HEX_PATTERN.test(payloadHash) ||
+    typeof kind !== "string" || !REQUEST_KINDS.has(kind) ||
+    typeof createdAt !== "number" || !Number.isSafeInteger(createdAt) || createdAt <= 0) {
+    throw new HttpError(400, "Epoch rotation request is malformed");
+  }
+  const nextEpoch = createDatabaseEpoch();
+  const result = await rotateDatabaseEpochOnSequenceConflict(env.DB, expectedEpoch!, nextEpoch, {
+    seq,
+    request_id: requestId,
+    payload_hash: payloadHash,
+    kind: kind as "telegram" | "library_scan" | "file_preview" | "file_confirm" | "legacy_import",
+    created_at: createdAt,
+  });
+  if (!result.rotated) {
+    throw new HttpError(409, "Cloud sequence conflict no longer matches", undefined, result.database_epoch);
+  }
+  return json({ rotated: true, database_epoch: result.database_epoch });
 }
 
 async function handleLocalWebSocket(request: Request, env: Env): Promise<Response> {
   requireLocalAuthorization(request, env);
+  await assertDatabaseEpoch(env.DB, request.headers.get("X-Cloud-Database-Epoch"));
   if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
     return json({ error: "WebSocket upgrade required" }, 426);
   }
@@ -128,6 +228,10 @@ async function dispatch(request: Request, env: Env): Promise<Response> {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
     return handleLocalAck(request, env);
   }
+  if (path === "/api/local/epoch/rotate-on-conflict") {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    return handleLocalEpochRotation(request, env);
+  }
   if (path === "/api/local/state") {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
     return handleLocalState(request, env);
@@ -158,10 +262,18 @@ export default {
       return await dispatch(request, env);
     } catch (error) {
       if (error instanceof HttpError) {
+        const extraHeaders: Record<string, string> = {};
         const stateVersion = error.stateVersion;
-        const extraHeaders = error.status === 409 && Number.isSafeInteger(stateVersion) && stateVersion !== undefined && stateVersion > 0
-          ? { "X-Cloud-State-Version": String(stateVersion) }
-          : {};
+        if (error.status === 409 && Number.isSafeInteger(stateVersion) && stateVersion !== undefined && stateVersion > 0) {
+          extraHeaders["X-Cloud-State-Version"] = String(stateVersion);
+        }
+        if (error.status === 409 && error.databaseEpoch !== undefined && isDatabaseEpoch(error.databaseEpoch)) {
+          extraHeaders["X-Cloud-Database-Epoch"] = error.databaseEpoch;
+        }
+        if (error.status === 409 && error.sequenceConflict !== undefined &&
+          Number.isSafeInteger(error.sequenceConflict) && error.sequenceConflict > 0) {
+          extraHeaders["X-Cloud-Inbox-Sequence-Conflict"] = String(error.sequenceConflict);
+        }
         return json({ error: error.message }, error.status, extraHeaders);
       }
       const path = new URL(request.url).pathname;

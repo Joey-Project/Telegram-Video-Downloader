@@ -1,6 +1,8 @@
 use std::fs;
 use std::future::Future;
-use std::path::PathBuf;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Barrier, Mutex as StdMutex};
 use std::task::Poll;
@@ -31,6 +33,7 @@ struct FakeTelegramRequest {
     method: String,
     body: serde_json::Value,
     authorization: Option<String>,
+    database_epoch: Option<String>,
 }
 
 fn take_cloud_test_telegram_requests(
@@ -45,8 +48,13 @@ fn take_cloud_test_telegram_requests(
 
 struct FakeCloudApiState {
     pending: StdMutex<Vec<CloudRequest>>,
+    database_epoch: StdMutex<String>,
+    rotate_epoch_to: StdMutex<Option<String>>,
+    epoch_recovery_requests: StdMutex<Vec<serde_json::Value>>,
     fetch_count: AtomicUsize,
     ack_count: AtomicUsize,
+    ack_request_bodies: StdMutex<Vec<serde_json::Value>>,
+    replace_pending_before_ack: StdMutex<Option<CloudRequest>>,
     fail_first_ack: AtomicBool,
     durable_before_ack: AtomicBool,
     inbox_root: PathBuf,
@@ -301,6 +309,11 @@ async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTel
         name.eq_ignore_ascii_case("authorization")
             .then_some(value.trim().to_string())
     });
+    let database_epoch = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("x-cloud-database-epoch")
+            .then_some(value.trim().to_string())
+    });
     let body_end = header_end.saturating_add(content_length);
     while bytes.len() < body_end {
         let mut chunk = [0_u8; 4_096];
@@ -323,6 +336,7 @@ async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTel
         method,
         body,
         authorization,
+        database_epoch,
     }))
 }
 
@@ -399,6 +413,24 @@ async fn spawn_fake_cloud_api(
     oneshot::Sender<()>,
     tokio::task::JoinHandle<Result<()>>,
 ) {
+    spawn_fake_cloud_api_with_epoch(
+        inbox_root,
+        pending,
+        crate::cloud::TEST_DATABASE_EPOCH.to_string(),
+    )
+    .await
+}
+
+async fn spawn_fake_cloud_api_with_epoch(
+    inbox_root: PathBuf,
+    pending: Vec<CloudRequest>,
+    database_epoch: String,
+) -> (
+    String,
+    Arc<FakeCloudApiState>,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fake cloud API should bind localhost");
@@ -407,8 +439,13 @@ async fn spawn_fake_cloud_api(
         .expect("fake cloud API should expose its address");
     let state = Arc::new(FakeCloudApiState {
         pending: StdMutex::new(pending),
+        database_epoch: StdMutex::new(database_epoch),
+        rotate_epoch_to: StdMutex::new(None),
+        epoch_recovery_requests: StdMutex::new(Vec::new()),
         fetch_count: AtomicUsize::new(0),
         ack_count: AtomicUsize::new(0),
+        ack_request_bodies: StdMutex::new(Vec::new()),
+        replace_pending_before_ack: StdMutex::new(None),
         fail_first_ack: AtomicBool::new(true),
         durable_before_ack: AtomicBool::new(false),
         inbox_root,
@@ -432,43 +469,119 @@ async fn spawn_fake_cloud_api(
                         stream.write_all(fake_http_response(401, &serde_json::json!({"error":"unauthorized"})).as_bytes()).await?;
                         continue;
                     }
+                    let mut response_headers = Vec::new();
                     let (status, payload) = match request.method.as_str() {
                         "requests" => {
                             task_state.fetch_count.fetch_add(1, AtomicOrdering::SeqCst);
                             let pending = task_state.pending.lock().expect("fake cloud state lock should not poison").clone();
-                            (200, serde_json::json!({"requests": pending}))
+                            let database_epoch = task_state.database_epoch
+                                .lock()
+                                .expect("fake database epoch lock should not poison")
+                                .clone();
+                            (200, serde_json::json!({"database_epoch": database_epoch, "requests": pending}))
                         }
                         "ack" => {
                             task_state.ack_count.fetch_add(1, AtomicOrdering::SeqCst);
-                            let seqs = request.body["seqs"]
+                            task_state
+                                .ack_request_bodies
+                                .lock()
+                                .expect("fake ACK request lock should not poison")
+                                .push(request.body.clone());
+                            let receipts = request.body["receipts"]
                                 .as_array()
-                                .context("ACK body should contain sequence list")?
-                                .iter()
-                                .map(|value| value.as_u64().context("ACK sequence should be unsigned"))
-                                .collect::<Result<Vec<_>>>()?;
-                            let durable = seqs.iter().all(|seq| {
-                                let path = task_state.inbox_root
-                                    .join(".telegram-video-downloader-cloud")
-                                    .join(format!("request-{seq:020}.json"));
-                                std::fs::read(path)
-                                    .ok()
-                                    .and_then(|bytes| serde_json::from_slice::<InboxRecord>(&bytes).ok())
-                                    .is_some_and(|record| record.request.seq == *seq)
-                            });
-                            task_state.durable_before_ack.store(durable, AtomicOrdering::SeqCst);
-                            if !durable {
-                                (409, serde_json::json!({"error":"request was not durable before ACK"}))
-                            } else if task_state.fail_first_ack.swap(false, AtomicOrdering::SeqCst) {
-                                // Simulate a lost/failed ACK response while leaving the backlog
-                                // available for at-least-once redelivery on the next GET.
-                                (503, serde_json::json!({"error":"simulated lost ACK"}))
+                                .context("ACK body should contain receipt identities")?
+                                .clone();
+                            let replacement = task_state
+                                .replace_pending_before_ack
+                                .lock()
+                                .expect("fake ACK replacement lock should not poison")
+                                .take();
+                            if let Some(replacement) = replacement {
+                                let mut pending = task_state
+                                    .pending
+                                    .lock()
+                                    .expect("fake cloud state lock should not poison");
+                                if let Some(current) = pending
+                                    .iter_mut()
+                                    .find(|current| current.seq == replacement.seq)
+                                {
+                                    *current = replacement;
+                                }
+                            }
+                            let current_epoch = task_state.database_epoch
+                                .lock()
+                                .expect("fake database epoch lock should not poison")
+                                .clone();
+                            if request.database_epoch.as_deref() != Some(current_epoch.as_str()) {
+                                response_headers.push(("X-Cloud-Database-Epoch".to_string(), current_epoch));
+                                (409, serde_json::json!({"error":"database epoch changed"}))
                             } else {
-                                let mut pending = task_state.pending.lock().expect("fake cloud state lock should not poison");
-                                pending.retain(|request| !seqs.contains(&request.seq));
-                                (200, serde_json::json!({"ok":true}))
+                                let pending = task_state
+                                    .pending
+                                    .lock()
+                                    .expect("fake cloud state lock should not poison")
+                                    .clone();
+                                let conflicting_seq = receipts.iter().find_map(|receipt| {
+                                    let seq = receipt["seq"].as_u64()?;
+                                    pending
+                                        .iter()
+                                        .find(|current| current.seq == seq)
+                                        .filter(|current| !cloud_ack_receipt_matches_request(receipt, current))
+                                        .map(|_| seq)
+                                });
+                                if let Some(seq) = conflicting_seq {
+                                    response_headers.push((
+                                        "X-Cloud-Inbox-Sequence-Conflict".to_string(),
+                                        seq.to_string(),
+                                    ));
+                                    (409, serde_json::json!({"error":"ACK receipt identity changed"}))
+                                } else {
+                                    let durable = receipts.iter().all(|receipt| {
+                                        let Some(seq) = receipt["seq"].as_u64() else {
+                                            return false;
+                                        };
+                                        let Some(expected) = pending.iter().find(|item| item.seq == seq) else {
+                                            return true;
+                                        };
+                                        let path = task_state.inbox_root
+                                            .join(".telegram-video-downloader-cloud")
+                                            .join("epochs")
+                                            .join(&current_epoch)
+                                            .join(format!("request-{seq:020}.json"));
+                                        std::fs::read(path)
+                                            .ok()
+                                            .and_then(|bytes| serde_json::from_slice::<InboxRecord>(&bytes).ok())
+                                            .is_some_and(|record| {
+                                                record.request == *expected
+                                                    && cloud_ack_receipt_matches_request(receipt, &record.request)
+                                            })
+                                    });
+                                    task_state.durable_before_ack.store(durable, AtomicOrdering::SeqCst);
+                                    if !durable {
+                                        (409, serde_json::json!({"error":"request was not durable before ACK"}))
+                                    } else if task_state.fail_first_ack.swap(false, AtomicOrdering::SeqCst) {
+                                        // Simulate a lost/failed ACK response while leaving the backlog
+                                        // available for at-least-once redelivery on the next GET.
+                                        (503, serde_json::json!({"error":"simulated lost ACK"}))
+                                    } else {
+                                        let mut pending = task_state.pending.lock().expect("fake cloud state lock should not poison");
+                                        pending.retain(|current| !receipts.iter().any(|receipt| {
+                                            cloud_ack_receipt_matches_request(receipt, current)
+                                        }));
+                                        (200, serde_json::json!({"ok":true}))
+                                    }
+                                }
                             }
                         }
                         "state" => {
+                            let current_epoch = task_state.database_epoch
+                                .lock()
+                                .expect("fake database epoch lock should not poison")
+                                .clone();
+                            if request.database_epoch.as_deref() != Some(current_epoch.as_str()) {
+                                response_headers.push(("X-Cloud-Database-Epoch".to_string(), current_epoch));
+                                (409, serde_json::json!({"error":"database epoch changed"}))
+                            } else {
                             let library = &request.body["library"];
                             let mut content = request.body.clone();
                             if let Some(content) = content.as_object_mut() {
@@ -561,17 +674,76 @@ async fn spawn_fake_cloud_api(
                                 serde_json::json!({"error":"simulated state post failure"})
                             };
                             (status, payload)
+                            }
+                        }
+                        "rotate-on-conflict" => {
+                            task_state
+                                .epoch_recovery_requests
+                                .lock()
+                                .expect("fake epoch recovery lock should not poison")
+                                .push(request.body.clone());
+                            let current_epoch = task_state
+                                .database_epoch
+                                .lock()
+                                .expect("fake database epoch lock should not poison")
+                                .clone();
+                            let seq = request.body["seq"].as_u64();
+                            let pending_matches = seq.is_some_and(|seq| {
+                                task_state
+                                    .pending
+                                    .lock()
+                                    .expect("fake cloud state lock should not poison")
+                                    .iter()
+                                    .any(|pending| {
+                                        pending.seq == seq
+                                            && Some(pending.kind.as_str())
+                                                == request.body["kind"].as_str()
+                                            && Some(pending.created_at)
+                                                == request.body["created_at"].as_u64()
+                                            && pending
+                                                .extra
+                                                .get("request_id")
+                                                .and_then(serde_json::Value::as_str)
+                                                == request.body["request_id"].as_str()
+                                            && pending
+                                                .extra
+                                                .get("payload_hash")
+                                                .and_then(serde_json::Value::as_str)
+                                                == request.body["payload_hash"].as_str()
+                                    })
+                            });
+                            let next_epoch = task_state
+                                .rotate_epoch_to
+                                .lock()
+                                .expect("fake epoch rotation lock should not poison")
+                                .clone();
+                            if request.database_epoch.as_deref() != Some(current_epoch.as_str())
+                                || !pending_matches
+                            {
+                                response_headers.push((
+                                    "X-Cloud-Database-Epoch".to_string(),
+                                    current_epoch,
+                                ));
+                                (409, serde_json::json!({"error":"epoch rotation CAS did not match"}))
+                            } else if let Some(next_epoch) = next_epoch {
+                                *task_state
+                                    .database_epoch
+                                    .lock()
+                                    .expect("fake database epoch lock should not poison") =
+                                    next_epoch.clone();
+                                (200, serde_json::json!({"rotated":true,"database_epoch":next_epoch}))
+                            } else {
+                                (409, serde_json::json!({"error":"epoch rotation was not configured"}))
+                            }
                         }
                         _ => (404, serde_json::json!({"error":"not found"})),
                     };
-                    let response_headers = if request.method == "state" {
+                    if request.method == "state" && response_headers.is_empty() {
                         let mut headers = task_state.state_post_response_headers
                             .lock()
                             .expect("fake state response header lock should not poison");
-                        if headers.is_empty() { Vec::new() } else { headers.remove(0) }
-                    } else {
-                        Vec::new()
-                    };
+                        if !headers.is_empty() { response_headers = headers.remove(0); }
+                    }
                     stream.write_all(fake_http_response_with_headers(status, &payload, &response_headers).as_bytes()).await
                         .context("fake cloud API response write failed")?;
                 }
@@ -736,7 +908,10 @@ async fn spawn_fake_cloud_websocket_api(
             .expect("fake cloud event lock should not poison")
             .push(format!("fetch:{fetch_status}"));
         let payload = if (200..300).contains(&fetch_status) {
-            serde_json::json!({"requests": &backlog})
+            serde_json::json!({
+                "database_epoch": crate::cloud::TEST_DATABASE_EPOCH,
+                "requests": &backlog
+            })
         } else {
             serde_json::json!({"error":"simulated backlog fetch failure"})
         };
@@ -770,26 +945,41 @@ async fn spawn_fake_cloud_websocket_api(
                 ack.authorization.as_deref() == Some(expected_authorization.as_str()),
                 "ACK should use local bearer authorization"
             );
-            let seqs = ack.body["seqs"]
-                .as_array()
-                .context("ACK body should contain sequence list")?
-                .iter()
-                .map(|value| value.as_u64().context("ACK sequence should be unsigned"))
-                .collect::<Result<Vec<_>>>()?;
             anyhow::ensure!(
-                seqs == expected_ack_seqs,
+                ack.database_epoch.as_deref() == Some(crate::cloud::TEST_DATABASE_EPOCH),
+                "ACK must be scoped to the bound Cloud database epoch"
+            );
+            let receipts = ack.body["receipts"]
+                .as_array()
+                .context("ACK body should contain receipt identities")?;
+            let mut acknowledged_requests = backlog.clone();
+            acknowledged_requests.sort_by_key(|request| request.seq);
+            anyhow::ensure!(
+                receipts.len() == acknowledged_requests.len()
+                    && receipts
+                        .iter()
+                        .zip(&acknowledged_requests)
+                        .all(|(receipt, request)| cloud_ack_receipt_matches_request(
+                            receipt, request
+                        ),),
                 "ACK must cover the authoritative REST page before accepting the WebSocket frame"
             );
-            let durable = seqs.iter().all(|seq| {
-                let path = inbox_root
-                    .join(".telegram-video-downloader-cloud")
-                    .join(format!("request-{seq:020}.json"));
+            let durable = acknowledged_requests.iter().all(|request| {
+                let path = runtime_test_request_path(
+                    &inbox_root,
+                    crate::cloud::TEST_DATABASE_EPOCH,
+                    request.seq,
+                );
                 std::fs::read(path)
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<InboxRecord>(&bytes).ok())
-                    .is_some_and(|record| record.request.seq == *seq)
+                    .is_some_and(|record| record.request == *request)
             });
             anyhow::ensure!(durable, "every request must be durable before its page ACK");
+            let seqs = acknowledged_requests
+                .iter()
+                .map(|request| request.seq)
+                .collect::<Vec<_>>();
             server_events
                 .lock()
                 .expect("fake cloud event lock should not poison")
@@ -870,6 +1060,44 @@ fn temp_cloud_bot_dir(label: &str) -> PathBuf {
     ))
 }
 
+fn open_runtime_test_inbox(root: &Path) -> Result<CloudInbox> {
+    CloudInbox::open_for_epoch(root, crate::cloud::TEST_DATABASE_EPOCH)
+}
+
+fn open_runtime_test_inbox_with_file_provider(
+    root: &Path,
+    file_provider: Arc<dyn QueueFileProvider>,
+) -> Result<CloudInbox> {
+    CloudInbox::open_for_epoch_with_file_provider(
+        root,
+        crate::cloud::TEST_DATABASE_EPOCH,
+        file_provider,
+    )
+}
+
+fn runtime_test_inbox_directory(root: &Path, epoch: &str) -> PathBuf {
+    root.join(".telegram-video-downloader-cloud")
+        .join("epochs")
+        .join(epoch)
+}
+
+fn runtime_test_request_path(root: &Path, epoch: &str, seq: u64) -> PathBuf {
+    runtime_test_inbox_directory(root, epoch).join(format!("request-{seq:020}.json"))
+}
+
+fn persisted_cloud_preview_count(video_root: &Path) -> usize {
+    fs::read_dir(video_root.join(".telegram-video-downloader-library"))
+        .expect("private library directory should list")
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("preview-") && name.ends_with(".json"))
+        })
+        .count()
+}
+
 fn make_runtime(
     telegram: TelegramClient,
     config: AppConfig,
@@ -900,6 +1128,7 @@ fn make_runtime(
         management_dispatch: Arc::new(Semaphore::new(1)),
         backlog_sync_gate: Arc::new(Mutex::new(())),
         reconciliation_complete: Arc::new(AtomicBool::new(true)),
+        epoch_fatal: Arc::new(CloudEpochFatal::default()),
         cloud_ready_marker_emitted: Arc::new(AtomicBool::new(false)),
         test_file_provider: None,
         test_library_refresh_failure: Arc::new(StdMutex::new(None)),
@@ -1087,8 +1316,9 @@ async fn cloud_queue_hints_use_only_persisted_verified_episode_receipts() {
         BTreeMap::from([(legacy_path.display().to_string(), "b".repeat(64))]);
     queue.create(legacy).expect("legacy task should persist");
 
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let runtime = make_runtime(
         TelegramClient::with_test_api_base_url(
             TEST_TELEGRAM_TOKEN.to_string(),
@@ -1194,8 +1424,9 @@ async fn cloud_request_dispatcher_leaves_management_request_pending_while_busy()
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let runtime = make_runtime(
         TelegramClient::with_test_api_base_url(
             TEST_TELEGRAM_TOKEN.to_string(),
@@ -1269,8 +1500,9 @@ async fn oversized_dispatch_result_stays_terminal_and_is_not_redispatched() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let request = cloud_telegram_update(82, 820);
     inbox
         .persist(request.clone())
@@ -1301,7 +1533,7 @@ async fn oversized_dispatch_result_stays_terminal_and_is_not_redispatched() {
 
     drop(inbox);
     let inbox = Arc::new(
-        CloudInbox::open(&config.downloads.video_dir).expect("terminal inbox should reopen"),
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("terminal inbox should reopen"),
     );
     assert_eq!(
         inbox
@@ -1351,8 +1583,9 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     for offset in 0..128_u64 {
         let seq = 1_000 + offset;
         inbox
@@ -1555,8 +1788,9 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
         .set_modified(SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60))
         .expect("preview manifest should be old enough to expire");
 
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     inbox
         .persist(CloudRequest {
             seq: 83,
@@ -1584,11 +1818,11 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
     let preview_expires_at_millis = preview_updated_at
         .saturating_add(PREVIEW_RETENTION_SECONDS)
         .saturating_mul(1_000);
-    let preview_receipt_path = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud")
-        .join("request-00000000000000000083.json");
+    let preview_receipt_path = runtime_test_request_path(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+        83,
+    );
     let mut preview_receipt: InboxRecord = serde_json::from_slice(
         &fs::read(&preview_receipt_path).expect("preview receipt should read"),
     )
@@ -1601,8 +1835,9 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
     .expect("expired preview receipt should persist");
     drop(inbox);
 
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should reopen"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should reopen"),
+    );
     inbox
         .persist(CloudRequest {
             seq: 84,
@@ -1621,7 +1856,7 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
     drop(inbox);
 
     let inbox = Arc::new(
-        CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should recover"),
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should recover"),
     );
     let mut pending_confirmation = None;
     for _ in 0..4 {
@@ -1752,8 +1987,9 @@ async fn expired_preview_manifests_follow_terminal_and_unknown_confirmation_stat
             .expect("preview manifest should be old enough to expire");
     }
 
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     for (seq, preview) in [(1, &abandoned_preview), (2, &unresolved_preview)] {
         inbox
             .persist(CloudRequest {
@@ -1798,15 +2034,15 @@ async fn expired_preview_manifests_follow_terminal_and_unknown_confirmation_stat
         .expect("missing preview receipt should leave no expiry association");
     drop(inbox);
 
-    let missing_preview_receipt = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud")
-        .join("request-00000000000000000002.json");
+    let missing_preview_receipt = runtime_test_request_path(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+        2,
+    );
     fs::remove_file(&missing_preview_receipt)
         .expect("expired preview receipt should be absent for restart recovery");
     let inbox = Arc::new(
-        CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should recover"),
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should recover"),
     );
 
     let manager = LibraryManager::open_with_provider_and_preview_cleanup_gate(
@@ -1873,8 +2109,9 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
     let preview_revision = preview.revision.clone();
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     inbox
         .persist(CloudRequest {
             seq: 83,
@@ -2036,8 +2273,9 @@ async fn nonretryable_skipped_confirmation_requires_fresh_preview() {
     .expect("conflicting target should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let file_provider = Arc::new(MockQueueFileProvider::default());
     let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
     let library = LibraryManager::open_with_provider_and_preview_cleanup_gate(
@@ -2205,8 +2443,9 @@ async fn completed_file_confirmation_is_preserved_when_library_refresh_fails() {
     .expect("NFO fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let file_provider = Arc::new(MockQueueFileProvider::default());
     let provider: Arc<dyn QueueFileProvider> = file_provider.clone();
     let library = LibraryManager::open_with_provider_and_preview_cleanup_gate(
@@ -2408,8 +2647,9 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
     fs::write(&source_nfo, original_nfo).expect("NFO fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let library =
         LibraryManager::open(&config.downloads.video_dir).expect("library manager should open");
     let snapshot = library
@@ -2555,6 +2795,201 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
 }
 
 #[tokio::test]
+async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() {
+    const ITEM_COUNT: usize = 100;
+    const IDS_PER_PATCH: usize = 48;
+
+    let root = temp_cloud_bot_dir("oversized-cloud-file-preview");
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let video_root = config.downloads.video_dir.clone();
+
+    let mut item_ids = Vec::with_capacity(ITEM_COUNT);
+    let mut source_files = Vec::with_capacity(ITEM_COUNT);
+    for item_index in 0..ITEM_COUNT {
+        let stem = format!("c{item_index:02}");
+        let media = video_root.join(format!("{stem}.mp4"));
+        fs::write(&media, b"fixture-video").expect("media fixture should write");
+        source_files.push(media);
+    }
+
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(open_runtime_test_inbox(&video_root).expect("cloud inbox should open"));
+    let library = LibraryManager::open(&video_root).expect("library manager should open");
+    let snapshot = library
+        .scan(&[])
+        .expect("initial library scan should index the sidecar groups");
+    for item_index in 0..ITEM_COUNT {
+        let stem = format!("c{item_index:02}.mp4");
+        let item = snapshot
+            .items
+            .iter()
+            .find(|item| item.relative_path == stem)
+            .expect("media fixture should be indexed");
+        item_ids.push(item.id.clone());
+    }
+    drop(library);
+
+    let runtime = make_runtime(telegram, config, Arc::clone(&queue), Arc::clone(&inbox));
+    let patches = item_ids
+        .iter()
+        .enumerate()
+        .map(|(item_index, item_id)| {
+            let source_ids = (0..IDS_PER_PATCH)
+                .map(|source_id_index| {
+                    format!("cid{:0125}", item_index * IDS_PER_PATCH + source_id_index)
+                })
+                .collect::<Vec<_>>();
+            assert!(source_ids.iter().all(|source_id| source_id.len() == 128));
+            serde_json::json!({"item_id": item_id, "source_ids": source_ids})
+        })
+        .collect::<Vec<_>>();
+    let large_request = CloudRequest {
+        seq: 1,
+        kind: "file_preview".to_string(),
+        payload: serde_json::json!({"metadata_patches": patches}),
+        created_at: now_millis(),
+        extra: serde_json::Map::new(),
+    };
+    assert!(
+        serde_json::to_vec(&large_request)
+            .expect("large preview request should serialize")
+            .len()
+            < 1024 * 1024,
+        "fixture request must fit the existing inbox request limit"
+    );
+    inbox
+        .persist(large_request)
+        .expect("large preview request should persist");
+    let large_request = inbox
+        .update(1, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("large preview request should enter processing");
+    dispatch_cloud_record(runtime.clone(), large_request).await;
+
+    let rejected = inbox
+        .record(1)
+        .expect("large preview receipt should load")
+        .expect("large preview receipt should remain present");
+    assert_eq!(rejected.status, InboxStatus::Failed);
+    assert!(
+        rejected.error.as_deref().is_some_and(|error| {
+            error.contains("too large to save and confirm")
+                && error.contains("split the changes into smaller previews")
+        }),
+        "oversized cloud preview should fail at the receipt-budget guard, got: {:?}",
+        rejected.error
+    );
+    assert_eq!(persisted_cloud_preview_count(&video_root), 0);
+    assert!(
+        (0..ITEM_COUNT)
+            .all(|item_index| !video_root.join(format!("c{item_index:02}.nfo")).exists()),
+        "rejecting an oversized preview must not create any NFO target"
+    );
+    for source in &source_files {
+        assert!(
+            source.is_file(),
+            "preview rejection must leave {source:?} in place"
+        );
+    }
+    assert_eq!(
+        fs::read(source_files[0].as_path()).expect("primary source should remain readable"),
+        b"fixture-video"
+    );
+
+    inbox
+        .persist(CloudRequest {
+            seq: 2,
+            kind: "file_preview".to_string(),
+            payload: serde_json::json!({
+                "metadata_patches": [{
+                    "item_id": item_ids[0],
+                    "title": "Small preview",
+                }]
+            }),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("small preview request should persist");
+    let small_request = inbox
+        .update(2, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("small preview request should enter processing");
+    dispatch_cloud_record(runtime.clone(), small_request).await;
+
+    let preview_receipt = inbox
+        .record(2)
+        .expect("small preview receipt should load")
+        .expect("small preview receipt should remain present");
+    assert_eq!(preview_receipt.status, InboxStatus::AwaitingConfirmation);
+    let result = preview_receipt
+        .result
+        .as_ref()
+        .expect("confirmable preview should keep its receipt result");
+    let preview_id = result["preview_id"]
+        .as_str()
+        .expect("preview receipt should include its ID")
+        .to_string();
+    let revision = result["revision"]
+        .as_str()
+        .expect("preview receipt should include its revision")
+        .to_string();
+    assert_eq!(persisted_cloud_preview_count(&video_root), 1);
+
+    inbox
+        .persist(CloudRequest {
+            seq: 3,
+            kind: "file_confirm".to_string(),
+            payload: serde_json::json!({"preview_id": preview_id, "revision": revision}),
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("small preview confirmation should persist");
+    let confirmation = inbox
+        .update(3, |record| {
+            record.status = InboxStatus::Processing;
+            record.attempts = 1;
+        })
+        .expect("small preview confirmation should enter processing");
+    dispatch_cloud_record(runtime.clone(), confirmation).await;
+
+    let completed = inbox
+        .record(3)
+        .expect("confirmation receipt should load")
+        .expect("confirmation receipt should remain present");
+    assert_eq!(completed.status, InboxStatus::Completed);
+    let operation: crate::library::BatchMoveResult = serde_json::from_value(
+        completed
+            .result
+            .as_ref()
+            .expect("confirmation should retain its operation result")["operation"]
+            .clone(),
+    )
+    .expect("operation result should deserialize");
+    assert_eq!(operation.status, crate::library::BatchStatus::Complete);
+    assert_eq!(
+        fs::read_to_string(video_root.join("c00.nfo"))
+            .expect("confirmed metadata patch should create its NFO"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<movie>\n  <title>Small preview</title>\n</movie>\n"
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn missing_related_preview_does_not_retry_a_durable_primary_outcome() {
     const PRIMARY_SEQ: u64 = 861;
     const MISSING_PREVIEW_SEQ: u64 = 862;
@@ -2568,8 +3003,9 @@ async fn missing_related_preview_does_not_retry_a_durable_primary_outcome() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     inbox
         .persist(CloudRequest {
             seq: PRIMARY_SEQ,
@@ -2796,8 +3232,9 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
         .clone();
     drop(library);
 
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let mut hints = (0..=SELECTED_HINT_INDEX)
         .map(|index| SourceHint {
             source_ids: Vec::new(),
@@ -2869,8 +3306,9 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
     );
 
     drop(inbox);
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should reopen"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should reopen"),
+    );
     let mut recovered_state = None;
     for _ in 0..16 {
         if let Ok((records, _)) = inbox.state_records_bounded(0) {
@@ -3058,7 +3496,11 @@ fn cloud_batch_result_retry_advice_matches_confirmation_availability() {
 }
 
 fn cloud_telegram_update(seq: u64, update_id: i64) -> CloudRequest {
-    CloudRequest {
+    cloud_telegram_update_with_text(seq, update_id, "/queue")
+}
+
+fn cloud_telegram_update_with_text(seq: u64, update_id: i64, text: &str) -> CloudRequest {
+    let request = CloudRequest {
         seq,
         kind: "telegram".to_string(),
         payload: serde_json::json!({
@@ -3067,18 +3509,443 @@ fn cloud_telegram_update(seq: u64, update_id: i64) -> CloudRequest {
                 "message_id": update_id,
                 "chat": {"id": 123_456_789, "type": "private"},
                 "from": {"id": 123_456_789},
-                "text": "/queue"
+                "text": text
             }
         }),
         created_at: 1_790_000_000_000,
         extra: serde_json::Map::new(),
-    }
+    };
+    cloud_request_with_envelope_identity(request, &format!("telegram-update-{update_id}"))
 }
 
-fn cloud_telegram_update_with_text(seq: u64, update_id: i64, text: &str) -> CloudRequest {
-    let mut request = cloud_telegram_update(seq, update_id);
-    request.payload["message"]["text"] = serde_json::Value::String(text.to_string());
+fn cloud_request_with_envelope_identity(
+    mut request: CloudRequest,
+    request_id: &str,
+) -> CloudRequest {
+    let payload = serde_json::to_vec(&request.payload).expect("payload should serialize");
+    request.extra.insert(
+        "request_id".to_string(),
+        serde_json::Value::String(request_id.to_string()),
+    );
+    request.extra.insert(
+        "payload_hash".to_string(),
+        serde_json::Value::String(format!("{:x}", Sha256::digest(payload))),
+    );
     request
+}
+
+fn cloud_ack_receipt_matches_request(receipt: &serde_json::Value, request: &CloudRequest) -> bool {
+    receipt["seq"].as_u64() == Some(request.seq)
+        && receipt["kind"].as_str() == Some(request.kind.as_str())
+        && receipt["created_at"].as_u64() == Some(request.created_at)
+        && receipt["request_id"].as_str()
+            == request
+                .extra
+                .get("request_id")
+                .and_then(serde_json::Value::as_str)
+        && receipt["payload_hash"].as_str()
+            == request
+                .extra
+                .get("payload_hash")
+                .and_then(serde_json::Value::as_str)
+}
+
+#[cfg(unix)]
+#[test]
+fn cloud_database_epoch_scopes_reused_sequence_without_replacing_old_receipt() {
+    const SEQ: u64 = 77;
+    const OLD_EPOCH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const NEW_EPOCH: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let root = temp_cloud_bot_dir("database-epoch-sequence-scope");
+    fs::create_dir_all(&root).expect("cloud root should create");
+    let old_inbox =
+        CloudInbox::open_for_epoch(&root, OLD_EPOCH).expect("old epoch inbox should open");
+    let old_request = cloud_telegram_update_with_text(SEQ, 7_701, "/queue");
+    old_inbox
+        .persist(old_request.clone())
+        .expect("old epoch request should persist");
+    let old_result = serde_json::json!({"preview_id":"old-preview","completed":true});
+    old_inbox
+        .persist_dispatch_result(SEQ, InboxStatus::Completed, Some(old_result.clone()), None)
+        .expect("old epoch receipt should become completed");
+    let old_record_path = old_inbox.record_path_for_test(SEQ);
+    let old_record_bytes = fs::read(&old_record_path).expect("old receipt bytes should read");
+    let (old_device, old_inode) = {
+        let old_identity = fs::metadata(&old_record_path).expect("old receipt should stat");
+        (old_identity.dev(), old_identity.ino())
+    };
+    drop(old_inbox);
+
+    let new_inbox = CloudInbox::open_for_epoch(&root, NEW_EPOCH)
+        .expect("new epoch inbox should open independently");
+    assert!(
+        new_inbox
+            .records()
+            .expect("new epoch records should list")
+            .is_empty(),
+        "a reused sequence must not inherit the prior epoch's completed confirmation"
+    );
+    let new_request = cloud_telegram_update_with_text(SEQ, 7_702, "/help");
+    new_inbox
+        .persist(new_request.clone())
+        .expect("the new epoch may safely use the same sequence");
+    let new_record = new_inbox
+        .record(SEQ)
+        .expect("new epoch record should load")
+        .expect("new epoch record should exist");
+    assert_eq!(new_record.request, new_request);
+    assert_eq!(new_record.status, InboxStatus::Pending);
+    assert_ne!(new_inbox.record_path_for_test(SEQ), old_record_path);
+
+    let old_identity_after = fs::metadata(&old_record_path).expect("old receipt should remain");
+    assert_eq!(old_identity_after.dev(), old_device);
+    assert_eq!(old_identity_after.ino(), old_inode);
+    assert_eq!(
+        fs::read(&old_record_path).expect("old receipt bytes should remain readable"),
+        old_record_bytes,
+        "writing the new namespace must not replace or mutate the old receipt"
+    );
+    drop(new_inbox);
+
+    let reopened_old =
+        CloudInbox::open_for_epoch(&root, OLD_EPOCH).expect("old epoch should remain reopenable");
+    let reopened_record = reopened_old
+        .record(SEQ)
+        .expect("old epoch receipt should load after reopen")
+        .expect("old completed receipt should remain present");
+    assert_eq!(reopened_record.request, old_request);
+    assert_eq!(reopened_record.status, InboxStatus::Completed);
+    assert_eq!(reopened_record.result, Some(old_result));
+
+    drop(reopened_old);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cloud_rest_epoch_mismatch_keeps_reconciliation_closed_without_ack_or_dispatch() {
+    const ACTUAL_EPOCH: &str = "cccccccccccccccccccccccccccccccc";
+
+    let root = temp_cloud_bot_dir("database-epoch-rest-mismatch");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir)
+            .expect("epoch-scoped cloud inbox should open"),
+    );
+    let existing_local = cloud_telegram_update_with_text(702, 7_020, "/help");
+    inbox
+        .persist(existing_local.clone())
+        .expect("local pending work should be durable before reconciliation");
+    let remote = cloud_telegram_update_with_text(703, 7_030, "/queue");
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api_with_epoch(
+            config.downloads.video_dir.clone(),
+            vec![remote.clone()],
+            ACTUAL_EPOCH.to_string(),
+        )
+        .await;
+    let (telegram, mut telegram_requests, telegram_shutdown, telegram_server) =
+        spawn_fake_telegram_api().await;
+    let mut runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+
+    let error = sync_cloud_backlog(&runtime)
+        .await
+        .expect_err("a different authoritative epoch must stop reconciliation");
+    let epoch_error = error
+        .downcast_ref::<CloudDatabaseEpochChanged>()
+        .expect("REST epoch mismatch should remain a typed fatal condition");
+    assert_eq!(epoch_error.expected, crate::cloud::TEST_DATABASE_EPOCH);
+    assert_eq!(epoch_error.actual, ACTUAL_EPOCH);
+    assert!(runtime.epoch_fatal.is_signaled());
+    assert!(
+        !runtime
+            .reconciliation_complete
+            .load(AtomicOrdering::Acquire)
+    );
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        0,
+        "an epoch mismatch must not publish Cloud readiness"
+    );
+    assert_eq!(cloud_state.fetch_count.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(cloud_state.ack_count.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(
+        inbox
+            .record(existing_local.seq)
+            .expect("existing local receipt should remain readable")
+            .expect("existing local receipt should remain present")
+            .status,
+        InboxStatus::Pending
+    );
+    assert!(
+        inbox
+            .record(remote.seq)
+            .expect("mismatched remote sequence should be checked")
+            .is_none(),
+        "a request from another epoch must not enter the local inbox"
+    );
+
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    tokio::time::timeout(Duration::from_secs(2), dispatcher)
+        .await
+        .expect("fatal epoch latch should stop dispatch promptly")
+        .expect("dispatcher should not panic");
+    assert!(
+        telegram_requests.try_recv().is_err(),
+        "no Telegram dispatch should start while the database epoch is unknown"
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cloud_sequence_conflict_rotates_only_matching_remote_envelope_and_stops() {
+    const NEXT_EPOCH: &str = "dddddddddddddddddddddddddddddddd";
+    const SEQ: u64 = 811;
+
+    let root = temp_cloud_bot_dir("database-epoch-sequence-conflict");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir)
+            .expect("epoch-scoped cloud inbox should open"),
+    );
+    let existing_local = cloud_telegram_update_with_text(SEQ, 8_110, "/help");
+    inbox
+        .persist(existing_local.clone())
+        .expect("the prior local envelope should be durable");
+    let record_path = inbox.record_path_for_test(SEQ);
+    let original_bytes = fs::read(&record_path).expect("old receipt bytes should read");
+    let (original_device, original_inode) = {
+        let original_identity = fs::metadata(&record_path).expect("old receipt should stat");
+        (original_identity.dev(), original_identity.ino())
+    };
+
+    let remote = cloud_request_with_envelope_identity(
+        cloud_telegram_update_with_text(SEQ, 8_111, "/queue"),
+        "telegram-update-811",
+    );
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api_with_epoch(
+            config.downloads.video_dir.clone(),
+            vec![remote.clone()],
+            crate::cloud::TEST_DATABASE_EPOCH.to_string(),
+        )
+        .await;
+    *cloud_state
+        .rotate_epoch_to
+        .lock()
+        .expect("fake rotation lock should remain healthy") = Some(NEXT_EPOCH.to_string());
+    let (telegram, mut telegram_requests, telegram_shutdown, telegram_server) =
+        spawn_fake_telegram_api().await;
+    let mut runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+
+    let error = sync_cloud_backlog(&runtime)
+        .await
+        .expect_err("a reused sequence with another envelope must enter fatal CAS recovery");
+    let epoch_error = error
+        .downcast_ref::<CloudDatabaseEpochChanged>()
+        .expect("successful CAS rotation should request a process restart");
+    assert_eq!(epoch_error.expected, crate::cloud::TEST_DATABASE_EPOCH);
+    assert_eq!(epoch_error.actual, NEXT_EPOCH);
+    assert!(runtime.epoch_fatal.is_signaled());
+    assert!(
+        !runtime
+            .reconciliation_complete
+            .load(AtomicOrdering::Acquire)
+    );
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        0,
+        "a sequence collision must not publish Cloud readiness"
+    );
+    assert_eq!(cloud_state.fetch_count.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(cloud_state.ack_count.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(
+        cloud_state
+            .epoch_recovery_requests
+            .lock()
+            .expect("fake recovery list should remain healthy")
+            .as_slice(),
+        &[serde_json::json!({
+            "seq": SEQ,
+            "request_id": "telegram-update-811",
+            "payload_hash": remote.extra["payload_hash"],
+            "kind": remote.kind,
+            "created_at": remote.created_at
+        })],
+        "the recovery CAS must bind the original sequence and exact remote envelope identity"
+    );
+    assert_eq!(
+        *cloud_state
+            .database_epoch
+            .lock()
+            .expect("fake epoch lock should remain healthy"),
+        NEXT_EPOCH,
+        "the fake server should rotate only after a matching CAS"
+    );
+    let local_after = inbox
+        .record(SEQ)
+        .expect("prior local record should remain readable")
+        .expect("prior local record should remain present");
+    assert_eq!(local_after.request, existing_local);
+    assert_eq!(local_after.status, InboxStatus::Pending);
+    let identity_after = fs::metadata(&record_path).expect("old receipt should remain on disk");
+    assert_eq!(identity_after.dev(), original_device);
+    assert_eq!(identity_after.ino(), original_inode);
+    assert_eq!(
+        fs::read(&record_path).expect("old receipt bytes should remain readable"),
+        original_bytes,
+        "sequence conflict recovery must not overwrite the old epoch receipt"
+    );
+
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    tokio::time::timeout(Duration::from_secs(2), dispatcher)
+        .await
+        .expect("fatal epoch latch should stop dispatch promptly")
+        .expect("dispatcher should not panic");
+    assert!(
+        telegram_requests.try_recv().is_err(),
+        "no Telegram dispatch should start after sequence-conflict recovery"
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cloud_ack_does_not_clear_a_replacement_envelope_with_the_same_sequence() {
+    const SEQ: u64 = 812;
+
+    let root = temp_cloud_bot_dir("ack-envelope-replacement");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+
+    let fetched = cloud_telegram_update_with_text(SEQ, 8_120, "/queue");
+    let replacement = cloud_telegram_update_with_text(SEQ, 8_121, "/help");
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), vec![fetched.clone()]).await;
+    *cloud_state
+        .replace_pending_before_ack
+        .lock()
+        .expect("fake ACK replacement lock should remain healthy") = Some(replacement.clone());
+    let (telegram, _telegram_requests, telegram_shutdown, telegram_server) =
+        spawn_fake_telegram_api().await;
+    let mut runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+
+    let error = sync_cloud_backlog(&runtime)
+        .await
+        .expect_err("an ACK for the fetched envelope must reject a same-sequence replacement");
+    let conflict = error
+        .downcast_ref::<crate::cloud::CloudInboxSequenceConflict>()
+        .expect("an ACK identity collision should remain a typed sequence conflict");
+    assert_eq!(conflict.seq, SEQ);
+    assert!(
+        !runtime
+            .reconciliation_complete
+            .load(AtomicOrdering::Acquire),
+        "the authoritative backlog is not reconciled after an identity conflict"
+    );
+    assert_eq!(
+        runtime
+            .test_cloud_ready_marker_emissions
+            .load(AtomicOrdering::SeqCst),
+        0,
+        "a rejected old ACK must not publish readiness"
+    );
+    assert_eq!(cloud_state.ack_count.load(AtomicOrdering::SeqCst), 1);
+    let pending_after_ack = cloud_state
+        .pending
+        .lock()
+        .expect("fake pending list should remain healthy")
+        .clone();
+    assert_eq!(
+        pending_after_ack.as_slice(),
+        std::slice::from_ref(&replacement),
+        "the replacement envelope must remain pending after the old identity is rejected"
+    );
+
+    let receipts = cloud_state
+        .ack_request_bodies
+        .lock()
+        .expect("fake ACK request list should remain healthy")[0]["receipts"]
+        .as_array()
+        .expect("ACK should carry exact receipt identities")
+        .clone();
+    assert_eq!(receipts.len(), 1);
+    assert!(cloud_ack_receipt_matches_request(&receipts[0], &fetched));
+    assert!(
+        !cloud_ack_receipt_matches_request(&receipts[0], &replacement),
+        "the sent ACK must identify the fetched envelope, not the replacement"
+    );
+
+    let local = inbox
+        .record(SEQ)
+        .expect("durable fetched request should remain readable")
+        .expect("durable fetched request should remain on disk");
+    assert_eq!(local.request, fetched);
+    assert_eq!(local.status, InboxStatus::Pending);
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -3091,8 +3958,9 @@ async fn cloud_rest_persists_before_ack_and_recovers_duplicate_backlog_after_res
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let newer = cloud_telegram_update(9, 90);
     let older = cloud_telegram_update(2, 20);
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) = spawn_fake_cloud_api(
@@ -3139,7 +4007,7 @@ async fn cloud_rest_persists_before_ack_and_recovers_duplicate_backlog_after_res
 
     // Reopening models process restart after durable persistence but before a successful ACK.
     let reopened_inbox = Arc::new(
-        CloudInbox::open(&config.downloads.video_dir)
+        open_runtime_test_inbox(&config.downloads.video_dir)
             .expect("pending cloud inbox should recover after restart"),
     );
     let mut runtime = make_runtime(
@@ -3245,15 +4113,15 @@ async fn cloud_readiness_requires_durable_persistence_and_ack_then_emits_once() 
     let inbox_provider = Arc::new(FailOnceInboxFileProvider::default());
     let provider: Arc<dyn QueueFileProvider> = inbox_provider.clone();
     let inbox = Arc::new(
-        CloudInbox::open_with_file_provider(&config.downloads.video_dir, provider)
+        open_runtime_test_inbox_with_file_provider(&config.downloads.video_dir, provider)
             .expect("cloud inbox should open with retryable test storage"),
     );
     let request = cloud_telegram_update_with_text(401, 401, "/help");
-    let request_path = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud")
-        .join(format!("request-{:020}.json", request.seq));
+    let request_path = runtime_test_request_path(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+        request.seq,
+    );
     inbox_provider.fail_next_write_to(request_path);
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), vec![request]).await;
@@ -3332,7 +4200,7 @@ async fn startup_recovery_defers_ack_and_keeps_the_authoritative_page_in_memory(
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox = CloudInbox::open(&config.downloads.video_dir)
+    let inbox = open_runtime_test_inbox(&config.downloads.video_dir)
         .expect("cloud inbox should open for history fixture");
     for seq in 1..=120 {
         inbox
@@ -3350,14 +4218,14 @@ async fn startup_recovery_defers_ack_and_keeps_the_authoritative_page_in_memory(
     cloud_state
         .fail_first_ack
         .store(false, AtomicOrdering::SeqCst);
-    let inbox_directory = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud");
+    let inbox_directory = runtime_test_inbox_directory(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
     let (provider, read_started, release_read) = PauseOnDirectoryReadProvider::new(inbox_directory);
     let provider_trait: Arc<dyn QueueFileProvider> = provider.clone();
     let inbox = Arc::new(
-        CloudInbox::open_with_file_provider(&config.downloads.video_dir, provider_trait)
+        open_runtime_test_inbox_with_file_provider(&config.downloads.video_dir, provider_trait)
             .expect("bounded inbox recovery should start"),
     );
     provider.arm();
@@ -3377,11 +4245,11 @@ async fn startup_recovery_defers_ack_and_keeps_the_authoritative_page_in_memory(
         .expect("initial recovery should reach its controlled read");
     assert_eq!(cloud_state.fetch_count.load(AtomicOrdering::SeqCst), 1);
     assert_eq!(cloud_state.ack_count.load(AtomicOrdering::SeqCst), 0);
-    let incoming_path = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud")
-        .join(format!("request-{:020}.json", 200));
+    let incoming_path = runtime_test_request_path(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+        200,
+    );
     assert!(
         !incoming_path.exists(),
         "the incoming envelope must remain unwritten while the startup index is incomplete"
@@ -3435,8 +4303,9 @@ async fn completed_queue_publication_refreshes_the_cloud_library_snapshot() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let telegram = TelegramClient::with_test_api_base_url(
         TEST_TELEGRAM_TOKEN.to_string(),
         "http://127.0.0.1:1".to_string(),
@@ -3518,8 +4387,9 @@ async fn cloud_queue_command_progresses_while_management_job_waits_at_barrier() 
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let runtime = make_runtime(telegram, config, Arc::clone(&queue), Arc::clone(&inbox));
 
     let management_runtime = runtime.clone();
@@ -3608,8 +4478,9 @@ async fn file_batch_reuses_one_telegram_message_and_edits_it() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let request = CloudRequest {
         seq: 31,
         kind: "file_preview".to_string(),
@@ -3686,8 +4557,9 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
     let source_path = config.downloads.video_dir.join("clip.mp4");
     fs::write(&source_path, b"original media contents").expect("media fixture should write");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let library =
         LibraryManager::open_with_preview_cleanup_gate(&config.downloads.video_dir, inbox.clone())
             .expect("library manager should open with inbox cleanup coordination");
@@ -3826,8 +4698,9 @@ async fn coalesced_queue_progress_publishes_final_state_without_library_rescan()
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
     let runtime = make_runtime(
@@ -3934,8 +4807,9 @@ async fn cloud_websocket_stays_connected_through_long_idle_and_acks_durable_requ
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (telegram, _telegram_requests, telegram_shutdown, telegram_server) =
         spawn_fake_telegram_api().await;
     let mut runtime = make_runtime(telegram, config.clone(), queue, Arc::clone(&inbox));
@@ -3986,7 +4860,10 @@ async fn cloud_websocket_stays_connected_through_long_idle_and_acks_durable_requ
                 && backlog_fetch.authorization.as_deref() == Some(expected_authorization.as_str()),
             "receiver should fetch the authoritative REST request before ACK"
         );
-        let backlog_payload = serde_json::json!({"requests": [&request]});
+        let backlog_payload = serde_json::json!({
+            "database_epoch": crate::cloud::TEST_DATABASE_EPOCH,
+            "requests": [&request]
+        });
         requests_stream
             .write_all(fake_http_response(200, &backlog_payload).as_bytes())
             .await
@@ -3998,16 +4875,19 @@ async fn cloud_websocket_stays_connected_through_long_idle_and_acks_durable_requ
             .await
             .context("fake cloud ACK accept failed")?;
         let ack = read_fake_telegram_request(&mut ack_stream).await?;
-        let record_path = server_root
-            .join(".telegram-video-downloader-cloud")
-            .join(format!("request-{:020}.json", request.seq));
+        let record_path =
+            runtime_test_request_path(&server_root, crate::cloud::TEST_DATABASE_EPOCH, request.seq);
         let durable = std::fs::read(record_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<InboxRecord>(&bytes).ok())
             .is_some_and(|record| record.request == request);
+        let receipts = ack.body["receipts"].as_array();
         let valid_ack = ack.method == "ack"
             && ack.authorization.as_deref() == Some(expected_authorization.as_str())
-            && ack.body["seqs"] == serde_json::json!([request.seq]);
+            && ack.database_epoch.as_deref() == Some(crate::cloud::TEST_DATABASE_EPOCH)
+            && receipts.is_some_and(|receipts| {
+                receipts.len() == 1 && cloud_ack_receipt_matches_request(&receipts[0], &request)
+            });
         ack_stream
             .write_all(fake_http_response(200, &serde_json::json!({"ok":true})).as_bytes())
             .await
@@ -4090,8 +4970,9 @@ async fn websocket_reconciles_and_acks_earlier_rest_requests_before_dispatching_
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let earlier = cloud_telegram_update_with_text(1, 1, "/help");
     let later = cloud_telegram_update_with_text(2, 2, "/help");
     let (cloud_base_url, events, first_ack, release_first_ack, cloud_server) =
@@ -4226,8 +5107,9 @@ async fn websocket_backlog_fetch_failure_does_not_persist_or_dispatch_later_fram
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let later = cloud_telegram_update_with_text(2, 2, "/start");
     let (cloud_base_url, events, _first_ack, _release_first_ack, cloud_server) =
         spawn_fake_cloud_websocket_api(
@@ -4329,8 +5211,9 @@ async fn local_dispatch_waits_for_initial_authoritative_reconciliation() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (cloud_base_url, _cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
     let mut runtime = make_runtime(telegram, config, Arc::clone(&queue), Arc::clone(&inbox));
@@ -4429,8 +5312,9 @@ async fn cloud_library_publication_gate_keeps_snapshot_and_warning_ordered() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let runtime = make_runtime(
         TelegramClient::with_test_api_base_url(
             TEST_TELEGRAM_TOKEN.to_string(),
@@ -4595,7 +5479,7 @@ async fn completed_telegram_action_retries_receipt_without_sending_twice() {
     let inbox_provider = Arc::new(FailOnceInboxFileProvider::default());
     let provider: Arc<dyn QueueFileProvider> = inbox_provider.clone();
     let inbox = Arc::new(
-        CloudInbox::open_with_file_provider(&config.downloads.video_dir, provider)
+        open_runtime_test_inbox_with_file_provider(&config.downloads.video_dir, provider)
             .expect("cloud inbox should open with retryable test storage"),
     );
     let request = cloud_telegram_update_with_text(301, 301, "/help");
@@ -4608,11 +5492,11 @@ async fn completed_telegram_action_retries_receipt_without_sending_twice() {
             record.attempts = 1;
         })
         .expect("Telegram request should enter processing");
-    let receipt_path = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud")
-        .join(format!("request-{:020}.json", request.seq));
+    let receipt_path = runtime_test_request_path(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+        request.seq,
+    );
     inbox_provider.fail_next_write_to(receipt_path.clone());
 
     let (telegram, mut telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
@@ -4661,7 +5545,7 @@ async fn retryable_status_write_failure_preserves_error_and_retry_deadline() {
     let inbox_provider = Arc::new(FailOnceInboxFileProvider::default());
     let provider: Arc<dyn QueueFileProvider> = inbox_provider.clone();
     let inbox = Arc::new(
-        CloudInbox::open_with_file_provider(&config.downloads.video_dir, provider)
+        open_runtime_test_inbox_with_file_provider(&config.downloads.video_dir, provider)
             .expect("cloud inbox should open with retryable test storage"),
     );
     let request = CloudRequest {
@@ -4680,11 +5564,11 @@ async fn retryable_status_write_failure_preserves_error_and_retry_deadline() {
             record.attempts = 1;
         })
         .expect("confirmation should enter processing");
-    let receipt_path = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud")
-        .join(format!("request-{:020}.json", request.seq));
+    let receipt_path = runtime_test_request_path(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+        request.seq,
+    );
     inbox_provider.fail_next_read("simulated temporary inbox read failure");
     inbox_provider.fail_next_write_to(receipt_path.clone());
 
@@ -4748,8 +5632,11 @@ async fn completed_file_move_retries_primary_and_preview_receipts_without_repeat
     let inbox_provider = Arc::new(FailOnceInboxFileProvider::default());
     let inbox_provider_trait: Arc<dyn QueueFileProvider> = inbox_provider.clone();
     let inbox = Arc::new(
-        CloudInbox::open_with_file_provider(&config.downloads.video_dir, inbox_provider_trait)
-            .expect("cloud inbox should open with retryable test storage"),
+        open_runtime_test_inbox_with_file_provider(
+            &config.downloads.video_dir,
+            inbox_provider_trait,
+        )
+        .expect("cloud inbox should open with retryable test storage"),
     );
     let library_provider = Arc::new(MockQueueFileProvider::default());
     let library_provider_trait: Arc<dyn QueueFileProvider> = library_provider.clone();
@@ -4827,12 +5714,16 @@ async fn completed_file_move_retries_primary_and_preview_receipts_without_repeat
         })
         .expect("confirmation should enter processing");
 
-    let inbox_directory = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud");
-    let primary_path = inbox_directory.join(format!("request-{confirmation_seq:020}.json"));
-    let preview_path = inbox_directory.join(format!("request-{preview_seq:020}.json"));
+    let primary_path = runtime_test_request_path(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+        confirmation_seq,
+    );
+    let preview_path = runtime_test_request_path(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+        preview_seq,
+    );
     inbox_provider.fail_next_write_to(primary_path.clone());
     inbox_provider.fail_next_write_to(preview_path.clone());
 
@@ -4919,8 +5810,9 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
     fs::write(&source_path, b"fixture-video").expect("media fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let provider = Arc::new(MockQueueFileProvider::default());
     let provider_trait: Arc<dyn QueueFileProvider> = provider.clone();
     let library = LibraryManager::open_with_provider_and_preview_cleanup_gate(

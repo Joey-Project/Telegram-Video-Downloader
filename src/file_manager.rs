@@ -1287,7 +1287,29 @@ impl LibraryManager {
     }
 
     /// Builds and persists a preview from one locked scan, returning that same snapshot.
-    /// The validator runs under the scan/store locks and must only inspect the supplied snapshot.
+    /// Validators run under the scan/store locks and must only inspect their supplied values.
+    pub(crate) fn preview_with_hints_and_patches_and_snapshot_validator_and_preview_guard<V, G>(
+        &self,
+        request: PreviewBuildRequest<'_>,
+        hints: &[SourceHint],
+        validate_snapshot: V,
+        validate_preview: G,
+    ) -> Result<(MovePreview, LibrarySnapshot)>
+    where
+        V: FnOnce(&LibrarySnapshot) -> Result<()>,
+        G: FnOnce(&MovePreview) -> Result<()>,
+    {
+        self.preview_with_hints_and_patches_and_snapshot_validator_and_target_device_resolver_and_preview_guard(
+            request,
+            hints,
+            validate_snapshot,
+            |target_path| self.target_parent_device(target_path),
+            validate_preview,
+        )
+    }
+
+    /// Test-compatible preview API for callers that do not need a snapshot validator.
+    #[cfg(test)]
     pub(crate) fn preview_with_hints_and_patches_and_snapshot_validator<V>(
         &self,
         request: PreviewBuildRequest<'_>,
@@ -1297,11 +1319,11 @@ impl LibraryManager {
     where
         V: FnOnce(&LibrarySnapshot) -> Result<()>,
     {
-        self.preview_with_hints_and_patches_and_snapshot_validator_and_target_device_resolver(
+        self.preview_with_hints_and_patches_and_snapshot_validator_and_preview_guard(
             request,
             hints,
             validate_snapshot,
-            |target_path| self.target_parent_device(target_path),
+            |_| Ok(()),
         )
     }
 
@@ -1332,16 +1354,43 @@ impl LibraryManager {
         .map(|(preview, _)| preview)
     }
 
+    #[cfg(test)]
     fn preview_with_hints_and_patches_and_snapshot_validator_and_target_device_resolver<F, V>(
         &self,
         request: PreviewBuildRequest<'_>,
         hints: &[SourceHint],
         validate_snapshot: V,
-        mut target_device_for_path: F,
+        target_device_for_path: F,
     ) -> Result<(MovePreview, LibrarySnapshot)>
     where
         F: FnMut(&str) -> Result<u64>,
         V: FnOnce(&LibrarySnapshot) -> Result<()>,
+    {
+        self.preview_with_hints_and_patches_and_snapshot_validator_and_target_device_resolver_and_preview_guard(
+            request,
+            hints,
+            validate_snapshot,
+            target_device_for_path,
+            |_| Ok(()),
+        )
+    }
+
+    fn preview_with_hints_and_patches_and_snapshot_validator_and_target_device_resolver_and_preview_guard<
+        F,
+        V,
+        G,
+    >(
+        &self,
+        request: PreviewBuildRequest<'_>,
+        hints: &[SourceHint],
+        validate_snapshot: V,
+        mut target_device_for_path: F,
+        validate_preview: G,
+    ) -> Result<(MovePreview, LibrarySnapshot)>
+    where
+        F: FnMut(&str) -> Result<u64>,
+        V: FnOnce(&LibrarySnapshot) -> Result<()>,
+        G: FnOnce(&MovePreview) -> Result<()>,
     {
         let _process_guard = self
             .in_process_lock
@@ -1350,8 +1399,12 @@ impl LibraryManager {
         let _disk_guard = self.lock_store()?;
         let snapshot = self.scan_locked(hints)?;
         validate_snapshot(&snapshot)?;
-        let preview =
-            self.build_and_persist_preview(&snapshot, request, &mut target_device_for_path)?;
+        let preview = self.build_and_persist_preview_with_guard(
+            &snapshot,
+            request,
+            &mut target_device_for_path,
+            validate_preview,
+        )?;
         Ok((preview, snapshot))
     }
 
@@ -1424,12 +1477,28 @@ impl LibraryManager {
         Ok(result)
     }
 
+    #[cfg(test)]
     fn build_and_persist_preview(
         &self,
         snapshot: &LibrarySnapshot,
         request: PreviewBuildRequest<'_>,
         target_device_for_path: &mut impl FnMut(&str) -> Result<u64>,
     ) -> Result<MovePreview> {
+        self.build_and_persist_preview_with_guard(snapshot, request, target_device_for_path, |_| {
+            Ok(())
+        })
+    }
+
+    fn build_and_persist_preview_with_guard<G>(
+        &self,
+        snapshot: &LibrarySnapshot,
+        request: PreviewBuildRequest<'_>,
+        target_device_for_path: &mut impl FnMut(&str) -> Result<u64>,
+        validate_preview: G,
+    ) -> Result<MovePreview>
+    where
+        G: FnOnce(&MovePreview) -> Result<()>,
+    {
         let PreviewBuildRequest {
             item_ids,
             target_relative_dir,
@@ -1771,6 +1840,7 @@ impl LibraryManager {
         if contents.len() > PREVIEW_LIMIT {
             bail!("move preview exceeds its private storage limit");
         }
+        validate_preview(&preview)?;
         store_preview_anchors(&id, preview_anchors)?;
         if let Err(error) = self.write_private_file(&self.preview_path(&id), &contents) {
             release_preview_anchors(&id);
@@ -11865,6 +11935,66 @@ mod tests {
         );
         assert_eq!(preview.items.len(), 1);
         assert_eq!(preview.items[0].source_path, "clip.mp4");
+    }
+
+    #[test]
+    fn preview_guard_rejection_does_not_persist_manifest_or_anchors() {
+        let root = TemporaryRoot::new("preview-guard-rejects-before-persistence");
+        let source_path = root.path().join("clip.mp4");
+        fs::write(&source_path, b"fixture-video").expect("source media should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let item_id = item_at(&snapshot, "clip.mp4").id.clone();
+        let preview_count_before = persisted_preview_count(&manager);
+        let source_identity_before = fs::metadata(&source_path).expect("source should stat");
+        let mut rejected_preview = None;
+
+        let error = manager
+            .build_and_persist_preview_with_guard(
+                &snapshot,
+                PreviewBuildRequest {
+                    item_ids: std::slice::from_ref(&item_id),
+                    target_relative_dir: Some("Organized"),
+                    rename: false,
+                    conflict: ConflictPolicy::KeepBoth,
+                    patches: &[],
+                },
+                &mut |target_path| manager.target_parent_device(target_path),
+                |preview| {
+                    rejected_preview = Some((preview.id.clone(), preview.revision.clone()));
+                    Err(anyhow::anyhow!(
+                        "preview receipt exceeds its persistence budget"
+                    ))
+                },
+            )
+            .expect_err("the preview guard should reject before persisting");
+        assert!(error.to_string().contains("persistence budget"));
+        let (preview_id, revision) =
+            rejected_preview.expect("the guard should inspect the complete preview");
+        assert_eq!(persisted_preview_count(&manager), preview_count_before);
+        assert!(!root.path().join("Organized").exists());
+        assert_eq!(fs::read(&source_path).unwrap(), b"fixture-video");
+        let source_identity_after = fs::metadata(&source_path).expect("source should still stat");
+        assert_eq!(source_identity_before.dev(), source_identity_after.dev());
+        assert_eq!(source_identity_before.ino(), source_identity_after.ino());
+        if let Some(cache) = LIVE_PREVIEW_ANCHORS.get() {
+            assert!(
+                !cache
+                    .lock()
+                    .expect("preview anchor lock should remain healthy")
+                    .by_preview
+                    .contains_key(&preview_id),
+                "a rejected preview must not pin live file descriptors"
+            );
+        }
+        assert!(
+            manager
+                .unconfirmable_preview_ids(&[(preview_id, revision)])
+                .expect("missing rejected previews should remain distinguishable")
+                .len()
+                == 1,
+            "a rejected preview must have no persisted confirmation record"
+        );
     }
 
     #[test]

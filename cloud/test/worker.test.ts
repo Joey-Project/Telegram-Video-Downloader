@@ -28,7 +28,7 @@ import {
   MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES,
   readJsonBody,
 } from "../src/validation";
-import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue, storeSnapshot } from "../src/store";
+import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue, getDatabaseEpoch, storeSnapshot } from "../src/store";
 import type { LocalSnapshot } from "../src/types";
 import worker from "../src/index";
 
@@ -39,6 +39,7 @@ const webhookToken = syntheticCredentials.webhookSecret.value;
 const botToken = syntheticCredentials.botToken.value;
 const workerUrl = "https://worker.test";
 const textEncoder = new TextEncoder();
+const testDatabaseEpoch = "0123456789abcdef0123456789abcdef";
 
 describe("metadata preview details", () => {
   it("shows only concrete known-field changes and the source IDs to add", () => {
@@ -358,7 +359,10 @@ async function webhookWithOwnerId(update: unknown, ownerUserId: string, secret: 
 }
 
 function localHeaders(): HeadersInit {
-  return { authorization: `Bearer ${ownerToken}` };
+  return {
+    authorization: `Bearer ${ownerToken}`,
+    "X-Cloud-Database-Epoch": testDatabaseEpoch,
+  };
 }
 
 async function responseJson<T>(response: Response): Promise<T> {
@@ -367,6 +371,45 @@ async function responseJson<T>(response: Response): Promise<T> {
 
 async function localRequests(limit = 100): Promise<Response> {
   return SELF.fetch(new Request(`${workerUrl}/api/local/requests?limit=${limit}`, { headers: localHeaders() }));
+}
+
+async function acknowledgmentBody(seqs: number[]): Promise<{ receipts: Array<Record<string, unknown>> }> {
+  const rows: Array<{
+    seq: number;
+    dedup_key: string;
+    payload_hash: string;
+    kind: string;
+    created_at: number;
+  }> = [];
+  for (let offset = 0; offset < seqs.length; offset += 90) {
+    const chunk = seqs.slice(offset, offset + 90);
+    if (chunk.length === 0) continue;
+    const placeholders = chunk.map(() => "?").join(",");
+    const result = await testEnv.DB.prepare(
+      `SELECT seq, dedup_key, payload_hash, kind, created_at FROM inbox WHERE seq IN (${placeholders})`,
+    ).bind(...chunk).all<{
+      seq: number;
+      dedup_key: string;
+      payload_hash: string;
+      kind: string;
+      created_at: number;
+    }>();
+    if (!result.success) throw new Error("Unable to build test acknowledgment receipts");
+    rows.push(...result.results);
+  }
+  const bySequence = new Map(rows.map((row) => [row.seq, row]));
+  const receipts = seqs.map((seq) => {
+    const row = bySequence.get(seq);
+    if (row === undefined) throw new Error(`Missing test inbox row for sequence ${seq}`);
+    return {
+      seq: row.seq,
+      request_id: row.dedup_key,
+      payload_hash: row.payload_hash,
+      kind: row.kind,
+      created_at: row.created_at,
+    };
+  });
+  return { receipts };
 }
 
 async function signInitData(options: { userId?: number; authDate?: number; chatType?: string; chat?: object } = {}): Promise<string> {
@@ -466,7 +509,7 @@ describe("durable Telegram ingress", () => {
     expect(response.status).toBe(401);
     expect(await listDurableObjectIds(testEnv.NOTIFIER)).toHaveLength(0);
     expect((await localRequests()).status).toBe(200);
-    expect(await responseJson<{ requests: unknown[] }>(await localRequests())).toEqual({ requests: [] });
+    expect(await responseJson<{ requests: unknown[] }>(await localRequests())).toMatchObject({ requests: [] });
   });
 
   it("rejects authorized webhooks until the owner ID is configured", async () => {
@@ -547,10 +590,185 @@ describe("durable Telegram ingress", () => {
     const ack = await SELF.fetch(new Request(`${workerUrl}/api/local/ack`, {
       method: "POST",
       headers: { ...localHeaders(), "content-type": "application/json" },
-      body: JSON.stringify({ seqs: [1] }),
+      body: JSON.stringify(await acknowledgmentBody([1])),
     }));
     expect(ack.status).toBe(200);
     expect((await responseJson<{ requests: unknown[] }>(await localRequests())).requests).toEqual([]);
+  });
+});
+
+describe("cloud database epoch isolation", () => {
+  it("bootstraps one epoch and fails closed for stale or missing write scopes", async () => {
+    const actualEpoch = await getDatabaseEpoch(testEnv.DB);
+    expect(actualEpoch).toBe(testDatabaseEpoch);
+
+    const bootstrap = await SELF.fetch(new Request(workerUrl + "/api/local/requests?limit=1", {
+      headers: { authorization: "Bearer " + ownerToken },
+    }));
+    expect(bootstrap.status).toBe(200);
+    expect(await responseJson<{ database_epoch: string; requests: unknown[] }>(bootstrap)).toEqual({
+      database_epoch: testDatabaseEpoch,
+      requests: [],
+    });
+
+    const missingAck = await SELF.fetch(new Request(workerUrl + "/api/local/ack", {
+      method: "POST",
+      headers: { authorization: "Bearer " + ownerToken, "content-type": "application/json" },
+      body: JSON.stringify(await acknowledgmentBody([])),
+    }));
+    const missingState = await SELF.fetch(new Request(workerUrl + "/api/local/state", {
+      method: "POST",
+      headers: { authorization: "Bearer " + ownerToken, "content-type": "application/json" },
+      body: JSON.stringify(localSnapshot()),
+    }));
+    expect(missingAck.status).toBe(428);
+    expect(missingState.status).toBe(428);
+
+    const staleEpoch = "ffffffffffffffffffffffffffffffff";
+    const stalePage = await SELF.fetch(new Request(workerUrl + "/api/local/requests", {
+      headers: { ...localHeaders(), "X-Cloud-Database-Epoch": staleEpoch },
+    }));
+    const staleAck = await SELF.fetch(new Request(workerUrl + "/api/local/ack", {
+      method: "POST",
+      headers: { ...localHeaders(), "X-Cloud-Database-Epoch": staleEpoch, "content-type": "application/json" },
+      body: JSON.stringify(await acknowledgmentBody([])),
+    }));
+    const staleState = await SELF.fetch(new Request(workerUrl + "/api/local/state", {
+      method: "POST",
+      headers: { ...localHeaders(), "X-Cloud-Database-Epoch": staleEpoch, "content-type": "application/json" },
+      body: JSON.stringify(localSnapshot()),
+    }));
+    const staleSocket = await SELF.fetch(new Request(workerUrl + "/api/local/ws", {
+      headers: { ...localHeaders(), "X-Cloud-Database-Epoch": staleEpoch, upgrade: "websocket" },
+    }));
+    for (const response of [stalePage, staleAck, staleState, staleSocket]) {
+      expect(response.status).toBe(409);
+      expect(response.headers.get("X-Cloud-Database-Epoch")).toBe(testDatabaseEpoch);
+    }
+    expect(await getDatabaseEpoch(testEnv.DB)).toBe(testDatabaseEpoch);
+  });
+
+  it("rotates only for an exact pending sequence collision and retires the prior snapshot", async () => {
+    const stored = await enqueue(testEnv.DB, "action:epoch-reset-case", "library_scan", { root: "/Videos" });
+    expect(stored.envelope.seq).toBe(1);
+    const snapshotResponse = await SELF.fetch(new Request(workerUrl + "/api/local/state", {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(localSnapshot({ state_version: 14 })),
+    }));
+    expect(snapshotResponse.status).toBe(200);
+    expect((await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM snapshot_meta").first<{ count: number }>())?.count).toBe(1);
+
+    const rotationUrl = workerUrl + "/api/local/epoch/rotate-on-conflict";
+    const wrongEnvelope = await SELF.fetch(new Request(rotationUrl, {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({
+        seq: stored.envelope.seq,
+        request_id: stored.envelope.request_id,
+        payload_hash: "0".repeat(64),
+        kind: stored.envelope.kind,
+        created_at: stored.envelope.created_at,
+      }),
+    }));
+    expect(wrongEnvelope.status).toBe(409);
+    expect(wrongEnvelope.headers.get("X-Cloud-Database-Epoch")).toBe(testDatabaseEpoch);
+    expect(await getDatabaseEpoch(testEnv.DB)).toBe(testDatabaseEpoch);
+
+    const rotated = await SELF.fetch(new Request(rotationUrl, {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({
+        seq: stored.envelope.seq,
+        request_id: stored.envelope.request_id,
+        payload_hash: stored.envelope.payload_hash,
+        kind: stored.envelope.kind,
+        created_at: stored.envelope.created_at,
+      }),
+    }));
+    expect(rotated.status).toBe(200);
+    const rotation = await responseJson<{ rotated: boolean; database_epoch: string }>(rotated);
+    expect(rotation.rotated).toBe(true);
+    expect(rotation.database_epoch).toMatch(/^[0-9a-f]{32}$/u);
+    expect(rotation.database_epoch).not.toBe(testDatabaseEpoch);
+    expect(await getDatabaseEpoch(testEnv.DB)).toBe(rotation.database_epoch);
+    expect((await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM snapshot_meta").first<{ count: number }>())?.count).toBe(0);
+    expect((await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM snapshot_chunks").first<{ count: number }>())?.count).toBe(0);
+
+    const staleAck = await SELF.fetch(new Request(workerUrl + "/api/local/ack", {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(await acknowledgmentBody([stored.envelope.seq])),
+    }));
+    expect(staleAck.status).toBe(409);
+    expect(staleAck.headers.get("X-Cloud-Database-Epoch")).toBe(rotation.database_epoch);
+    expect((await testEnv.DB.prepare("SELECT acked_at FROM inbox WHERE seq = 1").first<{ acked_at: number | null }>())?.acked_at)
+      .toBeNull();
+
+    const stalePage = await SELF.fetch(new Request(workerUrl + "/api/local/requests", { headers: localHeaders() }));
+    expect(stalePage.status).toBe(409);
+    expect(stalePage.headers.get("X-Cloud-Database-Epoch")).toBe(rotation.database_epoch);
+    const reboundPage = await SELF.fetch(new Request(workerUrl + "/api/local/requests", {
+      headers: { ...localHeaders(), "X-Cloud-Database-Epoch": rotation.database_epoch },
+    }));
+    expect(reboundPage.status).toBe(200);
+    const page = await responseJson<{
+      database_epoch: string;
+      requests: Array<{ seq: number; kind: string; payload: Record<string, unknown>; created_at: number; request_id: string; payload_hash: string }>;
+    }>(reboundPage);
+    expect(page.database_epoch).toBe(rotation.database_epoch);
+    expect(page.requests).toEqual([{
+      seq: stored.envelope.seq,
+      kind: stored.envelope.kind,
+      payload: { root: "/Videos" },
+      created_at: stored.envelope.created_at,
+      request_id: stored.envelope.request_id,
+      payload_hash: stored.envelope.payload_hash,
+    }]);
+
+    const reboundAck = await SELF.fetch(new Request(workerUrl + "/api/local/ack", {
+      method: "POST",
+      headers: { ...localHeaders(), "X-Cloud-Database-Epoch": rotation.database_epoch, "content-type": "application/json" },
+      body: JSON.stringify(await acknowledgmentBody([stored.envelope.seq])),
+    }));
+    expect(reboundAck.status).toBe(200);
+    expect(await responseJson<{ acked: number }>(reboundAck)).toEqual({ acked: 1 });
+  });
+
+  it("rejects an entire ACK batch when a reused sequence has a different envelope", async () => {
+    const oldRequest = await enqueue(testEnv.DB, "action:before-database-rewind", "library_scan", { root: "/Old" });
+    const nextRequest = await enqueue(testEnv.DB, "action:unrelated-page-entry", "library_scan", { root: "/Other" });
+    expect(oldRequest.envelope.seq).toBe(1);
+    expect(nextRequest.envelope.seq).toBe(2);
+
+    await testEnv.DB.prepare(
+      "UPDATE inbox SET dedup_key = ?, payload_hash = ?, payload_json = ?, created_at = ? WHERE seq = ?",
+    ).bind(
+      "action:after-database-rewind",
+      "c".repeat(64),
+      JSON.stringify({ root: "/Restored" }),
+      oldRequest.envelope.created_at + 1,
+      oldRequest.envelope.seq,
+    ).run();
+
+    const rejected = await SELF.fetch(new Request(workerUrl + "/api/local/ack", {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({ receipts: [oldRequest.envelope, nextRequest.envelope] }),
+    }));
+    expect(rejected.status).toBe(409);
+    expect(rejected.headers.get("X-Cloud-Inbox-Sequence-Conflict")).toBe("1");
+    expect((await testEnv.DB.prepare("SELECT acked_at FROM inbox WHERE seq IN (1, 2) ORDER BY seq").all<{ acked_at: number | null }>()).results)
+      .toEqual([{ acked_at: null }, { acked_at: null }]);
+
+    const currentReceipts = await acknowledgmentBody([1, 2]);
+    const accepted = await SELF.fetch(new Request(workerUrl + "/api/local/ack", {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(currentReceipts),
+    }));
+    expect(accepted.status).toBe(200);
+    expect(await responseJson<{ acked: number }>(accepted)).toEqual({ acked: 2 });
   });
 });
 
@@ -1389,14 +1607,14 @@ describe("local client API and state snapshots", () => {
       const rows = Array.from({ length: Math.min(90, count - offset) }, (_, index) => {
         const sequence = offset + index + 1;
         return testEnv.DB.prepare("INSERT INTO inbox (dedup_key, payload_hash, kind, payload_json, created_at) VALUES (?, ?, 'library_scan', '{}', ?)")
-          .bind(`seed:${sequence}`, `hash-${sequence}`, Date.now());
+          .bind(`seed:${sequence}`, sequence.toString(16).padStart(64, "0"), Date.now());
       });
       await testEnv.DB.batch(rows);
     }
     const response = await SELF.fetch(new Request(`${workerUrl}/api/local/ack`, {
       method: "POST",
       headers: { ...localHeaders(), "content-type": "application/json" },
-      body: JSON.stringify({ seqs: Array.from({ length: count }, (_, index) => index + 1) }),
+      body: JSON.stringify(await acknowledgmentBody(Array.from({ length: count }, (_, index) => index + 1))),
     }));
     expect(response.status).toBe(200);
     expect((await responseJson<{ acked: number }>(response)).acked).toBe(count);
@@ -1442,8 +1660,8 @@ describe("local client API and state snapshots", () => {
       "INSERT INTO inbox (dedup_key, payload_hash, kind, payload_json, created_at, acked_at) VALUES ('expired:blocked', 'hash-expired', 'library_scan', '{}', ?, ?)",
     ).bind(expiredAt, expiredAt).run();
     await testEnv.DB.prepare(
-      "INSERT INTO inbox (dedup_key, payload_hash, kind, payload_json, created_at) VALUES ('pending:ack', 'hash-pending', 'library_scan', '{}', ?)",
-    ).bind(Date.now()).run();
+      "INSERT INTO inbox (dedup_key, payload_hash, kind, payload_json, created_at) VALUES ('pending:ack', ?, 'library_scan', '{}', ?)",
+    ).bind("b".repeat(64), Date.now()).run();
     await testEnv.DB.prepare(
       "CREATE TRIGGER fail_inbox_retention_delete BEFORE DELETE ON inbox WHEN OLD.dedup_key = 'expired:blocked' BEGIN SELECT RAISE(ABORT, 'retention unavailable'); END",
     ).run();
@@ -1453,7 +1671,7 @@ describe("local client API and state snapshots", () => {
     const response = await SELF.fetch(new Request(`${workerUrl}/api/local/ack`, {
       method: "POST",
       headers: { ...localHeaders(), "content-type": "application/json" },
-      body: JSON.stringify({ seqs: [pending!.seq] }),
+      body: JSON.stringify(await acknowledgmentBody([pending!.seq])),
     }));
     expect(response.status).toBe(200);
     expect(await responseJson<{ acked: number }>(response)).toEqual({ acked: 1 });

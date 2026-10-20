@@ -47,8 +47,9 @@ use crate::bilibili_attempt::{
     BilibiliAttemptUpdate,
 };
 use crate::cloud::{
-    CLOUD_REQUEST_PAGE_SIZE, CloudClient, CloudInbox, CloudInboxRecoveryIncomplete, CloudRequest,
-    CloudSettings, CloudState, CloudStatePostError, CloudWebSocket, InboxRecord, InboxStatus,
+    CLOUD_REQUEST_PAGE_SIZE, CloudClient, CloudDatabaseEpochChanged, CloudInbox,
+    CloudInboxRecoveryIncomplete, CloudInboxSequenceConflict, CloudRequest, CloudSettings,
+    CloudState, CloudStatePostError, CloudWebSocket, InboxRecord, InboxStatus,
     MAX_CLOUD_STATE_VERSION, is_state_version_exhausted, next_websocket_request, now_millis,
     now_seconds,
 };
@@ -431,6 +432,7 @@ struct CloudBotRuntime {
     management_dispatch: Arc<Semaphore>,
     backlog_sync_gate: Arc<Mutex<()>>,
     reconciliation_complete: Arc<AtomicBool>,
+    epoch_fatal: Arc<CloudEpochFatal>,
     cloud_ready_marker_emitted: Arc<AtomicBool>,
     #[cfg(test)]
     test_file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
@@ -438,6 +440,43 @@ struct CloudBotRuntime {
     test_library_refresh_failure: Arc<std::sync::Mutex<Option<String>>>,
     #[cfg(test)]
     test_cloud_ready_marker_emissions: Arc<AtomicUsize>,
+}
+
+#[derive(Default)]
+pub(crate) struct CloudEpochFatal {
+    changed: AtomicBool,
+    notify: Notify,
+}
+
+impl CloudEpochFatal {
+    pub(crate) fn signal(&self) -> bool {
+        let first_signal = !self.changed.swap(true, Ordering::AcqRel);
+        self.notify.notify_waiters();
+        first_signal
+    }
+
+    pub(crate) fn is_signaled(&self) -> bool {
+        self.changed.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn notified(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_signaled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl CloudBotRuntime {
+    fn signal_epoch_fatal(&self) -> bool {
+        self.reconciliation_complete.store(false, Ordering::Release);
+        self.epoch_fatal.signal()
+    }
 }
 
 #[derive(Clone)]
@@ -487,12 +526,21 @@ async fn run_cloud_library_operation_with_snapshot_update<T>(
 where
     T: Send + 'static,
 {
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; library publication is stopped");
+    }
     let _publication_guard = runtime.library_scan_publication_gate.lock().await;
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; library publication is stopped");
+    }
     let context = runtime.bot.clone();
     let inbox = Arc::clone(&runtime.inbox);
     let worker = tokio::task::spawn_blocking(move || operation(context, inbox))
         .await
         .with_context(|| failure_context);
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; library publication is stopped");
+    }
     match worker {
         Ok(Ok((value, snapshot_update))) => {
             match snapshot_update {
@@ -949,10 +997,38 @@ async fn run_cloud_bot(
     cloud_config: CloudConfig,
     shutdown: &mut (impl Future<Output = Result<()>> + Unpin),
 ) -> Result<()> {
-    let client = CloudClient::new(&cloud_config)?;
+    let unbound_client = CloudClient::new(&cloud_config)?;
+    let database_epoch = loop {
+        let bootstrap = tokio::select! {
+            signal = &mut *shutdown => {
+                signal?;
+                info!("shutdown requested while waiting for cloud database epoch");
+                return Ok(());
+            }
+            result = unbound_client.bootstrap_database_epoch() => result,
+        };
+        match bootstrap {
+            Ok(epoch) => break epoch,
+            Err(error) => {
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to read the cloud database epoch; retrying before opening the local inbox"
+                );
+                if !retry_delay_or_shutdown(shutdown, Duration::from_secs(5)).await? {
+                    info!("shutdown requested while retrying cloud database epoch bootstrap");
+                    return Ok(());
+                }
+            }
+        }
+    };
+    let client = unbound_client.with_database_epoch(database_epoch.clone())?;
+    if client.database_epoch()? != database_epoch.as_str() {
+        bail!("cloud client bound a different database epoch than bootstrap returned");
+    }
     let inbox_root = bot.config.downloads.video_dir.clone();
+    let inbox_epoch = database_epoch.clone();
     let Some(inbox) = retry_file_provider_startup_operation(
-        move || CloudInbox::open(&inbox_root),
+        move || CloudInbox::open_for_epoch(&inbox_root, &inbox_epoch),
         QUEUE_START_FILE_PROVIDER_RETRY_DELAY,
         shutdown,
     )
@@ -960,6 +1036,9 @@ async fn run_cloud_bot(
     else {
         return Ok(());
     };
+    if inbox.database_epoch() != database_epoch.as_str() {
+        bail!("cloud inbox opened a different database epoch than its client");
+    }
     let runtime = CloudBotRuntime {
         bot,
         client,
@@ -973,6 +1052,7 @@ async fn run_cloud_bot(
         management_dispatch: Arc::new(Semaphore::new(1)),
         backlog_sync_gate: Arc::new(Mutex::new(())),
         reconciliation_complete: Arc::new(AtomicBool::new(false)),
+        epoch_fatal: Arc::new(CloudEpochFatal::default()),
         cloud_ready_marker_emitted: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
         test_file_provider: None,
@@ -997,11 +1077,19 @@ async fn run_cloud_bot(
     tokio::spawn(cloud_websocket_receiver(runtime.clone()));
     tokio::spawn(cloud_request_dispatcher(runtime.clone()));
     runtime.state_notify.notify_one();
-    tokio::spawn(cloud_state_reporter(runtime));
+    tokio::spawn(cloud_state_reporter(runtime.clone()));
 
-    shutdown.await?;
-    info!("shutdown requested");
-    Ok(())
+    tokio::select! {
+        signal = &mut *shutdown => {
+            signal?;
+            info!("shutdown requested");
+            Ok(())
+        }
+        _ = runtime.epoch_fatal.notified() => {
+            error!("cloud database epoch changed; stopping this runtime so the supervisor can reopen the current epoch");
+            bail!("cloud database epoch changed; local runtime stopped for supervisor restart")
+        }
+    }
 }
 
 async fn cloud_initial_library_scan(runtime: CloudBotRuntime) {
@@ -1019,11 +1107,23 @@ async fn cloud_initial_library_scan(runtime: CloudBotRuntime) {
 async fn cloud_library_publication_watcher(runtime: CloudBotRuntime) {
     let published = runtime.bot.queue.publication_notify();
     loop {
-        published.notified().await;
+        tokio::select! {
+            _ = runtime.epoch_fatal.notified() => return,
+            _ = published.notified() => {},
+        }
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
         // Coalesce collection and multi-part completions into one scan after their queue
         // publication records have settled. The scan reads the existing library and queue hints;
         // it does not change download scheduling or block Telegram dispatch.
-        sleep(Duration::from_secs(2)).await;
+        tokio::select! {
+            _ = runtime.epoch_fatal.notified() => return,
+            _ = sleep(Duration::from_secs(2)) => {},
+        }
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
         if let Err(error) = run_cloud_library_operation(
             &runtime,
             "media-library refresh worker failed",
@@ -1043,12 +1143,27 @@ async fn cloud_queue_state_watcher(runtime: CloudBotRuntime) {
 async fn cloud_queue_state_watcher_with_debounce(runtime: CloudBotRuntime, debounce: Duration) {
     let changed = runtime.bot.queue.state_change_notify();
     loop {
-        changed.notified().await;
+        tokio::select! {
+            _ = runtime.epoch_fatal.notified() => return,
+            _ = changed.notified() => {},
+        }
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
         let deadline = Instant::now() + debounce;
-        while tokio::time::timeout_at(deadline, changed.notified())
-            .await
-            .is_ok()
-        {}
+        loop {
+            tokio::select! {
+                _ = runtime.epoch_fatal.notified() => return,
+                result = tokio::time::timeout_at(deadline, changed.notified()) => {
+                    if result.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
         runtime.state_notify.notify_one();
     }
 }
@@ -1084,13 +1199,20 @@ async fn cloud_state_reporter_with_retry_policy(
     let mut pending: Option<PendingCloudState> = None;
 
     loop {
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
         if pending.is_none() {
             let heartbeat_due = tokio::select! {
+                _ = runtime.epoch_fatal.notified() => return,
                 _ = runtime.state_notify.notified() => false,
                 _ = heartbeat.tick() => true,
             };
             match build_cloud_state_snapshot(&runtime).await {
                 Ok(Some(snapshot)) => {
+                    if runtime.epoch_fatal.is_signaled() {
+                        return;
+                    }
                     let fingerprint = match snapshot.fingerprint() {
                         Ok(fingerprint) => fingerprint,
                         Err(error) => {
@@ -1182,7 +1304,11 @@ async fn cloud_state_reporter_with_retry_policy(
         };
         let failed_fingerprint = state.fingerprint.clone();
         let failed_version = state.state_version;
-        match state.snapshot.post(&runtime, state.state_version).await {
+        let post_result = tokio::select! {
+            _ = runtime.epoch_fatal.notified() => return,
+            result = state.snapshot.post(&runtime, state.state_version) => result,
+        };
+        match post_result {
             Ok(()) => {
                 published_fingerprint = Some(state.fingerprint.clone());
                 published_version = Some(state.state_version);
@@ -1334,6 +1460,28 @@ async fn cloud_state_reporter_with_retry_policy(
                     "cloud returned HTTP 409 without a valid X-Cloud-State-Version hint; retrying the same state with backoff (check Worker compatibility and its response header)"
                 );
                 sleep(retry_backoff).await;
+            }
+            Err(CloudStatePostError::HttpStatus(status))
+                if status == reqwest::StatusCode::BAD_REQUEST =>
+            {
+                warn!(
+                    state_version = failed_version,
+                    "cloud rejected the state with HTTP 400; retrying the same content with backoff so time-dependent validation can recover"
+                );
+                // The Worker rejects future `reported_at` values, but the timestamp is
+                // refreshed for each POST and excluded from the content fingerprint. Keep
+                // this snapshot pending so correcting a temporarily skewed clock can recover.
+                sleep(retry_backoff).await;
+            }
+            Err(CloudStatePostError::DatabaseEpochChanged { expected, actual }) => {
+                warn!(
+                    expected,
+                    actual,
+                    state_version = failed_version,
+                    "cloud database epoch changed while publishing state; stopping the local runtime"
+                );
+                runtime.signal_epoch_fatal();
+                return;
             }
             Err(error) if !error.is_retryable() => {
                 warn!(
@@ -1585,37 +1733,68 @@ fn cloud_task_summaries(
 
 async fn cloud_rest_fallback(runtime: CloudBotRuntime, poll_seconds: u64) {
     loop {
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
         if let Err(error) = sync_cloud_backlog(&runtime).await {
             warn!(error = %format!("{error:#}"), "local cloud HTTPS fallback poll failed");
         }
-        sleep(Duration::from_secs(poll_seconds)).await;
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
+        tokio::select! {
+            _ = runtime.epoch_fatal.notified() => return,
+            _ = sleep(Duration::from_secs(poll_seconds)) => {},
+        }
     }
 }
 
 async fn cloud_websocket_receiver(runtime: CloudBotRuntime) {
     let mut backoff = Duration::from_secs(1);
     loop {
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
         // The REST queue is authoritative. Reconcile it before every WebSocket connection so
         // messages missed during disconnection are durably accepted and acknowledged first.
         if let Err(error) = sync_cloud_backlog(&runtime).await {
             warn!(error = %format!("{error:#}"), "local cloud reconnect backlog fetch failed");
         }
-        match runtime.client.connect_websocket().await {
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
+        let connection = tokio::select! {
+            _ = runtime.epoch_fatal.notified() => return,
+            result = runtime.client.connect_websocket() => result,
+        };
+        match connection {
             Ok(mut socket) => {
                 backoff = Duration::from_secs(1);
                 info!("connected to local cloud request WebSocket");
                 match receive_cloud_websocket_session(&runtime, &mut socket, None).await {
                     Ok(()) => warn!("local cloud request WebSocket closed"),
                     Err(error) => {
+                        if error.downcast_ref::<CloudDatabaseEpochChanged>().is_some() {
+                            runtime.signal_epoch_fatal();
+                        }
                         warn!(error = %format!("{error:#}"), "local cloud request WebSocket failed");
                     }
                 }
             }
             Err(error) => {
+                if error.downcast_ref::<CloudDatabaseEpochChanged>().is_some() {
+                    runtime.signal_epoch_fatal();
+                }
                 warn!(error = %format!("{error:#}"), "local cloud WebSocket connection failed");
             }
         }
-        sleep(backoff).await;
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
+        tokio::select! {
+            _ = runtime.epoch_fatal.notified() => return,
+            _ = sleep(backoff) => {},
+        }
         backoff = backoff.saturating_mul(2).min(Duration::from_secs(60));
     }
 }
@@ -1632,7 +1811,11 @@ async fn receive_cloud_websocket_session(
         if let Some(waiting) = &waiting {
             waiting.notify_one();
         }
-        match next.await? {
+        let next = tokio::select! {
+            _ = runtime.epoch_fatal.notified() => return Ok(()),
+            result = next => result?,
+        };
+        match next {
             Some(request) => {
                 let seq = request.seq;
                 sync_cloud_backlog_through(runtime, &request)
@@ -1659,19 +1842,44 @@ async fn sync_cloud_backlog_inner(
     runtime: &CloudBotRuntime,
     websocket_request: Option<&CloudRequest>,
 ) -> Result<()> {
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; reconciliation is stopped");
+    }
     let _gate = runtime.backlog_sync_gate.lock().await;
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; reconciliation is stopped");
+    }
     // A failed fetch or ACK leaves this false, so the periodic dispatcher cannot bypass a
     // partially reconciled authoritative backlog.
     runtime
         .reconciliation_complete
         .store(false, Ordering::Release);
-    sync_cloud_backlog_pass(runtime, websocket_request).await
+    let result = sync_cloud_backlog_pass(runtime, websocket_request).await;
+    if result
+        .as_ref()
+        .is_err_and(|error| error.downcast_ref::<CloudDatabaseEpochChanged>().is_some())
+    {
+        runtime.signal_epoch_fatal();
+    }
+    if runtime.epoch_fatal.is_signaled() {
+        runtime
+            .reconciliation_complete
+            .store(false, Ordering::Release);
+        return match result {
+            Err(error) => Err(error),
+            Ok(()) => bail!("cloud database epoch changed during reconciliation"),
+        };
+    }
+    result
 }
 
 async fn sync_cloud_backlog_pass(
     runtime: &CloudBotRuntime,
     websocket_request: Option<&CloudRequest>,
 ) -> Result<()> {
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; reconciliation is stopped");
+    }
     let mut expected_request_seen = false;
     let mut previous_page_last_seq = None;
     loop {
@@ -1691,6 +1899,9 @@ async fn sync_cloud_backlog_pass(
         }
         let mut acknowledged = Vec::with_capacity(page_len);
         for request in requests {
+            if runtime.epoch_fatal.is_signaled() {
+                bail!("cloud database epoch changed before the request page was acknowledged");
+            }
             if let Some(expected) = websocket_request
                 && request.seq == expected.seq
             {
@@ -1702,13 +1913,27 @@ async fn sync_cloud_backlog_pass(
                 }
                 expected_request_seen = true;
             }
-            let seq = request.seq;
-            persist_cloud_request(runtime, request).await?;
-            acknowledged.push(seq);
+            match persist_cloud_request(runtime, request.clone()).await {
+                Ok(()) => {}
+                Err(error) if error.downcast_ref::<CloudInboxSequenceConflict>().is_some() => {
+                    runtime.client.recover_sequence_conflict(&request).await?;
+                    bail!(
+                        "cloud sequence-conflict recovery returned without changing the database epoch"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+            if runtime.epoch_fatal.is_signaled() {
+                bail!("cloud database epoch changed before the request page was acknowledged");
+            }
+            acknowledged.push(request);
         }
-        // Every envelope in this page was fsynced before this page ACK. Exact-sequence durable
-        // deduplication makes a repeated page safe if this request or its response is lost.
+        // Every envelope in this page was fsynced before this page ACK. The ACK binds its
+        // exact server identity so a same-epoch restore cannot acknowledge a replacement row.
         runtime.client.acknowledge(&acknowledged).await?;
+        if runtime.epoch_fatal.is_signaled() {
+            bail!("cloud database epoch changed before reconciliation completed");
+        }
         if page_len < CLOUD_REQUEST_PAGE_SIZE {
             break;
         }
@@ -1731,9 +1956,19 @@ async fn sync_cloud_backlog_pass(
         }
     }
 
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed before reconciliation completed");
+    }
+
     runtime
         .reconciliation_complete
         .store(true, Ordering::Release);
+    if runtime.epoch_fatal.is_signaled() {
+        runtime
+            .reconciliation_complete
+            .store(false, Ordering::Release);
+        bail!("cloud database epoch changed before reconciliation became ready");
+    }
     if runtime
         .cloud_ready_marker_emitted
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1752,6 +1987,9 @@ async fn sync_cloud_backlog_pass(
 
 async fn persist_cloud_request(runtime: &CloudBotRuntime, request: CloudRequest) -> Result<()> {
     loop {
+        if runtime.epoch_fatal.is_signaled() {
+            bail!("cloud database epoch changed before request persistence completed");
+        }
         let inbox = Arc::clone(&runtime.inbox);
         let request = request.clone();
         let result = tokio::task::spawn_blocking(move || inbox.persist(request))
@@ -1773,11 +2011,20 @@ async fn persist_cloud_request(runtime: &CloudBotRuntime, request: CloudRequest)
 async fn cloud_request_dispatcher(runtime: CloudBotRuntime) {
     loop {
         tokio::select! {
+            _ = runtime.epoch_fatal.notified() => return,
             _ = runtime.request_notify.notified() => {},
             _ = sleep(Duration::from_secs(1)) => {},
         }
+        if runtime.epoch_fatal.is_signaled() {
+            return;
+        }
         let _gate = runtime.backlog_sync_gate.lock().await;
-        if !runtime.reconciliation_complete.load(Ordering::Acquire) {
+        if runtime.epoch_fatal.is_signaled()
+            || !runtime.reconciliation_complete.load(Ordering::Acquire)
+        {
+            if runtime.epoch_fatal.is_signaled() {
+                return;
+            }
             continue;
         }
         let inbox = Arc::clone(&runtime.inbox);
@@ -1793,6 +2040,9 @@ async fn cloud_request_dispatcher(runtime: CloudBotRuntime) {
             }
         };
         for record in pending {
+            if runtime.epoch_fatal.is_signaled() {
+                return;
+            }
             let seq = record.request.seq;
             let semaphore = if record.request.kind == "telegram" {
                 Arc::clone(&runtime.telegram_dispatch)
@@ -1824,6 +2074,10 @@ async fn cloud_request_dispatcher(runtime: CloudBotRuntime) {
                     continue;
                 }
             };
+            if runtime.epoch_fatal.is_signaled() {
+                restore_claimed_cloud_request_after_epoch_change(&runtime, seq).await;
+                return;
+            }
             runtime.state_notify.notify_one();
             let task_runtime = runtime.clone();
             tokio::spawn(async move {
@@ -1885,6 +2139,10 @@ struct LegacyImportPayload {
 }
 
 async fn dispatch_cloud_record(runtime: CloudBotRuntime, record: InboxRecord) {
+    if runtime.epoch_fatal.is_signaled() {
+        restore_claimed_cloud_request_after_epoch_change(&runtime, record.request.seq).await;
+        return;
+    }
     let outcome = if record.request.kind == "telegram" {
         dispatch_cloud_telegram(&runtime, &record.request).await
     } else {
@@ -1904,6 +2162,32 @@ async fn dispatch_cloud_record(runtime: CloudBotRuntime, record: InboxRecord) {
             let next_attempt_at = now_seconds().saturating_add(delay);
             persist_cloud_retryable_status(&runtime, seq, message, next_attempt_at, delay).await;
         }
+    }
+}
+
+async fn restore_claimed_cloud_request_after_epoch_change(runtime: &CloudBotRuntime, seq: u64) {
+    let inbox = Arc::clone(&runtime.inbox);
+    match tokio::task::spawn_blocking(move || {
+        inbox.update(seq, |record| {
+            if record.status == InboxStatus::Processing {
+                record.status = InboxStatus::Pending;
+                record.next_attempt_at = 0;
+            }
+        })
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => warn!(
+            seq,
+            error = %format!("{error:#}"),
+            "could not restore a claimed request after a database epoch change"
+        ),
+        Err(error) => warn!(
+            seq,
+            error = %error,
+            "cloud request restoration worker failed after a database epoch change"
+        ),
     }
 }
 
@@ -2193,23 +2477,18 @@ async fn dispatch_cloud_management(
             } else {
                 Vec::new()
             };
+            let receipt_seq = request.seq;
             let preview = run_cloud_library_operation(
                 runtime,
                 "file preview worker failed",
                 move |context, inbox| {
-                    create_cloud_file_preview(&context, parsed, &legacy_imports, inbox)
+                    create_cloud_file_preview(&context, parsed, &legacy_imports, inbox, receipt_seq)
                 },
             )
             .await?;
-            let preview_id = preview.id.clone();
-            let revision = preview.revision.clone();
             Ok(CloudDispatchOutcome {
                 status: InboxStatus::AwaitingConfirmation,
-                result: Some(serde_json::json!({
-                    "preview_id": preview_id,
-                    "revision": revision,
-                    "preview": preview,
-                })),
+                result: Some(cloud_file_preview_result(&preview)),
                 error: None,
                 related_preview: None,
             })
@@ -2635,10 +2914,14 @@ fn create_cloud_file_preview(
     prepared: PreparedFilePreview,
     legacy_imports: &[InboxRecord],
     inbox: Arc<CloudInbox>,
+    receipt_seq: u64,
 ) -> Result<(MovePreview, LibrarySnapshot)> {
+    let receipt = inbox
+        .record(receipt_seq)?
+        .context("cloud preview request receipt is missing")?;
     let manager = open_cloud_library_manager(bot, inbox, None)?;
     let hints = queue_source_hints(bot)?;
-    manager.preview_with_hints_and_patches_and_snapshot_validator(
+    manager.preview_with_hints_and_patches_and_snapshot_validator_and_preview_guard(
         PreviewBuildRequest {
             item_ids: if prepared.target_relative_dir.is_some() {
                 &prepared.item_ids
@@ -2659,7 +2942,30 @@ fn create_cloud_file_preview(
                 &prepared.hint_indices,
             )
         },
+        |preview| validate_cloud_file_preview_receipt(&receipt, preview),
     )
+}
+
+fn cloud_file_preview_result(preview: &MovePreview) -> serde_json::Value {
+    serde_json::json!({
+        "preview_id": preview.id,
+        "revision": preview.revision,
+        "preview": preview,
+    })
+}
+
+fn validate_cloud_file_preview_receipt(receipt: &InboxRecord, preview: &MovePreview) -> Result<()> {
+    let mut generated = receipt.clone();
+    generated.status = InboxStatus::AwaitingConfirmation;
+    generated.result = Some(cloud_file_preview_result(preview));
+    generated.error = None;
+    generated.next_attempt_at = 0;
+    if generated.compact_oversized_result()? {
+        bail!(
+            "This preview is too large to save and confirm. Select fewer files or split the changes into smaller previews."
+        );
+    }
+    Ok(())
 }
 
 fn validate_legacy_metadata_patches(

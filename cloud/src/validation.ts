@@ -457,14 +457,3 @@ export function parseLimit(value: string | null, maximum = 500): number {
   if (limit < 1 || limit > maximum) throw new HttpError(400, `limit must be an integer from ${range}`);
   return limit;
 }
-
-export function parseAckSeqs(value: unknown): number[] {
-  if (!isRecord(value) || !onlyKeys(value, ["seqs"]) || !Array.isArray(value.seqs) || value.seqs.length < 1 || value.seqs.length > 500) {
-    throw new HttpError(400, "seqs must contain between 1 and 500 sequence values");
-  }
-  const seqs = value.seqs;
-  if (!seqs.every((seq) => Number.isSafeInteger(seq) && (seq as number) > 0)) {
-    throw new HttpError(400, "seqs must contain positive integers");
-  }
-  return [...new Set(seqs as number[])];
-}

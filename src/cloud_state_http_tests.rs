@@ -8,8 +8,9 @@ async fn cloud_state_reporter_retries_transient_failure_with_same_content_and_sy
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
     cloud_state
@@ -61,6 +62,90 @@ async fn cloud_state_reporter_retries_transient_failure_with_same_content_and_sy
 }
 
 #[tokio::test]
+async fn cloud_state_reporter_retries_bad_request_with_fresh_timestamp_and_backoff() {
+    let root = temp_cloud_bot_dir("state-reporter-clock-skew");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    queue_state_post_response(&cloud_state, 400, None);
+    queue_state_post_response(&cloud_state, 400, None);
+    queue_state_post_response(&cloud_state, 200, None);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *runtime.library_snapshot.lock().await =
+        Some(empty_cloud_test_library_snapshot("clock-skew-retry"));
+    let retry_backoff = Duration::from_millis(250);
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        Duration::from_secs(30),
+        retry_backoff,
+        Duration::from_secs(1),
+    ));
+    runtime.state_notify.notify_one();
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 3),
+    )
+    .await
+    .expect("HTTP 400 should remain retryable so a corrected clock can recover");
+    assert_eq!(posts[0]["status"], 400);
+    assert_eq!(posts[1]["status"], 400);
+    assert_eq!(posts[2]["status"], 200);
+    assert_eq!(posts[0]["state_version"], posts[1]["state_version"]);
+    assert_eq!(posts[1]["state_version"], posts[2]["state_version"]);
+    assert_eq!(posts[0]["content_hash"], posts[1]["content_hash"]);
+    assert_eq!(posts[1]["content_hash"], posts[2]["content_hash"]);
+
+    let first_reported_at = posts[0]["reported_at"]
+        .as_u64()
+        .expect("first post should include a millisecond timestamp");
+    let second_reported_at = posts[1]["reported_at"]
+        .as_u64()
+        .expect("retry should include a millisecond timestamp");
+    let third_reported_at = posts[2]["reported_at"]
+        .as_u64()
+        .expect("successful retry should include a millisecond timestamp");
+    assert_ne!(first_reported_at, second_reported_at);
+    assert_ne!(second_reported_at, third_reported_at);
+    assert!(
+        first_reported_at.abs_diff(second_reported_at) >= 100,
+        "repeated HTTP 400 responses should respect the retry backoff"
+    );
+    assert!(
+        second_reported_at.abs_diff(third_reported_at) >= 100,
+        "a stable HTTP 400 should not trigger a tight retry loop"
+    );
+
+    reporter.abort();
+    let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_clears_it() {
     let root = temp_cloud_bot_dir("state-reporter-scan-warning");
     let mut config = AppConfig::for_test();
@@ -70,8 +155,9 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
     cloud_state
@@ -209,8 +295,9 @@ async fn cloud_state_reporter_retries_413_with_new_incomplete_snapshot_then_sync
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
     cloud_state
@@ -331,8 +418,9 @@ async fn cloud_state_reporter_bounds_large_library_warnings_and_categories_with_
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
     cloud_state
@@ -502,8 +590,9 @@ async fn cloud_state_reporter_compacts_operation_receipts_before_library_and_kee
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
     cloud_state
@@ -607,8 +696,9 @@ async fn cloud_state_reporter_omits_oversized_items_and_recovers_full_source_aft
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
     cloud_state
@@ -756,8 +846,9 @@ async fn cloud_state_reporter_advances_same_version_conflict_and_heartbeats_the_
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
     queue_state_post_response(&cloud_state, 409, Some("1"));
@@ -840,19 +931,20 @@ async fn cloud_state_reporter_recovers_after_lost_version_file_and_continues_aft
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     assert_eq!(
         inbox
             .next_state_version()
             .expect("initial state version should persist"),
         1
     );
-    let version_path = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud")
-        .join(".state-version.json");
+    let version_path = runtime_test_inbox_directory(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+    )
+    .join(".state-version.json");
     std::fs::remove_file(&version_path)
         .expect("the test should simulate a lost local version file");
 
@@ -898,7 +990,7 @@ async fn cloud_state_reporter_recovers_after_lost_version_file_and_continues_aft
     drop(inbox);
 
     let reopened_inbox = Arc::new(
-        CloudInbox::open(&config.downloads.video_dir)
+        open_runtime_test_inbox(&config.downloads.video_dir)
             .expect("cloud inbox should reopen with its version counter"),
     );
     let mut restarted_runtime = make_runtime(
@@ -952,8 +1044,9 @@ async fn cloud_state_reporter_retries_unknown_conflicts_and_paces_version_exhaus
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
         spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
     queue_state_post_response(&cloud_state, 409, None);
@@ -979,11 +1072,13 @@ async fn cloud_state_reporter_retries_unknown_conflicts_and_paces_version_exhaus
         .expect("test cloud client should use localhost");
     *runtime.library_snapshot.lock().await =
         Some(empty_cloud_test_library_snapshot("unknown-conflict"));
+    let retry_backoff = Duration::from_millis(100);
+    let version_exhausted_backoff = Duration::from_millis(500);
     let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
         runtime.clone(),
         Duration::from_millis(250),
-        Duration::from_millis(100),
-        Duration::from_millis(500),
+        retry_backoff,
+        version_exhausted_backoff,
     ));
     runtime.state_notify.notify_one();
 
@@ -994,16 +1089,6 @@ async fn cloud_state_reporter_retries_unknown_conflicts_and_paces_version_exhaus
     .await
     .expect("the initial state post should reach the fake server");
     assert_eq!(posts[0]["status"], 409);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(
-        cloud_state
-            .state_posts
-            .lock()
-            .expect("fake state post lock should not poison")
-            .len(),
-        1,
-        "a missing hint should retain the bounded retry delay"
-    );
 
     let posts = tokio::time::timeout(
         Duration::from_secs(3),
@@ -1017,6 +1102,18 @@ async fn cloud_state_reporter_retries_unknown_conflicts_and_paces_version_exhaus
     }
     assert_eq!(posts[1]["status"], 409);
     assert_eq!(posts[2]["status"], 200);
+    for (earlier, later) in [(0, 1), (1, 2)] {
+        let earlier_reported_at = posts[earlier]["reported_at"]
+            .as_u64()
+            .expect("reported_at should be Unix milliseconds");
+        let later_reported_at = posts[later]["reported_at"]
+            .as_u64()
+            .expect("reported_at should be Unix milliseconds");
+        assert!(
+            later_reported_at.abs_diff(earlier_reported_at) >= retry_backoff.as_millis() as u64,
+            "unknown conflicts must wait for the configured retry backoff"
+        );
+    }
 
     let posts = tokio::time::timeout(
         Duration::from_secs(3),
@@ -1026,21 +1123,11 @@ async fn cloud_state_reporter_retries_unknown_conflicts_and_paces_version_exhaus
     .expect("the heartbeat should exercise the maximum remote version hint");
     assert_eq!(posts[3]["status"], 409);
     assert_eq!(posts[3]["state_version"], 1);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        cloud_state
-            .state_posts
-            .lock()
-            .expect("fake state post lock should not poison")
-            .len(),
-        4,
-        "a maximum remote hint must wait for the longer exhaustion backoff"
-    );
-    let version_path = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud")
-        .join(".state-version.json");
+    let version_path = runtime_test_inbox_directory(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+    )
+    .join(".state-version.json");
     let persisted: serde_json::Value = serde_json::from_slice(
         &std::fs::read(&version_path).expect("local version should persist"),
     )
@@ -1059,6 +1146,16 @@ async fn cloud_state_reporter_retries_unknown_conflicts_and_paces_version_exhaus
     assert_eq!(posts[4]["status"], 200);
     assert_eq!(posts[4]["state_version"], 1);
     assert_eq!(posts[4]["content_hash"], posts[0]["content_hash"]);
+    let exhausted_at = posts[3]["reported_at"]
+        .as_u64()
+        .expect("reported_at should be Unix milliseconds");
+    let retried_at = posts[4]["reported_at"]
+        .as_u64()
+        .expect("reported_at should be Unix milliseconds");
+    assert!(
+        retried_at.abs_diff(exhausted_at) >= version_exhausted_backoff.as_millis() as u64,
+        "maximum remote version hints must use the longer exhaustion backoff"
+    );
 
     reporter.abort();
     let _ = reporter.await;
@@ -1079,8 +1176,9 @@ async fn cloud_state_reporter_paces_when_local_state_version_is_exhausted() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
-    let inbox =
-        Arc::new(CloudInbox::open(&config.downloads.video_dir).expect("cloud inbox should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
     assert_eq!(
         inbox
             .next_state_version_after(MAX_CLOUD_STATE_VERSION - 1)
@@ -1119,11 +1217,11 @@ async fn cloud_state_reporter_paces_when_local_state_version_is_exhausted() {
             .is_empty(),
         "an exhausted local counter must not wrap or post a duplicate version"
     );
-    let version_path = config
-        .downloads
-        .video_dir
-        .join(".telegram-video-downloader-cloud")
-        .join(".state-version.json");
+    let version_path = runtime_test_inbox_directory(
+        &config.downloads.video_dir,
+        crate::cloud::TEST_DATABASE_EPOCH,
+    )
+    .join(".state-version.json");
     let persisted: serde_json::Value = serde_json::from_slice(
         &std::fs::read(version_path).expect("max local version should remain readable"),
     )
@@ -1132,6 +1230,85 @@ async fn cloud_state_reporter_paces_when_local_state_version_is_exhausted() {
 
     reporter.abort();
     let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cloud_state_reporter_stops_when_remote_database_epoch_changes() {
+    let root = temp_cloud_bot_dir("state-reporter-epoch-change");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    cloud_state
+        .state_post_statuses
+        .lock()
+        .expect("fake state status lock should not poison")
+        .push(409);
+    cloud_state
+        .state_post_response_headers
+        .lock()
+        .expect("fake state response-header lock should not poison")
+        .push(vec![(
+            "X-Cloud-Database-Epoch".to_string(),
+            "fedcba9876543210fedcba9876543210".to_string(),
+        )]);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    runtime
+        .library_snapshot
+        .lock()
+        .await
+        .replace(empty_cloud_test_library_snapshot("epoch-change"));
+
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        Duration::from_secs(60),
+        Duration::from_millis(20),
+        Duration::from_millis(100),
+    ));
+    runtime.state_notify.notify_one();
+
+    let posts = wait_for_state_posts(&cloud_state, 1).await;
+    assert_eq!(posts[0]["status"], 409);
+    tokio::time::timeout(Duration::from_secs(2), reporter)
+        .await
+        .expect("reporter should stop after an epoch mismatch")
+        .expect("reporter task should join");
+    assert!(runtime.epoch_fatal.is_signaled());
+    assert!(!runtime.reconciliation_complete.load(Ordering::Acquire));
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state post lock should not poison")
+            .len(),
+        1,
+        "a fatal epoch mismatch must not retry state posts on the old runtime"
+    );
+
     stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
     drop(runtime);
     drop(inbox);

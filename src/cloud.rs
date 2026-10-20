@@ -31,6 +31,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 const CLOUD_INBOX_DIRECTORY: &str = ".telegram-video-downloader-cloud";
 const CLOUD_INBOX_OWNER_LOCK: &str = ".owner.lock";
+const CLOUD_INBOX_EPOCHS_DIRECTORY: &str = "epochs";
 const CLOUD_STATE_VERSION_FILE: &str = ".state-version.json";
 const CLOUD_REQUEST_PREFIX: &str = "request-";
 const CLOUD_REQUEST_SUFFIX: &str = ".json";
@@ -81,6 +82,58 @@ impl std::fmt::Display for CloudInboxRecoveryIncomplete {
 
 impl std::error::Error for CloudInboxRecoveryIncomplete {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CloudDatabaseEpochChanged {
+    pub(crate) expected: String,
+    pub(crate) actual: String,
+}
+
+impl std::fmt::Display for CloudDatabaseEpochChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cloud database epoch changed from {} to {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for CloudDatabaseEpochChanged {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CloudInboxSequenceConflict {
+    pub(crate) seq: u64,
+}
+
+impl std::fmt::Display for CloudInboxSequenceConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cloud request sequence {} was reused with a different envelope",
+            self.seq
+        )
+    }
+}
+
+impl std::error::Error for CloudInboxSequenceConflict {}
+
+fn valid_database_epoch(epoch: &str) -> bool {
+    epoch.len() == 32
+        && epoch
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+}
+
+fn database_epoch_from_header(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let epoch = headers
+        .get("X-Cloud-Database-Epoch")?
+        .to_str()
+        .ok()?
+        .to_string();
+    valid_database_epoch(&epoch).then_some(epoch)
+}
+
 pub(crate) fn is_state_version_exhausted(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CloudStateVersionExhausted>().is_some()
 }
@@ -88,6 +141,8 @@ pub(crate) fn is_state_version_exhausted(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 // Catalog fixture: pool joey-private-v3, token ID bearer-a, role bearer, state active.
 pub(crate) const TEST_CLOUD_SECRET: &str = "codex_synth_v1_bearer_a";
+#[cfg(test)]
+pub(crate) const TEST_DATABASE_EPOCH: &str = "0123456789abcdef0123456789abcdef";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CloudRequest {
@@ -128,12 +183,37 @@ impl CloudRequest {
 
 #[derive(Debug, Deserialize)]
 struct RequestList {
+    database_epoch: String,
     requests: Vec<CloudRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EpochRotationResponse {
+    rotated: bool,
+    database_epoch: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EpochRotationBody<'a> {
+    seq: u64,
+    request_id: &'a str,
+    payload_hash: &'a str,
+    kind: &'a str,
+    created_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AckReceipt<'a> {
+    seq: u64,
+    request_id: &'a str,
+    payload_hash: &'a str,
+    kind: &'a str,
+    created_at: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct AckBody<'a> {
-    seqs: &'a [u64],
+    receipts: Vec<AckReceipt<'a>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +239,7 @@ pub struct CloudClient {
     base_url: url::Url,
     client: Client,
     authorization: HeaderValue,
+    database_epoch: Option<String>,
 }
 
 fn parse_cloud_state_version_hint(bytes: &[u8]) -> Option<u64> {
@@ -174,12 +255,14 @@ pub enum CloudStatePostError {
     Transport(anyhow::Error),
     HttpStatus(reqwest::StatusCode),
     Conflict { stored_version: u64 },
+    DatabaseEpochChanged { expected: String, actual: String },
 }
 
 impl CloudStatePostError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Transport(_) | Self::Conflict { .. } => true,
+            Self::DatabaseEpochChanged { .. } => false,
             Self::HttpStatus(status) => {
                 *status == reqwest::StatusCode::UNAUTHORIZED
                     || *status == reqwest::StatusCode::FORBIDDEN
@@ -198,7 +281,7 @@ impl CloudStatePostError {
     pub fn stored_version_hint(&self) -> Option<u64> {
         match self {
             Self::Conflict { stored_version } => Some(*stored_version),
-            Self::Transport(_) | Self::HttpStatus(_) => None,
+            Self::Transport(_) | Self::HttpStatus(_) | Self::DatabaseEpochChanged { .. } => None,
         }
     }
 }
@@ -211,6 +294,10 @@ impl std::fmt::Display for CloudStatePostError {
             Self::Conflict { stored_version } => write!(
                 formatter,
                 "HTTP 409; server cloud state version is {stored_version}"
+            ),
+            Self::DatabaseEpochChanged { expected, actual } => write!(
+                formatter,
+                "HTTP 409; cloud database epoch changed from {expected} to {actual}"
             ),
         }
     }
@@ -238,12 +325,33 @@ impl CloudClient {
                 .build()
                 .context("failed to initialize local cloud client")?,
             authorization,
+            database_epoch: None,
         })
+    }
+
+    pub async fn bootstrap_database_epoch(&self) -> Result<String> {
+        let request_list = self.fetch_request_list().await?;
+        Ok(request_list.database_epoch)
+    }
+
+    pub fn with_database_epoch(mut self, epoch: String) -> Result<Self> {
+        if !valid_database_epoch(&epoch) {
+            bail!("cloud database epoch must be 32 lowercase hexadecimal characters");
+        }
+        self.database_epoch = Some(epoch);
+        Ok(self)
+    }
+
+    pub(crate) fn database_epoch(&self) -> Result<&str> {
+        self.database_epoch
+            .as_deref()
+            .ok_or_else(|| anyhow!("cloud client database epoch has not been bootstrapped"))
     }
 
     #[cfg(test)]
     pub(crate) fn with_test_base_url(base_url: &str) -> Result<Self> {
-        Self::with_base_url(url::Url::parse(base_url)?, TEST_CLOUD_SECRET.to_string())
+        Self::with_base_url(url::Url::parse(base_url)?, TEST_CLOUD_SECRET.to_string())?
+            .with_database_epoch(TEST_DATABASE_EPOCH.to_string())
     }
 
     fn api_url(&self, path: &str) -> Result<url::Url> {
@@ -256,54 +364,208 @@ impl CloudClient {
             .context("failed to build local cloud API URL")
     }
 
-    pub async fn fetch_requests(&self) -> Result<Vec<CloudRequest>> {
-        let page_size = CLOUD_REQUEST_PAGE_SIZE.to_string();
-        let response = self
+    async fn fetch_request_list(&self) -> Result<RequestList> {
+        let expected = self.database_epoch.as_deref();
+        let page_size = if expected.is_some() {
+            CLOUD_REQUEST_PAGE_SIZE
+        } else {
+            1
+        }
+        .to_string();
+        let mut request = self
             .client
             .get(self.api_url("api/local/requests")?)
             .query(&[("limit", page_size.as_str())])
-            .header(AUTHORIZATION, self.authorization.clone())
+            .header(AUTHORIZATION, self.authorization.clone());
+        if let Some(expected) = expected {
+            request = request.header(
+                "X-Cloud-Database-Epoch",
+                HeaderValue::from_str(expected).context("invalid cloud database epoch header")?,
+            );
+        }
+        let response = request
             .send()
             .await
-            .context("failed to fetch local cloud requests")?
+            .context("failed to fetch local cloud requests")?;
+        if response.status() == reqwest::StatusCode::CONFLICT
+            && let Some(expected) = expected
+            && let Some(actual) = database_epoch_from_header(response.headers())
+            && actual != expected
+        {
+            return Err(CloudDatabaseEpochChanged {
+                expected: expected.to_string(),
+                actual,
+            }
+            .into());
+        }
+        let response = response
             .error_for_status()
             .context("local cloud request fetch returned HTTP error")?;
         let request_list = response
             .json::<RequestList>()
             .await
             .context("failed to decode local cloud request list")?;
+        if !valid_database_epoch(&request_list.database_epoch) {
+            bail!("local cloud request page omitted a valid database epoch");
+        }
         for request in &request_list.requests {
             request.validate()?;
+        }
+        Ok(request_list)
+    }
+
+    pub async fn fetch_requests(&self) -> Result<Vec<CloudRequest>> {
+        let expected = self.database_epoch()?.to_string();
+        let request_list = self.fetch_request_list().await?;
+        if request_list.database_epoch != expected {
+            return Err(CloudDatabaseEpochChanged {
+                expected,
+                actual: request_list.database_epoch,
+            }
+            .into());
         }
         Ok(request_list.requests)
     }
 
-    pub async fn acknowledge(&self, seqs: &[u64]) -> Result<()> {
-        if seqs.is_empty() {
+    pub async fn acknowledge(&self, requests: &[CloudRequest]) -> Result<()> {
+        if requests.is_empty() {
             return Ok(());
         }
-        if seqs
-            .iter()
-            .any(|seq| *seq == 0 || *seq > MAX_JS_SAFE_INTEGER)
-        {
-            bail!("cannot acknowledge a sequence outside JavaScript's safe integer range");
+        let mut receipts = Vec::with_capacity(requests.len());
+        for request in requests {
+            request.validate()?;
+            if request.seq == 0 || request.seq > MAX_JS_SAFE_INTEGER {
+                bail!("cannot acknowledge a sequence outside JavaScript's safe integer range");
+            }
+            let request_id = request
+                .extra
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 256)
+                .ok_or_else(|| anyhow!("cloud request omitted its stable request identifier"))?;
+            let payload_hash = request
+                .extra
+                .get("payload_hash")
+                .and_then(Value::as_str)
+                .filter(|value| {
+                    value.len() == 64
+                        && value
+                            .as_bytes()
+                            .iter()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+                })
+                .ok_or_else(|| anyhow!("cloud request omitted its stable payload hash"))?;
+            receipts.push(AckReceipt {
+                seq: request.seq,
+                request_id,
+                payload_hash,
+                kind: &request.kind,
+                created_at: request.created_at,
+            });
         }
-        self.client
+        let expected = self.database_epoch()?.to_string();
+        let response = self
+            .client
             .post(self.api_url("api/local/ack")?)
             .header(AUTHORIZATION, self.authorization.clone())
-            .json(&AckBody { seqs })
+            .header("X-Cloud-Database-Epoch", expected.as_str())
+            .json(&AckBody { receipts })
             .send()
             .await
-            .context("failed to acknowledge local cloud requests")?
+            .context("failed to acknowledge local cloud requests")?;
+        if response.status() == reqwest::StatusCode::CONFLICT
+            && let Some(actual) = database_epoch_from_header(response.headers())
+            && actual != expected
+        {
+            return Err(CloudDatabaseEpochChanged { expected, actual }.into());
+        }
+        if response.status() == reqwest::StatusCode::CONFLICT
+            && let Some(seq) = response
+                .headers()
+                .get("X-Cloud-Inbox-Sequence-Conflict")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|seq| *seq > 0 && *seq <= MAX_JS_SAFE_INTEGER)
+        {
+            return Err(CloudInboxSequenceConflict { seq }.into());
+        }
+        response
             .error_for_status()
             .context("local cloud acknowledgement returned HTTP error")?;
         Ok(())
+    }
+
+    pub async fn recover_sequence_conflict(&self, request: &CloudRequest) -> Result<()> {
+        let expected = self.database_epoch()?.to_string();
+        let request_id = request
+            .extra
+            .get("request_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .ok_or_else(|| anyhow!("cloud request omitted its stable request identifier"))?;
+        let payload_hash = request
+            .extra
+            .get("payload_hash")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value.len() == 64
+                    && value
+                        .as_bytes()
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            })
+            .ok_or_else(|| anyhow!("cloud request omitted its stable payload hash"))?;
+        let response = self
+            .client
+            .post(self.api_url("api/local/epoch/rotate-on-conflict")?)
+            .header(AUTHORIZATION, self.authorization.clone())
+            .header("X-Cloud-Database-Epoch", expected.as_str())
+            .json(&EpochRotationBody {
+                seq: request.seq,
+                request_id,
+                payload_hash,
+                kind: &request.kind,
+                created_at: request.created_at,
+            })
+            .send()
+            .await
+            .context("failed to request conditional cloud epoch rotation")?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            if let Some(actual) = database_epoch_from_header(response.headers())
+                && actual != expected
+            {
+                return Err(CloudDatabaseEpochChanged { expected, actual }.into());
+            }
+            bail!("cloud epoch rotation conflict no longer matches the pending request");
+        }
+        let response = response
+            .error_for_status()
+            .context("conditional cloud epoch rotation returned HTTP error")?;
+        let rotation = response
+            .json::<EpochRotationResponse>()
+            .await
+            .context("failed to decode conditional cloud epoch rotation response")?;
+        if !rotation.rotated || !valid_database_epoch(&rotation.database_epoch) {
+            bail!("cloud epoch rotation returned an invalid response");
+        }
+        if rotation.database_epoch == expected {
+            bail!("cloud epoch rotation did not change the database epoch");
+        }
+        Err(CloudDatabaseEpochChanged {
+            expected,
+            actual: rotation.database_epoch,
+        }
+        .into())
     }
 
     pub async fn post_state(
         &self,
         state: &CloudState<'_>,
     ) -> std::result::Result<(), CloudStatePostError> {
+        let expected = self
+            .database_epoch()
+            .map_err(CloudStatePostError::Transport)?
+            .to_string();
         let url = self
             .api_url("api/local/state")
             .map_err(CloudStatePostError::Transport)?;
@@ -311,6 +573,7 @@ impl CloudClient {
             .client
             .post(url)
             .header(AUTHORIZATION, self.authorization.clone())
+            .header("X-Cloud-Database-Epoch", expected.as_str())
             .json(state)
             .send()
             .await
@@ -323,6 +586,11 @@ impl CloudClient {
         if status.is_success() {
             Ok(())
         } else if status == reqwest::StatusCode::CONFLICT {
+            if let Some(actual) = database_epoch_from_header(response.headers())
+                && actual != expected
+            {
+                return Err(CloudStatePostError::DatabaseEpochChanged { expected, actual });
+            }
             match response
                 .headers()
                 .get("X-Cloud-State-Version")
@@ -337,6 +605,7 @@ impl CloudClient {
     }
 
     pub async fn connect_websocket(&self) -> Result<CloudWebSocket> {
+        let expected = self.database_epoch()?.to_string();
         let mut url = self.api_url("api/local/ws")?;
         match url.scheme() {
             "https" => url
@@ -354,10 +623,36 @@ impl CloudClient {
         request
             .headers_mut()
             .insert(WS_AUTHORIZATION, self.authorization.clone());
-        let (socket, _) = timeout(Duration::from_secs(15), connect_async(request))
+        request.headers_mut().insert(
+            "X-Cloud-Database-Epoch",
+            HeaderValue::from_str(&expected).context("invalid cloud database epoch header")?,
+        );
+        let result = timeout(Duration::from_secs(15), connect_async(request))
             .await
-            .context("local cloud WebSocket handshake timed out")?
-            .context("failed to connect to local cloud WebSocket")?;
+            .context("local cloud WebSocket handshake timed out")?;
+        let (socket, _) = match result {
+            Ok(connection) => connection,
+            Err(tokio_tungstenite::tungstenite::Error::Http(response))
+                if response.status()
+                    == tokio_tungstenite::tungstenite::http::StatusCode::CONFLICT =>
+            {
+                let actual = response
+                    .headers()
+                    .get("X-Cloud-Database-Epoch")
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| valid_database_epoch(value))
+                    .map(str::to_string);
+                if let Some(actual) = actual.filter(|actual| actual != &expected) {
+                    return Err(CloudDatabaseEpochChanged { expected, actual }.into());
+                }
+                return Err(anyhow!(
+                    "local cloud WebSocket returned an unbound epoch conflict"
+                ));
+            }
+            Err(error) => {
+                return Err(anyhow!(error).context("failed to connect to local cloud WebSocket"));
+            }
+        };
         Ok(socket)
     }
 }
@@ -806,6 +1101,10 @@ enum InboxRecordRead {
 pub struct CloudInbox {
     root: RootedFs,
     file_provider: Arc<dyn QueueFileProvider>,
+    base_directory: PathBuf,
+    base_directory_identity: EntryIdentity,
+    epochs_directory: Option<(PathBuf, EntryIdentity)>,
+    database_epoch: String,
     directory: PathBuf,
     directory_identity: EntryIdentity,
     _owner_lock: BoundFile,
@@ -816,23 +1115,71 @@ pub struct CloudInbox {
 }
 
 impl CloudInbox {
+    #[cfg(test)]
     pub fn open(root_path: &Path) -> Result<Self> {
         Self::open_with_file_provider(root_path, platform_queue_file_provider())
     }
 
+    pub(crate) fn open_for_epoch(root_path: &Path, epoch: &str) -> Result<Self> {
+        Self::open_for_epoch_with_file_provider(root_path, epoch, platform_queue_file_provider())
+    }
+
+    pub(crate) fn open_for_epoch_with_file_provider(
+        root_path: &Path,
+        epoch: &str,
+        file_provider: Arc<dyn QueueFileProvider>,
+    ) -> Result<Self> {
+        if !valid_database_epoch(epoch) {
+            bail!("cloud inbox epoch must be 32 lowercase hexadecimal characters");
+        }
+        Self::open_inner(root_path, file_provider, Some(epoch))
+    }
+
+    #[cfg(test)]
     pub(crate) fn open_with_file_provider(
         root_path: &Path,
         file_provider: Arc<dyn QueueFileProvider>,
     ) -> Result<Self> {
+        Self::open_inner(root_path, file_provider, None)
+    }
+
+    fn open_inner(
+        root_path: &Path,
+        file_provider: Arc<dyn QueueFileProvider>,
+        epoch: Option<&str>,
+    ) -> Result<Self> {
         let root = coordinate_download_root(file_provider.as_ref(), root_path)?;
-        let directory = root.logical_root_path().join(CLOUD_INBOX_DIRECTORY);
-        coordinate_private_directory_creation(file_provider.as_ref(), &root, &directory)?;
-        let (directory, directory_identity) =
-            coordinate_bound_directory(file_provider.as_ref(), &root, &directory)?;
-        let owner_lock = create_owner_lock(&directory, &directory, &root, &file_provider)?;
+        let base_directory = root.logical_root_path().join(CLOUD_INBOX_DIRECTORY);
+        coordinate_private_directory_creation(file_provider.as_ref(), &root, &base_directory)?;
+        let (base_directory, base_directory_identity) =
+            coordinate_bound_directory(file_provider.as_ref(), &root, &base_directory)?;
+        let owner_lock =
+            create_owner_lock(&base_directory, &base_directory, &root, &file_provider)?;
+        let (directory, directory_identity, epochs_directory) = match epoch {
+            Some(epoch) => {
+                let epochs_path = base_directory.join(CLOUD_INBOX_EPOCHS_DIRECTORY);
+                coordinate_private_directory_creation(file_provider.as_ref(), &root, &epochs_path)?;
+                let (epochs_path, epochs_identity) =
+                    coordinate_bound_directory(file_provider.as_ref(), &root, &epochs_path)?;
+                let directory = epochs_path.join(epoch);
+                coordinate_private_directory_creation(file_provider.as_ref(), &root, &directory)?;
+                let (directory, directory_identity) =
+                    coordinate_bound_directory(file_provider.as_ref(), &root, &directory)?;
+                (
+                    directory,
+                    directory_identity,
+                    Some((epochs_path, epochs_identity)),
+                )
+            }
+            None => (base_directory.clone(), base_directory_identity, None),
+        };
         let inbox = Self {
             root,
             file_provider,
+            base_directory,
+            base_directory_identity,
+            epochs_directory,
+            database_epoch: epoch.unwrap_or_default().to_string(),
             directory,
             directory_identity,
             _owner_lock: owner_lock,
@@ -851,6 +1198,15 @@ impl CloudInbox {
         // This avoids loading the complete request history into memory during startup.
         inbox.recover_interrupted_requests()?;
         Ok(inbox)
+    }
+
+    pub(crate) fn database_epoch(&self) -> &str {
+        &self.database_epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_path_for_test(&self, seq: u64) -> PathBuf {
+        self.record_path(seq)
     }
 
     pub fn persist(&self, request: CloudRequest) -> Result<bool> {
@@ -873,10 +1229,7 @@ impl CloudInbox {
                     .record(&existing);
                 return Ok(false);
             }
-            bail!(
-                "cloud request sequence {} was reused with a different envelope",
-                request.seq
-            );
+            return Err(CloudInboxSequenceConflict { seq: request.seq }.into());
         }
         self.require_initial_recovery_complete_before_write()?;
         let record = InboxRecord {
@@ -1419,10 +1772,122 @@ impl CloudInbox {
     }
 
     fn validate_directory(&self) -> Result<()> {
+        let base_entry = self.root.bind_entry(&self.base_directory, false)?;
+        self.root
+            .validate_private_bound_directory(&base_entry, self.base_directory_identity, 0o700)
+            .context("cloud inbox base directory is not owner-private")?;
+        if let Some((epochs_directory, epochs_identity)) = &self.epochs_directory {
+            let epochs_entry = self.root.bind_entry(epochs_directory, false)?;
+            self.root
+                .validate_private_bound_directory(&epochs_entry, *epochs_identity, 0o700)
+                .context("cloud inbox epoch directory is not owner-private")?;
+        }
         let entry = self.root.bind_entry(&self.directory, false)?;
         self.root
             .validate_private_bound_directory(&entry, self.directory_identity, 0o700)
             .context("cloud inbox directory is not owner-private")
+    }
+
+    fn retired_namespace_may_exist(&self) -> Result<bool> {
+        if self.database_epoch.is_empty() {
+            return Ok(false);
+        }
+        let Some((epochs_directory, epochs_identity)) = &self.epochs_directory else {
+            return Ok(true);
+        };
+        self.validate_directory()?;
+
+        let Some(base_names) =
+            self.bounded_directory_names(&self.base_directory, self.base_directory_identity)?
+        else {
+            return Ok(true);
+        };
+        for (name, identity) in base_names {
+            let Some(name) = name.to_str() else {
+                return Ok(true);
+            };
+            match name {
+                CLOUD_INBOX_OWNER_LOCK | CLOUD_STATE_VERSION_FILE => {}
+                CLOUD_INBOX_EPOCHS_DIRECTORY if identity.is_dir() => {}
+                name if name.starts_with(CLOUD_REQUEST_PREFIX) => return Ok(true),
+                _ => return Ok(true),
+            }
+        }
+
+        let Some(epoch_names) = self.bounded_directory_names(epochs_directory, *epochs_identity)?
+        else {
+            return Ok(true);
+        };
+        for (name, identity) in epoch_names {
+            if name.to_str() != Some(self.database_epoch.as_str()) || !identity.is_dir() {
+                // Any sibling may contain old confirmations; keep all private previews until
+                // there is a retirement-aware cleanup policy.
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn bounded_directory_names(
+        &self,
+        path: &Path,
+        expected: EntryIdentity,
+    ) -> Result<Option<Vec<(std::ffi::OsString, EntryIdentity)>>> {
+        const MAX_RETIRED_DIRECTORY_NAMES: usize = 128;
+        const PAGE_NAMES: usize = 16;
+
+        let mut result = None;
+        let mut read = |coordinated_path: &Path| -> Result<()> {
+            let coordinated = coordinated_path_under_root(&self.root, coordinated_path)?;
+            if coordinated != path {
+                bail!("File Provider changed a retired cloud inbox directory path");
+            }
+            let entry = self.root.bind_entry(path, false)?;
+            let mut cursor = self
+                .root
+                .start_bound_directory_cursor(&entry, expected, 0o700)?;
+            let mut examined = 0usize;
+            let mut names = Vec::new();
+            loop {
+                let page = self.root.peek_bound_directory_cursor(
+                    &mut cursor,
+                    PAGE_NAMES.min(MAX_RETIRED_DIRECTORY_NAMES.saturating_sub(examined)),
+                    0o700,
+                )?;
+                examined = examined.saturating_add(page.names_read);
+                match page.entry {
+                    Some(BoundDirectoryCursorEntry::Unreadable { .. }) => {
+                        result = Some(None);
+                        return Ok(());
+                    }
+                    Some(BoundDirectoryCursorEntry::Present { name, identity }) => {
+                        names.push((name, identity));
+                        self.root.consume_bound_directory_cursor_entry(&mut cursor);
+                    }
+                    None if page.exhausted => {
+                        result = Some(Some(names));
+                        return Ok(());
+                    }
+                    None if examined >= MAX_RETIRED_DIRECTORY_NAMES => {
+                        let extra = self
+                            .root
+                            .peek_bound_directory_cursor(&mut cursor, 1, 0o700)?;
+                        if extra.entry.is_some() || !extra.exhausted {
+                            result = Some(None);
+                        } else {
+                            result = Some(Some(names));
+                        }
+                        return Ok(());
+                    }
+                    None => {}
+                }
+            }
+        };
+        self.file_provider
+            .coordinate_read(path, &mut read)
+            .map_err(|error| classify_deadlock_error(path, "read", error))?;
+        result
+            .ok_or_else(|| anyhow!("File Provider did not provide retired inbox directory access"))
     }
 
     fn recover_interrupted_requests(&self) -> Result<bool> {
@@ -1951,6 +2416,10 @@ impl PreviewCleanupGate for CloudInbox {
             .operation_lock
             .lock()
             .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        self.validate_directory()?;
+        if self.retired_namespace_may_exist().unwrap_or(true) {
+            return Ok(PreviewCleanupOutcome::Deferred);
+        }
         if !self.recover_interrupted_requests()? {
             return Ok(PreviewCleanupOutcome::Deferred);
         }

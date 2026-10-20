@@ -10,6 +10,8 @@ export interface InboxEnvelope {
   kind: RequestKind;
   payload: Record<string, unknown>;
   created_at: number;
+  request_id: string;
+  payload_hash: string;
 }
 
 export interface CollectionMetadata {
@@ -64,6 +66,8 @@ export class HttpError extends Error {
     readonly status: number,
     message: string,
     readonly stateVersion?: number,
+    readonly databaseEpoch?: string,
+    readonly sequenceConflict?: number,
   ) {
     super(message);
     this.name = "HttpError";

@@ -12,8 +12,8 @@ The local service initiates every cloud connection and sends Telegram replies di
 
 1. The Worker validates the Telegram webhook or Mini App request, writes the complete request to D1, and assigns a sequence number. Telegram submissions deduplicate by update ID; Mini App actions deduplicate by client request ID.
 2. After the D1 write, the Worker sends the full request envelope over the hibernating WebSocket. A failed notification leaves the D1 request available for replay. Before enabling dispatch after a notification, Rust reconciles the authoritative REST backlog so earlier unacknowledged requests are durably present even when notifications arrive out of order.
-3. Rust validates the envelope and JavaScript-safe sequence number, then durably writes the full request to its private inbox under the configured video download root. It sends `POST /api/local/ack` only after that write succeeds. WebSocket delivery uses this same HTTPS receipt; the WebSocket itself has no ACK frame.
-4. The inbox deduplicates by exact sequence and envelope, not by a maximum-sequence watermark. An unseen lower sequence is accepted. Re-delivery of an identical sequence wakes recovery without creating another local record; a conflicting envelope for a used sequence is rejected.
+3. Rust obtains the authenticated database epoch before opening its local inbox, validates the envelope and JavaScript-safe sequence number, and durably writes the full request under that epoch. It sends `POST /api/local/ack` only after that write succeeds. WebSocket delivery uses this same HTTPS receipt; the WebSocket itself has no ACK frame.
+4. Within one epoch, the inbox deduplicates by exact sequence and envelope, not by a maximum-sequence watermark. An unseen lower sequence is accepted. Re-delivery of an identical sequence wakes recovery without creating another local record.
 5. Local receipt and operation completion are separate. Pending management work survives restart; a confirmed file batch uses its persisted preview and move journal to resume unfinished steps. An interrupted Telegram update whose external side effect is uncertain is surfaced as uncertain rather than blindly replayed.
 6. Rust separately publishes operation results and snapshots through HTTPS. The client fetches the oldest pending batch at startup, on reconnect, and on a low-frequency fallback poll (30 seconds by default, configurable no lower than 5 seconds). WebSocket reconnect uses bounded backoff.
 
@@ -24,6 +24,16 @@ D1 retains acknowledged requests and their deduplication keys for seven days aft
 The Rust client leaves an established WebSocket open while it is idle; it does not reconnect on an idle deadline. The independent REST fallback reads the D1 backlog and does not invoke the notification object. A real close or socket error triggers reconnect and backlog reconciliation. Production Durable Object hibernation behavior still needs live validation.
 
 The durable local inbox stores full request envelopes and statuses such as pending, processing, awaiting confirmation, retryable, completed, failed, stale, and uncertain. The inbox is single-process owned and private to the configured local account. Download-task update-ID deduplication remains in place for downloads; the inbox also covers bot commands, callbacks, and management requests.
+
+The database epoch is a random identifier stored in D1. The local inbox uses a separate directory per epoch under its existing private root; the root owner lock remains shared across epochs. Upgrading leaves the legacy flat inbox and its inode bindings in place. Retired namespaces are preserved and are not replayed into the new namespace. Old confirmation actions require a fresh preview.
+
+Every local ACK, snapshot write, and WebSocket handshake is bound to the negotiated epoch. D1 write transactions reject an outdated epoch before changing data. An epoch change closes reconciliation and stops the local cloud runtime through the existing supervisor; the next service start negotiates the new namespace. The client never replaces the inbox used by an operation already in flight.
+
+ACK receipts also carry each request's server identifier, payload hash, kind, and creation time. The D1 transaction compares these identities before acknowledging the page. A same-epoch restore between local persistence and ACK therefore cannot acknowledge a different request that reused the sequence; Rust reconciles the authoritative backlog again after a conflict.
+
+A D1 restore can also restore its epoch row. If a new authoritative request reuses a local sequence with a different envelope, Rust asks the authenticated Worker to rotate the epoch conditionally. The comparison includes the expected epoch and the current server request identity and payload hash. A successful rotation leaves pending cloud requests intact and requires a runtime restart. Identical restored envelopes remain duplicates. This detects an observable sequence collision; it does not claim to identify every database restore proactively.
+
+Retired local records are retained without moving or rewriting them. Their presence, or an incomplete check for retired records, conservatively defers private preview cleanup so an old active or uncertain confirmation cannot lose its recovery manifest.
 
 Local completed, failed, stale, and uncertain envelopes use a seven-day replay window after their terminal update. Pending, processing, and retryable records remain available for recovery. Awaiting-confirmation previews stop offering new confirmations after seven days. A confirmation created before that boundary preserves its associated inbox preview receipt while pending, processing, or retryable; abandoned preview receipts can expire. The state view marks expired previews stale even before bounded cleanup reaches their record. Confirmation lookup uses a preview-ID index and reads the selected durable record rather than the retained history. Private-directory maintenance has per-pass limits of 32 names and 8 MiB of record reads, revalidates object identity, contents, access policy, and expiry before removal, and removes expired sequences from the in-memory indexes. It does not replace exact-sequence deduplication with a maximum-sequence watermark.
 
@@ -101,6 +111,8 @@ Cloud reads fetch snapshot metadata and content chunks in one D1 transaction, th
 
 A state-version conflict returns the current stored version in `X-Cloud-State-Version`. Rust validates that hint and durably allocates a version above both its local counter and the stored version before retrying the same content. This recovers after moving the installation or losing the private counter file. Conflicts without a valid hint remain eligible for backed-off retry; invalid or exhausted counters are reported rather than wrapping.
 
+HTTP 400 state responses also retain the pending content and version with retry backoff. The Worker can reject a temporarily future `reported_at`; refreshing that timestamp on each attempt lets the unchanged snapshot recover after the local clock is corrected.
+
 Operation history and active previews have separate encoded-byte budgets. Recent import details remain available for manual mapping; older oversized results carry explicit truncation warnings. An incomplete preview cannot be confirmed. A 413 response first compacts operation details, then reduces the library only if necessary, without silently describing a reduced snapshot as complete. Authentication failures remain eligible for backed-off retry after configuration is corrected.
 
 Upload reduction also bounds warning text and category paths, including snapshots with zero or one media item. Omitted categories are reported in warnings; shortened paths are never offered as real destinations. The uploaded snapshot is marked incomplete, while the full local library remains available.
@@ -122,6 +134,8 @@ A failed refresh publishes its warning with the preserved library without waitin
 Initial, publication, and management scans share one local gate held from before the blocking scan through snapshot and warning publication. A delayed older scan cannot overwrite a newer scan result; failure warnings follow the same ordering.
 
 A file preview uses one fresh scan under the library's process and store locks. Legacy mapping validation, preview construction, and the published snapshot use that same scan. Source tokens and destination checks still run before the preview is persisted.
+
+Cloud preview construction checks the complete prospective inbox receipt before storing preview anchors or the private manifest. A plan that exceeds the receipt budget fails with a request to split the selection into smaller previews; it does not leave an unconfirmable manifest or truncate an approved plan.
 
 After a file batch executes, a failed refresh does not discard its execution result or change a completed batch into a failure. The operation result retains a refresh warning, while cloud publication preserves the prior library snapshot and reports the scan failure separately. A later successful scan replaces that snapshot and clears the scan warning.
 

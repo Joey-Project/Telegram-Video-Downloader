@@ -3,7 +3,7 @@ id: 20261007-fmm01
 title: 文件管理 Mini App 设计与实施计划
 status: active
 created: 2026-10-07
-updated: 2026-10-19
+updated: 2026-10-20
 branch: "wip/file-management-cloud"
 pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/32"
 supersedes: []
@@ -33,6 +33,13 @@ superseded_by: ""
 - Isolated real Cloudflare validation covered Worker/D1 authorization, persist-before-notify, request deduplication, ACK replay, disconnected backlog recovery, and versioned snapshots. The reviewed Rust client also recovered from a stale local state version. A WebSocket received a notification after 20 seconds idle; this does not directly observe the Durable Object hibernation lifecycle. Static HTML, JavaScript, and CSS passed HTTP/MIME checks. Production webhook cutover, quota observation, and Telegram-client browser E2E remain rollout work.
 - Real integration exposed a manual metadata guard mismatch: dispatch intentionally skips import lookup for patches without `hint_index`, but validation still required an import. Manual patches now use current-item and preview-confirm validation independently; explicit hint mappings retain completed-import requirements.
 - Review fixes reject supported HFS-ignorable private-directory aliases before enqueueing, compact oversized legacy import reports against the complete persisted receipt while retaining a usable hint prefix and stable candidate indices, and open one searchable manual target picker with at most 100 present-media options.
+
+### 2026-10-20 Recovery boundaries
+
+- Local validation passed with 1,028 Rust tests, 0 failures, and 16 ignored tests; 78 Cloud tests passed. Formatting, all-target compilation, strict Clippy, the debug build, Cloud typechecking, and the Wrangler dry-run also passed. HTTP retry regressions compare actual request timestamps instead of short negative timing windows, preserving the configured 100 ms retry and 500 ms exhaustion-backoff assertions under concurrent test scheduling.
+- State uploads keep their pending content and version after HTTP 400, refresh the timestamp on each attempt, and use backoff so correcting clock skew can recover without another library change.
+- Cloud previews check the complete prospective inbox receipt before saving descriptor anchors or a manifest. Oversized selections receive an actionable split request; smaller previews retain the normal confirmation flow.
+- The local inbox is scoped to an authenticated D1 epoch. A replacement database gets a separate local namespace; legacy and retired records keep their original paths and inode bindings. A same-epoch sequence collision conditionally rotates the cloud epoch using the current server request identity, then stops the runtime for a fresh start. ACK transactions compare the complete server request identity as well as the epoch, including when a restore occurs between persistence and ACK. Stale ACK and state writes are rejected transactionally. Retired records conservatively protect existing private preview manifests from cleanup.
 
 ### 2026-10-18 审查修复
 
