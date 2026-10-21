@@ -3196,6 +3196,7 @@ struct PgcFixtureTaskSpec {
     task_id: &'static str,
     url: &'static str,
     collection_title: Option<&'static str>,
+    canonical_season_id: Option<u64>,
     entries: Vec<PgcFixtureEntry>,
     with_verified_attempt: bool,
 }
@@ -3210,6 +3211,7 @@ fn add_completed_bilibili_plan_fixture(
         task_id,
         url,
         collection_title,
+        canonical_season_id,
         entries,
         with_verified_attempt,
     } = spec;
@@ -3286,8 +3288,18 @@ fn add_completed_bilibili_plan_fixture(
     record.plan = Some(PlanValidationSnapshot {
         stable_media_ids,
         title: collection_title.map(str::to_string),
+        bilibili_pgc_season_id: canonical_season_id,
+        bilibili_pgc_episode_orders: if canonical_season_id.is_some() {
+            group_entries.clone()
+        } else {
+            Vec::new()
+        },
         bilibili_publication_namespace: Some(publication_namespace),
-        bilibili_group_entries: group_entries,
+        bilibili_group_entries: if entries.len() > 1 {
+            group_entries
+        } else {
+            Vec::new()
+        },
         ..PlanValidationSnapshot::default()
     });
     if with_verified_attempt {
@@ -3376,6 +3388,7 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
             task_id: "pgc-md1376",
             url: "https://www.bilibili.com/bangumi/media/md1376",
             collection_title: Some("家庭教师HITMAN REBORN!"),
+            canonical_season_id: Some(1376),
             entries: md1376_entries,
             with_verified_attempt: true,
         },
@@ -3388,6 +3401,7 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
             task_id: "pgc-ss8621",
             url: "https://www.bilibili.com/bangumi/play/ss8621",
             collection_title: Some("Synthetic SS Season"),
+            canonical_season_id: None,
             entries: vec![
                 PgcFixtureEntry {
                     index: 1,
@@ -3415,9 +3429,27 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
             task_id: "pgc-ep-single",
             url: "https://www.bilibili.com/bangumi/play/ep11001",
             collection_title: Some("Single Episode Title"),
+            canonical_season_id: None,
             entries: vec![PgcFixtureEntry {
                 index: 1,
                 stable_media_id: pgc_test_stable_media_id(70_001, 70_001),
+                nfo_collection: None,
+            }],
+            with_verified_attempt: false,
+        },
+    );
+    let ep_with_resolved_season_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 10,
+            task_id: "pgc-ep-with-resolved-season",
+            url: "https://www.bilibili.com/bangumi/play/ep11002",
+            collection_title: Some("Resolved Season from Episode URL"),
+            canonical_season_id: Some(18_101),
+            entries: vec![PgcFixtureEntry {
+                index: 10,
+                stable_media_id: pgc_test_stable_media_id(95_001, 95_101),
                 nfo_collection: None,
             }],
             with_verified_attempt: false,
@@ -3431,6 +3463,7 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
             task_id: "pgc-one-distinct-episode",
             url: "https://www.bilibili.com/bangumi/media/md9000",
             collection_title: Some("Insufficient Episode Evidence"),
+            canonical_season_id: None,
             entries: vec![
                 PgcFixtureEntry {
                     index: 1,
@@ -3454,6 +3487,7 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
             task_id: "pgc-without-title",
             url: "https://www.bilibili.com/bangumi/media/md9001",
             collection_title: None,
+            canonical_season_id: None,
             entries: vec![
                 PgcFixtureEntry {
                     index: 1,
@@ -3469,9 +3503,187 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
             with_verified_attempt: false,
         },
     );
+    let single_selected_md_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 5,
+            task_id: "pgc-single-selected-md",
+            url: "https://www.bilibili.com/bangumi/media/md17771",
+            collection_title: Some("Aliased PGC Season"),
+            canonical_season_id: Some(17772),
+            entries: vec![PgcFixtureEntry {
+                index: 10,
+                stable_media_id: pgc_test_stable_media_id(80_001, 80_101),
+                nfo_collection: None,
+            }],
+            with_verified_attempt: false,
+        },
+    );
+    let single_selected_ss_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 6,
+            task_id: "pgc-single-selected-ss",
+            url: "https://www.bilibili.com/bangumi/play/ss17772",
+            collection_title: Some("Aliased PGC Season"),
+            canonical_season_id: Some(17772),
+            entries: vec![PgcFixtureEntry {
+                index: 3,
+                stable_media_id: pgc_test_stable_media_id(80_002, 80_102),
+                nfo_collection: None,
+            }],
+            with_verified_attempt: false,
+        },
+    );
+    let legacy_md_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 7,
+            task_id: "pgc-legacy-md-without-canonical-id",
+            url: "https://www.bilibili.com/bangumi/media/md17773",
+            collection_title: Some("Legacy MD without canonical season identity"),
+            canonical_season_id: None,
+            entries: vec![
+                PgcFixtureEntry {
+                    index: 1,
+                    stable_media_id: pgc_test_stable_media_id(81_001, 82_001),
+                    nfo_collection: None,
+                },
+                PgcFixtureEntry {
+                    index: 2,
+                    stable_media_id: pgc_test_stable_media_id(81_002, 82_002),
+                    nfo_collection: None,
+                },
+            ],
+            with_verified_attempt: false,
+        },
+    );
+    let aliased_ss_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 8,
+            task_id: "pgc-aliased-ss-identity",
+            url: "https://www.bilibili.com/bangumi/play/ss17774",
+            collection_title: Some("Aliased SS Season"),
+            canonical_season_id: Some(17775),
+            entries: vec![PgcFixtureEntry {
+                index: 1,
+                stable_media_id: pgc_test_stable_media_id(83_001, 84_001),
+                nfo_collection: None,
+            }],
+            with_verified_attempt: false,
+        },
+    );
+    let empty_epid_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 9,
+            task_id: "pgc-empty-epid",
+            url: "https://www.bilibili.com/bangumi/media/md17776",
+            collection_title: Some("Empty Episode Identity"),
+            canonical_season_id: Some(17776),
+            entries: vec![PgcFixtureEntry {
+                index: 1,
+                stable_media_id: "bvid:BV1xx411c7mD:aid:100001:cid:85001:epid:".to_string(),
+                nfo_collection: None,
+            }],
+            with_verified_attempt: false,
+        },
+    );
+    let legacy_single_md_order10_stable_id = pgc_test_stable_media_id(95_002, 95_102);
+    let legacy_single_md_order10_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 11,
+            task_id: "pgc-legacy-md-single-order10",
+            url: "https://www.bilibili.com/bangumi/media/md18102",
+            collection_title: Some("Backfilled Legacy Season"),
+            canonical_season_id: None,
+            entries: vec![PgcFixtureEntry {
+                index: 10,
+                stable_media_id: legacy_single_md_order10_stable_id.clone(),
+                nfo_collection: None,
+            }],
+            with_verified_attempt: false,
+        },
+    );
+
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
+    let legacy_before_backfill = queue
+        .get("pgc-legacy-md-single-order10")
+        .expect("legacy task should load before backfill")
+        .expect("legacy task should exist before backfill");
+    assert_eq!(legacy_before_backfill.status, TaskStatus::Completed);
+    assert!(legacy_before_backfill.bilibili_attempt.is_none());
+    let legacy_before_hashes = legacy_before_backfill.primary_media_hashes.clone();
+    let legacy_before_saved_location = legacy_before_backfill.saved_location.clone();
+    let resolver_url = "https://www.bilibili.com/bangumi/media/md18102";
+    let resolver_episode_id = 95_102_u64;
+    let backfill_cursor =
+        crate::pgc_metadata_backfill::backfill_legacy_pgc_metadata_with_resolver_for_test(
+            Arc::clone(&queue),
+            Arc::new(config.clone()),
+            &library_id,
+            &root_binding,
+            None,
+            move |_config: Arc<AppConfig>, url: String| {
+                let identity =
+                    (url == resolver_url).then(|| crate::downloader::BilibiliPgcSeasonIdentity {
+                        season_id: 18_102,
+                        episode_orders: BTreeMap::from([(resolver_episode_id, 10)]),
+                    });
+                async move { Ok(identity) }
+            },
+        )
+        .await;
+    assert!(
+        backfill_cursor.is_some(),
+        "legacy metadata backfill pass should run against the temporary queue"
+    );
+    let backfilled_record = queue
+        .get("pgc-legacy-md-single-order10")
+        .expect("backfilled task should load")
+        .expect("backfilled task should remain present");
+    assert_eq!(backfilled_record.status, TaskStatus::Completed);
+    assert!(backfilled_record.bilibili_attempt.is_none());
+    assert_eq!(backfilled_record.primary_media_hashes, legacy_before_hashes);
+    assert_eq!(
+        backfilled_record.saved_location,
+        legacy_before_saved_location
+    );
+    let backfilled_plan = backfilled_record
+        .plan
+        .as_ref()
+        .expect("backfilled plan should remain present");
+    assert_eq!(backfilled_plan.bilibili_pgc_season_id, Some(18_102));
+    assert_eq!(backfilled_plan.bilibili_pgc_episode_orders.len(), 1);
+    assert_eq!(backfilled_plan.bilibili_pgc_episode_orders[0].index, 10);
+    assert!(
+        backfilled_plan.bilibili_group_entries.is_empty(),
+        "metadata backfill must not turn one selected episode into independent group execution"
+    );
 
     let (telegram, mut telegram_requests, telegram_shutdown, telegram_server) =
         spawn_fake_telegram_api().await;
+    let single_md_record = queue
+        .get("pgc-single-selected-md")
+        .expect("single PGC task should load")
+        .expect("single PGC task should exist");
+    let single_md_plan = single_md_record
+        .plan
+        .as_ref()
+        .expect("single PGC plan should persist");
+    assert!(
+        single_md_plan.bilibili_group_entries.is_empty(),
+        "PGC order metadata must not turn a one-episode task into independent group execution"
+    );
+    assert_eq!(single_md_plan.bilibili_pgc_episode_orders[0].index, 10);
     let runtime = make_runtime(
         telegram,
         config.clone(),
@@ -3508,20 +3720,20 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
     assert_eq!(md1376_paths.len(), 203);
     assert_eq!(
         items.len(),
-        210,
+        218,
         "cloud snapshot should retain every fixture item"
     );
     assert_eq!(
         items
             .iter()
-            .filter(|item| item["collection"]["id"] == "md1376")
+            .filter(|item| item["collection"]["id"] == "ss1376")
             .count(),
         203,
         "cloud snapshot should retain all 203 PGC collection annotations"
     );
 
     let md_first = cloud_snapshot_item_for_path(items, &md1376_paths[0]);
-    assert_eq!(md_first["collection"]["id"], "md1376");
+    assert_eq!(md_first["collection"]["id"], "ss1376");
     assert_eq!(md_first["collection"]["title"], "家庭教师HITMAN REBORN!");
     assert_eq!(md_first["collection"]["order"], 1);
     assert_eq!(md_first["metadata_status"], "complete");
@@ -3529,7 +3741,7 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
         .last()
         .expect("203-entry PGC fixture should have a last episode");
     let md_last = cloud_snapshot_item_for_path(items, md_last_path);
-    assert_eq!(md_last["collection"]["id"], "md1376");
+    assert_eq!(md_last["collection"]["id"], "ss1376");
     assert_eq!(md_last["collection"]["order"], 203);
     assert_eq!(md_last["collection"]["part_id"], "10203");
     assert_eq!(md_last["metadata_status"], "complete");
@@ -3545,12 +3757,44 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
     assert_eq!(ss_second["collection"]["order"], 2);
     assert_eq!(ss_second["collection"]["part_id"], "60002");
 
+    let ep_with_season = cloud_snapshot_item_for_path(items, &ep_with_resolved_season_paths[0]);
+    assert_eq!(ep_with_season["collection"]["id"], "ss18101");
+    assert_eq!(
+        ep_with_season["collection"]["title"],
+        "Resolved Season from Episode URL"
+    );
+    assert_eq!(ep_with_season["collection"]["order"], 10);
+
+    let single_md = cloud_snapshot_item_for_path(items, &single_selected_md_paths[0]);
+    assert_eq!(single_md["collection"]["id"], "ss17772");
+    assert_eq!(single_md["collection"]["title"], "Aliased PGC Season");
+    assert_eq!(single_md["collection"]["order"], 10);
+    let single_ss = cloud_snapshot_item_for_path(items, &single_selected_ss_paths[0]);
+    assert_eq!(single_ss["collection"]["id"], "ss17772");
+    assert_eq!(single_ss["collection"]["title"], "Aliased PGC Season");
+    assert_eq!(single_ss["collection"]["order"], 3);
+    assert_eq!(single_md["collection"]["id"], single_ss["collection"]["id"]);
+    let aliased_ss = cloud_snapshot_item_for_path(items, &aliased_ss_paths[0]);
+    assert_eq!(aliased_ss["collection"]["id"], "ss17775");
+    assert_eq!(aliased_ss["collection"]["title"], "Aliased SS Season");
+    let backfilled_legacy_single =
+        cloud_snapshot_item_for_path(items, &legacy_single_md_order10_paths[0]);
+    assert_eq!(backfilled_legacy_single["collection"]["id"], "ss18102");
+    assert_eq!(
+        backfilled_legacy_single["collection"]["title"],
+        "Backfilled Legacy Season"
+    );
+    assert_eq!(backfilled_legacy_single["collection"]["order"], 10);
+
     for path in [
         &ep_paths[0],
         &repeated_episode_paths[0],
         &repeated_episode_paths[1],
         &untitled_paths[0],
         &untitled_paths[1],
+        &legacy_md_paths[0],
+        &legacy_md_paths[1],
+        &empty_epid_paths[0],
     ] {
         assert!(
             cloud_snapshot_item_for_path(items, path)["collection"].is_null(),

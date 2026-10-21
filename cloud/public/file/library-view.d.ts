@@ -85,6 +85,7 @@ export function mediaSnapshotInfo(descriptor: MediaLibraryDescriptor | null | un
 export function mediaSnapshotOmissionNotice(descriptor: MediaLibraryDescriptor | null | undefined, snapshot: unknown): string;
 export function operationLibraryId(operation: Record<string, unknown> | null | undefined): string;
 export function operationMatchesLibrary(operation: Record<string, unknown> | null | undefined, libraryId: string): boolean;
+export function collectionIdentity(collection: unknown): string;
 export function filterLibraryItems<T extends LibraryViewItem>(
   items: readonly T[] | null | undefined,
   filters?: { query?: string; category?: string; status?: string },

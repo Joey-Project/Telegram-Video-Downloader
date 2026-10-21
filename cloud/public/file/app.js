@@ -11,7 +11,7 @@ import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewableP
 import { sourceIdUrl } from "./source-links.js";
 import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
 import { validateTargetRelativeDirectory } from "./target-directory.js";
-import { boundedFolderSuggestions, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget, statusOf } from "./library-view.js";
+import { boundedFolderSuggestions, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnRegisteredMediaLibrary, collectionIdentity, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget, statusOf } from "./library-view.js";
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
 import { renderMigrationDiscoveryWarnings, renderMigrationHistory } from "./migration-rendering.js";
 import { createMigrationRefreshQueuedCallback, inspectMigrationRefreshHistory, migrationPreviewDraftKey, migrationPreviewEntries as collectMigrationPreviewEntries, migrationPreviewPageWindow, reconcileMigrationRefreshDrafts, releaseMigrationRefreshTracking, renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
@@ -767,10 +767,11 @@ function renderGroupedItems(container, items, page, scope, selectionEnabled = tr
   const renderedGroups = groups.map(({ title, items: entries }, index) => {
     const selectableEntries = presentMediaItems(entries);
     const groupIds = selectableEntries.map((item) => String(item.id));
+    const groupKey = collectionIdentity(entries[0]?.collection);
     const allSelected = groupIds.length > 0 && groupIds.every((id) => state.selected.has(id));
     const someSelected = groupIds.some((id) => state.selected.has(id));
     return `<details class="collection-group" ${index < 3 ? "open" : ""}>
-      <summary><input class="group-check" type="checkbox" aria-label="Select available ${escapeHtml(title)} items on this page" data-select-group="${escapeHtml(title)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${selectableEntries.length && selectionEnabled ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count">${entries.length} file${entries.length === 1 ? "" : "s"} on this page</span></summary>
+      <summary><input class="group-check" type="checkbox" aria-label="Select available ${escapeHtml(title)} items on this page" data-select-group="${escapeHtml(groupKey)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${selectableEntries.length && selectionEnabled ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count">${entries.length} file${entries.length === 1 ? "" : "s"} on this page</span></summary>
       <div class="collection-items">${entries.map((item) => itemRow(item, selectionEnabled)).join("")}</div>
     </details>`;
   }).join("");
@@ -1674,10 +1675,10 @@ function bindEvents() {
     const groupCheckbox = event.target.closest("[data-select-group]");
     if (groupCheckbox) {
       if (!libraryCanOperate()) { renderLibrary(); return; }
-      const groupTitle = groupCheckbox.dataset.selectGroup;
+      const groupIdentity = groupCheckbox.dataset.selectGroup;
       const scope = state.view === "needs" ? "needs" : "library";
       const visibleItems = pageItemsForScope(scope);
-      const groupItems = presentMediaItems(visibleItems.filter((item) => (item.collection?.title ?? item.collection ?? "Uncollected") === groupTitle));
+      const groupItems = presentMediaItems(visibleItems.filter((item) => collectionIdentity(item?.collection) === groupIdentity));
       const omittedCount = updateSelectedItems(groupItems.map((item) => String(item.id)), groupCheckbox.checked);
       renderLibrary();
       if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));

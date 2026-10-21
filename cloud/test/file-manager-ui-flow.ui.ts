@@ -43,6 +43,9 @@ const ownerSnapshot = {
         items: [
           { id: "item-alpha", title: "Alpha video", relative_path: "Films/Alpha.mkv", presence: "present", bytes: 1024 },
           { id: "item-beta", title: "Beta video", relative_path: "Films/Beta.mkv", presence: "present", bytes: 2048 },
+          { id: "series-a-1", title: "Shared episode 1", relative_path: "Series/A1.mkv", presence: "present", collection: { id: "series-a", title: "Shared Series", kind: "series", order: 1 } },
+          { id: "series-a-2", title: "Shared episode 2", relative_path: "Series/A2.mkv", presence: "present", collection: { id: "series-a", title: "Shared Series renamed", kind: "series", order: 2 } },
+          { id: "series-b-1", title: "Shared episode 3", relative_path: "Series/B1.mkv", presence: "present", collection: { id: "series-b", title: "Shared Series", kind: "series", order: 1 } },
         ],
       },
     }],
@@ -118,6 +121,16 @@ describe("file manager UI flow", () => {
     element<HTMLButtonElement>(".detail-panel .detail-close").click();
     expect(document.querySelector(".detail-panel")).toBeNull();
 
+    const sameTitleGroupChecks = [...document.querySelectorAll<HTMLInputElement>("#library-list [data-select-group]")]
+      .filter((checkbox) => checkbox.closest("summary")?.querySelector("span")?.textContent === "Shared Series");
+    expect(sameTitleGroupChecks).toHaveLength(2);
+    const firstSameTitleGroupCheck = sameTitleGroupChecks[0];
+    if (!firstSameTitleGroupCheck) throw new Error("Expected a group checkbox for the first collection identity");
+    firstSameTitleGroupCheck.click();
+    expect([...document.querySelectorAll<HTMLInputElement>("#library-list [data-select-item]:checked")].map((checkbox) => checkbox.dataset.selectItem).sort()).toEqual(["series-a-1", "series-a-2"]);
+    element<HTMLButtonElement>("#clear-selection").click();
+    expect(document.querySelectorAll<HTMLInputElement>("[data-select-item]:checked")).toHaveLength(0);
+
     const tray = element<HTMLElement>("#selection-actions");
     expect(tray.classList.contains("hidden")).toBe(true);
     element<HTMLInputElement>('[data-select-item="item-alpha"]').click();
@@ -125,15 +138,15 @@ describe("file manager UI flow", () => {
     expect(element<HTMLElement>("#selection-count").textContent).toBe("1 item selected");
 
     element<HTMLButtonElement>("#select-visible").click();
-    expect(element<HTMLElement>("#selection-count").textContent).toBe("2 items selected");
+    expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected");
     const search = element<HTMLInputElement>("#search-input");
     search.value = "Beta";
     search.dispatchEvent(new Event("input", { bubbles: true }));
-    expect(element<HTMLElement>("#selection-count").textContent).toBe("2 items selected");
+    expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected");
 
     element<HTMLButtonElement>("#refresh-button").click();
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
-    await vi.waitFor(() => expect(element<HTMLElement>("#selection-count").textContent).toBe("2 items selected"));
+    await vi.waitFor(() => expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected"));
     element<HTMLButtonElement>("#clear-selection").click();
     expect(tray.classList.contains("hidden")).toBe(true);
     expect(document.querySelectorAll<HTMLInputElement>("[data-select-item]:checked")).toHaveLength(0);
