@@ -1378,12 +1378,22 @@ async fn media_library_settings_and_scoped_file_management_mock_e2e() {
         .find(|library| library.name == "Archive")
         .expect("registered library should be listed")
         .id;
+    let archive_binding = queue
+        .registry_snapshot()
+        .unwrap()
+        .libraries
+        .into_iter()
+        .find(|library| library.id == archive_id)
+        .unwrap()
+        .root_binding_token()
+        .unwrap();
     let changed = run_library_management_test_request(
         &runtime,
         702,
         "library_set_default",
         serde_json::json!({
             "library_id": archive_id,
+            "root_binding": archive_binding,
         }),
     )
     .await;
@@ -1511,6 +1521,7 @@ async fn media_library_settings_and_scoped_file_management_mock_e2e() {
         "library_remove",
         serde_json::json!({
             "library_id": archive_id,
+            "root_binding": archive_binding,
         }),
     )
     .await;
@@ -2080,6 +2091,15 @@ async fn explicit_library_download_survives_default_change_mock_telegram_e2e() {
         "library_set_default",
         serde_json::json!({
             "library_id": original_id,
+            "root_binding": queue
+                .registry_snapshot()
+                .unwrap()
+                .libraries
+                .into_iter()
+                .find(|library| library.id == original_id)
+                .unwrap()
+                .root_binding_token()
+                .unwrap(),
         }),
     )
     .await;

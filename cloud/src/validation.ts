@@ -1,6 +1,7 @@
 import { HttpError } from "./types";
 import type {
   ActionRequest,
+  BoundLibraryMutationIdentity,
   CollectionMetadata,
   FilePreviewPayload,
   LocalSnapshot,
@@ -323,6 +324,21 @@ function parseOptionalRootBinding(value: unknown, field: string): void {
   }
 }
 
+function parseRequiredRootBinding(value: unknown): string {
+  if (typeof value !== "string" || UTF8_ENCODER.encode(value).byteLength !== 67
+      || !/^v1:[0-9a-f]{64}$/u.test(value)) {
+    throw new HttpError(400, "root_binding must be an opaque root identity token");
+  }
+  return value;
+}
+
+function parseBoundLibraryMutationIdentity(value: Record<string, unknown>): BoundLibraryMutationIdentity {
+  return {
+    library_id: parseLibraryId(value.library_id),
+    root_binding: parseRequiredRootBinding(value.root_binding),
+  };
+}
+
 function parseLibraryName(value: unknown, field = "name"): string {
   return boundedUtf8String(value, field, 100);
 }
@@ -404,21 +420,24 @@ function parseSettingsAction(kind: string, value: Record<string, unknown>): Reco
     }
     case "library_set_default":
     case "library_remove": {
-      if (!onlyKeys(value, ["library_id"])) throw new HttpError(400, `${kind} payload has an invalid shape`);
-      return { library_id: parseLibraryId(value.library_id) };
+      if (!onlyKeys(value, ["library_id", "root_binding"])) throw new HttpError(400, `${kind} payload has an invalid shape`);
+      return parseBoundLibraryMutationIdentity(value);
     }
     case "library_set_category": {
-      if (!onlyKeys(value, ["library_id", "default_category"])) {
+      if (!onlyKeys(value, ["library_id", "root_binding", "default_category"])) {
         throw new HttpError(400, "library_set_category payload has an invalid shape");
       }
       return {
-        library_id: parseLibraryId(value.library_id),
+        ...parseBoundLibraryMutationIdentity(value),
         default_category: parseRelativeDirectory(value.default_category),
       };
     }
     case "library_rename": {
-      if (!onlyKeys(value, ["library_id", "name"])) throw new HttpError(400, "library_rename payload has an invalid shape");
-      return { library_id: parseLibraryId(value.library_id), name: parseLibraryName(value.name) };
+      if (!onlyKeys(value, ["library_id", "root_binding", "name"])) throw new HttpError(400, "library_rename payload has an invalid shape");
+      return {
+        ...parseBoundLibraryMutationIdentity(value),
+        name: parseLibraryName(value.name),
+      };
     }
     default:
       throw new HttpError(400, "kind is not supported");

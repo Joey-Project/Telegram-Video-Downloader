@@ -14,7 +14,7 @@ import { validateTargetRelativeDirectory } from "./target-directory.js";
 import { boundedFolderSuggestions, buildMigrationPreviewPayload, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget, statusOf } from "./library-view.js";
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
 import { renderMigrationHistory } from "./migration-rendering.js";
-import { renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
+import { migrationPreviewDraftKey, migrationPreviewPageWindow, renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
 import { inspectDownloadSubmissionHistory, releaseDownloadSubmissionTracking } from "./download-submission-history.js";
 
 const API = "/api";
@@ -919,7 +919,7 @@ function migrationPreviewEntries() {
     const result = operation.result && typeof operation.result === "object" ? operation.result : {};
     active.push({
       ...operation,
-      id: result.id ?? result.preview_id ?? operation.preview_id,
+      id: operation.preview_id ?? result.id ?? result.preview_id ?? operation.id,
       result,
       incomplete: operation.details_incomplete === true || operation.result_truncated === true || result.incomplete === true,
     });
@@ -932,7 +932,8 @@ function migrationPreviewEntries() {
     const id = operation.id ?? result.id ?? result.preview_id;
     const revision = operation.revision ?? result.revision;
     if (id && revision) {
-      const key = `${id}:${revision}`;
+      const key = migrationPreviewDraftKey(id, revision);
+      if (!key) continue;
       const existing = unique.get(key);
       if (!existing || existing.incomplete && !operation.incomplete) {
         unique.set(key, { ...operation, id, revision });
@@ -942,12 +943,53 @@ function migrationPreviewEntries() {
   return [...unique.values()].slice(-8).reverse();
 }
 
+function migrationConflictDraft(previewId, revision) {
+  const key = migrationPreviewDraftKey(previewId, revision);
+  return key ? state.migrationConflictDrafts.get(key) ?? null : null;
+}
+
+function saveMigrationConflictDraft(previewId, revision, draft) {
+  const key = migrationPreviewDraftKey(previewId, revision);
+  if (!key) return null;
+  state.migrationConflictDrafts.set(key, { ...draft, previewId, revision });
+  return key;
+}
+
+function deleteMigrationConflictDraft(previewId, revision) {
+  const key = migrationPreviewDraftKey(previewId, revision);
+  if (!key) return;
+  state.migrationConflictDrafts.delete(key);
+  state.migrationConflictInvalidated.delete(key);
+}
+
+function retireMigrationConflictDrafts(previews) {
+  const liveKeys = new Set(previews.map((preview) => migrationPreviewDraftKey(preview.id, preview.revision)));
+  const snapshots = [
+    ...(Array.isArray(state.snapshot?.previews) ? state.snapshot.previews : []),
+    ...(Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []),
+  ];
+  const retainedRefreshSequences = new Set(snapshots
+    .filter((entry) => entry?.kind === "library_migration_preview" && Number.isSafeInteger(entry.seq))
+    .map((entry) => entry.seq));
+  const retainedRequestIds = new Set(readActionQueue().map((action) => action.request_id));
+  for (const [key, draft] of state.migrationConflictDrafts) {
+    if (liveKeys.has(key)
+      || typeof draft.refreshRequestId === "string" && retainedRequestIds.has(draft.refreshRequestId)
+      || Number.isSafeInteger(draft.refreshSeq) && retainedRefreshSequences.has(draft.refreshSeq)) continue;
+    state.migrationConflictDrafts.delete(key);
+    state.migrationConflictInvalidated.delete(key);
+  }
+  for (const key of state.migrationConflictInvalidated) {
+    if (!state.migrationConflictDrafts.has(key) && !liveKeys.has(key)) state.migrationConflictInvalidated.delete(key);
+  }
+}
+
 function settleMigrationConflictRefreshes() {
   const snapshots = [
     ...(Array.isArray(state.snapshot?.previews) ? state.snapshot.previews : []),
     ...(Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []),
   ];
-  for (const [previewId, draft] of state.migrationConflictDrafts) {
+  for (const [draftKey, draft] of state.migrationConflictDrafts) {
     if (!Number.isSafeInteger(draft.refreshSeq)) continue;
     const operation = snapshots.find((entry) => entry?.kind === "library_migration_preview" && entry.seq === draft.refreshSeq);
     if (!operation) continue;
@@ -955,8 +997,12 @@ function settleMigrationConflictRefreshes() {
       ? operation.result
       : operation.preview && typeof operation.preview === "object" ? operation.preview : {};
     if (operation.status === "awaiting_confirmation") {
-      if (migrationRefreshMatches(result, draft.refreshPayload) && (result.id ?? result.preview_id) !== previewId) {
-        state.migrationConflictDrafts.delete(previewId);
+      const replacementId = result.id ?? result.preview_id ?? operation.preview_id ?? operation.id;
+      const replacementRevision = result.revision ?? operation.revision;
+      const replacementKey = migrationPreviewDraftKey(replacementId, replacementRevision);
+      if (migrationRefreshMatches(result, draft.refreshPayload) && replacementKey && replacementKey !== draftKey) {
+        state.migrationConflictDrafts.delete(draftKey);
+        state.migrationConflictInvalidated.delete(draftKey);
         continue;
       }
       if (operation.details_incomplete !== true && operation.result_truncated !== true) {
@@ -974,11 +1020,12 @@ function settleMigrationConflictRefreshes() {
 
 function renderMigrationPreview(operation) {
   const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
-  const id = String(result.id ?? result.preview_id ?? operation?.preview_id ?? operation?.id ?? "");
+  const id = String(operation?.preview_id ?? operation?.id ?? result.id ?? result.preview_id ?? "");
+  const revision = String(operation?.revision ?? result.revision ?? "");
   const sourceLibraryId = migrationLibraryId(operation, result, "source_library_id");
   const targetLibraryId = migrationLibraryId(operation, result, "target_library_id");
   const endpoints = migrationEndpointAvailability(state.snapshot, sourceLibraryId, targetLibraryId);
-  const draft = state.migrationConflictDrafts.get(id);
+  const draft = migrationConflictDraft(id, revision);
   const savedConflicts = normalizeMigrationItemConflicts(result.item_conflicts);
   const draftConflicts = draft ? normalizeMigrationItemConflicts(draft.itemConflicts) : savedConflicts;
   const choicesChanged = Boolean(draft && migrationConflictChoicesChanged(savedConflicts, draftConflicts));
@@ -987,15 +1034,17 @@ function renderMigrationPreview(operation) {
     sourceAvailable: endpoints.sourceAvailable,
     targetAvailable: endpoints.targetAvailable,
     draft,
+    page: draft?.page,
     draftChanged: choicesChanged,
     refreshPending: Boolean(draft?.refreshRequestId),
-    invalidated: state.migrationConflictInvalidated.has(id),
+    invalidated: state.migrationConflictInvalidated.has(migrationPreviewDraftKey(id, revision)),
   });
 }
 
 function renderMigrations() {
   migrationTargetOptions();
   const previews = migrationPreviewEntries();
+  retireMigrationConflictDrafts(previews);
   byId("migration-preview-list").innerHTML = previews.map(renderMigrationPreview).join("");
   byId("migration-progress-list").innerHTML = renderMigrationHistory({
     migrations: state.snapshot?.library?.migrations,
@@ -1448,10 +1497,12 @@ function bindEvents() {
     const migrationConflict = event.target.closest("[data-migration-conflict-item]");
     if (migrationConflict) {
       const previewId = migrationConflict.dataset.migrationPreviewId;
+      const revision = migrationConflict.dataset.migrationPreviewRevision;
       const itemId = migrationConflict.dataset.migrationConflictItem;
-      const operation = migrationPreviewEntries().find((entry) => entry.id === previewId);
+      const operation = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === revision);
+      if (!operation) return;
       const result = operation?.result ?? {};
-      const existing = state.migrationConflictDrafts.get(previewId);
+      const existing = migrationConflictDraft(previewId, revision);
       const defaultPolicy = result.conflict === "keep_both" ? "keep_both" : "skip";
       const current = normalizeMigrationItemConflicts(existing?.itemConflicts ?? result.item_conflicts);
       const next = setMigrationConflictChoice(current, itemId, migrationConflict.value, defaultPolicy);
@@ -1460,12 +1511,15 @@ function bindEvents() {
         showToast(`Per-bundle conflict overrides are limited to ${MAX_MIGRATION_ITEM_CONFLICTS.toLocaleString()} bundles.`);
         return;
       }
-      if (migrationConflictChoicesChanged(result.item_conflicts, next)) {
-        state.migrationConflictDrafts.set(previewId, { ...existing, itemConflicts: next, refreshError: null });
-        state.migrationConflictInvalidated.add(previewId);
+      const choicesChanged = migrationConflictChoicesChanged(result.item_conflicts, next);
+      const updatedDraft = { ...existing, previewId, revision, itemConflicts: next, page: existing?.page ?? 0, refreshError: null };
+      const draftHasPendingWork = Boolean(updatedDraft.refreshRequestId || Number.isSafeInteger(updatedDraft.refreshSeq) || updatedDraft.refreshError);
+      if (choicesChanged || updatedDraft.page > 0 || draftHasPendingWork) {
+        const key = saveMigrationConflictDraft(previewId, revision, updatedDraft);
+        if (choicesChanged) state.migrationConflictInvalidated.add(key);
+        else state.migrationConflictInvalidated.delete(key);
       } else {
-        state.migrationConflictDrafts.delete(previewId);
-        state.migrationConflictInvalidated.delete(previewId);
+        deleteMigrationConflictDraft(previewId, revision);
       }
       renderMigrations();
       return;
@@ -1520,10 +1574,37 @@ function bindEvents() {
     if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
   });
   document.body.addEventListener("click", (event) => {
+    const migrationPage = event.target.closest("[data-migration-preview-page]");
+    if (migrationPage) {
+      const previewId = migrationPage.dataset.migrationPreviewPage;
+      const revision = migrationPage.dataset.migrationPreviewRevision;
+      const operation = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === revision);
+      const direction = Number(migrationPage.dataset.pageDirection);
+      const files = Array.isArray(operation?.result?.items) ? operation.result.items : [];
+      if (!operation || ![-1, 1].includes(direction)) return;
+      const existing = migrationConflictDraft(previewId, revision);
+      const page = migrationPreviewPageWindow(files.length, existing?.page);
+      const nextPage = migrationPreviewPageWindow(files.length, page.page + direction).page;
+      if (nextPage === page.page) return;
+      const baseline = normalizeMigrationItemConflicts(operation.result?.item_conflicts);
+      const draft = {
+        ...existing,
+        previewId,
+        revision,
+        itemConflicts: normalizeMigrationItemConflicts(existing?.itemConflicts ?? baseline),
+        page: nextPage,
+      };
+      const key = saveMigrationConflictDraft(previewId, revision, draft);
+      if (migrationConflictChoicesChanged(baseline, draft.itemConflicts)) state.migrationConflictInvalidated.add(key);
+      renderMigrations();
+      return;
+    }
     const migrationRefresh = event.target.closest("[data-migration-refresh-conflicts]");
     if (migrationRefresh) {
       const previewId = migrationRefresh.dataset.migrationRefreshConflicts;
-      const operation = migrationPreviewEntries().find((entry) => entry.id === previewId);
+      const revision = migrationRefresh.dataset.migrationPreviewRevision;
+      const operation = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === revision);
+      if (!operation) return;
       const sourceLibraryId = migrationLibraryId(operation, operation?.result ?? {}, "source_library_id");
       const targetLibraryId = migrationLibraryId(operation, operation?.result ?? {}, "target_library_id");
       const endpoints = migrationEndpointAvailability(state.snapshot, sourceLibraryId, targetLibraryId);
@@ -1531,7 +1612,7 @@ function bindEvents() {
         showToast("This source library is offline or showing a saved scan. Reconnect it before refreshing the preview.");
         return;
       }
-      const draft = state.migrationConflictDrafts.get(previewId);
+      const draft = migrationConflictDraft(previewId, revision);
       const payload = buildMigrationPreviewRefreshPayload(operation?.result, draft?.itemConflicts, {
         seq: operation?.seq,
         id: operation?.id,
@@ -1544,7 +1625,7 @@ function bindEvents() {
       migrationRefresh.disabled = true;
       submitAction("library_migration_preview", payload, {
         onQueued(action) {
-          state.migrationConflictDrafts.set(previewId, {
+          const key = saveMigrationConflictDraft(previewId, revision, {
             ...draft,
             refreshRequestId: action.request_id,
             rejectedRefreshRequestId: null,
@@ -1552,11 +1633,12 @@ function bindEvents() {
             refreshSeq: null,
             refreshError: null,
           });
+          if (migrationConflictChoicesChanged(result.item_conflicts, draft?.itemConflicts)) state.migrationConflictInvalidated.add(key);
           renderMigrations();
         },
       }).then((queued) => {
         if (!queued) {
-          const current = state.migrationConflictDrafts.get(previewId);
+          const current = migrationConflictDraft(previewId, revision);
           if (current && !current.refreshRequestId) {
             current.refreshError = "The refreshed preview could not be queued. Try again when the connection is ready.";
             renderMigrations();
@@ -1642,8 +1724,10 @@ function bindEvents() {
         return;
       }
       const saved = normalizeMigrationItemConflicts(matchingPreview?.result?.item_conflicts);
-      const draft = state.migrationConflictDrafts.get(previewId);
-      if (!matchingPreview || state.migrationConflictInvalidated.has(previewId) || draft && migrationConflictChoicesChanged(saved, draft.itemConflicts)) {
+      const revision = migrationConfirm.dataset.revision;
+      const draft = migrationConflictDraft(previewId, revision);
+      const draftKey = migrationPreviewDraftKey(previewId, revision);
+      if (!matchingPreview || state.migrationConflictInvalidated.has(draftKey) || draft && migrationConflictChoicesChanged(saved, draft.itemConflicts)) {
         showToast("Conflict choices changed. Refresh the preview before confirming the migration.");
         return;
       }

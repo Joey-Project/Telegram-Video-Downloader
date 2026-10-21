@@ -52,6 +52,18 @@ fn create_migration_fixture(
     (fixture, queue, inbox)
 }
 
+fn library_root_binding(queue: &QueueManager, library_id: &str) -> String {
+    queue
+        .registry_snapshot()
+        .expect("library registry should load")
+        .libraries
+        .into_iter()
+        .find(|library| library.id == library_id)
+        .expect("library should be registered")
+        .root_binding_token()
+        .expect("registered library should have a bound root token")
+}
+
 fn migration_engine_for_test(
     runtime: &CloudBotRuntime,
     source_library_id: &str,
@@ -747,7 +759,9 @@ async fn migration_pause_survives_runtime_restart_until_explicit_resume() {
         &runtime,
         1_103,
         "library_scan",
-        serde_json::json!({"library_id": fixture.source_library_id}),
+        serde_json::json!({
+            "library_id": fixture.source_library_id,
+        }),
     )
     .await;
     assert_eq!(scan.status, InboxStatus::Failed, "{:?}", scan.error);
@@ -1134,7 +1148,10 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         &reopened_runtime,
         2_802,
         "library_remove",
-        serde_json::json!({"library_id": fixture.source_library_id}),
+        serde_json::json!({
+            "library_id": fixture.source_library_id,
+            "root_binding": library_root_binding(&reopened_queue, &fixture.source_library_id),
+        }),
     )
     .await;
     assert_eq!(
@@ -1183,7 +1200,10 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         &reopened_runtime,
         2_804,
         "library_remove",
-        serde_json::json!({"library_id": fixture.source_library_id}),
+        serde_json::json!({
+            "library_id": fixture.source_library_id,
+            "root_binding": library_root_binding(&reopened_queue, &fixture.source_library_id),
+        }),
     )
     .await;
     assert_eq!(cleanup_blocked_removal.status, InboxStatus::Failed);
@@ -1290,7 +1310,10 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         &reopened_runtime,
         2_805,
         "library_remove",
-        serde_json::json!({"library_id": fixture.source_library_id}),
+        serde_json::json!({
+            "library_id": fixture.source_library_id,
+            "root_binding": library_root_binding(&reopened_queue, &fixture.source_library_id),
+        }),
     )
     .await;
     assert_eq!(
@@ -2979,7 +3002,10 @@ async fn completed_default_finalization_requires_new_epoch_authorization_and_blo
         &reopened_runtime,
         3_102,
         "library_remove",
-        serde_json::json!({"library_id": fixture.target_library_id}),
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": library_root_binding(&reopened_queue, &fixture.target_library_id),
+        }),
     )
     .await;
     assert_eq!(remove_before_finalize.status, InboxStatus::Failed);
@@ -3428,6 +3454,416 @@ async fn stopped_target_installed_handoff_reauthorizes_once_and_keeps_dispatch_r
     drop(reopened_runtime);
     drop(reopened_inbox);
     drop(reopened_queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[tokio::test]
+async fn stale_settings_bindings_cannot_mutate_a_reregistered_same_root() {
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "stale-settings-registration-binding",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let archive_media = fixture.archive_root.join("keep.mp4");
+    fs::write(&archive_media, b"registered library B media")
+        .expect("archive media should be available for the stale-action checks");
+    let first_root = crate::safe_fs::RootedFs::new(&fixture.archive_root)
+        .expect("A root should open")
+        .root_identity();
+    let runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+
+    let first_binding = library_root_binding(&queue, &fixture.target_library_id);
+    let removed_first = run_library_management_test_request(
+        &runtime,
+        31_001,
+        "library_remove",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": first_binding,
+        }),
+    )
+    .await;
+    assert_eq!(
+        removed_first.status,
+        InboxStatus::Completed,
+        "{:?}",
+        removed_first.error
+    );
+
+    let scoped_metadata = fixture
+        .archive_root
+        .join(".telegram-video-downloader-library");
+    if scoped_metadata.exists() {
+        fs::remove_dir_all(&scoped_metadata)
+            .expect("the migration preflight metadata from A should be removed in this fixture");
+    }
+    assert!(
+        !scoped_metadata.exists(),
+        "the same-root B fixture starts without library-manager metadata"
+    );
+
+    let registered_second = run_library_management_test_request(
+        &runtime,
+        31_002,
+        "library_register",
+        serde_json::json!({
+            "name": "Archive B",
+            "path": fixture.archive_root,
+            "set_default": false,
+            "create_directory": false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        registered_second.status,
+        InboxStatus::Completed,
+        "{:?}",
+        registered_second.error
+    );
+    let registered_b = queue
+        .registry_snapshot()
+        .expect("registry should list B")
+        .libraries
+        .into_iter()
+        .find(|library| library.name == "Archive B")
+        .expect("B should be registered");
+    assert_eq!(
+        registered_b.id, fixture.target_library_id,
+        "the path-derived ID is intentionally reused"
+    );
+    let second_root = crate::safe_fs::RootedFs::new(&fixture.archive_root)
+        .expect("same-root B should open")
+        .root_identity();
+    assert_eq!(
+        queue
+            .registry_snapshot()
+            .unwrap()
+            .libraries
+            .iter()
+            .find(|library| library.id == fixture.target_library_id)
+            .and_then(|library| library.root_binding_token())
+            .as_deref(),
+        Some(registered_b.root_binding_token().unwrap().as_str())
+    );
+    let second_binding = registered_b
+        .root_binding_token()
+        .expect("B should have a displayed registration identity");
+    assert_ne!(
+        second_binding, first_binding,
+        "a new registration of the same directory object gets a fresh opaque identity"
+    );
+    assert_eq!(
+        first_root, second_root,
+        "A and B use the same directory object in this regression"
+    );
+
+    let child = fixture.archive_root.join("ordinary-child");
+    fs::create_dir(&child).expect("ordinary child should create");
+    fs::remove_dir(&child).expect("ordinary child should remove");
+    assert_eq!(
+        library_root_binding(&queue, &fixture.target_library_id),
+        second_binding,
+        "child-entry churn does not invalidate B's displayed identity"
+    );
+
+    let registry_path = crate::media_libraries::registry_path(None, &fixture.video_root)
+        .expect("registry path should resolve");
+    let before_stale = queue.registry_snapshot().unwrap();
+    let registry_bytes_before = fs::read(&registry_path).expect("registry bytes should read");
+    let stale_actions = [
+        (
+            "library_set_default",
+            serde_json::json!({
+                "library_id": fixture.target_library_id,
+                "root_binding": first_binding,
+            }),
+        ),
+        (
+            "library_set_category",
+            serde_json::json!({
+                "library_id": fixture.target_library_id,
+                "root_binding": first_binding,
+                "default_category": "Stale category",
+            }),
+        ),
+        (
+            "library_rename",
+            serde_json::json!({
+                "library_id": fixture.target_library_id,
+                "root_binding": first_binding,
+                "name": "Stale name",
+            }),
+        ),
+        (
+            "library_remove",
+            serde_json::json!({
+                "library_id": fixture.target_library_id,
+                "root_binding": first_binding,
+            }),
+        ),
+    ];
+    for (offset, (kind, payload)) in stale_actions.into_iter().enumerate() {
+        let result =
+            run_library_management_test_request(&runtime, 31_010 + offset as u64, kind, payload)
+                .await;
+        assert_eq!(
+            result.status,
+            InboxStatus::Failed,
+            "{kind} must reject A's token"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("library root identity changed")),
+            "{kind} should report a stale displayed identity: {:?}",
+            result.error
+        );
+    }
+
+    for (seq, payload) in [
+        (
+            31_020,
+            serde_json::json!({
+                "library_id": fixture.target_library_id,
+                "name": "Missing binding",
+            }),
+        ),
+        (
+            31_021,
+            serde_json::json!({
+                "library_id": fixture.target_library_id,
+                "root_binding": "v1:not-a-token",
+                "default_category": "Invalid binding",
+            }),
+        ),
+    ] {
+        let result = run_library_management_test_request(
+            &runtime,
+            seq,
+            if seq == 31_020 {
+                "library_rename"
+            } else {
+                "library_set_category"
+            },
+            payload,
+        )
+        .await;
+        assert_eq!(result.status, InboxStatus::Failed);
+    }
+
+    assert_eq!(queue.registry_snapshot().unwrap(), before_stale);
+    assert_eq!(
+        fs::read(&registry_path).unwrap(),
+        registry_bytes_before,
+        "stale or incomplete actions do not rewrite the registry"
+    );
+    assert!(
+        !scoped_metadata.exists(),
+        "stale removal must reject before opening B's library manager"
+    );
+    assert_eq!(
+        fs::read(&archive_media).unwrap(),
+        b"registered library B media",
+        "stale actions preserve B's media bytes"
+    );
+
+    let selected_b = run_library_management_test_request(
+        &runtime,
+        31_030,
+        "library_set_default",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": second_binding,
+        }),
+    )
+    .await;
+    assert_eq!(
+        selected_b.status,
+        InboxStatus::Completed,
+        "{:?}",
+        selected_b.error
+    );
+    let category_b = run_library_management_test_request(
+        &runtime,
+        31_031,
+        "library_set_category",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": second_binding,
+            "default_category": "Films",
+        }),
+    )
+    .await;
+    assert_eq!(
+        category_b.status,
+        InboxStatus::Completed,
+        "{:?}",
+        category_b.error
+    );
+    let rename_b = run_library_management_test_request(
+        &runtime,
+        31_032,
+        "library_rename",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": second_binding,
+            "name": "Archive B renamed",
+        }),
+    )
+    .await;
+    assert_eq!(
+        rename_b.status,
+        InboxStatus::Completed,
+        "{:?}",
+        rename_b.error
+    );
+    assert_eq!(
+        library_root_binding(&queue, &fixture.target_library_id),
+        second_binding,
+        "the token remains stable across category, name, and default changes"
+    );
+
+    let source_binding = library_root_binding(&queue, &fixture.source_library_id);
+    let restore_default = run_library_management_test_request(
+        &runtime,
+        31_033,
+        "library_set_default",
+        serde_json::json!({
+            "library_id": fixture.source_library_id,
+            "root_binding": source_binding,
+        }),
+    )
+    .await;
+    assert_eq!(restore_default.status, InboxStatus::Completed);
+    let remove_b = run_library_management_test_request(
+        &runtime,
+        31_034,
+        "library_remove",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": second_binding,
+        }),
+    )
+    .await;
+    assert_eq!(
+        remove_b.status,
+        InboxStatus::Completed,
+        "{:?}",
+        remove_b.error
+    );
+    assert_eq!(
+        fs::read(&archive_media).unwrap(),
+        b"registered library B media"
+    );
+
+    let displaced_archive = fixture.root.join("archive-displaced");
+    fs::rename(&fixture.archive_root, &displaced_archive)
+        .expect("removed B root should be movable in the replacement fixture");
+    fs::create_dir(&fixture.archive_root)
+        .expect("replacement root should reuse the registered pathname");
+    let replacement_media = fixture.archive_root.join("replacement.mp4");
+    fs::write(&replacement_media, b"replacement library media")
+        .expect("replacement media should be available");
+    let registered_c = run_library_management_test_request(
+        &runtime,
+        31_035,
+        "library_register",
+        serde_json::json!({
+            "name": "Archive C",
+            "path": fixture.archive_root,
+            "set_default": false,
+            "create_directory": false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        registered_c.status,
+        InboxStatus::Completed,
+        "{:?}",
+        registered_c.error
+    );
+    let replacement_library = queue
+        .registry_snapshot()
+        .expect("replacement registration should appear")
+        .libraries
+        .into_iter()
+        .find(|library| library.id == fixture.target_library_id)
+        .expect("path-derived ID should be reused for replacement C");
+    let replacement_binding = replacement_library
+        .root_binding_token()
+        .expect("replacement C should have an identity token");
+    assert_ne!(
+        replacement_binding, second_binding,
+        "the replacement object and registration must not reuse B's token"
+    );
+    let replacement_registry = queue.registry_snapshot().unwrap();
+    let replacement_registry_bytes = fs::read(&registry_path).unwrap();
+    let replacement_metadata = fixture
+        .archive_root
+        .join(".telegram-video-downloader-library");
+    assert!(!replacement_metadata.exists());
+    let stale_b_rename = run_library_management_test_request(
+        &runtime,
+        31_036,
+        "library_rename",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": second_binding,
+            "name": "Stale B rename",
+        }),
+    )
+    .await;
+    assert_eq!(stale_b_rename.status, InboxStatus::Failed);
+    assert!(
+        stale_b_rename
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("library root identity changed"))
+    );
+    assert_eq!(queue.registry_snapshot().unwrap(), replacement_registry);
+    assert_eq!(
+        fs::read(&registry_path).unwrap(),
+        replacement_registry_bytes
+    );
+    assert!(
+        !replacement_metadata.exists(),
+        "a stale token must not open the replacement library manager"
+    );
+    assert_eq!(
+        fs::read(&replacement_media).unwrap(),
+        b"replacement library media"
+    );
+    let remove_c = run_library_management_test_request(
+        &runtime,
+        31_037,
+        "library_remove",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": replacement_binding,
+        }),
+    )
+    .await;
+    assert_eq!(
+        remove_c.status,
+        InboxStatus::Completed,
+        "{:?}",
+        remove_c.error
+    );
+
+    runtime.signal_epoch_fatal();
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
     stop_fake_telegram_api(shutdown, server).await;
     let _ = fs::remove_dir_all(&fixture.root);
 }

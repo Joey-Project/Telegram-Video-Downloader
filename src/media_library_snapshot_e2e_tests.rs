@@ -859,6 +859,20 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
     let archive = queue
         .register_video_library("Archive", &archive_root, None, false, false)
         .expect("archive library should register");
+    let initial_settings = media_library_bot::applied_settings(&queue)
+        .expect("initial library bindings should serialize");
+    let binding_for = |settings: &Value, library_id: &str| {
+        settings["libraries"]
+            .as_array()
+            .expect("settings should include library descriptors")
+            .iter()
+            .find(|view| view["id"] == library_id)
+            .and_then(|view| view["root_binding"].as_str())
+            .expect("registered root should expose its binding")
+            .to_owned()
+    };
+    let source_binding = binding_for(&initial_settings, &source_id);
+    let archive_binding = binding_for(&initial_settings, &archive.id);
     let inbox = Arc::new(open_runtime_test_inbox(&video_root).expect("cloud inbox should open"));
     let runtime = make_runtime(
         telegram,
@@ -888,7 +902,7 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         &runtime,
         8_102,
         "library_set_default",
-        serde_json::json!({"library_id": archive.id}),
+        serde_json::json!({"library_id": archive.id, "root_binding": archive_binding}),
     )
     .await;
     assert_eq!(set_archive_default.status, InboxStatus::Completed);
@@ -925,6 +939,7 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         .and_then(|view| view["root_binding"].as_str())
         .expect("bound roots should publish an opaque identity token")
         .to_string();
+    assert_eq!(old_binding, archive_binding);
     assert_eq!(old_binding.len(), 67);
     assert!(old_binding.starts_with("v1:"));
     assert!(
@@ -988,7 +1003,7 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         &runtime,
         8_104,
         "library_remove",
-        serde_json::json!({"library_id": archive.id}),
+        serde_json::json!({"library_id": archive.id, "root_binding": old_binding}),
     )
     .await;
     assert_eq!(failed_remove.status, InboxStatus::Failed);
@@ -1021,7 +1036,7 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         &runtime,
         8_105,
         "library_set_default",
-        serde_json::json!({"library_id": source_id}),
+        serde_json::json!({"library_id": source_id, "root_binding": source_binding}),
     )
     .await;
     assert_eq!(restore_source_default.status, InboxStatus::Completed);
@@ -1059,7 +1074,7 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
     let request = CloudRequest {
         seq: 8_106,
         kind: "library_remove".to_string(),
-        payload: serde_json::json!({"library_id": archive.id}),
+        payload: serde_json::json!({"library_id": archive.id, "root_binding": old_binding}),
         created_at: now_millis(),
         extra: serde_json::Map::new(),
     };
@@ -1185,7 +1200,7 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
         &runtime,
         8_108,
         "library_set_default",
-        serde_json::json!({"library_id": archive.id}),
+        serde_json::json!({"library_id": archive.id, "root_binding": new_binding}),
     )
     .await;
     assert_eq!(set_readded_default.status, InboxStatus::Completed);

@@ -70,6 +70,11 @@ export interface ActionRequest {
   payload: Record<string, unknown>;
 }
 
+export interface BoundLibraryMutationIdentity extends Record<string, unknown> {
+  library_id: string;
+  root_binding: string;
+}
+
 export interface LocalSnapshot {
   revision?: string;
   state_version: number;

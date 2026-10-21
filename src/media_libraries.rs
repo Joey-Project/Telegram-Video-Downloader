@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -30,15 +31,17 @@ pub struct MediaLibrary {
     root_device: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     root_inode: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registration_nonce: Option<String>,
 }
 
 impl MediaLibrary {
-    /// Return a stable opaque token for the registered root directory object.
+    /// Return a stable opaque token for this registration and its root directory object.
     ///
-    /// The token intentionally binds only the library ID and the persisted root
-    /// device/inode pair. It is unaffected by child entries, timestamps, display
-    /// names, categories, or the selected default. Legacy registrations without
-    /// an adopted root identity have no token.
+    /// New registrations also bind a persisted registration nonce, distinguishing a removed
+    /// registration from a later registration of the same path and directory object. Legacy
+    /// entries without a nonce retain the original token calculation. Child entries, timestamps,
+    /// display names, categories, and the selected default are not part of the token.
     pub fn root_binding_token(&self) -> Option<String> {
         let (device, inode) = self.root_device.zip(self.root_inode)?;
         let library_id = self.id.as_bytes();
@@ -48,6 +51,10 @@ impl MediaLibrary {
         digest.update(library_id);
         digest.update(device.to_be_bytes());
         digest.update(inode.to_be_bytes());
+        if let Some(nonce) = &self.registration_nonce {
+            digest.update(b"registration-incarnation/v1\0");
+            digest.update(nonce.as_bytes());
+        }
         let digest = digest.finalize();
         Some(format!("v1:{}", hex_prefix(&digest, 64)))
     }
@@ -572,6 +579,7 @@ impl MediaLibraryRegistryStore {
             default_category: category,
             root_device: Some(root_id.device()),
             root_inode: Some(root_id.inode()),
+            registration_nonce: Some(new_registration_nonce()?),
         };
         if self.library(&library.id).is_some() {
             bail!("media library identifier collision");
@@ -1073,6 +1081,14 @@ fn validate_registry_shape(snapshot: &MediaLibrarySnapshot) -> Result<()> {
         if library.root_device.is_some() != library.root_inode.is_some() {
             bail!("media library settings contains an incomplete root identity binding");
         }
+        if library.registration_nonce.as_ref().is_some_and(|nonce| {
+            nonce.len() != 32
+                || !nonce
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            bail!("media library settings contains an invalid registration nonce");
+        }
         validate_name(&library.name)?;
         if !names.insert(library.name.as_str()) {
             bail!("media library names must be unique");
@@ -1168,7 +1184,17 @@ fn library_from_existing_root(
         // File Provider has supplied its authoritative directory descriptor.
         root_device: None,
         root_inode: None,
+        registration_nonce: None,
     })
+}
+
+fn new_registration_nonce() -> Result<String> {
+    let mut bytes = [0_u8; 16];
+    fs::File::open("/dev/urandom")
+        .context("failed to open the system random source for a media library registration")?
+        .read_exact(&mut bytes)
+        .context("failed to read a media library registration nonce")?;
+    Ok(hex_prefix(&bytes, 32))
 }
 
 pub(crate) fn prepare_library_root(path: &Path, create_directory: bool) -> Result<PathBuf> {
@@ -1949,7 +1975,7 @@ mod tests {
     }
 
     #[test]
-    fn root_binding_token_tracks_persisted_object_identity_only() {
+    fn legacy_root_binding_token_tracks_persisted_object_identity_only() {
         let directory = test_dir("root-binding-token");
         let root = directory.join("videos");
         let moved_original = directory.join("videos-original");
@@ -2036,6 +2062,71 @@ mod tests {
                 .as_deref(),
             Some(original_token.as_str()),
             "restoring the original directory object restores its stable token"
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn root_binding_token_distinguishes_same_object_reregistration() {
+        let directory = test_dir("root-binding-reregistration");
+        let default_root = directory.join("videos");
+        let archive_root = directory.join("archive");
+        fs::create_dir_all(&default_root).unwrap();
+        fs::create_dir_all(&archive_root).unwrap();
+
+        let mut registry = MediaLibraryRegistryStore::open(None, &default_root).unwrap();
+        let first = registry
+            .add("Archive A", &archive_root, None, false, false)
+            .unwrap();
+        let first_token = first.root_binding_token().unwrap();
+        let first_identity = RootedFs::new(&archive_root).unwrap().root_identity();
+        assert_eq!(
+            (first_identity.device(), first_identity.inode()),
+            registry.root_binding(&first.id).unwrap()
+        );
+
+        registry.remove(&first.id).unwrap();
+        let second = registry
+            .add("Archive B", &archive_root, None, false, false)
+            .unwrap();
+        assert_eq!(second.id, first.id, "library IDs remain path-derived");
+        assert_eq!(
+            RootedFs::new(&archive_root).unwrap().root_identity(),
+            first_identity,
+            "the same directory object remains registered at the same path"
+        );
+        let second_token = second.root_binding_token().unwrap();
+        assert_ne!(
+            second_token, first_token,
+            "a new registration incarnation must invalidate the old displayed token"
+        );
+
+        let child = archive_root.join("ordinary-child");
+        fs::create_dir(&child).unwrap();
+        fs::remove_dir(&child).unwrap();
+        registry.rename(&second.id, "Archive renamed").unwrap();
+        registry
+            .set_category(&second.id, Some(Path::new("Films")))
+            .unwrap();
+        assert_eq!(
+            registry
+                .library(&second.id)
+                .unwrap()
+                .root_binding_token()
+                .as_deref(),
+            Some(second_token.as_str()),
+            "ordinary child churn and descriptor edits do not change the registration token"
+        );
+
+        let reopened = MediaLibraryRegistryStore::open(None, &default_root).unwrap();
+        assert_eq!(
+            reopened
+                .library(&second.id)
+                .unwrap()
+                .root_binding_token()
+                .as_deref(),
+            Some(second_token.as_str()),
+            "the registration token survives a registry reopen"
         );
         let _ = fs::remove_dir_all(directory);
     }

@@ -1,7 +1,6 @@
 import { migrationControlActions, migrationHistoryNotice } from "./migration-conflicts.js";
 import { escapeHtml } from "./preview-rendering.js";
 
-export const MAX_VISIBLE_MIGRATIONS = 8;
 const MAX_FINALIZATION_WARNING_CHARS = 320;
 
 function formatBytes(value) {
@@ -108,5 +107,5 @@ export function renderMigrationHistory({ migrations, libraries = [], libraryId, 
   const notice = migrationHistoryNotice(omittedCount);
   const noticeMarkup = notice ? `<p class="field-hint">${escapeHtml(notice)}</p>` : "";
   // The backend has already ordered the bounded snapshot by recovery priority.
-  return `${noticeMarkup}${relevant.slice(0, MAX_VISIBLE_MIGRATIONS).map((migration) => renderMigrationProgress(migration, libraries)).join("")}`;
+  return `${noticeMarkup}${relevant.map((migration) => renderMigrationProgress(migration, libraries)).join("")}`;
 }

@@ -54,12 +54,14 @@ struct RegisterLibrary {
 #[serde(deny_unknown_fields)]
 struct LibraryId {
     library_id: String,
+    root_binding: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LibraryCategory {
     library_id: String,
+    root_binding: String,
     #[serde(default)]
     default_category: Option<String>,
 }
@@ -68,6 +70,7 @@ struct LibraryCategory {
 #[serde(deny_unknown_fields)]
 struct LibraryName {
     library_id: String,
+    root_binding: String,
     name: String,
 }
 
@@ -535,19 +538,34 @@ pub(super) async fn dispatch(
                 }
                 "library_set_default" => {
                     let payload: LibraryId = serde_json::from_value(payload)?;
-                    queue.set_default_video_library(&payload.library_id)?;
+                    queue.set_default_video_library_with_root_binding(
+                        &payload.library_id,
+                        &payload.root_binding,
+                    )?;
                 }
                 "library_set_category" => {
                     let payload: LibraryCategory = serde_json::from_value(payload)?;
                     let category = category_path(payload.default_category.as_deref())?;
-                    queue.set_video_library_category(&payload.library_id, category.as_deref())?;
+                    queue.set_video_library_category_with_root_binding(
+                        &payload.library_id,
+                        category.as_deref(),
+                        &payload.root_binding,
+                    )?;
                 }
                 "library_rename" => {
                     let payload: LibraryName = serde_json::from_value(payload)?;
-                    queue.rename_video_library(&payload.library_id, &payload.name)?;
+                    queue.rename_video_library_with_root_binding(
+                        &payload.library_id,
+                        &payload.name,
+                        &payload.root_binding,
+                    )?;
                 }
                 "library_remove" => {
                     let payload: LibraryId = serde_json::from_value(payload)?;
+                    queue.require_video_library_root_binding(
+                        &payload.library_id,
+                        &payload.root_binding,
+                    )?;
                     removed_was_original_library =
                         original_library_id_from_bot(&migration_runtime.bot)
                             .ok()
@@ -557,7 +575,10 @@ pub(super) async fn dispatch(
                         &migration_runtime,
                         &payload.library_id,
                     )?;
-                    queue.remove_video_library(&payload.library_id)?;
+                    queue.remove_video_library_with_root_binding(
+                        &payload.library_id,
+                        &payload.root_binding,
+                    )?;
                     removed_library_id = Some(payload.library_id);
                     default_library_after_remove = queue
                         .registry_snapshot()

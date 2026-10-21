@@ -57,6 +57,34 @@ const MAX_PERSISTED_MEDIA_HASH_BYTES: usize = 256 * 1024;
 const QUEUE_PAGE_SIZE: usize = 10;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn validate_library_root_binding_token(binding: &str) -> Result<()> {
+    if binding.len() != 67
+        || !binding.starts_with("v1:")
+        || !binding[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("root_binding must be an opaque root identity token");
+    }
+    Ok(())
+}
+
+fn require_registry_root_binding(
+    registry: &MediaLibraryRegistryStore,
+    library_id: &str,
+    expected_binding: &str,
+) -> Result<()> {
+    if registry
+        .library(library_id)
+        .and_then(MediaLibrary::root_binding_token)
+        .as_deref()
+        != Some(expected_binding)
+    {
+        bail!("library root identity changed; refresh settings and retry");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidecarMoveStatus {
     Moved,
@@ -1259,6 +1287,27 @@ impl QueueManager {
         Ok(())
     }
 
+    fn require_video_library_root_binding_unlocked(
+        &self,
+        library_id: &str,
+        expected_binding: &str,
+    ) -> Result<()> {
+        validate_library_root_binding_token(expected_binding)?;
+        let registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+        require_registry_root_binding(&registry, library_id, expected_binding)
+    }
+
+    /// Check the displayed identity before callers perform any root-dependent preflight work.
+    /// The final mutation APIs repeat this check while holding the queue operation lock.
+    pub fn require_video_library_root_binding(
+        &self,
+        library_id: &str,
+        expected_binding: &str,
+    ) -> Result<()> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        self.require_video_library_root_binding_unlocked(library_id, expected_binding)
+    }
+
     fn validate_pdf_task_config_root_unlocked(&self) -> Result<()> {
         self.pdf.root.validate_configured_root()?;
         let identity = self.pdf.root.root_identity();
@@ -1664,6 +1713,7 @@ impl QueueManager {
         Ok(library)
     }
 
+    #[cfg(test)]
     pub fn set_default_video_library(&self, library_id: &str) -> Result<MediaLibrarySnapshot> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         self.validate_video_library_for_settings_mutation_unlocked(library_id)?;
@@ -1672,6 +1722,22 @@ impl QueueManager {
             .lock()
             .map_err(poisoned_lock)?
             .set_default(library_id)?;
+        self.state_change_notify.notify_one();
+        Ok(snapshot)
+    }
+
+    pub fn set_default_video_library_with_root_binding(
+        &self,
+        library_id: &str,
+        expected_binding: &str,
+    ) -> Result<MediaLibrarySnapshot> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        self.require_video_library_root_binding_unlocked(library_id, expected_binding)?;
+        self.validate_video_library_for_settings_mutation_unlocked(library_id)?;
+        let mut registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+        require_registry_root_binding(&registry, library_id, expected_binding)?;
+        let snapshot = registry.set_default(library_id)?;
+        drop(registry);
         self.state_change_notify.notify_one();
         Ok(snapshot)
     }
@@ -1708,6 +1774,7 @@ impl QueueManager {
         Ok(outcome)
     }
 
+    #[cfg(test)]
     pub fn set_video_library_category(
         &self,
         library_id: &str,
@@ -1724,21 +1791,40 @@ impl QueueManager {
         Ok(snapshot)
     }
 
-    pub fn rename_video_library(
+    pub fn set_video_library_category_with_root_binding(
         &self,
         library_id: &str,
-        name: &str,
+        category: Option<&Path>,
+        expected_binding: &str,
     ) -> Result<MediaLibrarySnapshot> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
-        let snapshot = self
-            .media_libraries
-            .lock()
-            .map_err(poisoned_lock)?
-            .rename(library_id, name)?;
+        self.require_video_library_root_binding_unlocked(library_id, expected_binding)?;
+        self.validate_video_library_for_settings_mutation_unlocked(library_id)?;
+        let mut registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+        require_registry_root_binding(&registry, library_id, expected_binding)?;
+        let snapshot = registry.set_category(library_id, category)?;
+        drop(registry);
         self.state_change_notify.notify_one();
         Ok(snapshot)
     }
 
+    pub fn rename_video_library_with_root_binding(
+        &self,
+        library_id: &str,
+        name: &str,
+        expected_binding: &str,
+    ) -> Result<MediaLibrarySnapshot> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        self.require_video_library_root_binding_unlocked(library_id, expected_binding)?;
+        let mut registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+        require_registry_root_binding(&registry, library_id, expected_binding)?;
+        let snapshot = registry.rename(library_id, name)?;
+        drop(registry);
+        self.state_change_notify.notify_one();
+        Ok(snapshot)
+    }
+
+    #[cfg(test)]
     pub fn remove_video_library(&self, library_id: &str) -> Result<MediaLibrarySnapshot> {
         let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
         let library = self
@@ -1776,6 +1862,58 @@ impl QueueManager {
             .lock()
             .map_err(poisoned_lock)?
             .remove(library_id)?;
+        self.video_libraries
+            .write()
+            .map_err(poisoned_lock)?
+            .retain(|registered| registered.library_id != library_id);
+        self.video_statuses
+            .write()
+            .map_err(poisoned_lock)?
+            .remove(library_id);
+        self.state_change_notify.notify_one();
+        Ok(snapshot)
+    }
+
+    pub fn remove_video_library_with_root_binding(
+        &self,
+        library_id: &str,
+        expected_binding: &str,
+    ) -> Result<MediaLibrarySnapshot> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        self.require_video_library_root_binding_unlocked(library_id, expected_binding)?;
+        self.validate_video_library_for_settings_mutation_unlocked(library_id)?;
+        let library = self
+            .media_libraries
+            .lock()
+            .map_err(poisoned_lock)?
+            .library(library_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("library root identity changed; refresh settings and retry"))?;
+        let store = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .find(|registered| registered.library_id == library_id && registered.available)
+            .map(|registered| registered.store.clone())
+            .ok_or_else(|| {
+                anyhow!("media library is offline; task dependencies cannot be checked")
+            })?;
+        let legacy_root_matches = same_trusted_root_path(&store.root_path, &library.root)?;
+        if store.list_records()?.iter().any(|record| {
+            !record.status.is_history()
+                && !matches!(&record.job, JobRequest::Pdf { .. })
+                && record.destination.as_ref().map_or_else(
+                    || legacy_root_matches,
+                    |destination| destination.library_id == library_id,
+                )
+        }) {
+            bail!("media library still has video tasks that depend on it");
+        }
+        let mut registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+        require_registry_root_binding(&registry, library_id, expected_binding)?;
+        let snapshot = registry.remove(library_id)?;
+        drop(registry);
         self.video_libraries
             .write()
             .map_err(poisoned_lock)?

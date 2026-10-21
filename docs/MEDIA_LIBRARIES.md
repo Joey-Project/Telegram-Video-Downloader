@@ -26,9 +26,17 @@ An offline snapshot is a last known view, not evidence that a requested setting 
 Polling retains unsaved name and category edits for the same library ID and root. Each field
 returns to the applied snapshot when its submitted value appears; unrelated updates do not
 discard edits, and removed or rebound registrations do not inherit another library's drafts.
-An opaque binding derived from the saved directory identity also distinguishes a replacement
-registered at the same pathname. Name/category edits and ordinary child-entry changes leave it
-stable. Legacy snapshots without a known binding do not retain drafts across snapshot updates.
+An opaque binding combines the saved directory identity with a persisted registration identity,
+distinguishing a replacement registered at the same pathname. Removing and registering the same
+directory again creates a new binding. Name/category edits, ordinary child-entry changes and
+restarts leave it stable. Older registry entries without the new registration identity retain
+their stable legacy binding until a new registration replaces them. Legacy snapshots without a
+known binding do not retain drafts across snapshot updates.
+Default, category, name and unregister requests also carry the displayed registration binding.
+The desktop compares it with the current registration while applying the change; a stale tab
+cannot modify a replacement registered at the same pathname. Missing or mismatched bindings
+are rejected, including older queued requests. Refresh the applied library view before submitting
+a new request rather than reusing the old confirmation.
 An open Mini App retains the last successful view for the same library ID and root, marks it
 read-only while unavailable, and replaces it after a successful scan. A fresh page without that
 cached view reports the library as unavailable rather than inventing its contents.
@@ -109,6 +117,9 @@ read failures remain an attention state rather than being treated as a missing p
 Large previews retain an actionable summary with counts, space requirements, sampled paths and
 explicit omission totals. Starting this summary confirms the complete selection with its existing
 conflict choices; per-item conflict editing is unavailable in the compact view.
+Full previews show a bounded page of conflict controls. Choices remain associated with the
+exact preview and revision while switching pages, and confirmation includes choices from every
+page. A replacement preview does not inherit the previous revision's editing state.
 
 The separate **include unfinished tasks** checkbox is shown only when the scope affects such
 tasks and starts unchecked. When checked for a partially selected unfinished collection task,
@@ -174,8 +185,9 @@ The default update is conditional on the settings revision durably recorded at c
 before waiting for task writers or output ownership. A newer settings change causes it to be
 skipped durably. Cloud snapshots include at most 32 migrations, prioritizing active
 and recoverable jobs, including completed or stopped jobs with pending finalization,
-then recent completed jobs. The UI displays that priority order and reports
-omitted entries; local manifests remain available for recovery.
+then recent completed jobs. The UI displays every published entry in that priority order,
+keeping all published recovery controls reachable, and reports backend omissions separately;
+local manifests remain available for recovery.
 Snapshot upload limits also compact migration item, task-handoff, and conflict-choice details.
 Totals, recovery controls, error counts, bounded error details and omission counts remain
 available; complete records stay in the source library's private migration manifest.

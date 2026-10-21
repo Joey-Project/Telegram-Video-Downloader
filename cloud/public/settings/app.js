@@ -4,6 +4,7 @@ import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotR
 import { escapeHtml } from "/file/preview-rendering.js";
 import { validateTargetRelativeDirectory } from "/file/target-directory.js";
 import { mediaLibraryAvailability, mediaLibraryEntries } from "/file/library-view.js";
+import { buildLibraryMutationPayload, isValidLibraryRootBinding } from "./library-actions.js";
 import { captureLibraryEditorFocus, libraryDraftFieldValue, reconcileLibraryDrafts, restoreLibraryEditorFocus, setLibraryDraftField } from "./library-drafts.js";
 import { takeRejectedSettingsActions } from "./local-action-rejections.js";
 import { timeAgoMilliseconds, timeAgoSeconds } from "./time-format.js";
@@ -351,6 +352,7 @@ function renderLibraryCard(rawEntry) {
   const name = String(entry.name ?? "Unnamed library");
   const root = String(entry.root ?? "Path unavailable");
   const rootBinding = typeof entry.root_binding === "string" ? entry.root_binding : "";
+  const canMutateRegistration = isValidLibraryRootBinding(rootBinding);
   const category = String(entry.default_category ?? "");
   const nameDraft = libraryDraftFieldValue(state.libraryDrafts, entry, "name");
   const categoryDraft = libraryDraftFieldValue(state.libraryDrafts, entry, "default_category");
@@ -367,6 +369,7 @@ function renderLibraryCard(rawEntry) {
   const scanTime = entry.scanned_at ?? snapshot?.scanned_at ?? null;
   const idAttr = escapeHtml(id);
   const rootBindingAttr = escapeHtml(rootBinding);
+  const registrationMutationDisabled = canMutateRegistration ? "" : "disabled";
   const nameAttr = escapeHtml(name);
   const categoryAttr = escapeHtml(category);
   const badges = [
@@ -382,21 +385,22 @@ function renderLibraryCard(rawEntry) {
     <div class="settings-library-stats"><span class="badge">${mediaCount === null ? "Media count unavailable" : `${mediaCount.toLocaleString()} media items`}</span><span class="badge">Last scan: ${escapeHtml(scanTime ? formatTime(scanTime) : "Not scanned")}</span></div>
     ${entry.snapshot_stale === true ? '<p class="settings-status-note">This is the last saved scan. Cached items are unavailable for local actions until the root is scanned again.</p>' : ""}
     <div class="settings-card-actions">
-      ${entry.is_default === true ? "" : `<button class="small-button" type="button" data-settings-action="library_set_default" data-library-id="${idAttr}">Set as default</button>`}
+      ${entry.is_default === true ? "" : `<button class="small-button" type="button" data-settings-action="library_set_default" data-library-id="${idAttr}" data-library-root-binding="${rootBindingAttr}" ${registrationMutationDisabled}>Set as default</button>`}
       <button class="small-button" type="button" data-settings-action="library_scan" data-library-id="${idAttr}">Scan this library</button>
-      <button class="small-button danger" type="button" data-settings-action="library_remove" data-library-id="${idAttr}" ${entry.is_default === true ? "disabled" : ""}>Remove registration</button>
+      <button class="small-button danger" type="button" data-settings-action="library_remove" data-library-id="${idAttr}" data-library-root-binding="${rootBindingAttr}" data-library-is-default="${entry.is_default === true}" ${entry.is_default === true || !canMutateRegistration ? "disabled" : ""}>Remove registration</button>
     </div>
+    ${canMutateRegistration ? "" : '<p class="settings-status-note">Refresh settings to verify this library before changing its registration.</p>'}
     ${dependentWarning}
     <div class="settings-edit-grid">
-      <form class="settings-edit-form" data-rename-form="${idAttr}" data-library-root="${escapeHtml(root)}" data-library-root-binding="${rootBindingAttr}">
+      <form class="settings-edit-form" data-rename-form="${idAttr}" data-library-root="${escapeHtml(root)}" data-library-root-binding="${rootBindingAttr}" data-library-name="${nameAttr}" data-library-default-category="${categoryAttr}">
         <label class="field-label" for="rename-${idAttr}">Rename library</label>
         <input id="rename-${idAttr}" class="text-input" name="name" type="text" maxlength="100" required value="${escapeHtml(nameDraft)}">
-        <button class="small-button" type="submit">Save name</button>
+        <button class="small-button" type="submit" ${registrationMutationDisabled}>Save name</button>
       </form>
-      <form class="settings-edit-form" data-category-form="${idAttr}" data-library-root="${escapeHtml(root)}" data-library-root-binding="${rootBindingAttr}">
+      <form class="settings-edit-form" data-category-form="${idAttr}" data-library-root="${escapeHtml(root)}" data-library-root-binding="${rootBindingAttr}" data-library-name="${nameAttr}" data-library-default-category="${categoryAttr}">
         <label class="field-label" for="category-${idAttr}">Default category</label>
         <input id="category-${idAttr}" class="text-input" name="default_category" type="text" maxlength="1024" value="${escapeHtml(categoryDraft)}" placeholder="Library root">
-        <button class="small-button" type="submit">Save category</button>
+        <button class="small-button" type="submit" ${registrationMutationDisabled}>Save category</button>
       </form>
     </div>
   </article>`;
@@ -495,6 +499,16 @@ function normalizeCategory(value) {
   return validateTargetRelativeDirectory(value);
 }
 
+function displayedLibraryFromForm(form) {
+  return {
+    id: form.dataset.renameForm ?? form.dataset.categoryForm,
+    root: form.dataset.libraryRoot,
+    root_binding: form.dataset.libraryRootBinding,
+    name: form.dataset.libraryName,
+    default_category: form.dataset.libraryDefaultCategory,
+  };
+}
+
 function bindEvents() {
   byId("refresh-button").addEventListener("click", () => refreshState());
   byId("register-form").addEventListener("submit", (event) => {
@@ -517,31 +531,35 @@ function bindEvents() {
     const form = event.target.closest("form[data-rename-form], form[data-category-form]");
     if (!form) return;
     event.preventDefault();
-    const libraryId = form.dataset.renameForm ?? form.dataset.categoryForm;
-    const entry = mediaLibraryEntries(state.snapshot).map(libraryDescriptor).find((candidate) => candidate.id === libraryId);
-    if (!entry) return showToast("This library is no longer registered. Refresh the settings and try again.");
+    const displayedEntry = displayedLibraryFromForm(form);
     if (form.dataset.renameForm) {
       const name = normalizeName(form.elements.name.value);
       if (name.error) return showToast(name.error);
-      submitAction("library_rename", { library_id: libraryId, name: name.name }, `Rename library to “${name.name}”`, () => {
-        setLibraryDraftField(state.libraryDrafts, entry, "name", name.name);
+      const payload = buildLibraryMutationPayload("library_rename", displayedEntry, { name: name.name });
+      if (!payload) return showToast("Refresh settings to verify this library before changing its registration.");
+      submitAction("library_rename", payload, `Rename library to “${name.name}”`, () => {
+        setLibraryDraftField(state.libraryDrafts, displayedEntry, "name", name.name);
       });
     } else {
       const category = normalizeCategory(form.elements.default_category.value);
       if (category.error) return showToast(category.error);
-      submitAction("library_set_category", { library_id: libraryId, default_category: category.directory }, "Update default category", () => {
-        setLibraryDraftField(state.libraryDrafts, entry, "default_category", category.directory);
+      const payload = buildLibraryMutationPayload("library_set_category", displayedEntry, { default_category: category.directory });
+      if (!payload) return showToast("Refresh settings to verify this library before changing its registration.");
+      submitAction("library_set_category", payload, "Update default category", () => {
+        setLibraryDraftField(state.libraryDrafts, displayedEntry, "default_category", category.directory);
       });
     }
   });
   byId("library-list").addEventListener("input", (event) => {
     const form = event.target.closest("form[data-rename-form], form[data-category-form]");
     if (!form) return;
-    const libraryId = form.dataset.renameForm ?? form.dataset.categoryForm;
-    const entry = mediaLibraryEntries(state.snapshot).map(libraryDescriptor).find((candidate) => candidate.id === libraryId);
-    if (!entry) return;
+    const displayedEntry = displayedLibraryFromForm(form);
+    if (!isValidLibraryRootBinding(displayedEntry.root_binding)) return;
+    const currentEntry = mediaLibraryEntries(state.snapshot).map(libraryDescriptor)
+      .find((candidate) => candidate.id === displayedEntry.id);
+    if (!currentEntry || currentEntry.root_binding !== displayedEntry.root_binding) return;
     const field = form.dataset.renameForm ? "name" : "default_category";
-    setLibraryDraftField(state.libraryDrafts, entry, field, event.target.value);
+    setLibraryDraftField(state.libraryDrafts, displayedEntry, field, event.target.value);
   });
   window.addEventListener("storage", (event) => {
     if (!event.key?.startsWith(ACTION_RECEIPT_STORAGE_PREFIX)) return;
@@ -558,12 +576,20 @@ function bindEvents() {
     if (!button) return;
     const kind = button.dataset.settingsAction;
     const libraryId = button.dataset.libraryId;
+    if (kind === "library_scan") {
+      submitAction(kind, { library_id: libraryId }, "Scan library");
+      return;
+    }
+    const payload = buildLibraryMutationPayload(kind, {
+      id: libraryId,
+      root_binding: button.dataset.libraryRootBinding,
+    });
+    if (!payload) return showToast("Refresh settings to verify this library before changing its registration.");
     if (kind === "library_remove") {
-      const entry = mediaLibraryEntries(state.snapshot).find((candidate) => candidate.id === libraryId);
-      if (entry?.is_default === true) return showToast("Set another library as default before removing this one.");
+      if (button.dataset.libraryIsDefault === "true") return showToast("Set another library as default before removing this one.");
       if (!window.confirm("Remove this library registration? Its media files stay in place. The desktop checks for dependent tasks before applying the change.")) return;
     }
-    submitAction(kind, { library_id: libraryId }, kind === "library_scan" ? "Scan library" : kind === "library_remove" ? "Remove library registration" : "Change default library");
+    submitAction(kind, payload, kind === "library_remove" ? "Remove library registration" : "Change default library");
   });
   window.addEventListener("online", () => {
     showToast("Connection restored. Sending saved requests.");

@@ -7,6 +7,27 @@ import { escapeHtml } from "./preview-rendering.js";
 
 const MAX_SUMMARY_SAMPLE_ITEMS = 4;
 const MAX_SUMMARY_PATH_CHARS = 240;
+export const MIGRATION_PREVIEW_PAGE_SIZE = 30;
+
+export function migrationPreviewDraftKey(id, revision) {
+  if (typeof id !== "string" || !id || typeof revision !== "string" || !revision) return null;
+  return JSON.stringify([id, revision]);
+}
+
+export function migrationPreviewPageWindow(itemCount, requestedPage) {
+  const count = Number.isSafeInteger(itemCount) && itemCount >= 0 ? itemCount : 0;
+  const pageCount = Math.max(1, Math.ceil(count / MIGRATION_PREVIEW_PAGE_SIZE));
+  const page = Number.isSafeInteger(requestedPage)
+    ? Math.min(Math.max(0, requestedPage), pageCount - 1)
+    : 0;
+  const start = page * MIGRATION_PREVIEW_PAGE_SIZE;
+  return {
+    page,
+    pageCount,
+    start,
+    end: Math.min(count, start + MIGRATION_PREVIEW_PAGE_SIZE),
+  };
+}
 
 function formatBytes(value) {
   const bytes = Number(value);
@@ -133,16 +154,23 @@ function compactPreview(operation, result, options) {
 }
 
 function fullPreview(operation, result, options) {
-  const id = String(result.id ?? result.preview_id ?? operation?.preview_id ?? operation?.id ?? "");
-  const revision = String(result.revision ?? operation?.revision ?? "");
+  const resultId = result.id ?? result.preview_id;
+  const resultRevision = result.revision;
+  const id = String(operation?.preview_id ?? operation?.id ?? resultId ?? "");
+  const revision = String(operation?.revision ?? resultRevision ?? "");
   const sourceAvailable = options.sourceAvailable === true;
   const targetAvailable = options.targetAvailable === true;
   if (operation?.incomplete || !Array.isArray(result.items)) {
     return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>${escapeHtml(operation?.reason ?? "Preview details are unavailable in this cloud snapshot. Request a fresh preview before confirming.")}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
   }
+  if ((resultId !== undefined && resultId !== id) || (resultRevision !== undefined && resultRevision !== revision)) {
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>The preview identity changed while its details were being loaded. Request a fresh preview before continuing.</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+  }
   const files = result.items;
-  const displayItems = [...files.slice(0, 30), ...files.slice(30).filter((item) => item?.conflict === true)];
-  const draft = options.draft;
+  const candidateDraft = options.draft && typeof options.draft === "object" ? options.draft : null;
+  const draft = candidateDraft?.previewId === id && candidateDraft?.revision === revision ? candidateDraft : null;
+  const page = migrationPreviewPageWindow(files.length, options.page ?? draft?.page);
+  const displayItems = files.slice(page.start, page.end);
   const savedConflicts = normalizeMigrationItemConflicts(result.item_conflicts);
   const draftConflicts = draft ? normalizeMigrationItemConflicts(draft.itemConflicts) : savedConflicts;
   const choicesChanged = Boolean(draft && migrationConflictChoicesChanged(savedConflicts, draftConflicts));
@@ -159,12 +187,13 @@ function fullPreview(operation, result, options) {
     const labels = nested.slice(0, 12).map((file) => `${escapeHtml(file.source_path ?? "Source unavailable")} → ${escapeHtml(file.target_path ?? "Target unavailable")}`);
     const path = `${escapeHtml(item.source_path ?? "Source unavailable")} → ${escapeHtml(item.target_path ?? "Target unavailable")}`;
     const choice = conflict
-      ? `<label class="migration-conflict-choice">${escapeHtml(itemId)} conflict<select class="select-control" data-migration-conflict-item="${escapeHtml(itemId)}" data-migration-preview-id="${escapeHtml(id)}" aria-label="Conflict handling for ${escapeHtml(itemId)}" ${refreshPending || !sourceAvailable || !targetAvailable ? "disabled" : ""}><option value="skip" ${policy === "skip" ? "selected" : ""}>Skip</option><option value="keep_both" ${policy === "keep_both" ? "selected" : ""}>Keep both</option></select></label>`
+      ? `<label class="migration-conflict-choice">${escapeHtml(itemId)} conflict<select class="select-control" data-migration-conflict-item="${escapeHtml(itemId)}" data-migration-preview-id="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}" aria-label="Conflict handling for ${escapeHtml(itemId)}" ${refreshPending || !sourceAvailable || !targetAvailable ? "disabled" : ""}><option value="skip" ${policy === "skip" ? "selected" : ""}>Skip</option><option value="keep_both" ${policy === "keep_both" ? "selected" : ""}>Keep both</option></select></label>`
       : `<strong class="${item.outcome === "skip" || item.status === "skipped" ? "skip" : "move"}">${outcome}</strong>`;
     return `<div class="preview-line${conflict ? " migration-conflict-line" : ""}"><span>${path}${labels.length ? `<br><span class="field-hint">${labels.join("<br>")}</span>` : ""}</span>${choice}</div>`;
   }).join("");
-  const moreCount = Math.max(0, files.length - displayItems.length);
-  const more = moreCount ? `<p class="field-hint">${moreCount} non-conflicting item paths are retained in the preview.</p>` : "";
+  const pageControls = page.pageCount > 1
+    ? `<nav class="toolbar migration-preview-pagination" aria-label="Migration preview item pages"><button class="quiet-button" type="button" data-migration-preview-page="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}" data-page-direction="-1" ${page.page === 0 ? "disabled" : ""}>Previous items</button><span class="field-hint">Page ${page.page + 1} of ${page.pageCount} · items ${page.start + 1}–${page.end} of ${files.length.toLocaleString()} · choices on other pages are retained</span><button class="quiet-button" type="button" data-migration-preview-page="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}" data-page-direction="1" ${page.page + 1 >= page.pageCount ? "disabled" : ""}>Next items</button></nav>`
+    : "";
   const summary = `${Number(result.item_count ?? files.length).toLocaleString()} media items · ${Number(result.file_count ?? 0).toLocaleString()} files · ${formatBytes(result.total_bytes)} total`;
   const space = `Required space ${formatBytes(result.required_space_bytes)} · Available ${formatBytes(result.available_space_bytes)} · ${Number(result.conflict_count ?? 0)} conflict${Number(result.conflict_count ?? 0) === 1 ? "" : "s"}`;
   const taskBytes = result.incomplete_task_bytes ?? result.staging_bytes;
@@ -186,13 +215,13 @@ function fullPreview(operation, result, options) {
   const canConfirm = Boolean(id && revision) && !invalidated && sourceAvailable && targetAvailable;
   const canRefresh = Boolean(id && revision && draft && choicesChanged && !refreshPending);
   const refreshButton = canRefresh
-    ? `<button class="small-button" type="button" data-migration-refresh-conflicts="${escapeHtml(id)}" ${sourceAvailable && targetAvailable ? "" : "disabled"}>Refresh preview</button>`
+    ? `<button class="small-button" type="button" data-migration-refresh-conflicts="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}" ${sourceAvailable && targetAvailable ? "" : "disabled"}>Refresh preview</button>`
     : "";
   const conflictLimit = Number(result.conflict_count ?? files.filter((item) => item?.conflict === true).length) > MAX_MIGRATION_ITEM_CONFLICTS
     ? `<p class="field-hint">This preview has more than ${MAX_MIGRATION_ITEM_CONFLICTS.toLocaleString()} conflicting bundles. Refresh with the global choice to review a supported subset.</p>`
     : "";
   const offlineMessage = sourceAvailable && targetAvailable ? "" : `<p class="field-hint">The source or target library is offline or showing a saved scan. Reconnect it and refresh before starting the migration.</p>`;
-  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Category and collection structure will be preserved. Default conflict choice: ${escapeHtml(result.conflict ?? "skip")}.</p>${offlineMessage}${refreshMessage}${staleMessage}${supersededMessage}${conflictLimit}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${paths || `<div class="preview-line"><span>No media items were found in this selection.</span></div>`}${more}</div><div class="stack-actions">${refreshButton}<button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button></div></article>`;
+  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Category and collection structure will be preserved. Default conflict choice: ${escapeHtml(result.conflict ?? "skip")}.</p>${offlineMessage}${refreshMessage}${staleMessage}${supersededMessage}${conflictLimit}</div><span class="state-pill pending">Review needed</span></div>${pageControls}<div class="preview-table">${paths || `<div class="preview-line"><span>No media items were found in this selection.</span></div>`}</div>${pageControls}<div class="stack-actions">${refreshButton}<button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button></div></article>`;
 }
 
 export function renderMigrationPreview(operation, options = {}) {
