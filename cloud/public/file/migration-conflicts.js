@@ -103,7 +103,7 @@ export function migrationControlActions(migration) {
   const actions = [];
   if (active) actions.push("pause");
   if (paused) actions.push("resume");
-  if (active || paused || terminalWithTaskError && hasTaskTransferError) actions.push("stop_remaining");
+  if (active || paused || terminalWithTaskError && (hasFailedMedia || hasTaskTransferError)) actions.push("stop_remaining");
   if (terminalWithTaskError && (hasFailedMedia || hasTaskTransferError)) actions.push("retry_failed");
   if (terminal && migration.terminal_finalization_pending === true) actions.push("finalize_terminal");
   return actions;

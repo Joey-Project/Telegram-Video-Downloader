@@ -654,6 +654,114 @@ fn refreshing_preview_writes_candidate_before_supersession_and_recovers_after_re
 }
 
 #[test]
+fn invalid_task_conflict_refresh_preserves_old_preview_before_any_candidate_write() {
+    let source_root = TestRoot::new("task-conflict-refresh-source");
+    let target_root = TestRoot::new("task-conflict-refresh-target");
+    fs::write(source_root.path().join("clip.mp4"), MEDIA_BYTES).expect("source media should write");
+    fs::write(
+        target_root.path().join("clip.mp4"),
+        b"existing target media",
+    )
+    .expect("conflicting target media should write");
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should open"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should open"),
+    );
+    let engine = MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should open");
+    let snapshot = engine
+        .source
+        .migration_scan()
+        .expect("source library should scan");
+    let item_id = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4" && item.presence == Presence::Present)
+        .expect("synthetic media should be indexed")
+        .id
+        .clone();
+    let task_impact = MigrationTaskImpact {
+        task_id: "unfinished-task".to_string(),
+        generation: 7,
+        revision: 3,
+        staging_bytes: 0,
+        staging_file_count: 0,
+        published_item_ids: vec![item_id.clone()],
+    };
+    let mut request = MigrationRequest {
+        scope: MigrationScope::Selected,
+        item_ids: vec![item_id],
+        conflict: ConflictPolicy::KeepBoth,
+        item_conflicts: BTreeMap::new(),
+        include_incomplete_tasks: true,
+        set_target_default_on_success: false,
+        task_impacts: vec![task_impact],
+        warnings: Vec::new(),
+    };
+    let old = engine
+        .preview(&request)
+        .expect("keep-both preview should move every unfinished task member");
+    let old_snapshot = engine
+        .source
+        .migration_read_state_snapshot(&preview_state_name(&old.id), MAX_STATE_BYTES)
+        .expect("old preview should read")
+        .expect("old preview should remain persisted");
+
+    request.conflict = ConflictPolicy::Skip;
+    let old_document: PreviewDocument =
+        decode_state(&old_snapshot.contents, "migration preview").expect("preview should decode");
+    let identity = engine
+        .preview_refresh_identity(
+            &request,
+            &old_document.source,
+            &old_document.target,
+            &old.id,
+            &old.revision,
+            &old_snapshot.proof.sha256,
+        )
+        .expect("replacement preview identity should be deterministic");
+    let error = engine
+        .preview_replacing(&request, &old.id, &old.revision)
+        .expect_err("a skipped published member must reject refresh before persistence");
+    assert!(
+        error
+            .to_string()
+            .contains("would stay in the source library")
+    );
+    let old_after = engine
+        .source
+        .migration_read_state_snapshot(&preview_state_name(&old.id), MAX_STATE_BYTES)
+        .expect("old preview should remain readable")
+        .expect("old preview should not be retired by invalid refresh");
+    assert_eq!(old_after.contents, old_snapshot.contents);
+    assert!(
+        engine
+            .source
+            .migration_read_state(&preview_state_name(&identity.candidate_id), MAX_STATE_BYTES)
+            .expect("candidate lookup should succeed")
+            .is_none()
+    );
+    assert_eq!(
+        MigrationEngine::preview_confirmability_for_inbox(
+            engine.source.as_ref(),
+            &[(old.id.clone(), old.revision.clone())],
+        )
+        .expect("old preview confirmation status should remain readable"),
+        vec![MigrationPreviewConfirmability::Confirmable]
+    );
+}
+
+#[test]
 fn migration_preview_applies_scan_completeness_to_the_requested_scope() {
     let source_root = TestRoot::new("scan-completeness-preview-source");
     let target_root = TestRoot::new("scan-completeness-preview-target");

@@ -55,6 +55,9 @@ struct ControlPayload {
 }
 
 fn manager(runtime: &CloudBotRuntime, id: &str) -> Result<Arc<LibraryManager>> {
+    // LibraryManager::open can create/update recovery metadata. Refresh the registered queue
+    // store first so an offline or identity-replaced path is rejected before opening that root.
+    super::refresh_and_require_library_queue_available(&runtime.bot.queue, id)?;
     let (scoped, _) = media_library_bot::scoped_runtime(runtime, Some(id))?;
     Ok(Arc::new(open_cloud_library_manager(
         &scoped.bot,
@@ -86,6 +89,11 @@ pub(super) async fn ensure_library_io_available(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn discover_for_test(runtime: &CloudBotRuntime) -> Result<()> {
+    discover(runtime).await
 }
 
 pub(super) fn ensure_library_removable(runtime: &CloudBotRuntime, library_id: &str) -> Result<()> {
@@ -288,10 +296,6 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
     if expanded && payload.scope == MigrationScope::Selected {
         warnings.push("The selection includes every published member of the affected unfinished task, so its recovery remains in one library.".to_string());
     }
-    let task_items = impacts
-        .iter()
-        .flat_map(|impact| impact.published_item_ids.iter().cloned())
-        .collect::<HashSet<_>>();
     let engine = MigrationEngine::new(
         payload.source_library_id,
         source,
@@ -314,16 +318,6 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
         }
         None => engine.preview(&request)?,
     };
-    if payload.include_incomplete_tasks
-        && preview.items.iter().any(|item| {
-            task_items.contains(&item.item_id)
-                && item.status == crate::library_migration::MigrationItemPhase::Skipped
-        })
-    {
-        bail!(
-            "a conflicting published member of an unfinished task would stay in the source library; choose Keep both or leave unfinished tasks in the source library"
-        );
-    }
     if let Some((seq, id, revision)) = supersession {
         let mut changed = false;
         runtime.inbox.update(seq, |record| {

@@ -621,6 +621,7 @@ impl MigrationEngine {
         };
         validate_migration_scan_scope(request, &scan, Some(&plan))?;
         let (preview, plan) = self.make_preview(request, item_ids, plan)?;
+        validate_task_published_members_will_move(request, &preview)?;
         let mut preview = preview;
         let supersession = refresh
             .as_ref()
@@ -897,6 +898,7 @@ impl MigrationEngine {
         let candidate: PreviewDocument =
             decode_state(&snapshot.contents, "refreshed migration preview")?;
         self.validate_refresh_candidate(&candidate, request, refresh)?;
+        validate_task_published_members_will_move(request, &candidate.preview)?;
 
         // A prior atomic write may have returned an error after exchanging the file but before
         // syncing its parent directory. A readable candidate is therefore not sufficient proof
@@ -912,6 +914,23 @@ impl MigrationEngine {
             bail!("the refreshed migration preview changed while establishing durability");
         }
         Ok(candidate)
+    }
+
+    fn validate_existing_refresh_candidate(
+        &self,
+        request: &MigrationRequest,
+        refresh: &PreviewRefreshIdentity,
+    ) -> Result<Option<PreviewDocument>> {
+        let Some(bytes) = self
+            .source
+            .migration_read_state(&preview_state_name(&refresh.candidate_id), MAX_STATE_BYTES)?
+        else {
+            return Ok(None);
+        };
+        let candidate: PreviewDocument = decode_state(&bytes, "refreshed migration preview")?;
+        self.validate_refresh_candidate(&candidate, request, refresh)?;
+        validate_task_published_members_will_move(request, &candidate.preview)?;
+        Ok(Some(candidate))
     }
 
     fn validate_committed_refresh_supersession(&self, candidate: &PreviewDocument) -> Result<()> {
@@ -1044,6 +1063,8 @@ impl MigrationEngine {
                 .source
                 .migration_read_state(&job_state_name(&refresh.candidate_id), MAX_STATE_BYTES)?
             else {
+                self.validate_existing_refresh_candidate(request, refresh)?
+                    .context("the durable refresh candidate disappeared")?;
                 let candidate = self.load_and_redurabilize_refresh_candidate(request, refresh)?;
                 return Ok(Some(candidate.preview));
             };
@@ -1055,12 +1076,12 @@ impl MigrationEngine {
             {
                 bail!("the confirmed refresh does not match its durable provenance");
             }
+            validate_task_published_members_will_move(request, &job.preview)?;
             return Ok(Some(job.preview));
         }
 
         if self
-            .source
-            .migration_read_state(&preview_state_name(&refresh.candidate_id), MAX_STATE_BYTES)?
+            .validate_existing_refresh_candidate(request, refresh)?
             .is_none()
         {
             return Ok(None);
@@ -3384,6 +3405,28 @@ fn validate_request(request: &MigrationRequest) -> Result<()> {
     }
     if request.item_ids.len() > 50_000 {
         bail!("selected migration item list exceeds its bounded limit");
+    }
+    Ok(())
+}
+
+fn validate_task_published_members_will_move(
+    request: &MigrationRequest,
+    preview: &MigrationPreview,
+) -> Result<()> {
+    if !request.include_incomplete_tasks {
+        return Ok(());
+    }
+    let task_items = request
+        .task_impacts
+        .iter()
+        .flat_map(|impact| impact.published_item_ids.iter().map(String::as_str))
+        .collect::<HashSet<_>>();
+    if preview.items.iter().any(|item| {
+        item.status == MigrationItemPhase::Skipped && task_items.contains(item.item_id.as_str())
+    }) {
+        bail!(
+            "a conflicting published member of an unfinished task would stay in the source library; choose Keep both or leave unfinished tasks in the source library"
+        );
     }
     Ok(())
 }

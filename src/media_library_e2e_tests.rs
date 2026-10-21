@@ -300,6 +300,196 @@ async fn expired_migration_preview_projects_stale_without_hiding_a_live_preview(
     let _ = fs::remove_dir_all(&fixture.root);
 }
 
+#[tokio::test]
+async fn migration_preview_and_discovery_reject_replaced_registered_roots() {
+    let root = temp_cloud_bot_dir("migration-root-identity-gate");
+    let video_root = root.join("videos");
+    let pdf_root = root.join("pdfs");
+    let source_root = root.join("source");
+    let displaced_source = root.join("source-original");
+    let replacement_source = root.join("source-replacement");
+    let target_root = root.join("target");
+    let displaced_target = root.join("target-original");
+    let replacement_target = root.join("target-replacement");
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = video_root.clone();
+    config.downloads.pdf_dir = pdf_root;
+    config
+        .ensure_runtime_dirs()
+        .expect("stable inbox and PDF roots should create");
+    fs::create_dir(&source_root).expect("source library should create");
+    fs::create_dir(&target_root).expect("target library should create");
+    fs::write(source_root.join("clip.mp4"), b"migration source media")
+        .expect("source media should write");
+    let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let source_id = queue
+        .register_video_library("Migration source", &source_root, None, false, false)
+        .expect("secondary source should register")
+        .id;
+    let target_id = queue
+        .register_video_library("Migration target", &target_root, None, false, false)
+        .expect("secondary target should register")
+        .id;
+    let inbox =
+        Arc::new(open_runtime_test_inbox(&video_root).expect("stable cloud inbox should open"));
+    let runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+
+    let preview_payload = || {
+        serde_json::json!({
+            "source_library_id": source_id.clone(),
+            "target_library_id": target_id.clone(),
+            "scope": "library",
+            "conflict": "skip",
+            "include_incomplete_tasks": false,
+        })
+    };
+    let baseline = run_library_management_test_request(
+        &runtime,
+        4_101,
+        "library_migration_preview",
+        preview_payload(),
+    )
+    .await;
+    assert_eq!(
+        baseline.status,
+        InboxStatus::AwaitingConfirmation,
+        "baseline migration preview should open the registered roots: {:?}",
+        baseline.error
+    );
+    assert!(
+        source_root
+            .join(".telegram-video-downloader-library")
+            .exists()
+    );
+    assert!(
+        target_root
+            .join(".telegram-video-downloader-library")
+            .exists()
+    );
+
+    fs::rename(&source_root, &displaced_source).expect("source root should be displaced");
+    fs::create_dir(&source_root).expect("replacement source root should create");
+    fs::write(source_root.join("replacement.mp4"), b"replacement source")
+        .expect("replacement source media should write");
+    let rejected_source = run_library_management_test_request(
+        &runtime,
+        4_102,
+        "library_migration_preview",
+        preview_payload(),
+    )
+    .await;
+    assert_eq!(rejected_source.status, InboxStatus::Failed);
+    assert!(rejected_source.error.as_deref().is_some_and(|error| {
+        error.contains("unavailable") || error.contains("different root object")
+    }));
+    crate::library_migration_bot::discover_for_test(&runtime)
+        .await
+        .expect("discovery should skip an unavailable registered root");
+    assert!(
+        !source_root
+            .join(".telegram-video-downloader-library")
+            .exists(),
+        "preview and discovery must not create library metadata on a replacement source inode"
+    );
+    assert!(
+        !source_root
+            .join(".telegram-video-downloader-queue")
+            .exists(),
+        "preview and discovery must not initialize queue metadata on a replacement source inode"
+    );
+    assert_eq!(
+        fs::read(source_root.join("replacement.mp4")).unwrap(),
+        b"replacement source"
+    );
+    fs::rename(&source_root, &replacement_source).expect("replacement source should move aside");
+    fs::rename(&displaced_source, &source_root).expect("original source root should be restored");
+    fs::write(source_root.join("ordinary-child-churn.mp4"), b"new child")
+        .expect("same-root child churn should be allowed");
+    let restored_source = run_library_management_test_request(
+        &runtime,
+        4_103,
+        "library_migration_preview",
+        preview_payload(),
+    )
+    .await;
+    assert_eq!(
+        restored_source.status,
+        InboxStatus::AwaitingConfirmation,
+        "restoring the same registered source object with ordinary child changes should work: {:?}",
+        restored_source.error
+    );
+
+    fs::rename(&target_root, &displaced_target).expect("target root should be displaced");
+    fs::create_dir(&target_root).expect("replacement target root should create");
+    fs::write(target_root.join("replacement.mp4"), b"replacement target")
+        .expect("replacement target media should write");
+    let rejected_target = run_library_management_test_request(
+        &runtime,
+        4_104,
+        "library_migration_preview",
+        preview_payload(),
+    )
+    .await;
+    assert_eq!(rejected_target.status, InboxStatus::Failed);
+    assert!(rejected_target.error.as_deref().is_some_and(|error| {
+        error.contains("unavailable") || error.contains("different root object")
+    }));
+    crate::library_migration_bot::discover_for_test(&runtime)
+        .await
+        .expect("discovery should skip an unavailable target root");
+    assert!(
+        !target_root
+            .join(".telegram-video-downloader-library")
+            .exists(),
+        "preview and discovery must not create library metadata on a replacement target inode"
+    );
+    assert!(
+        !target_root
+            .join(".telegram-video-downloader-queue")
+            .exists(),
+        "preview and discovery must not initialize queue metadata on a replacement target inode"
+    );
+    assert_eq!(
+        fs::read(target_root.join("replacement.mp4")).unwrap(),
+        b"replacement target"
+    );
+    fs::rename(&target_root, &replacement_target).expect("replacement target should move aside");
+    fs::rename(&displaced_target, &target_root).expect("original target root should be restored");
+    fs::write(
+        target_root.join("ordinary-target-churn.mp4"),
+        b"new target child",
+    )
+    .expect("same-root target child churn should be allowed");
+    let restored_target = run_library_management_test_request(
+        &runtime,
+        4_105,
+        "library_migration_preview",
+        preview_payload(),
+    )
+    .await;
+    assert_eq!(
+        restored_target.status,
+        InboxStatus::AwaitingConfirmation,
+        "restoring the same registered target object with ordinary child changes should work: {:?}",
+        restored_target.error
+    );
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&root);
+}
+
 fn expire_migration_preview_for_test(video_root: &Path, preview_id: &str) -> PathBuf {
     let path = video_root
         .join(".telegram-video-downloader-library")

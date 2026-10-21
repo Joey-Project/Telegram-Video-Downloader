@@ -19,6 +19,9 @@ ownership until the process releases the PDF store.
 
 The settings page distinguishes applied local settings from requests waiting for the desktop.
 An offline snapshot is a last known view, not evidence that a requested setting was applied.
+Polling retains unsaved name and category edits for the same library ID and root. Each field
+returns to the applied snapshot when its submitted value appears; unrelated updates do not
+discard edits, and removed or rebound registrations do not inherit another library's drafts.
 An open Mini App retains the last successful view for the same library ID and root, marks it
 read-only while unavailable, and replaces it after a successful scan. A fresh page without that
 cached view reports the library as unavailable rather than inventing its contents.
@@ -54,6 +57,9 @@ The media total remains the full reported count when the cloud retains only part
 the page discloses that filters and pagination apply to the retained rows.
 The `/file` and `/settings` pages keep locally queued actions with their originating surface,
 including receipt tracking before removing an action from their shared browser queue.
+Requests awaiting a local result retain a sequence receipt by request ID so another tab can
+help send them without consuming the origin tab's result. The origin recovers its own receipt
+before polling or retrying; if necessary, it resubmits the same saved request ID and payload.
 
 ## Moving a library
 
@@ -71,8 +77,15 @@ low-confidence metadata do not by themselves make a scan incomplete.
 Refreshing conflict choices durably supersedes the exact earlier preview. Reloading the Mini App
 cannot make that earlier revision executable again. A refreshed candidate is durable before the
 old revision is superseded; interrupted refreshes replay from those durable records after restart.
+Conflict choices for unfinished tasks are validated before either preview document is written.
+A rejected refresh keeps the old preview usable and does not leave an orphan replacement.
+Migration preview and discovery validate each registered root's availability and saved directory
+identity before opening its metadata, including both endpoints. Replaced roots are rejected;
+ordinary child-entry changes remain supported.
 Starting a migration requires both endpoint IDs to resolve to registered libraries. Removing a
 previously selected target disables that preview's Start control.
+Polling and scope changes preserve a selected target while it remains registered and distinct
+from the source. A temporarily offline target stays selected with preview disabled.
 Expired, superseded and confirmed preview documents are retired through bounded cleanup.
 Confirmation keeps the durable job plan and replay information needed for recovery; retiring a
 preview does not remove media, retained download fragments or an active migration's checkpoints.
@@ -119,6 +132,8 @@ leaves uncompleted source data available. **Retry failed** retries failed work. 
 actual source and destination locations; Telegram edits one migration status message. Ambiguous
 Telegram delivery is retained without automatically sending a duplicate message.
 Task-transfer failures also expose retry and stop controls, even when no media bundle failed.
+Media-only failed and partially completed migrations expose **Stop remaining** as well, allowing
+the remaining source files to stay in place without retrying the move.
 Startup completes or aborts a stopped migration's pending queue handoffs so the affected tasks
 do not remain blocked by an orphaned transfer.
 When a new independent queue store reconnects, its library remains unavailable until the existing

@@ -1,4 +1,4 @@
-import { ACTION_SURFACE_FILE, appendAction, dispatchNextOwnedAction, recordActionReceipt, removeQueuedAction, shouldRetryActionFailure } from "./action-queue.js";
+import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, appendAction, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "./action-queue.js";
 import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
@@ -11,7 +11,7 @@ import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewableP
 import { sourceIdUrl } from "./source-links.js";
 import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
 import { validateTargetRelativeDirectory } from "./target-directory.js";
-import { boundedFolderSuggestions, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary, statusOf } from "./library-view.js";
+import { boundedFolderSuggestions, buildMigrationPreviewPayload, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget, statusOf } from "./library-view.js";
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
 import { renderMigrationHistory } from "./migration-rendering.js";
 import { renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
@@ -300,6 +300,7 @@ async function api(path, options = {}) {
 
 async function refreshState({ quiet = false } = {}) {
   if (!initData || state.loading) return;
+  recoverFileActionReceipts();
   state.loading = true;
   try {
     const fresh = await api("/state");
@@ -338,6 +339,19 @@ function readActionQueue() {
   } catch { return []; }
 }
 
+function recoverFileActionReceipts() {
+  const recovered = recoverActionReceipts(state, { surface: ACTION_SURFACE_FILE });
+  if (recovered.matched > 0) {
+    const matchedIds = new Set(recovered.requestIds);
+    const queue = readActionQueue();
+    const remaining = queue.filter((action) => !matchedIds.has(action.request_id));
+    if (remaining.length !== queue.length) writeActionQueue(remaining);
+    if (recovered.downloadSubmission) renderDownloadStatus();
+    if (recovered.migrationConflictDrafts > 0) renderMigrations();
+  }
+  return recovered;
+}
+
 function writeActionQueue(actions) {
   if (actions.length > 20) return false;
   try { localStorage.setItem(ACTION_QUEUE_KEY, JSON.stringify(actions)); } catch { showToast("This browser could not save the action queue."); return false; }
@@ -353,6 +367,15 @@ function renderQueueCount() {
 async function drainActionQueue({ quiet = false } = {}) {
   if (!initData || !mayDispatchActions(state) || !navigator.onLine) return false;
   if (state.draining) return state.draining;
+  recoverFileActionReceipts();
+  const restored = restorePendingActions(state, {
+    surface: ACTION_SURFACE_FILE,
+    readQueue: readActionQueue,
+    writeQueue: writeActionQueue,
+  });
+  if ((restored.writeFailed || restored.skippedAtLimit > 0) && !quiet) {
+    showToast("A saved request could not be restored to the browser queue yet. It will retry when queue space is available.");
+  }
   state.draining = (async () => {
     let sentAny = false;
     let connectionInterrupted = false;
@@ -368,9 +391,8 @@ async function drainActionQueue({ quiet = false } = {}) {
           method: "POST",
           body: JSON.stringify({ request_id: action.request_id, kind: action.kind, payload: action.payload }),
         }),
-        onReceipt: (action, receipt) => recordActionReceipt(action, receipt, {
-          downloadSubmission: state.downloadSubmission,
-          migrationConflictDrafts: state.migrationConflictDrafts,
+        onReceipt: (action, receipt, resolvedSurface) => recordActionReceipt(action, receipt, state, {
+          surface: resolvedSurface,
         }),
       });
       const receiptUpdate = outcome.receiptUpdate ?? {};
@@ -379,6 +401,19 @@ async function drainActionQueue({ quiet = false } = {}) {
       if (outcome.status === "empty") break;
       if (outcome.status === "remove_failed") {
         if (!quiet) showToast("Request reached the computer, but this browser could not update its retry queue.");
+        break;
+      }
+      if (outcome.status === "receipt_failed") {
+        connectionInterrupted = true;
+        if (!quiet) showToast("The computer accepted the request, but this browser could not save its receipt. The same request ID will retry.");
+        if (!state.retryTimer) {
+          const delay = state.retryDelay;
+          state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
+          state.retryTimer = window.setTimeout(() => {
+            state.retryTimer = 0;
+            drainActionQueue({ quiet });
+          }, delay);
+        }
         break;
       }
       if (outcome.status === "sent") {
@@ -500,6 +535,7 @@ async function submitAction(kind, payload, { onQueued } = {}) {
       url: String(payload.url ?? ""),
       library_id: String(payload.library_id ?? ""),
       category: String(payload.category ?? ""),
+      payload: { ...payload },
     };
     renderDownloadStatus();
   }
@@ -764,21 +800,18 @@ function incompleteTaskSummary(libraryId) {
 
 function migrationTargetOptions() {
   const sourceId = activeLibraryId();
-  const entries = mediaLibraryEntries(state.snapshot).filter((entry) => entry.id !== sourceId);
-  byId("migration-target").innerHTML = entries.map((entry) =>
-    `<option value="${escapeHtml(entry.id)}" ${libraryCanOperate(entry.id) ? "" : "disabled"}>${escapeHtml(entry.name)} · ${escapeHtml(entry.root ?? "root unavailable")}${libraryCanOperate(entry.id) ? "" : " · offline"}</option>`,
-  ).join("");
-  const availableTargets = entries.filter((entry) => libraryCanOperate(entry.id));
+  const target = byId("migration-target");
+  const selection = selectMigrationTarget(mediaLibraryEntries(state.snapshot), sourceId, target.value, libraryCanOperate);
+  target.innerHTML = renderMigrationTargetOptions(selection, escapeHtml);
+  target.value = selection.selectedId;
   const sourceAvailable = libraryCanOperate(sourceId);
-  if (!availableTargets.some((entry) => entry.id === byId("migration-target").value)) {
-    byId("migration-target").value = availableTargets[0]?.id ?? "";
-  }
-  byId("migration-target").disabled = availableTargets.length === 0 || !sourceAvailable;
+  const targetAvailable = libraryCanOperate(target.value);
+  target.disabled = selection.targets.length === 0 || !sourceAvailable;
   byId("migration-scope").disabled = !sourceAvailable;
   byId("migration-include-tasks").disabled = !sourceAvailable;
   byId("migration-set-default").disabled = !sourceAvailable;
   byId("migration-conflict").disabled = !sourceAvailable;
-  byId("migration-preview").disabled = availableTargets.length === 0 || !sourceAvailable;
+  byId("migration-preview").disabled = selection.availableTargets.length === 0 || !sourceAvailable || !targetAvailable;
   byId("migration-source").textContent = `Source: ${libraryLabel(sourceId)} · Choose the source in the library selector above.`;
   const selectionSize = state.selected.size;
   const sourceMediaInfo = mediaSnapshotInfo(activeLibrary().descriptor, activeLibrarySnapshot());
@@ -792,7 +825,7 @@ function migrationTargetOptions() {
   const countLabel = taskSummary.countIsLowerBound ? `At least ${taskSummary.count}` : String(taskSummary.count);
   const byteLabel = taskSummary.bytes === null ? "staged data size unknown" : `${formatBytes(taskSummary.bytes)} staged data`;
   byId("migration-task-count").textContent = `${countLabel} unfinished task${taskSummary.count === 1 ? "" : "s"} · ${byteLabel}. This option is off by default.`;
-  byId("migration-preview").disabled = !sourceAvailable || availableTargets.length === 0 || selectedScope && selectionSize === 0;
+  byId("migration-preview").disabled = !sourceAvailable || !selection.availableTargets.length || !targetAvailable || selectedScope && selectionSize === 0;
 }
 
 function migrationPreviewEntries() {
@@ -1257,6 +1290,7 @@ function bindEvents() {
     submitAction("download_submit", { url, library_id: libraryId, category: directory });
   });
   byId("migration-scope").addEventListener("change", renderMigrations);
+  byId("migration-target").addEventListener("change", renderMigrations);
   byId("migration-preview").addEventListener("click", () => {
     const sourceId = activeLibraryId();
     const targetId = byId("migration-target").value;
@@ -1264,15 +1298,17 @@ function bindEvents() {
     if (!sourceId || !targetId || sourceId === targetId) return showToast("Choose a different registered target library.");
     if (scope === "selected" && state.selected.size === 0) return showToast("Select media or collections in the Library view first.");
     if (state.selected.size > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} media items per migration preview.`);
-    submitAction("library_migration_preview", {
-      source_library_id: sourceId,
-      target_library_id: targetId,
+    const payload = buildMigrationPreviewPayload({
+      sourceLibraryId: sourceId,
+      targetLibraryId: targetId,
       scope,
-      ...(scope === "selected" ? { item_ids: [...state.selected] } : {}),
-      include_incomplete_tasks: !byId("migration-task-option").classList.contains("hidden") && byId("migration-include-tasks").checked,
+      itemIds: [...state.selected],
+      includeIncompleteTasks: !byId("migration-task-option").classList.contains("hidden") && byId("migration-include-tasks").checked,
       conflict: byId("migration-conflict").value,
-      set_target_default_on_success: byId("migration-set-default").checked,
+      setTargetDefaultOnSuccess: byId("migration-set-default").checked,
     });
+    if (!payload) return showToast("Choose a different registered target library.");
+    submitAction("library_migration_preview", payload);
   });
   byId("search-input").addEventListener("input", (event) => { state.query = event.target.value; state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
   byId("category-filter").addEventListener("input", () => { state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
@@ -1545,6 +1581,15 @@ function bindEvents() {
       return;
     }
     if (event.target.closest("#preview-metadata")) { previewSelectedLegacy(); return; }
+  });
+  window.addEventListener("storage", (event) => {
+    if (!event.key?.startsWith(ACTION_RECEIPT_STORAGE_PREFIX)) return;
+    const recovered = recoverFileActionReceipts();
+    if (recovered.matched === 0) return;
+    if (state.ownerVerified) {
+      if (state.loading) state.refreshAfterDrain = true;
+      else refreshState({ quiet: true });
+    }
   });
   window.addEventListener("online", () => { showToast("Connection restored. Sending saved actions."); drainActionQueue(); refreshState({ quiet: true }); });
   window.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.detailId) { state.detailId = null; renderDetail(); } });

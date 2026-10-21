@@ -454,7 +454,7 @@ describe("migration progress controls and history notice", () => {
     expect(migrationControlActions({ status: "running", failed_count: 0 })).toEqual(["pause", "stop_remaining"]);
     expect(migrationControlActions({ status: "paused", failed_count: 0 })).toEqual(["resume", "stop_remaining"]);
     expect(migrationControlActions({ status: "partial", failed_count: 0, task_transfers: [] })).toEqual([]);
-    expect(migrationControlActions({ status: "partial", failed_count: 2 })).toEqual(["retry_failed"]);
+    expect(migrationControlActions({ status: "partial", failed_count: 2 })).toEqual(["stop_remaining", "retry_failed"]);
   });
 
   it("offers terminal finalization only when completed or stopped work reports pending cleanup", () => {
@@ -490,7 +490,7 @@ describe("migration history rendering", () => {
     ["paused", true, ["resume", "stop_remaining"]],
     ["completed", false, []],
     ["stopped", false, []],
-    ["failed", false, ["retry_failed"]],
+    ["failed", false, ["stop_remaining", "retry_failed"]],
     ["partial", false, ["stop_remaining", "retry_failed"]],
   ] as const)("renders the production card for wire status %s", (status, pending, controls) => {
     const migration = {
@@ -512,6 +512,25 @@ describe("migration history rendering", () => {
     expect(markup).toContain(`state-pill${pending ? " pending" : ""}`);
     for (const control of controls) expect(markup).toContain(`data-migration-control="${control}"`);
     if (controls.length === 0) expect(markup).not.toContain("data-migration-control=");
+  });
+
+  it.each(["failed", "partial"] as const)("offers stop and retry for media-only %s migrations", (status) => {
+    const markup = renderMigrationHistory({
+      migrations: [{
+        id: `media-only-${status}`,
+        status,
+        source_library_id: "source",
+        target_library_id: "target",
+        failed_count: 1,
+        task_transfers: [],
+        items: [{ item_id: "media-a", status: "failed", source_path: "Films/a.mp4", target_path: "Films/a.mp4" }],
+      }],
+      libraries,
+      libraryId: "source",
+    });
+
+    expect(markup).toContain('data-migration-control="stop_remaining"');
+    expect(markup).toContain('data-migration-control="retry_failed"');
   });
 
   it.each([

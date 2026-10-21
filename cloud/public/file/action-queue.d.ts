@@ -8,6 +8,7 @@ export interface QueuedAction {
 export const ACTION_QUEUE_LIMIT: number;
 export const ACTION_SURFACE_SETTINGS: "settings";
 export const ACTION_SURFACE_FILE: "file";
+export const ACTION_RECEIPT_STORAGE_PREFIX: string;
 export function appendAction<T extends QueuedAction>(queue: T[], action: T): { ok: boolean; queue: T[] };
 export function removeQueuedAction<T extends QueuedAction>(queue: T[], requestId: string): T[];
 export function actionBelongsToSurface(action: QueuedAction, surface: "settings" | "file"): boolean;
@@ -22,19 +23,37 @@ export function dispatchNextOwnedAction(options: {
   writeQueue: (queue: QueuedAction[]) => boolean;
   excludedIds?: ReadonlySet<string>;
   dispatch: (action: QueuedAction) => Promise<unknown>;
-  onReceipt?: (action: QueuedAction, receipt: unknown) => unknown;
+  onReceipt?: (action: QueuedAction, receipt: unknown, surface: "settings" | "file") => unknown;
 }): Promise<
   | { status: "empty" }
   | { status: "error"; action: QueuedAction; error: unknown }
+  | { status: "receipt_failed"; action: QueuedAction; receipt: unknown; receiptUpdate?: unknown; error?: unknown }
   | { status: "sent" | "remove_failed"; action: QueuedAction; receipt: unknown; receiptUpdate: unknown }
 >;
 export function recordActionReceipt(
   action: QueuedAction,
   receipt: unknown,
   state?: {
-    localActions?: Map<string, { seq?: number | null }>;
+    localActions?: Map<string, { kind?: string; payload?: Record<string, unknown>; seq?: number | null }>;
+    downloadSubmission?: { request_id?: string; payload?: Record<string, unknown>; seq?: number | null } | null;
+    migrationConflictDrafts?: Map<string, { refreshRequestId?: string | null; refreshPayload?: Record<string, unknown> | null; refreshSeq?: number | null }>;
+  },
+  options?: { surface?: "settings" | "file"; storage?: Storage; now?: number },
+): { persisted: boolean; matched: boolean; localAction: boolean; downloadSubmission: boolean; migrationConflictDrafts: number };
+export function recoverActionReceipts(
+  state: {
+    localActions?: Map<string, { kind?: string; seq?: number | null }>;
     downloadSubmission?: { request_id?: string; seq?: number | null } | null;
     migrationConflictDrafts?: Map<string, { refreshRequestId?: string | null; refreshSeq?: number | null }>;
   },
-): { localAction: boolean; downloadSubmission: boolean; migrationConflictDrafts: number };
+  options: { surface: "settings" | "file"; storage?: Storage },
+): { matched: number; localActions: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; requestIds: string[] };
+export function restorePendingActions(
+  state: {
+    localActions?: Map<string, { kind?: string; payload?: Record<string, unknown>; seq?: number | null }>;
+    downloadSubmission?: { request_id?: string; payload?: Record<string, unknown>; seq?: number | null } | null;
+    migrationConflictDrafts?: Map<string, { refreshRequestId?: string | null; refreshPayload?: Record<string, unknown> | null; refreshSeq?: number | null }>;
+  },
+  options: { surface: "settings" | "file"; readQueue: () => QueuedAction[]; writeQueue: (queue: QueuedAction[]) => boolean },
+): { requeued: number; skippedAtLimit: number; writeFailed: boolean };
 export function shouldRetryActionFailure(error: unknown): boolean;

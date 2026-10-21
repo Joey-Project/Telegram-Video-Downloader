@@ -34,6 +34,29 @@ export function migrationEndpointAvailability(ownerSnapshot: unknown, sourceLibr
   sourceAvailable: boolean;
   targetAvailable: boolean;
 };
+export function selectMigrationTarget(
+  entries: readonly MediaLibraryDescriptor[] | null | undefined,
+  sourceLibraryId: string,
+  currentTargetId: string,
+  canOperate?: (libraryId: string) => boolean,
+): {
+  targets: MediaLibraryDescriptor[];
+  availableTargets: MediaLibraryDescriptor[];
+  selectedId: string;
+};
+export function renderMigrationTargetOptions(
+  selection: ReturnType<typeof selectMigrationTarget>,
+  escapeHtml: (value: unknown) => string,
+): string;
+export function buildMigrationPreviewPayload(options: {
+  sourceLibraryId: string;
+  targetLibraryId: string;
+  scope: "library" | "selected";
+  itemIds?: readonly string[];
+  includeIncompleteTasks?: boolean;
+  conflict?: "skip" | "keep_both";
+  setTargetDefaultOnSuccess?: boolean;
+}): Record<string, unknown> | null;
 export function canOperateOnMediaLibrary(descriptor: MediaLibraryDescriptor | null | undefined): boolean;
 export function mediaSnapshotInfo(descriptor: MediaLibraryDescriptor | null | undefined, snapshot: unknown): {
   totalCount: number;

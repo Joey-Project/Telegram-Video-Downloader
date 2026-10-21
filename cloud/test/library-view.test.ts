@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { boundedFolderSuggestions, canOperateOnMediaLibrary, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, resolveMediaLibrary } from "../public/file/library-view.js";
+import { boundedFolderSuggestions, buildMigrationPreviewPayload, canOperateOnMediaLibrary, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget } from "../public/file/library-view.js";
 import { updateSelectionWithinLimit } from "../public/file/selection-limit.js";
 import { renderMigrationPreview } from "../public/file/migration-preview-rendering.js";
+import { escapeHtml } from "../public/file/preview-rendering.js";
 
 describe("bounded library views", () => {
   it("merges applied registrations with per-library snapshots and preserves offline status", () => {
@@ -110,6 +111,37 @@ describe("bounded library views", () => {
     });
     expect(migrationEndpointAvailability(registry, "main", "main").sourceAvailable).toBe(true);
     expect(canOperateOnRegisteredMediaLibrary(snapshot, "default")).toBe(true);
+  });
+
+  it("preserves the selected registered migration target across option rebuilds and uses it in the preview payload", () => {
+    const main = { id: "main", availability: "available" };
+    const archive = { id: "archive", availability: "available" };
+    const added = { id: "added", availability: "available" };
+    const canOperate = (id: string) => [main, archive, added].find((entry) => entry.id === id)?.availability === "available";
+
+    const firstRender = selectMigrationTarget([main, archive], "main", "", canOperate);
+    expect(firstRender.selectedId).toBe("archive");
+
+    const rerender = selectMigrationTarget([main, added, archive], "main", "archive", canOperate);
+    expect(rerender.selectedId).toBe("archive");
+    expect(renderMigrationTargetOptions(rerender, escapeHtml)).toContain('<option value="archive" selected>');
+    const payload = buildMigrationPreviewPayload({
+      sourceLibraryId: "main",
+      targetLibraryId: rerender.selectedId,
+      scope: "library",
+    });
+    expect(payload?.target_library_id).toBe("archive");
+
+    const archiveOffline = { ...archive, availability: "offline" };
+    const withOfflineCurrent = selectMigrationTarget([main, archiveOffline, added], "main", "archive", (id) => id !== "archive");
+    expect(withOfflineCurrent.selectedId).toBe("archive");
+    expect(withOfflineCurrent.availableTargets.map((entry) => entry.id)).toEqual(["added"]);
+    expect(renderMigrationTargetOptions(withOfflineCurrent, escapeHtml)).toContain('<option value="archive" selected disabled>');
+
+    const removedTarget = selectMigrationTarget([main, added], "main", "archive", canOperate);
+    expect(removedTarget.selectedId).toBe("added");
+    const targetBecomesSource = selectMigrationTarget([main, added], "added", "added", canOperate);
+    expect(targetBecomesSource.selectedId).toBe("main");
   });
 
   it("disables migration Start for removed or offline descriptors and enables registered endpoints", () => {

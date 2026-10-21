@@ -81,6 +81,47 @@ export function migrationEndpointAvailability(ownerSnapshot, sourceLibraryId, ta
   };
 }
 
+export function selectMigrationTarget(entries, sourceLibraryId, currentTargetId, canOperate = () => true) {
+  const targets = (Array.isArray(entries) ? entries : []).filter((entry) => entry?.id !== sourceLibraryId);
+  const availableTargets = targets.filter((entry) => canOperate(entry.id));
+  const selectedId = targets.some((entry) => entry.id === currentTargetId)
+    ? currentTargetId
+    : String(availableTargets[0]?.id ?? targets[0]?.id ?? "");
+  return { targets, availableTargets, selectedId };
+}
+
+export function renderMigrationTargetOptions(selection, escapeHtml) {
+  if (!selection || typeof escapeHtml !== "function") return "";
+  return selection.targets.map((entry) => {
+    const available = selection.availableTargets.some((candidate) => candidate.id === entry.id);
+    const selected = entry.id === selection.selectedId;
+    return `<option value="${escapeHtml(entry.id)}"${selected ? " selected" : ""}${available ? "" : " disabled"}>${escapeHtml(entry.name)} · ${escapeHtml(entry.root ?? "root unavailable")}${available ? "" : " · offline"}</option>`;
+  }).join("");
+}
+
+export function buildMigrationPreviewPayload({
+  sourceLibraryId,
+  targetLibraryId,
+  scope,
+  itemIds = [],
+  includeIncompleteTasks = false,
+  conflict = "skip",
+  setTargetDefaultOnSuccess = false,
+} = {}) {
+  if (typeof sourceLibraryId !== "string" || !sourceLibraryId
+      || typeof targetLibraryId !== "string" || !targetLibraryId || sourceLibraryId === targetLibraryId) return null;
+  if (scope !== "library" && scope !== "selected") return null;
+  return {
+    source_library_id: sourceLibraryId,
+    target_library_id: targetLibraryId,
+    scope,
+    ...(scope === "selected" ? { item_ids: Array.isArray(itemIds) ? [...itemIds] : [] } : {}),
+    include_incomplete_tasks: includeIncompleteTasks === true,
+    conflict: conflict === "keep_both" ? "keep_both" : "skip",
+    set_target_default_on_success: setTargetDefaultOnSuccess === true,
+  };
+}
+
 export function canOperateOnMediaLibrary(descriptor) {
   return validLibraryIdentity(descriptor?.id)
     && mediaLibraryAvailability(descriptor) !== "offline"

@@ -1,9 +1,10 @@
-import { ACTION_QUEUE_LIMIT, ACTION_SURFACE_SETTINGS, appendAction, dispatchNextOwnedAction, recordActionReceipt, removeQueuedAction, shouldRetryActionFailure } from "/file/action-queue.js";
+import { ACTION_QUEUE_LIMIT, ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_SETTINGS, appendAction, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "/file/action-queue.js";
 import { HttpResponseError } from "/file/http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "/file/snapshot-session.js";
 import { escapeHtml } from "/file/preview-rendering.js";
 import { validateTargetRelativeDirectory } from "/file/target-directory.js";
 import { mediaLibraryAvailability, mediaLibraryEntries } from "/file/library-view.js";
+import { captureLibraryEditorFocus, libraryDraftFieldValue, reconcileLibraryDrafts, restoreLibraryEditorFocus, setLibraryDraftField } from "./library-drafts.js";
 
 const API = "/api";
 const ACTION_QUEUE_KEY = "file-manager.actions.v1";
@@ -24,6 +25,7 @@ const state = {
   refreshAfterDrain: false,
   quarantinedActionIds: new Set(),
   localActions: new Map(),
+  libraryDrafts: new Map(),
   toastTimer: 0,
 };
 
@@ -103,6 +105,18 @@ function writeActionQueue(actions) {
   return true;
 }
 
+function recoverSettingsActionReceipts() {
+  const recovered = recoverActionReceipts(state, { surface: ACTION_SURFACE_SETTINGS });
+  if (recovered.matched > 0) {
+    const matchedIds = new Set(recovered.requestIds);
+    const queue = readActionQueue();
+    const remaining = queue.filter((action) => !matchedIds.has(action.request_id));
+    if (remaining.length !== queue.length) writeActionQueue(remaining);
+    else renderPending();
+  }
+  return recovered;
+}
+
 function clearLocalSettingsAction(action, message) {
   state.localActions.delete(action.request_id);
   showToast(message);
@@ -135,9 +149,18 @@ function settleLocalActions() {
 async function drainActionQueue({ quiet = false } = {}) {
   if (!initData || !mayDispatchActions(state) || !navigator.onLine) return false;
   if (state.draining) return state.draining;
+  recoverSettingsActionReceipts();
+  const restored = restorePendingActions(state, {
+    surface: ACTION_SURFACE_SETTINGS,
+    readQueue: readActionQueue,
+    writeQueue: writeActionQueue,
+  });
+  if (restored.writeFailed && !quiet) showToast("This browser could not restore a saved settings request. It will retry when storage is available.");
+  else if (restored.skippedAtLimit > 0 && !quiet) showToast("The browser request queue is full. A saved settings request remains pending in this tab.");
   state.draining = (async () => {
     let sentAny = false;
     let interrupted = false;
+    let receiptFailed = false;
     const rejected = [];
     while (navigator.onLine) {
       const outcome = await dispatchNextOwnedAction({
@@ -149,7 +172,7 @@ async function drainActionQueue({ quiet = false } = {}) {
           method: "POST",
           body: JSON.stringify({ request_id: action.request_id, kind: action.kind, payload: action.payload }),
         }),
-        onReceipt: (action, receipt) => recordActionReceipt(action, receipt, { localActions: state.localActions }),
+        onReceipt: (action, receipt, surface) => recordActionReceipt(action, receipt, state, { surface }),
       });
       if (outcome.status === "empty") break;
       if (outcome.status === "remove_failed") {
@@ -159,6 +182,18 @@ async function drainActionQueue({ quiet = false } = {}) {
       if (outcome.status === "sent") {
         sentAny = true;
         continue;
+      }
+      if (outcome.status === "receipt_failed") {
+        receiptFailed = true;
+        if (!state.retryTimer) {
+          const delay = state.retryDelay;
+          state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
+          state.retryTimer = window.setTimeout(() => {
+            state.retryTimer = 0;
+            drainActionQueue({ quiet });
+          }, delay);
+        }
+        break;
       }
 
       const { action, error } = outcome;
@@ -189,6 +224,7 @@ async function drainActionQueue({ quiet = false } = {}) {
     }
     if (sentAny) state.retryDelay = 1_500;
     if (rejected.length) showToast(`Request rejected before local execution: ${[...new Set(rejected)].slice(0, 2).join(" · ")}`);
+    else if (!quiet && receiptFailed) showToast("The request reached the cloud inbox, but this browser could not save its receipt. It will retry with the same ID.");
     else if (!quiet && interrupted) showToast("Connection interrupted. Saved requests will retry with their same IDs.");
     return sentAny;
   })();
@@ -202,13 +238,14 @@ async function drainActionQueue({ quiet = false } = {}) {
   return sentAny;
 }
 
-async function submitAction(kind, payload, label) {
+async function submitAction(kind, payload, label, onQueued = null) {
   if (!mayDispatchActions(state)) return false;
   const action = { request_id: crypto.randomUUID(), kind, payload, surface: ACTION_SURFACE_SETTINGS };
   const queued = appendAction(readActionQueue(), action);
   if (!queued.ok) return showToast("The browser retry queue is full. Send its saved requests first."), false;
   if (!writeActionQueue(queued.queue)) return showToast("This browser could not save the request, so it was not sent."), false;
   state.localActions.set(action.request_id, { kind, payload, label, seq: null });
+  onQueued?.();
   if (kind === "library_register") byId("register-form").dataset.pendingRequestId = action.request_id;
   showToast(navigator.onLine ? `${label} saved. Waiting for the desktop to apply it.` : `${label} saved in this browser. It has not reached the desktop.`);
   if (navigator.onLine) await drainActionQueue();
@@ -241,6 +278,8 @@ function renderLibraryCard(rawEntry) {
   const name = String(entry.name ?? "Unnamed library");
   const root = String(entry.root ?? "Path unavailable");
   const category = String(entry.default_category ?? "");
+  const nameDraft = libraryDraftFieldValue(state.libraryDrafts, entry, "name");
+  const categoryDraft = libraryDraftFieldValue(state.libraryDrafts, entry, "default_category");
   const availability = mediaLibraryAvailability(entry);
   const status = entry.snapshot_stale === true
     ? availability === "offline" ? "Offline · last saved view only" : "Scan pending · saved view only"
@@ -274,14 +313,14 @@ function renderLibraryCard(rawEntry) {
     </div>
     ${dependentWarning}
     <div class="settings-edit-grid">
-      <form class="settings-edit-form" data-rename-form="${idAttr}">
+      <form class="settings-edit-form" data-rename-form="${idAttr}" data-library-root="${escapeHtml(root)}">
         <label class="field-label" for="rename-${idAttr}">Rename library</label>
-        <input id="rename-${idAttr}" class="text-input" name="name" type="text" maxlength="100" required value="${nameAttr}">
+        <input id="rename-${idAttr}" class="text-input" name="name" type="text" maxlength="100" required value="${escapeHtml(nameDraft)}">
         <button class="small-button" type="submit">Save name</button>
       </form>
-      <form class="settings-edit-form" data-category-form="${idAttr}">
+      <form class="settings-edit-form" data-category-form="${idAttr}" data-library-root="${escapeHtml(root)}">
         <label class="field-label" for="category-${idAttr}">Default category</label>
-        <input id="category-${idAttr}" class="text-input" name="default_category" type="text" maxlength="1024" value="${categoryAttr}" placeholder="Library root">
+        <input id="category-${idAttr}" class="text-input" name="default_category" type="text" maxlength="1024" value="${escapeHtml(categoryDraft)}" placeholder="Library root">
         <button class="small-button" type="submit">Save category</button>
       </form>
     </div>
@@ -290,8 +329,12 @@ function renderLibraryCard(rawEntry) {
 
 function renderLibraries() {
   const entries = mediaLibraryEntries(state.snapshot).map(libraryDescriptor);
+  reconcileLibraryDrafts(state.libraryDrafts, entries);
   byId("library-empty").classList.toggle("hidden", entries.length > 0);
-  byId("library-list").innerHTML = entries.map(renderLibraryCard).join("");
+  const list = byId("library-list");
+  const focus = captureLibraryEditorFocus(list, document.activeElement, entries);
+  list.innerHTML = entries.map(renderLibraryCard).join("");
+  restoreLibraryEditorFocus(list, focus, entries);
   const stale = state.snapshot?.stale === true || state.snapshot?.synced !== true;
   byId("library-list").classList.toggle("settings-applied-warning", stale);
 }
@@ -400,14 +443,39 @@ function bindEvents() {
     if (!form) return;
     event.preventDefault();
     const libraryId = form.dataset.renameForm ?? form.dataset.categoryForm;
+    const entry = mediaLibraryEntries(state.snapshot).map(libraryDescriptor).find((candidate) => candidate.id === libraryId);
+    if (!entry) return showToast("This library is no longer registered. Refresh the settings and try again.");
     if (form.dataset.renameForm) {
       const name = normalizeName(form.elements.name.value);
       if (name.error) return showToast(name.error);
-      submitAction("library_rename", { library_id: libraryId, name: name.name }, `Rename library to “${name.name}”`);
+      submitAction("library_rename", { library_id: libraryId, name: name.name }, `Rename library to “${name.name}”`, () => {
+        setLibraryDraftField(state.libraryDrafts, entry, "name", name.name);
+      });
     } else {
       const category = normalizeCategory(form.elements.default_category.value);
       if (category.error) return showToast(category.error);
-      submitAction("library_set_category", { library_id: libraryId, default_category: category.directory }, "Update default category");
+      submitAction("library_set_category", { library_id: libraryId, default_category: category.directory }, "Update default category", () => {
+        setLibraryDraftField(state.libraryDrafts, entry, "default_category", category.directory);
+      });
+    }
+  });
+  byId("library-list").addEventListener("input", (event) => {
+    const form = event.target.closest("form[data-rename-form], form[data-category-form]");
+    if (!form) return;
+    const libraryId = form.dataset.renameForm ?? form.dataset.categoryForm;
+    const entry = mediaLibraryEntries(state.snapshot).map(libraryDescriptor).find((candidate) => candidate.id === libraryId);
+    if (!entry) return;
+    const field = form.dataset.renameForm ? "name" : "default_category";
+    setLibraryDraftField(state.libraryDrafts, entry, field, event.target.value);
+  });
+  window.addEventListener("storage", (event) => {
+    if (!event.key?.startsWith(ACTION_RECEIPT_STORAGE_PREFIX)) return;
+    const recovered = recoverSettingsActionReceipts();
+    if (recovered.matched === 0) return;
+    renderPending();
+    if (state.ownerVerified) {
+      if (state.loading) state.refreshAfterDrain = true;
+      else refreshState({ quiet: true });
     }
   });
   byId("library-list").addEventListener("click", (event) => {
@@ -442,6 +510,7 @@ function applySnapshotFailure(status) {
 
 async function refreshState({ quiet = false } = {}) {
   if (!initData || state.loading) return;
+  recoverSettingsActionReceipts();
   state.loading = true;
   try {
     const fresh = await api("/state");
