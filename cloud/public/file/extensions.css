@@ -1,0 +1,110 @@
+.select-label {
+  display: grid;
+  gap: 5px;
+  min-width: 170px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.library-context {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 12px 0 18px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, .72);
+}
+
+.library-context code {
+  min-width: 0;
+  flex: 1;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.migration-card .organize-controls > .select-control {
+  max-width: 480px;
+}
+
+.migration-conflict-line {
+  align-items: center;
+}
+
+.migration-conflict-choice {
+  display: grid;
+  gap: 4px;
+  min-width: 132px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.migration-conflict-choice .select-control {
+  min-width: 132px;
+  min-height: 34px;
+}
+
+.task-transfer-list {
+  margin-bottom: 12px;
+}
+
+.download-dialog {
+  width: min(100% - 28px, 560px);
+  max-height: min(90vh, 820px);
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  color: var(--ink);
+  background: var(--paper);
+  box-shadow: 0 24px 90px rgba(17, 27, 30, .24);
+}
+
+.download-dialog::backdrop {
+  background: rgba(19, 28, 30, .42);
+  backdrop-filter: blur(4px);
+}
+
+.download-form {
+  display: grid;
+  gap: 12px;
+  padding: 22px;
+}
+
+.download-form .detail-top {
+  margin-bottom: 0;
+}
+
+.download-form .detail-top h2 {
+  margin: 3px 0 0;
+}
+
+.download-form .field-label {
+  margin: 4px 0 -7px;
+}
+
+.download-form .stack-actions {
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.download-form .primary-button:disabled {
+  cursor: wait;
+  opacity: .6;
+}
+
+@media (max-width: 640px) {
+  .select-label,
+  .select-label .select-control,
+  .library-context code {
+    width: 100%;
+  }
+
+  .download-form {
+    padding: 18px;
+  }
+}

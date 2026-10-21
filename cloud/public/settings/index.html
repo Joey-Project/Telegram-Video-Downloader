@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#f4f6f4">
+    <meta name="description" content="Manage the media libraries used by your downloader.">
+    <title>Media Library Settings</title>
+    <link rel="stylesheet" href="/file/styles.css">
+    <link rel="stylesheet" href="/settings/extensions.css">
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script type="module" src="/settings/app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="brand" href="/settings/" aria-label="Media library settings home">
+          <span class="brand-mark" aria-hidden="true">V</span>
+          <span><strong>Video Library</strong><small>Media library settings</small></span>
+        </a>
+        <div class="connection-wrap">
+          <span id="connection-dot" class="connection-dot" aria-hidden="true"></span>
+          <span id="connection-label">Connecting</span>
+          <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh settings" title="Refresh">↻</button>
+        </div>
+      </header>
+
+      <main>
+        <section id="auth-gate" class="auth-gate hidden" aria-live="polite">
+          <div class="auth-icon" aria-hidden="true">↗</div>
+          <h1>Open from Telegram</h1>
+          <p id="auth-message">Open settings from the bot’s Mini App button in the owner’s private chat.</p>
+        </section>
+
+        <div id="app-content" class="hidden">
+          <section class="hero">
+            <div>
+              <p class="eyebrow">LOCAL DESTINATIONS</p>
+              <h1>Media libraries</h1>
+              <p class="hero-copy">Choose where new downloads go and manage the folders the desktop app scans.</p>
+            </div>
+            <a class="secondary-button settings-nav" href="/file/">Open file library</a>
+          </section>
+
+          <section class="sync-card" aria-live="polite">
+            <div class="sync-icon" aria-hidden="true">◷</div>
+            <div class="sync-copy"><strong id="sync-title">Waiting for your computer</strong><span id="sync-detail">Applied settings appear here after the desktop app connects.</span></div>
+            <span id="sync-badge" class="badge">Not synced</span>
+          </section>
+
+          <section class="settings-section">
+            <div class="panel-heading"><div><p class="eyebrow">REGISTERED LOCATIONS</p><h2>Your libraries</h2><p>Settings shown here are the last values applied on the desktop. Requests remain pending until that computer applies them.</p></div></div>
+            <div id="library-list" class="settings-library-list" aria-live="polite"></div>
+            <div id="library-empty" class="empty-state hidden"><div class="empty-art" aria-hidden="true">▱</div><h2>No media libraries registered</h2><p>Add a folder from the computer that runs the bot. Existing files are discovered by a scan and stay where they are.</p></div>
+          </section>
+
+          <section class="settings-section add-library-card">
+            <div class="panel-heading"><div><p class="eyebrow">ADD A LOCATION</p><h2>Register a media library</h2><p>Enter a path on the deployment machine. The local app checks it and rejects overlapping roots.</p></div></div>
+            <form id="register-form" class="settings-form">
+              <label class="field-label" for="register-name">Library name</label>
+              <input id="register-name" name="name" class="text-input" type="text" maxlength="100" required autocomplete="off" placeholder="e.g. Archive">
+              <label class="field-label" for="register-path">Folder path on the desktop</label>
+              <input id="register-path" name="path" class="text-input" type="text" maxlength="1024" required autocomplete="off" placeholder="/Volumes/Media/Archive">
+              <p class="field-hint">This path is interpreted by the desktop computer running the bot. Use an absolute path.</p>
+              <label class="field-label" for="register-category">Default download category</label>
+              <input id="register-category" name="default_category" class="text-input" type="text" maxlength="1024" autocomplete="off" placeholder="Leave blank to save at the library root">
+              <div class="settings-checkboxes">
+                <label class="option-row"><input id="register-set-default" name="set_default" type="checkbox"><span><strong>Make this the default library</strong><small>New bot downloads use this location.</small></span></label>
+                <label class="option-row"><input id="register-create-directory" name="create_directory" type="checkbox"><span><strong>Create the folder if it is missing</strong><small>This is an explicit local filesystem action.</small></span></label>
+              </div>
+              <div class="settings-form-footer"><span id="register-status" class="field-hint" aria-live="polite">New folders are never created unless you check the box above.</span><button class="primary-button" type="submit">Register library</button></div>
+            </form>
+          </section>
+
+          <section class="settings-section">
+            <div class="panel-heading"><div><p class="eyebrow">REQUEST STATUS</p><h2>Waiting for the desktop</h2><p>Cloud acceptance and browser queuing are not proof of a local settings change.</p></div></div>
+            <div id="waiting-list" class="settings-history" aria-live="polite"></div>
+          </section>
+
+          <section class="settings-section">
+            <div class="panel-heading"><div><p class="eyebrow">LOCAL RECEIPTS</p><h2>Recent settings activity</h2><p>A completed receipt means the local app finished the request. Failed requests show the local error and leave applied settings unchanged.</p></div></div>
+            <div id="operations-list" class="settings-history" aria-live="polite"></div>
+          </section>
+        </div>
+      </main>
+
+      <footer class="footer"><span>Private settings for the bot owner</span><span id="queued-actions"></span></footer>
+    </div>
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  </body>
+</html>

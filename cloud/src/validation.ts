@@ -1,7 +1,9 @@
 import { HttpError } from "./types";
 import type {
   ActionRequest,
+  BoundLibraryMutationIdentity,
   CollectionMetadata,
+  DownloadSubmitPayload,
   FilePreviewPayload,
   LocalSnapshot,
   MetadataPatch,
@@ -13,10 +15,17 @@ export const MAX_LEGACY_TEXT_BYTES = 256 * 1024;
 const MAX_ACTION_BODY_ENVELOPE_BYTES = 4 * 1024;
 // JSON may represent each ASCII code unit as a six-byte \\uXXXX escape.
 export const MAX_ACTION_BODY_BYTES = MAX_LEGACY_TEXT_BYTES * 6 + MAX_ACTION_BODY_ENVELOPE_BYTES;
+export const ACTION_REPLAY_WINDOW_MS = 6 * 24 * 60 * 60 * 1_000;
+const MAX_ACTION_CLOCK_SKEW_MS = 5 * 60 * 1_000;
 export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
 export const MAX_TARGET_RELATIVE_DIR_BYTES = 1_024;
 export const MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES = 255;
 export const MAX_SELECTED_ITEMS = 100;
+export const MAX_MEDIA_LIBRARIES = 16;
+export const MAX_MIGRATION_ITEM_CONFLICTS = 10_000;
+export const MAX_MIGRATION_DISCOVERY_WARNINGS = 16;
+export const MAX_LIBRARY_ROOT_BYTES = 1_024;
+export const MAX_DOWNLOAD_URL_BYTES = 8_192;
 const MAX_COLLECTION_ORDER = 0xffff_ffff;
 const MAX_LEGACY_HINTS = 10_000;
 const MAX_LEGACY_HINT_INDEX = MAX_LEGACY_HINTS - 1;
@@ -295,8 +304,51 @@ function parseRelativeDirectory(value: unknown): string {
   return directory;
 }
 
+function parseLibraryId(value: unknown, field = "library_id"): string {
+  return boundedUtf8String(value, field, 128);
+}
+
+function parseOptionalLibraryId(value: unknown): { library_id?: string } {
+  return value === undefined ? {} : { library_id: parseLibraryId(value) };
+}
+
+function parseAbsoluteLibraryRoot(value: unknown): string {
+  const root = boundedUtf8String(value, "path", MAX_LIBRARY_ROOT_BYTES);
+  if (!root.startsWith("/") && !/^[A-Za-z]:[\\/]/u.test(root) && !/^\\\\[^\\]/u.test(root)) {
+    throw new HttpError(400, "path must be an absolute path on the deployment machine");
+  }
+  return root;
+}
+
+function parseOptionalRootBinding(value: unknown, field: string): void {
+  if (value === undefined || value === null) return;
+  if (typeof value !== "string" || UTF8_ENCODER.encode(value).byteLength !== 67
+      || !/^v1:[0-9a-f]{64}$/u.test(value)) {
+    throw new HttpError(400, `${field} must be an opaque root binding token`);
+  }
+}
+
+function parseRequiredRootBinding(value: unknown): string {
+  if (typeof value !== "string" || UTF8_ENCODER.encode(value).byteLength !== 67
+      || !/^v1:[0-9a-f]{64}$/u.test(value)) {
+    throw new HttpError(400, "root_binding must be an opaque root identity token");
+  }
+  return value;
+}
+
+function parseBoundLibraryMutationIdentity(value: Record<string, unknown>): BoundLibraryMutationIdentity {
+  return {
+    library_id: parseLibraryId(value.library_id),
+    root_binding: parseRequiredRootBinding(value.root_binding),
+  };
+}
+
+function parseLibraryName(value: unknown, field = "name"): string {
+  return boundedUtf8String(value, field, 100);
+}
+
 function parsePreviewPayload(value: unknown): FilePreviewPayload {
-  if (!isRecord(value) || !onlyKeys(value, ["item_ids", "target_relative_dir", "rename", "conflict", "metadata_patches"])) {
+  if (!isRecord(value) || !onlyKeys(value, ["library_id", "root_binding", "item_ids", "target_relative_dir", "rename", "conflict", "metadata_patches"])) {
     throw new HttpError(400, "file_preview payload has an invalid shape");
   }
 
@@ -342,6 +394,7 @@ function parsePreviewPayload(value: unknown): FilePreviewPayload {
   }
 
   return {
+    ...parseBoundLibraryMutationIdentity(value),
     ...(itemIds === undefined ? {} : { item_ids: itemIds }),
     ...(targetRelativeDir === undefined ? {} : { target_relative_dir: targetRelativeDir }),
     rename,
@@ -350,15 +403,316 @@ function parsePreviewPayload(value: unknown): FilePreviewPayload {
   };
 }
 
+function parseSettingsAction(kind: string, value: Record<string, unknown>): Record<string, unknown> {
+  switch (kind) {
+    case "library_register": {
+      if (!onlyKeys(value, ["name", "path", "default_category", "set_default", "create_directory"])) {
+        throw new HttpError(400, "library_register payload has an invalid shape");
+      }
+      const setDefault = value.set_default === undefined ? false : value.set_default;
+      const createDirectory = value.create_directory === undefined ? false : value.create_directory;
+      if (typeof setDefault !== "boolean" || typeof createDirectory !== "boolean") {
+        throw new HttpError(400, "set_default and create_directory must be booleans");
+      }
+      return {
+        name: parseLibraryName(value.name),
+        path: parseAbsoluteLibraryRoot(value.path),
+        default_category: value.default_category === undefined ? "" : parseRelativeDirectory(value.default_category),
+        set_default: setDefault,
+        create_directory: createDirectory,
+      };
+    }
+    case "library_set_default":
+    case "library_remove": {
+      if (!onlyKeys(value, ["library_id", "root_binding"])) throw new HttpError(400, `${kind} payload has an invalid shape`);
+      return parseBoundLibraryMutationIdentity(value);
+    }
+    case "library_set_category": {
+      if (!onlyKeys(value, ["library_id", "root_binding", "default_category"])) {
+        throw new HttpError(400, "library_set_category payload has an invalid shape");
+      }
+      return {
+        ...parseBoundLibraryMutationIdentity(value),
+        default_category: parseRelativeDirectory(value.default_category),
+      };
+    }
+    case "library_rename": {
+      if (!onlyKeys(value, ["library_id", "root_binding", "name"])) throw new HttpError(400, "library_rename payload has an invalid shape");
+      return {
+        ...parseBoundLibraryMutationIdentity(value),
+        name: parseLibraryName(value.name),
+      };
+    }
+    default:
+      throw new HttpError(400, "kind is not supported");
+  }
+}
+
+function parseMigrationPreview(value: Record<string, unknown>): Record<string, unknown> {
+  if (!onlyKeys(value, [
+    "source_library_id", "target_library_id", "source_root_binding", "target_root_binding",
+    "scope", "item_ids", "include_incomplete_tasks",
+    "conflict", "item_conflicts", "set_target_default_on_success",
+    "supersedes_preview_seq", "supersedes_preview_id", "supersedes_revision",
+  ])) {
+    throw new HttpError(400, "library_migration_preview payload has an invalid shape");
+  }
+  const scope = value.scope;
+  if (scope !== "library" && scope !== "selected") {
+    throw new HttpError(400, "scope must be library or selected");
+  }
+  const itemIds = value.item_ids === undefined
+    ? undefined
+    : stringList(value.item_ids, "item_ids", MAX_SELECTED_ITEMS, 128);
+  if (scope === "selected" && itemIds === undefined) {
+    throw new HttpError(400, "item_ids are required when scope is selected");
+  }
+  if (scope === "library" && itemIds !== undefined) {
+    throw new HttpError(400, "item_ids must be omitted when scope is library");
+  }
+  const includeIncompleteTasks = value.include_incomplete_tasks === undefined ? false : value.include_incomplete_tasks;
+  const setTargetDefault = value.set_target_default_on_success === undefined ? false : value.set_target_default_on_success;
+  if (typeof includeIncompleteTasks !== "boolean" || typeof setTargetDefault !== "boolean") {
+    throw new HttpError(400, "migration options must be booleans");
+  }
+  const conflict = value.conflict === undefined ? "skip" : value.conflict;
+  if (conflict !== "skip" && conflict !== "keep_both") {
+    throw new HttpError(400, "conflict must be skip or keep_both");
+  }
+  let itemConflicts: Record<string, "skip" | "keep_both"> | undefined;
+  if (value.item_conflicts !== undefined) {
+    if (!isRecord(value.item_conflicts)) {
+      throw new HttpError(400, "item_conflicts must be an object keyed by media item ID");
+    }
+    const entries = Object.entries(value.item_conflicts);
+    if (entries.length > MAX_MIGRATION_ITEM_CONFLICTS) {
+      throw new HttpError(400, `item_conflicts cannot exceed ${MAX_MIGRATION_ITEM_CONFLICTS} entries`);
+    }
+    const selectedIds = new Set(itemIds ?? []);
+    itemConflicts = Object.create(null) as Record<string, "skip" | "keep_both">;
+    for (const [rawItemId, policy] of entries) {
+      const itemId = boundedUtf8String(rawItemId, "item_conflicts item ID", 256);
+      if (itemId !== rawItemId) throw new HttpError(400, "item_conflicts IDs must not have surrounding whitespace");
+      if (scope === "selected" && !selectedIds.has(itemId)) {
+        throw new HttpError(400, "item_conflicts may only target selected media item IDs");
+      }
+      if (policy !== "skip" && policy !== "keep_both") {
+        throw new HttpError(400, "each item_conflicts value must be skip or keep_both");
+      }
+      itemConflicts[itemId] = policy;
+    }
+  }
+  const sourceLibraryId = parseLibraryId(value.source_library_id, "source_library_id");
+  const targetLibraryId = parseLibraryId(value.target_library_id, "target_library_id");
+  const sourceRootBinding = parseRequiredRootBinding(value.source_root_binding);
+  const targetRootBinding = parseRequiredRootBinding(value.target_root_binding);
+  if (sourceLibraryId === targetLibraryId) throw new HttpError(400, "source and target libraries must differ");
+  const supersessionFields = ["supersedes_preview_seq", "supersedes_preview_id", "supersedes_revision"] as const;
+  const hasSupersessionField = supersessionFields.map((field) => Object.hasOwn(value, field));
+  const hasSupersession = hasSupersessionField.some(Boolean);
+  if (hasSupersession && !hasSupersessionField.every(Boolean)) {
+    throw new HttpError(400, "all supersedes preview fields must be provided together");
+  }
+  let supersedesPreviewSeq: number | undefined;
+  let supersedesPreviewId: string | undefined;
+  let supersedesRevision: string | undefined;
+  if (hasSupersession) {
+    if (!Number.isSafeInteger(value.supersedes_preview_seq) || (value.supersedes_preview_seq as number) <= 0) {
+      throw new HttpError(400, "supersedes_preview_seq must be a positive safe integer");
+    }
+    supersedesPreviewSeq = value.supersedes_preview_seq as number;
+    supersedesPreviewId = boundedString(value.supersedes_preview_id, "supersedes_preview_id", 128);
+    supersedesRevision = boundedString(value.supersedes_revision, "supersedes_revision", 256);
+  }
+  return {
+    source_library_id: sourceLibraryId,
+    target_library_id: targetLibraryId,
+    source_root_binding: sourceRootBinding,
+    target_root_binding: targetRootBinding,
+    scope,
+    ...(itemIds === undefined ? {} : { item_ids: itemIds }),
+    include_incomplete_tasks: includeIncompleteTasks,
+    conflict,
+    ...(itemConflicts === undefined ? {} : { item_conflicts: itemConflicts }),
+    set_target_default_on_success: setTargetDefault,
+    ...(hasSupersession ? {
+      supersedes_preview_seq: supersedesPreviewSeq,
+      supersedes_preview_id: supersedesPreviewId,
+      supersedes_revision: supersedesRevision,
+    } : {}),
+  };
+}
+
+function parseDownloadSubmit(value: Record<string, unknown>): DownloadSubmitPayload {
+  if (!onlyKeys(value, ["url", "library_id", "root_binding", "category"])) {
+    throw new HttpError(400, "download_submit payload has an invalid shape");
+  }
+  const url = boundedUtf8String(value.url, "url", MAX_DOWNLOAD_URL_BYTES);
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new HttpError(400, "url must be an absolute HTTP or HTTPS URL");
+  }
+  if ((parsed.protocol !== "https:" && parsed.protocol !== "http:") || !parsed.hostname || parsed.username || parsed.password) {
+    throw new HttpError(400, "url must be an absolute HTTP or HTTPS URL without embedded credentials");
+  }
+  return {
+    url,
+    library_id: parseLibraryId(value.library_id),
+    root_binding: parseRequiredRootBinding(value.root_binding),
+    ...(value.category === undefined ? {} : { category: parseRelativeDirectory(value.category) }),
+  };
+}
+
+const MIGRATION_DISCOVERY_WARNING_KINDS = [
+  "disappeared",
+  "unreadable",
+  "oversized",
+  "malformed",
+  "source_binding_mismatch",
+  "source_unavailable",
+  "enumeration_failed",
+  "maintenance_failed",
+] as const;
+
+function validateMigrationDiscoveryWarnings(library: Record<string, unknown>): void {
+  const warnings = library.migration_discovery_warnings;
+  if (warnings !== undefined) {
+    if (!Array.isArray(warnings) || warnings.length > MAX_MIGRATION_DISCOVERY_WARNINGS) {
+      throw new HttpError(400, `library.migration_discovery_warnings must contain at most ${MAX_MIGRATION_DISCOVERY_WARNINGS} entries`);
+    }
+    for (const [index, candidate] of warnings.entries()) {
+      if (!isRecord(candidate)) throw new HttpError(400, `library.migration_discovery_warnings[${index}] must be an object`);
+      const kind = candidate.kind;
+      if (!MIGRATION_DISCOVERY_WARNING_KINDS.includes(kind as typeof MIGRATION_DISCOVERY_WARNING_KINDS[number])) {
+        throw new HttpError(400, `library.migration_discovery_warnings[${index}].kind is invalid`);
+      }
+      const rootLevelEnumeration = kind === "enumeration_failed"
+        && candidate.source_library_id === ""
+        && candidate.record_name === "";
+      if (rootLevelEnumeration) {
+        // A registry-level enumeration failure has no single source library or manifest.
+      } else {
+        parseLibraryId(candidate.source_library_id, `library.migration_discovery_warnings[${index}].source_library_id`);
+        const sourceLevelWithoutManifest = candidate.record_name === ""
+          && (kind === "source_unavailable" || kind === "maintenance_failed" || kind === "enumeration_failed");
+        if (!sourceLevelWithoutManifest) {
+          const recordName = boundedUtf8String(candidate.record_name, `library.migration_discovery_warnings[${index}].record_name`, 160);
+          if (recordName === "." || recordName === ".." || recordName.includes("/") || recordName.includes("\\")) {
+            throw new HttpError(400, `library.migration_discovery_warnings[${index}].record_name must be a basename`);
+          }
+        }
+      }
+      boundedUtf8String(candidate.message, `library.migration_discovery_warnings[${index}].message`, 192);
+    }
+  }
+  const omitted = library.migration_discovery_warning_omitted_count;
+  if (omitted !== undefined && (!Number.isSafeInteger(omitted) || (omitted as number) < 0)) {
+    throw new HttpError(400, "library.migration_discovery_warning_omitted_count must be a non-negative safe integer");
+  }
+}
+
+function validateAppliedSettings(value: unknown): void {
+  if (!isRecord(value) || !onlyKeys(value, ["revision", "default_library_id", "default_category", "libraries"])) {
+    throw new HttpError(400, "settings.applied has an invalid shape");
+  }
+  boundedString(value.revision, "settings.applied.revision", 256);
+  const defaultLibraryId = value.default_library_id;
+  if (typeof defaultLibraryId !== "string" || new TextEncoder().encode(defaultLibraryId).byteLength > 128) {
+    throw new HttpError(400, "settings.applied.default_library_id is invalid");
+  }
+  if (typeof value.default_category !== "string") {
+    throw new HttpError(400, "settings.applied.default_category must be a string");
+  }
+  parseRelativeDirectory(value.default_category);
+  if (!Array.isArray(value.libraries) || value.libraries.length > MAX_MEDIA_LIBRARIES) {
+    throw new HttpError(400, `settings.applied.libraries must contain at most ${MAX_MEDIA_LIBRARIES} entries`);
+  }
+  const ids = new Set<string>();
+  let defaults = 0;
+  for (const [index, candidate] of value.libraries.entries()) {
+    if (!isRecord(candidate) || !onlyKeys(candidate, ["id", "name", "root", "default_category", "is_default", "root_binding"])) {
+      throw new HttpError(400, `settings.applied.libraries[${index}] has an invalid shape`);
+    }
+    const id = parseLibraryId(candidate.id, `settings.applied.libraries[${index}].id`);
+    if (ids.has(id)) throw new HttpError(400, "settings.applied.libraries contains duplicate IDs");
+    ids.add(id);
+    parseLibraryName(candidate.name, `settings.applied.libraries[${index}].name`);
+    parseAbsoluteLibraryRoot(candidate.root);
+    parseOptionalRootBinding(candidate.root_binding, `settings.applied.libraries[${index}].root_binding`);
+    if (typeof candidate.default_category !== "string") {
+      throw new HttpError(400, `settings.applied.libraries[${index}].default_category must be a string`);
+    }
+    parseRelativeDirectory(candidate.default_category);
+    if (typeof candidate.is_default !== "boolean") {
+      throw new HttpError(400, `settings.applied.libraries[${index}].is_default must be a boolean`);
+    }
+    if (candidate.is_default) defaults += 1;
+  }
+  if (value.libraries.length > 0 && (defaults !== 1 || !ids.has(defaultLibraryId))) {
+    throw new HttpError(400, "settings.applied must identify exactly one registered default library");
+  }
+}
+
+function validateLibraryDescriptors(library: Record<string, unknown>): void {
+  if (library.libraries !== undefined) {
+    if (!Array.isArray(library.libraries) || library.libraries.length > MAX_MEDIA_LIBRARIES) {
+      throw new HttpError(400, `library.libraries must contain at most ${MAX_MEDIA_LIBRARIES} entries`);
+    }
+    const ids = new Set<string>();
+    for (const [index, candidate] of library.libraries.entries()) {
+      if (!isRecord(candidate)) throw new HttpError(400, `library.libraries[${index}] must be an object`);
+      const id = parseLibraryId(candidate.id, `library.libraries[${index}].id`);
+      if (ids.has(id)) throw new HttpError(400, "library.libraries contains duplicate IDs");
+      ids.add(id);
+      parseLibraryName(candidate.name, `library.libraries[${index}].name`);
+      parseAbsoluteLibraryRoot(candidate.root);
+      parseOptionalRootBinding(candidate.root_binding, `library.libraries[${index}].root_binding`);
+      if (candidate.default_category !== undefined && candidate.default_category !== null) {
+        if (typeof candidate.default_category !== "string") {
+          throw new HttpError(400, `library.libraries[${index}].default_category must be a string`);
+        }
+        parseRelativeDirectory(candidate.default_category);
+      }
+      if (candidate.is_default !== undefined && typeof candidate.is_default !== "boolean") {
+        throw new HttpError(400, `library.libraries[${index}].is_default must be a boolean`);
+      }
+      if (candidate.availability !== undefined &&
+        !["available", "unavailable", "offline", "unknown"].includes(String(candidate.availability))) {
+        throw new HttpError(400, `library.libraries[${index}].availability is invalid`);
+      }
+      for (const field of ["media_count", "scanned_at", "free_bytes", "total_bytes", "incomplete_task_count", "staging_bytes"]) {
+        const fieldValue = candidate[field];
+        if (fieldValue !== undefined && fieldValue !== null &&
+          (!Number.isSafeInteger(fieldValue) || (fieldValue as number) < 0)) {
+          throw new HttpError(400, `library.libraries[${index}].${field} must be a non-negative safe integer`);
+        }
+      }
+    }
+  }
+  if (library.migrations !== undefined &&
+    (!Array.isArray(library.migrations) || library.migrations.length > 32)) {
+    throw new HttpError(400, "library.migrations must contain at most 32 entries");
+  }
+  validateMigrationDiscoveryWarnings(library);
+}
+
 export function validateActionRequest(value: unknown): ActionRequest {
-  if (!isRecord(value) || !onlyKeys(value, ["request_id", "kind", "payload"])) {
+  if (!isRecord(value) || !onlyKeys(value, ["request_id", "kind", "payload", "queued_at_ms", "replay_expires_at_ms"])) {
     throw new HttpError(400, "Action request has an invalid shape");
   }
+  const replayWindow = parseActionReplayWindow(value, Date.now());
   const requestId = boundedString(value.request_id, "request_id", 36);
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(requestId)) {
     throw new HttpError(400, "request_id must be a UUID");
   }
-  if (typeof value.kind !== "string" || !["library_scan", "file_preview", "file_confirm", "legacy_import"].includes(value.kind)) {
+  const supportedKinds = [
+    "library_scan", "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove",
+    "file_preview", "file_confirm", "legacy_import", "download_submit", "library_migration_preview",
+    "library_migration_confirm", "library_migration_control",
+  ];
+  if (typeof value.kind !== "string" || !supportedKinds.includes(value.kind)) {
     throw new HttpError(400, "kind is not supported");
   }
   if (!isRecord(value.payload)) throw new HttpError(400, "payload must be an object");
@@ -367,29 +721,87 @@ export function validateActionRequest(value: unknown): ActionRequest {
   let payload: Record<string, unknown>;
   switch (kind) {
     case "library_scan":
-      if (Object.keys(value.payload).length !== 0) throw new HttpError(400, "library_scan payload must be empty");
-      payload = {};
+      if (!onlyKeys(value.payload, ["library_id"])) throw new HttpError(400, "library_scan payload has an invalid shape");
+      payload = parseOptionalLibraryId(value.payload.library_id);
       break;
     case "file_preview":
       payload = parsePreviewPayload(value.payload) as unknown as Record<string, unknown>;
       break;
     case "file_confirm":
-      if (!onlyKeys(value.payload, ["preview_id", "revision"])) {
+      if (!onlyKeys(value.payload, ["preview_id", "revision", "library_id"])) {
         throw new HttpError(400, "file_confirm payload has an invalid shape");
+      }
+      payload = {
+        preview_id: boundedString(value.payload.preview_id, "preview_id", 128),
+        revision: boundedString(value.payload.revision, "revision", 256),
+        ...parseOptionalLibraryId(value.payload.library_id),
+      };
+      break;
+    case "legacy_import": {
+      if (!onlyKeys(value.payload, ["text", "library_id", "root_binding"])) throw new HttpError(400, "legacy_import payload has an invalid shape");
+      const text = boundedLegacyText(value.payload.text);
+      payload = { text, ...parseBoundLibraryMutationIdentity(value.payload) };
+      break;
+    }
+    case "download_submit":
+      payload = parseDownloadSubmit(value.payload);
+      break;
+    case "library_register":
+    case "library_set_default":
+    case "library_set_category":
+    case "library_rename":
+    case "library_remove":
+      payload = parseSettingsAction(kind, value.payload);
+      break;
+    case "library_migration_preview":
+      payload = parseMigrationPreview(value.payload);
+      break;
+    case "library_migration_confirm":
+      if (!onlyKeys(value.payload, ["preview_id", "revision"])) {
+        throw new HttpError(400, "library_migration_confirm payload has an invalid shape");
       }
       payload = {
         preview_id: boundedString(value.payload.preview_id, "preview_id", 128),
         revision: boundedString(value.payload.revision, "revision", 256),
       };
       break;
-    case "legacy_import": {
-      if (!onlyKeys(value.payload, ["text"])) throw new HttpError(400, "legacy_import payload has an invalid shape");
-      const text = boundedLegacyText(value.payload.text);
-      payload = { text };
+    case "library_migration_control": {
+      if (!onlyKeys(value.payload, ["migration_id", "control"])) {
+        throw new HttpError(400, "library_migration_control payload has an invalid shape");
+      }
+      const control = value.payload.control;
+      if (!["pause", "resume", "stop_remaining", "retry_failed", "finalize_terminal"].includes(String(control))) {
+        throw new HttpError(400, "control is not supported");
+      }
+      payload = {
+        migration_id: boundedString(value.payload.migration_id, "migration_id", 128),
+        control,
+      };
       break;
     }
   }
-  return { request_id: requestId, kind, payload };
+  return { request_id: requestId, kind, payload, ...replayWindow };
+}
+
+function parseActionReplayWindow(
+  value: Record<string, unknown>,
+  now: number,
+): Pick<ActionRequest, "queued_at_ms" | "replay_expires_at_ms"> {
+  const queuedAt = value.queued_at_ms;
+  const expiresAt = value.replay_expires_at_ms;
+  if (!Number.isSafeInteger(queuedAt) || (queuedAt as number) <= 0
+      || !Number.isSafeInteger(expiresAt) || (expiresAt as number) <= 0) {
+    throw new HttpError(400, "Action replay window metadata is required and must contain safe integer timestamps");
+  }
+  const queuedAtMs = queuedAt as number;
+  const expiresAtMs = expiresAt as number;
+  if (expiresAtMs <= queuedAtMs || expiresAtMs - queuedAtMs > ACTION_REPLAY_WINDOW_MS) {
+    throw new HttpError(400, "Action replay window metadata is invalid");
+  }
+  if (!Number.isSafeInteger(now) || now <= 0 || queuedAtMs > now + MAX_ACTION_CLOCK_SKEW_MS) {
+    throw new HttpError(400, "Action replay window timestamp is too far in the future");
+  }
+  return { queued_at_ms: queuedAtMs, replay_expires_at_ms: expiresAtMs };
 }
 
 export function validateTelegramUpdate(value: unknown): Record<string, unknown> & { update_id: number } {
@@ -445,6 +857,8 @@ export function validateSnapshot(value: unknown): LocalSnapshot {
   if (!isRecord(value.settings) || typeof value.settings.download_dir !== "string") {
     throw new HttpError(400, "settings.download_dir is required");
   }
+  if (value.settings.applied !== undefined) validateAppliedSettings(value.settings.applied);
+  validateLibraryDescriptors(library);
   return value as unknown as LocalSnapshot;
 }
 

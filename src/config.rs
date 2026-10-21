@@ -30,6 +30,13 @@ pub struct AppConfig {
     pub bot: BotConfig,
     #[serde(skip)]
     project_dir: PathBuf,
+    #[serde(skip)]
+    config_file: Option<PathBuf>,
+    /// Runtime-only shared storage root for a selected video library. `video_dir` remains the
+    /// final output directory (which may include a category); staging and publication locks
+    /// stay rooted at the library root.
+    #[serde(skip)]
+    video_storage_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -205,6 +212,8 @@ impl AppConfig {
             bilibili: BilibiliConfig::default(),
             bot: BotConfig::default(),
             project_dir: PathBuf::from("."),
+            config_file: None,
+            video_storage_root: None,
         }
     }
 
@@ -218,7 +227,9 @@ impl AppConfig {
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."))
             .to_path_buf();
-        Self::from_toml_str(&content, project_dir)
+        let mut config = Self::from_toml_str(&content, project_dir)?;
+        config.config_file = Some(config_path);
+        Ok(config)
     }
 
     pub fn ensure_runtime_dirs(&self) -> Result<()> {
@@ -261,9 +272,27 @@ impl AppConfig {
         }
     }
 
+    pub(crate) fn config_file(&self) -> Option<&Path> {
+        self.config_file.as_deref()
+    }
+
+    /// Root for shared staging and publication state. Task configs set this to the selected
+    /// library root before narrowing `downloads.video_dir` to its category output directory.
+    pub fn video_storage_root(&self) -> &Path {
+        self.video_storage_root
+            .as_deref()
+            .unwrap_or(&self.downloads.video_dir)
+    }
+
+    pub fn set_video_storage_root(&mut self, root: PathBuf) {
+        self.video_storage_root = Some(root);
+    }
+
     fn from_toml_str(content: &str, project_dir: PathBuf) -> Result<Self> {
         let mut config: Self = toml::from_str(content).context("failed to parse config TOML")?;
         config.project_dir = project_dir;
+        config.config_file = None;
+        config.video_storage_root = None;
         config.expand_config_paths();
         config.validate()?;
         Ok(config)

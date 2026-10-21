@@ -34,6 +34,11 @@ export interface EnqueueResult {
   duplicate: boolean;
 }
 
+export interface ActionReplayWindow {
+  queued_at_ms: number;
+  replay_expires_at_ms: number;
+}
+
 export interface PendingSummary {
   seq: number;
   kind: RequestKind;
@@ -115,22 +120,55 @@ export async function enqueue(
   dedupKey: string,
   kind: RequestKind,
   payload: Record<string, unknown>,
+  replayWindow?: ActionReplayWindow,
 ): Promise<EnqueueResult> {
   const payloadJson = canonicalJson(payload);
   if (new TextEncoder().encode(payloadJson).byteLength > MAX_WEBHOOK_BODY_BYTES) {
     throw new HttpError(413, "Stored request payload is too large");
   }
-  const payloadHash = await sha256Hex(payloadJson);
+  const hashInput = replayWindow === undefined
+    ? payloadJson
+    : canonicalJson({
+      kind,
+      payload,
+      queued_at_ms: replayWindow.queued_at_ms,
+      replay_expires_at_ms: replayWindow.replay_expires_at_ms,
+    });
+  const payloadHash = await sha256Hex(hashInput);
+  const readRow = () => db.prepare(
+    "SELECT seq, dedup_key, kind, payload_json, created_at, acked_at, payload_hash FROM inbox WHERE dedup_key = ?",
+  ).bind(dedupKey).first<InboxRow>();
+
+  // Check an extant row before expiry. Its exact hash is the durable proof that
+  // this request ID already received a sequence, even when the retry window
+  // elapsed while the D1 row was still retained.
+  if (replayWindow !== undefined) {
+    const existing = await readRow();
+    if (existing !== null) return buildEnqueueResult(existing, payloadHash, kind, true);
+    if (Date.now() >= replayWindow.replay_expires_at_ms) {
+      throw new HttpError(
+        410,
+        "Action replay window expired; delivery outcome is unknown. Check the desktop before submitting again.",
+        undefined,
+        undefined,
+        undefined,
+        "action_replay_window_expired",
+      );
+    }
+  }
+
   const createdAt = Date.now();
   const insert = await db.prepare(
     "INSERT INTO inbox (dedup_key, payload_hash, kind, payload_json, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(dedup_key) DO NOTHING",
   ).bind(dedupKey, payloadHash, kind, payloadJson, createdAt).run();
   if (!insert.success) throw new Error("D1 inbox insert failed");
 
-  const row = await db.prepare(
-    "SELECT seq, dedup_key, kind, payload_json, created_at, acked_at, payload_hash FROM inbox WHERE dedup_key = ?",
-  ).bind(dedupKey).first<InboxRow>();
+  const row = await readRow();
   if (row === null) throw new Error("D1 inbox row was not readable after insert");
+  return buildEnqueueResult(row, payloadHash, kind, insert.meta.changes === 0);
+}
+
+function buildEnqueueResult(row: InboxRow, payloadHash: string, kind: RequestKind, duplicate: boolean): EnqueueResult {
   if (row.payload_hash !== payloadHash || row.kind !== kind) {
     throw new HttpError(409, "Request identifier was already used with a different request");
   }
@@ -153,7 +191,7 @@ export async function enqueue(
       request_id: row.dedup_key,
       payload_hash: row.payload_hash,
     },
-    duplicate: insert.meta.changes === 0,
+    duplicate,
   };
 }
 

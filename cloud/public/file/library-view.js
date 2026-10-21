@@ -1,6 +1,273 @@
 export const LIBRARY_PAGE_SIZE = 50;
 export const MAX_FOLDER_SUGGESTIONS = 100;
 
+function validRootBinding(value) {
+  return typeof value === "string" && /^v1:[0-9a-f]{64}$/u.test(value);
+}
+
+export function isValidLibraryRootBinding(value) {
+  return validRootBinding(value);
+}
+
+function hasInvalidRootBinding(entry) {
+  return Boolean(entry && Object.hasOwn(entry, "root_binding") && entry.root_binding != null
+    && !validRootBinding(entry.root_binding));
+}
+
+function mismatchedRootBinding(applied, live) {
+  return hasInvalidRootBinding(applied) || hasInvalidRootBinding(live)
+    || validRootBinding(applied?.root_binding) && validRootBinding(live?.root_binding)
+      && applied.root_binding !== live.root_binding;
+}
+
+export function mediaLibraryEntries(ownerSnapshot) {
+  const library = ownerSnapshot?.library;
+  const applied = ownerSnapshot?.settings?.applied;
+  const appliedEntries = Array.isArray(applied?.libraries) ? applied.libraries : [];
+  const statusEntries = Array.isArray(library?.libraries) ? library.libraries : [];
+  const merged = new Map();
+  for (const entry of appliedEntries) {
+    if (!entry || typeof entry.id !== "string") continue;
+    merged.set(entry.id, { ...entry });
+  }
+  for (const entry of statusEntries) {
+    if (!entry || typeof entry.id !== "string") continue;
+    const appliedEntry = merged.get(entry.id);
+    if (mismatchedRootBinding(appliedEntry, entry)) {
+      merged.set(entry.id, {
+        ...appliedEntry,
+        id: entry.id,
+        availability: "unavailable",
+        available: false,
+        snapshot: null,
+        snapshot_stale: true,
+      });
+    } else {
+      const combined = { ...appliedEntry, ...entry };
+      if (validRootBinding(appliedEntry?.root_binding) && !validRootBinding(entry.root_binding)) {
+        combined.root_binding = appliedEntry.root_binding;
+      }
+      merged.set(entry.id, combined);
+    }
+  }
+  if (merged.size === 0 && library && typeof library === "object") {
+    const id = String(applied?.default_library_id ?? library.default_library_id ?? "default");
+    merged.set(id, {
+      id,
+      name: String(library.root_label ?? "Default library"),
+      root: String(ownerSnapshot?.settings?.download_dir ?? ""),
+      ...(Object.hasOwn(library, "root_binding") ? { root_binding: library.root_binding } : {}),
+      default_category: String(applied?.default_category ?? ""),
+      is_default: true,
+      availability: library.availability,
+      snapshot: library,
+    });
+  }
+  return [...merged.values()];
+}
+
+export function defaultMediaLibraryId(ownerSnapshot) {
+  const entries = mediaLibraryEntries(ownerSnapshot);
+  const configured = ownerSnapshot?.settings?.applied?.default_library_id ?? ownerSnapshot?.library?.default_library_id;
+  if (typeof configured === "string" && entries.some((entry) => entry.id === configured)) return configured;
+  return String(entries.find((entry) => entry.is_default === true)?.id ?? entries[0]?.id ?? "");
+}
+
+export function resolveMediaLibrary(ownerSnapshot, requestedId = "") {
+  const entries = mediaLibraryEntries(ownerSnapshot);
+  const fallbackId = defaultMediaLibraryId(ownerSnapshot);
+  const selected = entries.find((entry) => entry.id === requestedId)
+    ?? entries.find((entry) => entry.id === fallbackId)
+    ?? entries[0]
+    ?? null;
+  if (!selected) return { descriptor: null, snapshot: null, id: "" };
+  const snapshot = selected.snapshot && typeof selected.snapshot === "object"
+    ? selected.snapshot
+    : selected.id === fallbackId && selected.snapshot_stale !== true
+        && mediaLibraryAvailability(selected) !== "offline"
+      ? ownerSnapshot?.library ?? null
+      : null;
+  return { descriptor: selected, snapshot, id: String(selected.id) };
+}
+
+export function mediaLibraryAvailability(descriptor) {
+  const value = String(descriptor?.availability ?? "").toLowerCase();
+  if (["offline", "unavailable"].includes(value) || descriptor?.available === false) return "offline";
+  if (value === "available" || descriptor?.available === true) return "available";
+  return "unknown";
+}
+
+export function registeredMediaLibrary(ownerSnapshot, libraryId) {
+  if (!validLibraryIdentity(libraryId)) return null;
+  return mediaLibraryEntries(ownerSnapshot).find((entry) => entry.id === libraryId) ?? null;
+}
+
+export function canOperateOnRegisteredMediaLibrary(ownerSnapshot, libraryId) {
+  const descriptor = registeredMediaLibrary(ownerSnapshot, libraryId);
+  return descriptor !== null && canOperateOnMediaLibrary(descriptor);
+}
+
+export function migrationEndpointAvailability(ownerSnapshot, sourceLibraryId, targetLibraryId) {
+  const source = registeredMediaLibrary(ownerSnapshot, sourceLibraryId);
+  const target = registeredMediaLibrary(ownerSnapshot, targetLibraryId);
+  return {
+    sourceRegistered: source !== null,
+    targetRegistered: target !== null,
+    sourceAvailable: source !== null && canOperateOnMediaLibrary(source),
+    targetAvailable: target !== null && canOperateOnMediaLibrary(target),
+  };
+}
+
+export function migrationPreviewBindingsMatch(ownerSnapshot, sourceLibraryId, targetLibraryId, sourceRootBinding, targetRootBinding) {
+  if (!validRootBinding(sourceRootBinding) || !validRootBinding(targetRootBinding)) return false;
+  const source = registeredMediaLibrary(ownerSnapshot, sourceLibraryId);
+  const target = registeredMediaLibrary(ownerSnapshot, targetLibraryId);
+  return source?.root_binding === sourceRootBinding && target?.root_binding === targetRootBinding;
+}
+
+export function selectMigrationTarget(entries, sourceLibraryId, currentTargetId, canOperate = () => true) {
+  const targets = (Array.isArray(entries) ? entries : []).filter((entry) => entry?.id !== sourceLibraryId);
+  const availableTargets = targets.filter((entry) => canOperate(entry.id));
+  const selectedId = targets.some((entry) => entry.id === currentTargetId)
+    ? currentTargetId
+    : String(availableTargets[0]?.id ?? targets[0]?.id ?? "");
+  return { targets, availableTargets, selectedId };
+}
+
+export function renderMigrationTargetOptions(selection, escapeHtml) {
+  if (!selection || typeof escapeHtml !== "function") return "";
+  return selection.targets.map((entry) => {
+    const available = selection.availableTargets.some((candidate) => candidate.id === entry.id);
+    const selected = entry.id === selection.selectedId;
+    return `<option value="${escapeHtml(entry.id)}" data-root-binding="${escapeHtml(entry.root_binding ?? "")}"${selected ? " selected" : ""}${available ? "" : " disabled"}>${escapeHtml(entry.name)} · ${escapeHtml(entry.root ?? "root unavailable")}${available ? "" : " · offline"}</option>`;
+  }).join("");
+}
+
+export function buildMigrationPreviewPayload({
+  sourceLibraryId,
+  targetLibraryId,
+  sourceRootBinding,
+  targetRootBinding,
+  scope,
+  itemIds = [],
+  includeIncompleteTasks = false,
+  conflict = "skip",
+  setTargetDefaultOnSuccess = false,
+} = {}) {
+  if (typeof sourceLibraryId !== "string" || !sourceLibraryId
+      || typeof targetLibraryId !== "string" || !targetLibraryId || sourceLibraryId === targetLibraryId) return null;
+  if (!validRootBinding(sourceRootBinding) || !validRootBinding(targetRootBinding)) return null;
+  if (scope !== "library" && scope !== "selected") return null;
+  return {
+    source_library_id: sourceLibraryId,
+    target_library_id: targetLibraryId,
+    source_root_binding: sourceRootBinding,
+    target_root_binding: targetRootBinding,
+    scope,
+    ...(scope === "selected" ? { item_ids: Array.isArray(itemIds) ? [...itemIds] : [] } : {}),
+    include_incomplete_tasks: includeIncompleteTasks === true,
+    conflict: conflict === "keep_both" ? "keep_both" : "skip",
+    set_target_default_on_success: setTargetDefaultOnSuccess === true,
+  };
+}
+
+export function buildMigrationPreviewPayloadFromRenderedOptions({
+  sourceOption,
+  targetOption,
+  ...options
+} = {}) {
+  return buildMigrationPreviewPayload({
+    ...options,
+    sourceLibraryId: sourceOption?.value,
+    targetLibraryId: targetOption?.value,
+    sourceRootBinding: sourceOption?.dataset?.rootBinding,
+    targetRootBinding: targetOption?.dataset?.rootBinding,
+  });
+}
+
+export function canOperateOnMediaLibrary(descriptor) {
+  return validLibraryIdentity(descriptor?.id)
+    && mediaLibraryAvailability(descriptor) !== "offline"
+    && descriptor.snapshot_stale !== true;
+}
+
+function validLibraryIdentity(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 128
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function safeNonnegativeCount(value) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function libraryItemOmissionWarningCount(snapshot) {
+  const warnings = Array.isArray(snapshot?.warnings) ? snapshot.warnings : [];
+  const prefix = "Cloud snapshot omitted ";
+  const suffix = " library item(s) from the complete source view to fit the upload budget.";
+  for (const warning of warnings) {
+    if (typeof warning !== "string" || !warning.startsWith(prefix) || !warning.endsWith(suffix)) continue;
+    const digits = warning.slice(prefix.length, -suffix.length);
+    if (!/^\d+$/u.test(digits)) continue;
+    const count = Number(digits);
+    if (Number.isSafeInteger(count) && count >= 0) return count;
+  }
+  return null;
+}
+
+export function mediaSnapshotInfo(descriptor, snapshot) {
+  const items = Array.isArray(snapshot?.items) ? snapshot.items : [];
+  const reportedCount = safeNonnegativeCount(descriptor?.media_count);
+  const warningOmittedCount = libraryItemOmissionWarningCount(snapshot);
+  const hasSnapshot = Boolean(snapshot && typeof snapshot === "object");
+  const totalCount = Math.max(
+    reportedCount ?? 0,
+    items.length,
+    hasSnapshot ? items.length + (warningOmittedCount ?? 0) : 0,
+  );
+  const omittedCount = hasSnapshot ? Math.max(0, totalCount - items.length) : 0;
+  return {
+    totalCount,
+    retainedCount: items.length,
+    omittedCount,
+  };
+}
+
+export function mediaSnapshotOmissionNotice(descriptor, snapshot) {
+  const info = mediaSnapshotInfo(descriptor, snapshot);
+  if (info.omittedCount === 0) return "";
+  const totalLabel = Number.isSafeInteger(info.totalCount) ? info.totalCount.toLocaleString() : "an unknown total";
+  return `The cloud view retains ${info.retainedCount.toLocaleString()} of ${totalLabel} media items; ${info.omittedCount.toLocaleString()} item details are omitted. Search, filters, and pagination cover only the retained rows.`;
+}
+
+function operationLibraryBinding(operation) {
+  const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
+  const nested = result.operation && typeof result.operation === "object" ? result.operation : {};
+  const preview = result.preview && typeof result.preview === "object" ? result.preview : {};
+  const candidates = [
+    [result, "library_id"], [result, "source_library_id"],
+    [nested, "library_id"], [nested, "source_library_id"],
+    [preview, "library_id"], [preview, "source_library_id"],
+    [operation, "source_library_id"], [operation, "library_id"],
+  ];
+  for (const [container, key] of candidates) {
+    if (Object.prototype.hasOwnProperty.call(container, key)) {
+      const value = container[key];
+      return { present: true, valid: validLibraryIdentity(value), id: validLibraryIdentity(value) ? value : "" };
+    }
+  }
+  return { present: false, valid: false, id: "" };
+}
+
+export function operationLibraryId(operation) {
+  const binding = operationLibraryBinding(operation);
+  return binding.valid ? binding.id : "";
+}
+
+export function operationMatchesLibrary(operation, libraryId) {
+  const binding = operationLibraryBinding(operation);
+  return binding.present ? binding.valid && binding.id === libraryId : true;
+}
+
 export function itemFolder(item) {
   const path = String(item?.relative_path ?? "").replaceAll("\\", "/");
   const slash = path.lastIndexOf("/");

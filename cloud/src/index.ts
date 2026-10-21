@@ -1,4 +1,4 @@
-import type { InboxEnvelope } from "./types";
+import type { InboxEnvelope, RequestKind } from "./types";
 import { HttpError } from "./types";
 import { requireConfiguredOwnerUserId, requireLocalAuthorization, requireOwner, requireWebhookAuthorization } from "./security";
 import {
@@ -34,7 +34,26 @@ const MAX_ACK_RECEIPTS = 500;
 const MAX_ACK_BODY_BYTES = 128 * 1024;
 const MAX_EPOCH_ROTATION_REQUEST_ID_LENGTH = 256;
 const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/u;
-const REQUEST_KINDS = new Set(["telegram", "library_scan", "file_preview", "file_confirm", "legacy_import"]);
+const REQUEST_KINDS = new Set<RequestKind>([
+  "telegram",
+  "library_scan",
+  "library_register",
+  "library_set_default",
+  "library_set_category",
+  "library_rename",
+  "library_remove",
+  "file_preview",
+  "file_confirm",
+  "legacy_import",
+  "download_submit",
+  "library_migration_preview",
+  "library_migration_confirm",
+  "library_migration_control",
+]);
+
+function isRequestKind(value: unknown): value is RequestKind {
+  return typeof value === "string" && REQUEST_KINDS.has(value as RequestKind);
+}
 
 function parseAckReceipts(value: unknown): AcknowledgedReceipt[] {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -56,7 +75,7 @@ function parseAckReceipts(value: unknown): AcknowledgedReceipt[] {
       typeof requestId !== "string" || requestId.length === 0 ||
       new TextEncoder().encode(requestId).byteLength > MAX_EPOCH_ROTATION_REQUEST_ID_LENGTH ||
       typeof payloadHash !== "string" || !SHA256_HEX_PATTERN.test(payloadHash) ||
-      typeof kind !== "string" || !REQUEST_KINDS.has(kind) ||
+      !isRequestKind(kind) ||
       typeof createdAt !== "number" || !Number.isSafeInteger(createdAt) || createdAt <= 0 ||
       seen.has(seq)) {
       throw new HttpError(400, "Acknowledgment receipt is malformed or duplicated");
@@ -66,7 +85,7 @@ function parseAckReceipts(value: unknown): AcknowledgedReceipt[] {
       seq,
       request_id: requestId,
       payload_hash: payloadHash,
-      kind: kind as AcknowledgedReceipt["kind"],
+      kind,
       created_at: createdAt,
     });
   }
@@ -108,7 +127,10 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
 async function handleAction(request: Request, env: Env): Promise<Response> {
   await requireOwner(request, env);
   const action = validateActionRequest(await readJsonBody(request, MAX_ACTION_BODY_BYTES));
-  const result = await enqueue(env.DB, `action:${action.request_id}`, action.kind, action.payload);
+  const result = await enqueue(env.DB, `action:${action.request_id}`, action.kind, action.payload, {
+    queued_at_ms: action.queued_at_ms,
+    replay_expires_at_ms: action.replay_expires_at_ms,
+  });
   await notifyAfterPersist(env, result.envelope);
   return persistedResponse(202, result.envelope.seq, result.duplicate);
 }
@@ -161,7 +183,7 @@ async function handleLocalEpochRotation(request: Request, env: Env): Promise<Res
   if (typeof seq !== "number" || !Number.isSafeInteger(seq) || seq <= 0 ||
     typeof requestId !== "string" || requestId.length === 0 || requestId.length > MAX_EPOCH_ROTATION_REQUEST_ID_LENGTH ||
     typeof payloadHash !== "string" || !SHA256_HEX_PATTERN.test(payloadHash) ||
-    typeof kind !== "string" || !REQUEST_KINDS.has(kind) ||
+    !isRequestKind(kind) ||
     typeof createdAt !== "number" || !Number.isSafeInteger(createdAt) || createdAt <= 0) {
     throw new HttpError(400, "Epoch rotation request is malformed");
   }
@@ -170,7 +192,7 @@ async function handleLocalEpochRotation(request: Request, env: Env): Promise<Res
     seq,
     request_id: requestId,
     payload_hash: payloadHash,
-    kind: kind as "telegram" | "library_scan" | "file_preview" | "file_confirm" | "legacy_import",
+    kind,
     created_at: createdAt,
   });
   if (!result.rotated) {
@@ -252,6 +274,9 @@ async function dispatch(request: Request, env: Env): Promise<Response> {
   if (path === "/file") {
     return new Response(null, { status: 308, headers: { Location: "/file/", "Cache-Control": "no-store" } });
   }
+  if (path === "/settings") {
+    return new Response(null, { status: 308, headers: { Location: "/settings/", "Cache-Control": "no-store" } });
+  }
   if (path.startsWith("/api/")) return json({ error: "Not found" }, 404);
   return env.ASSETS.fetch(request);
 }
@@ -263,6 +288,8 @@ export default {
     } catch (error) {
       if (error instanceof HttpError) {
         const extraHeaders: Record<string, string> = {};
+        const body: Record<string, unknown> = { error: error.message };
+        if (error.code !== undefined) body.code = error.code;
         const stateVersion = error.stateVersion;
         if (error.status === 409 && Number.isSafeInteger(stateVersion) && stateVersion !== undefined && stateVersion > 0) {
           extraHeaders["X-Cloud-State-Version"] = String(stateVersion);
@@ -274,7 +301,7 @@ export default {
           Number.isSafeInteger(error.sequenceConflict) && error.sequenceConflict > 0) {
           extraHeaders["X-Cloud-Inbox-Sequence-Conflict"] = String(error.sequenceConflict);
         }
-        return json({ error: error.message }, error.status, extraHeaders);
+        return json(body, error.status, extraHeaders);
       }
       const path = new URL(request.url).pathname;
       console.error(JSON.stringify({ event: "request_failed", path }));

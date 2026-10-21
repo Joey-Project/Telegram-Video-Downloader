@@ -14,7 +14,7 @@
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",
-    "run_worker_first": ["/api/*", "/webhook", "/file", "/file/*"]
+    "run_worker_first": ["/api/*", "/webhook", "/file", "/file/*", "/settings", "/settings/*"]
   },
   "d1_databases": [
     {

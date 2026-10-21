@@ -232,6 +232,8 @@ pub struct CloudState<'a> {
 #[derive(Debug, Clone, Serialize)]
 pub struct CloudSettings<'a> {
     pub download_dir: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<&'a Value>,
 }
 
 #[derive(Clone)]
@@ -721,18 +723,22 @@ impl InboxStateIndex {
                 }
             }
         }
-        if record.request.kind == "file_preview" {
+        if matches!(
+            record.request.kind.as_str(),
+            "file_preview" | "library_migration_preview"
+        ) {
             if record.status == InboxStatus::AwaitingConfirmation {
                 self.awaiting_previews.insert(record.request.seq);
                 if let Some(preview_id) =
                     inbox_preview_id(record).filter(|id| preview_identifier_is_indexable(id))
                 {
+                    let preview_key = preview_index_key(&record.request.kind, preview_id);
                     self.awaiting_preview_sequences
-                        .entry(preview_id.to_string())
+                        .entry(preview_key.clone())
                         .or_default()
                         .insert(record.request.seq);
                     self.awaiting_preview_id_by_sequence
-                        .insert(record.request.seq, preview_id.to_string());
+                        .insert(record.request.seq, preview_key);
                     self.awaiting_preview_expiry_seconds_by_sequence
                         .insert(record.request.seq, inbox_preview_expiry_seconds(record));
                 }
@@ -740,27 +746,32 @@ impl InboxStateIndex {
                 self.awaiting_previews.remove(&record.request.seq);
             }
         }
-        if record.request.kind == "file_confirm"
-            && matches!(
-                record.status,
-                InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
-            )
-            && let Some(preview_id) = record
-                .request
-                .payload
-                .get("preview_id")
-                .and_then(Value::as_str)
-                .filter(|id| preview_identifier_is_indexable(id))
+        if matches!(
+            record.request.kind.as_str(),
+            "file_confirm" | "library_migration_confirm"
+        ) && matches!(
+            record.status,
+            InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
+        ) && let Some(preview_id) = record
+            .request
+            .payload
+            .get("preview_id")
+            .and_then(Value::as_str)
+            .filter(|id| preview_identifier_is_indexable(id))
         {
             let received_at_seconds = record.received_at;
+            let preview_kind = match record.request.kind.as_str() {
+                "file_confirm" => "file_preview",
+                "library_migration_confirm" => "library_migration_preview",
+                _ => unreachable!("confirmation kind was checked above"),
+            };
+            let preview_key = preview_index_key(preview_kind, preview_id);
             self.active_confirmations
-                .entry(preview_id.to_string())
+                .entry(preview_key.clone())
                 .or_default()
                 .insert((received_at_seconds, record.request.seq));
-            self.active_confirmation_by_sequence.insert(
-                record.request.seq,
-                (preview_id.to_string(), received_at_seconds),
-            );
+            self.active_confirmation_by_sequence
+                .insert(record.request.seq, (preview_key, received_at_seconds));
         }
     }
 
@@ -802,15 +813,24 @@ impl InboxStateIndex {
         }
     }
 
-    fn awaiting_preview_sequence(&self, preview_id: &str) -> Option<u64> {
+    fn awaiting_preview_sequence_for_kind(
+        &self,
+        preview_id: &str,
+        preview_kind: &str,
+    ) -> Option<u64> {
         self.awaiting_preview_sequences
-            .get(preview_id)
+            .get(&preview_index_key(preview_kind, preview_id))
             .and_then(|sequences| sequences.last().copied())
     }
 
-    fn has_active_confirmation_before(&self, preview_id: &str, expires_at_seconds: u64) -> bool {
+    fn has_active_confirmation_before_kind(
+        &self,
+        preview_id: &str,
+        preview_kind: &str,
+        expires_at_seconds: u64,
+    ) -> bool {
         self.active_confirmations
-            .get(preview_id)
+            .get(&preview_index_key(preview_kind, preview_id))
             .is_some_and(|confirmations| {
                 confirmations
                     // Unknown legacy receipt time is retained conservatively. For known
@@ -823,19 +843,21 @@ impl InboxStateIndex {
 
     fn has_preexpiry_confirmation_for_preview(&self, preview_id: &str) -> Option<bool> {
         let expiry_seconds = self
-            .awaiting_preview_sequence(preview_id)
+            .awaiting_preview_sequence_for_kind(preview_id, "file_preview")
             .and_then(|sequence| {
                 self.awaiting_preview_expiry_seconds_by_sequence
                     .get(&sequence)
                     .copied()
             });
         match expiry_seconds {
-            Some(expiry_seconds) => {
-                Some(self.has_active_confirmation_before(preview_id, expiry_seconds))
-            }
+            Some(expiry_seconds) => Some(self.has_active_confirmation_before_kind(
+                preview_id,
+                "file_preview",
+                expiry_seconds,
+            )),
             None if self
                 .active_confirmations
-                .get(preview_id)
+                .get(&preview_index_key("file_preview", preview_id))
                 .is_some_and(|confirmations| !confirmations.is_empty()) =>
             {
                 None
@@ -913,17 +935,25 @@ fn inbox_terminal_record_expired(record: &InboxRecord, now: u64) -> bool {
 }
 
 fn inbox_preview_id(record: &InboxRecord) -> Option<&str> {
-    record.result.as_ref().and_then(|result| {
-        result
-            .get("preview_id")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                result
-                    .get("preview")
-                    .and_then(|preview| preview.get("id"))
-                    .and_then(Value::as_str)
-            })
-    })
+    record
+        .result
+        .as_ref()
+        .and_then(|result| match record.request.kind.as_str() {
+            "file_preview" => result
+                .get("preview_id")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    result
+                        .get("preview")
+                        .and_then(|preview| preview.get("id"))
+                        .and_then(Value::as_str)
+                }),
+            "library_migration_preview" => result
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| result.get("preview_id").and_then(Value::as_str)),
+            _ => None,
+        })
 }
 
 fn preview_identifier_is_indexable(preview_id: &str) -> bool {
@@ -934,9 +964,15 @@ fn preview_identifier_is_indexable(preview_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn preview_index_key(preview_kind: &str, preview_id: &str) -> String {
+    format!("{preview_kind}\0{preview_id}")
+}
+
 fn inbox_abandoned_preview_expired(record: &InboxRecord, now: u64) -> bool {
-    record.request.kind == "file_preview"
-        && record.status == InboxStatus::AwaitingConfirmation
+    matches!(
+        record.request.kind.as_str(),
+        "file_preview" | "library_migration_preview"
+    ) && record.status == InboxStatus::AwaitingConfirmation
         && record.updated_at <= now
         && now.saturating_sub(record.updated_at)
             >= CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION.as_secs()
@@ -1139,6 +1175,10 @@ pub struct CloudInbox {
 }
 
 impl CloudInbox {
+    pub(crate) fn download_root(&self) -> &Path {
+        self.root.logical_root_path()
+    }
+
     #[cfg(test)]
     pub fn open(root_path: &Path) -> Result<Self> {
         Self::open_with_file_provider(root_path, platform_queue_file_provider())
@@ -1406,8 +1446,15 @@ impl CloudInbox {
         let Some(confirmation) = self.read_record_path(&self.record_path(confirmation_seq))? else {
             return Ok(None);
         };
+        let (preview_kind, confirmation_kind) = match confirmation.request.kind.as_str() {
+            "file_confirm" => ("file_preview", "file_confirm"),
+            "library_migration_confirm" => {
+                ("library_migration_preview", "library_migration_confirm")
+            }
+            _ => return Ok(None),
+        };
         if confirmation.request.seq != confirmation_seq
-            || confirmation.request.kind != "file_confirm"
+            || confirmation.request.kind != confirmation_kind
             || !matches!(
                 confirmation.status,
                 InboxStatus::Pending | InboxStatus::Processing | InboxStatus::Retryable
@@ -1425,7 +1472,7 @@ impl CloudInbox {
             .state_index
             .lock()
             .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
-            .awaiting_preview_sequence(preview_id);
+            .awaiting_preview_sequence_for_kind(preview_id, preview_kind);
         let Some(sequence) = sequence else {
             return Ok(None);
         };
@@ -1433,7 +1480,7 @@ impl CloudInbox {
             bail!("indexed cloud preview request {sequence} is missing");
         };
         if record.request.seq != sequence
-            || record.request.kind != "file_preview"
+            || record.request.kind != preview_kind
             || record.status != InboxStatus::AwaitingConfirmation
             || inbox_preview_id(&record) != Some(preview_id)
         {
@@ -2344,7 +2391,11 @@ impl CloudInbox {
             .state_index
             .lock()
             .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
-        Ok(!index.has_active_confirmation_before(preview_id, inbox_preview_expiry_seconds(record)))
+        Ok(!index.has_active_confirmation_before_kind(
+            preview_id,
+            &record.request.kind,
+            inbox_preview_expiry_seconds(record),
+        ))
     }
 
     fn require_initial_recovery_complete_before_write(&self) -> Result<()> {
@@ -2606,9 +2657,16 @@ fn coordinate_bound_directory(
 }
 
 fn coordinated_path_under_root(root: &RootedFs, coordinated_path: &Path) -> Result<PathBuf> {
+    // File Provider can return canonical /private/... URLs for roots configured through the
+    // verified /var, /tmp, or /etc aliases. Normalize only those fixed system aliases; arbitrary
+    // path components remain subject to the rooted-prefix and normal-component checks below.
+    let coordinated_path = crate::media_libraries::normalize_trusted_macos_alias(coordinated_path)?;
+    let logical_root =
+        crate::media_libraries::normalize_trusted_macos_alias(root.logical_root_path())?;
+    let canonical_root = crate::media_libraries::normalize_trusted_macos_alias(root.root_path())?;
     let relative = coordinated_path
-        .strip_prefix(root.logical_root_path())
-        .or_else(|_| coordinated_path.strip_prefix(root.root_path()))
+        .strip_prefix(&logical_root)
+        .or_else(|_| coordinated_path.strip_prefix(&canonical_root))
         .with_context(|| {
             format!(
                 "coordinated File Provider URL is outside the configured download root: {}",
@@ -2777,6 +2835,50 @@ mod tests {
         cloud_request.kind = "file_confirm".to_string();
         cloud_request.payload = json!({"preview_id": preview_id, "revision": "revision-1"});
         cloud_request.created_at = worker_created_at_millis;
+        InboxRecord {
+            schema_version: INBOX_RECORD_VERSION,
+            request: cloud_request,
+            status,
+            attempts: 1,
+            received_at: received_at_seconds,
+            updated_at: now_seconds(),
+            next_attempt_at: 0,
+            error: None,
+            result: None,
+        }
+    }
+
+    fn migration_preview_inbox_record(seq: u64, preview_id: &str, updated_at: u64) -> InboxRecord {
+        let mut cloud_request = request(seq, "migration preview");
+        cloud_request.kind = "library_migration_preview".to_string();
+        cloud_request.payload = json!({});
+        InboxRecord {
+            schema_version: INBOX_RECORD_VERSION,
+            request: cloud_request,
+            status: InboxStatus::AwaitingConfirmation,
+            attempts: 1,
+            received_at: Some(updated_at),
+            updated_at,
+            next_attempt_at: 0,
+            error: None,
+            result: Some(json!({
+                "id": preview_id,
+                "revision": "migration-revision-1",
+                "items": [{"item_id": "video-1", "source_path": "old/video.mp4", "target_path": "new/video.mp4"}]
+            })),
+        }
+    }
+
+    fn migration_confirmation_inbox_record(
+        seq: u64,
+        preview_id: &str,
+        status: InboxStatus,
+        received_at_seconds: Option<u64>,
+    ) -> InboxRecord {
+        let mut cloud_request = request(seq, "migration confirm");
+        cloud_request.kind = "library_migration_confirm".to_string();
+        cloud_request.payload =
+            json!({"preview_id": preview_id, "revision": "migration-revision-1"});
         InboxRecord {
             schema_version: INBOX_RECORD_VERSION,
             request: cloud_request,
@@ -3542,8 +3644,9 @@ mod tests {
                 .state_index
                 .lock()
                 .expect("cloud inbox state index lock should be available")
-                .has_active_confirmation_before(
+                .has_active_confirmation_before_kind(
                     "processing-preview",
+                    "file_preview",
                     inbox_preview_expiry_seconds(&processing_preview),
                 ),
             "the persisted Processing confirmation must be present in the active index"
@@ -4170,6 +4273,84 @@ mod tests {
             "startup recovery must preserve the original local receive time"
         );
         drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn migration_confirmation_resolves_kind_qualified_preview_identity() {
+        let root = temp_root("inbox-migration-confirmation-lookup");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        let same_id = "shared-preview-id";
+
+        let mut file_preview = request(1, "file preview");
+        file_preview.kind = "file_preview".to_string();
+        inbox
+            .persist(file_preview)
+            .expect("file preview should persist");
+        inbox
+            .update(1, |record| {
+                record.status = InboxStatus::AwaitingConfirmation;
+                record.result = Some(json!({
+                    "preview_id": same_id,
+                    "revision": "revision-1",
+                    "preview": {"id": same_id, "revision": "revision-1"}
+                }));
+            })
+            .expect("file preview should become confirmable");
+
+        let migration_preview = migration_preview_inbox_record(2, same_id, now_seconds());
+        inbox
+            .persist(migration_preview.request.clone())
+            .expect("migration preview should persist");
+        inbox
+            .update(2, |record| {
+                record.status = InboxStatus::AwaitingConfirmation;
+                record.result = migration_preview.result.clone();
+            })
+            .expect("migration preview should become confirmable");
+
+        inbox
+            .persist(
+                migration_confirmation_inbox_record(
+                    3,
+                    same_id,
+                    InboxStatus::Pending,
+                    Some(now_seconds()),
+                )
+                .request,
+            )
+            .expect("migration confirmation should persist");
+        inbox
+            .persist(
+                confirmation_inbox_record(
+                    4,
+                    same_id,
+                    InboxStatus::Pending,
+                    now_millis(),
+                    Some(now_seconds()),
+                )
+                .request,
+            )
+            .expect("file confirmation should persist");
+        finish_initial_recovery(&inbox);
+
+        let migration = inbox
+            .awaiting_confirmation_record(same_id, 3)
+            .expect("migration lookup should succeed")
+            .expect("migration confirmation should resolve its persisted preview");
+        assert_eq!(migration.request.seq, 2);
+        assert_eq!(migration.request.kind, "library_migration_preview");
+        assert_eq!(inbox_preview_id(&migration), Some(same_id));
+
+        let file = inbox
+            .awaiting_confirmation_record(same_id, 4)
+            .expect("file lookup should succeed")
+            .expect("file confirmation should resolve its persisted preview");
+        assert_eq!(file.request.seq, 1);
+        assert_eq!(file.request.kind, "file_preview");
+
+        drop(inbox);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -29,6 +29,10 @@ use super::*;
 // Synthetic catalog joey-private-v3: api-key-a (active API key).
 const TEST_TELEGRAM_TOKEN: &str = "codex_synth_v1_api_key_a";
 
+// Chunked migration fixtures hash and sync 8–16 MiB while the full suite shares the output slot.
+// Keep completion waits bounded without treating parallel-suite contention as a deadlock.
+const MIGRATION_TEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct FakeTelegramRequest {
     method: String,
     body: serde_json::Value,
@@ -595,9 +599,60 @@ async fn spawn_fake_cloud_api_with_epoch(
                                         .context("fake state content should serialize")?
                                 )
                             );
+                            let mut stable_content = content.clone();
+                            if let Some(descriptors) =
+                                stable_content["library"]["libraries"].as_array_mut()
+                            {
+                                for descriptor in descriptors {
+                                    if let Some(fields) = descriptor.as_object_mut() {
+                                        fields.remove("free_bytes");
+                                    }
+                                }
+                            }
+                            let stable_content_hash = format!(
+                                "{:x}",
+                                Sha256::digest(
+                                    serde_json::to_vec(&stable_content)
+                                        .context("normalized fake state should serialize")?
+                                )
+                            );
+                            let state_field_hashes = content
+                                .as_object()
+                                .map(|fields| {
+                                    fields
+                                        .iter()
+                                        .map(|(key, value)| {
+                                            let encoded = serde_json::to_vec(value)
+                                                .context("fake state field should serialize")?;
+                                            let hash = format!("{:x}", Sha256::digest(encoded));
+                                            Ok((
+                                                key.clone(),
+                                                serde_json::Value::String(hash),
+                                            ))
+                                        })
+                                        .collect::<Result<serde_json::Map<String, serde_json::Value>>>()
+                                })
+                                .transpose()?
+                                .unwrap_or_default();
                             let library_hash = format!("{:x}", Sha256::digest(
                                 serde_json::to_vec(library).context("fake state library should serialize")?
                             ));
+                            let library_descriptor_status = library["libraries"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|descriptor| serde_json::json!({
+                                    "id": descriptor["id"],
+                                    "availability": descriptor["availability"],
+                                    "media_count": descriptor["media_count"],
+                                    "scanned_at": descriptor["scanned_at"],
+                                    "free_bytes": descriptor["free_bytes"],
+                                    "incomplete_task_count": descriptor["incomplete_task_count"],
+                                    "staging_bytes": descriptor["staging_bytes"],
+                                    "snapshot_ready": descriptor["snapshot"]["ready"],
+                                    "snapshot_incomplete": descriptor["snapshot"]["incomplete"],
+                                }))
+                                .collect::<Vec<_>>();
                             let operations = &request.body["operations"];
                             let operations_bytes = serde_json::to_vec(operations)
                                 .context("fake state operations should serialize")?;
@@ -632,7 +687,10 @@ async fn spawn_fake_cloud_api_with_epoch(
                                 "reported_at": request.body["reported_at"],
                                 "revision": request.body["revision"],
                                 "content_hash": content_hash,
+                                "stable_content_hash": stable_content_hash,
+                                "state_field_hashes": state_field_hashes,
                                 "library_hash": library_hash,
+                                "library_descriptor_status": library_descriptor_status,
                                 "library_ready": library["ready"],
                                 "library_incomplete": library["incomplete"],
                                 "library_warnings": library_warning_sample,
@@ -1064,6 +1122,77 @@ fn open_runtime_test_inbox(root: &Path) -> Result<CloudInbox> {
     CloudInbox::open_for_epoch(root, crate::cloud::TEST_DATABASE_EPOCH)
 }
 
+fn cloud_test_root_binding(queue: &QueueManager, library_id: &str) -> String {
+    queue
+        .registry_snapshot()
+        .expect("library registry should load")
+        .libraries
+        .into_iter()
+        .find(|library| library.id == library_id)
+        .and_then(|library| library.root_binding_token())
+        .expect("registered library should have a root binding")
+}
+
+fn cloud_test_default_library_binding(queue: &QueueManager) -> (String, String) {
+    let library_id = queue
+        .default_video_destination()
+        .expect("default video library should resolve")
+        .library_id;
+    let root_binding = cloud_test_root_binding(queue, &library_id);
+    (library_id, root_binding)
+}
+
+fn bound_migration_preview_payload(
+    queue: &QueueManager,
+    source_library_id: &str,
+    target_library_id: &str,
+    mut options: serde_json::Value,
+) -> serde_json::Value {
+    let payload = options
+        .as_object_mut()
+        .expect("migration preview options should be a JSON object");
+    payload.insert(
+        "source_library_id".to_string(),
+        serde_json::json!(source_library_id),
+    );
+    payload.insert(
+        "source_root_binding".to_string(),
+        serde_json::json!(cloud_test_root_binding(queue, source_library_id)),
+    );
+    payload.insert(
+        "target_library_id".to_string(),
+        serde_json::json!(target_library_id),
+    );
+    payload.insert(
+        "target_root_binding".to_string(),
+        serde_json::json!(cloud_test_root_binding(queue, target_library_id)),
+    );
+    options
+}
+
+async fn dispatch_download_for_test(
+    runtime: &CloudBotRuntime,
+    seq: u64,
+    payload: serde_json::Value,
+) -> CloudDispatchOutcome {
+    let request = CloudRequest {
+        seq,
+        kind: "download_submit".to_string(),
+        payload,
+        created_at: now_millis(),
+        extra: serde_json::Map::new(),
+    };
+    media_library_bot::dispatch(runtime, &request)
+        .await
+        .expect("download_submit should be handled")
+        .expect("download_submit should return an outcome")
+}
+
+fn queue_index_contents(root: &Path) -> Vec<u8> {
+    fs::read(root.join(".telegram-video-downloader-queue/index.json"))
+        .expect("queue index should be readable")
+}
+
 fn open_runtime_test_inbox_with_file_provider(
     root: &Path,
     file_provider: Arc<dyn QueueFileProvider>,
@@ -1122,6 +1251,16 @@ fn make_runtime(
         request_notify: Arc::new(Notify::new()),
         state_notify: Arc::new(Notify::new()),
         library_snapshot: Arc::new(Mutex::new(None)),
+        library_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
+        library_unavailable: Arc::new(Mutex::new(BTreeMap::new())),
+        migrations: Arc::new(Mutex::new(BTreeMap::new())),
+        migration_discovery_warnings: Arc::new(Mutex::new(
+            library_migration::MigrationDiscoveryWarnings::default(),
+        )),
+        migration_runners: Arc::new(Mutex::new(HashSet::new())),
+        library_io_gates: library_migration_bot::LibraryIoGateRegistry::default(),
+        test_migration_runner_gate_waiting: Arc::new(Notify::new()),
+        test_migration_runner_gate_acquired: Arc::new(Notify::new()),
         library_scan_warning: Arc::new(Mutex::new(None)),
         library_scan_publication_gate: Arc::new(Mutex::new(())),
         telegram_dispatch: Arc::new(Semaphore::new(1)),
@@ -1151,6 +1290,1638 @@ fn web_app_button_uses_web_app_field_without_callback_data() {
         value["web_app"]["url"].as_str(),
         Some("https://worker.example.test/file/")
     );
+}
+
+#[tokio::test]
+async fn settings_command_opens_the_separate_private_app_with_mock_telegram() {
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.cloud = Some(CloudConfig {
+        worker_url: "https://worker.example.test/bot".to_string(),
+        shared_secret: None,
+        fallback_poll_seconds: 30,
+    });
+    handle_settings_command(&telegram, &config, 123_456_789, true)
+        .await
+        .expect("settings command should send the app button");
+    let request = requests
+        .recv()
+        .await
+        .expect("mock Telegram should receive the button");
+    assert_eq!(request.method, "sendMessage");
+    let button = &request.body["reply_markup"]["inline_keyboard"][0][0];
+    assert_eq!(
+        button["web_app"]["url"],
+        "https://worker.example.test/bot/settings/"
+    );
+    assert!(button.get("callback_data").is_none());
+    assert!(requests.try_recv().is_err());
+
+    handle_settings_command(&telegram, &config, -123_456_789, false)
+        .await
+        .expect("group command should explain the private-chat entry");
+    let group_reply = requests
+        .recv()
+        .await
+        .expect("mock Telegram should receive the group reply");
+    assert!(group_reply.body.get("reply_markup").is_none());
+    assert!(
+        group_reply.body["text"]
+            .as_str()
+            .unwrap()
+            .contains("private chat")
+    );
+    stop_fake_telegram_api(shutdown, server).await;
+}
+
+#[test]
+fn settings_command_recognizes_bot_mentions_without_matching_longer_commands() {
+    assert!(is_settings_command("/settings"));
+    assert!(is_settings_command("/SETTINGS@ExampleBot"));
+    assert!(!is_settings_command("/settings_extra"));
+    assert!(!is_settings_command("settings"));
+}
+
+async fn run_library_management_test_request(
+    runtime: &CloudBotRuntime,
+    seq: u64,
+    kind: &str,
+    payload: serde_json::Value,
+) -> InboxRecord {
+    runtime
+        .inbox
+        .persist(CloudRequest {
+            seq,
+            kind: kind.to_string(),
+            payload,
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        })
+        .expect("management ingress should persist before dispatch");
+    runtime.request_notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let record = runtime
+                .inbox
+                .record(seq)
+                .expect("management receipt should load")
+                .expect("management receipt should remain present");
+            if matches!(
+                record.status,
+                InboxStatus::Completed | InboxStatus::Failed | InboxStatus::AwaitingConfirmation
+            ) {
+                return record;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("management operation should reach a durable result")
+}
+
+#[tokio::test]
+async fn media_library_settings_and_scoped_file_management_mock_e2e() {
+    let root = temp_cloud_bot_dir("media-libraries-e2e");
+    let archive = root.join("archive");
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test roots should create");
+    fs::create_dir_all(archive.join("Documentaries")).expect("archive should create");
+    fs::write(
+        config.downloads.video_dir.join("clip.mp4"),
+        b"source library media",
+    )
+    .expect("source media should write");
+    fs::write(
+        config.downloads.video_dir.join("clip.nfo"),
+        b"<movie><title>Source clip</title></movie>",
+    )
+    .expect("source metadata should write");
+    fs::write(archive.join("clip.mp4"), b"different archive media")
+        .expect("archive media should write");
+    let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    queue
+        .create(TaskRecord::new(
+            "original-target".to_string(),
+            1,
+            1,
+            123_456_789,
+            Some(123_456_789),
+            0,
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=abcdefghijk".to_string(),
+            },
+        ))
+        .expect("initial task should persist");
+    let original_id = queue
+        .default_video_destination()
+        .expect("default should resolve")
+        .library_id;
+    let inbox =
+        Arc::new(open_runtime_test_inbox(&config.downloads.video_dir).expect("inbox should open"));
+    let runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+
+    let registered = run_library_management_test_request(
+        &runtime,
+        701,
+        "library_register",
+        serde_json::json!({
+            "name": "Archive", "path": archive, "default_category": "Documentaries",
+            "set_default": false, "create_directory": false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        registered.status,
+        InboxStatus::Completed,
+        "{:?}",
+        registered.error
+    );
+    let archive_id = queue
+        .registry_snapshot()
+        .unwrap()
+        .libraries
+        .into_iter()
+        .find(|library| library.name == "Archive")
+        .expect("registered library should be listed")
+        .id;
+    let archive_binding = queue
+        .registry_snapshot()
+        .unwrap()
+        .libraries
+        .into_iter()
+        .find(|library| library.id == archive_id)
+        .unwrap()
+        .root_binding_token()
+        .unwrap();
+    let changed = run_library_management_test_request(
+        &runtime,
+        702,
+        "library_set_default",
+        serde_json::json!({
+            "library_id": archive_id,
+            "root_binding": archive_binding,
+        }),
+    )
+    .await;
+    assert_eq!(
+        changed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        changed.error
+    );
+    assert_eq!(
+        queue
+            .task_config(&config, "original-target")
+            .unwrap()
+            .unwrap()
+            .downloads
+            .video_dir,
+        config.downloads.video_dir
+    );
+    assert_eq!(
+        queue
+            .default_video_config(&config)
+            .unwrap()
+            .downloads
+            .video_dir,
+        archive.join("Documentaries"),
+        "the task config keeps the registered logical root path; canonical identity is checked separately"
+    );
+
+    queue
+        .create(TaskRecord::new(
+            "new-default-target".to_string(),
+            2,
+            2,
+            123_456_789,
+            Some(123_456_789),
+            0,
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=lmnopqrstuv".to_string(),
+            },
+        ))
+        .expect("new task should persist with new default");
+    assert_eq!(
+        queue
+            .task_config(&config, "new-default-target")
+            .unwrap()
+            .unwrap()
+            .downloads
+            .video_dir,
+        archive.join("Documentaries")
+    );
+    let scanned = run_library_management_test_request(
+        &runtime,
+        703,
+        "library_scan",
+        serde_json::json!({
+            "library_id": original_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        scanned.status,
+        InboxStatus::Completed,
+        "{:?}",
+        scanned.error
+    );
+    let item_id = scanned.result.unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "clip.mp4")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let original_binding = cloud_test_root_binding(&queue, &original_id);
+    let preview = run_library_management_test_request(
+        &runtime,
+        704,
+        "file_preview",
+        serde_json::json!({
+            "library_id": original_id, "item_ids": [item_id],
+            "root_binding": original_binding,
+            "target_relative_dir": "organized", "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(
+        preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview.error
+    );
+    let preview = preview.result.unwrap();
+    assert_eq!(preview["library_id"], original_id);
+    assert_eq!(preview["root_binding"], original_binding);
+    let wrong = run_library_management_test_request(&runtime, 705, "file_confirm", serde_json::json!({
+        "library_id": archive_id, "preview_id": preview["preview_id"], "revision": preview["revision"],
+    })).await;
+    assert_eq!(wrong.status, InboxStatus::Failed);
+    assert!(config.downloads.video_dir.join("clip.mp4").exists());
+    let confirmed = run_library_management_test_request(&runtime, 706, "file_confirm", serde_json::json!({
+        "library_id": original_id, "preview_id": preview["preview_id"], "revision": preview["revision"],
+    })).await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    assert_eq!(
+        fs::read(config.downloads.video_dir.join("organized/clip.mp4")).unwrap(),
+        b"source library media"
+    );
+    assert!(
+        config
+            .downloads
+            .video_dir
+            .join("organized/clip.nfo")
+            .exists()
+    );
+    assert_eq!(
+        fs::read(archive.join("clip.mp4")).unwrap(),
+        b"different archive media"
+    );
+    let removed = run_library_management_test_request(
+        &runtime,
+        707,
+        "library_remove",
+        serde_json::json!({
+            "library_id": archive_id,
+            "root_binding": archive_binding,
+        }),
+    )
+    .await;
+    assert_eq!(
+        removed.status,
+        InboxStatus::Failed,
+        "dependent tasks should keep their library registered"
+    );
+    assert!(archive.join("clip.mp4").exists());
+    let recorded = take_cloud_test_telegram_requests(&mut requests);
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .count(),
+        1
+    );
+    assert!(
+        recorded
+            .iter()
+            .any(|request| request.method == "editMessageText")
+    );
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let reopened =
+        QueueManager::open(&config).expect("registry and both queue roots should reopen");
+    assert_eq!(
+        reopened
+            .task_config(&config, "original-target")
+            .unwrap()
+            .unwrap()
+            .downloads
+            .video_dir,
+        config.downloads.video_dir
+    );
+    assert_eq!(
+        reopened
+            .task_config(&config, "new-default-target")
+            .unwrap()
+            .unwrap()
+            .downloads
+            .video_dir,
+        archive.join("Documentaries")
+    );
+    drop(reopened);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn media_library_dispatch_rejects_replaced_roots_and_recovers_scoped_roots() {
+    let root = temp_cloud_bot_dir("media-library-root-replacement-dispatch");
+    let video_root = root.join("videos");
+    let archive_root = root.join("archive");
+    let displaced_root = root.join("archive-displaced");
+    let replacement_root = root.join("archive-replacement");
+    let pdf_root = root.join("pdfs");
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = video_root.clone();
+    config.downloads.pdf_dir = pdf_root;
+    config
+        .ensure_runtime_dirs()
+        .expect("test roots should create");
+    fs::create_dir(&archive_root).expect("archive root should create");
+    fs::write(archive_root.join("original.mp4"), b"original root media")
+        .expect("original media should write");
+    let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let library_id = queue
+        .register_video_library("Archive", &archive_root, None, false, false)
+        .expect("secondary library should register")
+        .id;
+    let original_binding = cloud_test_root_binding(&queue, &library_id);
+    let inbox = Arc::new(open_runtime_test_inbox(&video_root).expect("test inbox should open"));
+    let runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+
+    let baseline = run_library_management_test_request(
+        &runtime,
+        781,
+        "library_scan",
+        serde_json::json!({"library_id": library_id}),
+    )
+    .await;
+    assert_eq!(
+        baseline.status,
+        InboxStatus::Completed,
+        "{:?}",
+        baseline.error
+    );
+    let baseline_item_id = baseline.result.as_ref().unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "original.mp4")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    fs::write(archive_root.join("added-after-scan.mp4"), b"child churn")
+        .expect("ordinary child churn should be allowed");
+    let after_child_churn = run_library_management_test_request(
+        &runtime,
+        782,
+        "library_scan",
+        serde_json::json!({"library_id": library_id}),
+    )
+    .await;
+    assert_eq!(
+        after_child_churn.status,
+        InboxStatus::Completed,
+        "same-root child changes must not trip the identity guard: {:?}",
+        after_child_churn.error
+    );
+
+    fs::rename(&archive_root, &displaced_root).expect("original root should be displaced");
+    fs::create_dir(&archive_root).expect("replacement should occupy the registered path");
+    fs::write(
+        archive_root.join("replacement.mp4"),
+        b"replacement root media",
+    )
+    .expect("replacement media should write");
+
+    let rejected_scan = run_library_management_test_request(
+        &runtime,
+        783,
+        "library_scan",
+        serde_json::json!({"library_id": library_id}),
+    )
+    .await;
+    assert_eq!(rejected_scan.status, InboxStatus::Failed);
+    assert!(rejected_scan.error.as_deref().is_some_and(|error| {
+        error.contains("unavailable") || error.contains("different root object")
+    }));
+    assert!(
+        !archive_root
+            .join(".telegram-video-downloader-library")
+            .exists(),
+        "rejected scan must not create library metadata on the replacement inode"
+    );
+    assert!(
+        !archive_root
+            .join(".telegram-video-downloader-queue")
+            .exists(),
+        "rejected scan must not initialize a queue on the replacement inode"
+    );
+
+    let rejected_preview = run_library_management_test_request(
+        &runtime,
+        784,
+        "file_preview",
+        serde_json::json!({
+            "library_id": library_id,
+            "root_binding": original_binding,
+            "item_ids": [baseline_item_id],
+            "target_relative_dir": "organized",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(rejected_preview.status, InboxStatus::Failed);
+    assert!(rejected_preview.error.as_deref().is_some_and(|error| {
+        error.contains("unavailable") || error.contains("different root object")
+    }));
+    assert!(
+        !archive_root
+            .join(".telegram-video-downloader-library")
+            .exists(),
+        "rejected file preview must not create preview/recovery metadata on the replacement inode"
+    );
+    assert!(
+        !archive_root
+            .join(".telegram-video-downloader-queue")
+            .exists(),
+        "rejected file preview must not initialize a queue on the replacement inode"
+    );
+    assert_eq!(
+        fs::read(archive_root.join("replacement.mp4")).unwrap(),
+        b"replacement root media",
+        "the rejection path must leave replacement contents unchanged"
+    );
+
+    fs::rename(&archive_root, &replacement_root).expect("replacement should be moved aside");
+    fs::rename(&displaced_root, &archive_root).expect("original root object should be restored");
+    let recovered_scan = run_library_management_test_request(
+        &runtime,
+        785,
+        "library_scan",
+        serde_json::json!({"library_id": library_id}),
+    )
+    .await;
+    assert_eq!(
+        recovered_scan.status,
+        InboxStatus::Completed,
+        "restoring the same bound root should recover a scoped scan: {:?}",
+        recovered_scan.error
+    );
+    let recovered_item_id = recovered_scan.result.as_ref().unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "original.mp4")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let recovered_preview = run_library_management_test_request(
+        &runtime,
+        786,
+        "file_preview",
+        serde_json::json!({
+            "library_id": library_id,
+            "root_binding": original_binding,
+            "item_ids": [recovered_item_id],
+            "target_relative_dir": "organized",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(
+        recovered_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "scoped preview should work after the original root recovers: {:?}",
+        recovered_preview.error
+    );
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+fn install_mock_media_library_video_tools(root: &Path, config: &mut AppConfig) {
+    use std::os::unix::fs::PermissionsExt;
+    let scripts = [
+        (
+            "yt-dlp",
+            r#"#!/bin/sh
+case " $* " in
+  *" --dump-json "*)
+    printf '%s\n' '{"id":"abcdefghijk","title":"Library fixture","width":1280,"height":720,"vcodec":"avc1","acodec":"aac","format_id":"mock","filesize":64}'
+    ;;
+  *)
+    printf 'synthetic media fixture\n' > 'Library fixture [abcdefghijk].mkv'
+    printf '%s/Library fixture [abcdefghijk].mkv\n' "$(pwd -P)"
+    ;;
+esac
+"#,
+        ),
+        (
+            "ffprobe",
+            r#"#!/bin/sh
+printf '%s\n' '{"streams":[{"codec_type":"video","codec_name":"h264","width":1280,"height":720},{"codec_type":"audio","codec_name":"aac"}],"format":{"duration":"10","size":"24"}}'
+"#,
+        ),
+        (
+            "ffmpeg",
+            r#"#!/bin/sh
+for arg do
+  if [ "$arg" = "-progress" ]; then
+    printf '%s\n' 'frame=1' 'out_time_us=1000000' 'progress=end'
+    exit 0
+  fi
+done
+exit 0
+"#,
+        ),
+    ];
+    for (name, script) in scripts {
+        let path = root.join(name);
+        fs::write(&path, script).expect("mock tool should write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("mock tool should be executable");
+    }
+    config.tools.yt_dlp = root.join("yt-dlp");
+    config.tools.ffmpeg = root.join("ffmpeg");
+}
+
+#[tokio::test]
+async fn media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e() {
+    for include_tasks in [false, true] {
+        let root = temp_cloud_bot_dir(if include_tasks {
+            "migration-with-task"
+        } else {
+            "migration-without-task"
+        });
+        let archive = root.join("archive");
+        let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+        let mut config = AppConfig::for_test();
+        config.downloads.video_dir = root.join("videos");
+        config.downloads.pdf_dir = root.join("pdfs");
+        config.ensure_runtime_dirs().unwrap();
+        fs::create_dir_all(&archive).unwrap();
+        for (name, content) in [
+            ("Season/01 clip.mp4", b"complete media one".as_slice()),
+            (
+                "Season/01 clip.nfo",
+                b"<movie><title>First clip</title></movie>".as_slice(),
+            ),
+            ("Season/01 clip.ass", b"retained danmaku".as_slice()),
+            ("Season/02 clip.mp4", b"complete media two".as_slice()),
+            (
+                "Season/02 clip.nfo",
+                b"<movie><title>Second clip</title></movie>".as_slice(),
+            ),
+        ] {
+            let path = config.downloads.video_dir.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let queue = Arc::new(QueueManager::open(&config).unwrap());
+        let source = queue.default_video_destination().unwrap();
+        let target = queue
+            .register_video_library("Archive", &archive, None, false, false)
+            .unwrap();
+        let retained =
+            downloader::create_test_retained_video_staging(&config.downloads.video_dir).unwrap();
+        fs::write(retained.join("segment.part"), b"retained partial payload").unwrap();
+        let mut failed = TaskRecord::new(
+            "failed-remains-recoverable".into(),
+            1,
+            1,
+            123_456_789,
+            Some(123_456_789),
+            0,
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=abcdefghijk".into(),
+            },
+        );
+        failed.status = TaskStatus::Failed;
+        failed.error = Some("synthetic interrupted transfer".into());
+        failed.staging_attempts.push(retained.clone());
+        queue.create(failed).unwrap();
+        let inbox = Arc::new(open_runtime_test_inbox(&config.downloads.video_dir).unwrap());
+        let runtime = make_runtime(
+            telegram,
+            config.clone(),
+            Arc::clone(&queue),
+            Arc::clone(&inbox),
+        );
+        let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+        let preview = run_library_management_test_request(
+            &runtime,
+            901,
+            "library_migration_preview",
+            bound_migration_preview_payload(
+                &queue,
+                &source.library_id,
+                &target.id,
+                serde_json::json!({
+                    "scope":"library", "conflict":"skip", "include_incomplete_tasks":include_tasks,
+                    "set_target_default_on_success":true,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            preview.status,
+            InboxStatus::AwaitingConfirmation,
+            "{:?}",
+            preview.error
+        );
+        let preview = preview.result.unwrap();
+        assert_eq!(preview["incomplete_task_count"], 1);
+        assert_eq!(preview["item_count"], 2);
+        if include_tasks {
+            assert!(preview["file_count"].as_u64().unwrap() >= 6);
+        } else {
+            assert_eq!(preview["file_count"], 5);
+        }
+        let payload =
+            serde_json::json!({"preview_id":preview["id"],"revision":preview["revision"]});
+        let confirm = run_library_management_test_request(
+            &runtime,
+            902,
+            "library_migration_confirm",
+            payload.clone(),
+        )
+        .await;
+        assert_eq!(
+            confirm.status,
+            InboxStatus::Completed,
+            "{:?}",
+            confirm.error
+        );
+        let id = preview["id"].as_str().unwrap().to_string();
+        let status = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let status = runtime.migrations.lock().await.get(&id).cloned();
+                if let Some(status) = status
+                    && !runtime.migration_runners.lock().await.contains(&id)
+                {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("migration should reach a recoverable terminal checkpoint");
+        assert_eq!(
+            status.status,
+            crate::library_migration::MigrationRunStatus::Completed,
+            "{:?}",
+            status
+        );
+        assert_eq!(status.success_count, 2);
+        assert_eq!(status.failed_count, 0);
+        assert_eq!(
+            fs::read(archive.join("Season/01 clip.mp4")).unwrap(),
+            b"complete media one"
+        );
+        assert_eq!(
+            fs::read(archive.join("Season/01 clip.ass")).unwrap(),
+            b"retained danmaku"
+        );
+        assert!(archive.join("Season/01 clip.nfo").exists());
+        assert!(archive.join("Season/02 clip.nfo").exists());
+        assert!(
+            !config
+                .downloads
+                .video_dir
+                .join("Season/01 clip.mp4")
+                .exists()
+        );
+        let task = queue.get("failed-remains-recoverable").unwrap().unwrap();
+        assert_eq!(
+            task.status,
+            TaskStatus::Failed,
+            "a failed task must require explicit retry after relocation"
+        );
+        assert!(task.destination_transfer.is_none());
+        let actual_attempt = task
+            .staging_attempts
+            .first()
+            .expect("retained attempt remains associated");
+        assert_eq!(
+            fs::read(actual_attempt.join("segment.part")).unwrap(),
+            b"retained partial payload"
+        );
+        if include_tasks {
+            assert!(actual_attempt.starts_with(&target.root));
+            assert!(!retained.join("segment.part").exists());
+        } else {
+            assert_eq!(actual_attempt, &retained);
+        }
+        assert_eq!(
+            task.destination.unwrap().library_id,
+            if include_tasks {
+                target.id.clone()
+            } else {
+                source.library_id.clone()
+            }
+        );
+        assert_eq!(
+            queue.default_video_destination().unwrap().library_id,
+            target.id
+        );
+        let sent = take_cloud_test_telegram_requests(&mut requests);
+        assert_eq!(
+            sent.iter()
+                .filter(|request| request.method == "sendMessage")
+                .count(),
+            1,
+            "one migration progress message"
+        );
+        assert!(
+            sent.iter()
+                .any(|request| request.method == "editMessageText")
+        );
+        let replay = runtime.inbox.record(902).unwrap().unwrap();
+        dispatch_cloud_record(runtime.clone(), replay).await;
+        assert!(
+            requests.try_recv().is_err(),
+            "a repeated confirmation must not send another message"
+        );
+        dispatcher.abort();
+        let _ = dispatcher.await;
+        runtime.signal_epoch_fatal();
+        drop(runtime);
+        drop(inbox);
+        drop(queue);
+        let reopened = QueueManager::open(&config).unwrap();
+        assert_eq!(
+            reopened
+                .get("failed-remains-recoverable")
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Failed
+        );
+        assert_eq!(
+            reopened.registry_snapshot().unwrap().libraries.len(),
+            2,
+            "source registration is retained"
+        );
+        drop(reopened);
+        stop_fake_telegram_api(shutdown, server).await;
+        let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn download_submit_requires_current_registration_binding_before_queue_writes_mock_e2e() {
+    let root = temp_cloud_bot_dir("download-submit-registration-binding");
+    let archive = root.join("archive");
+    fs::create_dir_all(&archive).expect("archive root should create");
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test roots should create");
+    install_mock_media_library_video_tools(&root, &mut config);
+
+    let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let library_a = queue
+        .register_video_library("Archive", &archive, None, false, false)
+        .expect("first archive registration should succeed");
+    let default_index_before = queue_index_contents(&config.downloads.video_dir);
+    let archive_index_before = queue_index_contents(&archive);
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("test inbox should open"),
+    );
+    let mut runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.bot.job_dispatch.download_semaphore = Arc::new(Semaphore::new(0));
+
+    let missing = dispatch_download_for_test(
+        &runtime,
+        98_101,
+        serde_json::json!({
+            "url":"https://www.youtube.com/watch?v=abcdefghijk",
+            "library_id":library_a.id,
+        }),
+    )
+    .await;
+    assert_eq!(missing.status, InboxStatus::Failed);
+    assert!(missing.error.as_deref().is_some_and(|error| {
+        error.contains("root_binding must be an opaque root identity token")
+    }));
+
+    let malformed = dispatch_download_for_test(
+        &runtime,
+        98_102,
+        serde_json::json!({
+            "url":"https://www.youtube.com/watch?v=abcdefghijk",
+            "library_id":library_a.id,
+            "root_binding":"v1:not-a-root-token",
+        }),
+    )
+    .await;
+    assert_eq!(malformed.status, InboxStatus::Failed);
+    assert!(malformed.error.as_deref().is_some_and(|error| {
+        error.contains("root_binding must be an opaque root identity token")
+    }));
+    assert_eq!(
+        queue_index_contents(&config.downloads.video_dir),
+        default_index_before,
+        "unbound submissions must not mutate the default queue"
+    );
+    assert_eq!(
+        queue_index_contents(&archive),
+        archive_index_before,
+        "unbound submissions must not mutate the selected queue"
+    );
+
+    let binding_a = cloud_test_root_binding(&queue, &library_a.id);
+    queue
+        .remove_video_library_with_root_binding(&library_a.id, &binding_a)
+        .expect("empty first registration should be removable");
+    let library_b = queue
+        .register_video_library("Archive", &archive, None, false, false)
+        .expect("same root object should be re-registered");
+    assert_eq!(library_b.id, library_a.id, "library IDs are path-derived");
+    let binding_b = cloud_test_root_binding(&queue, &library_b.id);
+    assert_ne!(
+        binding_b, binding_a,
+        "a new registration at the same path must invalidate a displayed old token"
+    );
+
+    fs::create_dir(archive.join("ordinary-child")).expect("benign child churn should be allowed");
+    fs::write(archive.join("ordinary-child/notes.txt"), b"child churn")
+        .expect("benign child file should write");
+    assert_eq!(
+        cloud_test_root_binding(&queue, &library_b.id),
+        binding_b,
+        "ordinary child changes must preserve the selected registration token"
+    );
+    let archive_index_after_registration = queue_index_contents(&archive);
+
+    let stale = dispatch_download_for_test(
+        &runtime,
+        98_103,
+        serde_json::json!({
+            "url":"https://www.youtube.com/watch?v=abcdefghijk",
+            "library_id":library_b.id,
+            "root_binding":binding_a,
+            "category":"",
+        }),
+    )
+    .await;
+    assert_eq!(stale.status, InboxStatus::Failed);
+    assert!(
+        stale
+            .error
+            .as_deref()
+            .is_some_and(|error| { error.contains("library root identity changed") })
+    );
+    assert_eq!(
+        queue_index_contents(&archive),
+        archive_index_after_registration,
+        "a stale displayed registration must not write to the re-registered queue"
+    );
+    assert_eq!(
+        queue_index_contents(&config.downloads.video_dir),
+        default_index_before,
+        "a stale selected-root token must not fall back to the current default"
+    );
+
+    let accepted = dispatch_download_for_test(
+        &runtime,
+        98_104,
+        serde_json::json!({
+            "url":"https://www.youtube.com/watch?v=abcdefghijk",
+            "library_id":library_b.id,
+            "root_binding":binding_b,
+            "category":"",
+        }),
+    )
+    .await;
+    assert_eq!(
+        accepted.status,
+        InboxStatus::Completed,
+        "{:?}",
+        accepted.error
+    );
+    let task_id = accepted.result.unwrap()["task_ids"][0]
+        .as_str()
+        .expect("accepted download should return its task ID")
+        .to_string();
+    let queued = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let task = queue
+                .get(&task_id)
+                .expect("accepted task should be readable")
+                .expect("accepted task should exist");
+            if task.status == TaskStatus::Queued && task.status_message_id.is_some() {
+                break task;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("valid registration should enqueue a task");
+    let destination = queue
+        .task_destination(&task_id)
+        .expect("accepted destination should be readable")
+        .expect("accepted task should retain its destination");
+    assert_eq!(destination.library_id, library_b.id);
+    assert_eq!(destination.root, library_b.root);
+    assert_eq!(
+        destination.category, None,
+        "an explicit blank category targets the root"
+    );
+    assert_eq!(
+        queued.destination.as_ref(),
+        Some(&destination),
+        "the accepted task must freeze the exact destination selected by the request"
+    );
+
+    queue
+        .cancel_for_chat_if_generation(&task_id, queued.generation, 123_456_789)
+        .expect("test cancellation should succeed")
+        .expect("queued task should be cancellable");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let request = requests
+                .recv()
+                .await
+                .expect("mock Telegram should remain available");
+            if request.method == "sendMessage"
+                && request.body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Canceled job #"))
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("cancellation should stop the semaphore-blocked worker");
+    assert_eq!(
+        queue.get(&task_id).unwrap().unwrap().status,
+        TaskStatus::Cancelled
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn download_submit_rejects_same_path_root_replacement_before_queue_writes_mock_e2e() {
+    let root = temp_cloud_bot_dir("download-submit-replaced-root");
+    let archive = root.join("archive");
+    let displaced = root.join("archive-original");
+    fs::create_dir_all(&archive).expect("archive root should create");
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test roots should create");
+    install_mock_media_library_video_tools(&root, &mut config);
+
+    let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let library = queue
+        .register_video_library("Archive", &archive, None, false, false)
+        .expect("archive should register");
+    let binding = cloud_test_root_binding(&queue, &library.id);
+    let archive_index_before = queue_index_contents(&archive);
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("test inbox should open"),
+    );
+    let runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+
+    fs::rename(&archive, &displaced).expect("original root should be displaced");
+    fs::create_dir(&archive).expect("replacement should occupy the registered path");
+    fs::write(archive.join("keep.txt"), b"replacement sentinel")
+        .expect("replacement sentinel should write");
+
+    let outcome = dispatch_download_for_test(
+        &runtime,
+        98_201,
+        serde_json::json!({
+            "url":"https://www.youtube.com/watch?v=abcdefghijk",
+            "library_id":library.id,
+            "root_binding":binding,
+        }),
+    )
+    .await;
+    assert_eq!(outcome.status, InboxStatus::Failed);
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| { error.contains("root") || error.contains("available") })
+    );
+    assert_eq!(
+        queue_index_contents(&displaced),
+        archive_index_before,
+        "a replacement-root rejection must not mutate the previously bound queue"
+    );
+    assert!(
+        !archive.join(".telegram-video-downloader-queue").exists(),
+        "the replacement root must not receive queue state"
+    );
+    let rejected_task_id = format!("c{}-98201", crate::cloud::TEST_DATABASE_EPOCH);
+    assert!(
+        !displaced
+            .join(".telegram-video-downloader-queue")
+            .join(format!("task-{rejected_task_id}.json"))
+            .exists(),
+        "the rejected task must not be written into the displaced root"
+    );
+    let replacement_entries = fs::read_dir(&archive)
+        .expect("replacement should remain readable")
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replacement_entries,
+        vec![std::ffi::OsString::from("keep.txt")],
+        "the replacement should retain only its sentinel"
+    );
+
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_library_download_survives_default_change_mock_telegram_e2e() {
+    let root = temp_cloud_bot_dir("explicit-library-download");
+    let archive = root.join("archive");
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test roots should create");
+    fs::create_dir_all(archive.join("Documentaries")).expect("archive should create");
+    install_mock_media_library_video_tools(&root, &mut config);
+    let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let original_id = queue.default_video_destination().unwrap().library_id;
+    let library = queue
+        .register_video_library(
+            "Archive",
+            &archive,
+            Some(Path::new("Documentaries")),
+            false,
+            false,
+        )
+        .expect("archive should register");
+    let inbox =
+        Arc::new(open_runtime_test_inbox(&config.downloads.video_dir).expect("inbox should open"));
+    let mut runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.bot.job_dispatch.download_semaphore = Arc::new(Semaphore::new(0));
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let root_binding = cloud_test_root_binding(&queue, &library.id);
+    let payload = serde_json::json!({
+        "url": "https://www.youtube.com/watch?v=abcdefghijk",
+        "library_id": library.id, "root_binding": root_binding,
+        "category": "Documentaries",
+    });
+    let submitted =
+        run_library_management_test_request(&runtime, 801, "download_submit", payload.clone())
+            .await;
+    assert_eq!(
+        submitted.status,
+        InboxStatus::Completed,
+        "{:?}",
+        submitted.error
+    );
+    let task_id = submitted.result.unwrap()["task_ids"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if queue.get(&task_id).unwrap().unwrap().status == TaskStatus::Queued {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("task should queue without starting the mocked download");
+    let changed = run_library_management_test_request(
+        &runtime,
+        802,
+        "library_set_default",
+        serde_json::json!({
+            "library_id": original_id,
+            "root_binding": queue
+                .registry_snapshot()
+                .unwrap()
+                .libraries
+                .into_iter()
+                .find(|library| library.id == original_id)
+                .unwrap()
+                .root_binding_token()
+                .unwrap(),
+        }),
+    )
+    .await;
+    assert_eq!(changed.status, InboxStatus::Completed);
+    runtime.bot.job_dispatch.download_semaphore.add_permits(1);
+    let completed = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let task = queue.get(&task_id).unwrap().unwrap();
+            if matches!(
+                task.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Interrupted
+            ) {
+                break task;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("mock download should finish");
+    assert_eq!(
+        completed.status,
+        TaskStatus::Completed,
+        "{:?}",
+        completed.error
+    );
+    let destination = archive.join("Documentaries/Library fixture [abcdefghijk].mkv");
+    assert_eq!(
+        fs::read(&destination).unwrap(),
+        b"synthetic media fixture\n"
+    );
+    assert!(destination.with_extension("nfo").exists());
+    assert!(archive.join(".telegram-video-downloader-staging").exists());
+    assert!(
+        !archive
+            .join("Documentaries/.telegram-video-downloader-staging")
+            .exists()
+    );
+    assert!(
+        !config
+            .downloads
+            .video_dir
+            .join("Library fixture [abcdefghijk].mkv")
+            .exists()
+    );
+
+    let mut first_requests = take_cloud_test_telegram_requests(&mut requests);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !first_requests.iter().any(|request| {
+            request.body["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Finished job #"))
+        }) {
+            first_requests.push(
+                requests
+                    .recv()
+                    .await
+                    .expect("completion reply should arrive"),
+            );
+        }
+    })
+    .await
+    .expect("completion Telegram edit should finish before checking replay");
+    let replay = dispatch_cloud_management(
+        &runtime,
+        &CloudRequest {
+            seq: 801,
+            kind: "download_submit".to_string(),
+            payload,
+            created_at: now_millis(),
+            extra: serde_json::Map::new(),
+        },
+    )
+    .await
+    .expect("replayed submission should be idempotent");
+    assert_eq!(replay.status, InboxStatus::Completed);
+    tokio::task::yield_now().await;
+    assert!(take_cloud_test_telegram_requests(&mut requests).is_empty());
+    assert!(
+        first_requests
+            .iter()
+            .any(|request| request.method == "sendMessage")
+    );
+    assert!(
+        first_requests
+            .iter()
+            .any(|request| request.method == "editMessageText")
+    );
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queued_download_relocates_and_resumes_without_cancel_reply_mock_e2e() {
+    let root = temp_cloud_bot_dir("queued-task-library-migration");
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config.ensure_runtime_dirs().unwrap();
+    let archive = root.join("archive");
+    fs::create_dir_all(&archive).unwrap();
+    install_mock_media_library_video_tools(&root, &mut config);
+    let queue = Arc::new(QueueManager::open(&config).unwrap());
+    let source = queue.default_video_destination().unwrap();
+    let target = queue
+        .register_video_library("Archive", &archive, None, false, false)
+        .unwrap();
+    let inbox = Arc::new(open_runtime_test_inbox(&config.downloads.video_dir).unwrap());
+    let mut runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.bot.job_dispatch.download_semaphore = Arc::new(Semaphore::new(0));
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let root_binding = cloud_test_root_binding(&queue, &source.library_id);
+    let submitted=run_library_management_test_request(&runtime,951,"download_submit",serde_json::json!({
+        "url":"https://www.youtube.com/watch?v=abcdefghijk","library_id":source.library_id,"root_binding":root_binding,"category":"",
+    })).await;
+    assert_eq!(
+        submitted.status,
+        InboxStatus::Completed,
+        "{:?}",
+        submitted.error
+    );
+    let task_id = submitted.result.unwrap()["task_ids"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let generation = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let task = queue.get(&task_id).unwrap().unwrap();
+            if task.status == TaskStatus::Queued && task.status_message_id.is_some() {
+                break task.generation;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let preview = run_library_management_test_request(
+        &runtime,
+        952,
+        "library_migration_preview",
+        bound_migration_preview_payload(
+            &queue,
+            &source.library_id,
+            &target.id,
+            serde_json::json!({
+                "scope":"library", "conflict":"skip", "include_incomplete_tasks":true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview.error
+    );
+    let preview = preview.result.unwrap();
+    assert_eq!(preview["item_count"], 0);
+    assert_eq!(preview["incomplete_task_count"], 1);
+    let confirmed = run_library_management_test_request(
+        &runtime,
+        953,
+        "library_migration_confirm",
+        serde_json::json!({
+            "preview_id":preview["id"],"revision":preview["revision"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    let migration_id = preview["id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if !runtime
+                .migration_runners
+                .lock()
+                .await
+                .contains(migration_id)
+            {
+                let status = runtime
+                    .migrations
+                    .lock()
+                    .await
+                    .get(migration_id)
+                    .unwrap()
+                    .clone();
+                assert_eq!(
+                    status.status,
+                    crate::library_migration::MigrationRunStatus::Completed,
+                    "{:?}",
+                    status
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("queued task ownership should relocate without starting media transfer");
+    let task = queue.get(&task_id).unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::Queued);
+    assert!(task.generation > generation);
+    assert_eq!(task.destination.unwrap().library_id, target.id);
+    assert!(task.destination_transfer.is_none());
+    let mut recorded = take_cloud_test_telegram_requests(&mut requests);
+    assert!(
+        !recorded.iter().any(|request| request.body["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Canceled job"))),
+        "migration pause must not report user cancellation"
+    );
+    runtime.bot.job_dispatch.download_semaphore.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            recorded.extend(take_cloud_test_telegram_requests(&mut requests));
+            if queue.get(&task_id).unwrap().unwrap().status == TaskStatus::Completed
+                && recorded.iter().any(|request| {
+                    request.body["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("Finished job #"))
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("relocated task should download to its new frozen root");
+    assert_eq!(
+        fs::read(archive.join("Library fixture [abcdefghijk].mkv")).unwrap(),
+        b"synthetic media fixture\n"
+    );
+    assert!(
+        !config
+            .downloads
+            .video_dir
+            .join("Library fixture [abcdefghijk].mkv")
+            .exists()
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|request| request.method == "sendMessage"
+                && request.body["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("Library migration")))
+            .count(),
+        1
+    );
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    runtime.signal_epoch_fatal();
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn partial_task_migration_keep_both_rewrites_published_paths_mock_e2e() {
+    let root = temp_cloud_bot_dir("partial-task-migration-paths");
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config.ensure_runtime_dirs().unwrap();
+    let archive = root.join("archive");
+    fs::create_dir_all(&archive).unwrap();
+    let media = config.downloads.video_dir.join("clip.mp4");
+    fs::write(&media, b"published source media").unwrap();
+    fs::write(
+        config.downloads.video_dir.join("clip.nfo"),
+        b"<movie><title>Published clip</title></movie>",
+    )
+    .unwrap();
+    fs::write(archive.join("clip.mp4"), b"unrelated destination media").unwrap();
+    fs::write(
+        archive.join("clip.nfo"),
+        b"<movie><title>Unrelated clip</title></movie>",
+    )
+    .unwrap();
+    let queue = Arc::new(QueueManager::open(&config).unwrap());
+    let source = queue.default_video_destination().unwrap();
+    let target = queue
+        .register_video_library("Archive", &archive, None, false, false)
+        .unwrap();
+    let mut task = TaskRecord::new(
+        "partial-published-task".into(),
+        1,
+        1,
+        123_456_789,
+        Some(123_456_789),
+        0,
+        JobRequest::Youtube {
+            url: "https://www.youtube.com/watch?v=abcdefghijk".into(),
+        },
+    );
+    task.status = TaskStatus::PartiallyCompleted;
+    task.saved_location = Some(media.to_string_lossy().into_owned());
+    task.primary_media_hashes =
+        hash_primary_media(&config.downloads.video_dir, std::slice::from_ref(&media)).unwrap();
+    task.media_entries_completed = 1;
+    task.media_entries_total = 2;
+    queue.create(task).unwrap();
+    let inbox = Arc::new(open_runtime_test_inbox(&config.downloads.video_dir).unwrap());
+    let runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let base = bound_migration_preview_payload(
+        &queue,
+        &source.library_id,
+        &target.id,
+        serde_json::json!({
+            "scope":"library", "include_incomplete_tasks":true, "conflict":"skip"
+        }),
+    );
+    let rejected = run_library_management_test_request(
+        &runtime,
+        971,
+        "library_migration_preview",
+        base.clone(),
+    )
+    .await;
+    assert_eq!(
+        rejected.status,
+        InboxStatus::Failed,
+        "a task's skipped published output cannot be silently left behind"
+    );
+    let mut payload = base;
+    payload["conflict"] = serde_json::json!("keep_both");
+    let preview =
+        run_library_management_test_request(&runtime, 972, "library_migration_preview", payload)
+            .await;
+    assert_eq!(
+        preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview.error
+    );
+    let preview = preview.result.unwrap();
+    let expected_path = archive.join(preview["items"][0]["target_path"].as_str().unwrap());
+    assert_ne!(expected_path, archive.join("clip.mp4"));
+    let confirmed = run_library_management_test_request(
+        &runtime,
+        973,
+        "library_migration_confirm",
+        serde_json::json!({
+            "preview_id":preview["id"],"revision":preview["revision"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    let id = preview["id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if !runtime.migration_runners.lock().await.contains(id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let status = runtime.migrations.lock().await.get(id).unwrap().clone();
+    assert_eq!(
+        status.status,
+        crate::library_migration::MigrationRunStatus::Completed,
+        "{:?}",
+        status
+    );
+    let task = queue.get("partial-published-task").unwrap().unwrap();
+    assert_eq!(task.status, TaskStatus::PartiallyCompleted);
+    let rewritten = task.primary_media_hashes.keys().next().unwrap();
+    assert_eq!(
+        fs::canonicalize(rewritten).unwrap(),
+        fs::canonicalize(&expected_path).unwrap()
+    );
+    assert_eq!(
+        fs::canonicalize(task.saved_location.unwrap()).unwrap(),
+        fs::canonicalize(&expected_path).unwrap()
+    );
+    assert_eq!(fs::read(&expected_path).unwrap(), b"published source media");
+    assert_eq!(
+        fs::read(archive.join("clip.mp4")).unwrap(),
+        b"unrelated destination media"
+    );
+    assert!(expected_path.with_extension("nfo").exists());
+    assert!(!media.exists());
+    assert_eq!(
+        take_cloud_test_telegram_requests(&mut requests)
+            .iter()
+            .filter(|request| request.method == "sendMessage")
+            .count(),
+        1
+    );
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    runtime.signal_epoch_fatal();
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1583,6 +3354,7 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -1619,7 +3391,11 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
         .persist(CloudRequest {
             seq: 83,
             kind: "file_preview".to_string(),
-            payload: serde_json::json!({"item_ids": ["item-a"]}),
+            payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
+                "item_ids": ["item-a"]
+            }),
             created_at: 100,
             extra: serde_json::Map::new(),
         })
@@ -1628,6 +3404,8 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
         .update(83, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": "retryable-preview",
                 "revision": "revision-retryable",
                 "preview": preview,
@@ -1772,6 +3550,11 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
         .expect("file move should produce a persistent preview");
     let preview_id = preview.id.clone();
     let preview_revision = preview.revision.clone();
+    let (library_id, root_binding) = {
+        let queue =
+            QueueManager::open(&config).expect("task queue should open for preview binding");
+        cloud_test_default_library_binding(&queue)
+    };
     let preview_manifest = config
         .downloads
         .video_dir
@@ -1793,6 +3576,8 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
             seq: 83,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "item_ids": [item_id],
                 "target_relative_dir": "organized"
             }),
@@ -1806,6 +3591,8 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
             record.result = Some(serde_json::json!({
                 "preview_id": preview_id,
                 "revision": preview_revision,
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview": preview,
             }));
         })
@@ -2128,6 +3915,7 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
     let preview_revision = preview.revision.clone();
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -2135,7 +3923,12 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
         .persist(CloudRequest {
             seq: 83,
             kind: "file_preview".to_string(),
-            payload: serde_json::json!({"item_ids": [item_id], "target_relative_dir": "organized"}),
+            payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
+                "item_ids": [item_id],
+                "target_relative_dir": "organized"
+            }),
             created_at: 100,
             extra: serde_json::Map::new(),
         })
@@ -2144,6 +3937,8 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
         .update(83, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id.clone(),
                 "revision": preview_revision.clone(),
                 "preview": preview,
@@ -2292,6 +4087,7 @@ async fn nonretryable_skipped_confirmation_requires_fresh_preview() {
     .expect("conflicting target should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -2326,7 +4122,12 @@ async fn nonretryable_skipped_confirmation_requires_fresh_preview() {
         .persist(CloudRequest {
             seq: 83,
             kind: "file_preview".to_string(),
-            payload: serde_json::json!({"item_ids": [item_id], "target_relative_dir": "Existing"}),
+            payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
+                "item_ids": [item_id],
+                "target_relative_dir": "Existing"
+            }),
             created_at: now_millis(),
             extra: serde_json::Map::new(),
         })
@@ -2335,6 +4136,8 @@ async fn nonretryable_skipped_confirmation_requires_fresh_preview() {
         .update(83, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id.clone(),
                 "revision": preview_revision.clone(),
                 "preview": preview,
@@ -2462,6 +4265,7 @@ async fn completed_file_confirmation_is_preserved_when_library_refresh_fails() {
     .expect("NFO fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -2508,6 +4312,8 @@ async fn completed_file_confirmation_is_preserved_when_library_refresh_fails() {
             seq: 86,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "item_ids": [item_id],
                 "target_relative_dir": "organized"
             }),
@@ -2519,6 +4325,8 @@ async fn completed_file_confirmation_is_preserved_when_library_refresh_fails() {
         .update(86, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id,
                 "revision": preview_revision,
                 "preview": preview,
@@ -2666,6 +4474,7 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
     fs::write(&source_nfo, original_nfo).expect("NFO fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -2690,6 +4499,8 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
             seq: 1,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "metadata_patches": [{
                     "item_id": item_id,
                     "title": "Must require a completed import",
@@ -2726,6 +4537,8 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
             seq: 2,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "metadata_patches": [{
                     "item_id": item_id,
                     "title": "Manual title",
@@ -2752,6 +4565,8 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
         .result
         .as_ref()
         .expect("manual preview should store its result");
+    assert_eq!(preview_result["library_id"], library_id);
+    assert_eq!(preview_result["root_binding"], root_binding);
     let preview_id = preview_result["preview_id"]
         .as_str()
         .expect("manual preview should include an id")
@@ -2838,6 +4653,7 @@ async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() 
     }
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(open_runtime_test_inbox(&video_root).expect("cloud inbox should open"));
     let library = LibraryManager::open(&video_root).expect("library manager should open");
     let snapshot = library
@@ -2871,7 +4687,11 @@ async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() 
     let large_request = CloudRequest {
         seq: 1,
         kind: "file_preview".to_string(),
-        payload: serde_json::json!({"metadata_patches": patches}),
+        payload: serde_json::json!({
+            "library_id": library_id,
+            "root_binding": root_binding,
+            "metadata_patches": patches,
+        }),
         created_at: now_millis(),
         extra: serde_json::Map::new(),
     };
@@ -2928,6 +4748,8 @@ async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() 
             seq: 2,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "metadata_patches": [{
                     "item_id": item_ids[0],
                     "title": "Small preview",
@@ -2954,6 +4776,8 @@ async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() 
         .result
         .as_ref()
         .expect("confirmable preview should keep its receipt result");
+    assert_eq!(result["library_id"], library_id);
+    assert_eq!(result["root_binding"], root_binding);
     let preview_id = result["preview_id"]
         .as_str()
         .expect("preview receipt should include its ID")
@@ -3237,6 +5061,7 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
     .expect("library media fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let library =
         LibraryManager::open(&config.downloads.video_dir).expect("library manager should open");
     let snapshot = library
@@ -3285,7 +5110,11 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
         .persist(CloudRequest {
             seq: LEGACY_IMPORT_SEQ,
             kind: "legacy_import".to_string(),
-            payload: serde_json::json!({"text":"Imported title https://www.bilibili.com/video/BV1xx411c7mD"}),
+            payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
+                "text":"Imported title https://www.bilibili.com/video/BV1xx411c7mD"
+            }),
             created_at: now_millis(),
             extra: serde_json::Map::new(),
         })
@@ -3294,6 +5123,8 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
         .update(LEGACY_IMPORT_SEQ, |record| {
             record.status = InboxStatus::Completed;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "hints": hints,
                 "candidates": [candidate],
             }));
@@ -3353,6 +5184,8 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
         seq: PREVIEW_SEQ,
         kind: "file_preview".to_string(),
         payload: serde_json::json!({
+            "library_id": library_id,
+            "root_binding": root_binding,
             "metadata_patches": [{
                 "item_id": item_id,
                 "title": "Imported title",
@@ -3397,6 +5230,22 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
         .expect("file preview receipt should load")
         .expect("file preview receipt should remain present");
     assert_eq!(preview_receipt.status, InboxStatus::AwaitingConfirmation);
+    assert_eq!(
+        preview_receipt
+            .result
+            .as_ref()
+            .and_then(|result| result["library_id"].as_str()),
+        Some(library_id.as_str()),
+        "the durable preview must retain the library whose identity was captured"
+    );
+    assert_eq!(
+        preview_receipt
+            .result
+            .as_ref()
+            .and_then(|result| result["root_binding"].as_str()),
+        Some(root_binding.as_str()),
+        "the durable preview must retain its original root binding"
+    );
     let stored_preview = preview_receipt
         .result
         .as_ref()
@@ -4576,6 +6425,7 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
     let source_path = config.downloads.video_dir.join("clip.mp4");
     fs::write(&source_path, b"original media contents").expect("media fixture should write");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -4606,7 +6456,12 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
         .persist(CloudRequest {
             seq: 41,
             kind: "file_preview".to_string(),
-            payload: serde_json::json!({"item_ids": [item_id], "target_relative_dir": "organized"}),
+            payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
+                "item_ids": [item_id],
+                "target_relative_dir": "organized"
+            }),
             created_at: now_millis(),
             extra: serde_json::Map::new(),
         })
@@ -4615,6 +6470,8 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
         .update(41, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id,
                 "revision": preview_revision,
                 "preview": preview,
@@ -5648,6 +7505,7 @@ async fn completed_file_move_retries_primary_and_preview_receipts_without_repeat
     fs::write(&source_path, b"fixture-video").expect("media fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox_provider = Arc::new(FailOnceInboxFileProvider::default());
     let inbox_provider_trait: Arc<dyn QueueFileProvider> = inbox_provider.clone();
     let inbox = Arc::new(
@@ -5692,6 +7550,8 @@ async fn completed_file_move_retries_primary_and_preview_receipts_without_repeat
             seq: preview_seq,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "item_ids": [item_id],
                 "target_relative_dir": "organized"
             }),
@@ -5703,6 +7563,8 @@ async fn completed_file_move_retries_primary_and_preview_receipts_without_repeat
         .update(preview_seq, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id,
                 "revision": preview_revision,
                 "telegram_status_delivery": "sent",
@@ -5829,6 +7691,7 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
     fs::write(&source_path, b"fixture-video").expect("media fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -5868,6 +7731,8 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
             seq: preview_seq,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "item_ids": [item_id],
                 "target_relative_dir": "organized"
             }),
@@ -5879,6 +7744,8 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
         .update(preview_seq, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id.clone(),
                 "revision": preview_revision.clone(),
                 "preview": preview,
@@ -5925,7 +7792,10 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
         .expect("preview operation should remain visible while its live anchor exists");
     assert_eq!(confirmable_operation["status"], "awaiting_confirmation");
     assert!(confirmable_state.previews.iter().any(|entry| {
-        entry["preview_id"] == preview_id && entry["revision"] == preview_revision
+        entry["preview_id"] == preview_id
+            && entry["revision"] == preview_revision
+            && entry["library_id"] == library_id
+            && entry["root_binding"] == root_binding
     }));
 
     release_preview_anchors(&preview_id);
@@ -5994,4 +7864,327 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
     drop(queue);
     stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
     let _ = std::fs::remove_dir_all(root);
+}
+#[path = "media_library_e2e_tests.rs"]
+mod media_library_e2e_tests;
+#[path = "media_library_snapshot_e2e_tests.rs"]
+mod media_library_snapshot_e2e_tests;
+
+#[tokio::test]
+async fn media_library_migration_uses_per_bundle_conflict_choices_mock_e2e() {
+    let root = temp_cloud_bot_dir("migration-mixed-conflicts");
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config.ensure_runtime_dirs().unwrap();
+    let archive = root.join("archive");
+    fs::create_dir(&archive).unwrap();
+    for name in ["one", "two"] {
+        fs::write(
+            config.downloads.video_dir.join(format!("{name}.mp4")),
+            name.as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            config.downloads.video_dir.join(format!("{name}.nfo")),
+            b"<movie/>",
+        )
+        .unwrap();
+        fs::write(
+            archive.join(format!("{name}.mp4")),
+            b"existing target media",
+        )
+        .unwrap();
+    }
+    let queue = Arc::new(QueueManager::open(&config).unwrap());
+    let source = queue.default_video_destination().unwrap();
+    let target = queue
+        .register_video_library("Archive", &archive, None, false, false)
+        .unwrap();
+    let inbox = Arc::new(open_runtime_test_inbox(&config.downloads.video_dir).unwrap());
+    let runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let source_manager = LibraryManager::open(&config.downloads.video_dir).unwrap();
+    let snapshot = source_manager.scan(&[]).unwrap();
+    let one = snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "one.mp4")
+        .unwrap();
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let preview = run_library_management_test_request(
+        &runtime,
+        951,
+        "library_migration_preview",
+        bound_migration_preview_payload(
+            &queue,
+            &source.library_id,
+            &target.id,
+            serde_json::json!({
+                "scope": "library", "conflict": "skip", "item_conflicts": { (one.id.clone()): "keep_both" },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview.error
+    );
+    let preview = preview.result.unwrap();
+    let id = preview["id"].as_str().unwrap().to_string();
+    let one_target = preview["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["source_path"] == "one.mp4")
+        .unwrap()["target_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let confirmed = run_library_management_test_request(
+        &runtime,
+        952,
+        "library_migration_confirm",
+        serde_json::json!({"preview_id":id, "revision":preview["revision"]}),
+    )
+    .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    let status_result = tokio::time::timeout(MIGRATION_TEST_COMPLETION_TIMEOUT, async {
+        loop {
+            let status = runtime.migrations.lock().await.get(&id).cloned();
+            let runner_active = runtime.migration_runners.lock().await.contains(&id);
+            if let Some(status) = status
+                && !runner_active
+                && matches!(
+                    status.status,
+                    crate::library_migration::MigrationRunStatus::Completed
+                        | crate::library_migration::MigrationRunStatus::Partial
+                        | crate::library_migration::MigrationRunStatus::Failed
+                        | crate::library_migration::MigrationRunStatus::Paused
+                        | crate::library_migration::MigrationRunStatus::Stopped
+                )
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let status = match status_result {
+        Ok(status) => status,
+        Err(_) => {
+            let diagnostic = tokio::time::timeout(Duration::from_secs(1), async {
+                let in_memory = runtime.migrations.lock().await.get(&id).cloned();
+                let runner_active = runtime.migration_runners.lock().await.contains(&id);
+                (in_memory, runner_active)
+            })
+            .await;
+            match diagnostic {
+                Ok((in_memory, runner_active)) => panic!(
+                    "mixed conflict choices did not reach a terminal status: id={id}, runner_active={runner_active}, in_memory={in_memory:?}"
+                ),
+                Err(_) => panic!(
+                    "mixed conflict choices timed out and migration-state locks remained unavailable: id={id}"
+                ),
+            }
+        }
+    };
+    assert_eq!(
+        status.status,
+        crate::library_migration::MigrationRunStatus::Completed,
+        "mixed conflict migration should complete: {status:?}"
+    );
+    assert_eq!((status.success_count, status.skipped_count), (1, 1));
+    assert!(!config.downloads.video_dir.join("one.mp4").exists());
+    assert!(!config.downloads.video_dir.join("one.nfo").exists());
+    assert_eq!(fs::read(archive.join(&one_target)).unwrap(), b"one");
+    assert!(archive.join(&one_target).with_extension("nfo").exists());
+    assert_eq!(
+        fs::read(archive.join("one.mp4")).unwrap(),
+        b"existing target media"
+    );
+    assert!(config.downloads.video_dir.join("two.mp4").exists());
+    assert!(config.downloads.video_dir.join("two.nfo").exists());
+    let mut sends = 0;
+    while let Ok(request) = requests.try_recv() {
+        sends += usize::from(request.method == "sendMessage");
+    }
+    assert_eq!(sends, 1);
+    runtime.signal_epoch_fatal();
+    dispatcher.await.unwrap();
+    stop_fake_telegram_api(shutdown, server).await;
+    drop(source_manager);
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unavailable_saved_category_fails_without_losing_fragments_mock_e2e() {
+    let root = temp_cloud_bot_dir("saved-category-replaced");
+    let (telegram, mut requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config.ensure_runtime_dirs().unwrap();
+    let category = config.downloads.video_dir.join("Category");
+    fs::create_dir(&category).unwrap();
+    let outside = root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let queue = Arc::new(QueueManager::open(&config).unwrap());
+    let library_id = queue.default_video_destination().unwrap().library_id;
+    queue
+        .set_video_library_category(&library_id, Some(Path::new("Category")))
+        .unwrap();
+    let retained =
+        downloader::create_test_retained_video_staging(&config.downloads.video_dir).unwrap();
+    fs::write(retained.join("segment.part"), b"retained before failure").unwrap();
+    let job = JobRequest::Youtube {
+        url: "https://www.youtube.com/watch?v=abcdefghijk".to_string(),
+    };
+    let mut task = TaskRecord::new(
+        "saved-category-replaced".to_string(),
+        1,
+        1,
+        123_456_789,
+        Some(123_456_789),
+        0,
+        job.clone(),
+    );
+    task.staging_attempts.push(retained.clone());
+    queue.create(task).unwrap();
+    fs::remove_dir(&category).unwrap();
+    std::os::unix::fs::symlink(&outside, &category).unwrap();
+    let inbox = Arc::new(open_runtime_test_inbox(&config.downloads.video_dir).unwrap());
+    let runtime = make_runtime(telegram, config, Arc::clone(&queue), inbox);
+    queue_or_prompt_job(
+        runtime.bot.clone(),
+        123_456_789,
+        1,
+        "saved-category-replaced".to_string(),
+        0,
+        job,
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if queue
+                .get("saved-category-replaced")
+                .unwrap()
+                .unwrap()
+                .status
+                == TaskStatus::Failed
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("destination failure should leave a retryable failed task");
+    let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        request.body["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("could not open its saved destination"))
+    );
+    assert_eq!(
+        fs::read(retained.join("segment.part")).unwrap(),
+        b"retained before failure"
+    );
+    assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    stop_fake_telegram_api(shutdown, server).await;
+    drop(runtime);
+    drop(queue);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn explicit_blank_download_category_targets_library_root_mock_e2e() {
+    let root = temp_cloud_bot_dir("explicit-blank-category");
+    let archive = root.join("archive");
+    fs::create_dir_all(archive.join("Default")).unwrap();
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config.ensure_runtime_dirs().unwrap();
+    install_mock_media_library_video_tools(&root, &mut config);
+    let queue = Arc::new(QueueManager::open(&config).unwrap());
+    let library = queue
+        .register_video_library(
+            "Archive",
+            &archive,
+            Some(Path::new("Default")),
+            false,
+            false,
+        )
+        .unwrap();
+    let inbox = Arc::new(open_runtime_test_inbox(&config.downloads.video_dir).unwrap());
+    let mut runtime = make_runtime(telegram, config, Arc::clone(&queue), inbox);
+    runtime.bot.job_dispatch.download_semaphore = Arc::new(Semaphore::new(0));
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let root_binding = cloud_test_root_binding(&queue, &library.id);
+
+    for (seq, category, expected_category) in
+        [(9_311, Some(""), None), (9_312, None, Some("Default"))]
+    {
+        let mut payload = serde_json::json!({
+            "url":"https://www.youtube.com/watch?v=abcdefghijk",
+            "library_id":library.id,"root_binding":root_binding,
+        });
+        if let Some(category) = category {
+            payload["category"] = serde_json::json!(category);
+        }
+        let submitted =
+            run_library_management_test_request(&runtime, seq, "download_submit", payload).await;
+        assert_eq!(
+            submitted.status,
+            InboxStatus::Completed,
+            "{:?}",
+            submitted.error
+        );
+        let result = submitted.result.unwrap();
+        let task_id = result["task_ids"][0].as_str().unwrap();
+        let destination = queue.task_destination(task_id).unwrap().unwrap();
+        assert_eq!(destination.library_id, library.id);
+        assert_eq!(
+            destination.category.as_deref(),
+            expected_category.map(Path::new)
+        );
+        let expected_path = expected_category
+            .map(|category| library.root.join(category))
+            .unwrap_or_else(|| library.root.clone());
+        assert_eq!(
+            result["save_path"],
+            expected_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(result["category"], expected_category.unwrap_or_default());
+        queue.cancel(task_id, 123_456_789).unwrap().unwrap();
+    }
+
+    runtime.bot.job_dispatch.download_semaphore.add_permits(2);
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    stop_fake_telegram_api(shutdown, server).await;
+    drop(runtime);
+    drop(queue);
+    let _ = fs::remove_dir_all(root);
 }

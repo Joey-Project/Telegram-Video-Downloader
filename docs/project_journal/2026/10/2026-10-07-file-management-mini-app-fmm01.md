@@ -14,7 +14,7 @@ superseded_by: ""
 
 ## 摘要
 
-为 Telegram 下载 bot 实现 `/file` 文件管理 Mini App，以整理已有媒体为最高优先级，同时覆盖查找媒体。`/settings` 与新下载位置选择属于第五阶段，详细设计待前四阶段完成。本文保留已确认的用户体验、安全边界和分阶段计划；具体检查结果单独记录。
+为 Telegram 下载 bot 实现 `/file` 文件管理 Mini App，以整理已有媒体为最高优先级，同时覆盖查找媒体。第五阶段 `/settings`、新下载目标和媒体库迁移的设计、实施与验证见[独立条目](2026-10-20-media-library-settings-mls01.md)。本文保留原主线的用户体验、安全边界和分阶段计划；具体检查结果单独记录。
 
 ## 当前状态
 
@@ -22,7 +22,7 @@ superseded_by: ""
 - 三个明确场景是整理现有媒体（优先）、查找媒体、创建新下载时选择保存位置。分类对应根目录内的真实文件夹。
 - 当前接受的架构大方向是公开托管的静态界面自动加载文件库并提交操作；Telegram webhook 进入 Cloudflare Worker，再进入 D1 持久收件箱。本机 Rust bot 主动领取操作，并由本机通过同一 Telegram bot 发送或编辑进度消息。本机没有公网入站接口。偏好使用 Cloudflare Free；达到额度限制时暂停操作并提示用户。
 - Rust 通过固定 Worker API 补领、确认和回写状态；Mini App 验证 Telegram initData。休眠 WebSocket 推送完整请求，固定共享密钥鉴权，本机落盘后才确认接收。状态通过持久递增版本防止旧回写覆盖新快照。
-- 第一至第四阶段的本地代码已落在隔离分支：Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段 `/settings` 与新下载位置选择仍延期。
+- 第一至第四阶段提供 Worker/D1 收件、Rust 本地收件与状态回写、媒体库扫描、`/file` Mini App、预览确认移动及旧内容 metadata patch。第五阶段的多媒体库、设置、下载目标与迁移扩展由[独立条目](2026-10-20-media-library-settings-mls01.md)跟踪。
 - Cloudflare 等待卡片重复问题已修复。2026-10-19 的类型检查、75 项 Cloud 测试及 Wrangler dry-run 通过；Rust 1.99.1 的格式、编译、Clippy、调试构建及完整测试通过，完整测试为 1020 项通过、0 项失败、16 项忽略，包含 mock Telegram/cloud、文件管理、状态版本恢复、单集发布记录、来源匹配和有界状态清理，以及 YouTube legacy 提取、纯标题导入、目标目录深度、确认恢复提示、导入来源恢复、队列快照、hint 唯一映射、长附件名改名、零条目上传缩减和预览 anchor 可用性覆盖。
 - 未创建生产 Cloudflare 资源或配置运行时密钥，未修改 Telegram webhook，也未部署 bot。实际休眠、配额和 webhook 切换验证尚未发生。
 - 实施分支 `wip/file-management-cloud` 初始基于 `b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`，后续整合截至 `afbf09300bf5ac7c0dbdc11ac5d1e10f934336fb` 的 master 更新，包含 ASS 弹幕显示默认值、恢复工作流收尾、Cargo 输出目录之外的签名服务安装流程及切换记录，并补齐 Cloud 模式的服务就绪兼容。本分支未安装或重启 bot，也未修改其他 worktree；本记录保持 `active`，后续生产验证及第五阶段范围仍需推进。
@@ -187,7 +187,7 @@ superseded_by: ""
 - 本地代码已实现启动/重连 REST 补领、空闲保持 WS、收件后 HTTPS ACK、递增版本状态回写、授权的单 owner 配置校验和 Mini App `initData` 验证；真实 Cloudflare hibernation、空闲计费和配额行为仍待部署实测。
 - 本地 mock 覆盖 Worker/Telegram 边界，但不能证明生产 bot owner ID、密钥、现存待处理更新和 webhook 状态已正确配置。生产切换前要核对 owner 对齐、保留旧 update、避免 webhook 与 `getUpdates` 同时消费。
 - 附件关联和来源线索仍有歧义场景；旧 NFO 的跨媒体库互操作需要实测。已导入线索不会自动覆盖文件 metadata，必须手动映射、预览并确认。
-- `/settings`、下载根目录/分类设置和新任务目标冻结属于阶段 5，仍未实现。
+- `/settings`、多媒体库设置、默认分类和新任务目标冻结属于阶段 5；实施和验收证据见[独立条目](2026-10-20-media-library-settings-mls01.md)。
 
 ### 旧候选和已完成的文档调研
 
@@ -198,7 +198,7 @@ superseded_by: ""
 
 ## 实施计划
 
-第一至第四阶段已有对应本地实现和测试覆盖。第五阶段仅保留既有范围，仍延期。生产资源、凭据、配额、休眠与 webhook 切换仍需协调并实测。
+第一至第四阶段已有对应本地实现和测试覆盖。第五阶段的设计、实施与验证记录在[独立条目](2026-10-20-media-library-settings-mls01.md)。生产资源、凭据、配额、休眠与 webhook 切换仍需协调并实测。
 
 最初代码核对基于 canonical checkout 的 `e108262dfb11b5a43ff135bb0b029beb7d8b12a4`。实际实施已从更新后的 `origin/master`（`b5cc42e13a4f0d3bb939a2f95b15cc4b6ea4ac16`）建立 `wip/file-management-cloud`，复用当前任务的隔离 worktree；canonical checkout 和已安装的 bot 保持原状。
 
@@ -247,9 +247,7 @@ superseded_by: ""
 
 ### 第五阶段：`/settings` 与新下载位置选择
 
-- 独立设置 Mini App 支持下载根目录及默认分类，明确区分已生效值和待应用请求；设置变化不隐式移动历史文件。
-- 新下载可选择根内分类目录，并在任务创建时冻结目标；已有任务恢复仍使用其原始目标。登录状态整合保留为后续扩展，不要求首期导入云端凭证。
-- 验收：设置重复提交、本机离线、任务创建与设置变更交错、任务恢复和无效目标目录；历史任务和文件不会随默认设置变化而悄然迁移。
+- `/settings`、多根媒体库、默认分类、逐次下载目标、迁移范围及验收证据见[媒体库设置、下载目标与迁移](2026-10-20-media-library-settings-mls01.md)。登录凭证管理仍为未来范围。
 
 ### 测试与交付约定
 
@@ -268,14 +266,14 @@ superseded_by: ""
 - 生产接通后的端到端验证与远端 CI 结果；本地 mock 通过不代表已接通生产 bot。
 - 附件文件的可移植关联清单，以及历史裸字幕/封面的可靠归属策略；NFO 扩展仍需其他媒体库互操作验证。
 - 生产部署前验证两边 owner ID 对齐、密钥配置、Cloudflare 配额和真实 hibernation 行为，并制定保留旧 Telegram updates 的 webhook 切换方案。本轮没有创建生产资源或切换 webhook。
-- 阶段 5 `/settings`、默认分类和新下载目标目录冻结仍未实现，待前四阶段最终 gate 后再规划。
+- 阶段 5 的实施与验证单独记录在[媒体库设置、下载目标与迁移](2026-10-20-media-library-settings-mls01.md)，不由本文原阶段 1–4 的测试结果代替。
 
 ## 后续事项
 
 - 保持当前生产部署，协调其他 worktree 后再安排云端接通和真实端到端验证。
 - 在最终本地 gate 通过后，单独准备生产配置和部署验证；需显式核对 owner、secret、配额、hibernation 及 Telegram webhook 切换条件。
 - 继续完善附件和旧 NFO 的互操作验证；用户导入的 Telegram Desktop 文本仍只作为线索，必须手动映射、预览与确认。
-- 阶段 5 的 `/settings` 和新下载位置选择待本轮阶段 1–4 完成后再启动。
+- 阶段 5 后续事项以[独立条目](2026-10-20-media-library-settings-mls01.md)为准，避免与原阶段重复维护。
 - 弹幕 append-only 更新仍是独立待办，按 `docs/PROJECT_TODO.md` 跟踪，不属于本文件管理设计的实现范围。
 
 ## 依据

@@ -2,9 +2,9 @@
 
 ## Scope and delivery status
 
-The isolated `wip/file-management-cloud` branch implements stages 1–4: Telegram ingress through a Worker inbox, the Rust local client, a persistent media library, the `/file` Mini App, and preview-confirm file operations including legacy metadata patches. `/settings` and new-download location selection are stage 5 and remain deferred.
+Stages 1–4 provide Telegram ingress through a Worker inbox, the Rust local client, a persistent media library, the `/file` Mini App, and preview-confirm file operations including legacy metadata patches. The `codex/media-library-settings` workstream extends this with the separate `/settings` Mini App, multiple registered libraries, frozen per-download destinations, and durable library migration. See [media-library behavior and recovery](MEDIA_LIBRARIES.md) and the [current implementation journal](project_journal/2026/10/2026-10-20-media-library-settings-mls01.md) for current validation status.
 
-The branch integrates master through `afbf09300bf5ac7c0dbdc11ac5d1e10f934336fb`. Local validation is recorded below. This workstream has not changed production Cloudflare resources, Worker secrets, the Telegram webhook, or the bot deployment, and has not run live quota/hibernation checks.
+The original stages 1–4 validation below is historical evidence and does not validate the newer settings/migration implementation. The settings/migration workstream has not changed production Cloudflare resources, Worker secrets, the Telegram webhook, or the bot deployment.
 
 The local service initiates every cloud connection and sends Telegram replies directly. It exposes no public inbound endpoint. With `[cloud]` absent, the existing `getUpdates` bot path remains active.
 
@@ -57,6 +57,7 @@ Local service requests carry the fixed shared secret in their `Authorization: Be
 | `GET /api/state` | Read the latest local snapshot and safely expose unacknowledged request summaries |
 | `GET /api/library` | Read the media library snapshot |
 | `POST /api/actions` | Submit a file-management action |
+| `GET /settings/` | Open the separate owner-only library settings Mini App |
 
 Example move preview:
 

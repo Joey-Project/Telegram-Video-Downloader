@@ -14,6 +14,12 @@ const MAX_OPERATION_KIND_JSON_BYTES: usize = 128;
 const MAX_PREVIEW_SNAPSHOT_RECORDS: usize = 100;
 const MAX_PREVIEW_SNAPSHOT_BYTES: usize = 3 * 1024 * 1024;
 const MAX_PREVIEW_ID_JSON_BYTES: usize = 128;
+const MAX_LIBRARY_ID_BYTES: usize = 128;
+const MAX_LIBRARY_ID_JSON_BYTES: usize = MAX_LIBRARY_ID_BYTES * 6 + 2;
+const MAX_MIGRATION_PREVIEW_SUMMARY_BYTES: usize = 12 * 1024;
+const MAX_MIGRATION_PREVIEW_SAMPLE_ITEMS: usize = 4;
+const MAX_MIGRATION_PREVIEW_SAMPLE_ID_JSON_BYTES: usize = 128;
+const MAX_MIGRATION_PREVIEW_SAMPLE_PATH_JSON_BYTES: usize = 384;
 
 const OPERATION_DETAILS_OMITTED_REASON: &str =
     "Older operation details were omitted to keep the cloud state within its size limit.";
@@ -21,6 +27,7 @@ const PREVIEW_DETAILS_OMITTED_REASON: &str =
     "Preview details exceeded the cloud snapshot budget. Reload the preview before confirming.";
 const PREVIEW_DETAILS_UNAVAILABLE_REASON: &str =
     "Preview details are unavailable in this cloud snapshot. Reload the preview before confirming.";
+const MIGRATION_SUMMARY_REASON: &str = "A bounded summary is shown. Start confirms the complete saved migration plan; item and file details are omitted.";
 const PREVIEWS_OMITTED_REASON: &str = "Some pending previews were omitted from this snapshot. Refresh pending previews before confirming.";
 /// Build the bounded operation receipt list, reserving space for the newest usable legacy import.
 pub(crate) fn operation_snapshots(records: &[&InboxRecord]) -> Result<Vec<Value>> {
@@ -98,6 +105,14 @@ fn is_usable_completed_legacy_import_record(record: &InboxRecord) -> bool {
 }
 
 fn is_usable_legacy_import_result(result: &Value) -> bool {
+    let has_library_binding = result
+        .get("library_id")
+        .and_then(Value::as_str)
+        .is_some_and(valid_library_id)
+        && result
+            .get("root_binding")
+            .and_then(Value::as_str)
+            .is_some_and(valid_root_binding_token);
     let has_hints = result
         .get("hints")
         .and_then(Value::as_array)
@@ -106,7 +121,7 @@ fn is_usable_legacy_import_result(result: &Value) -> bool {
     let result_marked_incomplete = ["incomplete", "details_incomplete", "result_truncated"]
         .iter()
         .any(|field| result.get(field).and_then(Value::as_bool) == Some(true));
-    has_hints && has_candidates && !result_marked_incomplete
+    has_library_binding && has_hints && has_candidates && !result_marked_incomplete
 }
 
 /// Compact large historical receipts after an upload-size rejection.
@@ -184,33 +199,107 @@ pub(crate) fn preview_snapshots(
         .iter()
         .copied()
         .filter(|record| {
-            record.request.kind == "file_preview"
-                && record.status == InboxStatus::AwaitingConfirmation
+            matches!(
+                record.request.kind.as_str(),
+                "file_preview" | "library_migration_preview"
+            ) && record.status == InboxStatus::AwaitingConfirmation
         })
         .collect::<Vec<_>>();
     active.sort_by_key(|record| record.request.seq);
+
+    // Do not publish a file preview without both its library ID and original root identity.
+    // Legacy receipts remain visible only in the bounded operation history and cannot be used
+    // to confirm against a later registration that reused the same path-derived ID.
+    let invalid_file_preview_binding_count = active
+        .iter()
+        .filter(|record| {
+            record.request.kind == "file_preview" && !file_preview_has_valid_root_binding(record)
+        })
+        .count();
+    active.retain(|record| {
+        record.request.kind != "file_preview" || file_preview_has_valid_root_binding(record)
+    });
 
     let locally_omitted = active.len().saturating_sub(MAX_PREVIEW_SNAPSHOT_RECORDS);
     if locally_omitted > 0 {
         active.drain(..locally_omitted);
     }
-    let omitted_count = omitted_preview_count.saturating_add(locally_omitted);
+    let omitted_count = omitted_preview_count
+        .saturating_add(invalid_file_preview_binding_count)
+        .saturating_add(locally_omitted);
 
+    // Reserve one bounded, actionable fallback for each valid migration preview before any full
+    // preview can consume the shared budget. The cloud still confirms only the exact persisted
+    // ID/revision; sample paths and omission counts never reconstruct or alter the local plan.
     let mut snapshots = active
         .iter()
         .map(|record| {
             let result = record.result.as_ref();
-            let reason = if result.and_then(|value| value.get("preview")).is_some() {
+            if record.request.kind == "library_migration_preview"
+                && let Some(result) = result
+                && let Some(summary) = compact_migration_preview_summary(record, result)
+            {
+                return summary;
+            }
+
+            let is_migration = record.request.kind == "library_migration_preview";
+            let details_present = result.is_some_and(|value| {
+                if is_migration {
+                    value.get("id").is_some() && value.get("items").is_some()
+                } else {
+                    value.get("preview").is_some()
+                }
+            });
+            let reason = if details_present {
                 PREVIEW_DETAILS_OMITTED_REASON
             } else {
                 PREVIEW_DETAILS_UNAVAILABLE_REASON
             };
-            preview_placeholder(
+            let mut placeholder = preview_placeholder(
                 record,
                 preview_identity_value(result, "preview_id"),
                 preview_identity_value(result, "revision"),
                 reason,
-            )
+            );
+            if let Some(fields) = placeholder.as_object_mut() {
+                fields.insert("kind".to_string(), json!(record.request.kind));
+                if record.request.kind == "file_preview"
+                    && let FilePreviewLibraryId::Valid(library_id) = file_preview_library_id(record)
+                {
+                    fields.insert("library_id".to_string(), json!(library_id));
+                    if let Some(root_binding) = file_preview_root_binding(record) {
+                        fields.insert("root_binding".to_string(), json!(root_binding));
+                    }
+                }
+                if record.request.kind == "library_migration_preview"
+                    && let Some(result) = result
+                {
+                    for (field, max_json_bytes) in [
+                        ("source_library_id", 256),
+                        ("source_root_binding", 80),
+                        ("target_library_id", 256),
+                        ("target_root_binding", 80),
+                        ("scope", 64),
+                        ("conflict", 64),
+                        ("include_incomplete_tasks", 8),
+                        ("set_target_default_on_success", 8),
+                    ] {
+                        if let Some(value) =
+                            exact_bounded_scalar_field(result, field, max_json_bytes)
+                        {
+                            if matches!(field, "source_root_binding" | "target_root_binding")
+                                && value
+                                    .as_str()
+                                    .is_none_or(|binding| !valid_root_binding_token(binding))
+                            {
+                                continue;
+                            }
+                            fields.insert(field.to_string(), value);
+                        }
+                    }
+                }
+            }
+            placeholder
         })
         .collect::<Vec<_>>();
     if omitted_count > 0 {
@@ -227,7 +316,14 @@ pub(crate) fn preview_snapshots(
 
     for (index, record) in active.iter().enumerate().rev() {
         let result = record.result.as_ref();
-        let Some(preview) = result.and_then(|value| value.get("preview")) else {
+        let is_migration = record.request.kind == "library_migration_preview";
+        let Some(details) = result.and_then(|value| {
+            if is_migration {
+                Some(value)
+            } else {
+                value.get("preview")
+            }
+        }) else {
             continue;
         };
         let preview_id = preview_identity_value(result, "preview_id");
@@ -236,17 +332,38 @@ pub(crate) fn preview_snapshots(
             .expect("preview placeholder should fit the bounded snapshot budget");
         let remaining = MAX_PREVIEW_SNAPSHOT_BYTES
             .saturating_sub(total_bytes.saturating_sub(placeholder_bytes));
-        if json_size_within(preview, remaining).is_none() {
+        if json_size_within(details, remaining).is_none() {
             continue;
         }
 
-        let candidate = json!({
-            "seq": record.request.seq,
-            "preview_id": preview_id,
-            "revision": revision,
-            "status": "awaiting_confirmation",
-            "preview": preview,
-        });
+        let mut candidate = if is_migration {
+            json!({
+                "seq": record.request.seq,
+                "kind": record.request.kind,
+                "preview_id": preview_id,
+                "revision": revision,
+                "status": "awaiting_confirmation",
+                "result": details,
+            })
+        } else {
+            json!({
+                "seq": record.request.seq,
+                "kind": record.request.kind,
+                "preview_id": preview_id,
+                "revision": revision,
+                "status": "awaiting_confirmation",
+                "preview": details,
+            })
+        };
+        if !is_migration
+            && let FilePreviewLibraryId::Valid(library_id) = file_preview_library_id(record)
+            && let Some(fields) = candidate.as_object_mut()
+        {
+            fields.insert("library_id".to_string(), json!(library_id));
+            if let Some(root_binding) = file_preview_root_binding(record) {
+                fields.insert("root_binding".to_string(), json!(root_binding));
+            }
+        }
         let Some(candidate_bytes) = json_size_within(&candidate, remaining) else {
             continue;
         };
@@ -259,6 +376,185 @@ pub(crate) fn preview_snapshots(
         }
     }
     snapshots
+}
+
+fn compact_migration_preview_summary(record: &InboxRecord, result: &Value) -> Option<Value> {
+    let preview_id = compact_identity(result, "preview_id")?;
+    let revision = compact_identity(result, "revision")?;
+    let preview_id_text = preview_id.as_str()?;
+    let revision_text = revision.as_str()?;
+
+    let id = exact_bounded_scalar_field(result, "id", MAX_PREVIEW_ID_JSON_BYTES)?;
+    let result_revision =
+        exact_bounded_scalar_field(result, "revision", MAX_PREVIEW_ID_JSON_BYTES)?;
+    if id.as_str()? != preview_id_text || result_revision.as_str()? != revision_text {
+        return None;
+    }
+
+    let source_library_id = exact_bounded_scalar_field(result, "source_library_id", 256)?;
+    let target_library_id = exact_bounded_scalar_field(result, "target_library_id", 256)?;
+    let source_root_binding = exact_bounded_scalar_field(result, "source_root_binding", 80)?;
+    let target_root_binding = exact_bounded_scalar_field(result, "target_root_binding", 80)?;
+    let scope = exact_bounded_scalar_field(result, "scope", 64)?;
+    let conflict = exact_bounded_scalar_field(result, "conflict", 64)?;
+    let include_incomplete_tasks =
+        exact_bounded_scalar_field(result, "include_incomplete_tasks", 8)?;
+    let set_target_default_on_success =
+        exact_bounded_scalar_field(result, "set_target_default_on_success", 8)?;
+    if source_library_id.as_str().is_none()
+        || target_library_id.as_str().is_none()
+        || !valid_root_binding_token(source_root_binding.as_str()?)
+        || !valid_root_binding_token(target_root_binding.as_str()?)
+        || scope.as_str().is_none()
+        || conflict.as_str().is_none()
+        || include_incomplete_tasks.as_bool().is_none()
+        || set_target_default_on_success.as_bool().is_none()
+    {
+        return None;
+    }
+
+    let scalar_fields = [
+        "item_count",
+        "file_count",
+        "total_bytes",
+        "required_space_bytes",
+        "available_space_bytes",
+        "conflict_count",
+        "incomplete_task_count",
+        "staging_bytes",
+    ];
+    let mut aggregates = Map::new();
+    for field in scalar_fields {
+        let value = exact_bounded_scalar_field(result, field, 32)?;
+        value.as_u64()?;
+        aggregates.insert(field.to_string(), value);
+    }
+
+    let items = result.get("items")?.as_array()?;
+    let item_count = usize::try_from(aggregates.get("item_count")?.as_u64()?).ok()?;
+    let file_count = usize::try_from(aggregates.get("file_count")?.as_u64()?).ok()?;
+    if item_count != items.len() {
+        return None;
+    }
+    let item_ids = result.get("item_ids")?.as_array()?;
+    if item_ids.len() != item_count || item_ids.iter().any(|item_id| item_id.as_str().is_none()) {
+        return None;
+    }
+    let item_conflicts = result.get("item_conflicts")?.as_object()?;
+    let warnings = result.get("warnings")?.as_array()?;
+
+    let mut sample_items = Vec::with_capacity(items.len().min(MAX_MIGRATION_PREVIEW_SAMPLE_ITEMS));
+    let mut sampled_item_ids = 0usize;
+    for item in items.iter().take(MAX_MIGRATION_PREVIEW_SAMPLE_ITEMS) {
+        let Some(original_item_id) = item.get("item_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(item_id) =
+            bounded_json_string(original_item_id, MAX_MIGRATION_PREVIEW_SAMPLE_ID_JSON_BYTES)
+        else {
+            continue;
+        };
+        let Some(source_path) = item
+            .get("source_path")
+            .and_then(Value::as_str)
+            .and_then(|value| {
+                bounded_json_string(value, MAX_MIGRATION_PREVIEW_SAMPLE_PATH_JSON_BYTES)
+            })
+        else {
+            continue;
+        };
+        let Some(target_path) = item
+            .get("target_path")
+            .and_then(Value::as_str)
+            .and_then(|value| {
+                bounded_json_string(value, MAX_MIGRATION_PREVIEW_SAMPLE_PATH_JSON_BYTES)
+            })
+        else {
+            continue;
+        };
+        if !item_ids
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(original_item_id))
+        {
+            return None;
+        }
+        let bytes = item.get("bytes")?.as_u64()?;
+        let conflict = item.get("conflict")?.as_bool()?;
+        let status = item.get("status")?.as_str()?;
+        let outcome = match status {
+            "skipped" => "skip",
+            "copying" => "move",
+            _ => return None,
+        };
+        if item_id == original_item_id {
+            sampled_item_ids = sampled_item_ids.saturating_add(1);
+        }
+        sample_items.push(json!({
+            "item_id": item_id,
+            "source_path": source_path,
+            "target_path": target_path,
+            "bytes": bytes,
+            "conflict": conflict,
+            "status": status,
+            "outcome": outcome,
+        }));
+    }
+
+    let mut summary = json!({
+        "id": id,
+        "revision": result_revision,
+        "source_library_id": source_library_id,
+        "source_root_binding": source_root_binding,
+        "target_library_id": target_library_id,
+        "target_root_binding": target_root_binding,
+        "scope": scope,
+        "conflict": conflict,
+        "include_incomplete_tasks": include_incomplete_tasks,
+        "set_target_default_on_success": set_target_default_on_success,
+        "omitted_item_id_count": item_ids.len().saturating_sub(sampled_item_ids),
+        "omitted_conflict_choice_count": item_conflicts.len(),
+        "omitted_warning_count": warnings.len(),
+        "omitted_item_count": item_count.saturating_sub(sample_items.len()),
+        "omitted_file_count": file_count,
+        "sample_items": sample_items,
+    });
+    if let Some(fields) = summary.as_object_mut() {
+        fields.extend(aggregates);
+    }
+    let envelope = json!({
+        "seq": record.request.seq,
+        "kind": record.request.kind,
+        "preview_id": preview_id,
+        "revision": revision,
+        "status": "awaiting_confirmation",
+        "migration_summary": true,
+        "reason": MIGRATION_SUMMARY_REASON,
+        "result": summary,
+    });
+    json_size_within(&envelope, MAX_MIGRATION_PREVIEW_SUMMARY_BYTES)?;
+    Some(envelope)
+}
+
+fn valid_root_binding_token(value: &str) -> bool {
+    value.len() == 67
+        && value.starts_with("v1:")
+        && value[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_library_id(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.trim() == value
+        && value.len() <= MAX_LIBRARY_ID_BYTES
+        && !value.chars().any(char::is_control)
+        && json_size_within(&Value::String(value.to_string()), MAX_LIBRARY_ID_JSON_BYTES).is_some()
+}
+
+fn exact_bounded_scalar_field(result: &Value, field: &str, max_json_bytes: usize) -> Option<Value> {
+    let candidate = result.get(field)?;
+    let compacted = compact_scalar_value(candidate, max_json_bytes)?;
+    (compacted == *candidate).then_some(compacted)
 }
 
 fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value {
@@ -349,6 +645,14 @@ fn compact_result_summary(result: &Value) -> Value {
     for (key, value) in [
         ("preview_id", compact_identity(result, "preview_id")),
         ("revision", compact_identity(result, "revision")),
+        (
+            "library_id",
+            compact_scalar_field(result, "library_id", MAX_LIBRARY_ID_BYTES * 6 + 2),
+        ),
+        (
+            "root_binding",
+            compact_scalar_field(result, "root_binding", 80),
+        ),
         ("status", compact_scalar_field(result, "status", 128)),
         ("error", compact_scalar_field(result, "error", 512)),
         ("scanned_at", compact_scalar_field(result, "scanned_at", 64)),
@@ -384,7 +688,8 @@ fn compact_identity(result: &Value, field: &str) -> Option<Value> {
             (field == "preview_id")
                 .then(|| preview.and_then(|value| value.get("id")))
                 .flatten()
-        })?;
+        })
+        .or_else(|| (field == "preview_id").then(|| result.get("id")).flatten())?;
     let value = compact_scalar_value(candidate, MAX_PREVIEW_ID_JSON_BYTES)?;
     (candidate == &value).then_some(value)
 }
@@ -417,6 +722,7 @@ fn preview_identity_value(result: Option<&Value>, field: &str) -> Value {
                         .then(|| value.get("preview").and_then(|preview| preview.get("id")))
                         .flatten()
                 })
+                .or_else(|| (field == "preview_id").then(|| value.get("id")).flatten())
         })
         .and_then(identity_scalar_value)
         .unwrap_or(Value::Null)
@@ -447,6 +753,46 @@ fn preview_placeholder(
         "reload_required": true,
         "reason": reason,
     })
+}
+
+enum FilePreviewLibraryId<'a> {
+    Absent,
+    Valid(&'a str),
+    Invalid,
+}
+
+fn file_preview_library_id(record: &InboxRecord) -> FilePreviewLibraryId<'_> {
+    let Some(value) = record
+        .result
+        .as_ref()
+        .and_then(|result| result.get("library_id"))
+    else {
+        return FilePreviewLibraryId::Absent;
+    };
+    let Some(library_id) = value.as_str() else {
+        return FilePreviewLibraryId::Invalid;
+    };
+    if !valid_library_id(library_id) {
+        FilePreviewLibraryId::Invalid
+    } else {
+        FilePreviewLibraryId::Valid(library_id)
+    }
+}
+
+fn file_preview_root_binding(record: &InboxRecord) -> Option<&str> {
+    record
+        .result
+        .as_ref()?
+        .get("root_binding")?
+        .as_str()
+        .filter(|binding| valid_root_binding_token(binding))
+}
+
+fn file_preview_has_valid_root_binding(record: &InboxRecord) -> bool {
+    matches!(
+        file_preview_library_id(record),
+        FilePreviewLibraryId::Valid(_)
+    ) && file_preview_root_binding(record).is_some()
 }
 
 fn bounded_operation_kind(kind: &str) -> String {
@@ -542,6 +888,8 @@ mod tests {
     use crate::cloud::CloudRequest;
 
     const MAX_COMPACT_OPERATION_ARRAY_BYTES: usize = 512 * 1024;
+    const TEST_ROOT_BINDING: &str =
+        "v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn record(
         seq: u64,
@@ -550,6 +898,17 @@ mod tests {
         result: Option<Value>,
         error: Option<String>,
     ) -> InboxRecord {
+        let mut result = result;
+        if kind == "file_preview"
+            && let Some(fields) = result.as_mut().and_then(Value::as_object_mut)
+        {
+            fields
+                .entry("library_id")
+                .or_insert_with(|| json!("ml-test-root"));
+            fields
+                .entry("root_binding")
+                .or_insert_with(|| json!(TEST_ROOT_BINDING));
+        }
         InboxRecord {
             schema_version: 1,
             request: CloudRequest {
@@ -580,9 +939,82 @@ mod tests {
             })
             .unwrap_or_default();
         json!({
+            "library_id": "ml-test-root",
+            "root_binding": TEST_ROOT_BINDING,
             "hints": [{"hint_index": 0, "title": "Star Wars", "source_ids": []}],
             "candidates": candidates,
             "warnings": warnings,
+        })
+    }
+
+    fn migration_preview_result(
+        seq: u64,
+        item_count: usize,
+        files_per_item: usize,
+        nested_path_bytes: usize,
+        sample_path_bytes: usize,
+    ) -> Value {
+        let item_ids = (0..item_count)
+            .map(|index| format!("media-item-{seq}-{index}"))
+            .collect::<Vec<_>>();
+        let item_conflicts = item_ids
+            .iter()
+            .take(3)
+            .map(|item_id| (item_id.clone(), json!("keep_both")))
+            .collect::<Map<String, Value>>();
+        let items = item_ids
+            .iter()
+            .enumerate()
+            .map(|(index, item_id)| {
+                let nested_path = "nested/".repeat(nested_path_bytes / 7 + 1);
+                let files = (0..files_per_item)
+                    .map(|file_index| {
+                        json!({
+                            "source_path": format!("source/{nested_path}{file_index}.mkv"),
+                            "target_path": format!("target/{nested_path}{file_index}.mkv"),
+                            "size_bytes": 1024,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let sample_path = "segment/".repeat(sample_path_bytes / 8 + 1);
+                json!({
+                    "item_id": item_id,
+                    "status": if index == 0 { "skipped" } else { "copying" },
+                    "conflict": index < 3,
+                    "source_path": format!("source/{sample_path}{index}.mkv"),
+                    "target_path": format!("target/{sample_path}{index}.mkv"),
+                    "bytes": 1024,
+                    "files": files,
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "id": format!("migration-preview-{seq}"),
+            "revision": format!("migration-revision-{seq}"),
+            "source_library_id": "library-source",
+            "source_root_binding": format!("v1:{}", "a".repeat(64)),
+            "target_library_id": "library-target",
+            "target_root_binding": format!("v1:{}", "b".repeat(64)),
+            "scope": "library",
+            "item_ids": item_ids,
+            "conflict": "skip",
+            "item_conflicts": item_conflicts,
+            "include_incomplete_tasks": true,
+            "set_target_default_on_success": false,
+            "item_count": item_count,
+            "file_count": item_count
+                .saturating_mul(files_per_item)
+                .saturating_add(2),
+            "total_bytes": item_count.saturating_mul(1024).saturating_add(4096) as u64,
+            "required_space_bytes": item_count
+                .saturating_mul(1024)
+                .saturating_add(4096) as u64,
+            "available_space_bytes": 8 * 1024 * 1024 * 1024_u64,
+            "conflict_count": item_count.min(3),
+            "incomplete_task_count": 2,
+            "staging_bytes": 4096,
+            "warnings": ["first warning", "second warning"],
+            "items": items,
         })
     }
 
@@ -656,6 +1088,8 @@ mod tests {
                     kind,
                     InboxStatus::Completed,
                     Some(json!({
+                        "library_id": "ml-test-root",
+                        "root_binding": TEST_ROOT_BINDING,
                         "preview_id": format!("preview-{seq}"),
                         "revision": format!("revision-{seq}"),
                         "candidates": ["x".repeat(900 * 1024)],
@@ -685,6 +1119,29 @@ mod tests {
                 .iter()
                 .any(|operation| operation["result_truncated"] == true)
         );
+    }
+
+    #[test]
+    fn compacted_legacy_import_keeps_its_original_library_root_binding() {
+        let records = (1..=2)
+            .map(|seq| {
+                record(
+                    seq,
+                    "legacy_import",
+                    InboxStatus::Completed,
+                    Some(legacy_import_result(Some(900 * 1024), &[])),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let refs = records.iter().collect::<Vec<_>>();
+        let mut operations = operation_snapshots(&refs).expect("operations should be built");
+
+        assert!(compact_operation_receipts(&mut operations));
+
+        assert_eq!(operations[0]["result"]["incomplete"], true);
+        assert_eq!(operations[0]["result"]["library_id"], "ml-test-root");
+        assert_eq!(operations[0]["result"]["root_binding"], TEST_ROOT_BINDING);
     }
 
     #[test]
@@ -1034,6 +1491,7 @@ mod tests {
                     Some(json!({
                         "preview_id": format!("preview-{seq}"),
                         "revision": format!("revision-{seq}"),
+                        "library_id": format!("library-{seq}"),
                         "preview": {"id": format!("preview-{seq}"), "items": [{"path": format!("clip-{seq}.mp4")}]},
                     })),
                     None,
@@ -1045,7 +1503,11 @@ mod tests {
 
         assert_eq!(previews.len(), 3);
         assert_eq!(previews[0]["seq"], 1);
+        assert_eq!(previews[0]["library_id"], "library-1");
+        assert_eq!(previews[0]["root_binding"], TEST_ROOT_BINDING);
         assert_eq!(previews[2]["preview"]["items"][0]["path"], "clip-3.mp4");
+        assert_eq!(previews[2]["library_id"], "library-3");
+        assert_eq!(previews[2]["root_binding"], TEST_ROOT_BINDING);
         assert!(
             previews
                 .iter()
@@ -1053,6 +1515,340 @@ mod tests {
         );
         assert!(previews.iter().map(object_size).sum::<usize>() <= MAX_PREVIEW_SNAPSHOT_BYTES);
         assert!(serde_json::to_vec(&previews).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn file_preview_snapshot_keeps_source_library_binding_after_operation_compaction_and_replay() {
+        let record = record(
+            31,
+            "file_preview",
+            InboxStatus::AwaitingConfirmation,
+            Some(json!({
+                "preview_id": "preview-source-bound",
+                "revision": "revision-source-bound",
+                "library_id": "ml-source-root",
+                "preview": {"items": "x".repeat(2 * 1024 * 1024)},
+            })),
+            None,
+        );
+        let persisted = serde_json::to_vec(&record).expect("inbox record should serialize");
+        let reopened: InboxRecord =
+            serde_json::from_slice(&persisted).expect("inbox record should replay");
+
+        let operations = operation_snapshots(&[&reopened]).expect("operations should fit");
+        assert_eq!(operations[0]["details_incomplete"], true);
+        assert_eq!(operations[0]["result"]["incomplete"], true);
+        assert_eq!(operations[0]["result"]["library_id"], "ml-source-root");
+        assert_eq!(operations[0]["result"]["root_binding"], TEST_ROOT_BINDING);
+
+        let previews = preview_snapshots(&[&reopened], 0);
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["library_id"], "ml-source-root");
+        assert_eq!(
+            previews[0]["preview"]["items"].as_str().unwrap().len(),
+            2 * 1024 * 1024
+        );
+        assert!(serde_json::to_vec(&previews).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn file_preview_placeholder_keeps_source_library_binding_when_details_do_not_fit() {
+        let record = record(
+            32,
+            "file_preview",
+            InboxStatus::AwaitingConfirmation,
+            Some(json!({
+                "preview_id": "preview-placeholder-bound",
+                "revision": "revision-placeholder-bound",
+                "library_id": "ml-source-root",
+                "preview": {"items": "x".repeat(MAX_PREVIEW_SNAPSHOT_BYTES + 1)},
+            })),
+            None,
+        );
+
+        let previews = preview_snapshots(&[&record], 0);
+
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["kind"], "file_preview");
+        assert_eq!(previews[0]["library_id"], "ml-source-root");
+        assert_eq!(previews[0]["root_binding"], TEST_ROOT_BINDING);
+        assert_eq!(previews[0]["preview_id"], "preview-placeholder-bound");
+        assert_eq!(previews[0]["preview_incomplete"], true);
+        assert_eq!(previews[0]["reload_required"], true);
+        assert!(previews[0].get("preview").is_none());
+    }
+
+    #[test]
+    fn file_preview_keeps_absent_legacy_binding_distinct_from_malformed_bindings() {
+        let mut legacy = record(
+            40,
+            "file_preview",
+            InboxStatus::AwaitingConfirmation,
+            Some(json!({
+                "preview_id": "legacy-preview",
+                "revision": "legacy-revision",
+                "preview": {"items": []},
+            })),
+            None,
+        );
+        let legacy_result = legacy.result.as_mut().unwrap().as_object_mut().unwrap();
+        legacy_result.remove("library_id");
+        legacy_result.remove("root_binding");
+        let malformed_results = [
+            Value::Null,
+            json!(42),
+            json!(""),
+            json!(" "),
+            json!("x".repeat(MAX_LIBRARY_ID_BYTES + 1)),
+            json!("bad\nroot"),
+        ];
+        let malformed_count = malformed_results.len();
+        let malformed = malformed_results
+            .into_iter()
+            .enumerate()
+            .map(|(index, library_id)| {
+                record(
+                    41 + index as u64,
+                    "file_preview",
+                    InboxStatus::AwaitingConfirmation,
+                    Some(json!({
+                        "preview_id": format!("malformed-preview-{index}"),
+                        "revision": format!("malformed-revision-{index}"),
+                        "library_id": library_id,
+                        "preview": {"items": []},
+                    })),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let malformed_tokens = [Value::Null, json!("v1:short"), json!("v1:")]
+            .into_iter()
+            .enumerate()
+            .map(|(index, root_binding)| {
+                record(
+                    50 + index as u64,
+                    "file_preview",
+                    InboxStatus::AwaitingConfirmation,
+                    Some(json!({
+                        "preview_id": format!("malformed-token-preview-{index}"),
+                        "revision": format!("malformed-token-revision-{index}"),
+                        "library_id": "ml-test-root",
+                        "root_binding": root_binding,
+                        "preview": {"items": []},
+                    })),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let malformed_token_count = malformed_tokens.len();
+        let records = std::iter::once(&legacy)
+            .chain(malformed.iter())
+            .chain(malformed_tokens.iter())
+            .collect::<Vec<_>>();
+
+        let previews = preview_snapshots(&records, 0);
+
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["preview_incomplete"], true);
+        assert_eq!(
+            previews[0]["omitted_count"],
+            malformed_count + malformed_token_count + 1
+        );
+        for index in 0..malformed_count {
+            assert!(
+                previews
+                    .iter()
+                    .all(|preview| preview["preview_id"] != format!("malformed-preview-{index}"))
+            );
+        }
+        for index in 0..malformed_token_count {
+            assert!(
+                previews
+                    .iter()
+                    .all(|preview| preview["preview_id"]
+                        != format!("malformed-token-preview-{index}"))
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_actionable_migration_preview_result_in_kind_tagged_envelope() {
+        let result = json!({
+            "id": "migration-preview-1",
+            "revision": "migration-revision-1",
+            "source_library_id": "library-main",
+            "source_root_binding": format!("v1:{}", "a".repeat(64)),
+            "target_library_id": "library-archive",
+            "target_root_binding": format!("v1:{}", "b".repeat(64)),
+            "scope": "selected",
+            "item_ids": ["video-1"],
+            "conflict": "skip",
+            "include_incomplete_tasks": false,
+            "set_target_default_on_success": false,
+            "item_count": 1,
+            "file_count": 2,
+            "total_bytes": 2048,
+            "required_space_bytes": 4096,
+            "available_space_bytes": 8192,
+            "conflict_count": 0,
+            "incomplete_task_count": 3,
+            "staging_bytes": 1024,
+            "items": [{
+                "item_id": "video-1",
+                "source_path": "Collections/Series/video.mp4",
+                "target_path": "Collections/Series/video.mp4",
+                "bytes": 2048,
+                "outcome": "move"
+            }]
+        });
+        let record = record(
+            24,
+            "library_migration_preview",
+            InboxStatus::AwaitingConfirmation,
+            Some(result.clone()),
+            None,
+        );
+
+        let previews = preview_snapshots(&[&record], 0);
+
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["kind"], "library_migration_preview");
+        assert_eq!(previews[0]["preview_id"], "migration-preview-1");
+        assert_eq!(previews[0]["revision"], "migration-revision-1");
+        assert_eq!(previews[0]["status"], "awaiting_confirmation");
+        assert_eq!(previews[0]["result"], result);
+        assert!(previews[0].get("preview").is_none());
+        assert!(serde_json::to_vec(&previews).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn oversized_whole_library_migration_keeps_a_bounded_actionable_summary() {
+        let result = migration_preview_result(42, 120, 8, 2200, 700);
+        assert!(object_size(&result) > MAX_PREVIEW_SNAPSHOT_BYTES);
+        let record = record(
+            42,
+            "library_migration_preview",
+            InboxStatus::AwaitingConfirmation,
+            Some(result),
+            None,
+        );
+
+        let previews = preview_snapshots(&[&record], 0);
+        let snapshot = &previews[0];
+        let summary = &snapshot["result"];
+        let samples = summary["sample_items"]
+            .as_array()
+            .expect("summary samples should be present");
+
+        assert_eq!(snapshot["kind"], "library_migration_preview");
+        assert_eq!(snapshot["migration_summary"], true);
+        assert_eq!(snapshot["preview_id"], "migration-preview-42");
+        assert_eq!(snapshot["revision"], "migration-revision-42");
+        assert_eq!(snapshot["status"], "awaiting_confirmation");
+        assert_eq!(summary["id"], "migration-preview-42");
+        assert_eq!(summary["revision"], "migration-revision-42");
+        assert_eq!(summary["source_library_id"], "library-source");
+        assert_eq!(
+            summary["source_root_binding"],
+            format!("v1:{}", "a".repeat(64))
+        );
+        assert_eq!(summary["target_library_id"], "library-target");
+        assert_eq!(
+            summary["target_root_binding"],
+            format!("v1:{}", "b".repeat(64))
+        );
+        assert_eq!(summary["scope"], "library");
+        assert_eq!(summary["conflict"], "skip");
+        assert_eq!(summary["include_incomplete_tasks"], true);
+        assert_eq!(summary["set_target_default_on_success"], false);
+        assert_eq!(summary["item_count"], 120);
+        assert_eq!(summary["file_count"], 962);
+        assert_eq!(summary["total_bytes"], 124 * 1024);
+        assert_eq!(summary["required_space_bytes"], 124 * 1024);
+        assert_eq!(summary["available_space_bytes"], 8 * 1024 * 1024 * 1024_u64);
+        assert_eq!(summary["conflict_count"], 3);
+        assert_eq!(summary["incomplete_task_count"], 2);
+        assert_eq!(summary["staging_bytes"], 4096);
+        assert_eq!(summary["omitted_item_count"], 116);
+        assert_eq!(summary["omitted_file_count"], 962);
+        assert_eq!(summary["omitted_item_id_count"], 116);
+        assert_eq!(summary["omitted_conflict_choice_count"], 3);
+        assert_eq!(summary["omitted_warning_count"], 2);
+        assert_eq!(samples.len(), MAX_MIGRATION_PREVIEW_SAMPLE_ITEMS);
+        assert_eq!(samples[0]["outcome"], "skip");
+        assert_eq!(samples[0]["status"], "skipped");
+        assert_eq!(samples[1]["outcome"], "move");
+        assert_eq!(samples[1]["status"], "copying");
+        for sample in samples {
+            assert!(sample.get("files").is_none());
+            for field in ["source_path", "target_path"] {
+                let path = sample[field].as_str().unwrap();
+                assert!(path.ends_with('…'));
+                assert!(
+                    json_size_within(
+                        &Value::String(path.to_string()),
+                        MAX_MIGRATION_PREVIEW_SAMPLE_PATH_JSON_BYTES
+                    )
+                    .is_some()
+                );
+            }
+        }
+        for omitted_detail in ["items", "item_ids", "item_conflicts", "warnings"] {
+            assert!(summary.get(omitted_detail).is_none());
+        }
+        assert!(snapshot.get("reload_required").is_none());
+        assert!(snapshot.get("preview_incomplete").is_none());
+        assert!(object_size(snapshot) <= MAX_MIGRATION_PREVIEW_SUMMARY_BYTES);
+        assert!(serde_json::to_vec(&previews).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn reserves_actionable_summaries_for_migration_previews_under_shared_budget() {
+        let records = (1..=MAX_PREVIEW_SNAPSHOT_RECORDS as u64)
+            .map(|seq| {
+                record(
+                    seq,
+                    "library_migration_preview",
+                    InboxStatus::AwaitingConfirmation,
+                    Some(migration_preview_result(seq, 3, 3, 2048, 32)),
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let refs = records.iter().collect::<Vec<_>>();
+        let previews = preview_snapshots(&refs, 0);
+        let encoded = serde_json::to_vec(&previews).expect("previews should serialize");
+        let mut full_count = 0usize;
+        let mut summary_count = 0usize;
+
+        assert_eq!(previews.len(), MAX_PREVIEW_SNAPSHOT_RECORDS);
+        assert!(encoded.len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+        for (index, preview) in previews.iter().enumerate() {
+            let expected_id = format!("migration-preview-{}", index + 1);
+            let expected_revision = format!("migration-revision-{}", index + 1);
+            assert_eq!(preview["preview_id"], expected_id);
+            assert_eq!(preview["revision"], expected_revision);
+            assert_eq!(preview["status"], "awaiting_confirmation");
+            assert!(preview.get("reload_required").is_none());
+            if preview["migration_summary"] == true {
+                summary_count += 1;
+                assert_eq!(preview["result"]["id"], expected_id);
+                assert_eq!(preview["result"]["revision"], expected_revision);
+                assert!(preview["result"].get("items").is_none());
+                assert!(preview["result"].get("item_ids").is_none());
+            } else {
+                full_count += 1;
+                assert!(preview["result"]["items"].is_array());
+            }
+        }
+        assert!(
+            summary_count > 0,
+            "some previews should use the compact form"
+        );
+        assert!(
+            full_count > 0,
+            "some previews should retain their full details"
+        );
     }
 
     #[test]
