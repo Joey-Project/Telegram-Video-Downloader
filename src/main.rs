@@ -7442,7 +7442,7 @@ async fn bilibili_ugc_selection_prompt(
         return Ok(None);
     }
 
-    if bilibili_bvid_from_url(url).is_none() {
+    if !bilibili_video_pages_prompt_required(job) {
         return Ok(None);
     }
 

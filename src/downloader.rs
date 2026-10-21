@@ -13194,9 +13194,14 @@ async fn probe_bilibili_duplicate_metadata(
     sync_bilibili_rust_credentials(config).await?;
     let client = bilibili_core::client(config)?;
     let metadata = probe_bilibili_resolved_content(&client, url, selection, timeout).await?;
-    let skip_total_entries = matches!(selection, Some(BilibiliSelection::All))
-        .then(|| bilibili_metadata_identity_plan(&metadata).entries.len())
-        .filter(|count| *count > 0);
+    let skip_total_entries = match (selection, &metadata) {
+        (Some(BilibiliSelection::All), ResolvedContent::Season(season)) => {
+            Some(season.selected_episodes.len())
+        }
+        (Some(BilibiliSelection::All), ResolvedContent::Video(video)) => Some(video.pages.len()),
+        _ => None,
+    }
+    .filter(|count| *count > 0);
     Ok(BilibiliDuplicateMetadataProbe {
         plan: bilibili_metadata_identity_plan(&metadata),
         skip_total_entries,
