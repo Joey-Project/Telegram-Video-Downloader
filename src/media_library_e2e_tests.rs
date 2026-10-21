@@ -1029,6 +1029,232 @@ async fn migration_discovery_skips_damaged_record_and_recovers_other_library_aft
 }
 
 #[tokio::test]
+async fn library_io_admission_serializes_cancelled_root_work_and_migration_runtime() {
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "library-io-admission-runtime",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let unrelated_root = fixture.root.join("unrelated");
+    fs::create_dir_all(&unrelated_root).expect("unrelated library root should create");
+    let unrelated_library = queue
+        .register_video_library("Independent", &unrelated_root, None, false, false)
+        .expect("unrelated library should register");
+    let telegram = TelegramClient::with_test_api_base_url(
+        TEST_TELEGRAM_TOKEN.to_string(),
+        "http://127.0.0.1:1".to_string(),
+    );
+    let runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+
+    // Persist a confirmed migration without starting it. Discovery below is the real runtime
+    // start path, and deterministic runner notifications expose its admission boundary.
+    let engine = migration_engine_for_test(
+        &runtime,
+        &fixture.source_library_id,
+        &fixture.target_library_id,
+    );
+    let preview = engine
+        .preview(&crate::library_migration::MigrationRequest {
+            scope: crate::library_migration::MigrationScope::Library,
+            item_ids: Vec::new(),
+            conflict: crate::library::ConflictPolicy::Skip,
+            item_conflicts: Default::default(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("migration preview should persist");
+    engine
+        .confirm_with_default_revision(&preview.id, &preview.revision, None)
+        .expect("migration should be durably confirmed");
+    engine
+        .set_runtime_context(
+            &preview.id,
+            crate::library_migration::MigrationRuntimeContext {
+                database_epoch: crate::cloud::TEST_DATABASE_EPOCH.to_string(),
+                preview_seq: 49_001,
+                chat_id: None,
+                message_id: None,
+                delivery: crate::library_migration::MigrationDeliveryState::Pending,
+            },
+        )
+        .expect("migration should retain its current epoch");
+    drop(engine);
+
+    let output_guard = hold_migration_output_slot(&fixture).await;
+    let (operation_started_tx, operation_started_rx) = oneshot::channel();
+    let (release_operation_tx, release_operation_rx) = std::sync::mpsc::sync_channel(1);
+    let (operation_finished_tx, operation_finished_rx) = std::sync::mpsc::channel();
+    let operation_runtime = runtime.clone();
+    let operation = tokio::spawn(async move {
+        crate::run_cloud_library_operation(
+            &operation_runtime,
+            "admission fixture scan worker failed",
+            move |context, inbox| {
+                let _ = operation_started_tx.send(());
+                release_operation_rx
+                    .recv_timeout(Duration::from_secs(30))
+                    .context("test did not release the root scan worker")?;
+                let snapshot = crate::scan_cloud_library(&context, inbox)?;
+                let _ = operation_finished_tx.send(());
+                Ok(((), snapshot))
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), operation_started_rx)
+        .await
+        .expect("root scan should enter its blocking worker")
+        .expect("root scan start signal should be delivered");
+
+    // Cancelling the request must not release the root admission while spawn_blocking still
+    // owns filesystem work. A separately registered library remains independently admissible.
+    operation.abort();
+    assert!(
+        operation
+            .await
+            .expect_err("request should be cancelled")
+            .is_cancelled()
+    );
+    let unrelated_lease = crate::library_migration_bot::try_acquire_library_io(
+        &runtime,
+        std::slice::from_ref(&unrelated_library.id),
+    )
+    .await
+    .expect("an unrelated library must remain independently admissible");
+    drop(unrelated_lease);
+
+    let (discovery, runner_acquired_before_release) = {
+        let runner_waiting = runtime.test_migration_runner_gate_waiting.notified();
+        tokio::pin!(runner_waiting);
+        runner_waiting.as_mut().enable();
+        let runner_acquired = runtime.test_migration_runner_gate_acquired.notified();
+        tokio::pin!(runner_acquired);
+        runner_acquired.as_mut().enable();
+        let discovery_runtime = runtime.clone();
+        let discovery = tokio::spawn(async move {
+            crate::library_migration_bot::discover_for_test(&discovery_runtime).await
+        });
+        tokio::time::timeout(Duration::from_secs(10), &mut runner_waiting)
+            .await
+            .expect("discovery should start the confirmed migration and reach its gate wait");
+        let acquired_while_root_worker_blocked =
+            tokio::time::timeout(Duration::from_millis(50), &mut runner_acquired)
+                .await
+                .is_ok();
+        (discovery, acquired_while_root_worker_blocked)
+    };
+    discovery
+        .await
+        .expect("migration discovery task should join")
+        .expect("migration discovery should succeed");
+
+    {
+        let runner_acquired = runtime.test_migration_runner_gate_acquired.notified();
+        tokio::pin!(runner_acquired);
+        runner_acquired.as_mut().enable();
+        release_operation_tx
+            .send(())
+            .expect("test should release the blocked root worker");
+        tokio::task::spawn_blocking(move || {
+            operation_finished_rx.recv_timeout(Duration::from_secs(10))
+        })
+        .await
+        .expect("root worker completion waiter should join")
+        .expect("root worker should finish after release");
+    }
+    if !runner_acquired_before_release {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            runtime.test_migration_runner_gate_acquired.notified(),
+        )
+        .await
+        .expect("migration runner should acquire source and target gates after root work ends");
+    }
+    assert!(
+        !runner_acquired_before_release,
+        "the cancelled scan's blocking worker must retain source admission until it exits"
+    );
+
+    let assert_library_operation_blocked = |library_id: String| {
+        let (scoped, _) = crate::media_library_bot::scoped_runtime(&runtime, Some(&library_id))
+            .expect("registered library should scope");
+        async move {
+            let invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let invoked_by_worker = Arc::clone(&invoked);
+            let result = crate::run_cloud_library_operation(
+                &scoped,
+                "blocked-operation fixture worker failed",
+                move |context, inbox| {
+                    invoked_by_worker.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let snapshot = crate::scan_cloud_library(&context, inbox)?;
+                    Ok(((), snapshot))
+                },
+            )
+            .await;
+            assert!(
+                result.is_err(),
+                "migration-owned libraries must reject file operations"
+            );
+            assert!(
+                !invoked.load(std::sync::atomic::Ordering::SeqCst),
+                "a rejected operation must not enter its root worker"
+            );
+        }
+    };
+    assert_library_operation_blocked(fixture.source_library_id.clone()).await;
+    assert_library_operation_blocked(fixture.target_library_id.clone()).await;
+
+    let (unrelated_runtime, _) =
+        crate::media_library_bot::scoped_runtime(&runtime, Some(&unrelated_library.id))
+            .expect("unrelated library should scope");
+    let unrelated_scan = crate::run_cloud_library_operation(
+        &unrelated_runtime,
+        "independent library scan worker failed",
+        |context, inbox| {
+            let snapshot = crate::scan_cloud_library(&context, inbox)?;
+            Ok(((), snapshot))
+        },
+    )
+    .await;
+    unrelated_scan.expect("a migration must not block an unrelated library scan");
+
+    drop(output_guard);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let changed = runtime.state_notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if runtime
+                .migrations
+                .lock()
+                .await
+                .get(&preview.id)
+                .is_some_and(|status| {
+                    status.status == crate::library_migration::MigrationRunStatus::Completed
+                })
+            {
+                break;
+            }
+            changed.await;
+        }
+    })
+    .await
+    .expect("migration should complete after the output-slot blocker is released");
+
+    runtime.signal_epoch_fatal();
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[tokio::test]
 async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_after_restart() {
     let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
     let (fixture, queue, inbox) = create_migration_fixture(
@@ -1336,6 +1562,27 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
     .expect("recovery should retain its exact queue ACK while source cleanup waits");
     assert!(source_staging.exists());
     assert!(target_staging.join("segment.part").exists());
+    let capture_source_staging = || {
+        let mut entries = fs::read_dir(&source_staging)
+            .expect("source staging should remain readable")
+            .map(|entry| {
+                let entry = entry.expect("source staging entry should be readable");
+                let file_type = entry
+                    .file_type()
+                    .expect("source staging entry type should be readable");
+                let bytes = file_type
+                    .is_file()
+                    .then(|| fs::read(entry.path()).expect("source staging control should read"));
+                Ok::<_, std::io::Error>((entry.file_name(), bytes))
+            })
+            .collect::<std::io::Result<Vec<_>>>()
+            .expect("source staging contents should enumerate");
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    };
+    let source_staging_before_refused_removal = capture_source_staging();
+    let target_fragment_before_refused_removal =
+        fs::read(target_staging.join("segment.part")).unwrap();
     let cleanup_blocked_removal = run_library_management_test_request(
         &reopened_runtime,
         2_804,
@@ -1351,10 +1598,28 @@ async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_aft
         cleanup_blocked_removal
             .error
             .as_deref()
-            .is_some_and(|error| {
-                error.contains("task destination handoff")
-                    || error.contains("source staging cleanup")
-            })
+            .is_some_and(|error| error.contains("active migration")),
+        "removal during the active recovery lease should be refused by admission: {:?}",
+        cleanup_blocked_removal.error
+    );
+    assert!(
+        reopened_queue
+            .registry_snapshot()
+            .expect("registry should remain readable during cleanup")
+            .libraries
+            .iter()
+            .any(|library| library.id == fixture.source_library_id),
+        "the source registration must remain while recovery owns its gate"
+    );
+    assert_eq!(
+        capture_source_staging(),
+        source_staging_before_refused_removal,
+        "refused removal must preserve the source staging entries during cleanup"
+    );
+    assert_eq!(
+        fs::read(target_staging.join("segment.part")).unwrap(),
+        target_fragment_before_refused_removal,
+        "refused removal must preserve the installed target fragment"
     );
     drop(cleanup_blocker);
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -1657,6 +1922,9 @@ async fn migration_pauses_when_new_media_appears_before_leased_task_handoff() {
     })
     .await;
     assert_eq!(final_status.success_count, 0);
+    // The durable stop status may be stored before the detached runner finishes reconciling
+    // its queue handoff. Wait for the runner boundary before asserting the final token state.
+    wait_for_migration_runner(&runtime, &migration_id, false).await;
     let task_after = queue
         .get("late-media-manual-task")
         .expect("manual task should remain readable after stop")

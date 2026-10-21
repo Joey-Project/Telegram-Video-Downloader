@@ -514,14 +514,38 @@ pub(super) async fn dispatch(
     let kind = request.kind.clone();
     let payload = request.payload.clone();
     let migration_runtime = runtime.clone();
-    // Serialize removal against every scan from manager open through cache publication. The
-    // management-dispatch semaphore does not cover startup and publication-watcher scans.
-    let _publication_guard = if kind == "library_remove" {
-        Some(runtime.library_scan_publication_gate.lock().await)
+    let io_lease = if kind == "library_remove" {
+        if let Some(library_id) = payload.get("library_id").and_then(Value::as_str) {
+            match crate::library_migration_bot::try_acquire_library_io(
+                runtime,
+                &[library_id.to_string()],
+            )
+            .await
+            {
+                Ok(lease) => Some(lease),
+                Err(error) => return Some(Err(error)),
+            }
+        } else {
+            None
+        }
     } else {
         None
     };
+    // Serialize removal against every scan from manager open through cache publication. The
+    // per-library admission lease also excludes migration discovery and runners. The
+    // management-dispatch semaphore does not cover startup and publication-watcher scans.
+    let publication_guard = if kind == "library_remove" {
+        Some(
+            Arc::clone(&runtime.library_scan_publication_gate)
+                .lock_owned()
+                .await,
+        )
+    } else {
+        None
+    };
+    let blocking_io_lease = io_lease.as_ref().map(Arc::clone);
     let worker = tokio::task::spawn_blocking(move || {
+        let _io_lease = blocking_io_lease;
         let mut removed_library_id = None;
         let mut removed_was_original_library = false;
         let mut default_library_after_remove = None;
@@ -592,19 +616,27 @@ pub(super) async fn dispatch(
             Ok(json!({"applied": applied_settings(&queue)?}))
         })();
         (
-            result,
-            removed_library_id,
-            removed_was_original_library,
-            default_library_after_remove,
+            (
+                result,
+                removed_library_id,
+                removed_was_original_library,
+                default_library_after_remove,
+            ),
+            publication_guard,
         )
     })
     .await
     .context("media-library settings worker failed");
+    let (worker, _publication_guard) = match worker {
+        Ok((worker, publication_guard)) => (Ok(worker), publication_guard),
+        Err(error) => (Err(error), None),
+    };
     let (result, removed_library_id, removed_was_original_library, default_library_after_remove) =
         match worker {
             Ok(worker_result) => worker_result,
             Err(error) => (Err(error), None, false, None),
         };
+    let _io_lease = io_lease;
     if let Some(removed_library_id) = removed_library_id {
         let default_snapshot = {
             let mut snapshots = runtime.library_snapshots.lock().await;

@@ -13,6 +13,33 @@ export function appendAction(queue, action) {
   return { ok: true, queue: [...queue, action] };
 }
 
+export async function persistQueuedActionAndDrain({
+  action,
+  readQueue,
+  writeQueue,
+  onQueued,
+  afterPersist,
+  isOnline,
+  onOffline,
+  onSending,
+  drain,
+}) {
+  const queued = appendAction(readQueue(), action);
+  if (!queued.ok) return { status: "queue_full", action };
+  if (!writeQueue(queued.queue)) return { status: "storage_failed", action };
+
+  onQueued?.(action);
+  afterPersist?.(action);
+  if (!isOnline()) {
+    onOffline?.(action);
+    return { status: "queued", action };
+  }
+
+  onSending?.(action);
+  await drain();
+  return { status: "drained", action };
+}
+
 export function removeQueuedAction(queue, requestId) {
   return queue.filter((action) => action.request_id !== requestId);
 }

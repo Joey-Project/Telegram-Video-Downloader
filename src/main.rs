@@ -444,6 +444,11 @@ struct CloudBotRuntime {
     migrations: Arc<Mutex<BTreeMap<String, library_migration::MigrationStatus>>>,
     migration_discovery_warnings: Arc<Mutex<library_migration::MigrationDiscoveryWarnings>>,
     migration_runners: Arc<Mutex<HashSet<String>>>,
+    library_io_gates: library_migration_bot::LibraryIoGateRegistry,
+    #[cfg(test)]
+    test_migration_runner_gate_waiting: Arc<Notify>,
+    #[cfg(test)]
+    test_migration_runner_gate_acquired: Arc<Notify>,
     library_scan_warning: Arc<Mutex<Option<String>>>,
     library_scan_publication_gate: Arc<Mutex<()>>,
     telegram_dispatch: Arc<Semaphore>,
@@ -605,8 +610,14 @@ where
         .context("library operation has no registered queue store for its root")?
         .to_string();
     let default_library_id = settings.default_library_id;
-    library_migration_bot::ensure_library_io_available(runtime, &selected_queue_library_id).await?;
-    let _publication_guard = runtime.library_scan_publication_gate.lock().await;
+    let io_lease = library_migration_bot::try_acquire_library_io(
+        runtime,
+        std::slice::from_ref(&selected_queue_library_id),
+    )
+    .await?;
+    let publication_guard = Arc::clone(&runtime.library_scan_publication_gate)
+        .lock_owned()
+        .await;
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
     }
@@ -614,12 +625,20 @@ where
     let inbox = Arc::clone(&runtime.inbox);
     let queue = Arc::clone(&runtime.bot.queue);
     let selected_library_id_for_worker = selected_queue_library_id;
+    let blocking_io_lease = Arc::clone(&io_lease);
     let worker = tokio::task::spawn_blocking(move || {
-        refresh_and_require_library_queue_available(&queue, &selected_library_id_for_worker)?;
-        operation(context, inbox)
+        let _io_lease = blocking_io_lease;
+        let result = (|| {
+            refresh_and_require_library_queue_available(&queue, &selected_library_id_for_worker)?;
+            operation(context, inbox)
+        })();
+        (result, publication_guard)
     })
-    .await
-    .with_context(|| failure_context);
+    .await;
+    let (worker, _publication_guard) = match worker {
+        Ok((result, publication_guard)) => (Ok(result), Some(publication_guard)),
+        Err(error) => (Err(error).with_context(|| failure_context), None),
+    };
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; library publication is stopped");
     }
@@ -1648,6 +1667,11 @@ async fn run_cloud_bot(
             library_migration::MigrationDiscoveryWarnings::default(),
         )),
         migration_runners: Arc::new(Mutex::new(HashSet::new())),
+        library_io_gates: library_migration_bot::LibraryIoGateRegistry::default(),
+        #[cfg(test)]
+        test_migration_runner_gate_waiting: Arc::new(Notify::new()),
+        #[cfg(test)]
+        test_migration_runner_gate_acquired: Arc::new(Notify::new()),
         library_scan_warning: Arc::new(Mutex::new(None)),
         library_scan_publication_gate: Arc::new(Mutex::new(())),
         telegram_dispatch: Arc::new(Semaphore::new(1)),

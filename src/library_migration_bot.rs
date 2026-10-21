@@ -1,6 +1,7 @@
 //! Cloud commands and background scheduling for durable media-library migrations.
 
 use std::sync::Mutex as StdMutex;
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::*;
 use crate::file_manager::MigrationScanResult;
@@ -16,6 +17,88 @@ use serde::Deserialize;
 use serde_json::json;
 
 const MAX_MIGRATION_TASKS: usize = 10_000;
+
+/// Owns one async admission lock per registered library ID. Management takes a shared permit;
+/// migration execution and finalization take an exclusive permit.
+///
+/// Gates are acquired in sorted ID order, so migrations involving two libraries cannot
+/// deadlock with another migration involving the same pair in reverse order.
+#[derive(Clone, Default)]
+pub(crate) struct LibraryIoGateRegistry {
+    gates: Arc<Mutex<BTreeMap<String, Arc<RwLock<()>>>>>,
+}
+
+enum LibraryIoPermit {
+    Management { _guard: OwnedRwLockReadGuard<()> },
+    Migration { _guard: OwnedRwLockWriteGuard<()> },
+}
+
+pub(crate) struct LibraryIoGuard {
+    _guards: Vec<LibraryIoPermit>,
+}
+
+pub(crate) type LibraryIoLease = Arc<LibraryIoGuard>;
+
+impl LibraryIoGateRegistry {
+    async fn gates_for(&self, library_ids: &[String]) -> Result<Vec<Arc<RwLock<()>>>> {
+        let ids = library_ids
+            .iter()
+            .filter(|library_id| !library_id.is_empty())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if ids.is_empty() {
+            bail!("library I/O admission requires at least one library ID");
+        }
+        let mut gates = self.gates.lock().await;
+        Ok(ids
+            .into_iter()
+            .map(|library_id| {
+                Arc::clone(
+                    gates
+                        .entry(library_id)
+                        .or_insert_with(|| Arc::new(RwLock::new(()))),
+                )
+            })
+            .collect())
+    }
+
+    pub(crate) async fn acquire(&self, library_ids: &[String]) -> Result<LibraryIoLease> {
+        let gates = self.gates_for(library_ids).await?;
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in gates {
+            guards.push(LibraryIoPermit::Migration {
+                _guard: gate.write_owned().await,
+            });
+        }
+        Ok(Arc::new(LibraryIoGuard { _guards: guards }))
+    }
+
+    pub(crate) async fn try_acquire(&self, library_ids: &[String]) -> Result<LibraryIoLease> {
+        let gates = self.gates_for(library_ids).await?;
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in gates {
+            match gate.try_read_owned() {
+                Ok(guard) => guards.push(LibraryIoPermit::Management { _guard: guard }),
+                Err(_) => bail!("this library has an active migration; retry after it finishes"),
+            }
+        }
+        Ok(Arc::new(LibraryIoGuard { _guards: guards }))
+    }
+}
+
+pub(crate) async fn try_acquire_library_io(
+    runtime: &CloudBotRuntime,
+    library_ids: &[String],
+) -> Result<LibraryIoLease> {
+    runtime.library_io_gates.try_acquire(library_ids).await
+}
+
+pub(crate) async fn acquire_library_io(
+    runtime: &CloudBotRuntime,
+    library_ids: &[String],
+) -> Result<LibraryIoLease> {
+    runtime.library_io_gates.acquire(library_ids).await
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,22 +157,6 @@ fn engine(runtime: &CloudBotRuntime, source: &str, target: &str) -> Result<Migra
         target,
         manager(runtime, target)?,
     )
-}
-
-pub(super) async fn ensure_library_io_available(
-    runtime: &CloudBotRuntime,
-    library_id: &str,
-) -> Result<()> {
-    let active = runtime.migration_runners.lock().await.clone();
-    if runtime.migrations.lock().await.values().any(|status| {
-        active.contains(&status.id)
-            && (status.source_library_id == library_id || status.target_library_id == library_id)
-    }) {
-        bail!(
-            "this library has an active migration; pause it before scanning or changing its files"
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -426,12 +493,27 @@ async fn dispatch_inner(
     match request.kind.as_str() {
         "library_migration_preview" => {
             let payload: PreviewPayload = serde_json::from_value(request.payload.clone())?;
-            ensure_library_io_available(runtime, &payload.source_library_id).await?;
-            ensure_library_io_available(runtime, &payload.target_library_id).await?;
+            let io_lease = try_acquire_library_io(
+                runtime,
+                &[
+                    payload.source_library_id.clone(),
+                    payload.target_library_id.clone(),
+                ],
+            )
+            .await?;
+            let publication_guard = Arc::clone(&runtime.library_scan_publication_gate)
+                .lock_owned()
+                .await;
             let superseded_seq = payload.supersedes_preview_seq;
             let worker = runtime.clone();
-            let preview =
-                tokio::task::spawn_blocking(move || build_preview(&worker, payload)).await??;
+            let blocking_io_lease = Arc::clone(&io_lease);
+            let (preview, _publication_guard) = tokio::task::spawn_blocking(move || {
+                let _io_lease = blocking_io_lease;
+                let preview = build_preview(&worker, payload);
+                (preview, publication_guard)
+            })
+            .await?;
+            let preview = preview?;
             Ok(CloudDispatchOutcome {
                 status: InboxStatus::AwaitingConfirmation,
                 result: Some(serde_json::to_value(preview)?),
@@ -521,14 +603,6 @@ async fn dispatch_inner(
                 Ok::<_, anyhow::Error>((engine, status, terminal_noop))
             })
             .await??;
-            if !terminal_noop
-                && status.status == MigrationRunStatus::Stopped
-                && !runtime.migration_runners.lock().await.contains(&status.id)
-            {
-                let status = finish_task_transfers(runtime, &engine, &status, None).await?;
-                edit_status(runtime, &engine, &status).await?;
-                publish_status(runtime, status).await;
-            }
             let status = read_status(&engine, &status.id).await?.unwrap_or(status);
             publish_status(runtime, status.clone()).await;
             if !terminal_noop {
@@ -632,12 +706,37 @@ async fn finalize_terminal_control(
             let worker_engine = engine.clone();
             let worker_status = status.clone();
             let worker_id = migration_id.clone();
+            let library_ids = vec![
+                status.source_library_id.clone(),
+                status.target_library_id.clone(),
+            ];
             tokio::spawn(async move {
+                #[cfg(test)]
+                worker_runtime
+                    .test_migration_runner_gate_waiting
+                    .notify_one();
+                let io_lease = match acquire_library_io(&worker_runtime, &library_ids).await {
+                    Ok(io_lease) => io_lease,
+                    Err(error) => {
+                        warn!(migration_id=%worker_id,error=%redact_sensitive_text(&format!("{error:#}")),"could not acquire library admission for terminal migration finalization");
+                        worker_runtime
+                            .migration_runners
+                            .lock()
+                            .await
+                            .remove(&worker_id);
+                        return;
+                    }
+                };
+                #[cfg(test)]
+                worker_runtime
+                    .test_migration_runner_gate_acquired
+                    .notify_one();
                 run_terminal_finalizer(
                     worker_runtime,
                     worker_engine,
                     worker_status,
                     worker_id.clone(),
+                    io_lease,
                 )
                 .await;
             });
@@ -657,6 +756,7 @@ async fn run_terminal_finalizer(
     engine: MigrationEngine,
     initial: MigrationStatus,
     migration_id: String,
+    _io_lease: LibraryIoLease,
 ) {
     let result = async {
         let mut status = finish_task_transfers(&runtime, &engine, &initial, None).await?;
@@ -769,7 +869,23 @@ async fn start(runtime: CloudBotRuntime, status: MigrationStatus) {
     tokio::spawn(async move {
         let id = status.id.clone();
         let source = status.source_library_id.clone();
-        if let Err(error) = run(&runtime, status).await {
+        let library_ids = vec![
+            status.source_library_id.clone(),
+            status.target_library_id.clone(),
+        ];
+        #[cfg(test)]
+        runtime.test_migration_runner_gate_waiting.notify_one();
+        let io_lease = match acquire_library_io(&runtime, &library_ids).await {
+            Ok(io_lease) => io_lease,
+            Err(error) => {
+                warn!(migration_id=%id,error=%redact_sensitive_text(&format!("{error:#}")),"could not acquire library admission for migration runner");
+                runtime.migration_runners.lock().await.remove(&id);
+                return;
+            }
+        };
+        #[cfg(test)]
+        runtime.test_migration_runner_gate_acquired.notify_one();
+        if let Err(error) = run(&runtime, status, Arc::clone(&io_lease)).await {
             warn!(migration_id=%id,error=%redact_sensitive_text(&format!("{error:#}")),"media-library migration paused for recovery");
             if let Some(kind) =
                 crate::library_migration::migration_record_warning_kind(&format!("{error:#}"))
@@ -814,6 +930,7 @@ async fn start(runtime: CloudBotRuntime, status: MigrationStatus) {
             runtime.state_notify.notify_one();
         }
         runtime.migration_runners.lock().await.remove(&id);
+        drop(io_lease);
     });
 }
 
@@ -958,7 +1075,11 @@ async fn edit_status_with_context(
     }
 }
 
-async fn run(runtime: &CloudBotRuntime, initial: MigrationStatus) -> Result<()> {
+async fn run(
+    runtime: &CloudBotRuntime,
+    initial: MigrationStatus,
+    _io_lease: LibraryIoLease,
+) -> Result<()> {
     let worker = runtime.clone();
     let source_id = initial.source_library_id.clone();
     let target_id = initial.target_library_id.clone();
@@ -2091,6 +2212,86 @@ mod completeness_tests {
                 Path::new("/source"),
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod library_io_gate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn library_io_gate_is_scoped_to_sorted_unique_library_ids() {
+        let gates = LibraryIoGateRegistry::default();
+        let first_management = gates
+            .try_acquire(&["library-b".to_string(), "library-a".to_string()])
+            .await
+            .expect("management should acquire shared permits for both libraries");
+
+        let second_management = gates
+            .try_acquire(&["library-a".to_string()])
+            .await
+            .expect("same-library management operations may queue on publication");
+        let unrelated_management = gates
+            .try_acquire(&["library-b".to_string()])
+            .await
+            .expect("a second management operation may share the read permit");
+
+        drop(first_management);
+        drop(second_management);
+        drop(unrelated_management);
+
+        let migration = gates
+            .acquire(&["library-b".to_string(), "library-a".to_string()])
+            .await
+            .expect("migration should acquire exclusive permits for both libraries");
+        let active_migration = gates
+            .try_acquire(&["library-a".to_string()])
+            .await
+            .err()
+            .expect("management should fail promptly while migration is active");
+        assert!(active_migration.to_string().contains("active migration"));
+        let unrelated = gates
+            .try_acquire(&["library-c".to_string()])
+            .await
+            .expect("an unrelated library should remain available during migration");
+        drop(unrelated);
+        drop(migration);
+
+        gates
+            .try_acquire(&[
+                "library-a".to_string(),
+                "library-b".to_string(),
+                "library-a".to_string(),
+            ])
+            .await
+            .expect("released, duplicate IDs should be acquired once in sorted order");
+    }
+
+    #[tokio::test]
+    async fn reversed_multi_library_waiters_do_not_deadlock() {
+        let gates = LibraryIoGateRegistry::default();
+        let left = gates.clone();
+        let right = gates;
+        let waiters = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                async {
+                    left.acquire(&["library-a".to_string(), "library-b".to_string()])
+                        .await
+                        .expect("forward-order waiter should acquire both gates");
+                },
+                async {
+                    right
+                        .acquire(&["library-b".to_string(), "library-a".to_string()])
+                        .await
+                        .expect("reverse-order waiter should acquire both gates");
+                },
+            )
+        })
+        .await;
+        assert!(
+            waiters.is_ok(),
+            "sorted gate acquisition should not deadlock"
         );
     }
 }

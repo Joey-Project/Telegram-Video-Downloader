@@ -33,6 +33,17 @@ export const ACTION_SURFACE_SETTINGS: "settings";
 export const ACTION_SURFACE_FILE: "file";
 export const ACTION_RECEIPT_STORAGE_PREFIX: string;
 export function appendAction<T extends QueuedAction>(queue: T[], action: T): { ok: boolean; queue: T[] };
+export function persistQueuedActionAndDrain<T extends QueuedAction>(options: {
+  action: T;
+  readQueue: () => T[];
+  writeQueue: (queue: T[]) => boolean;
+  onQueued?: (action: T) => void;
+  afterPersist?: (action: T) => void;
+  isOnline: () => boolean;
+  onOffline?: (action: T) => void;
+  onSending?: (action: T) => void;
+  drain: () => Promise<unknown>;
+}): Promise<{ status: "queue_full" | "storage_failed" | "queued" | "drained"; action: T }>;
 export function removeQueuedAction<T extends QueuedAction>(queue: T[], requestId: string): T[];
 export function actionBelongsToSurface(action: QueuedAction, surface: "settings" | "file"): boolean;
 export function nextQueuedActionForSurface(

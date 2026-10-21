@@ -115,6 +115,13 @@ Valid jobs in the same library and other libraries remain discoverable and recov
 warnings identify records needing attention. Existing records remain in place, and unverified
 jobs never start. Library removal still uses strict dependency checks, so an unreadable record
 does not establish that the library has no remaining migration dependencies.
+Scans, file changes and migration previews hold shared per-library I/O admission through their
+root work and use the publication gate to preserve ordinary management-operation ordering.
+Scans and file changes retain admission through snapshot publication. Migration execution
+acquires exclusive source and target admission before its root work, including during periodic
+recovery. Cancelling a request does not
+release admission while its detached file work is still running; unrelated libraries use
+independent gates.
 Starting a migration requires both endpoint IDs to resolve to registered libraries. Removing a
 previously selected target disables that preview's Start control.
 Polling and scope changes preserve a selected target while it remains registered and distinct
@@ -130,6 +137,9 @@ conflict choices; per-item conflict editing is unavailable in the compact view.
 Full previews show a bounded page of conflict controls. Choices remain associated with the
 exact preview and revision while switching pages, and confirmation includes choices from every
 page. A replacement preview does not inherit the previous revision's editing state.
+Every awaiting preview published for the selected source remains reachable in the File view,
+including the ninth and later previews. Refreshing conflict choices preserves the draft and
+dispatches the replacement-preview request immediately.
 
 The separate **include unfinished tasks** checkbox is shown only when the scope affects such
 tasks and starts unchecked. When checked for a partially selected unfinished collection task,

@@ -1,4 +1,4 @@
-import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, appendAction, consumeRejectedActionReceipts, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "./action-queue.js";
+import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, consumeRejectedActionReceipts, dispatchNextOwnedAction, persistQueuedActionAndDrain, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "./action-queue.js";
 import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
@@ -14,7 +14,7 @@ import { validateTargetRelativeDirectory } from "./target-directory.js";
 import { boundedFolderSuggestions, buildMigrationPreviewPayload, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget, statusOf } from "./library-view.js";
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
 import { renderMigrationDiscoveryWarnings, renderMigrationHistory } from "./migration-rendering.js";
-import { migrationPreviewDraftKey, migrationPreviewPageWindow, renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
+import { createMigrationRefreshQueuedCallback, migrationPreviewDraftKey, migrationPreviewEntries as collectMigrationPreviewEntries, migrationPreviewPageWindow, renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
 import { inspectDownloadSubmissionHistory, releaseDownloadSubmissionTracking } from "./download-submission-history.js";
 import { buildDownloadSubmitPayload, isBoundDownloadLibraryOption } from "./download-submit.js";
 
@@ -599,33 +599,36 @@ async function submitAction(kind, payload, { onQueued } = {}) {
     }
   }
   const action = { request_id: crypto.randomUUID(), kind, payload, surface: ACTION_SURFACE_FILE };
-  const queued = appendAction(readActionQueue(), action);
-  if (!queued.ok) {
+  const queued = await persistQueuedActionAndDrain({
+    action,
+    readQueue: readActionQueue,
+    writeQueue: writeActionQueue,
+    onQueued,
+    afterPersist: () => {
+      if (kind !== "download_submit") return;
+      state.downloadSubmission = {
+        request_id: action.request_id,
+        seq: null,
+        url: String(payload.url ?? ""),
+        library_id: String(payload.library_id ?? ""),
+        category: String(payload.category ?? ""),
+        payload: { ...payload },
+      };
+      renderDownloadStatus();
+    },
+    isOnline: () => navigator.onLine,
+    onOffline: () => showToast("Saved offline. It will send when this device reconnects."),
+    onSending: () => showToast("Sending the saved request"),
+    drain: drainActionQueue,
+  });
+  if (queued.status === "queue_full") {
     showToast("The offline queue is full. Reconnect and send its saved requests first.");
     return false;
   }
-  if (!writeActionQueue(queued.queue)) {
+  if (queued.status === "storage_failed") {
     showToast("This browser could not save the action, so it was not sent.");
     return false;
   }
-  if (typeof onQueued === "function") onQueued(action);
-  if (kind === "download_submit") {
-    state.downloadSubmission = {
-      request_id: action.request_id,
-      seq: null,
-      url: String(payload.url ?? ""),
-      library_id: String(payload.library_id ?? ""),
-      category: String(payload.category ?? ""),
-      payload: { ...payload },
-    };
-    renderDownloadStatus();
-  }
-  if (!navigator.onLine) {
-    showToast("Saved offline. It will send when this device reconnects.");
-    return true;
-  }
-  showToast("Sending the saved request");
-  await drainActionQueue();
   return true;
 }
 
@@ -910,43 +913,7 @@ function migrationTargetOptions() {
 }
 
 function migrationPreviewEntries() {
-  const active = [];
-  for (const preview of Array.isArray(state.snapshot?.previews) ? state.snapshot.previews : []) {
-    if (preview?.kind !== "library_migration_preview" || preview?.status !== "awaiting_confirmation") continue;
-    active.push({
-      ...preview,
-      result: preview.result && typeof preview.result === "object" ? preview.result : null,
-      id: preview.preview_id ?? preview.id,
-      incomplete: preview.preview_incomplete === true || preview.incomplete === true || preview.reload_required === true,
-    });
-  }
-  for (const operation of Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []) {
-    if (operation?.kind !== "library_migration_preview" || operation?.status !== "awaiting_confirmation") continue;
-    const result = operation.result && typeof operation.result === "object" ? operation.result : {};
-    active.push({
-      ...operation,
-      id: operation.preview_id ?? result.id ?? result.preview_id ?? operation.id,
-      result,
-      incomplete: operation.details_incomplete === true || operation.result_truncated === true || result.incomplete === true,
-    });
-  }
-  const unique = new Map();
-  for (const operation of active) {
-    const result = operation.result ?? {};
-    const sourceLibraryId = result.source_library_id ?? operation.source_library_id;
-    if (sourceLibraryId !== activeLibraryId()) continue;
-    const id = operation.id ?? result.id ?? result.preview_id;
-    const revision = operation.revision ?? result.revision;
-    if (id && revision) {
-      const key = migrationPreviewDraftKey(id, revision);
-      if (!key) continue;
-      const existing = unique.get(key);
-      if (!existing || existing.incomplete && !operation.incomplete) {
-        unique.set(key, { ...operation, id, revision });
-      }
-    }
-  }
-  return [...unique.values()].slice(-8).reverse();
+  return collectMigrationPreviewEntries(state.snapshot, activeLibraryId());
 }
 
 function migrationConflictDraft(previewId, revision) {
@@ -1642,18 +1609,16 @@ function bindEvents() {
       }
       migrationRefresh.disabled = true;
       submitAction("library_migration_preview", payload, {
-        onQueued(action) {
-          const key = saveMigrationConflictDraft(previewId, revision, {
-            ...draft,
-            refreshRequestId: action.request_id,
-            rejectedRefreshRequestId: null,
-            refreshPayload: payload,
-            refreshSeq: null,
-            refreshError: null,
-          });
-          if (migrationConflictChoicesChanged(result.item_conflicts, draft?.itemConflicts)) state.migrationConflictInvalidated.add(key);
-          renderMigrations();
-        },
+        onQueued: createMigrationRefreshQueuedCallback({
+          operation,
+          previewId,
+          revision,
+          draft,
+          payload,
+          saveDraft: saveMigrationConflictDraft,
+          markInvalidated: (key) => state.migrationConflictInvalidated.add(key),
+          render: renderMigrations,
+        }),
       }).then((queued) => {
         if (!queued) {
           const current = migrationConflictDraft(previewId, revision);

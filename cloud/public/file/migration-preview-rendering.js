@@ -14,6 +14,73 @@ export function migrationPreviewDraftKey(id, revision) {
   return JSON.stringify([id, revision]);
 }
 
+export function migrationPreviewEntries(snapshot, selectedLibraryId) {
+  const active = [];
+  for (const preview of Array.isArray(snapshot?.previews) ? snapshot.previews : []) {
+    if (preview?.kind !== "library_migration_preview" || preview?.status !== "awaiting_confirmation") continue;
+    active.push({
+      ...preview,
+      result: preview.result && typeof preview.result === "object" ? preview.result : null,
+      id: preview.preview_id ?? preview.id,
+      incomplete: preview.preview_incomplete === true || preview.incomplete === true || preview.reload_required === true,
+    });
+  }
+  for (const operation of Array.isArray(snapshot?.operations) ? snapshot.operations : []) {
+    if (operation?.kind !== "library_migration_preview" || operation?.status !== "awaiting_confirmation") continue;
+    const result = operation.result && typeof operation.result === "object" ? operation.result : {};
+    active.push({
+      ...operation,
+      id: operation.preview_id ?? result.id ?? result.preview_id ?? operation.id,
+      result,
+      incomplete: operation.details_incomplete === true || operation.result_truncated === true || result.incomplete === true,
+    });
+  }
+  const unique = new Map();
+  for (const operation of active) {
+    const result = operation.result ?? {};
+    const sourceLibraryId = result.source_library_id ?? operation.source_library_id;
+    if (sourceLibraryId !== selectedLibraryId) continue;
+    const id = operation.id ?? result.id ?? result.preview_id;
+    const revision = operation.revision ?? result.revision;
+    if (!id || !revision) continue;
+    const key = migrationPreviewDraftKey(id, revision);
+    if (!key) continue;
+    const existing = unique.get(key);
+    if (!existing || existing.incomplete && !operation.incomplete) {
+      unique.set(key, { ...operation, id, revision });
+    }
+  }
+  return [...unique.values()].reverse();
+}
+
+export function createMigrationRefreshQueuedCallback({
+  operation,
+  previewId,
+  revision,
+  draft,
+  payload,
+  saveDraft,
+  markInvalidated,
+  render,
+}) {
+  const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
+  const currentDraft = draft && typeof draft === "object" ? draft : {};
+  return (action) => {
+    const key = saveDraft(previewId, revision, {
+      ...currentDraft,
+      refreshRequestId: action.request_id,
+      rejectedRefreshRequestId: null,
+      refreshPayload: payload,
+      refreshSeq: null,
+      refreshError: null,
+    });
+    if (key && migrationConflictChoicesChanged(result.item_conflicts, currentDraft.itemConflicts)) {
+      markInvalidated(key);
+    }
+    render();
+  };
+}
+
 export function migrationPreviewPageWindow(itemCount, requestedPage) {
   const count = Number.isSafeInteger(itemCount) && itemCount >= 0 ? itemCount : 0;
   const pageCount = Math.max(1, Math.ceil(count / MIGRATION_PREVIEW_PAGE_SIZE));
