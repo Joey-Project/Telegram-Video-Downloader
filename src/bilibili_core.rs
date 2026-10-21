@@ -7,13 +7,15 @@ use bbdown_core::{
     AccessKeyLoginConfig, AccessKeyLoginCredentials, AccessKeyLoginTicket, BiliClient,
     ClientConfig, CredentialHealthReport, CredentialProfileSelection, CredentialSource,
     CredentialStore, Credentials, DanmakuFormat, DownloadMode, DownloadOptions, EndpointConfig,
-    Input, MediaHostOptions, MuxOptions, PlayurlMode, RestrictedArea, RestrictedAreaConfig,
+    MediaHostOptions, MuxOptions, PlayurlMode, RestrictedArea, RestrictedAreaConfig,
     RestrictedAreaProxy, RestrictedAreaProxyKind, RetryPolicy, Selection, StreamSelection,
     UgcCollectionKind, UgcCollectionReference,
 };
 
 use crate::config::AppConfig;
-use crate::router::BilibiliSelection;
+use crate::router::{BilibiliSelection, bilibili_bvid_from_url};
+#[cfg(test)]
+use bbdown_core::Input;
 use reqwest::redirect::Policy;
 use url::Url;
 
@@ -163,6 +165,7 @@ pub async fn resolve_b23_short_link(config: &AppConfig, raw_url: &str) -> Result
     bail!("Bilibili short link exceeded redirect limit")
 }
 
+#[cfg(test)]
 pub async fn resolve_video_collection_membership(
     config: &AppConfig,
     raw_url: &str,
@@ -185,6 +188,32 @@ pub async fn resolve_video_collection_membership(
         .resolve_video_collection_membership(&bvid)
         .await
         .context("failed to resolve Bilibili UGC collection membership")
+}
+
+pub async fn resolve_video_page_info(
+    config: &AppConfig,
+    raw_url: &str,
+) -> Result<(usize, Option<UgcCollectionReference>)> {
+    let client = client(config)?;
+    let resolved = client
+        .resolve_input(raw_url, Some(Selection::All))
+        .await
+        .context("failed to resolve Bilibili video pages")?;
+    let bbdown_core::ResolvedContent::Video(video) = resolved else {
+        bail!("Bilibili URL did not resolve to a normal video")
+    };
+    let page_count = video.pages.len().max(1);
+    let parsed_bvid = bilibili_bvid_from_url(raw_url);
+    let bvid = video
+        .bvid
+        .as_deref()
+        .or(parsed_bvid.as_deref())
+        .context("resolved Bilibili video did not include a BV identifier")?;
+    let collection = client
+        .resolve_video_collection_membership(bvid)
+        .await
+        .context("failed to resolve Bilibili UGC collection membership")?;
+    Ok((page_count, collection))
 }
 
 pub fn ugc_collection_url(reference: &UgcCollectionReference) -> String {
