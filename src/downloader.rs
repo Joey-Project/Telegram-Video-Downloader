@@ -5573,7 +5573,7 @@ async fn inspect_job_plan_inner(
             }
             let client = bilibili_core::client(config)?;
             let plan = if matches!(selection, Some(BilibiliSelection::Missing)) {
-                plan_bilibili_missing_season(
+                plan_bilibili_missing_entries(
                     config,
                     &client,
                     url,
@@ -5863,7 +5863,7 @@ async fn find_video_duplicate_with_probe_inner(
                 overwrite_identities = bilibili_plan_overwrite_identities(&plan);
                 display_metadata = Some(bilibili_metadata_display_snapshot(&plan));
                 if let (Some(total_entries), Ok(mode)) = (
-                    probe.season_total,
+                    probe.skip_total_entries,
                     bilibili_core::download_mode_from_config(config),
                 ) && bilibili_missing_skip_mode_supported(mode)
                 {
@@ -6801,10 +6801,10 @@ fn current_sidecar_path_matches_identity(
     Ok(current.identity() == expected)
 }
 
-struct BilibiliMissingSeasonPlan {
+struct BilibiliMissingEntriesPlan {
     plan: bbdown_core::DownloadPlan,
     resolved: ResolvedContent,
-    skipped: Vec<(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)>,
+    skipped_entries: Vec<(BilibiliDownloadEntry, ExistingEpisodeEvidence)>,
     total_entries: usize,
 }
 
@@ -6835,9 +6835,9 @@ fn revalidate_missing_season_evidence_for_report(
     Ok(paths.into_iter().collect())
 }
 
-async fn revalidate_missing_season_evidence_bounded(
+async fn revalidate_missing_entries_evidence_bounded(
     root: &RootedFs,
-    skipped: &[(bbdown_core::EpisodeMetadata, ExistingEpisodeEvidence)],
+    skipped: &[(BilibiliDownloadEntry, ExistingEpisodeEvidence)],
     phase: &'static str,
 ) -> Result<Vec<PathBuf>> {
     let permit = tokio_timeout(
@@ -6850,7 +6850,12 @@ async fn revalidate_missing_season_evidence_bounded(
     let skipped = skipped.to_vec();
     let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        revalidate_missing_season_evidence_for_report(&root, &skipped)
+        let mut paths = BTreeSet::new();
+        for (entry, evidence) in &skipped {
+            revalidate_bilibili_entry_evidence(&root, entry, evidence, phase)?;
+            paths.insert(evidence.path.clone());
+        }
+        Ok::<_, anyhow::Error>(paths.into_iter().collect())
             .with_context(|| format!("failed to revalidate skipped Bilibili media during {phase}"))
     });
     tokio_timeout(Duration::from_secs(6), task)
@@ -6939,7 +6944,7 @@ fn revalidate_bilibili_entry_evidence(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn plan_bilibili_missing_season(
+async fn plan_bilibili_missing_entries(
     config: &AppConfig,
     client: &bbdown_core::BiliClient,
     url: &str,
@@ -6949,10 +6954,10 @@ async fn plan_bilibili_missing_season(
     timeout: Duration,
     progress: impl Fn(usize, usize),
     stage_progress: impl Fn(bilibili_planning::PlanningStage, usize, usize),
-) -> Result<BilibiliMissingSeasonPlan> {
+) -> Result<BilibiliMissingEntriesPlan> {
     if !bilibili_missing_skip_mode_supported(mode) {
         bail!(
-            "persisted missing-episode selection is unsupported for the configured download mode; retry the season with a supported media mode"
+            "persisted missing-entry selection is unsupported for the configured download mode; retry with a supported media mode"
         );
     }
     let ffprobe = ffprobe.to_path_buf();
@@ -6984,43 +6989,122 @@ async fn plan_bilibili_missing_season(
         .context("Bilibili existing season media scan task failed")??;
     let index = Arc::new(index);
     let filter_index = Arc::clone(&index);
-    let (plan, resolved, skipped) = bilibili_planning::plan_download_filtered_with_progress(
-        client,
-        url,
-        Some(Selection::All),
-        mode,
-        timeout,
-        progress,
-        stage_progress,
-        move |episode| {
-            let entry = bilibili_entry_from_episode_metadata(&episode);
-            let ffprobe = ffprobe.clone();
-            let index = Arc::clone(&filter_index);
-            let config = Arc::clone(&probe_config);
-            async move {
-                bilibili_plan_entry_compatible_existing_media(
-                    &config, index, &entry, mode, &ffprobe,
+    let resolved = tokio_timeout(timeout, client.resolve_input(url, Some(Selection::All)))
+        .await
+        .context("Bilibili missing-entry metadata probe timed out")??;
+    let (plan, skipped_entries, total_entries) = match &resolved {
+        ResolvedContent::Season(season) => {
+            let (plan, _, skipped) = bilibili_planning::plan_download_filtered_with_progress(
+                client,
+                url,
+                Some(Selection::All),
+                mode,
+                timeout,
+                progress,
+                stage_progress,
+                move |episode| {
+                    let entry = bilibili_entry_from_episode_metadata(&episode);
+                    let ffprobe = ffprobe.clone();
+                    let index = Arc::clone(&filter_index);
+                    let config = Arc::clone(&probe_config);
+                    async move {
+                        bilibili_plan_entry_compatible_existing_media(
+                            &config, index, &entry, mode, &ffprobe,
+                        )
+                        .await
+                    }
+                },
+            )
+            .await?;
+            let entries: Vec<(BilibiliDownloadEntry, ExistingEpisodeEvidence)> = skipped
+                .iter()
+                .map(|(episode, evidence)| {
+                    (
+                        bilibili_entry_from_episode_metadata(episode),
+                        evidence.clone(),
+                    )
+                })
+                .collect();
+            (plan, entries, season.selected_episodes.len())
+        }
+        ResolvedContent::Video(video) => {
+            let total_entries = video.pages.len();
+            stage_progress(
+                bilibili_planning::PlanningStage::ScanningExistingMedia,
+                0,
+                total_entries,
+            );
+            let mut skipped = Vec::new();
+            let mut missing_page_indices = Vec::new();
+            for (offset, page) in video.pages.iter().enumerate() {
+                let entry = BilibiliDownloadEntry {
+                    index: page.index,
+                    aid: page.aid,
+                    bvid: video.bvid.clone(),
+                    cid: page.cid,
+                    epid: page.epid,
+                    title: page.title.clone(),
+                    ..Default::default()
+                };
+                if let Some(evidence) = bilibili_plan_entry_compatible_existing_media(
+                    &probe_config,
+                    Arc::clone(&index),
+                    &entry,
+                    mode,
+                    &ffprobe,
                 )
                 .await
+                {
+                    skipped.push((entry, evidence));
+                } else {
+                    missing_page_indices.push(page.index);
+                }
+                stage_progress(
+                    bilibili_planning::PlanningStage::ScanningExistingMedia,
+                    offset + 1,
+                    total_entries,
+                );
             }
-        },
-    )
-    .await?;
-    let ResolvedContent::Season(season) = &resolved else {
-        bail!("missing Bilibili episode download requires a season URL");
+            let plan = if missing_page_indices.is_empty() {
+                bbdown_core::DownloadPlan {
+                    title: video.title.clone(),
+                    entries: Vec::new(),
+                }
+            } else {
+                let selectors = missing_page_indices
+                    .iter()
+                    .copied()
+                    .map(IndexSelector::index)
+                    .collect::<Vec<_>>();
+                let selection = Selection::Indices(
+                    IndexSelection::new(selectors)
+                        .context("failed to select missing Bilibili video pages")?,
+                );
+                tokio_timeout(
+                    timeout,
+                    client.plan_download_with_mode(url, Some(selection), mode),
+                )
+                .await
+                .context("Bilibili remaining-page download planning timed out")??
+            };
+            progress(plan.entries.len(), total_entries);
+            (plan, skipped, total_entries)
+        }
+        ResolvedContent::Collection(_) => {
+            bail!("missing-entry selection for a collection requires its collection URL")
+        }
     };
-    let total_entries = season.selected_episodes.len();
     let root = index
         .root
         .as_ref()
-        .context("Bilibili output root became unavailable while validating skipped episodes")?;
-    revalidate_missing_season_evidence_bounded(root, &skipped, "planning")
+        .context("Bilibili output root became unavailable while validating skipped media")?;
+    revalidate_missing_entries_evidence_bounded(root, &skipped_entries, "planning")
         .await
-        .context("retry the season so the updated plan can be reviewed")?;
-    Ok(BilibiliMissingSeasonPlan {
+        .context("retry the Bilibili job so the updated plan can be reviewed")?;
+    Ok(BilibiliMissingEntriesPlan {
         plan,
         resolved,
-        skipped,
+        skipped_entries,
         total_entries,
     })
 }
@@ -8351,8 +8435,10 @@ async fn run_bilibili_job_locked(
         options = options.with_output_template(output_template.clone());
     }
     let client = bilibili_core::client(config)?;
-    let collection_download = if matches!(selection, Some(BilibiliSelection::All))
-        && is_bilibili_ugc_collection_url(url)
+    let collection_download = if matches!(
+        selection,
+        Some(BilibiliSelection::All | BilibiliSelection::Missing)
+    ) && is_bilibili_ugc_collection_url(url)
     {
         let final_output_root = worker_context.final_output_root;
         send_progress(
@@ -8387,8 +8473,9 @@ async fn run_bilibili_job_locked(
             "missing-episode job has no persisted plan snapshot; retry the queued job to generate and review a plan before downloading"
         );
     }
-    let mut missing_season_skip_evidence = Vec::new();
-    let mut missing_season_summary = None;
+    let mut missing_entry_skip_evidence = Vec::new();
+    let mut missing_entry_summary = None;
+    let mut missing_entry_kind = "Season";
     let (mut core_plan, resolved_metadata): (
         bbdown_core::DownloadPlan,
         Result<Option<ResolvedContent>>,
@@ -8408,9 +8495,9 @@ async fn run_bilibili_job_locked(
     } else if missing_selection {
         send_progress(
             progress.as_ref(),
-            "BBDown-rust: re-resolving selected season for missing episodes".to_string(),
+            "BBDown-rust: re-resolving selected media and skipping existing entries".to_string(),
         );
-        let missing = plan_bilibili_missing_season(
+        let missing = plan_bilibili_missing_entries(
             config,
             &client,
             url,
@@ -8429,29 +8516,36 @@ async fn run_bilibili_job_locked(
             validate_missing_plan_snapshot(expected, &current)?;
         }
         let total_entries = missing.total_entries;
-        let skipped_entries = missing.skipped.len();
-        missing_season_summary = Some((total_entries, skipped_entries));
+        let skipped_entries = missing.skipped_entries.len();
+        missing_entry_kind = if matches!(&missing.resolved, ResolvedContent::Video(_)) {
+            "Video"
+        } else {
+            "Season"
+        };
+        missing_entry_summary = Some((total_entries, skipped_entries));
         send_progress(
             progress.as_ref(),
             format!(
-                "Season sync: {total_entries} total; {skipped_entries} already present; {} queued",
+                "{missing_entry_kind} sync: {total_entries} total; {skipped_entries} already present; {} queued",
                 total_entries.saturating_sub(skipped_entries)
             ),
         );
         if missing.plan.entries.is_empty() {
-            let existing_media_paths = revalidate_missing_season_evidence_bounded(
+            let existing_media_paths = revalidate_missing_entries_evidence_bounded(
                 worker_context.final_output_root,
-                &missing.skipped,
+                &missing.skipped_entries,
                 "all-existing completion",
             )
             .await?;
-            let ResolvedContent::Season(season) = &missing.resolved else {
-                bail!("missing Bilibili episode download requires a season URL");
+            let title = match &missing.resolved {
+                ResolvedContent::Season(season) => season.season.title.as_str(),
+                ResolvedContent::Video(video) => video.title.as_str(),
+                ResolvedContent::Collection(collection) => collection.collection.title.as_str(),
             };
             send_bilibili_attempt(
                 progress.as_ref(),
                 BilibiliAttemptSnapshot::new(
-                    redact_sensitive_text(&season.season.title),
+                    redact_sensitive_text(title),
                     std::iter::empty(),
                     skipped_entries,
                 ),
@@ -8463,16 +8557,16 @@ async fn run_bilibili_job_locked(
                     join_paths(&existing_media_paths)
                 },
                 details: format!(
-                    "Bilibili season already complete: {} ({total_entries} total, {skipped_entries} already present)",
-                    season.season.title
+                    "Bilibili {kind} already complete: {title} ({total_entries} total, {skipped_entries} already present)",
+                    kind = missing_entry_kind.to_lowercase(),
                 ),
                 primary_media_paths: existing_media_paths,
-                existing_bilibili_evidence: Some(bilibili_report_evidence_from_skipped(
-                    &missing.skipped,
+                existing_bilibili_evidence: Some(bilibili_report_evidence_from_entries(
+                    &missing.skipped_entries,
                 )),
             }));
         }
-        missing_season_skip_evidence = missing.skipped;
+        missing_entry_skip_evidence = missing.skipped_entries;
         let metadata = config.video.write_nfo.then_some(missing.resolved);
         (missing.plan, Ok(metadata))
     } else {
@@ -8575,7 +8669,7 @@ async fn run_bilibili_job_locked(
         ]),
     );
     let skipped_entries = collection_manifest.as_ref().map_or_else(
-        || missing_season_summary.map_or(0, |(_, skipped)| skipped),
+        || missing_entry_summary.map_or(0, |(_, skipped)| skipped),
         |manifest| manifest.skipped_entries,
     );
     send_bilibili_attempt(
@@ -8659,9 +8753,9 @@ async fn run_bilibili_job_locked(
     if let Some(collection) = collection_download.as_ref() {
         details.push(collection.details_summary(report.entries.len()));
     }
-    if let Some((total_entries, skipped_entries)) = missing_season_summary {
+    if let Some((total_entries, skipped_entries)) = missing_entry_summary {
         details.push(format!(
-            "Season sync: {total_entries} total; {skipped_entries} already present; {} downloaded",
+            "{missing_entry_kind} sync: {total_entries} total; {skipped_entries} already present; {} downloaded",
             report.entries.len()
         ));
     }
@@ -8696,9 +8790,9 @@ async fn run_bilibili_job_locked(
                 .map(|path| rebase_download_path(path, &output_dir, reported_output_dir)),
         );
     }
-    let missing_existing_media_paths = revalidate_missing_season_evidence_bounded(
+    let missing_existing_media_paths = revalidate_missing_entries_evidence_bounded(
         worker_context.final_output_root,
-        &missing_season_skip_evidence,
+        &missing_entry_skip_evidence,
         "download completion",
     )
     .await?;
@@ -8725,7 +8819,7 @@ async fn run_bilibili_job_locked(
         details: nonempty_join(details),
         primary_media_paths: reported_primary_videos,
         existing_bilibili_evidence: missing_selection
-            .then(|| bilibili_report_evidence_from_skipped(&missing_season_skip_evidence)),
+            .then(|| bilibili_report_evidence_from_entries(&missing_entry_skip_evidence)),
     }))
 }
 
@@ -13100,19 +13194,18 @@ async fn probe_bilibili_duplicate_metadata(
     sync_bilibili_rust_credentials(config).await?;
     let client = bilibili_core::client(config)?;
     let metadata = probe_bilibili_resolved_content(&client, url, selection, timeout).await?;
-    let season_total = match &metadata {
-        ResolvedContent::Season(season) => Some(season.selected_episodes.len()),
-        _ => None,
-    };
+    let skip_total_entries = matches!(selection, Some(BilibiliSelection::All))
+        .then(|| bilibili_metadata_identity_plan(&metadata).entries.len())
+        .filter(|count| *count > 0);
     Ok(BilibiliDuplicateMetadataProbe {
         plan: bilibili_metadata_identity_plan(&metadata),
-        season_total,
+        skip_total_entries,
     })
 }
 
 struct BilibiliDuplicateMetadataProbe {
     plan: BilibiliDownloadPlan,
-    season_total: Option<usize>,
+    skip_total_entries: Option<usize>,
 }
 
 fn bilibili_metadata_identity_plan(metadata: &ResolvedContent) -> BilibiliDownloadPlan {
@@ -28157,7 +28250,7 @@ mod tests {
         let stages = StdMutex::new(Vec::new());
         let plan = tokio_timeout(
             Duration::from_secs(5),
-            plan_bilibili_missing_season(
+            plan_bilibili_missing_entries(
                 &test_config(),
                 &client,
                 "https://www.bilibili.com/bangumi/play/ss123",
@@ -28205,7 +28298,7 @@ mod tests {
             )
             .expect("existing identity metadata should write");
         }
-        let complete_plan = plan_bilibili_missing_season(
+        let complete_plan = plan_bilibili_missing_entries(
             &test_config(),
             &client,
             "https://www.bilibili.com/bangumi/play/ss123",
@@ -28221,7 +28314,8 @@ mod tests {
         server.abort();
 
         assert_eq!(plan.total_entries, 2);
-        assert_eq!(plan.skipped.len(), 1);
+        assert_eq!(plan.skipped_entries.len(), 1);
+        assert_eq!(plan.skipped_entries[0].0.epid, Some(1000));
         assert_eq!(plan.plan.entries.len(), 1);
         assert_eq!(plan.plan.entries[0].epid, Some(1001));
         assert!(complete_plan.plan.entries.is_empty());
