@@ -4,7 +4,7 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 use super::*;
-use crate::file_manager::MigrationScanResult;
+use crate::file_manager::{LibraryManager, MigrationScanResult};
 use crate::library::Presence;
 use crate::library_migration::{
     MigrationControl, MigrationDeliveryState, MigrationDiscoveryWarning,
@@ -13,7 +13,8 @@ use crate::library_migration::{
     MigrationTaskImpact, validate_migration_scan_paths,
 };
 use crate::media_libraries::TaskDestination;
-use serde::Deserialize;
+use crate::safe_fs::RootedFs;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const MAX_MIGRATION_TASKS: usize = 10_000;
@@ -104,7 +105,9 @@ pub(crate) async fn acquire_library_io(
 #[serde(deny_unknown_fields)]
 struct PreviewPayload {
     source_library_id: String,
+    source_root_binding: String,
     target_library_id: String,
+    target_root_binding: String,
     scope: MigrationScope,
     #[serde(default)]
     item_ids: Vec<String>,
@@ -122,6 +125,14 @@ struct PreviewPayload {
     supersedes_preview_id: Option<String>,
     #[serde(default)]
     supersedes_revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct BoundMigrationPreview {
+    #[serde(flatten)]
+    preview: MigrationPreview,
+    source_root_binding: String,
+    target_root_binding: String,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +159,28 @@ fn manager(runtime: &CloudBotRuntime, id: &str) -> Result<Arc<LibraryManager>> {
         Arc::clone(&runtime.inbox),
         None,
     )?))
+}
+
+fn manager_for_verified_root(
+    runtime: &CloudBotRuntime,
+    root: RootedFs,
+) -> Result<Arc<LibraryManager>> {
+    #[cfg(test)]
+    let provider = runtime
+        .test_file_provider
+        .clone()
+        .unwrap_or_else(crate::file_provider::platform_queue_file_provider);
+    #[cfg(not(test))]
+    let provider = crate::file_provider::platform_queue_file_provider();
+    let preview_cleanup_gate: Arc<dyn crate::file_manager::PreviewCleanupGate> =
+        runtime.inbox.clone();
+    Ok(Arc::new(
+        LibraryManager::open_with_bound_root_and_provider_and_preview_cleanup_gate(
+            root,
+            provider,
+            preview_cleanup_gate,
+        )?,
+    ))
 }
 
 fn engine(runtime: &CloudBotRuntime, source: &str, target: &str) -> Result<MigrationEngine> {
@@ -272,7 +305,10 @@ fn item_ids_for_task(snapshot: &LibrarySnapshot, task: &TaskRecord, root: &Path)
         .collect()
 }
 
-fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<MigrationPreview> {
+fn build_preview(
+    runtime: &CloudBotRuntime,
+    payload: PreviewPayload,
+) -> Result<BoundMigrationPreview> {
     let supersession = match (
         payload.supersedes_preview_seq,
         payload.supersedes_preview_id.as_deref(),
@@ -303,14 +339,37 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
             {
                 bail!("the migration preview being refreshed is no longer awaiting confirmation");
             }
+            let prior = serde_json::from_value::<BoundMigrationPreview>(
+                record
+                    .result
+                    .clone()
+                    .context("the saved migration preview is missing its root identity")?,
+            )
+            .context("the saved migration preview is missing its root identity")?;
+            if prior.preview.source_library_id != payload.source_library_id
+                || prior.preview.target_library_id != payload.target_library_id
+                || prior.source_root_binding != payload.source_root_binding
+                || prior.target_root_binding != payload.target_root_binding
+            {
+                bail!("the migration preview root identity changed; create a fresh preview");
+            }
             Some((seq, id.to_string(), revision.to_string()))
         }
         _ => bail!(
             "supersedes_preview_seq, supersedes_preview_id, and supersedes_revision must be supplied together"
         ),
     };
-    let source = manager(runtime, &payload.source_library_id)?;
-    let target = manager(runtime, &payload.target_library_id)?;
+    let (source_root, target_root) = runtime
+        .bot
+        .queue
+        .verified_video_library_roots_with_bindings(
+            &payload.source_library_id,
+            &payload.source_root_binding,
+            &payload.target_library_id,
+            &payload.target_root_binding,
+        )?;
+    let source = manager_for_verified_root(runtime, source_root)?;
+    let target = manager_for_verified_root(runtime, target_root)?;
     let scan = source.migration_scan_with_completeness()?;
     validate_migration_scan_paths(&scan, &payload.scope, std::iter::empty())?;
     let snapshot = &scan.snapshot;
@@ -414,7 +473,11 @@ fn build_preview(runtime: &CloudBotRuntime, payload: PreviewPayload) -> Result<M
             bail!("the migration preview being refreshed changed before it could be invalidated");
         }
     }
-    Ok(preview)
+    Ok(BoundMigrationPreview {
+        preview,
+        source_root_binding: payload.source_root_binding,
+        target_root_binding: payload.target_root_binding,
+    })
 }
 
 async fn publish_status(runtime: &CloudBotRuntime, mut status: MigrationStatus) {
@@ -460,6 +523,26 @@ fn mark_terminal_finalization_attention(status: &mut MigrationStatus) {
     }
 }
 
+fn locate_preview_for_source(
+    source: &LibraryManager,
+    id: &str,
+    revision: &str,
+    source_library_id: &str,
+    target_library_id: &str,
+) -> Result<MigrationPreview> {
+    let persisted = MigrationEngine::find_preview_for_source(source, id)?
+        .context("migration preview is unavailable; create a new preview")?
+        .preview;
+    if persisted.id != id
+        || persisted.revision != revision
+        || persisted.source_library_id != source_library_id
+        || persisted.target_library_id != target_library_id
+    {
+        bail!("saved migration preview identity does not match its confirmed inbox result");
+    }
+    Ok(persisted)
+}
+
 fn locate_preview(runtime: &CloudBotRuntime, id: &str) -> Result<MigrationPreview> {
     for library in runtime.bot.queue.registry_snapshot()?.libraries {
         let source = match manager(runtime, &library.id) {
@@ -470,7 +553,7 @@ fn locate_preview(runtime: &CloudBotRuntime, id: &str) -> Result<MigrationPrevie
             return Ok(preview.preview);
         }
     }
-    bail!("migration preview is unavailable; reconnect the source library or create a new preview")
+    bail!("migration preview {id} is unavailable")
 }
 
 pub(super) async fn dispatch(
@@ -533,25 +616,58 @@ async fn dispatch_inner(
             if record.request.kind != "library_migration_preview" {
                 bail!("a file-operation preview cannot authorize a library migration");
             }
-            let preview: MigrationPreview = serde_json::from_value(
+            let bound_preview: BoundMigrationPreview = serde_json::from_value(
                 record
                     .result
                     .clone()
                     .context("migration preview result is missing")?,
-            )?;
+            )
+            .context("saved migration preview has no root binding; create a fresh preview")?;
+            let preview = bound_preview.preview;
             if preview.id != payload.preview_id || preview.revision != payload.revision {
                 bail!("migration preview ID or revision does not match confirmation");
             }
+            let io_lease = try_acquire_library_io(
+                runtime,
+                &[
+                    preview.source_library_id.clone(),
+                    preview.target_library_id.clone(),
+                ],
+            )
+            .await?;
+            let publication_guard = Arc::clone(&runtime.library_scan_publication_gate)
+                .lock_owned()
+                .await;
             let worker = runtime.clone();
             let id = payload.preview_id.clone();
             let revision = payload.revision;
+            let source_library_id = preview.source_library_id.clone();
+            let target_library_id = preview.target_library_id.clone();
+            let source_root_binding = bound_preview.source_root_binding;
+            let target_root_binding = bound_preview.target_root_binding;
+            let blocking_io_lease = Arc::clone(&io_lease);
             let migration = tokio::task::spawn_blocking(move || {
-                let persisted = locate_preview(&worker, &id)?;
-                let engine = engine(
-                    &worker,
-                    &persisted.source_library_id,
-                    &persisted.target_library_id,
+                let _io_lease = blocking_io_lease;
+                let (source_root, target_root) = worker
+                    .bot
+                    .queue
+                    .verified_video_library_roots_with_bindings(
+                        &source_library_id,
+                        &source_root_binding,
+                        &target_library_id,
+                        &target_root_binding,
+                    )?;
+                let source = manager_for_verified_root(&worker, source_root)?;
+                let target = manager_for_verified_root(&worker, target_root)?;
+                let persisted = locate_preview_for_source(
+                    &source,
+                    &id,
+                    &revision,
+                    &source_library_id,
+                    &target_library_id,
                 )?;
+                let engine =
+                    MigrationEngine::new(&source_library_id, source, &target_library_id, target)?;
                 let expected_default_revision = if persisted.set_target_default_on_success {
                     Some(worker.bot.queue.registry_snapshot()?.revision)
                 } else {
@@ -562,10 +678,10 @@ async fn dispatch_inner(
                     &revision,
                     expected_default_revision,
                 )?;
-                Ok::<_, anyhow::Error>((engine, status))
+                Ok::<_, anyhow::Error>((engine, status, publication_guard))
             })
             .await??;
-            let (engine, status) = migration;
+            let (engine, status, _publication_guard) = migration;
             ensure_message_context(runtime, &engine, &status, record.request.seq).await?;
             publish_status(runtime, status.clone()).await;
             start(runtime.clone(), status.clone()).await;

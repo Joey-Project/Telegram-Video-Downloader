@@ -1,4 +1,4 @@
-import { ACTION_QUEUE_LIMIT, ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_SETTINGS, appendAction, consumeRejectedActionReceipts, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, restorePendingActions, shouldRetryActionFailure } from "/file/action-queue.js";
+import { ACTION_QUEUE_LIMIT, ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_SETTINGS, appendAction, consumeRejectedActionReceipts, createQueuedAction, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "/file/action-queue.js";
 import { HttpResponseError } from "/file/http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "/file/snapshot-session.js";
 import { escapeHtml } from "/file/preview-rendering.js";
@@ -30,6 +30,7 @@ const state = {
   retryTimer: 0,
   refreshAfterDrain: false,
   quarantinedActionIds: new Set(),
+  unknownActionNotices: new Map(),
   localActions: new Map(),
   libraryDrafts: new Map(),
   toastTimer: 0,
@@ -239,11 +240,29 @@ async function drainActionQueue({ quiet = false } = {}) {
         excludedIds: state.quarantinedActionIds,
         dispatch: (action) => api("/actions", {
           method: "POST",
-          body: JSON.stringify({ request_id: action.request_id, kind: action.kind, payload: action.payload }),
+          body: JSON.stringify({
+            request_id: action.request_id,
+            kind: action.kind,
+            payload: action.payload,
+            queued_at_ms: action.queued_at_ms,
+            replay_expires_at_ms: action.replay_expires_at_ms,
+          }),
         }),
         onReceipt: (action, receipt, surface) => recordActionReceipt(action, receipt, state, { surface }),
       });
       if (outcome.status === "empty") break;
+      if (outcome.status === "outcome_unknown") {
+        state.quarantinedActionIds.add(outcome.action.request_id);
+        state.unknownActionNotices.set(outcome.action.request_id, outcome.action);
+        const local = state.localActions.get(outcome.action.request_id);
+        if (local) {
+          local.delivery_outcome = "outcome_unknown";
+          local.delivery_error_code = outcome.code;
+          local.delivery_error = outcome.error;
+        }
+        renderPending();
+        continue;
+      }
       if (outcome.status === "remove_failed") {
         if (!quiet) showToast("The request reached the cloud inbox, but this browser could not update its retry queue.");
         break;
@@ -313,11 +332,18 @@ async function drainActionQueue({ quiet = false } = {}) {
 
 async function submitAction(kind, payload, label, onQueued = null) {
   if (!mayDispatchActions(state)) return false;
-  const action = { request_id: crypto.randomUUID(), kind, payload, surface: ACTION_SURFACE_SETTINGS };
+  const action = createQueuedAction({ request_id: crypto.randomUUID(), kind, payload, surface: ACTION_SURFACE_SETTINGS });
   const queued = appendAction(readActionQueue(), action);
   if (!queued.ok) return showToast("The browser retry queue is full. Send its saved requests first."), false;
   if (!writeActionQueue(queued.queue)) return showToast("This browser could not save the request, so it was not sent."), false;
-  state.localActions.set(action.request_id, { kind, payload, label, seq: null });
+  state.localActions.set(action.request_id, {
+    kind,
+    payload,
+    label,
+    seq: null,
+    queued_at_ms: action.queued_at_ms,
+    replay_expires_at_ms: action.replay_expires_at_ms,
+  });
   onQueued?.();
   if (kind === "library_register") byId("register-form").dataset.pendingRequestId = action.request_id;
   showToast(navigator.onLine ? `${label} saved. Waiting for the desktop to apply it.` : `${label} saved in this browser. It has not reached the desktop.`);
@@ -428,19 +454,31 @@ function statusLabel(status) {
 
 function renderPending() {
   const snapshot = state.snapshot ?? {};
-  const local = readActionQueue().filter((action) => SETTINGS_KINDS.has(action.kind) && !state.quarantinedActionIds.has(action.request_id));
+  const queue = readActionQueue();
+  const unknownById = new Map(queue
+    .filter((action) => SETTINGS_KINDS.has(action.kind) && action.delivery_outcome === "outcome_unknown")
+    .map((action) => [action.request_id, action]));
+  for (const [requestId, action] of state.unknownActionNotices) {
+    if (SETTINGS_KINDS.has(action?.kind) && !unknownById.has(requestId)) unknownById.set(requestId, action);
+  }
+  const unknown = [...unknownById.values()];
+  const local = queue.filter((action) => SETTINGS_KINDS.has(action.kind)
+    && action.delivery_outcome !== "outcome_unknown"
+    && !state.quarantinedActionIds.has(action.request_id));
   const pending = (Array.isArray(snapshot.pending_requests) ? snapshot.pending_requests : [])
     .filter((entry) => SETTINGS_KINDS.has(entry?.kind));
   const inProgress = (Array.isArray(snapshot.operations) ? snapshot.operations : [])
     .filter((entry) => SETTINGS_KINDS.has(entry?.kind) && ["pending", "processing", "retryable"].includes(String(entry?.status)));
   const rows = [];
+  for (const action of unknown) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(action.kind))} · delivery outcome unknown</h3><p>${escapeHtml(action.delivery_error ?? "The replay window ended before a receipt could be confirmed. Check the desktop before dismissing this request.")}</p><p>This request will not be sent again automatically. Check the desktop for its result, then dismiss this notice.</p></div><span class="state-pill pending">Check desktop</span></div><button class="small-button" type="button" data-dismiss-unknown-action="${escapeHtml(action.request_id)}">I checked the desktop · dismiss</button></article>`);
   for (const action of local) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(action.kind))}</h3><p>Saved in this browser retry queue. No local change has been applied.</p></div><span class="state-pill pending">Browser queue</span></div></article>`);
   for (const request of pending) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(request.kind))}</h3><p>Saved in the cloud inbox. Waiting for the desktop; applied settings have not changed yet.</p></div><span class="state-pill pending">Waiting · #${escapeHtml(request.seq)}</span></div><p>Received ${escapeHtml(timeAgoMilliseconds(request.created_at))}</p></article>`);
   for (const operation of inProgress) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(operation.kind))}</h3><p>${escapeHtml(operation.error ?? "The desktop received this request and is working on it.")}</p></div><span class="state-pill pending">${escapeHtml(statusLabel(operation.status))}</span></div>${operation.updated_at ? `<p>Updated ${escapeHtml(timeAgoSeconds(operation.updated_at))}</p>` : ""}</article>`);
   byId("waiting-list").innerHTML = rows.length
     ? rows.join("")
     : '<div class="empty-state"><div class="empty-art" aria-hidden="true">✓</div><h2>Nothing is waiting</h2><p>New library requests appear here until the desktop finishes them.</p></div>';
-  const queuedCount = readActionQueue().filter((action) => !state.quarantinedActionIds.has(action.request_id)).length;
+  const queuedCount = queue.filter((action) => action.delivery_outcome !== "outcome_unknown"
+    && !state.quarantinedActionIds.has(action.request_id)).length;
   byId("queued-actions").textContent = queuedCount ? `${queuedCount} saved request${queuedCount === 1 ? "" : "s"}` : "";
 }
 
@@ -511,6 +549,23 @@ function displayedLibraryFromForm(form) {
 
 function bindEvents() {
   byId("refresh-button").addEventListener("click", () => refreshState());
+  byId("waiting-list").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-dismiss-unknown-action]");
+    if (!button) return;
+    const requestId = button.dataset.dismissUnknownAction;
+    const action = readActionQueue().find((entry) => entry.request_id === requestId && entry.delivery_outcome === "outcome_unknown")
+      ?? state.unknownActionNotices.get(requestId);
+    if (!action) return renderPending();
+    if (!window.confirm("Only dismiss this notice after checking the desktop for the request’s result. The browser will not send this request again.")) return;
+    if (!writeActionQueue(removeQueuedAction(readActionQueue(), requestId))) {
+      showToast("This browser could not dismiss the checked request. Its notice remains saved.");
+      return;
+    }
+    state.localActions.delete(requestId);
+    state.unknownActionNotices.delete(requestId);
+    state.quarantinedActionIds.delete(requestId);
+    renderPending();
+  });
   byId("register-form").addEventListener("submit", (event) => {
     event.preventDefault();
     const form = event.currentTarget;

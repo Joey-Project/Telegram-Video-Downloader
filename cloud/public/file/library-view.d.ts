@@ -28,12 +28,20 @@ export function resolveMediaLibrary(ownerSnapshot: unknown, requestedId?: string
 export function mediaLibraryAvailability(descriptor: MediaLibraryDescriptor | null | undefined): "available" | "offline" | "unknown";
 export function registeredMediaLibrary(ownerSnapshot: unknown, libraryId: string): MediaLibraryDescriptor | null;
 export function canOperateOnRegisteredMediaLibrary(ownerSnapshot: unknown, libraryId: string): boolean;
+export function isValidLibraryRootBinding(value: unknown): value is string;
 export function migrationEndpointAvailability(ownerSnapshot: unknown, sourceLibraryId: string, targetLibraryId: string): {
   sourceRegistered: boolean;
   targetRegistered: boolean;
   sourceAvailable: boolean;
   targetAvailable: boolean;
 };
+export function migrationPreviewBindingsMatch(
+  ownerSnapshot: unknown,
+  sourceLibraryId: string,
+  targetLibraryId: string,
+  sourceRootBinding: unknown,
+  targetRootBinding: unknown,
+): boolean;
 export function selectMigrationTarget(
   entries: readonly MediaLibraryDescriptor[] | null | undefined,
   sourceLibraryId: string,
@@ -51,6 +59,17 @@ export function renderMigrationTargetOptions(
 export function buildMigrationPreviewPayload(options: {
   sourceLibraryId: string;
   targetLibraryId: string;
+  sourceRootBinding: string;
+  targetRootBinding: string;
+  scope: "library" | "selected";
+  itemIds?: readonly string[];
+  includeIncompleteTasks?: boolean;
+  conflict?: "skip" | "keep_both";
+  setTargetDefaultOnSuccess?: boolean;
+}): Record<string, unknown> | null;
+export function buildMigrationPreviewPayloadFromRenderedOptions(options: {
+  sourceOption: { value?: unknown; dataset?: { rootBinding?: unknown } } | null | undefined;
+  targetOption: { value?: unknown; dataset?: { rootBinding?: unknown } } | null | undefined;
   scope: "library" | "selected";
   itemIds?: readonly string[];
   includeIncompleteTasks?: boolean;

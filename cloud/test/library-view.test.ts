@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { boundedFolderSuggestions, buildMigrationPreviewPayload, canOperateOnMediaLibrary, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget } from "../public/file/library-view.js";
+import { boundedFolderSuggestions, buildMigrationPreviewPayload, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnMediaLibrary, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget } from "../public/file/library-view.js";
 import { updateSelectionWithinLimit } from "../public/file/selection-limit.js";
 import { renderMigrationPreview } from "../public/file/migration-preview-rendering.js";
 import { escapeHtml } from "../public/file/preview-rendering.js";
@@ -143,8 +143,8 @@ describe("bounded library views", () => {
   });
 
   it("preserves the selected registered migration target across option rebuilds and uses it in the preview payload", () => {
-    const main = { id: "main", availability: "available" };
-    const archive = { id: "archive", availability: "available" };
+    const main = { id: "main", root_binding: `v1:${"a".repeat(64)}`, availability: "available" };
+    const archive = { id: "archive", root_binding: `v1:${"b".repeat(64)}`, availability: "available" };
     const added = { id: "added", availability: "available" };
     const canOperate = (id: string) => [main, archive, added].find((entry) => entry.id === id)?.availability === "available";
 
@@ -153,24 +153,58 @@ describe("bounded library views", () => {
 
     const rerender = selectMigrationTarget([main, added, archive], "main", "archive", canOperate);
     expect(rerender.selectedId).toBe("archive");
-    expect(renderMigrationTargetOptions(rerender, escapeHtml)).toContain('<option value="archive" selected>');
-    const payload = buildMigrationPreviewPayload({
-      sourceLibraryId: "main",
-      targetLibraryId: rerender.selectedId,
+    expect(renderMigrationTargetOptions(rerender, escapeHtml)).toContain(`<option value="archive" data-root-binding="${archive.root_binding}" selected>`);
+    const payload = buildMigrationPreviewPayloadFromRenderedOptions({
+      sourceOption: { value: "main", dataset: { rootBinding: main.root_binding } },
+      targetOption: { value: rerender.selectedId, dataset: { rootBinding: archive.root_binding } },
       scope: "library",
     });
     expect(payload?.target_library_id).toBe("archive");
+    expect(payload?.source_root_binding).toBe(main.root_binding);
+    expect(payload?.target_root_binding).toBe(archive.root_binding);
 
     const archiveOffline = { ...archive, availability: "offline" };
     const withOfflineCurrent = selectMigrationTarget([main, archiveOffline, added], "main", "archive", (id) => id !== "archive");
     expect(withOfflineCurrent.selectedId).toBe("archive");
     expect(withOfflineCurrent.availableTargets.map((entry) => entry.id)).toEqual(["added"]);
-    expect(renderMigrationTargetOptions(withOfflineCurrent, escapeHtml)).toContain('<option value="archive" selected disabled>');
+    expect(renderMigrationTargetOptions(withOfflineCurrent, escapeHtml)).toContain(`<option value="archive" data-root-binding="${archive.root_binding}" selected disabled>`);
 
     const removedTarget = selectMigrationTarget([main, added], "main", "archive", canOperate);
     expect(removedTarget.selectedId).toBe("added");
     const targetBecomesSource = selectMigrationTarget([main, added], "added", "added", canOperate);
     expect(targetBecomesSource.selectedId).toBe("main");
+  });
+
+  it("binds a preview to the rendered registration and rejects a same-ID replacement", () => {
+    const renderedSourceBinding = `v1:${"a".repeat(64)}`;
+    const renderedTargetBinding = `v1:${"b".repeat(64)}`;
+    const replacementTargetBinding = `v1:${"c".repeat(64)}`;
+    const payload = buildMigrationPreviewPayloadFromRenderedOptions({
+      sourceOption: { value: "source", dataset: { rootBinding: renderedSourceBinding } },
+      targetOption: { value: "target", dataset: { rootBinding: renderedTargetBinding } },
+      scope: "selected",
+      itemIds: ["item-1"],
+    });
+    const currentSnapshot = {
+      settings: { applied: { libraries: [
+        { id: "source", root_binding: renderedSourceBinding },
+        { id: "target", root_binding: replacementTargetBinding },
+      ] } },
+      library: { libraries: [
+        { id: "source", root_binding: renderedSourceBinding, availability: "available", snapshot: { items: [] } },
+        { id: "target", root_binding: replacementTargetBinding, availability: "available", snapshot: { items: [] } },
+      ] },
+    };
+
+    expect(isValidLibraryRootBinding(renderedTargetBinding)).toBe(true);
+    expect(payload).toMatchObject({
+      source_library_id: "source",
+      target_library_id: "target",
+      source_root_binding: renderedSourceBinding,
+      target_root_binding: renderedTargetBinding,
+      item_ids: ["item-1"],
+    });
+    expect(migrationPreviewBindingsMatch(currentSnapshot, "source", "target", payload?.source_root_binding, payload?.target_root_binding)).toBe(false);
   });
 
   it("disables migration Start for removed or offline descriptors and enables registered endpoints", () => {
@@ -181,6 +215,8 @@ describe("bounded library views", () => {
         revision: "revision-a",
         source_library_id: "main",
         target_library_id: "archive",
+        source_root_binding: `v1:${"a".repeat(64)}`,
+        target_root_binding: `v1:${"b".repeat(64)}`,
         scope: "library",
         conflict: "skip",
         include_incomplete_tasks: false,
@@ -198,23 +234,43 @@ describe("bounded library views", () => {
     const registry = {
       settings: { applied: { default_library_id: "main", libraries: [{ id: "main", is_default: true }, { id: "archive" }] } },
       library: { libraries: [
-        { id: "main", availability: "available", snapshot: { items: [] } },
-        { id: "archive", availability: "offline", snapshot: null },
+        { id: "main", root_binding: `v1:${"a".repeat(64)}`, availability: "available", snapshot: { items: [] } },
+        { id: "archive", root_binding: `v1:${"b".repeat(64)}`, availability: "offline", snapshot: null },
       ] },
     };
     const render = (targetLibraryId: string) => {
-      const preview = { ...operation, result: { ...operation.result, target_library_id: targetLibraryId } };
-      return renderMigrationPreview(preview, migrationEndpointAvailability(registry, "main", targetLibraryId));
+      const preview = { ...operation, result: {
+        ...operation.result,
+        target_library_id: targetLibraryId,
+        target_root_binding: targetLibraryId === "main" ? `v1:${"a".repeat(64)}` : operation.result.target_root_binding,
+      } };
+      return renderMigrationPreview(preview, {
+        ...migrationEndpointAvailability(registry, "main", targetLibraryId),
+        rootBindingsMatch: migrationPreviewBindingsMatch(registry, "main", targetLibraryId, preview.result.source_root_binding, preview.result.target_root_binding),
+      });
     };
 
     expect(render("removed")).toMatch(/data-migration-confirm="preview-a" data-revision="revision-a" disabled/u);
     expect(render("archive")).toMatch(/data-migration-confirm="preview-a" data-revision="revision-a" disabled/u);
     expect(render("main")).toContain('data-migration-confirm="preview-a" data-revision="revision-a" >Start migration</button>');
 
-    const legacy = { settings: { download_dir: "/Volumes/Main" }, library: { items: [] } };
-    const legacyPreview = { ...operation, result: { ...operation.result, source_library_id: "default", target_library_id: "default" } };
+    const legacy = {
+      settings: { download_dir: "/Volumes/Main" },
+      library: { root_label: "Main", items: [], categories: [], root_binding: `v1:${"a".repeat(64)}` },
+    };
+    const legacyPreview = { ...operation, result: {
+      ...operation.result,
+      source_library_id: "default",
+      target_library_id: "default",
+      source_root_binding: `v1:${"a".repeat(64)}`,
+      target_root_binding: `v1:${"a".repeat(64)}`,
+    } };
     const legacyEndpoints = migrationEndpointAvailability(legacy, "default", "default");
-    expect(renderMigrationPreview(legacyPreview, legacyEndpoints)).toContain('data-migration-confirm="preview-a" data-revision="revision-a" >Start migration</button>');
+    expect(resolveMediaLibrary(legacy, "default").descriptor?.root_binding).toBe(legacy.library.root_binding);
+    expect(renderMigrationPreview(legacyPreview, {
+      ...legacyEndpoints,
+      rootBindingsMatch: migrationPreviewBindingsMatch(legacy, "default", "default", legacyPreview.result.source_root_binding, legacyPreview.result.target_root_binding),
+    })).toContain('data-migration-confirm="preview-a" data-revision="revision-a" >Start migration</button>');
   });
 
   it("shows a whole-library migration's full item count separately from retained sample paths", () => {

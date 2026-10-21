@@ -1,4 +1,5 @@
 export const ACTION_QUEUE_LIMIT = 20;
+export const ACTION_REPLAY_WINDOW_MS = 6 * 24 * 60 * 60 * 1000;
 
 export const ACTION_SURFACE_SETTINGS = "settings";
 export const ACTION_SURFACE_FILE = "file";
@@ -7,6 +8,56 @@ export const ACTION_RECEIPT_STORAGE_PREFIX = "file-manager.action-receipt.v1:";
 const SETTINGS_ACTION_KINDS = new Set([
   "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove", "library_scan",
 ]);
+
+const MAX_ACTION_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const OUTCOME_UNKNOWN_CODES = new Set([
+  "action_replay_window_expired",
+  "action_replay_window_unverifiable",
+]);
+
+export function createQueuedAction(action, now = Date.now()) {
+  if (!action || typeof action !== "object" || Array.isArray(action)) {
+    throw new TypeError("Queued action must be an object");
+  }
+  if (!Number.isSafeInteger(now) || now <= 0 || now > Number.MAX_SAFE_INTEGER - ACTION_REPLAY_WINDOW_MS) {
+    throw new TypeError("Queued action timestamp is invalid");
+  }
+  const {
+    queued_at_ms: _queuedAt,
+    replay_expires_at_ms: _expiresAt,
+    delivery_outcome: _deliveryOutcome,
+    delivery_error_code: _deliveryCode,
+    delivery_error: _deliveryError,
+    ...freshAction
+  } = action;
+  return {
+    ...freshAction,
+    queued_at_ms: now,
+    replay_expires_at_ms: now + ACTION_REPLAY_WINDOW_MS,
+  };
+}
+
+export function actionReplayStatus(action, now = Date.now()) {
+  if (!action || typeof action !== "object" || Array.isArray(action)
+      || !Number.isSafeInteger(now) || now <= 0
+      || !Number.isSafeInteger(action.queued_at_ms) || action.queued_at_ms <= 0
+      || !Number.isSafeInteger(action.replay_expires_at_ms) || action.replay_expires_at_ms <= 0
+      || action.replay_expires_at_ms <= action.queued_at_ms
+      || action.replay_expires_at_ms - action.queued_at_ms > ACTION_REPLAY_WINDOW_MS
+      || action.queued_at_ms > now + MAX_ACTION_CLOCK_SKEW_MS) {
+    return {
+      status: "unverifiable",
+      code: "action_replay_window_unverifiable",
+    };
+  }
+  if (action.replay_expires_at_ms <= now) {
+    return {
+      status: "expired",
+      code: "action_replay_window_expired",
+    };
+  }
+  return { status: "valid", code: null };
+}
 
 export function appendAction(queue, action) {
   if (queue.length >= ACTION_QUEUE_LIMIT) return { ok: false, queue };
@@ -78,10 +129,38 @@ export async function dispatchNextOwnedAction({
   const action = nextQueuedActionForSurface(readQueue(), surface, excludedIds);
   if (!action) return { status: "empty" };
 
+  if (action.delivery_outcome === "outcome_unknown") {
+    excludedIds.add(action.request_id);
+    return {
+      status: "outcome_unknown",
+      action,
+      code: validOutcomeUnknownCode(action.delivery_error_code) ?? "action_replay_window_unverifiable",
+      error: boundedOutcomeUnknownMessage(action.delivery_error),
+      persisted: true,
+    };
+  }
+
+  const replay = actionReplayStatus(action);
+  if (replay.status !== "valid") {
+    excludedIds.add(action.request_id);
+    const error = replay.status === "expired"
+      ? "This saved request is past its safe replay window. Check the desktop before dismissing it."
+      : "This saved request has no verifiable replay window. Check the desktop before dismissing it.";
+    const persisted = persistOutcomeUnknown(action, replay.code, error, readQueue, writeQueue);
+    return { status: "outcome_unknown", action: { ...action, ...unknownFields(replay.code, error) }, code: replay.code, error, persisted };
+  }
+
   let receipt;
   try {
     receipt = await dispatch(action);
   } catch (error) {
+    if (isReplayWindowExpiry(error)) {
+      const code = "action_replay_window_expired";
+      const message = "The cloud no longer has a retained receipt for this request. Check the desktop before dismissing it.";
+      excludedIds.add(action.request_id);
+      const persisted = persistOutcomeUnknown(action, code, message, readQueue, writeQueue);
+      return { status: "outcome_unknown", action: { ...action, ...unknownFields(code, message) }, code, error: message, persisted };
+    }
     if (needsDurableReceipt(action, surface) && isPermanentReceiptRejection(error)) {
       const rejection = {
         outcome: "rejected",
@@ -121,6 +200,60 @@ export async function dispatchNextOwnedAction({
 
   const removed = writeQueue(removeQueuedAction(readQueue(), action.request_id));
   return { status: removed ? "sent" : "remove_failed", action, receipt, receiptUpdate };
+}
+
+function isReplayWindowExpiry(error) {
+  const status = error && typeof error === "object" ? error.status : undefined;
+  const code = error && typeof error === "object" ? error.code : undefined;
+  return code === "action_replay_window_expired" || status === 410;
+}
+
+function validOutcomeUnknownCode(value) {
+  return typeof value === "string" && OUTCOME_UNKNOWN_CODES.has(value) ? value : null;
+}
+
+function boundedOutcomeUnknownMessage(value) {
+  const text = String(value ?? "Delivery outcome is unknown. Check the desktop before dismissing this request.")
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  let bounded = "";
+  const encoder = new TextEncoder();
+  for (const character of text || "Delivery outcome is unknown. Check the desktop before dismissing this request.") {
+    if (encoder.encode(bounded + character).byteLength > 256) break;
+    bounded += character;
+  }
+  return bounded || "Delivery outcome is unknown. Check the desktop before dismissing this request.";
+}
+
+function unknownFields(code, error) {
+  return {
+    delivery_outcome: "outcome_unknown",
+    delivery_error_code: code,
+    delivery_error: boundedOutcomeUnknownMessage(error),
+  };
+}
+
+function persistOutcomeUnknown(action, code, error, readQueue, writeQueue) {
+  try {
+    const current = readQueue();
+    let found = false;
+    let changed = false;
+    const fields = unknownFields(code, error);
+    const updated = current.map((entry) => {
+      if (entry?.request_id !== action.request_id) return entry;
+      found = true;
+      if (entry.delivery_outcome === fields.delivery_outcome
+          && entry.delivery_error_code === fields.delivery_error_code
+          && entry.delivery_error === fields.delivery_error) return entry;
+      changed = true;
+      return { ...entry, ...fields };
+    });
+    if (!found) return false;
+    return !changed || writeQueue(updated) === true;
+  } catch {
+    return false;
+  }
 }
 
 function needsDurableReceipt(action, surface) {
@@ -408,22 +541,47 @@ export function restorePendingActions(state, { surface, readQueue, writeQueue } 
   const candidates = [];
   if (surface === ACTION_SURFACE_SETTINGS && state?.localActions instanceof Map) {
     for (const [requestId, local] of state.localActions) {
-      if (local?.seq !== null || local?.rejected === true || !SETTINGS_ACTION_KINDS.has(local.kind) || !validRequestId(requestId)
+      if (local?.seq !== null || local?.rejected === true || local?.delivery_outcome === "outcome_unknown"
+          || !SETTINGS_ACTION_KINDS.has(local.kind) || !validRequestId(requestId)
           || !local.payload || typeof local.payload !== "object") continue;
-      candidates.push({ request_id: requestId, kind: local.kind, payload: local.payload, surface });
+      candidates.push({
+        request_id: requestId,
+        kind: local.kind,
+        payload: local.payload,
+        surface,
+        ...replayWindowFields(local),
+        ...unknownTrackerFields(local),
+      });
     }
   }
   if (surface === ACTION_SURFACE_FILE) {
     const submission = state?.downloadSubmission;
-    if (submission?.seq === null && submission?.rejected !== true && validRequestId(submission.request_id)
+    if (submission?.seq === null && submission?.rejected !== true && submission?.delivery_outcome !== "outcome_unknown"
+        && validRequestId(submission.request_id)
         && submission.payload && typeof submission.payload === "object") {
-      candidates.push({ request_id: submission.request_id, kind: "download_submit", payload: submission.payload, surface });
+      candidates.push({
+        request_id: submission.request_id,
+        kind: "download_submit",
+        payload: submission.payload,
+        surface,
+        ...replayWindowFields(submission),
+        ...unknownTrackerFields(submission),
+      });
     }
     if (state?.migrationConflictDrafts instanceof Map) {
       for (const draft of state.migrationConflictDrafts.values()) {
-        if (draft?.refreshSeq !== null || !validRequestId(draft?.refreshRequestId)
+        if (draft?.refreshSeq !== null || draft?.refreshDeliveryOutcome === "outcome_unknown"
+            || !validRequestId(draft?.refreshRequestId)
             || !draft.refreshPayload || typeof draft.refreshPayload !== "object") continue;
-        candidates.push({ request_id: draft.refreshRequestId, kind: "library_migration_preview", payload: draft.refreshPayload, surface });
+        candidates.push({
+          request_id: draft.refreshRequestId,
+          kind: "library_migration_preview",
+          payload: draft.refreshPayload,
+          surface,
+          ...(draft.refreshQueuedAtMs === undefined ? {} : { queued_at_ms: draft.refreshQueuedAtMs }),
+          ...(draft.refreshExpiresAtMs === undefined ? {} : { replay_expires_at_ms: draft.refreshExpiresAtMs }),
+          ...(draft.refreshDeliveryOutcome === "outcome_unknown" ? { delivery_outcome: "outcome_unknown" } : {}),
+        });
       }
     }
   }
@@ -444,6 +602,23 @@ export function restorePendingActions(state, { surface, readQueue, writeQueue } 
   }
   if (result.requeued > 0 && !writeQueue(restored)) result.writeFailed = true;
   return result;
+}
+
+function replayWindowFields(tracker) {
+  return {
+    ...(Object.prototype.hasOwnProperty.call(tracker, "queued_at_ms") ? { queued_at_ms: tracker.queued_at_ms } : {}),
+    ...(Object.prototype.hasOwnProperty.call(tracker, "replay_expires_at_ms") ? { replay_expires_at_ms: tracker.replay_expires_at_ms } : {}),
+  };
+}
+
+function unknownTrackerFields(tracker) {
+  return tracker.delivery_outcome === "outcome_unknown"
+    ? {
+      delivery_outcome: "outcome_unknown",
+      ...(tracker.delivery_error_code ? { delivery_error_code: tracker.delivery_error_code } : {}),
+      ...(tracker.delivery_error ? { delivery_error: tracker.delivery_error } : {}),
+    }
+    : {};
 }
 
 export function shouldRetryActionFailure(error) {

@@ -1,6 +1,7 @@
 export const MAX_MIGRATION_ITEM_CONFLICTS = 10_000;
 
 const POLICIES = new Set(["skip", "keep_both"]);
+const ROOT_BINDING_PATTERN = /^v1:[0-9a-f]{64}$/u;
 
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -45,6 +46,8 @@ export function migrationConflictChoicesChanged(original, draft) {
 export function buildMigrationPreviewRefreshPayload(result, itemConflicts, supersedes) {
   if (!isRecord(result) || !["library", "selected"].includes(result.scope)) return null;
   if (typeof result.source_library_id !== "string" || typeof result.target_library_id !== "string") return null;
+  if (typeof result.source_root_binding !== "string" || !ROOT_BINDING_PATTERN.test(result.source_root_binding)
+      || typeof result.target_root_binding !== "string" || !ROOT_BINDING_PATTERN.test(result.target_root_binding)) return null;
   if (!isRecord(supersedes)
     || !Number.isSafeInteger(supersedes.seq) || supersedes.seq <= 0
     || typeof supersedes.id !== "string" || !supersedes.id.trim()
@@ -56,6 +59,8 @@ export function buildMigrationPreviewRefreshPayload(result, itemConflicts, super
   const payload = {
     source_library_id: result.source_library_id,
     target_library_id: result.target_library_id,
+    source_root_binding: result.source_root_binding,
+    target_root_binding: result.target_root_binding,
     scope: result.scope,
     include_incomplete_tasks: result.include_incomplete_tasks === true,
     conflict: result.conflict === "keep_both" ? "keep_both" : "skip",
@@ -76,6 +81,8 @@ export function migrationRefreshMatches(result, expected) {
   if (!isRecord(result) || !isRecord(expected)) return false;
   const fieldsMatch = result.source_library_id === expected.source_library_id
     && result.target_library_id === expected.target_library_id
+    && result.source_root_binding === expected.source_root_binding
+    && result.target_root_binding === expected.target_root_binding
     && result.scope === expected.scope
     && (result.include_incomplete_tasks === true) === (expected.include_incomplete_tasks === true)
     && (result.conflict === "keep_both" ? "keep_both" : "skip") === expected.conflict

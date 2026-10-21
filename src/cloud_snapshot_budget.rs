@@ -272,7 +272,9 @@ pub(crate) fn preview_snapshots(
                 {
                     for (field, max_json_bytes) in [
                         ("source_library_id", 256),
+                        ("source_root_binding", 80),
                         ("target_library_id", 256),
+                        ("target_root_binding", 80),
                         ("scope", 64),
                         ("conflict", 64),
                         ("include_incomplete_tasks", 8),
@@ -281,6 +283,13 @@ pub(crate) fn preview_snapshots(
                         if let Some(value) =
                             exact_bounded_scalar_field(result, field, max_json_bytes)
                         {
+                            if matches!(field, "source_root_binding" | "target_root_binding")
+                                && value
+                                    .as_str()
+                                    .is_none_or(|binding| !valid_root_binding_token(binding))
+                            {
+                                continue;
+                            }
                             fields.insert(field.to_string(), value);
                         }
                     }
@@ -377,6 +386,8 @@ fn compact_migration_preview_summary(record: &InboxRecord, result: &Value) -> Op
 
     let source_library_id = exact_bounded_scalar_field(result, "source_library_id", 256)?;
     let target_library_id = exact_bounded_scalar_field(result, "target_library_id", 256)?;
+    let source_root_binding = exact_bounded_scalar_field(result, "source_root_binding", 80)?;
+    let target_root_binding = exact_bounded_scalar_field(result, "target_root_binding", 80)?;
     let scope = exact_bounded_scalar_field(result, "scope", 64)?;
     let conflict = exact_bounded_scalar_field(result, "conflict", 64)?;
     let include_incomplete_tasks =
@@ -385,6 +396,8 @@ fn compact_migration_preview_summary(record: &InboxRecord, result: &Value) -> Op
         exact_bounded_scalar_field(result, "set_target_default_on_success", 8)?;
     if source_library_id.as_str().is_none()
         || target_library_id.as_str().is_none()
+        || !valid_root_binding_token(source_root_binding.as_str()?)
+        || !valid_root_binding_token(target_root_binding.as_str()?)
         || scope.as_str().is_none()
         || conflict.as_str().is_none()
         || include_incomplete_tasks.as_bool().is_none()
@@ -484,7 +497,9 @@ fn compact_migration_preview_summary(record: &InboxRecord, result: &Value) -> Op
         "id": id,
         "revision": result_revision,
         "source_library_id": source_library_id,
+        "source_root_binding": source_root_binding,
         "target_library_id": target_library_id,
+        "target_root_binding": target_root_binding,
         "scope": scope,
         "conflict": conflict,
         "include_incomplete_tasks": include_incomplete_tasks,
@@ -511,6 +526,14 @@ fn compact_migration_preview_summary(record: &InboxRecord, result: &Value) -> Op
     });
     json_size_within(&envelope, MAX_MIGRATION_PREVIEW_SUMMARY_BYTES)?;
     Some(envelope)
+}
+
+fn valid_root_binding_token(value: &str) -> bool {
+    value.len() == 67
+        && value.starts_with("v1:")
+        && value[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn exact_bounded_scalar_field(result: &Value, field: &str, max_json_bytes: usize) -> Option<Value> {
@@ -920,7 +943,9 @@ mod tests {
             "id": format!("migration-preview-{seq}"),
             "revision": format!("migration-revision-{seq}"),
             "source_library_id": "library-source",
+            "source_root_binding": format!("v1:{}", "a".repeat(64)),
             "target_library_id": "library-target",
+            "target_root_binding": format!("v1:{}", "b".repeat(64)),
             "scope": "library",
             "item_ids": item_ids,
             "conflict": "skip",
@@ -1541,7 +1566,9 @@ mod tests {
             "id": "migration-preview-1",
             "revision": "migration-revision-1",
             "source_library_id": "library-main",
+            "source_root_binding": format!("v1:{}", "a".repeat(64)),
             "target_library_id": "library-archive",
+            "target_root_binding": format!("v1:{}", "b".repeat(64)),
             "scope": "selected",
             "item_ids": ["video-1"],
             "conflict": "skip",
@@ -1610,7 +1637,15 @@ mod tests {
         assert_eq!(summary["id"], "migration-preview-42");
         assert_eq!(summary["revision"], "migration-revision-42");
         assert_eq!(summary["source_library_id"], "library-source");
+        assert_eq!(
+            summary["source_root_binding"],
+            format!("v1:{}", "a".repeat(64))
+        );
         assert_eq!(summary["target_library_id"], "library-target");
+        assert_eq!(
+            summary["target_root_binding"],
+            format!("v1:{}", "b".repeat(64))
+        );
         assert_eq!(summary["scope"], "library");
         assert_eq!(summary["conflict"], "skip");
         assert_eq!(summary["include_incomplete_tasks"], true);

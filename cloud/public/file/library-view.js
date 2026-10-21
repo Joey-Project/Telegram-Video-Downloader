@@ -5,6 +5,10 @@ function validRootBinding(value) {
   return typeof value === "string" && /^v1:[0-9a-f]{64}$/u.test(value);
 }
 
+export function isValidLibraryRootBinding(value) {
+  return validRootBinding(value);
+}
+
 function hasInvalidRootBinding(entry) {
   return Boolean(entry && Object.hasOwn(entry, "root_binding") && entry.root_binding != null
     && !validRootBinding(entry.root_binding));
@@ -52,6 +56,7 @@ export function mediaLibraryEntries(ownerSnapshot) {
       id,
       name: String(library.root_label ?? "Default library"),
       root: String(ownerSnapshot?.settings?.download_dir ?? ""),
+      ...(Object.hasOwn(library, "root_binding") ? { root_binding: library.root_binding } : {}),
       default_category: String(applied?.default_category ?? ""),
       is_default: true,
       availability: library.availability,
@@ -113,6 +118,13 @@ export function migrationEndpointAvailability(ownerSnapshot, sourceLibraryId, ta
   };
 }
 
+export function migrationPreviewBindingsMatch(ownerSnapshot, sourceLibraryId, targetLibraryId, sourceRootBinding, targetRootBinding) {
+  if (!validRootBinding(sourceRootBinding) || !validRootBinding(targetRootBinding)) return false;
+  const source = registeredMediaLibrary(ownerSnapshot, sourceLibraryId);
+  const target = registeredMediaLibrary(ownerSnapshot, targetLibraryId);
+  return source?.root_binding === sourceRootBinding && target?.root_binding === targetRootBinding;
+}
+
 export function selectMigrationTarget(entries, sourceLibraryId, currentTargetId, canOperate = () => true) {
   const targets = (Array.isArray(entries) ? entries : []).filter((entry) => entry?.id !== sourceLibraryId);
   const availableTargets = targets.filter((entry) => canOperate(entry.id));
@@ -127,13 +139,15 @@ export function renderMigrationTargetOptions(selection, escapeHtml) {
   return selection.targets.map((entry) => {
     const available = selection.availableTargets.some((candidate) => candidate.id === entry.id);
     const selected = entry.id === selection.selectedId;
-    return `<option value="${escapeHtml(entry.id)}"${selected ? " selected" : ""}${available ? "" : " disabled"}>${escapeHtml(entry.name)} · ${escapeHtml(entry.root ?? "root unavailable")}${available ? "" : " · offline"}</option>`;
+    return `<option value="${escapeHtml(entry.id)}" data-root-binding="${escapeHtml(entry.root_binding ?? "")}"${selected ? " selected" : ""}${available ? "" : " disabled"}>${escapeHtml(entry.name)} · ${escapeHtml(entry.root ?? "root unavailable")}${available ? "" : " · offline"}</option>`;
   }).join("");
 }
 
 export function buildMigrationPreviewPayload({
   sourceLibraryId,
   targetLibraryId,
+  sourceRootBinding,
+  targetRootBinding,
   scope,
   itemIds = [],
   includeIncompleteTasks = false,
@@ -142,16 +156,33 @@ export function buildMigrationPreviewPayload({
 } = {}) {
   if (typeof sourceLibraryId !== "string" || !sourceLibraryId
       || typeof targetLibraryId !== "string" || !targetLibraryId || sourceLibraryId === targetLibraryId) return null;
+  if (!validRootBinding(sourceRootBinding) || !validRootBinding(targetRootBinding)) return null;
   if (scope !== "library" && scope !== "selected") return null;
   return {
     source_library_id: sourceLibraryId,
     target_library_id: targetLibraryId,
+    source_root_binding: sourceRootBinding,
+    target_root_binding: targetRootBinding,
     scope,
     ...(scope === "selected" ? { item_ids: Array.isArray(itemIds) ? [...itemIds] : [] } : {}),
     include_incomplete_tasks: includeIncompleteTasks === true,
     conflict: conflict === "keep_both" ? "keep_both" : "skip",
     set_target_default_on_success: setTargetDefaultOnSuccess === true,
   };
+}
+
+export function buildMigrationPreviewPayloadFromRenderedOptions({
+  sourceOption,
+  targetOption,
+  ...options
+} = {}) {
+  return buildMigrationPreviewPayload({
+    ...options,
+    sourceLibraryId: sourceOption?.value,
+    targetLibraryId: targetOption?.value,
+    sourceRootBinding: sourceOption?.dataset?.rootBinding,
+    targetRootBinding: targetOption?.dataset?.rootBinding,
+  });
 }
 
 export function canOperateOnMediaLibrary(descriptor) {

@@ -44,6 +44,8 @@ export type ConflictPolicy = "skip" | "keep_both";
 export interface LibraryMigrationPreviewPayload {
   source_library_id: string;
   target_library_id: string;
+  source_root_binding: string;
+  target_root_binding: string;
   scope: "library" | "selected";
   item_ids?: string[];
   include_incomplete_tasks?: boolean;
@@ -68,6 +70,8 @@ export interface ActionRequest {
   request_id: string;
   kind: Exclude<RequestKind, "telegram">;
   payload: Record<string, unknown>;
+  queued_at_ms: number;
+  replay_expires_at_ms: number;
 }
 
 export interface BoundLibraryMutationIdentity extends Record<string, unknown> {
@@ -126,6 +130,7 @@ export class HttpError extends Error {
     readonly stateVersion?: number,
     readonly databaseEpoch?: string,
     readonly sequenceConflict?: number,
+    readonly code?: string,
   ) {
     super(message);
     this.name = "HttpError";

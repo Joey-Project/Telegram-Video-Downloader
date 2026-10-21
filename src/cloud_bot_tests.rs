@@ -1133,6 +1133,34 @@ fn cloud_test_root_binding(queue: &QueueManager, library_id: &str) -> String {
         .expect("registered library should have a root binding")
 }
 
+fn bound_migration_preview_payload(
+    queue: &QueueManager,
+    source_library_id: &str,
+    target_library_id: &str,
+    mut options: serde_json::Value,
+) -> serde_json::Value {
+    let payload = options
+        .as_object_mut()
+        .expect("migration preview options should be a JSON object");
+    payload.insert(
+        "source_library_id".to_string(),
+        serde_json::json!(source_library_id),
+    );
+    payload.insert(
+        "source_root_binding".to_string(),
+        serde_json::json!(cloud_test_root_binding(queue, source_library_id)),
+    );
+    payload.insert(
+        "target_library_id".to_string(),
+        serde_json::json!(target_library_id),
+    );
+    payload.insert(
+        "target_root_binding".to_string(),
+        serde_json::json!(cloud_test_root_binding(queue, target_library_id)),
+    );
+    options
+}
+
 async fn dispatch_download_for_test(
     runtime: &CloudBotRuntime,
     seq: u64,
@@ -1914,10 +1942,21 @@ async fn media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e
             Arc::clone(&inbox),
         );
         let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
-        let preview=run_library_management_test_request(&runtime,901,"library_migration_preview",serde_json::json!({
-            "source_library_id":source.library_id,"target_library_id":target.id,"scope":"library",
-            "conflict":"skip","include_incomplete_tasks":include_tasks,"set_target_default_on_success":true,
-        })).await;
+        let preview = run_library_management_test_request(
+            &runtime,
+            901,
+            "library_migration_preview",
+            bound_migration_preview_payload(
+                &queue,
+                &source.library_id,
+                &target.id,
+                serde_json::json!({
+                    "scope":"library", "conflict":"skip", "include_incomplete_tasks":include_tasks,
+                    "set_target_default_on_success":true,
+                }),
+            ),
+        )
+        .await;
         assert_eq!(
             preview.status,
             InboxStatus::AwaitingConfirmation,
@@ -2590,10 +2629,14 @@ async fn queued_download_relocates_and_resumes_without_cancel_reply_mock_e2e() {
         &runtime,
         952,
         "library_migration_preview",
-        serde_json::json!({
-            "source_library_id":source.library_id,"target_library_id":target.id,"scope":"library",
-            "conflict":"skip","include_incomplete_tasks":true,
-        }),
+        bound_migration_preview_payload(
+            &queue,
+            &source.library_id,
+            &target.id,
+            serde_json::json!({
+                "scope":"library", "conflict":"skip", "include_incomplete_tasks":true,
+            }),
+        ),
     )
     .await;
     assert_eq!(
@@ -2764,8 +2807,14 @@ async fn partial_task_migration_keep_both_rewrites_published_paths_mock_e2e() {
         Arc::clone(&inbox),
     );
     let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
-    let base = serde_json::json!({"source_library_id":source.library_id,"target_library_id":target.id,
-        "scope":"library","include_incomplete_tasks":true,"conflict":"skip"});
+    let base = bound_migration_preview_payload(
+        &queue,
+        &source.library_id,
+        &target.id,
+        serde_json::json!({
+            "scope":"library", "include_incomplete_tasks":true, "conflict":"skip"
+        }),
+    );
     let rejected = run_library_management_test_request(
         &runtime,
         971,
@@ -7758,10 +7807,14 @@ async fn media_library_migration_uses_per_bundle_conflict_choices_mock_e2e() {
         &runtime,
         951,
         "library_migration_preview",
-        serde_json::json!({
-            "source_library_id": source.library_id, "target_library_id": target.id,
-            "scope": "library", "conflict": "skip", "item_conflicts": { (one.id.clone()): "keep_both" },
-        }),
+        bound_migration_preview_payload(
+            &queue,
+            &source.library_id,
+            &target.id,
+            serde_json::json!({
+                "scope": "library", "conflict": "skip", "item_conflicts": { (one.id.clone()): "keep_both" },
+            }),
+        ),
     )
     .await;
     assert_eq!(

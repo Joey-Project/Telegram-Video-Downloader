@@ -64,6 +64,58 @@ fn library_root_binding(queue: &QueueManager, library_id: &str) -> String {
         .expect("registered library should have a bound root token")
 }
 
+fn snapshot_library_metadata_tree(
+    root: &Path,
+) -> std::collections::BTreeMap<PathBuf, (bool, Vec<u8>)> {
+    fn walk(
+        base: &Path,
+        current: &Path,
+        entries: &mut std::collections::BTreeMap<PathBuf, (bool, Vec<u8>)>,
+    ) {
+        let mut children = fs::read_dir(current)
+            .expect("library metadata directory should remain readable")
+            .map(|entry| entry.expect("library metadata entry should load").path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for path in children {
+            let kind = fs::symlink_metadata(&path)
+                .expect("library metadata entry identity should load")
+                .file_type();
+            assert!(
+                !kind.is_symlink(),
+                "fixture metadata must not contain symlinks"
+            );
+            let relative = path
+                .strip_prefix(base)
+                .expect("metadata entries should remain under the library root")
+                .to_path_buf();
+            if kind.is_dir() {
+                entries.insert(relative.clone(), (true, Vec::new()));
+                walk(base, &path, entries);
+            } else {
+                assert!(
+                    kind.is_file(),
+                    "library metadata entries should be regular files"
+                );
+                entries.insert(
+                    relative,
+                    (
+                        false,
+                        fs::read(&path).expect("library metadata file should read"),
+                    ),
+                );
+            }
+        }
+    }
+
+    let metadata_root = root.join(".telegram-video-downloader-library");
+    let mut entries = std::collections::BTreeMap::new();
+    if metadata_root.exists() {
+        walk(&metadata_root, &metadata_root, &mut entries);
+    }
+    entries
+}
+
 fn migration_engine_for_test(
     runtime: &CloudBotRuntime,
     source_library_id: &str,
@@ -107,13 +159,16 @@ async fn create_and_confirm_migration(
         runtime,
         preview_seq,
         "library_migration_preview",
-        serde_json::json!({
-            "source_library_id": source_library_id,
-            "target_library_id": target_library_id,
-            "scope": "library",
-            "conflict": "skip",
-            "include_incomplete_tasks": false,
-        }),
+        bound_migration_preview_payload(
+            &runtime.bot.queue,
+            source_library_id,
+            target_library_id,
+            serde_json::json!({
+                "scope": "library",
+                "conflict": "skip",
+                "include_incomplete_tasks": false,
+            }),
+        ),
     )
     .await;
     assert_eq!(
@@ -160,13 +215,16 @@ async fn expired_migration_preview_projects_stale_without_hiding_a_live_preview(
         Arc::clone(&inbox),
     );
     let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
-    let payload = serde_json::json!({
-        "source_library_id": fixture.source_library_id,
-        "target_library_id": fixture.target_library_id,
-        "scope": "library",
-        "conflict": "skip",
-        "include_incomplete_tasks": false,
-    });
+    let payload = bound_migration_preview_payload(
+        &queue,
+        &fixture.source_library_id,
+        &fixture.target_library_id,
+        serde_json::json!({
+            "scope": "library",
+            "conflict": "skip",
+            "include_incomplete_tasks": false,
+        }),
+    );
     let expired_record = run_library_management_test_request(
         &runtime,
         3_301,
@@ -190,9 +248,13 @@ async fn expired_migration_preview_projects_stale_without_hiding_a_live_preview(
         .expect("migration preview should have a revision")
         .to_string();
 
-    let live_record =
-        run_library_management_test_request(&runtime, 3_302, "library_migration_preview", payload)
-            .await;
+    let live_record = run_library_management_test_request(
+        &runtime,
+        3_302,
+        "library_migration_preview",
+        payload.clone(),
+    )
+    .await;
     assert_eq!(
         live_record.status,
         InboxStatus::AwaitingConfirmation,
@@ -213,13 +275,7 @@ async fn expired_migration_preview_projects_stale_without_hiding_a_live_preview(
         &runtime,
         3_303,
         "library_migration_preview",
-        serde_json::json!({
-            "source_library_id": fixture.source_library_id,
-            "target_library_id": fixture.target_library_id,
-            "scope": "library",
-            "conflict": "skip",
-            "include_incomplete_tasks": false,
-        }),
+        payload.clone(),
     )
     .await;
     assert_eq!(unknown_record.status, InboxStatus::AwaitingConfirmation);
@@ -354,13 +410,16 @@ async fn migration_preview_and_discovery_reject_replaced_registered_roots() {
     let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
 
     let preview_payload = || {
-        serde_json::json!({
-            "source_library_id": source_id.clone(),
-            "target_library_id": target_id.clone(),
-            "scope": "library",
-            "conflict": "skip",
-            "include_incomplete_tasks": false,
-        })
+        bound_migration_preview_payload(
+            &queue,
+            &source_id,
+            &target_id,
+            serde_json::json!({
+                "scope": "library",
+                "conflict": "skip",
+                "include_incomplete_tasks": false,
+            }),
+        )
     };
     let baseline = run_library_management_test_request(
         &runtime,
@@ -500,6 +559,293 @@ async fn migration_preview_and_discovery_reject_replaced_registered_roots() {
     drop(queue);
     stop_fake_telegram_api(shutdown, server).await;
     let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn migration_preview_requires_displayed_bindings_before_opening_managers() {
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "migration-preview-required-root-bindings",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let source_metadata_before = snapshot_library_metadata_tree(&fixture.video_root);
+    let target_metadata_before = snapshot_library_metadata_tree(&fixture.archive_root);
+    let runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let source_binding = library_root_binding(&queue, &fixture.source_library_id);
+    let target_binding = library_root_binding(&queue, &fixture.target_library_id);
+
+    let mut cases = vec![
+        (
+            4_201,
+            serde_json::json!({
+                "source_library_id": fixture.source_library_id,
+                "target_library_id": fixture.target_library_id,
+                "scope": "library", "conflict": "skip",
+            }),
+            "both displayed root bindings are required",
+        ),
+        (
+            4_202,
+            serde_json::json!({
+                "source_library_id": fixture.source_library_id,
+                "source_root_binding": source_binding,
+                "target_library_id": fixture.target_library_id,
+                "scope": "library", "conflict": "skip",
+            }),
+            "the target displayed root binding is required",
+        ),
+        (
+            4_203,
+            serde_json::json!({
+                "source_library_id": fixture.source_library_id,
+                "source_root_binding": "v1:bad",
+                "target_library_id": fixture.target_library_id,
+                "target_root_binding": target_binding,
+                "scope": "library", "conflict": "skip",
+            }),
+            "malformed source binding must be rejected",
+        ),
+        (
+            4_204,
+            serde_json::json!({
+                "source_library_id": fixture.source_library_id,
+                "source_root_binding": source_binding,
+                "target_library_id": fixture.target_library_id,
+                "target_root_binding": "V1:INVALID",
+                "scope": "library", "conflict": "skip",
+            }),
+            "malformed target binding must be rejected",
+        ),
+    ];
+    for (seq, payload, context) in cases.drain(..) {
+        let record = run_library_management_test_request(
+            &runtime,
+            seq,
+            "library_migration_preview",
+            payload,
+        )
+        .await;
+        assert_eq!(
+            record.status,
+            InboxStatus::Failed,
+            "{context}: {:?}",
+            record.error
+        );
+        assert!(record.error.is_some(), "{context} should be actionable");
+    }
+    assert_eq!(
+        snapshot_library_metadata_tree(&fixture.video_root),
+        source_metadata_before,
+        "missing/malformed tokens must not initialize or mutate source library metadata"
+    );
+    assert_eq!(
+        snapshot_library_metadata_tree(&fixture.archive_root),
+        target_metadata_before,
+        "missing/malformed tokens must not initialize or mutate target library metadata"
+    );
+
+    let valid = run_library_management_test_request(
+        &runtime,
+        4_205,
+        "library_migration_preview",
+        bound_migration_preview_payload(
+            &queue,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+            serde_json::json!({"scope":"library", "conflict":"skip"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        valid.status,
+        InboxStatus::AwaitingConfirmation,
+        "current displayed root bindings should authorize a preview: {:?}",
+        valid.error
+    );
+    let result = valid
+        .result
+        .expect("valid preview should persist its result");
+    assert_eq!(result["source_root_binding"], source_binding);
+    assert_eq!(result["target_root_binding"], target_binding);
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    runtime.signal_epoch_fatal();
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[tokio::test]
+async fn migration_preview_binding_pair_survives_restart_and_same_root_reregistration() {
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "migration-preview-binding-restart-reregistration",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    fs::write(
+        fixture.video_root.join("root-bound.mp4"),
+        b"bound preview media",
+    )
+    .expect("preview source media should write");
+    let first_source_binding = library_root_binding(&queue, &fixture.source_library_id);
+    let first_target_binding = library_root_binding(&queue, &fixture.target_library_id);
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let first = run_library_management_test_request(
+        &runtime,
+        5_101,
+        "library_migration_preview",
+        bound_migration_preview_payload(
+            &queue,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+            serde_json::json!({"scope":"library", "conflict":"skip"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        first.status,
+        InboxStatus::AwaitingConfirmation,
+        "initial preview should persist: {:?}",
+        first.error
+    );
+    let first_result = first.result.expect("initial preview result should persist");
+    assert_eq!(first_result["source_root_binding"], first_source_binding);
+    assert_eq!(first_result["target_root_binding"], first_target_binding);
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    runtime.signal_epoch_fatal();
+    drop(runtime);
+    drop(inbox);
+
+    queue
+        .remove_video_library(&fixture.target_library_id)
+        .expect("an unreferenced preview should not prevent test unregister");
+    let target = queue
+        .register_video_library("Archive", &fixture.archive_root, None, false, false)
+        .expect("same root object should be allowed to register again");
+    assert_eq!(target.id, fixture.target_library_id);
+    let current_source_binding = library_root_binding(&queue, &fixture.source_library_id);
+    let current_target_binding = library_root_binding(&queue, &fixture.target_library_id);
+    assert_eq!(current_source_binding, first_source_binding);
+    assert_ne!(
+        current_target_binding, first_target_binding,
+        "re-registration must create a new displayed registration identity even for the same inode"
+    );
+
+    let reopened_inbox = Arc::new(
+        CloudInbox::open_for_epoch(&fixture.video_root, crate::cloud::TEST_DATABASE_EPOCH)
+            .expect("same-epoch inbox should reopen"),
+    );
+    let reopened_runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&reopened_inbox),
+    );
+    let reopened_dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
+    let source_metadata_before = snapshot_library_metadata_tree(&fixture.video_root);
+    let target_metadata_before = snapshot_library_metadata_tree(&fixture.archive_root);
+
+    let stale_refresh = run_library_management_test_request(
+        &reopened_runtime,
+        5_102,
+        "library_migration_preview",
+        bound_migration_preview_payload(
+            &queue,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+            serde_json::json!({
+                "scope":"library", "conflict":"skip",
+                "supersedes_preview_seq":5_101,
+                "supersedes_preview_id":first_result["id"],
+                "supersedes_revision":first_result["revision"],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(stale_refresh.status, InboxStatus::Failed);
+    assert!(stale_refresh.error.as_deref().is_some_and(|error| {
+        error.contains("root identity changed") || error.contains("fresh preview")
+    }));
+    assert_eq!(
+        reopened_inbox.record(5_101).unwrap().unwrap().status,
+        InboxStatus::AwaitingConfirmation,
+        "a rejected refresh must not invalidate the persisted preview for its old pair"
+    );
+
+    let stale_confirmation = run_library_management_test_request(
+        &reopened_runtime,
+        5_103,
+        "library_migration_confirm",
+        serde_json::json!({
+            "preview_id": first_result["id"], "revision": first_result["revision"],
+        }),
+    )
+    .await;
+    assert_eq!(stale_confirmation.status, InboxStatus::Failed);
+    assert!(
+        stale_confirmation
+            .error
+            .as_deref()
+            .is_some_and(|error| { error.contains("root identity changed") })
+    );
+    assert_eq!(
+        snapshot_library_metadata_tree(&fixture.video_root),
+        source_metadata_before,
+        "stale refresh/confirmation must not reopen or mutate source library metadata"
+    );
+    assert_eq!(
+        snapshot_library_metadata_tree(&fixture.archive_root),
+        target_metadata_before,
+        "stale refresh/confirmation must not open or mutate re-registered target metadata"
+    );
+
+    let fresh_preview = run_library_management_test_request(
+        &reopened_runtime,
+        5_104,
+        "library_migration_preview",
+        bound_migration_preview_payload(
+            &queue,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+            serde_json::json!({"scope":"library", "conflict":"skip"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        fresh_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "a fresh request with the new pair should work: {:?}",
+        fresh_preview.error
+    );
+    let fresh_result = fresh_preview.result.unwrap();
+    assert_eq!(fresh_result["source_root_binding"], current_source_binding);
+    assert_eq!(fresh_result["target_root_binding"], current_target_binding);
+
+    reopened_dispatcher.abort();
+    let _ = reopened_dispatcher.await;
+    reopened_runtime.signal_epoch_fatal();
+    drop(reopened_runtime);
+    drop(reopened_inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&fixture.root);
 }
 
 #[tokio::test]
@@ -1807,13 +2153,16 @@ async fn migration_pauses_when_new_media_appears_before_leased_task_handoff() {
         &runtime,
         1_601,
         "library_migration_preview",
-        serde_json::json!({
-            "source_library_id": fixture.source_library_id,
-            "target_library_id": fixture.target_library_id,
-            "scope": "library",
-            "conflict": "skip",
-            "include_incomplete_tasks": true,
-        }),
+        bound_migration_preview_payload(
+            &queue,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+            serde_json::json!({
+                "scope": "library",
+                "conflict": "skip",
+                "include_incomplete_tasks": true,
+            }),
+        ),
     )
     .await;
     assert_eq!(
@@ -3014,13 +3363,16 @@ async fn migration_default_update_preserves_a_newer_user_library_choice() {
         &runtime,
         1_901,
         "library_migration_preview",
-        serde_json::json!({
-            "source_library_id": fixture.source_library_id,
-            "target_library_id": fixture.target_library_id,
-            "scope": "library",
-            "conflict": "skip",
-            "set_target_default_on_success": true,
-        }),
+        bound_migration_preview_payload(
+            &queue,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+            serde_json::json!({
+                "scope": "library",
+                "conflict": "skip",
+                "set_target_default_on_success": true,
+            }),
+        ),
     )
     .await;
     assert_eq!(
@@ -3182,12 +3534,15 @@ async fn refreshed_migration_preview_stales_old_inbox_receipt_and_confirmation()
         &runtime,
         2_001,
         "library_migration_preview",
-        serde_json::json!({
-            "source_library_id": fixture.source_library_id,
-            "target_library_id": fixture.target_library_id,
-            "scope": "library",
-            "conflict": "skip",
-        }),
+        bound_migration_preview_payload(
+            &queue,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+            serde_json::json!({
+                "scope": "library",
+                "conflict": "skip",
+            }),
+        ),
     )
     .await;
     assert_eq!(
@@ -3206,16 +3561,19 @@ async fn refreshed_migration_preview_stales_old_inbox_receipt_and_confirmation()
         &runtime,
         2_002,
         "library_migration_preview",
-        serde_json::json!({
-            "source_library_id": fixture.source_library_id,
-            "target_library_id": fixture.target_library_id,
-            "scope": "library",
-            "conflict": "skip",
-            "item_conflicts": {item_id: "keep_both"},
-            "supersedes_preview_seq": 2_001,
-            "supersedes_preview_id": first_preview["id"],
-            "supersedes_revision": first_preview["revision"],
-        }),
+        bound_migration_preview_payload(
+            &queue,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+            serde_json::json!({
+                "scope": "library",
+                "conflict": "skip",
+                "item_conflicts": {item_id: "keep_both"},
+                "supersedes_preview_seq": 2_001,
+                "supersedes_preview_id": first_preview["id"],
+                "supersedes_revision": first_preview["revision"],
+            }),
+        ),
     )
     .await;
     assert_eq!(

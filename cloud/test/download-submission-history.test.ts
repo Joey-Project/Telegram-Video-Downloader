@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   ACTION_SURFACE_FILE,
+  createQueuedAction,
   dispatchNextOwnedAction,
   recordActionReceipt,
   type QueuedAction,
@@ -98,12 +99,12 @@ describe("File download submission history reconciliation", () => {
 
   it("releases only the browser tracker after an accepted receipt and does not dispatch again", async () => {
     const payload = { url: "https://example.test/video", library_id: "main", category: "" };
-    const action: QueuedAction = {
+    const action: QueuedAction = createQueuedAction({
       request_id: "download-stable-id",
       kind: "download_submit",
       payload,
       surface: ACTION_SURFACE_FILE,
-    };
+    }, Date.now());
     const state = {
       downloadSubmission: { request_id: action.request_id, seq: null as number | null, payload },
       downloadMessage: null as string | null,

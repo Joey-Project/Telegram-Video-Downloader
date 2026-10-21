@@ -85,6 +85,14 @@ before polling or retrying; if necessary, it resubmits the same saved request ID
 Permanent action rejections are recorded before dequeue as well. The origin clears the rejected
 submission or exposes its conflict-refresh error rather than restoring that rejected payload.
 Temporary transport errors and owner-authentication failures retain their existing recovery paths.
+New actions retain an immutable creation time and a six-day retry deadline, inside the server's
+seven-day acknowledged-request retention window. Neither reload nor retry renews that deadline.
+The browser stops automatic delivery for expired actions and older rows without verifiable retry
+metadata. It retains an explicit outcome-unknown notice for manual checking; dismissing that notice
+does not cancel a desktop task or submit a replacement. Other fresh actions can still proceed.
+The Worker validates the retry context before creating an inbox record. An expired request whose
+deduplication record has gone cannot create another sequence; a retained exact replay can return
+its original sequence. Missing or changed retry metadata cannot silently upgrade an old request.
 
 ## Moving a library
 
@@ -107,6 +115,11 @@ A rejected refresh keeps the old preview usable and does not leave an orphan rep
 Migration preview and discovery validate each registered root's availability and saved directory
 identity before opening its metadata, including both endpoints. Replaced roots are rejected;
 ordinary child-entry changes remain supported.
+Preview requests capture both registration bindings from the displayed source and destination.
+The desktop checks the pair before opening either library. Durable preview results retain that
+original pair for conflict refresh and confirmation, including after restart and snapshot
+compaction. Unregistering and registering the same directory again invalidates an older preview;
+missing or stale bindings require a fresh preview rather than adopting the current registration.
 Registered cloud file and migration managers retain the verified queue root's open directory
 descriptor during metadata initialization. They do not reopen the pathname after validation,
 so a directory replacement cannot receive another library's recovery metadata.
@@ -140,6 +153,10 @@ page. A replacement preview does not inherit the previous revision's editing sta
 Every awaiting preview published for the selected source remains reachable in the File view,
 including the ninth and later previews. Refreshing conflict choices preserves the draft and
 dispatches the replacement-preview request immediately.
+If a conflict-refresh receipt has left the complete, current operation history and is no longer
+pending, the page releases its waiting state with an outcome-unknown notice. It preserves the exact
+preview, revision and conflict choices for manual recovery. It does not automatically resend the
+refresh, and an incomplete or stale view does not establish that the request has finished.
 
 The separate **include unfinished tasks** checkbox is shown only when the scope affects such
 tasks and starts unchecked. When checked for a partially selected unfinished collection task,

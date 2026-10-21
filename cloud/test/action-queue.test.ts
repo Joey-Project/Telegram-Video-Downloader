@@ -1,10 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   ACTION_RECEIPT_STORAGE_PREFIX,
+  ACTION_REPLAY_WINDOW_MS,
   ACTION_SURFACE_FILE,
   ACTION_SURFACE_SETTINGS,
   actionBelongsToSurface,
+  actionReplayStatus,
   consumeRejectedActionReceipts,
+  createQueuedAction,
   dispatchNextOwnedAction,
   recoverActionReceipts,
   recordActionReceipt,
@@ -21,7 +24,16 @@ type RejectionTrackerState = {
   migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
 };
 
-function sharedQueue(initial: QueuedAction[]) {
+function sharedQueue(initial: QueuedAction[], { stampMissing = true }: { stampMissing?: boolean } = {}) {
+  if (stampMissing) {
+    for (const [index, action] of initial.entries()) {
+      if (!Object.prototype.hasOwnProperty.call(action, "queued_at_ms")
+          && !Object.prototype.hasOwnProperty.call(action, "replay_expires_at_ms")
+          && action.delivery_outcome !== "outcome_unknown") {
+        Object.assign(action, createQueuedAction(action, Date.now() + index));
+      }
+    }
+  }
   let value = JSON.stringify(initial);
   return {
     read() {
@@ -52,6 +64,119 @@ class MemoryStorage {
 }
 
 describe("shared Mini App action queue ownership", () => {
+  it("stamps a bounded immutable replay window only when a new action is created", () => {
+    const original = {
+      request_id: "fresh-action",
+      kind: "download_submit",
+      payload: { url: "https://example.test/video" },
+      surface: ACTION_SURFACE_FILE,
+      queued_at_ms: 1,
+      replay_expires_at_ms: 2,
+      delivery_outcome: "outcome_unknown" as const,
+      delivery_error: "old result",
+    };
+    const fresh = createQueuedAction(original, 2_000);
+    expect(fresh).toMatchObject({
+      request_id: original.request_id,
+      kind: original.kind,
+      payload: original.payload,
+      surface: original.surface,
+      queued_at_ms: 2_000,
+      replay_expires_at_ms: 2_000 + ACTION_REPLAY_WINDOW_MS,
+    });
+    expect(fresh).not.toHaveProperty("delivery_outcome");
+    expect(actionReplayStatus(fresh, 2_000 + ACTION_REPLAY_WINDOW_MS - 1)).toEqual({ status: "valid", code: null });
+    expect(actionReplayStatus(fresh, 2_000 + ACTION_REPLAY_WINDOW_MS)).toEqual({
+      status: "expired",
+      code: "action_replay_window_expired",
+    });
+    expect(actionReplayStatus({ ...fresh, replay_expires_at_ms: fresh.queued_at_ms + ACTION_REPLAY_WINDOW_MS + 1 }, 2_001).status)
+      .toBe("unverifiable");
+    expect(actionReplayStatus({ request_id: "legacy", kind: "download_submit", payload: {} }).status)
+      .toBe("unverifiable");
+  });
+
+  it("never posts expired or unverifiable legacy actions, preserves unknown rows, and continues to fresh work", async () => {
+    const now = Date.now();
+    const legacy: QueuedAction = { request_id: "legacy-expired", kind: "download_submit", payload: {}, surface: ACTION_SURFACE_FILE };
+    const fresh = createQueuedAction({ request_id: "fresh-after-legacy", kind: "file_preview", payload: {}, surface: ACTION_SURFACE_FILE }, now);
+    const queue = sharedQueue([legacy, fresh], { stampMissing: false });
+    const dispatched: string[] = [];
+    const excludedIds = new Set<string>();
+    const first = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+      excludedIds,
+      dispatch: async (action) => { dispatched.push(action.request_id); return { seq: 1 }; },
+    });
+    expect(first).toMatchObject({ status: "outcome_unknown", code: "action_replay_window_unverifiable", persisted: true });
+    expect(dispatched).toEqual([]);
+    expect(excludedIds.has(legacy.request_id)).toBe(true);
+    expect(queue.contents()[0]).toMatchObject({
+      request_id: legacy.request_id,
+      delivery_outcome: "outcome_unknown",
+      delivery_error_code: "action_replay_window_unverifiable",
+    });
+
+    const second = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+      excludedIds,
+      dispatch: async (action) => { dispatched.push(action.request_id); return { seq: 2 }; },
+    });
+    expect(second.status).toBe("sent");
+    expect(dispatched).toEqual([fresh.request_id]);
+    expect(queue.contents()).toHaveLength(1);
+    expect(queue.contents()[0]).toMatchObject({ delivery_outcome: "outcome_unknown" });
+  });
+
+  it("keeps an expired row non-dispatchable when its attention marker cannot be persisted", async () => {
+    const expired = createQueuedAction({ request_id: "storage-failed-expiry", kind: "library_scan", payload: {}, surface: ACTION_SURFACE_SETTINGS }, Date.now() - ACTION_REPLAY_WINDOW_MS - 10);
+    const next = createQueuedAction({ request_id: "after-storage-failure", kind: "library_scan", payload: {}, surface: ACTION_SURFACE_SETTINGS });
+    const queue = sharedQueue([expired, next]);
+    const excludedIds = new Set<string>();
+    let dispatchCount = 0;
+    const result = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_SETTINGS,
+      readQueue: queue.read,
+      writeQueue: () => false,
+      excludedIds,
+      dispatch: async () => { dispatchCount += 1; return { seq: 1 }; },
+    });
+    expect(result).toMatchObject({ status: "outcome_unknown", code: "action_replay_window_expired", persisted: false });
+    expect(excludedIds.has(expired.request_id)).toBe(true);
+    expect(dispatchCount).toBe(0);
+
+    const nextResult = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_SETTINGS,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+      excludedIds,
+      dispatch: async () => { dispatchCount += 1; return { seq: 2 }; },
+      onReceipt: () => ({ persisted: true }),
+    });
+    expect(nextResult.status).toBe("sent");
+    expect(dispatchCount).toBe(1);
+  });
+
+  it("turns the server expiry response into a durable unknown outcome without a rejection receipt", async () => {
+    const action = createQueuedAction({ request_id: "server-expired", kind: "download_submit", payload: {}, surface: ACTION_SURFACE_FILE });
+    const queue = sharedQueue([action]);
+    const receiptStorage = new MemoryStorage();
+    const result = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+      dispatch: async () => { throw Object.assign(new Error("expired"), { status: 410, code: "action_replay_window_expired" }); },
+      onReceipt: (entry, receipt, surface) => recordActionReceipt(entry, receipt, {}, { surface, storage: receiptStorage }),
+    });
+    expect(result.status).toBe("outcome_unknown");
+    expect(queue.contents()[0]).toMatchObject({ delivery_outcome: "outcome_unknown", delivery_error_code: "action_replay_window_expired" });
+    expect(receiptStorage.length).toBe(0);
+  });
+
   it("lets both pages drain their own entries and retain each page's receipt state", async () => {
     const actions: QueuedAction[] = [
       { request_id: "file-download", kind: "download_submit", payload: {}, surface: ACTION_SURFACE_FILE },
@@ -114,6 +239,7 @@ describe("shared Mini App action queue ownership", () => {
     expect(fileState.migrationConflictDrafts.get("preview-old")?.refreshSeq).toBeGreaterThan(0);
     expect(localActions.get("settings-rename")?.seq).toBeGreaterThan(0);
     expect(localActions.get("settings-scan")?.seq).toBeGreaterThan(0);
+    expect(actions.every((action) => actionReplayStatus(action).status === "valid")).toBe(true);
     expect(storage.contents()).toEqual([]);
   });
 
@@ -291,6 +417,8 @@ describe("shared Mini App action queue ownership", () => {
         request_id: "restored-download",
         seq: null as number | null,
         payload: { url: "https://example.test/v", library_id: "archive", category: "" },
+        queued_at_ms: 1_900_000_000_000,
+        replay_expires_at_ms: 1_900_000_000_000 + ACTION_REPLAY_WINDOW_MS,
       },
     };
     const queue = sharedQueue([]);
@@ -306,7 +434,47 @@ describe("shared Mini App action queue ownership", () => {
       kind: "download_submit",
       payload: state.downloadSubmission.payload,
       surface: ACTION_SURFACE_FILE,
+      queued_at_ms: state.downloadSubmission.queued_at_ms,
+      replay_expires_at_ms: state.downloadSubmission.replay_expires_at_ms,
     }]);
+  });
+
+  it("does not invent a replay window while restoring a legacy tracker", () => {
+    const state = {
+      downloadSubmission: {
+        request_id: "legacy-tracker",
+        seq: null as number | null,
+        payload: { url: "https://example.test/v" },
+      },
+    };
+    const queue = sharedQueue([]);
+    expect(restorePendingActions(state, {
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+    }).requeued).toBe(1);
+    expect(queue.contents()[0]).not.toHaveProperty("queued_at_ms");
+    expect(queue.contents()[0]).not.toHaveProperty("replay_expires_at_ms");
+  });
+
+  it("does not resurrect a dismissed unknown outcome from its tracker", () => {
+    const state = {
+      downloadSubmission: {
+        request_id: "dismissed-unknown",
+        seq: null as number | null,
+        payload: { url: "https://example.test/v" },
+        delivery_outcome: "outcome_unknown" as const,
+        queued_at_ms: 10,
+        replay_expires_at_ms: 20,
+      },
+    };
+    const queue = sharedQueue([]);
+    expect(restorePendingActions(state, {
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+    }).requeued).toBe(0);
+    expect(queue.contents()).toEqual([]);
   });
 
   it("delivers permanent rejections only to the matching download, settings, and conflict origin", async () => {

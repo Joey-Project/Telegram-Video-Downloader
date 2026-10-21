@@ -15,6 +15,8 @@ export const MAX_LEGACY_TEXT_BYTES = 256 * 1024;
 const MAX_ACTION_BODY_ENVELOPE_BYTES = 4 * 1024;
 // JSON may represent each ASCII code unit as a six-byte \\uXXXX escape.
 export const MAX_ACTION_BODY_BYTES = MAX_LEGACY_TEXT_BYTES * 6 + MAX_ACTION_BODY_ENVELOPE_BYTES;
+export const ACTION_REPLAY_WINDOW_MS = 6 * 24 * 60 * 60 * 1_000;
+const MAX_ACTION_CLOCK_SKEW_MS = 5 * 60 * 1_000;
 export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
 export const MAX_TARGET_RELATIVE_DIR_BYTES = 1_024;
 export const MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES = 255;
@@ -448,7 +450,8 @@ function parseSettingsAction(kind: string, value: Record<string, unknown>): Reco
 
 function parseMigrationPreview(value: Record<string, unknown>): Record<string, unknown> {
   if (!onlyKeys(value, [
-    "source_library_id", "target_library_id", "scope", "item_ids", "include_incomplete_tasks",
+    "source_library_id", "target_library_id", "source_root_binding", "target_root_binding",
+    "scope", "item_ids", "include_incomplete_tasks",
     "conflict", "item_conflicts", "set_target_default_on_success",
     "supersedes_preview_seq", "supersedes_preview_id", "supersedes_revision",
   ])) {
@@ -501,6 +504,8 @@ function parseMigrationPreview(value: Record<string, unknown>): Record<string, u
   }
   const sourceLibraryId = parseLibraryId(value.source_library_id, "source_library_id");
   const targetLibraryId = parseLibraryId(value.target_library_id, "target_library_id");
+  const sourceRootBinding = parseRequiredRootBinding(value.source_root_binding);
+  const targetRootBinding = parseRequiredRootBinding(value.target_root_binding);
   if (sourceLibraryId === targetLibraryId) throw new HttpError(400, "source and target libraries must differ");
   const supersessionFields = ["supersedes_preview_seq", "supersedes_preview_id", "supersedes_revision"] as const;
   const hasSupersessionField = supersessionFields.map((field) => Object.hasOwn(value, field));
@@ -522,6 +527,8 @@ function parseMigrationPreview(value: Record<string, unknown>): Record<string, u
   return {
     source_library_id: sourceLibraryId,
     target_library_id: targetLibraryId,
+    source_root_binding: sourceRootBinding,
+    target_root_binding: targetRootBinding,
     scope,
     ...(itemIds === undefined ? {} : { item_ids: itemIds }),
     include_incomplete_tasks: includeIncompleteTasks,
@@ -692,9 +699,10 @@ function validateLibraryDescriptors(library: Record<string, unknown>): void {
 }
 
 export function validateActionRequest(value: unknown): ActionRequest {
-  if (!isRecord(value) || !onlyKeys(value, ["request_id", "kind", "payload"])) {
+  if (!isRecord(value) || !onlyKeys(value, ["request_id", "kind", "payload", "queued_at_ms", "replay_expires_at_ms"])) {
     throw new HttpError(400, "Action request has an invalid shape");
   }
+  const replayWindow = parseActionReplayWindow(value, Date.now());
   const requestId = boundedString(value.request_id, "request_id", 36);
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(requestId)) {
     throw new HttpError(400, "request_id must be a UUID");
@@ -772,7 +780,28 @@ export function validateActionRequest(value: unknown): ActionRequest {
       break;
     }
   }
-  return { request_id: requestId, kind, payload };
+  return { request_id: requestId, kind, payload, ...replayWindow };
+}
+
+function parseActionReplayWindow(
+  value: Record<string, unknown>,
+  now: number,
+): Pick<ActionRequest, "queued_at_ms" | "replay_expires_at_ms"> {
+  const queuedAt = value.queued_at_ms;
+  const expiresAt = value.replay_expires_at_ms;
+  if (!Number.isSafeInteger(queuedAt) || (queuedAt as number) <= 0
+      || !Number.isSafeInteger(expiresAt) || (expiresAt as number) <= 0) {
+    throw new HttpError(400, "Action replay window metadata is required and must contain safe integer timestamps");
+  }
+  const queuedAtMs = queuedAt as number;
+  const expiresAtMs = expiresAt as number;
+  if (expiresAtMs <= queuedAtMs || expiresAtMs - queuedAtMs > ACTION_REPLAY_WINDOW_MS) {
+    throw new HttpError(400, "Action replay window metadata is invalid");
+  }
+  if (!Number.isSafeInteger(now) || now <= 0 || queuedAtMs > now + MAX_ACTION_CLOCK_SKEW_MS) {
+    throw new HttpError(400, "Action replay window timestamp is too far in the future");
+  }
+  return { queued_at_ms: queuedAtMs, replay_expires_at_ms: expiresAtMs };
 }
 
 export function validateTelegramUpdate(value: unknown): Record<string, unknown> & { update_id: number } {

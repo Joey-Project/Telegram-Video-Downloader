@@ -3,6 +3,11 @@ export interface QueuedAction {
   kind: string;
   payload: Record<string, unknown>;
   surface?: "settings" | "file";
+  queued_at_ms?: number;
+  replay_expires_at_ms?: number;
+  delivery_outcome?: "outcome_unknown";
+  delivery_error_code?: "action_replay_window_expired" | "action_replay_window_unverifiable";
+  delivery_error?: string;
 }
 
 export interface LocalActionReceiptTracker {
@@ -12,6 +17,11 @@ export interface LocalActionReceiptTracker {
   seq?: number | null;
   rejected?: boolean;
   error?: string;
+  queued_at_ms?: number;
+  replay_expires_at_ms?: number;
+  delivery_outcome?: "outcome_unknown";
+  delivery_error_code?: "action_replay_window_expired" | "action_replay_window_unverifiable";
+  delivery_error?: string;
 }
 export interface DownloadSubmissionReceiptTracker {
   request_id?: string;
@@ -19,6 +29,11 @@ export interface DownloadSubmissionReceiptTracker {
   seq?: number | null;
   rejected?: boolean;
   error?: string;
+  queued_at_ms?: number;
+  replay_expires_at_ms?: number;
+  delivery_outcome?: "outcome_unknown";
+  delivery_error_code?: "action_replay_window_expired" | "action_replay_window_unverifiable";
+  delivery_error?: string;
 }
 export interface MigrationConflictReceiptTracker {
   refreshRequestId?: string | null;
@@ -26,12 +41,21 @@ export interface MigrationConflictReceiptTracker {
   refreshPayload?: Record<string, unknown> | null;
   refreshSeq?: number | null;
   refreshError?: string | null;
+  refreshQueuedAtMs?: number | null;
+  refreshExpiresAtMs?: number | null;
+  refreshDeliveryOutcome?: "outcome_unknown" | null;
 }
 
 export const ACTION_QUEUE_LIMIT: number;
+export const ACTION_REPLAY_WINDOW_MS: number;
 export const ACTION_SURFACE_SETTINGS: "settings";
 export const ACTION_SURFACE_FILE: "file";
 export const ACTION_RECEIPT_STORAGE_PREFIX: string;
+export function createQueuedAction<T extends QueuedAction>(action: T, now?: number): T & { queued_at_ms: number; replay_expires_at_ms: number };
+export function actionReplayStatus(
+  action: QueuedAction,
+  now?: number,
+): { status: "valid"; code: null } | { status: "expired" | "unverifiable"; code: "action_replay_window_expired" | "action_replay_window_unverifiable" };
 export function appendAction<T extends QueuedAction>(queue: T[], action: T): { ok: boolean; queue: T[] };
 export function persistQueuedActionAndDrain<T extends QueuedAction>(options: {
   action: T;
@@ -49,13 +73,13 @@ export function actionBelongsToSurface(action: QueuedAction, surface: "settings"
 export function nextQueuedActionForSurface(
   queue: readonly QueuedAction[] | null | undefined,
   surface: "settings" | "file",
-  excludedIds?: ReadonlySet<string>,
+  excludedIds?: Set<string>,
 ): QueuedAction | null;
 export function dispatchNextOwnedAction(options: {
   surface: "settings" | "file";
   readQueue: () => QueuedAction[];
   writeQueue: (queue: QueuedAction[]) => boolean;
-  excludedIds?: ReadonlySet<string>;
+  excludedIds?: Set<string>;
   dispatch: (action: QueuedAction) => Promise<unknown>;
   onReceipt?: (action: QueuedAction, receipt: unknown, surface: "settings" | "file") => unknown;
 }): Promise<
@@ -64,6 +88,7 @@ export function dispatchNextOwnedAction(options: {
   | { status: "rejected"; action: QueuedAction; rejection: { outcome: "rejected"; status: number; error: string }; receiptUpdate: unknown }
   | { status: "rejection_receipt_failed"; action: QueuedAction; error: unknown; receiptUpdate?: unknown; receiptError?: unknown }
   | { status: "rejection_remove_failed"; action: QueuedAction; rejection: { outcome: "rejected"; status: number; error: string }; receiptUpdate: unknown }
+  | { status: "outcome_unknown"; action: QueuedAction; code: "action_replay_window_expired" | "action_replay_window_unverifiable"; error: string; persisted: boolean }
   | { status: "receipt_failed"; action: QueuedAction; receipt: unknown; receiptUpdate?: unknown; error?: unknown }
   | { status: "sent" | "remove_failed"; action: QueuedAction; receipt: unknown; receiptUpdate: unknown }
 >;

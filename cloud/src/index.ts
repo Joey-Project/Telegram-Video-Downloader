@@ -127,7 +127,10 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
 async function handleAction(request: Request, env: Env): Promise<Response> {
   await requireOwner(request, env);
   const action = validateActionRequest(await readJsonBody(request, MAX_ACTION_BODY_BYTES));
-  const result = await enqueue(env.DB, `action:${action.request_id}`, action.kind, action.payload);
+  const result = await enqueue(env.DB, `action:${action.request_id}`, action.kind, action.payload, {
+    queued_at_ms: action.queued_at_ms,
+    replay_expires_at_ms: action.replay_expires_at_ms,
+  });
   await notifyAfterPersist(env, result.envelope);
   return persistedResponse(202, result.envelope.seq, result.duplicate);
 }
@@ -285,6 +288,8 @@ export default {
     } catch (error) {
       if (error instanceof HttpError) {
         const extraHeaders: Record<string, string> = {};
+        const body: Record<string, unknown> = { error: error.message };
+        if (error.code !== undefined) body.code = error.code;
         const stateVersion = error.stateVersion;
         if (error.status === 409 && Number.isSafeInteger(stateVersion) && stateVersion !== undefined && stateVersion > 0) {
           extraHeaders["X-Cloud-State-Version"] = String(stateVersion);
@@ -296,7 +301,7 @@ export default {
           Number.isSafeInteger(error.sequenceConflict) && error.sequenceConflict > 0) {
           extraHeaders["X-Cloud-Inbox-Sequence-Conflict"] = String(error.sequenceConflict);
         }
-        return json({ error: error.message }, error.status, extraHeaders);
+        return json(body, error.status, extraHeaders);
       }
       const path = new URL(request.url).pathname;
       console.error(JSON.stringify({ event: "request_failed", path }));

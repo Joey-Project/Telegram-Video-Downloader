@@ -3,6 +3,7 @@ import {
   ACTION_RECEIPT_STORAGE_PREFIX,
   ACTION_SURFACE_SETTINGS,
   consumeRejectedActionReceipts,
+  createQueuedAction,
   dispatchNextOwnedAction,
   recoverActionReceipts,
   recordActionReceipt,
@@ -30,7 +31,9 @@ function sharedQueue(initial: QueuedAction[]) {
   };
 }
 
-function localState(action: QueuedAction) {
+type FreshQueuedAction = QueuedAction & { queued_at_ms: number; replay_expires_at_ms: number };
+
+function localState(action: FreshQueuedAction) {
   return {
     localActions: new Map([[action.request_id, {
       kind: action.kind,
@@ -38,6 +41,8 @@ function localState(action: QueuedAction) {
       label: "Rename Archive",
       seq: null as number | null,
       rejected: false,
+      queued_at_ms: action.queued_at_ms,
+      replay_expires_at_ms: action.replay_expires_at_ms,
     }]]),
   };
 }
@@ -48,12 +53,12 @@ function rejected(status: number) {
 
 describe("Settings permanent action rejections", () => {
   it("settles a same-tab rejection only after the durable receipt and queue removal", async () => {
-    const action: QueuedAction = {
+    const action = createQueuedAction({
       request_id: "settings-origin-422",
       kind: "library_rename",
       payload: { library_id: "archive", name: "Archive" },
       surface: ACTION_SURFACE_SETTINGS,
-    };
+    });
     const queue = sharedQueue([action]);
     const receiptStorage = new MemoryStorage();
     const state = localState(action);
@@ -81,12 +86,12 @@ describe("Settings permanent action rejections", () => {
   });
 
   it("leaves a helper-tab rejection for the origin to recover and consume", async () => {
-    const action: QueuedAction = {
+    const action = createQueuedAction({
       request_id: "settings-sleeping-origin",
       kind: "library_rename",
       payload: { library_id: "archive", name: "Archive" },
       surface: ACTION_SURFACE_SETTINGS,
-    };
+    });
     const queue = sharedQueue([action]);
     const receiptStorage = new MemoryStorage();
     const origin = localState(action);
@@ -122,12 +127,12 @@ describe("Settings permanent action rejections", () => {
   });
 
   it("keeps the queue and receipt when queue removal fails, then settles on recovery", async () => {
-    const action: QueuedAction = {
+    const action = createQueuedAction({
       request_id: "settings-remove-failure",
       kind: "library_rename",
       payload: { library_id: "archive", name: "Archive" },
       surface: ACTION_SURFACE_SETTINGS,
-    };
+    });
     const queue = sharedQueue([action]);
     const receiptStorage = new MemoryStorage();
     const state = localState(action);
@@ -162,12 +167,12 @@ describe("Settings permanent action rejections", () => {
   });
 
   it.each([401, 403, 408, 429, 500])("does not make HTTP %s a terminal rejection", async (status) => {
-    const action: QueuedAction = {
+    const action = createQueuedAction({
       request_id: `settings-http-${status}`,
       kind: "library_rename",
       payload: { library_id: "archive", name: "Archive" },
       surface: ACTION_SURFACE_SETTINGS,
-    };
+    });
     const queue = sharedQueue([action]);
     const receiptStorage = new MemoryStorage();
     const state = localState(action);

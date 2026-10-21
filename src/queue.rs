@@ -1413,6 +1413,86 @@ impl QueueManager {
         Ok(store.root.clone())
     }
 
+    /// Verify both displayed registration tokens before refreshing either queue root, then
+    /// return the two already-open roots only after each root still matches its persisted
+    /// identity. Callers can initialize root-bound managers from these handles without looking
+    /// either registration up again by pathname.
+    pub(crate) fn verified_video_library_roots_with_bindings(
+        &self,
+        source_library_id: &str,
+        source_binding: &str,
+        target_library_id: &str,
+        target_binding: &str,
+    ) -> Result<(RootedFs, RootedFs)> {
+        validate_library_root_binding_token(source_binding)?;
+        validate_library_root_binding_token(target_binding)?;
+        if source_library_id == target_library_id {
+            bail!("source and target media libraries must be different");
+        }
+
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let (source_library, target_library) = {
+            let registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+            require_registry_root_binding(&registry, source_library_id, source_binding)?;
+            require_registry_root_binding(&registry, target_library_id, target_binding)?;
+            let source = registry
+                .library(source_library_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown media library {source_library_id}"))?;
+            let target = registry
+                .library(target_library_id)
+                .cloned()
+                .ok_or_else(|| anyhow!("unknown media library {target_library_id}"))?;
+            (source, target)
+        };
+
+        // Both tokens were checked against one locked registry view before either refresh can
+        // recover queue state or initialize an owner lock.
+        self.refresh_video_library_unlocked(source_library)?;
+        self.require_video_library_available(source_library_id)?;
+        self.refresh_video_library_unlocked(target_library)?;
+        self.require_video_library_available(target_library_id)?;
+
+        let registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+        require_registry_root_binding(&registry, source_library_id, source_binding)?;
+        require_registry_root_binding(&registry, target_library_id, target_binding)?;
+        let source_identity = registry.root_binding(source_library_id);
+        let target_identity = registry.root_binding(target_library_id);
+        drop(registry);
+
+        let stores = self.video_libraries.read().map_err(poisoned_lock)?;
+        let source_store = stores
+            .iter()
+            .find(|store| store.library_id == source_library_id && store.available)
+            .ok_or_else(|| {
+                anyhow!("media library {source_library_id} has no available queue store")
+            })?;
+        let target_store = stores
+            .iter()
+            .find(|store| store.library_id == target_library_id && store.available)
+            .ok_or_else(|| {
+                anyhow!("media library {target_library_id} has no available queue store")
+            })?;
+        let source_root = source_store.store.root.clone();
+        let target_root = target_store.store.root.clone();
+
+        for (library_id, root, persisted_identity) in [
+            (source_library_id, &source_root, source_identity),
+            (target_library_id, &target_root, target_identity),
+        ] {
+            let identity = root.root_identity();
+            if persisted_identity != Some((identity.device(), identity.inode())) {
+                bail!(
+                    "media library {library_id} root does not match its persisted queue identity"
+                );
+            }
+            root.validate_configured_root()
+                .with_context(|| format!("media library {library_id} root identity changed"))?;
+        }
+
+        Ok((source_root, target_root))
+    }
+
     fn refresh_video_library_unlocked(&self, library: MediaLibrary) -> Result<()> {
         let root = match coordinate_directory_root(self.pdf.file_provider.as_ref(), &library.root) {
             Ok(root) => root,
