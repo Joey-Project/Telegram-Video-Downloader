@@ -38,6 +38,35 @@ describe("bounded library views", () => {
     expect(operationMatchesLibrary({ kind: "file_confirm", result: { library_id: "main" } }, "archive")).toBe(false);
   });
 
+  it("does not merge a live descriptor from a different root binding into the registered library", () => {
+    const currentBinding = `v1:${"b".repeat(64)}`;
+    const staleBinding = `v1:${"a".repeat(64)}`;
+    const snapshot = {
+      settings: {
+        applied: {
+          default_library_id: "archive",
+          libraries: [{ id: "archive", name: "Archive", root: "/Volumes/Archive", root_binding: currentBinding }],
+        },
+      },
+      library: {
+        libraries: [{
+          id: "archive", root: "/Volumes/Archive", root_binding: staleBinding, availability: "available",
+          snapshot: { ready: true, items: [{ id: "old-object" }] },
+        }],
+      },
+    };
+
+    const [entry] = mediaLibraryEntries(snapshot);
+    expect(entry).toMatchObject({
+      root_binding: currentBinding,
+      availability: "unavailable",
+      snapshot: null,
+      snapshot_stale: true,
+    });
+    expect(canOperateOnMediaLibrary(entry)).toBe(false);
+    expect(resolveMediaLibrary(snapshot, "archive").snapshot).toBeNull();
+  });
+
   it("falls back to the legacy single-root snapshot until the registry is published", () => {
     const snapshot = {
       settings: { download_dir: "/Users/test/Videos" },

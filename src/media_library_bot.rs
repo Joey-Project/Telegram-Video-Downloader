@@ -116,14 +116,18 @@ pub(super) fn applied_settings(queue: &QueueManager) -> Result<Value> {
         .libraries
         .iter()
         .map(|library| {
-            json!({
+            let mut descriptor = json!({
                 "id": library.id,
                 "name": library.name,
                 "root": library.root.to_string_lossy(),
                 "default_category": library.default_category.as_ref()
                     .map(|path| path.to_string_lossy().into_owned()).unwrap_or_default(),
                 "is_default": library.id == snapshot.default_library_id,
-            })
+            });
+            if let Some(root_binding) = library.root_binding_token() {
+                descriptor["root_binding"] = json!(root_binding);
+            }
+            descriptor
         })
         .collect::<Vec<_>>();
     Ok(json!({
@@ -505,47 +509,103 @@ pub(super) async fn dispatch(
     let kind = request.kind.clone();
     let payload = request.payload.clone();
     let migration_runtime = runtime.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
-        match kind.as_str() {
-            "library_register" => {
-                let payload: RegisterLibrary = serde_json::from_value(payload)?;
-                let category = category_path(payload.default_category.as_deref())?;
-                queue.register_video_library(
-                    &payload.name,
-                    &payload.path,
-                    category.as_deref(),
-                    payload.set_default,
-                    payload.create_directory,
-                )?;
+    // Serialize removal against every scan from manager open through cache publication. The
+    // management-dispatch semaphore does not cover startup and publication-watcher scans.
+    let _publication_guard = if kind == "library_remove" {
+        Some(runtime.library_scan_publication_gate.lock().await)
+    } else {
+        None
+    };
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut removed_library_id = None;
+        let mut removed_was_original_library = false;
+        let mut default_library_after_remove = None;
+        let result = (|| -> Result<Value> {
+            match kind.as_str() {
+                "library_register" => {
+                    let payload: RegisterLibrary = serde_json::from_value(payload)?;
+                    let category = category_path(payload.default_category.as_deref())?;
+                    queue.register_video_library(
+                        &payload.name,
+                        &payload.path,
+                        category.as_deref(),
+                        payload.set_default,
+                        payload.create_directory,
+                    )?;
+                }
+                "library_set_default" => {
+                    let payload: LibraryId = serde_json::from_value(payload)?;
+                    queue.set_default_video_library(&payload.library_id)?;
+                }
+                "library_set_category" => {
+                    let payload: LibraryCategory = serde_json::from_value(payload)?;
+                    let category = category_path(payload.default_category.as_deref())?;
+                    queue.set_video_library_category(&payload.library_id, category.as_deref())?;
+                }
+                "library_rename" => {
+                    let payload: LibraryName = serde_json::from_value(payload)?;
+                    queue.rename_video_library(&payload.library_id, &payload.name)?;
+                }
+                "library_remove" => {
+                    let payload: LibraryId = serde_json::from_value(payload)?;
+                    removed_was_original_library =
+                        original_library_id_from_bot(&migration_runtime.bot)
+                            .ok()
+                            .as_deref()
+                            == Some(payload.library_id.as_str());
+                    library_migration_bot::ensure_library_removable(
+                        &migration_runtime,
+                        &payload.library_id,
+                    )?;
+                    queue.remove_video_library(&payload.library_id)?;
+                    removed_library_id = Some(payload.library_id);
+                    default_library_after_remove = queue
+                        .registry_snapshot()
+                        .ok()
+                        .map(|snapshot| snapshot.default_library_id);
+                }
+                _ => unreachable!("only supported settings actions reach this worker"),
             }
-            "library_set_default" => {
-                let payload: LibraryId = serde_json::from_value(payload)?;
-                queue.set_default_video_library(&payload.library_id)?;
-            }
-            "library_set_category" => {
-                let payload: LibraryCategory = serde_json::from_value(payload)?;
-                let category = category_path(payload.default_category.as_deref())?;
-                queue.set_video_library_category(&payload.library_id, category.as_deref())?;
-            }
-            "library_rename" => {
-                let payload: LibraryName = serde_json::from_value(payload)?;
-                queue.rename_video_library(&payload.library_id, &payload.name)?;
-            }
-            "library_remove" => {
-                let payload: LibraryId = serde_json::from_value(payload)?;
-                library_migration_bot::ensure_library_removable(
-                    &migration_runtime,
-                    &payload.library_id,
-                )?;
-                queue.remove_video_library(&payload.library_id)?;
-            }
-            _ => unreachable!("only supported settings actions reach this worker"),
-        }
-        Ok(json!({"applied": applied_settings(&queue)?}))
+            Ok(json!({"applied": applied_settings(&queue)?}))
+        })();
+        (
+            result,
+            removed_library_id,
+            removed_was_original_library,
+            default_library_after_remove,
+        )
     })
     .await
-    .context("media-library settings worker failed")
-    .and_then(|result| result);
+    .context("media-library settings worker failed");
+    let (result, removed_library_id, removed_was_original_library, default_library_after_remove) =
+        match worker {
+            Ok(worker_result) => worker_result,
+            Err(error) => (Err(error), None, false, None),
+        };
+    if let Some(removed_library_id) = removed_library_id {
+        let default_snapshot = {
+            let mut snapshots = runtime.library_snapshots.lock().await;
+            snapshots.remove(&removed_library_id);
+            default_library_after_remove
+                .as_deref()
+                .and_then(|default_id| snapshots.get(default_id).cloned())
+        };
+        let default_warning = {
+            let mut unavailable = runtime.library_unavailable.lock().await;
+            unavailable.remove(&removed_library_id);
+            default_library_after_remove
+                .as_deref()
+                .and_then(|default_id| unavailable.get(default_id).cloned())
+        };
+        // The unscoped legacy cache has no identity of its own. Do not mirror another root's
+        // snapshot into the original-root fallback after that original registration is removed.
+        *runtime.library_snapshot.lock().await = if removed_was_original_library {
+            None
+        } else {
+            default_snapshot
+        };
+        *runtime.library_scan_warning.lock().await = default_warning;
+    }
     Some(match result {
         Ok(result) => {
             runtime.state_notify.notify_one();

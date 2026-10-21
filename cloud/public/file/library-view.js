@@ -1,6 +1,21 @@
 export const LIBRARY_PAGE_SIZE = 50;
 export const MAX_FOLDER_SUGGESTIONS = 100;
 
+function validRootBinding(value) {
+  return typeof value === "string" && /^v1:[0-9a-f]{64}$/u.test(value);
+}
+
+function hasInvalidRootBinding(entry) {
+  return Boolean(entry && Object.hasOwn(entry, "root_binding") && entry.root_binding != null
+    && !validRootBinding(entry.root_binding));
+}
+
+function mismatchedRootBinding(applied, live) {
+  return hasInvalidRootBinding(applied) || hasInvalidRootBinding(live)
+    || validRootBinding(applied?.root_binding) && validRootBinding(live?.root_binding)
+      && applied.root_binding !== live.root_binding;
+}
+
 export function mediaLibraryEntries(ownerSnapshot) {
   const library = ownerSnapshot?.library;
   const applied = ownerSnapshot?.settings?.applied;
@@ -13,7 +28,23 @@ export function mediaLibraryEntries(ownerSnapshot) {
   }
   for (const entry of statusEntries) {
     if (!entry || typeof entry.id !== "string") continue;
-    merged.set(entry.id, { ...merged.get(entry.id), ...entry });
+    const appliedEntry = merged.get(entry.id);
+    if (mismatchedRootBinding(appliedEntry, entry)) {
+      merged.set(entry.id, {
+        ...appliedEntry,
+        id: entry.id,
+        availability: "unavailable",
+        available: false,
+        snapshot: null,
+        snapshot_stale: true,
+      });
+    } else {
+      const combined = { ...appliedEntry, ...entry };
+      if (validRootBinding(appliedEntry?.root_binding) && !validRootBinding(entry.root_binding)) {
+        combined.root_binding = appliedEntry.root_binding;
+      }
+      merged.set(entry.id, combined);
+    }
   }
   if (merged.size === 0 && library && typeof library === "object") {
     const id = String(applied?.default_library_id ?? library.default_library_id ?? "default");
@@ -47,7 +78,8 @@ export function resolveMediaLibrary(ownerSnapshot, requestedId = "") {
   if (!selected) return { descriptor: null, snapshot: null, id: "" };
   const snapshot = selected.snapshot && typeof selected.snapshot === "object"
     ? selected.snapshot
-    : selected.id === fallbackId
+    : selected.id === fallbackId && selected.snapshot_stale !== true
+        && mediaLibraryAvailability(selected) !== "offline"
       ? ownerSnapshot?.library ?? null
       : null;
   return { descriptor: selected, snapshot, id: String(selected.id) };

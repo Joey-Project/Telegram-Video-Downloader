@@ -4,6 +4,7 @@ import { captureLibraryEditorFocus, libraryDraftFieldValue, reconcileLibraryDraf
 const library = (overrides: Record<string, unknown> = {}) => ({
   id: "archive",
   root: "/Volumes/Archive",
+  root_binding: `v1:${"a".repeat(64)}`,
   name: "Archive",
   default_category: "Films",
   ...overrides,
@@ -36,6 +37,35 @@ describe("settings library field drafts", () => {
 
     expect(drafts.size).toBe(0);
     expect(libraryDraftFieldValue(drafts, replacement, "default_category")).toBe("Films");
+  });
+
+  it("does not carry drafts across a same-path replacement registration", () => {
+    const drafts = new Map();
+    const original = library();
+    setLibraryDraftField(drafts, original, "name", "Old-root draft");
+
+    const replacement = library({ root_binding: `v1:${"b".repeat(64)}` });
+    reconcileLibraryDrafts(drafts, [replacement]);
+
+    expect(drafts.size).toBe(0);
+    expect(libraryDraftFieldValue(drafts, replacement, "name")).toBe("Archive");
+  });
+
+  it("fails closed for legacy or malformed root bindings", () => {
+    const drafts = new Map();
+    const original = library();
+    setLibraryDraftField(drafts, original, "name", "Draft from a bound library");
+    const legacy = library({ root_binding: undefined });
+    const malformed = library({ root_binding: `v1:${"A".repeat(64)}` });
+
+    expect(libraryDraftFieldValue(drafts, legacy, "name")).toBe("Archive");
+    reconcileLibraryDrafts(drafts, [legacy]);
+    expect(drafts.size).toBe(0);
+    expect(setLibraryDraftField(drafts, legacy, "name", "Legacy draft")).toBe(false);
+    expect(setLibraryDraftField(drafts, malformed, "name", "Malformed draft")).toBe(false);
+    expect(libraryDraftFieldValue(drafts, legacy, "name")).toBe("Archive");
+    expect(libraryDraftFieldValue(drafts, malformed, "name")).toBe("Archive");
+    expect(drafts.size).toBe(0);
   });
 
   it("reconciles a normalized submitted value only after it appears in the applied snapshot", () => {
@@ -74,7 +104,7 @@ describe("settings library field drafts", () => {
   it("restores editor focus and selection only for the same registered root and field", () => {
     const entry = library();
     const form: { dataset: Record<string, string>; elements?: { namedItem: (field: string) => unknown } } = {
-      dataset: { categoryForm: entry.id, libraryRoot: entry.root },
+      dataset: { categoryForm: entry.id, libraryRoot: entry.root, libraryRootBinding: entry.root_binding as string },
     };
     let focused = false;
     let selection = null;
@@ -106,5 +136,10 @@ describe("settings library field drafts", () => {
     expect(focused).toBe(false);
 
     expect(captureLibraryEditorFocus(list, input, [replacement])).toBe(null);
+
+    const samePathReplacement = library({ root_binding: `v1:${"c".repeat(64)}` });
+    expect(restoreLibraryEditorFocus(list, focus, [samePathReplacement])).toBe(false);
+    expect(captureLibraryEditorFocus(list, input, [samePathReplacement])).toBe(null);
+    expect(captureLibraryEditorFocus(list, input, [library({ root_binding: null })])).toBe(null);
   });
 });

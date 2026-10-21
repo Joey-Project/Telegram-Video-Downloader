@@ -1,15 +1,19 @@
-import { ACTION_QUEUE_LIMIT, ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_SETTINGS, appendAction, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "/file/action-queue.js";
+import { ACTION_QUEUE_LIMIT, ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_SETTINGS, appendAction, consumeRejectedActionReceipts, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, restorePendingActions, shouldRetryActionFailure } from "/file/action-queue.js";
 import { HttpResponseError } from "/file/http-error.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "/file/snapshot-session.js";
 import { escapeHtml } from "/file/preview-rendering.js";
 import { validateTargetRelativeDirectory } from "/file/target-directory.js";
 import { mediaLibraryAvailability, mediaLibraryEntries } from "/file/library-view.js";
 import { captureLibraryEditorFocus, libraryDraftFieldValue, reconcileLibraryDrafts, restoreLibraryEditorFocus, setLibraryDraftField } from "./library-drafts.js";
+import { takeRejectedSettingsActions } from "./local-action-rejections.js";
 
 const API = "/api";
 const ACTION_QUEUE_KEY = "file-manager.actions.v1";
 const POLL_MS = 12_000;
 const MAX_ACTION_QUEUE = ACTION_QUEUE_LIMIT;
+const SETTINGS_KINDS = new Set([
+  "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove", "library_scan",
+]);
 
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
@@ -90,12 +94,20 @@ async function api(path, options = {}) {
 }
 
 function readActionQueue() {
+  return readActionQueueState().actions;
+}
+
+function readActionQueueState() {
   try {
-    const value = JSON.parse(localStorage.getItem(ACTION_QUEUE_KEY) ?? "[]");
-    return Array.isArray(value)
-      ? value.filter((entry) => entry && typeof entry.request_id === "string" && typeof entry.kind === "string" && entry.payload && typeof entry.payload === "object")
-      : [];
-  } catch { return []; }
+    const stored = localStorage.getItem(ACTION_QUEUE_KEY);
+    if (stored === null) return { ok: true, actions: [] };
+    const value = JSON.parse(stored);
+    if (!Array.isArray(value)) return { ok: false, actions: [] };
+    return {
+      ok: true,
+      actions: value.filter((entry) => entry && typeof entry.request_id === "string" && typeof entry.kind === "string" && entry.payload && typeof entry.payload === "object"),
+    };
+  } catch { return { ok: false, actions: [] }; }
 }
 
 function writeActionQueue(actions) {
@@ -107,14 +119,78 @@ function writeActionQueue(actions) {
 
 function recoverSettingsActionReceipts() {
   const recovered = recoverActionReceipts(state, { surface: ACTION_SURFACE_SETTINGS });
-  if (recovered.matched > 0) {
-    const matchedIds = new Set(recovered.requestIds);
-    const queue = readActionQueue();
-    const remaining = queue.filter((action) => !matchedIds.has(action.request_id));
-    if (remaining.length !== queue.length) writeActionQueue(remaining);
-    else renderPending();
+  if (recovered.matched === 0) return recovered;
+
+  const rejectedIds = recovered.rejectedRequestIds ?? [];
+  const queueState = readActionQueueState();
+  if (!queueState.ok) {
+    quarantineRejectedActions(rejectedIds);
+    return recovered;
+  }
+
+  const matchedIds = new Set(recovered.requestIds);
+  const remaining = queueState.actions.filter((action) => !matchedIds.has(action.request_id));
+  const queueRemovalSucceeded = remaining.length === queueState.actions.length || writeActionQueue(remaining);
+  if (!queueRemovalSucceeded) {
+    quarantineRejectedActions(rejectedIds);
+    return recovered;
+  }
+  if (remaining.length === queueState.actions.length) renderPending();
+
+  if (rejectedIds.length > 0) {
+    // Rejection receipts stay durable until this origin has confirmed the
+    // matching shared-queue rows are gone.
+    consumeRejectedActionReceipts(state, { surface: ACTION_SURFACE_SETTINGS, requestIds: rejectedIds });
+    const settled = settleRejectedSettingsActions(rejectedIds);
+    if (settled.length > 0) showRejectedSettingsActions(settled);
   }
   return recovered;
+}
+
+function quarantineRejectedActions(requestIds) {
+  let newlyQuarantined = false;
+  for (const requestId of requestIds) {
+    if (!state.quarantinedActionIds.has(requestId)) newlyQuarantined = true;
+    state.quarantinedActionIds.add(requestId);
+  }
+  if (requestIds.length > 0) renderPending();
+  if (newlyQuarantined) {
+    showToast("A rejected settings request is still saved in this browser because its queue removal could not be confirmed. It is paused until browser storage works again.");
+  }
+  if (requestIds.length > 0) scheduleActionRetry(true);
+}
+
+function settleRejectedSettingsActions(requestIds) {
+  const settled = takeRejectedSettingsActions(state.localActions, requestIds);
+  for (const action of settled) {
+    state.quarantinedActionIds.delete(action.requestId);
+    if (action.kind === "library_register") {
+      const form = byId("register-form");
+      if (form?.dataset.pendingRequestId === action.requestId) delete form.dataset.pendingRequestId;
+    }
+  }
+  if (settled.length > 0) renderPending();
+  return settled;
+}
+
+function rejectionNotices(actions) {
+  return actions.map((action) => `${action.label} was rejected before reaching the desktop: ${action.error}`);
+}
+
+function showRejectedSettingsActions(actions) {
+  const notices = rejectionNotices(actions).slice(0, 2);
+  if (actions.length > notices.length) notices.push(`${actions.length - notices.length} more settings request(s) were rejected.`);
+  if (notices.length > 0) showToast(notices.join(" · "));
+}
+
+function scheduleActionRetry(quiet) {
+  if (state.retryTimer) return;
+  const delay = state.retryDelay;
+  state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
+  state.retryTimer = window.setTimeout(() => {
+    state.retryTimer = 0;
+    drainActionQueue({ quiet });
+  }, delay);
 }
 
 function clearLocalSettingsAction(action, message) {
@@ -183,16 +259,27 @@ async function drainActionQueue({ quiet = false } = {}) {
         sentAny = true;
         continue;
       }
+      if (outcome.status === "rejected") {
+        const settled = settleRejectedSettingsActions(outcome.receiptUpdate?.rejectedRequestIds ?? []);
+        if (settled.length > 0) rejected.push(...rejectionNotices(settled));
+        else rejected.push("A saved settings request was rejected before the desktop could apply it.");
+        continue;
+      }
+      if (outcome.status === "rejection_receipt_failed") {
+        receiptFailed = true;
+        scheduleActionRetry(quiet);
+        break;
+      }
+      if (outcome.status === "rejection_remove_failed") {
+        state.quarantinedActionIds.add(outcome.action.request_id);
+        renderPending();
+        if (!quiet) showToast("The cloud rejected this settings request, but browser storage could not remove it from the retry queue. It is paused until cleanup succeeds.");
+        scheduleActionRetry(quiet);
+        break;
+      }
       if (outcome.status === "receipt_failed") {
         receiptFailed = true;
-        if (!state.retryTimer) {
-          const delay = state.retryDelay;
-          state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
-          state.retryTimer = window.setTimeout(() => {
-            state.retryTimer = 0;
-            drainActionQueue({ quiet });
-          }, delay);
-        }
+        scheduleActionRetry(quiet);
         break;
       }
 
@@ -205,21 +292,14 @@ async function drainActionQueue({ quiet = false } = {}) {
       }
       if (!shouldRetryActionFailure(error)) {
         state.quarantinedActionIds.add(action.request_id);
-        writeActionQueue(removeQueuedAction(readActionQueue(), action.request_id));
+        renderPending();
         const local = state.localActions.get(action.request_id);
-        if (local) clearLocalSettingsAction(action, `${local.label} was rejected before reaching the desktop: ${error.message}`);
-        else rejected.push(String(error?.message ?? "Request rejected"));
-        continue;
+        if (local) rejected.push(`${local.label} could not be safely finalized: ${error.message}. The request remains paused in this browser queue.`);
+        else rejected.push("A settings request could not be safely finalized. It remains paused in this browser queue.");
+        break;
       }
       interrupted = true;
-      if (!state.retryTimer) {
-        const delay = state.retryDelay;
-        state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
-        state.retryTimer = window.setTimeout(() => {
-          state.retryTimer = 0;
-          drainActionQueue({ quiet });
-        }, delay);
-      }
+      scheduleActionRetry(quiet);
       break;
     }
     if (sentAny) state.retryDelay = 1_500;
@@ -267,9 +347,10 @@ function renderSync() {
 }
 
 function libraryDescriptor(entry) {
-  const live = (Array.isArray(state.snapshot?.library?.libraries) ? state.snapshot.library.libraries : [])
-    .find((candidate) => candidate?.id === entry.id);
-  return { ...entry, ...live, id: entry.id, name: entry.name, root: entry.root, default_category: entry.default_category, is_default: entry.is_default };
+  // mediaLibraryEntries already joins applied settings and live status. Do not
+  // re-merge a stale status descriptor here: it could restore the old root
+  // binding after the registry reports a replacement as unavailable.
+  return entry;
 }
 
 function renderLibraryCard(rawEntry) {
@@ -277,6 +358,7 @@ function renderLibraryCard(rawEntry) {
   const id = String(entry.id ?? "");
   const name = String(entry.name ?? "Unnamed library");
   const root = String(entry.root ?? "Path unavailable");
+  const rootBinding = typeof entry.root_binding === "string" ? entry.root_binding : "";
   const category = String(entry.default_category ?? "");
   const nameDraft = libraryDraftFieldValue(state.libraryDrafts, entry, "name");
   const categoryDraft = libraryDraftFieldValue(state.libraryDrafts, entry, "default_category");
@@ -292,6 +374,7 @@ function renderLibraryCard(rawEntry) {
     : Array.isArray(snapshot?.items) ? snapshot.items.length : null;
   const scanTime = entry.scanned_at ?? snapshot?.scanned_at ?? null;
   const idAttr = escapeHtml(id);
+  const rootBindingAttr = escapeHtml(rootBinding);
   const nameAttr = escapeHtml(name);
   const categoryAttr = escapeHtml(category);
   const badges = [
@@ -313,12 +396,12 @@ function renderLibraryCard(rawEntry) {
     </div>
     ${dependentWarning}
     <div class="settings-edit-grid">
-      <form class="settings-edit-form" data-rename-form="${idAttr}" data-library-root="${escapeHtml(root)}">
+      <form class="settings-edit-form" data-rename-form="${idAttr}" data-library-root="${escapeHtml(root)}" data-library-root-binding="${rootBindingAttr}">
         <label class="field-label" for="rename-${idAttr}">Rename library</label>
         <input id="rename-${idAttr}" class="text-input" name="name" type="text" maxlength="100" required value="${escapeHtml(nameDraft)}">
         <button class="small-button" type="submit">Save name</button>
       </form>
-      <form class="settings-edit-form" data-category-form="${idAttr}" data-library-root="${escapeHtml(root)}">
+      <form class="settings-edit-form" data-category-form="${idAttr}" data-library-root="${escapeHtml(root)}" data-library-root-binding="${rootBindingAttr}">
         <label class="field-label" for="category-${idAttr}">Default category</label>
         <input id="category-${idAttr}" class="text-input" name="default_category" type="text" maxlength="1024" value="${escapeHtml(categoryDraft)}" placeholder="Library root">
         <button class="small-button" type="submit">Save category</button>

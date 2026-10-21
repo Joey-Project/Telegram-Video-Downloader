@@ -17,14 +17,46 @@ function mergedLibraryDescriptors(snapshot) {
   const live = Array.isArray(library?.libraries) ? library.libraries : [];
   const byId = new Map();
   for (const entry of applied) {
-    if (entry && typeof entry.id === "string") byId.set(entry.id, { ...entry });
+    if (entry && typeof entry.id === "string") {
+      byId.set(entry.id, { ...entry, _root_binding_mismatch: hasInvalidRootBinding(entry) });
+    }
   }
   for (const entry of live) {
     if (entry && typeof entry.id === "string") {
-      byId.set(entry.id, { ...byId.get(entry.id), ...entry });
+      const previous = byId.get(entry.id);
+      const mismatch = previous
+        ? previous._root_binding_mismatch === true || hasInvalidRootBinding(entry)
+          || validRootBinding(previous.root_binding) && validRootBinding(entry.root_binding)
+            && previous.root_binding !== entry.root_binding
+        : hasInvalidRootBinding(entry);
+      const merged = { ...previous, ...entry, _root_binding_mismatch: mismatch };
+      if (mismatch && previous) {
+        merged.root = previous.root;
+        merged.root_binding = previous.root_binding;
+      } else if (validRootBinding(previous?.root_binding) && !validRootBinding(entry.root_binding)) {
+        merged.root_binding = previous.root_binding;
+      }
+      byId.set(entry.id, merged);
     }
   }
   return byId;
+}
+
+function hasInvalidRootBinding(entry) {
+  if (!entry || !Object.hasOwn(entry, "root_binding") || entry.root_binding == null) return false;
+  return !validRootBinding(entry.root_binding);
+}
+
+function validRootBinding(value) {
+  return typeof value === "string" && /^v1:[0-9a-f]{64}$/u.test(value);
+}
+
+function withCurrentLibraryIdentity(entry, current) {
+  return {
+    ...entry,
+    ...(typeof current?.root === "string" && current.root ? { root: current.root } : {}),
+    ...(validRootBinding(current?.root_binding) ? { root_binding: current.root_binding } : {}),
+  };
 }
 
 function retainLibrarySnapshots(previousSnapshot, incomingSnapshot) {
@@ -39,8 +71,25 @@ function retainLibrarySnapshots(previousSnapshot, incomingSnapshot) {
     if (!entry || typeof entry.id !== "string") return entry;
     const current = incoming.get(entry.id);
     const prior = previous.get(entry.id);
+    if (current?._root_binding_mismatch === true) {
+      return {
+        ...entry,
+        ...(typeof current.root === "string" ? { root: current.root } : {}),
+        ...(validRootBinding(current.root_binding) ? { root_binding: current.root_binding } : {}),
+        snapshot: null,
+        availability: "unavailable",
+        available: false,
+        snapshot_stale: true,
+      };
+    }
     if (!current || !prior || typeof current.root !== "string" || !current.root
-      || current.root !== prior.root) return entry;
+      || current.root !== prior.root) return withCurrentLibraryIdentity(entry, current);
+    const priorBound = validRootBinding(prior.root_binding);
+    const currentBound = validRootBinding(current.root_binding);
+    if (hasInvalidRootBinding(prior) || hasInvalidRootBinding(current)
+        || (priorBound || currentBound) && (!priorBound || !currentBound || prior.root_binding !== current.root_binding)) {
+      return withCurrentLibraryIdentity(entry, current);
+    }
 
     let priorSnapshot = prior.snapshot;
     if ((!priorSnapshot || typeof priorSnapshot !== "object")

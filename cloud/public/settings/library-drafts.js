@@ -1,10 +1,16 @@
 const DRAFT_FIELDS = new Set(["name", "default_category"]);
 const LIBRARY_EDITOR_FORMS = "form[data-rename-form], form[data-category-form]";
+const ROOT_BINDING_PATTERN = /^v1:[0-9a-f]{64}$/u;
 
 function libraryKey(entry) {
   if (!entry || typeof entry !== "object") return null;
   if (typeof entry.id !== "string" || !entry.id || typeof entry.root !== "string" || !entry.root) return null;
-  return { id: entry.id, root: entry.root };
+  if (typeof entry.root_binding !== "string" || !ROOT_BINDING_PATTERN.test(entry.root_binding)) return null;
+  return { id: entry.id, root: entry.root, rootBinding: entry.root_binding };
+}
+
+function sameLibraryBinding(left, right) {
+  return left?.root === right?.root && left?.rootBinding === right?.rootBinding;
 }
 
 function appliedValue(entry, field) {
@@ -21,7 +27,7 @@ export function setLibraryDraftField(drafts, entry, field, value) {
   if (!key) return false;
 
   let draft = drafts.get(key.id);
-  if (draft && draft.root !== key.root) {
+  if (draft && !sameLibraryBinding(draft, key)) {
     drafts.delete(key.id);
     draft = null;
   }
@@ -36,7 +42,7 @@ export function setLibraryDraftField(drafts, entry, field, value) {
   }
 
   if (!draft) {
-    draft = { root: key.root, fields: Object.create(null) };
+    draft = { root: key.root, rootBinding: key.rootBinding, fields: Object.create(null) };
     drafts.set(key.id, draft);
   }
   draft.fields[field] = text;
@@ -47,7 +53,7 @@ export function libraryDraftFieldValue(drafts, entry, field) {
   const key = libraryKey(entry);
   if (!key || !DRAFT_FIELDS.has(field)) return appliedValue(entry, field);
   const draft = drafts instanceof Map ? drafts.get(key.id) : null;
-  if (draft?.root === key.root && Object.hasOwn(draft.fields ?? {}, field)) return draft.fields[field];
+  if (sameLibraryBinding(draft, key) && Object.hasOwn(draft.fields ?? {}, field)) return draft.fields[field];
   return appliedValue(entry, field);
 }
 
@@ -56,12 +62,12 @@ export function reconcileLibraryDrafts(drafts, entries) {
   const current = new Map();
   for (const entry of Array.isArray(entries) ? entries : []) {
     const key = libraryKey(entry);
-    if (key) current.set(key.id, { entry, root: key.root });
+    if (key) current.set(key.id, { ...key, entry });
   }
 
   for (const [id, draft] of drafts) {
     const live = current.get(id);
-    if (!live || live.root !== draft?.root) {
+    if (!live || !sameLibraryBinding(draft, live)) {
       drafts.delete(id);
       continue;
     }
@@ -83,10 +89,12 @@ export function captureLibraryEditorFocus(list, activeElement, entries) {
   const entry = (Array.isArray(entries) ? entries : []).find((candidate) => candidate?.id === id);
   const key = libraryKey(entry);
   if (!key || form.dataset?.libraryRoot !== key.root
+    || form.dataset?.libraryRootBinding !== key.rootBinding
     || !Number.isSafeInteger(activeElement.selectionStart) || !Number.isSafeInteger(activeElement.selectionEnd)) return null;
   return {
     id: key.id,
     root: key.root,
+    rootBinding: key.rootBinding,
     field,
     selectionStart: activeElement.selectionStart,
     selectionEnd: activeElement.selectionEnd,
@@ -98,11 +106,12 @@ export function restoreLibraryEditorFocus(list, focus, entries) {
   if (!focus || !list?.querySelectorAll) return false;
   const entry = (Array.isArray(entries) ? entries : []).find((candidate) => candidate?.id === focus.id);
   const key = libraryKey(entry);
-  if (!key || key.root !== focus.root || !DRAFT_FIELDS.has(focus.field)) return false;
+  if (!key || !sameLibraryBinding(key, focus) || !DRAFT_FIELDS.has(focus.field)) return false;
   const form = [...list.querySelectorAll(LIBRARY_EDITOR_FORMS)].find((candidate) =>
     (candidate.dataset?.renameForm ?? candidate.dataset?.categoryForm) === focus.id
       && (candidate.dataset?.renameForm ? "name" : "default_category") === focus.field
       && candidate.dataset?.libraryRoot === focus.root
+      && candidate.dataset?.libraryRootBinding === focus.rootBinding
   );
   const input = form?.elements?.namedItem?.(focus.field);
   if (!input || input.disabled || input.readOnly || typeof input.focus !== "function") return false;

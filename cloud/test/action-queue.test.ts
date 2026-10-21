@@ -4,12 +4,22 @@ import {
   ACTION_SURFACE_FILE,
   ACTION_SURFACE_SETTINGS,
   actionBelongsToSurface,
+  consumeRejectedActionReceipts,
   dispatchNextOwnedAction,
   recoverActionReceipts,
   recordActionReceipt,
   restorePendingActions,
+  type DownloadSubmissionReceiptTracker,
+  type LocalActionReceiptTracker,
+  type MigrationConflictReceiptTracker,
   type QueuedAction,
 } from "../public/file/action-queue.js";
+
+type RejectionTrackerState = {
+  localActions?: ReadonlyMap<string, LocalActionReceiptTracker>;
+  downloadSubmission?: DownloadSubmissionReceiptTracker | null;
+  migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
+};
 
 function sharedQueue(initial: QueuedAction[]) {
   let value = JSON.stringify(initial);
@@ -297,5 +307,164 @@ describe("shared Mini App action queue ownership", () => {
       payload: state.downloadSubmission.payload,
       surface: ACTION_SURFACE_FILE,
     }]);
+  });
+
+  it("delivers permanent rejections only to the matching download, settings, and conflict origin", async () => {
+    const cases = [
+      {
+        surface: ACTION_SURFACE_FILE,
+        kind: "download_submit",
+        payload: { url: "https://example.test/video", library_id: "main", category: "" },
+        origin: (requestId: string): RejectionTrackerState => ({
+          downloadSubmission: { request_id: requestId, seq: null as number | null, payload: { url: "https://example.test/video" } },
+        }),
+        helper: (): RejectionTrackerState => ({ downloadSubmission: null }),
+      },
+      {
+        surface: ACTION_SURFACE_SETTINGS,
+        kind: "library_rename",
+        payload: { library_id: "archive", name: "Archive" },
+        origin: (requestId: string): RejectionTrackerState => ({
+          localActions: new Map([[requestId, { kind: "library_rename", payload: { library_id: "archive", name: "Archive" }, seq: null as number | null }]]),
+        }),
+        helper: (): RejectionTrackerState => ({ localActions: new Map() }),
+      },
+      {
+        surface: ACTION_SURFACE_FILE,
+        kind: "library_migration_preview",
+        payload: { supersedes_preview_seq: 17, supersedes_preview_id: "old", supersedes_revision: "r1" },
+        origin: (requestId: string): RejectionTrackerState => ({
+          migrationConflictDrafts: new Map([["old", {
+            refreshRequestId: requestId,
+            refreshPayload: { supersedes_preview_seq: 17 },
+            refreshSeq: null as number | null,
+            refreshError: null as string | null,
+          }]]),
+        }),
+        helper: (): RejectionTrackerState => ({ migrationConflictDrafts: new Map() }),
+      },
+    ] as const;
+
+    for (const [index, scenario] of cases.entries()) {
+      const requestId = `permanent-rejection-${index}`;
+      const action: QueuedAction = {
+        request_id: requestId,
+        kind: scenario.kind,
+        payload: scenario.payload,
+        surface: scenario.surface,
+      };
+      const queue = sharedQueue([action]);
+      const receiptStorage = new MemoryStorage();
+      const originState = scenario.origin(requestId);
+      const helperState = scenario.helper();
+      const result = await dispatchNextOwnedAction({
+        surface: scenario.surface,
+        readQueue: queue.read,
+        writeQueue: queue.write,
+        dispatch: async () => { throw Object.assign(new Error(`Invalid input ${"é".repeat(200)}\nfor this action`), { status: 422 }); },
+        onReceipt: (entry, receipt, surface) => recordActionReceipt(entry, receipt, helperState, { surface, storage: receiptStorage, now: 2_000 }),
+      });
+
+      expect(result.status).toBe("rejected");
+      expect(queue.contents()).toEqual([]);
+      const key = `${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(requestId)}`;
+      const persisted = JSON.parse(receiptStorage.getItem(key) ?? "null");
+      expect(persisted).toMatchObject({ version: 1, request_id: requestId, surface: scenario.surface, kind: scenario.kind, outcome: "rejected", status: 422 });
+      expect(new TextEncoder().encode(persisted.error).byteLength).toBeLessThanOrEqual(256);
+      expect(persisted.error).not.toMatch(/[\u0000-\u001f\u007f]/u);
+
+      const helperRecovery = recoverActionReceipts(helperState, { surface: scenario.surface, storage: receiptStorage });
+      expect(helperRecovery.matched).toBe(0);
+      expect(receiptStorage.getItem(key)).not.toBeNull();
+
+      const originRecovery = recoverActionReceipts(originState, { surface: scenario.surface, storage: receiptStorage });
+      expect(originRecovery.matched).toBe(1);
+      expect(originRecovery.rejectedRequestIds).toEqual([requestId]);
+      if (scenario.surface === ACTION_SURFACE_SETTINGS) {
+        const local = originState.localActions?.get(requestId);
+        expect(local).toMatchObject({ rejected: true, error: persisted.error, seq: null });
+        expect(restorePendingActions(originState, { surface: scenario.surface, readQueue: () => [], writeQueue: () => true }).requeued).toBe(0);
+      } else if (scenario.kind === "download_submit") {
+        expect(originState.downloadSubmission).toMatchObject({ rejected: true, error: persisted.error, seq: null });
+        expect(restorePendingActions(originState, { surface: scenario.surface, readQueue: () => [], writeQueue: () => true }).requeued).toBe(0);
+      } else {
+        const draft = originState.migrationConflictDrafts?.get("old");
+        expect(draft).toMatchObject({ refreshRequestId: null, rejectedRefreshRequestId: requestId, refreshPayload: null, refreshError: persisted.error });
+        expect(restorePendingActions(originState, { surface: scenario.surface, readQueue: () => [], writeQueue: () => true }).requeued).toBe(0);
+      }
+      expect(consumeRejectedActionReceipts(originState, { surface: scenario.surface, requestIds: [requestId], storage: receiptStorage }).consumed).toBe(1);
+      expect(receiptStorage.getItem(key)).toBeNull();
+    }
+  });
+
+  it("retains permanently rejected actions if rejection receipt storage fails, then retries the same ID", async () => {
+    const action: QueuedAction = { request_id: "rejection-storage-retry", kind: "download_submit", payload: { url: "https://example.test/video" }, surface: ACTION_SURFACE_FILE };
+    const queue = sharedQueue([action]);
+    const receiptStorage = new MemoryStorage();
+    receiptStorage.failWrites = true;
+    const onReceipt = (entry: QueuedAction, receipt: unknown, surface: "settings" | "file") =>
+      recordActionReceipt(entry, receipt, {}, { surface, storage: receiptStorage, now: 3_000 });
+    const failed = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+      dispatch: async () => { throw Object.assign(new Error("Invalid request"), { status: 422 }); },
+      onReceipt,
+    });
+    expect(failed.status).toBe("rejection_receipt_failed");
+    expect(queue.contents()).toEqual([action]);
+    expect(receiptStorage.length).toBe(0);
+
+    receiptStorage.failWrites = false;
+    const retried = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+      dispatch: async (entry) => {
+        expect(entry.request_id).toBe(action.request_id);
+        throw Object.assign(new Error("Invalid request"), { status: 422 });
+      },
+      onReceipt,
+    });
+    expect(retried.status).toBe("rejected");
+    expect(queue.contents()).toEqual([]);
+  });
+
+  it.each([401, 403, 408, 429, 500, 600])("does not persist a rejection for status %i", async (status) => {
+    const action: QueuedAction = { request_id: `not-terminal-${status}`, kind: "download_submit", payload: {}, surface: ACTION_SURFACE_FILE };
+    const queue = sharedQueue([action]);
+    const receiptStorage = new MemoryStorage();
+    const result = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+      dispatch: async () => { throw Object.assign(new Error(`HTTP ${status}`), { status }); },
+      onReceipt: (entry, receipt, surface) => recordActionReceipt(entry, receipt, {}, { surface, storage: receiptStorage }),
+    });
+    expect(result.status).toBe("error");
+    expect(queue.contents()).toEqual([action]);
+    expect(receiptStorage.length).toBe(0);
+  });
+
+  it("keeps a rejection receipt until the origin can remove its queue entry", async () => {
+    const action: QueuedAction = { request_id: "rejection-removal-retry", kind: "download_submit", payload: {}, surface: ACTION_SURFACE_FILE };
+    const queue = sharedQueue([action]);
+    const originState = { downloadSubmission: { request_id: action.request_id, seq: null as number | null, payload: {} } };
+    const receiptStorage = new MemoryStorage();
+    const result = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: () => false,
+      dispatch: async () => { throw Object.assign(new Error("Invalid request"), { status: 422 }); },
+      onReceipt: (entry, receipt, surface) => recordActionReceipt(entry, receipt, originState, { surface, storage: receiptStorage, now: 4_000 }),
+    });
+    expect(result.status).toBe("rejection_remove_failed");
+    expect(queue.contents()).toEqual([action]);
+    expect(receiptStorage.getItem(`${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(action.request_id)}`)).not.toBeNull();
+
+    const recovered = recoverActionReceipts(originState, { surface: ACTION_SURFACE_FILE, storage: receiptStorage });
+    expect(recovered.rejectedRequestIds).toEqual([action.request_id]);
+    expect(consumeRejectedActionReceipts(originState, { surface: ACTION_SURFACE_FILE, requestIds: recovered.rejectedRequestIds, storage: receiptStorage }).consumed).toBe(1);
+    expect(receiptStorage.length).toBe(0);
   });
 });

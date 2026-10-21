@@ -55,6 +55,27 @@ export async function dispatchNextOwnedAction({
   try {
     receipt = await dispatch(action);
   } catch (error) {
+    if (needsDurableReceipt(action, surface) && isPermanentReceiptRejection(error)) {
+      const rejection = {
+        outcome: "rejected",
+        status: error.status,
+        error: boundedReceiptError(error?.message),
+      };
+      let receiptUpdate;
+      try {
+        receiptUpdate = onReceipt?.(action, rejection, surface);
+      } catch (receiptError) {
+        return { status: "rejection_receipt_failed", action, error, receiptError };
+      }
+      if (receiptUpdate?.persisted !== true) {
+        return { status: "rejection_receipt_failed", action, error, receiptUpdate };
+      }
+      const removed = writeQueue(removeQueuedAction(readQueue(), action.request_id));
+      if (removed) receiptUpdate?.consume?.();
+      return removed
+        ? { status: "rejected", action, rejection, receiptUpdate }
+        : { status: "rejection_remove_failed", action, rejection, receiptUpdate };
+    }
     return { status: "error", action, error };
   }
 
@@ -92,6 +113,26 @@ function validRequestId(value) {
     && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
+function isPermanentReceiptRejection(error) {
+  const status = error && typeof error === "object" ? error.status : undefined;
+  return Number.isInteger(status) && status >= 400 && status <= 499
+    && status !== 401 && status !== 403 && status !== 408 && status !== 429;
+}
+
+function boundedReceiptError(value) {
+  const text = String(value ?? "Request rejected")
+    .replace(/[\u0000-\u001f\u007f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+  let bounded = "";
+  const encoder = new TextEncoder();
+  for (const character of text || "Request rejected") {
+    if (encoder.encode(bounded + character).byteLength > 256) break;
+    bounded += character;
+  }
+  return bounded || "Request rejected";
+}
+
 function receiptStorageKey(requestId) {
   return `${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(requestId)}`;
 }
@@ -103,23 +144,40 @@ function getStorage(storage) {
 
 function validReceiptRecord(value, expectedRequestId) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  return value.version === 1
+  const common = value.version === 1
     && validRequestId(value.request_id)
     && value.request_id === expectedRequestId
     && (value.surface === ACTION_SURFACE_SETTINGS || value.surface === ACTION_SURFACE_FILE)
     && typeof value.kind === "string"
-    && Number.isSafeInteger(value.seq) && value.seq > 0
     && Number.isSafeInteger(value.stored_at) && value.stored_at > 0;
+  if (!common) return false;
+  if (value.outcome === undefined || value.outcome === "accepted") {
+    return Number.isSafeInteger(value.seq) && value.seq > 0;
+  }
+  return value.outcome === "rejected"
+    && Number.isInteger(value.status) && value.status >= 400 && value.status <= 499
+    && value.status !== 401 && value.status !== 403 && value.status !== 408 && value.status !== 429
+    && typeof value.error === "string" && value.error.length > 0
+    && new TextEncoder().encode(value.error).byteLength <= 256
+    && !/[\u0000-\u001f\u007f]/u.test(value.error);
 }
 
 function applyReceiptToTrackers(action, receipt, state, surface) {
-  const result = { matched: false, localAction: false, downloadSubmission: false, migrationConflictDrafts: 0 };
-  if (!validRequestId(action?.request_id) || !Number.isSafeInteger(receipt?.seq) || receipt.seq <= 0) return result;
+  const result = { matched: false, localAction: false, downloadSubmission: false, migrationConflictDrafts: 0, rejected: false };
+  if (!validRequestId(action?.request_id)) return result;
+  const rejected = receipt?.outcome === "rejected";
+  if (rejected ? !validReceiptRecord({ ...receipt, version: 1, request_id: action.request_id, surface, kind: action.kind, stored_at: 1 }, action.request_id)
+    : !Number.isSafeInteger(receipt?.seq) || receipt.seq <= 0) return result;
 
   if (surface === ACTION_SURFACE_SETTINGS && SETTINGS_ACTION_KINDS.has(action.kind)) {
     const local = state?.localActions instanceof Map ? state.localActions.get(action.request_id) : null;
     if (local && local.kind === action.kind && (local.seq == null || local.seq === receipt.seq)) {
-      local.seq = receipt.seq;
+      if (rejected) {
+        local.rejected = true;
+        local.error = receipt.error;
+      } else {
+        local.seq = receipt.seq;
+      }
       result.localAction = true;
     }
   }
@@ -127,21 +185,35 @@ function applyReceiptToTrackers(action, receipt, state, surface) {
   if (surface === ACTION_SURFACE_FILE && action.kind === "download_submit"
       && state?.downloadSubmission?.request_id === action.request_id
       && (state.downloadSubmission.seq == null || state.downloadSubmission.seq === receipt.seq)) {
-    state.downloadSubmission.seq = receipt.seq;
+    if (rejected) {
+      state.downloadSubmission.rejected = true;
+      state.downloadSubmission.error = receipt.error;
+    } else {
+      state.downloadSubmission.seq = receipt.seq;
+    }
     result.downloadSubmission = true;
   }
 
   if (surface === ACTION_SURFACE_FILE && action.kind === "library_migration_preview"
       && state?.migrationConflictDrafts instanceof Map) {
     for (const draft of state.migrationConflictDrafts.values()) {
-      if (draft.refreshRequestId === action.request_id
+      if ((draft.refreshRequestId === action.request_id || draft.rejectedRefreshRequestId === action.request_id)
           && (draft.refreshSeq == null || draft.refreshSeq === receipt.seq)) {
-        draft.refreshSeq = receipt.seq;
+        if (rejected) {
+          draft.rejectedRefreshRequestId = action.request_id;
+          draft.refreshRequestId = null;
+          draft.refreshPayload = null;
+          draft.refreshSeq = null;
+          draft.refreshError = receipt.error;
+        } else {
+          draft.refreshSeq = receipt.seq;
+        }
         result.migrationConflictDrafts += 1;
       }
     }
   }
 
+  result.rejected = rejected && (result.localAction || result.downloadSubmission || result.migrationConflictDrafts > 0);
   result.matched = result.localAction || result.downloadSubmission || result.migrationConflictDrafts > 0;
   return result;
 }
@@ -158,7 +230,7 @@ function trackerKinds(state, requestId, surface) {
       kinds.add("download_submit");
     }
     if (state?.migrationConflictDrafts instanceof Map
-        && [...state.migrationConflictDrafts.values()].some((draft) => draft.refreshRequestId === requestId
+        && [...state.migrationConflictDrafts.values()].some((draft) => (draft.refreshRequestId === requestId || draft.rejectedRefreshRequestId === requestId)
           && (draft.refreshSeq == null || Number.isSafeInteger(draft.refreshSeq)))) {
       kinds.add("library_migration_preview");
     }
@@ -181,8 +253,9 @@ function trackerIds(state, surface) {
     }
     if (state?.migrationConflictDrafts instanceof Map) {
       for (const draft of state.migrationConflictDrafts.values()) {
-        if ((draft?.refreshSeq == null || Number.isSafeInteger(draft?.refreshSeq))
-            && validRequestId(draft?.refreshRequestId)) ids.add(draft.refreshRequestId);
+        for (const requestId of [draft?.refreshRequestId, draft?.rejectedRefreshRequestId]) {
+          if ((draft?.refreshSeq == null || Number.isSafeInteger(draft?.refreshSeq)) && validRequestId(requestId)) ids.add(requestId);
+        }
       }
     }
   }
@@ -191,13 +264,18 @@ function trackerIds(state, surface) {
 
 export function recordActionReceipt(action, receipt, state = {}, { surface = action?.surface, storage, now = Date.now() } = {}) {
   const resolvedSurface = surface ?? (SETTINGS_ACTION_KINDS.has(action?.kind) ? ACTION_SURFACE_SETTINGS : ACTION_SURFACE_FILE);
-  const result = { persisted: false, matched: false, localAction: false, downloadSubmission: false, migrationConflictDrafts: 0 };
+  const result = { persisted: false, matched: false, localAction: false, downloadSubmission: false, migrationConflictDrafts: 0, rejected: false, rejectedRequestIds: [] };
   if (!needsDurableReceipt(action, resolvedSurface)) {
     result.persisted = true;
     return result;
   }
-  if (!validRequestId(action?.request_id) || !Number.isSafeInteger(receipt?.seq) || receipt.seq <= 0
-      || !Number.isSafeInteger(now) || now <= 0) return result;
+  const rejected = receipt?.outcome === "rejected";
+  if (!validRequestId(action?.request_id) || !Number.isSafeInteger(now) || now <= 0) return result;
+  if (rejected) {
+    if (!isPermanentReceiptRejection(receipt) || typeof receipt.error !== "string"
+        || receipt.error.length === 0 || new TextEncoder().encode(receipt.error).byteLength > 256
+        || /[\u0000-\u001f\u007f]/u.test(receipt.error)) return result;
+  } else if (!Number.isSafeInteger(receipt?.seq) || receipt.seq <= 0) return result;
 
   const targetStorage = getStorage(storage);
   if (!targetStorage || typeof targetStorage.setItem !== "function") return result;
@@ -206,7 +284,9 @@ export function recordActionReceipt(action, receipt, state = {}, { surface = act
     request_id: action.request_id,
     surface: resolvedSurface,
     kind: action.kind,
-    seq: receipt.seq,
+    ...(rejected
+      ? { outcome: "rejected", status: receipt.status, error: receipt.error }
+      : { outcome: "accepted", seq: receipt.seq }),
     stored_at: now,
   };
   try {
@@ -218,14 +298,20 @@ export function recordActionReceipt(action, receipt, state = {}, { surface = act
   result.persisted = true;
   const applied = applyReceiptToTrackers(action, receipt, state, resolvedSurface);
   Object.assign(result, applied);
-  if (applied.matched) {
+  if (applied.rejected) result.rejectedRequestIds.push(action.request_id);
+  if (applied.matched && !rejected) {
     try { targetStorage.removeItem(receiptStorageKey(action.request_id)); } catch { /* Re-reading this receipt is idempotent. */ }
+  }
+  if (applied.matched && rejected) {
+    result.consume = () => {
+      try { targetStorage.removeItem(receiptStorageKey(action.request_id)); } catch { /* Re-reading this rejection is idempotent. */ }
+    };
   }
   return result;
 }
 
 export function recoverActionReceipts(state, { surface, storage } = {}) {
-  const result = { matched: 0, localActions: false, downloadSubmission: false, migrationConflictDrafts: 0, requestIds: [] };
+  const result = { matched: 0, localActions: false, downloadSubmission: false, migrationConflictDrafts: 0, requestIds: [], rejectedRequestIds: [], rejections: [] };
   if (surface !== ACTION_SURFACE_SETTINGS && surface !== ACTION_SURFACE_FILE) return result;
   const targetStorage = getStorage(storage);
   if (!targetStorage || typeof targetStorage.getItem !== "function") return result;
@@ -243,12 +329,48 @@ export function recoverActionReceipts(state, { surface, storage } = {}) {
     result.downloadSubmission ||= applied.downloadSubmission;
     result.migrationConflictDrafts += applied.migrationConflictDrafts;
     result.requestIds.push(requestId);
-    try { targetStorage.removeItem(receiptStorageKey(requestId)); } catch { /* Re-reading this receipt is idempotent. */ }
+    if (applied.rejected) {
+      result.rejectedRequestIds.push(requestId);
+      result.rejections.push({ request_id: requestId, kind: record.kind, status: record.status, error: record.error });
+    }
+    if (!applied.rejected) {
+      try { targetStorage.removeItem(receiptStorageKey(requestId)); } catch { /* Re-reading this receipt is idempotent. */ }
+    }
   }
 
-  // An unmatched key may belong to a sleeping origin tab. Only that tab's
-  // matching tracker may consume it; matched records are removed above.
+  // Unmatched keys may belong to a sleeping origin tab. Accepted receipts are
+  // consumed here; rejected receipts stay until the origin removes its queue row.
   return result;
+}
+
+export function consumeRejectedActionReceipts(state, { surface, requestIds, storage } = {}) {
+  const result = { consumed: 0 };
+  if (surface !== ACTION_SURFACE_SETTINGS && surface !== ACTION_SURFACE_FILE) return result;
+  const targetStorage = getStorage(storage);
+  if (!targetStorage || typeof targetStorage.getItem !== "function" || typeof targetStorage.removeItem !== "function") return result;
+  for (const requestId of Array.isArray(requestIds) ? requestIds : []) {
+    if (!validRequestId(requestId) || !hasRejectedTracker(state, requestId, surface)) continue;
+    let record;
+    try { record = JSON.parse(targetStorage.getItem(receiptStorageKey(requestId)) ?? "null"); } catch { continue; }
+    if (!validReceiptRecord(record, requestId) || record.outcome !== "rejected" || record.surface !== surface) continue;
+    if (!trackerKinds(state, requestId, surface).has(record.kind)) continue;
+    try {
+      targetStorage.removeItem(receiptStorageKey(requestId));
+      result.consumed += 1;
+    } catch { /* Keep the rejection available for the origin's next recovery pass. */ }
+  }
+  return result;
+}
+
+function hasRejectedTracker(state, requestId, surface) {
+  if (surface === ACTION_SURFACE_SETTINGS) return state?.localActions instanceof Map
+    && state.localActions.get(requestId)?.rejected === true;
+  if (surface === ACTION_SURFACE_FILE) {
+    return state?.downloadSubmission?.request_id === requestId && state.downloadSubmission.rejected === true
+      || state?.migrationConflictDrafts instanceof Map
+        && [...state.migrationConflictDrafts.values()].some((draft) => draft.rejectedRefreshRequestId === requestId);
+  }
+  return false;
 }
 
 export function restorePendingActions(state, { surface, readQueue, writeQueue } = {}) {
@@ -259,14 +381,14 @@ export function restorePendingActions(state, { surface, readQueue, writeQueue } 
   const candidates = [];
   if (surface === ACTION_SURFACE_SETTINGS && state?.localActions instanceof Map) {
     for (const [requestId, local] of state.localActions) {
-      if (local?.seq !== null || !SETTINGS_ACTION_KINDS.has(local.kind) || !validRequestId(requestId)
+      if (local?.seq !== null || local?.rejected === true || !SETTINGS_ACTION_KINDS.has(local.kind) || !validRequestId(requestId)
           || !local.payload || typeof local.payload !== "object") continue;
       candidates.push({ request_id: requestId, kind: local.kind, payload: local.payload, surface });
     }
   }
   if (surface === ACTION_SURFACE_FILE) {
     const submission = state?.downloadSubmission;
-    if (submission?.seq === null && validRequestId(submission.request_id)
+    if (submission?.seq === null && submission?.rejected !== true && validRequestId(submission.request_id)
         && submission.payload && typeof submission.payload === "object") {
       candidates.push({ request_id: submission.request_id, kind: "download_submit", payload: submission.payload, surface });
     }

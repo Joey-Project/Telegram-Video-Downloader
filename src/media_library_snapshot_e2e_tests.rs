@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -6,6 +7,7 @@ use super::*;
 use crate::file_provider::{FileProviderAccessError, QueueFileProvider};
 use crate::library::Presence;
 use anyhow::Result;
+use serde_json::Value;
 
 const SNAPSHOT_TEST_CHAT_ID: i64 = 123_456_789;
 
@@ -822,5 +824,458 @@ async fn failed_non_default_library_open_keeps_cache_unavailable_until_scoped_re
     drop(runtime);
     drop(inbox);
     drop(queue);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
+    let root = temp_cloud_bot_dir("media-library-remove-reused-id-cache");
+    let video_root = root.join("videos");
+    let archive_root = root.join("archive");
+    let retired_root = root.join("archive-retired");
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = video_root.clone();
+    config.downloads.pdf_dir = root.join("pdfs");
+    config.telegram.allowed_chat_ids = vec![SNAPSHOT_TEST_CHAT_ID];
+    config
+        .ensure_runtime_dirs()
+        .expect("test library roots should create");
+    fs::write(video_root.join("source.mp4"), b"source media").expect("source media should write");
+    fs::create_dir(&archive_root).expect("archive library should create");
+    fs::write(archive_root.join("old.mp4"), b"old archive media")
+        .expect("old archive media should write");
+    fs::write(
+        archive_root.join("old.nfo"),
+        b"<movie><title>Old archive metadata</title></movie>",
+    )
+    .expect("old archive metadata should write");
+
+    let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let source_id = queue
+        .default_video_destination()
+        .expect("source library should resolve")
+        .library_id;
+    let archive = queue
+        .register_video_library("Archive", &archive_root, None, false, false)
+        .expect("archive library should register");
+    let inbox = Arc::new(open_runtime_test_inbox(&video_root).expect("cloud inbox should open"));
+    let runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+
+    let source_scan = run_library_management_test_request(
+        &runtime,
+        8_101,
+        "library_scan",
+        serde_json::json!({"library_id": source_id}),
+    )
+    .await;
+    assert_eq!(source_scan.status, InboxStatus::Completed);
+    let source_snapshot = runtime
+        .library_snapshots
+        .lock()
+        .await
+        .get(&source_id)
+        .cloned()
+        .expect("the default source cache should be available for fallback");
+
+    let set_archive_default = run_library_management_test_request(
+        &runtime,
+        8_102,
+        "library_set_default",
+        serde_json::json!({"library_id": archive.id}),
+    )
+    .await;
+    assert_eq!(set_archive_default.status, InboxStatus::Completed);
+    let old_scan = run_library_management_test_request(
+        &runtime,
+        8_103,
+        "library_scan",
+        serde_json::json!({"library_id": archive.id}),
+    )
+    .await;
+    assert_eq!(
+        old_scan.status,
+        InboxStatus::Completed,
+        "{:?}",
+        old_scan.error
+    );
+    let old_cached = runtime
+        .library_snapshots
+        .lock()
+        .await
+        .get(&archive.id)
+        .cloned()
+        .expect("the old archive scan should populate its cache");
+    assert_eq!(old_cached.items.len(), 1);
+    assert_eq!(old_cached.items[0].relative_path, "old.mp4");
+
+    let old_applied = media_library_bot::applied_settings(&queue)
+        .expect("applied library settings should serialize");
+    let old_binding = old_applied["libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|view| view["id"] == archive.id)
+        .and_then(|view| view["root_binding"].as_str())
+        .expect("bound roots should publish an opaque identity token")
+        .to_string();
+    assert_eq!(old_binding.len(), 67);
+    assert!(old_binding.starts_with("v1:"));
+    assert!(
+        old_binding[3..]
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    );
+    fs::write(
+        archive_root.join("ordinary-child.txt"),
+        b"ordinary child churn",
+    )
+    .expect("same-root child churn should remain permitted");
+    let after_child_churn = media_library_bot::applied_settings(&queue)
+        .expect("settings should remain available after child churn");
+    assert_eq!(
+        after_child_churn["libraries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == archive.id)
+            .unwrap()["root_binding"],
+        old_binding,
+        "ordinary child-entry changes must not change the root object token"
+    );
+    let attached = media_library_bot::attach_library_views(
+        &runtime,
+        &old_applied,
+        serde_json::to_value(empty_cloud_test_library_snapshot("legacy"))
+            .expect("legacy snapshot should serialize"),
+    )
+    .await
+    .expect("library views should attach");
+    let old_view = attached["libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|view| view["id"] == archive.id)
+        .unwrap();
+    assert_eq!(old_view["root_binding"], old_binding);
+
+    let (archive_runtime, _) = media_library_bot::scoped_runtime(&runtime, Some(&archive.id))
+        .expect("archive runtime should scope");
+    let failed_scan = run_cloud_library_operation::<()>(
+        &archive_runtime,
+        "synthetic archive scan failure",
+        |_, _| Err(anyhow::anyhow!("synthetic archive scan failure")),
+    )
+    .await;
+    assert!(failed_scan.is_err());
+    let archive_warning = runtime
+        .library_unavailable
+        .lock()
+        .await
+        .get(&archive.id)
+        .cloned()
+        .expect("failed scan should mark the archive unavailable");
+    let global_before_failed_remove = runtime.library_snapshot.lock().await.clone();
+    let warning_before_failed_remove = runtime.library_scan_warning.lock().await.clone();
+
+    let failed_remove = run_library_management_test_request(
+        &runtime,
+        8_104,
+        "library_remove",
+        serde_json::json!({"library_id": archive.id}),
+    )
+    .await;
+    assert_eq!(failed_remove.status, InboxStatus::Failed);
+    assert!(
+        runtime
+            .library_snapshots
+            .lock()
+            .await
+            .get(&archive.id)
+            .is_some_and(|snapshot| snapshot == &old_cached),
+        "a failed removal must preserve the cached library snapshot"
+    );
+    assert_eq!(
+        runtime.library_unavailable.lock().await.get(&archive.id),
+        Some(&archive_warning),
+        "a failed removal must preserve its scoped unavailable marker"
+    );
+    assert_eq!(
+        runtime.library_snapshot.lock().await.as_ref(),
+        global_before_failed_remove.as_ref(),
+        "a failed removal must not alter the legacy snapshot"
+    );
+    assert_eq!(
+        runtime.library_scan_warning.lock().await.as_ref(),
+        warning_before_failed_remove.as_ref(),
+        "a failed removal must not alter the global warning"
+    );
+
+    let restore_source_default = run_library_management_test_request(
+        &runtime,
+        8_105,
+        "library_set_default",
+        serde_json::json!({"library_id": source_id}),
+    )
+    .await;
+    assert_eq!(restore_source_default.status, InboxStatus::Completed);
+
+    // Hold a real scan after it has opened and read the old root but before it publishes its
+    // snapshot. The remove dispatch is polled until it blocks on the same gate, so this ordering
+    // remains deterministic under a slow CI worker.
+    let (scan_read_tx, scan_read_rx) = oneshot::channel();
+    let (release_scan_tx, release_scan_rx) = std::sync::mpsc::channel();
+    let scan_runtime = archive_runtime.clone();
+    let scan_task = tokio::spawn(async move {
+        run_cloud_library_operation(
+            &scan_runtime,
+            "archive scan publication fixture failed",
+            move |context, inbox| {
+                let manager = open_cloud_library_manager(&context, inbox, None)?;
+                let snapshot = manager.scan(&[])?;
+                drop(manager);
+                scan_read_tx
+                    .send(())
+                    .map_err(|_| anyhow::anyhow!("scan synchronization receiver closed"))?;
+                release_scan_rx
+                    .recv()
+                    .map_err(|_| anyhow::anyhow!("scan release sender closed"))?;
+                Ok((snapshot.clone(), snapshot))
+            },
+        )
+        .await
+    });
+    scan_read_rx
+        .await
+        .expect("scan should reach the pre-publication checkpoint");
+    assert!(runtime.library_scan_publication_gate.try_lock().is_err());
+
+    let request = CloudRequest {
+        seq: 8_106,
+        kind: "library_remove".to_string(),
+        payload: serde_json::json!({"library_id": archive.id}),
+        created_at: now_millis(),
+        extra: serde_json::Map::new(),
+    };
+    let remove_runtime = runtime.clone();
+    let (remove_pending_tx, remove_pending_rx) = oneshot::channel();
+    let remove_task = tokio::spawn(async move {
+        let mut dispatch_future = Box::pin(media_library_bot::dispatch(&remove_runtime, &request));
+        let mut pending_sender = Some(remove_pending_tx);
+        futures_util::future::poll_fn(move |context| {
+            let polled = dispatch_future.as_mut().poll(context);
+            if let Some(sender) = pending_sender.take() {
+                let _ = sender.send(polled.is_pending());
+            }
+            polled
+        })
+        .await
+    });
+    assert!(
+        remove_pending_rx
+            .await
+            .expect("remove should report its first poll state"),
+        "removal must wait behind the scan publication gate"
+    );
+    assert!(
+        queue
+            .registry_snapshot()
+            .expect("registry should remain readable while removal waits")
+            .libraries
+            .iter()
+            .any(|library| library.id == archive.id),
+        "the scan must retain the old registration until its snapshot is published"
+    );
+    release_scan_tx
+        .send(())
+        .expect("scan should be released for publication");
+    scan_task
+        .await
+        .expect("scan worker should join")
+        .expect("scan should publish successfully");
+    let remove_outcome = remove_task
+        .await
+        .expect("remove dispatch should join")
+        .expect("remove request should be handled")
+        .expect("remove should complete after the scan releases the gate");
+    assert_eq!(remove_outcome.status, InboxStatus::Completed);
+    assert!(
+        !runtime
+            .library_snapshots
+            .lock()
+            .await
+            .contains_key(&archive.id),
+        "successful removal must clear the old per-library snapshot"
+    );
+    assert!(
+        !runtime
+            .library_unavailable
+            .lock()
+            .await
+            .contains_key(&archive.id),
+        "successful removal must clear the old per-library warning"
+    );
+    assert_eq!(
+        runtime.library_snapshot.lock().await.as_ref(),
+        Some(&source_snapshot),
+        "removing a secondary library should mirror the still-registered default snapshot"
+    );
+    assert!(runtime.library_scan_warning.lock().await.is_none());
+
+    let old_media = fs::read(archive_root.join("old.mp4")).unwrap();
+    let old_metadata = fs::read(archive_root.join("old.nfo")).unwrap();
+    fs::rename(&archive_root, &retired_root).expect("old root object should be retained");
+    fs::create_dir(&archive_root).expect("replacement should use the same path");
+    fs::write(archive_root.join("new.mp4"), b"replacement archive media")
+        .expect("replacement media should write");
+    fs::write(
+        archive_root.join("new.nfo"),
+        b"<movie><title>Replacement archive metadata</title></movie>",
+    )
+    .expect("replacement metadata should write");
+
+    let registered = run_library_management_test_request(
+        &runtime,
+        8_107,
+        "library_register",
+        serde_json::json!({
+            "name":"Archive", "path":archive_root,
+            "create_directory":false, "set_default":false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        registered.status,
+        InboxStatus::Completed,
+        "{:?}",
+        registered.error
+    );
+    let readded_settings =
+        media_library_bot::applied_settings(&queue).expect("replacement settings should serialize");
+    let new_binding = readded_settings["libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|view| view["id"] == archive.id)
+        .and_then(|view| view["root_binding"].as_str())
+        .expect("replacement root should have a binding token");
+    assert_ne!(new_binding, old_binding);
+    assert!(
+        !runtime
+            .library_snapshots
+            .lock()
+            .await
+            .contains_key(&archive.id)
+    );
+    assert!(
+        !runtime
+            .library_unavailable
+            .lock()
+            .await
+            .contains_key(&archive.id)
+    );
+
+    let set_readded_default = run_library_management_test_request(
+        &runtime,
+        8_108,
+        "library_set_default",
+        serde_json::json!({"library_id": archive.id}),
+    )
+    .await;
+    assert_eq!(set_readded_default.status, InboxStatus::Completed);
+    let readded_default_settings = media_library_bot::applied_settings(&queue)
+        .expect("replacement default settings should serialize");
+    let projected_without_scan = media_library_bot::attach_library_views(
+        &runtime,
+        &readded_default_settings,
+        serde_json::to_value(empty_cloud_test_library_snapshot("legacy"))
+            .expect("legacy snapshot should serialize"),
+    )
+    .await
+    .expect("replacement library view should build before scanning");
+    let replacement_view = projected_without_scan["libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|view| view["id"] == archive.id)
+        .unwrap();
+    assert_eq!(replacement_view["root_binding"], new_binding);
+    assert_eq!(replacement_view["availability"], "unknown");
+    assert_eq!(replacement_view["media_count"], Value::Null);
+    assert!(
+        replacement_view["snapshot"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(projected_without_scan["default_library_id"], archive.id);
+    assert!(
+        projected_without_scan["items"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the top-level selected view must not expose the old default snapshot"
+    );
+    assert_ne!(
+        replacement_view["snapshot"]["items"], old_view["snapshot"]["items"],
+        "reusing the same path-derived ID must not leak the old root's media list"
+    );
+
+    let new_scan = run_library_management_test_request(
+        &runtime,
+        8_109,
+        "library_scan",
+        serde_json::json!({"library_id": archive.id}),
+    )
+    .await;
+    assert_eq!(
+        new_scan.status,
+        InboxStatus::Completed,
+        "{:?}",
+        new_scan.error
+    );
+    let new_items = new_scan.result.unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["relative_path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(new_items, vec!["new.mp4"]);
+    assert_eq!(fs::read(retired_root.join("old.mp4")).unwrap(), old_media);
+    assert_eq!(
+        fs::read(retired_root.join("old.nfo")).unwrap(),
+        old_metadata
+    );
+    assert_eq!(
+        fs::read(archive_root.join("new.mp4")).unwrap(),
+        b"replacement archive media"
+    );
+    assert_eq!(
+        fs::read(archive_root.join("new.nfo")).unwrap(),
+        b"<movie><title>Replacement archive metadata</title></movie>"
+    );
+    let refreshed = runtime
+        .library_snapshots
+        .lock()
+        .await
+        .get(&archive.id)
+        .cloned()
+        .expect("replacement scan should populate a fresh cache");
+    assert_eq!(refreshed.items.len(), 1);
+    assert_eq!(refreshed.items[0].relative_path, "new.mp4");
+
+    runtime.signal_epoch_fatal();
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
     let _ = fs::remove_dir_all(root);
 }

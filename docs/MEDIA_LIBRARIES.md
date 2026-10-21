@@ -22,11 +22,16 @@ An offline snapshot is a last known view, not evidence that a requested setting 
 Polling retains unsaved name and category edits for the same library ID and root. Each field
 returns to the applied snapshot when its submitted value appears; unrelated updates do not
 discard edits, and removed or rebound registrations do not inherit another library's drafts.
+An opaque binding derived from the saved directory identity also distinguishes a replacement
+registered at the same pathname. Name/category edits and ordinary child-entry changes leave it
+stable. Legacy snapshots without a known binding do not retain drafts across snapshot updates.
 An open Mini App retains the last successful view for the same library ID and root, marks it
 read-only while unavailable, and replaces it after a successful scan. A fresh page without that
 cached view reports the library as unavailable rather than inventing its contents.
 Removing a registration preserves files and requires that dependent tasks and migrations have
 been resolved. A library is never unregistered automatically after migration.
+Successful removal evicts that registration's cached scan and unavailable state under the scan
+publication gate, so re-registering a replacement at the same path cannot expose the old media view.
 Retryable failed video tasks still depend on their registered library. Before a task resolves its
 download configuration, the queue revalidates the registered root's saved directory identity;
 a replacement directory at the same pathname is rejected while task and staging records remain
@@ -60,6 +65,9 @@ including receipt tracking before removing an action from their shared browser q
 Requests awaiting a local result retain a sequence receipt by request ID so another tab can
 help send them without consuming the origin tab's result. The origin recovers its own receipt
 before polling or retrying; if necessary, it resubmits the same saved request ID and payload.
+Permanent action rejections are recorded before dequeue as well. The origin clears the rejected
+submission or exposes its conflict-refresh error rather than restoring that rejected payload.
+Temporary transport errors and owner-authentication failures retain their existing recovery paths.
 
 ## Moving a library
 

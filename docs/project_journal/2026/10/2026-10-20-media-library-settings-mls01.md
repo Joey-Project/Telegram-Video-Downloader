@@ -102,20 +102,27 @@ superseded_by: ""
 | 范围 | 最终结果 |
 | --- | --- |
 | Rust 1.99.1 格式及差异空白检查 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
-| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,182 通过、0 失败、16 个既有忽略项 |
+| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,184 通过、0 失败、16 个既有忽略项 |
 | Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline --bin telegram-video-downloader` 通过 |
-| Cloud / Node 25.8.2 | 类型检查通过；162 项测试通过；Wrangler 4.149.0 dry-run 通过，45 个静态资源 |
+| Cloud / Node 25.8.2 | 类型检查通过；188 项测试通过；Wrangler 4.149.0 dry-run 通过，47 个静态资源 |
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
-- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review10/`；后者记录 24 项定向回归，以及迁移根目录校验、预览持久化前校验、多标签页回执和轮询期间表单状态的回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
-- 最新 Rust 验证日志为 `mls01-review10/tests-review10-final.log`、`clippy-review10-final.log`、`build-review10-final.log` 和 `focused-review10-final2.log`。首轮定向命令在编译前因既有共享 build-dir 的沙盒访问限制失败，日志单独保留；窄提权重跑通过。
-- 最新 Cloud 全量测试、类型检查和本地 dry-run 日志为同目录下的 `full-cloud-test.log`、`typecheck.log` 和 `build-dry-run.log`。新增浏览器测试覆盖原标签页丢失响应、其他标签页去重提交后的回执恢复，以及未匹配回执不会被休眠清理策略提前删除。
+- Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review11/`；后者记录 26 项定向回归，新增目录对象绑定和取消登记后同路径复用的扫描缓存回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
+- 最新 Rust 验证日志为 `mls01-review11/tests-review11-final.log`、`clippy-review11-final.log`、`build-review11-final.log` 和 `focused-review11-final2.log`。本轮首次定向编译缺少测试用的 `serde_json::Value` import，修正后重跑通过，首次失败日志独立保留为 `focused-review11-final.log`。上一轮共享 build-dir 的沙盒访问失败也单独保留；本轮 Cargo 命令从首次执行起使用窄提权。
+- 最新 Cloud 全量测试、类型检查和本地 dry-run 日志为同目录下的 `full-cloud-tests-3.log`、`cloud-typecheck-2.log` 和 `cloud-build-dry-run.log`。新增浏览器测试覆盖跨标签页永久拒绝、队列移除失败、401/403 与暂态重试，以及目录对象替换和旧快照隔离。首次全量测试发现草稿同步遗漏目录身份字段，修正后通过；测试替身及声明的类型错误也已修正，失败日志分别保留为 `full-cloud-tests.log` 和 `cloud-typecheck.log`。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
 - 大片段恢复用例使用 8–16 MiB 的合成文件；独立运行整体耗时约 15 秒。迁移完成等待设为明确的 60 秒上限，以容纳全量测试共享输出槽及调试模式校验开销，并保留超时状态诊断。全量测试随后通过；未改动生产迁移等待逻辑。
 - 测试使用临时本地目录、合成媒体/片段、fake 下载工具及 mock Telegram/cloud。恢复测试通过重建 runtime/queue 和持久状态重放模拟中断；未向真实 Telegram/Cloudflare 发送请求，未操作生产媒体或终止部署进程。
 
 ## PR regression coverage
 
+- Browser request outcomes distinguish accepted sequences from permanent rejections. A helping
+  tab persists a rejection before dequeue, allowing the origin to leave pending state without
+  restoring the rejected payload; retryable errors and owner-authentication gates remain distinct.
+- Settings draft/focus keys include an opaque persisted-directory binding. A same-path replacement
+  receives a different binding, while name/category changes, child churn and reopening preserve
+  the original binding. Successful unregister evicts scoped scan/error caches under the scan
+  publication gate and clears the unscoped legacy fallback; failed unregister preserves caches.
 - Concurrent tabs on the same Mini App surface retain a request receipt before dequeue. The
   originating download or conflict-refresh tracker can recover its sequence after a lost response
   and a second tab's deduplicated submission. Browser-local receipt metadata stays off the wire.

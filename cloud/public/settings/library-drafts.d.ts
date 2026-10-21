@@ -3,6 +3,7 @@ export type LibraryDraftField = "name" | "default_category";
 export interface LibraryDraftEntry {
   id?: unknown;
   root?: unknown;
+  root_binding?: unknown;
   name?: unknown;
   default_category?: unknown;
   [key: string]: unknown;
@@ -10,6 +11,7 @@ export interface LibraryDraftEntry {
 
 export interface LibraryDraftRecord {
   root: string;
+  rootBinding: string;
   fields: Partial<Record<LibraryDraftField, string>>;
 }
 
@@ -18,6 +20,7 @@ export interface LibraryEditorForm {
     renameForm?: string;
     categoryForm?: string;
     libraryRoot?: string;
+    libraryRootBinding?: string;
   };
   elements?: {
     namedItem(name: string): unknown;
@@ -44,6 +47,7 @@ export interface LibraryEditorList {
 export interface LibraryEditorFocus {
   id: string;
   root: string;
+  rootBinding: string;
   field: LibraryDraftField;
   selectionStart: number;
   selectionEnd: number;

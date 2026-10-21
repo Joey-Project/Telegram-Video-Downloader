@@ -96,6 +96,7 @@ export interface LocalSnapshot {
         root: string;
         default_category: string;
         is_default: boolean;
+        root_binding?: string | null;
       }>;
     };
   };

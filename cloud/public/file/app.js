@@ -1,4 +1,4 @@
-import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, appendAction, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "./action-queue.js";
+import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, appendAction, consumeRejectedActionReceipts, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "./action-queue.js";
 import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
@@ -130,6 +130,9 @@ function renderDownloadStatus() {
       ? "Saved in the cloud inbox. Waiting for your computer; this request is not applied yet."
       : "Your computer received this request. Waiting for its local result.";
     status.classList.remove("warning-text");
+  } else if (submission?.rejected === true) {
+    status.textContent = submission.error ?? "This request was rejected. It remains paused until browser storage is available.";
+    status.classList.add("warning-text");
   } else if (submission) {
     status.textContent = "Saved in this browser. It will be sent when the connection is available; no destination has been changed yet.";
     status.classList.add("warning-text");
@@ -345,11 +348,43 @@ function recoverFileActionReceipts() {
     const matchedIds = new Set(recovered.requestIds);
     const queue = readActionQueue();
     const remaining = queue.filter((action) => !matchedIds.has(action.request_id));
-    if (remaining.length !== queue.length) writeActionQueue(remaining);
+    const queueUpdated = remaining.length === queue.length || writeActionQueue(remaining);
+    if (recovered.rejectedRequestIds.length > 0) {
+      if (queueUpdated) {
+        consumeRejectedActionReceipts(state, { surface: ACTION_SURFACE_FILE, requestIds: recovered.rejectedRequestIds });
+      } else {
+        for (const requestId of recovered.rejectedRequestIds) state.quarantinedActionIds.add(requestId);
+      }
+      for (const rejection of recovered.rejections) settleRejectedFileAction(rejection, queueUpdated);
+    }
     if (recovered.downloadSubmission) renderDownloadStatus();
     if (recovered.migrationConflictDrafts > 0) renderMigrations();
   }
   return recovered;
+}
+
+function settleRejectedFileAction(rejection, queueRemoved) {
+  if (!rejection || typeof rejection.request_id !== "string") return;
+  if (queueRemoved) state.quarantinedActionIds.delete(rejection.request_id);
+  const message = typeof rejection.error === "string" ? rejection.error : "The request was rejected.";
+  if (rejection.kind === "download_submit" && state.downloadSubmission?.request_id === rejection.request_id) {
+    if (queueRemoved) {
+      state.downloadSubmission = null;
+      state.downloadMessage = message;
+    } else {
+      state.downloadSubmission.rejected = true;
+      state.downloadSubmission.error = message;
+    }
+    renderDownloadStatus();
+  }
+  if (rejection.kind === "library_migration_preview") {
+    for (const draft of state.migrationConflictDrafts.values()) {
+      if (draft.rejectedRefreshRequestId !== rejection.request_id) continue;
+      draft.refreshError = message;
+      if (queueRemoved) draft.rejectedRefreshRequestId = null;
+    }
+    renderMigrations();
+  }
 }
 
 function writeActionQueue(actions) {
@@ -415,6 +450,35 @@ async function drainActionQueue({ quiet = false } = {}) {
           }, delay);
         }
         break;
+      }
+      if (outcome.status === "rejection_receipt_failed") {
+        connectionInterrupted = true;
+        if (!quiet) showToast("The rejection could not be saved in this browser. The same request remains queued and will retry.");
+        if (!state.retryTimer) {
+          const delay = state.retryDelay;
+          state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
+          state.retryTimer = window.setTimeout(() => {
+            state.retryTimer = 0;
+            drainActionQueue({ quiet });
+          }, delay);
+        }
+        break;
+      }
+      if (outcome.status === "rejection_remove_failed") {
+        const { action, rejection } = outcome;
+        state.quarantinedActionIds.add(action.request_id);
+        settleRejectedFileAction({ request_id: action.request_id, kind: action.kind, ...rejection }, false);
+        if (!quiet) showToast("The rejection is saved, but this browser could not remove the rejected action yet. It will stay paused here until storage is available.");
+        removalFailed = true;
+        break;
+      }
+      if (outcome.status === "rejected") {
+        const { action, rejection, receiptUpdate } = outcome;
+        if (receiptUpdate?.rejectedRequestIds?.includes(action.request_id)) {
+          settleRejectedFileAction({ request_id: action.request_id, kind: action.kind, ...rejection }, true);
+        }
+        permanentRejections.push(rejection.error);
+        continue;
       }
       if (outcome.status === "sent") {
         sentAny = true;
@@ -1464,6 +1528,7 @@ function bindEvents() {
           state.migrationConflictDrafts.set(previewId, {
             ...draft,
             refreshRequestId: action.request_id,
+            rejectedRefreshRequestId: null,
             refreshPayload: payload,
             refreshSeq: null,
             refreshError: null,

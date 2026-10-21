@@ -32,6 +32,27 @@ pub struct MediaLibrary {
     root_inode: Option<u64>,
 }
 
+impl MediaLibrary {
+    /// Return a stable opaque token for the registered root directory object.
+    ///
+    /// The token intentionally binds only the library ID and the persisted root
+    /// device/inode pair. It is unaffected by child entries, timestamps, display
+    /// names, categories, or the selected default. Legacy registrations without
+    /// an adopted root identity have no token.
+    pub fn root_binding_token(&self) -> Option<String> {
+        let (device, inode) = self.root_device.zip(self.root_inode)?;
+        let library_id = self.id.as_bytes();
+        let mut digest = Sha256::new();
+        digest.update(b"telegram-video-downloader/media-library-root-binding/v1\0");
+        digest.update((library_id.len() as u64).to_be_bytes());
+        digest.update(library_id);
+        digest.update(device.to_be_bytes());
+        digest.update(inode.to_be_bytes());
+        let digest = digest.finalize();
+        Some(format!("v1:{}", hex_prefix(&digest, 64)))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MediaLibrarySnapshot {
     pub revision: u64,
@@ -1925,6 +1946,98 @@ mod tests {
             reopened.root_binding(&library_id),
             Some((identity.device(), identity.inode()))
         );
+    }
+
+    #[test]
+    fn root_binding_token_tracks_persisted_object_identity_only() {
+        let directory = test_dir("root-binding-token");
+        let root = directory.join("videos");
+        let moved_original = directory.join("videos-original");
+        let category = root.join("Movies");
+        fs::create_dir_all(&category).unwrap();
+        let mut registry = MediaLibraryRegistryStore::open(None, &root).unwrap();
+        let library_id = registry.snapshot().default_library_id;
+        assert_eq!(
+            registry.library(&library_id).unwrap().root_binding_token(),
+            None,
+            "legacy registrations stay explicitly unbound until QueueManager adopts identity"
+        );
+
+        let identity = RootedFs::new(&root).unwrap().root_identity();
+        registry
+            .bind_root_identity(&library_id, identity.device(), identity.inode())
+            .unwrap();
+        let original_token = registry
+            .library(&library_id)
+            .unwrap()
+            .root_binding_token()
+            .unwrap();
+        assert_eq!(original_token.len(), 67);
+        assert!(original_token.starts_with("v1:"));
+        assert!(
+            original_token[3..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+
+        let churned_child = root.join("ordinary-child");
+        fs::create_dir(&churned_child).unwrap();
+        fs::remove_dir(&churned_child).unwrap();
+        registry
+            .set_category(&library_id, Some(Path::new("Movies")))
+            .unwrap();
+        registry.rename(&library_id, "Renamed library").unwrap();
+        assert_eq!(
+            registry
+                .library(&library_id)
+                .unwrap()
+                .root_binding_token()
+                .as_deref(),
+            Some(original_token.as_str()),
+            "child churn, category, and display-name changes do not change root identity"
+        );
+
+        let reopened = MediaLibraryRegistryStore::open(None, &root).unwrap();
+        assert_eq!(
+            reopened
+                .library(&library_id)
+                .unwrap()
+                .root_binding_token()
+                .as_deref(),
+            Some(original_token.as_str()),
+            "the deterministic token survives a registry reopen"
+        );
+
+        fs::rename(&root, &moved_original).unwrap();
+        fs::create_dir(&root).unwrap();
+        let replacement_identity = RootedFs::new(&root).unwrap().root_identity();
+        assert_ne!(
+            (replacement_identity.device(), replacement_identity.inode()),
+            (identity.device(), identity.inode()),
+            "the live replacement must be a different directory object"
+        );
+        let mut replacement_registration = reopened.library(&library_id).unwrap().clone();
+        replacement_registration.root_device = Some(replacement_identity.device());
+        replacement_registration.root_inode = Some(replacement_identity.inode());
+        assert_ne!(
+            replacement_registration.root_binding_token().as_deref(),
+            Some(original_token.as_str()),
+            "a registration rebound to a same-path replacement gets a different token"
+        );
+
+        fs::remove_dir(&root).unwrap();
+        fs::rename(&moved_original, &root).unwrap();
+        let restored = MediaLibraryRegistryStore::open(None, &root).unwrap();
+        assert_eq!(
+            restored
+                .library(&library_id)
+                .unwrap()
+                .root_binding_token()
+                .as_deref(),
+            Some(original_token.as_str()),
+            "restoring the original directory object restores its stable token"
+        );
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]

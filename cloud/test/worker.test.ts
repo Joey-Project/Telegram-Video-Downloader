@@ -986,6 +986,49 @@ describe("owner snapshot session", () => {
     expect(canOperateOnMediaLibrary(snapshotLibraries(recovered)[0] as { id: string; availability?: string; snapshot_stale?: boolean })).toBe(true);
   });
 
+  it("does not graft an unavailable cached view onto a same-path replacement binding", () => {
+    const oldBinding = `v1:${"a".repeat(64)}`;
+    const replacementBinding = `v1:${"b".repeat(64)}`;
+    const previous = acceptOwnerSnapshot({
+      settings: {
+        applied: {
+          default_library_id: "archive",
+          libraries: [{ id: "archive", root: "/Volumes/Archive", root_binding: oldBinding }],
+        },
+      },
+      library: {
+        default_library_id: "archive",
+        libraries: [{
+          id: "archive", root: "/Volumes/Archive", root_binding: oldBinding, availability: "available",
+          snapshot: { ready: true, scanned_at: 123, items: [{ id: "old-object", presence: "present" }] },
+        }],
+      },
+    });
+    const incoming = {
+      settings: {
+        applied: {
+          default_library_id: "archive",
+          libraries: [{ id: "archive", root: "/Volumes/Archive", root_binding: replacementBinding }],
+        },
+      },
+      library: {
+        default_library_id: "archive",
+        libraries: [{ id: "archive", root: "/Volumes/Archive", availability: "offline", snapshot: null }],
+      },
+    };
+
+    const accepted = acceptOwnerSnapshot(incoming, previous);
+    const replacement = snapshotLibraries(accepted)[0];
+    expect(replacement).toMatchObject({
+      root_binding: replacementBinding,
+      availability: "offline",
+      snapshot: null,
+    });
+    expect(replacement?.snapshot_stale).toBeUndefined();
+    expect(JSON.stringify(replacement)).not.toContain("old-object");
+    expect(canOperateOnMediaLibrary(replacement as { id: string; availability?: string })).toBe(false);
+  });
+
   it("keeps older unknown-availability descriptors operable for compatibility", () => {
     expect(canOperateOnMediaLibrary({ id: "legacy" })).toBe(true);
     expect(canOperateOnMediaLibrary({ id: "offline", availability: "unavailable" })).toBe(false);
@@ -1148,9 +1191,11 @@ function localSnapshot(overrides: Record<string, unknown> = {}): Record<string, 
 }
 
 describe("applied media-library snapshot validation", () => {
+  const rootBinding = `v1:${"a".repeat(64)}`;
+
   it("accepts registered applied settings plus separate per-library availability and snapshots", () => {
     const descriptors = [
-      { id: "main", name: "Main", root: "/Volumes/Main", default_category: "Films", is_default: true },
+      { id: "main", name: "Main", root: "/Volumes/Main", default_category: "Films", is_default: true, root_binding: rootBinding },
       { id: "archive", name: "Archive", root: "/Volumes/Archive", default_category: "", is_default: false },
     ];
     const snapshot = localSnapshot({
@@ -1178,6 +1223,55 @@ describe("applied media-library snapshot validation", () => {
     });
 
     expect(validateSnapshot(snapshot).settings.applied?.default_library_id).toBe("main");
+  });
+
+  it.each(["v1:abcd", `v1:${"A".repeat(64)}`, `v2:${"a".repeat(64)}`, 7])
+  ("rejects an explicitly malformed root binding %j", (binding) => {
+    const snapshot = localSnapshot({
+      settings: {
+        download_dir: "/Volumes/Main",
+        applied: {
+          revision: "settings-root-binding-invalid",
+          default_library_id: "main",
+          default_category: "",
+          libraries: [{
+            id: "main", name: "Main", root: "/Volumes/Main", default_category: "", is_default: true,
+            root_binding: binding,
+          }],
+        },
+      },
+    });
+    expect(() => validateSnapshot(snapshot)).toThrow(/root_binding/u);
+  });
+
+  it("accepts omitted or null legacy root bindings and validates live descriptor tokens", () => {
+    const legacy = localSnapshot({
+      settings: {
+        download_dir: "/Volumes/Main",
+        applied: {
+          revision: "settings-root-binding-legacy",
+          default_library_id: "main",
+          default_category: "",
+          libraries: [{ id: "main", name: "Main", root: "/Volumes/Main", default_category: "", is_default: true, root_binding: null }],
+        },
+      },
+      library: {
+        revision: "library-root-binding-legacy",
+        scanned_at: 1,
+        items: [],
+        categories: [],
+        warnings: [],
+        libraries: [{ id: "main", name: "Main", root: "/Volumes/Main", root_binding: rootBinding, availability: "available" }],
+      },
+    });
+    expect(validateSnapshot(legacy).settings.applied?.libraries[0]?.root_binding).toBeNull();
+
+    const invalidLiveLibrary = structuredClone(legacy["library"]) as {
+      libraries: Array<{ root_binding?: unknown }>;
+    };
+    invalidLiveLibrary.libraries[0]!.root_binding = `v1:${"a".repeat(63)}`;
+    const invalidLive = { ...legacy, library: invalidLiveLibrary };
+    expect(() => validateSnapshot(invalidLive)).toThrow(/root_binding/u);
   });
 
   it.each([

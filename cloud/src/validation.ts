@@ -315,6 +315,14 @@ function parseAbsoluteLibraryRoot(value: unknown): string {
   return root;
 }
 
+function parseOptionalRootBinding(value: unknown, field: string): void {
+  if (value === undefined || value === null) return;
+  if (typeof value !== "string" || UTF8_ENCODER.encode(value).byteLength !== 67
+      || !/^v1:[0-9a-f]{64}$/u.test(value)) {
+    throw new HttpError(400, `${field} must be an opaque root binding token`);
+  }
+}
+
 function parseLibraryName(value: unknown, field = "name"): string {
   return boundedUtf8String(value, field, 100);
 }
@@ -547,7 +555,7 @@ function validateAppliedSettings(value: unknown): void {
   const ids = new Set<string>();
   let defaults = 0;
   for (const [index, candidate] of value.libraries.entries()) {
-    if (!isRecord(candidate) || !onlyKeys(candidate, ["id", "name", "root", "default_category", "is_default"])) {
+    if (!isRecord(candidate) || !onlyKeys(candidate, ["id", "name", "root", "default_category", "is_default", "root_binding"])) {
       throw new HttpError(400, `settings.applied.libraries[${index}] has an invalid shape`);
     }
     const id = parseLibraryId(candidate.id, `settings.applied.libraries[${index}].id`);
@@ -555,6 +563,7 @@ function validateAppliedSettings(value: unknown): void {
     ids.add(id);
     parseLibraryName(candidate.name, `settings.applied.libraries[${index}].name`);
     parseAbsoluteLibraryRoot(candidate.root);
+    parseOptionalRootBinding(candidate.root_binding, `settings.applied.libraries[${index}].root_binding`);
     if (typeof candidate.default_category !== "string") {
       throw new HttpError(400, `settings.applied.libraries[${index}].default_category must be a string`);
     }
@@ -582,6 +591,7 @@ function validateLibraryDescriptors(library: Record<string, unknown>): void {
       ids.add(id);
       parseLibraryName(candidate.name, `library.libraries[${index}].name`);
       parseAbsoluteLibraryRoot(candidate.root);
+      parseOptionalRootBinding(candidate.root_binding, `library.libraries[${index}].root_binding`);
       if (candidate.default_category !== undefined && candidate.default_category !== null) {
         if (typeof candidate.default_category !== "string") {
           throw new HttpError(400, `library.libraries[${index}].default_category must be a string`);
