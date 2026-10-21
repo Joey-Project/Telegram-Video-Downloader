@@ -442,6 +442,7 @@ struct CloudBotRuntime {
     library_snapshots: Arc<Mutex<BTreeMap<String, LibrarySnapshot>>>,
     library_unavailable: Arc<Mutex<BTreeMap<String, String>>>,
     migrations: Arc<Mutex<BTreeMap<String, library_migration::MigrationStatus>>>,
+    migration_discovery_warnings: Arc<Mutex<library_migration::MigrationDiscoveryWarnings>>,
     migration_runners: Arc<Mutex<HashSet<String>>>,
     library_scan_warning: Arc<Mutex<Option<String>>>,
     library_scan_publication_gate: Arc<Mutex<()>>,
@@ -1643,6 +1644,9 @@ async fn run_cloud_bot(
         library_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         library_unavailable: Arc::new(Mutex::new(BTreeMap::new())),
         migrations: Arc::new(Mutex::new(BTreeMap::new())),
+        migration_discovery_warnings: Arc::new(Mutex::new(
+            library_migration::MigrationDiscoveryWarnings::default(),
+        )),
         migration_runners: Arc::new(Mutex::new(HashSet::new())),
         library_scan_warning: Arc::new(Mutex::new(None)),
         library_scan_publication_gate: Arc::new(Mutex::new(())),
@@ -2260,6 +2264,16 @@ async fn build_cloud_state_snapshot(
     }
     library_value =
         media_library_bot::attach_library_views(runtime, &settings_applied, library_value).await?;
+    let migration_discovery_warnings = runtime.migration_discovery_warnings.lock().await.clone();
+    if !migration_discovery_warnings.warnings.is_empty()
+        || migration_discovery_warnings.omitted_count > 0
+    {
+        library_value["migration_discovery_warnings"] =
+            serde_json::to_value(&migration_discovery_warnings.warnings)
+                .context("failed to serialize bounded migration discovery warnings")?;
+        library_value["migration_discovery_warning_omitted_count"] =
+            serde_json::json!(migration_discovery_warnings.omitted_count);
+    }
     let revision = library_value["revision"]
         .as_str()
         .unwrap_or(&revision)

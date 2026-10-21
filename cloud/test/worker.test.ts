@@ -28,7 +28,8 @@ import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotR
 import { sourceIdUrl } from "../public/file/source-links.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, mergeRequestEntries, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "../public/file/state-view.js";
 import { MAX_MIGRATION_TASK_ROWS, incompleteMigrationTaskSummary } from "../public/file/migration-task-summary.js";
-import { renderMigrationHistory } from "../public/file/migration-rendering.js";
+import { renderMigrationDiscoveryWarnings, renderMigrationHistory } from "../public/file/migration-rendering.js";
+import { buildDownloadSubmitPayload } from "../public/file/download-submit.js";
 import { MIGRATION_PREVIEW_PAGE_SIZE, migrationPreviewDraftKey, migrationPreviewPageWindow, renderMigrationPreview } from "../public/file/migration-preview-rendering.js";
 import { canOperateOnMediaLibrary, resolveMediaLibrary } from "../public/file/library-view.js";
 import {
@@ -786,6 +787,36 @@ describe("migration history rendering", () => {
   });
 });
 
+describe("migration discovery warning rendering", () => {
+  it("renders bounded attention details, escapes text, and never invents migration controls", () => {
+    const markup = renderMigrationDiscoveryWarnings({
+      warnings: [
+        { source_library_id: "source", record_name: "preview-1.json", kind: "malformed", message: "Record <contents> could not be read." },
+        { source_library_id: "", record_name: "", kind: "enumeration_failed", message: "The migration registry could not be checked." },
+        { source_library_id: "source", record_name: "", kind: "source_unavailable", message: "The registered library root is unavailable." },
+        { source_library_id: "source", record_name: "", kind: "maintenance_failed", message: "Preview maintenance could not inspect this library." },
+        { source_library_id: "source", record_name: "", kind: "enumeration_failed", message: "Migration records in this library could not be listed." },
+      ],
+      libraries: [{ id: "source", name: "<Source>" }],
+      omittedCount: 2,
+    });
+    expect(markup).toContain("Migration discovery needs attention");
+    expect(markup).toContain("&lt;Source&gt;");
+    expect(markup).toContain("preview-1.json");
+    expect(markup).toContain("Migration registry");
+    expect(markup).toContain("Library root");
+    expect(markup).toContain("Preview maintenance");
+    expect(markup).toContain("Library scan");
+    expect(markup).toContain("&lt;contents&gt;");
+    expect(markup).toContain("2 additional migration discovery warnings were omitted");
+    expect(markup).not.toContain('data-migration-control=');
+  });
+
+  it("renders no warning surface for a legacy snapshot without the optional fields", () => {
+    expect(renderMigrationDiscoveryWarnings({ warnings: undefined, omittedCount: undefined })).toBe("");
+  });
+});
+
 describe("target directory validation", () => {
   it("matches the Worker UTF-8 byte limit and keeps the root destination valid", () => {
     expect(CLIENT_MAX_TARGET_RELATIVE_DIR_BYTES).toBe(WORKER_MAX_TARGET_RELATIVE_DIR_BYTES);
@@ -1326,6 +1357,94 @@ describe("applied media-library snapshot validation", () => {
     expect(validateSnapshot(snapshot).settings.applied?.default_library_id).toBe("main");
   });
 
+  it("accepts bounded migration discovery warnings and keeps valid migration controls visible", () => {
+    const snapshot = localSnapshot({
+      library: {
+        revision: "library-discovery-warning",
+        scanned_at: 1,
+        items: [],
+        categories: [],
+        warnings: [],
+        libraries: [{ id: "source", name: "Source", root: "/Volumes/Source", availability: "available" }],
+        migration_discovery_warnings: [
+          { source_library_id: "source", record_name: "preview-a.json", kind: "malformed", message: "A local migration record could not be checked." },
+          { source_library_id: "", record_name: "", kind: "enumeration_failed", message: "The migration registry could not be checked." },
+          { source_library_id: "source", record_name: "", kind: "source_unavailable", message: "The registered library root is unavailable." },
+          { source_library_id: "source", record_name: "", kind: "maintenance_failed", message: "Preview maintenance could not inspect this library." },
+          { source_library_id: "source", record_name: "", kind: "enumeration_failed", message: "Migration records in this library could not be listed." },
+        ],
+        migration_discovery_warning_omitted_count: 3,
+        migrations: [{
+          id: "usable-migration",
+          status: "partial",
+          source_library_id: "source",
+          target_library_id: "target",
+          failed_count: 1,
+          items: [],
+        }],
+      },
+    });
+    const validated = validateSnapshot(snapshot);
+    const warningMarkup = renderMigrationDiscoveryWarnings({
+      warnings: validated.library.migration_discovery_warnings,
+      omittedCount: validated.library.migration_discovery_warning_omitted_count,
+      libraries: [{ id: "source", name: "Source" }],
+    });
+    const migrationMarkup = renderMigrationHistory({
+      migrations: validated.library.migrations,
+      libraries: [{ id: "source", name: "Source" }, { id: "target", name: "Target" }],
+      libraryId: "source",
+    });
+
+    expect(warningMarkup).toContain("Migration registry");
+    expect(warningMarkup).toContain("3 additional migration discovery warnings were omitted");
+    expect(migrationMarkup).toContain('data-migration-control="stop_remaining"');
+    expect(migrationMarkup).toContain('data-migration-control="retry_failed"');
+  });
+
+  it.each([
+    { warning: { source_library_id: "", record_name: "", kind: "malformed", message: "Missing identity" }, omitted: 0 },
+    { warning: { source_library_id: "source", record_name: "", kind: "malformed", message: "Record name is required" }, omitted: 0 },
+    { warning: { source_library_id: "", record_name: "", kind: "source_unavailable", message: "Only registry enumeration may omit the source ID" }, omitted: 0 },
+    { warning: { source_library_id: "", record_name: "", kind: "maintenance_failed", message: "Only registry enumeration may omit the source ID" }, omitted: 0 },
+    { warning: { source_library_id: "source", record_name: "../private", kind: "malformed", message: "Unsafe basename" }, omitted: 0 },
+    { warning: { source_library_id: "source", record_name: "é".repeat(81), kind: "malformed", message: "Oversized UTF-8 basename" }, omitted: 0 },
+    { warning: { source_library_id: "source", record_name: "preview.json", kind: "malformed", message: "m".repeat(193) }, omitted: 0 },
+    { warning: { source_library_id: "source", record_name: "preview.json", kind: "unknown", message: "Unknown warning kind" }, omitted: 0 },
+    { warning: { source_library_id: "source", record_name: "preview.json", kind: "malformed", message: "Bad omitted count" }, omitted: -1 },
+  ])("rejects malformed migration discovery warning details %#", ({ warning, omitted }) => {
+    expect(() => validateSnapshot(localSnapshot({
+      library: {
+        revision: "library-discovery-warning-invalid",
+        scanned_at: 1,
+        items: [],
+        categories: [],
+        warnings: [],
+        migration_discovery_warnings: [warning],
+        migration_discovery_warning_omitted_count: omitted,
+      },
+    }))).toThrow(/migration_discovery/u);
+  });
+
+  it("enforces the migration discovery warning projection cap", () => {
+    const warnings = Array.from({ length: 17 }, (_, index) => ({
+      source_library_id: "source",
+      record_name: `preview-${index}.json`,
+      kind: "malformed",
+      message: "A local migration record could not be checked.",
+    }));
+    expect(() => validateSnapshot(localSnapshot({
+      library: {
+        revision: "library-discovery-warning-cap",
+        scanned_at: 1,
+        items: [],
+        categories: [],
+        warnings: [],
+        migration_discovery_warnings: warnings,
+      },
+    }))).toThrow("library.migration_discovery_warnings must contain at most 16 entries");
+  });
+
   it.each(["v1:abcd", `v1:${"A".repeat(64)}`, `v2:${"a".repeat(64)}`, 7])
   ("rejects an explicitly malformed root binding %j", (binding) => {
     const snapshot = localSnapshot({
@@ -1801,9 +1920,9 @@ describe("Mini App identity and actions", () => {
       { kind: "file_preview", payload: { library_id: "library-archive", item_ids: ["item-a"], target_relative_dir: "Films" } },
       { kind: "file_confirm", payload: { preview_id: "preview-a", revision: "revision-a", library_id: "library-archive" } },
       { kind: "legacy_import", payload: { text: "older links", library_id: "library-archive" } },
-      { kind: "download_submit", payload: { url: "https://www.bilibili.com/video/BV1xx", library_id: "library-archive", category: "Films" } },
-      { kind: "download_submit", payload: { url: "https://www.bilibili.com/video/BV1omitted", library_id: "library-archive" } },
-      { kind: "download_submit", payload: { url: "https://www.bilibili.com/video/BV1root", library_id: "library-archive", category: "" } },
+      { kind: "download_submit", payload: { url: "https://www.bilibili.com/video/BV1xx", library_id: "library-archive", root_binding: rootBinding, category: "Films" } },
+      { kind: "download_submit", payload: { url: "https://www.bilibili.com/video/BV1omitted", library_id: "library-archive", root_binding: rootBinding } },
+      { kind: "download_submit", payload: { url: "https://www.bilibili.com/video/BV1root", library_id: "library-archive", root_binding: rootBinding, category: "" } },
       { kind: "library_migration_preview", payload: { source_library_id: "library-main", target_library_id: "library-archive", scope: "library", include_incomplete_tasks: false, conflict: "skip", item_conflicts: { "item-a": "keep_both" }, set_target_default_on_success: false, supersedes_preview_seq: 19, supersedes_preview_id: "migration-preview-old", supersedes_revision: "revision-old" } },
       { kind: "library_migration_confirm", payload: { preview_id: "migration-preview-a", revision: "revision-a" } },
       { kind: "library_migration_control", payload: { migration_id: "migration-a", control: "resume" } },
@@ -1837,6 +1956,62 @@ describe("Mini App identity and actions", () => {
       supersedes_preview_id: "migration-preview-old",
       supersedes_revision: "revision-old",
     });
+  });
+
+  it("persists the binding captured by the rendered download option when the latest snapshot has a replacement", async () => {
+    const initData = await signInitData();
+    const displayedBinding = `v1:${"a".repeat(64)}`;
+    const replacementBinding = `v1:${"b".repeat(64)}`;
+    const selectedOption = { value: "library-archive", dataset: { rootBinding: displayedBinding } };
+    const latestDescriptor = { id: "library-archive", root_binding: replacementBinding };
+    const payload = buildDownloadSubmitPayload({
+      url: "https://www.bilibili.com/video/BV1displayed",
+      selectedOption,
+      category: "",
+    });
+
+    expect(latestDescriptor.root_binding).not.toBe(displayedBinding);
+    expect(payload).toEqual({
+      url: "https://www.bilibili.com/video/BV1displayed",
+      library_id: "library-archive",
+      root_binding: displayedBinding,
+      category: "",
+    });
+    const requestId = "00000000-0000-4000-8000-000000009701";
+    const response = await ownerRequest("/api/actions", initData, {
+      method: "POST",
+      body: JSON.stringify({ request_id: requestId, kind: "download_submit", payload }),
+    });
+    expect(response.status).toBe(202);
+
+    const backlog = await responseJson<{ requests: Array<{ request_id: string; payload: Record<string, unknown> }> }>(await localRequests());
+    const stored = backlog.requests.find((request) => request.request_id === `action:${requestId}`);
+    expect(stored?.payload).toEqual(payload);
+  });
+
+  it("rejects old or malformed download bindings without persisting them", async () => {
+    const initData = await signInitData();
+    const before = await responseJson<{ requests: Array<{ request_id: string }> }>(await localRequests());
+    const beforeIds = new Set(before.requests.map((request) => request.request_id));
+    const actions = [
+      { request_id: "00000000-0000-4000-8000-000000009711", payload: { url: "https://example.com/video", library_id: "library-a" } },
+      { request_id: "00000000-0000-4000-8000-000000009712", payload: { url: "https://example.com/video", library_id: "library-a", root_binding: `v1:${"A".repeat(64)}` } },
+    ];
+
+    for (const action of actions) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({ ...action, kind: "download_submit" }),
+      });
+      expect(response.status).toBe(400);
+      expect(await responseJson<{ error: string }>(response)).toMatchObject({
+        error: "root_binding must be an opaque root identity token",
+      });
+    }
+
+    const after = await responseJson<{ requests: Array<{ request_id: string }> }>(await localRequests());
+    expect(after.requests.filter((request) => !beforeIds.has(request.request_id))).toEqual([]);
+    expect(after.requests.some((request) => actions.some((action) => request.request_id === `action:${action.request_id}`))).toBe(false);
   });
 
   it("persists a stale Settings client binding unchanged for the desktop to reject", async () => {
@@ -1899,8 +2074,8 @@ describe("Mini App identity and actions", () => {
     const initData = await signInitData();
     const cases = [
       { kind: "library_register", payload: { name: "Relative", path: "Videos", default_category: "", set_default: false, create_directory: false } },
-      { kind: "download_submit", payload: { url: "file:///etc/passwd", library_id: "library-a", category: "" } },
-      { kind: "download_submit", payload: { url: "https://example.com/video", library_id: "library-a", category: "../outside" } },
+      { kind: "download_submit", payload: { url: "file:///etc/passwd", library_id: "library-a", root_binding: `v1:${"c".repeat(64)}`, category: "" } },
+      { kind: "download_submit", payload: { url: "https://example.com/video", library_id: "library-a", root_binding: `v1:${"c".repeat(64)}`, category: "../outside" } },
       { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-a", scope: "library" } },
       { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "selected", item_ids: [], include_incomplete_tasks: false } },
       { kind: "library_migration_preview", payload: { source_library_id: "library-a", target_library_id: "library-b", scope: "selected", item_ids: ["item-a"], item_conflicts: { "item-b": "keep_both" } } },

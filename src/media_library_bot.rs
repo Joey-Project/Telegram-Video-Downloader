@@ -80,6 +80,8 @@ struct DownloadSubmission {
     url: String,
     library_id: String,
     #[serde(default)]
+    root_binding: Option<String>,
+    #[serde(default)]
     category: Option<String>,
 }
 
@@ -655,6 +657,18 @@ async fn submit_download(
             "a single private bot owner is required",
         ));
     };
+    let Some(root_binding) = payload.root_binding.as_deref() else {
+        return Ok(cloud_dispatch_failure(
+            "root_binding must be an opaque root identity token",
+        ));
+    };
+    if let Err(error) = runtime
+        .bot
+        .queue
+        .require_video_library_root_binding(&payload.library_id, root_binding)
+    {
+        return Ok(cloud_dispatch_failure(format!("{error:#}")));
+    }
     let RouteResult::Jobs(mut jobs) = route_message(&payload.url, &[]) else {
         return Ok(cloud_dispatch_failure(
             "enter a supported video or collection link",
@@ -671,26 +685,6 @@ async fn submit_download(
     let source_update = i64::try_from(request.seq)?;
     let original_job = job.clone();
     let created = tokio::task::spawn_blocking(move || -> Result<CreatedDownload> {
-        if let Some(existing) = queue.get(&create_task_id)? {
-            let destination = queue
-                .task_destination(&create_task_id)?
-                .context("the existing download has no saved media destination")?;
-            let save_path = destination.category.as_ref().map_or_else(
-                || destination.root.clone(),
-                |category| destination.root.join(category),
-            );
-            return Ok(CreatedDownload {
-                created: false,
-                save_path,
-                generation: existing.generation,
-                library_id: destination.library_id,
-                category: destination
-                    .category
-                    .as_ref()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            });
-        }
         let destination = queue.video_destination(
             &payload.library_id,
             payload.category.as_deref().map(Path::new),
@@ -707,7 +701,7 @@ async fn submit_download(
         let library_id = destination.library_id.clone();
         let (stored_job, sanitized) = sanitize_job_for_storage(original_job);
         let mut task = TaskRecord::new(
-            create_task_id,
+            create_task_id.clone(),
             source_update,
             0,
             chat_id,
@@ -718,12 +712,43 @@ async fn submit_download(
         task.destination = Some(destination);
         task.url_was_sanitized = sanitized;
         let generation = task.generation;
+        let created = queue.create_video_task_with_root_binding(
+            task,
+            &payload.library_id,
+            payload
+                .root_binding
+                .as_deref()
+                .expect("root binding was checked before spawning the worker"),
+        )?;
+        if created {
+            return Ok(CreatedDownload {
+                created: true,
+                save_path,
+                generation,
+                library_id,
+                category,
+            });
+        }
+        let existing = queue
+            .get(&create_task_id)?
+            .context("the existing download disappeared after duplicate detection")?;
+        let destination = queue
+            .task_destination(&create_task_id)?
+            .context("the existing download has no saved media destination")?;
+        let save_path = destination.category.as_ref().map_or_else(
+            || destination.root.clone(),
+            |category| destination.root.join(category),
+        );
         Ok(CreatedDownload {
-            created: queue.create(task)?,
+            created: false,
             save_path,
-            generation,
-            library_id,
-            category,
+            generation: existing.generation,
+            library_id: destination.library_id,
+            category: destination
+                .category
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         })
     })
     .await

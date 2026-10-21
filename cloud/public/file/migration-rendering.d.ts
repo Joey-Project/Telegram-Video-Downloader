@@ -4,3 +4,15 @@ export function renderMigrationHistory(input: {
   libraryId: string;
   omittedCount?: unknown;
 }): string;
+
+export function renderMigrationDiscoveryWarnings(input: {
+  warnings: unknown;
+  libraries?: Array<{ id: string; name?: string }>;
+  omittedCount?: unknown;
+}): string;
+
+export function renderMigrationDiscoveryWarnings(input: {
+  warnings: unknown;
+  libraries?: Array<{ id: string; name?: string }>;
+  omittedCount?: unknown;
+}): string;

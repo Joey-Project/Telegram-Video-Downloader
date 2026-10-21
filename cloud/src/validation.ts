@@ -3,6 +3,7 @@ import type {
   ActionRequest,
   BoundLibraryMutationIdentity,
   CollectionMetadata,
+  DownloadSubmitPayload,
   FilePreviewPayload,
   LocalSnapshot,
   MetadataPatch,
@@ -20,6 +21,7 @@ export const MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES = 255;
 export const MAX_SELECTED_ITEMS = 100;
 export const MAX_MEDIA_LIBRARIES = 16;
 export const MAX_MIGRATION_ITEM_CONFLICTS = 10_000;
+export const MAX_MIGRATION_DISCOVERY_WARNINGS = 16;
 export const MAX_LIBRARY_ROOT_BYTES = 1_024;
 export const MAX_DOWNLOAD_URL_BYTES = 8_192;
 const MAX_COLLECTION_ORDER = 0xffff_ffff;
@@ -534,8 +536,8 @@ function parseMigrationPreview(value: Record<string, unknown>): Record<string, u
   };
 }
 
-function parseDownloadSubmit(value: Record<string, unknown>): Record<string, unknown> {
-  if (!onlyKeys(value, ["url", "library_id", "category"])) {
+function parseDownloadSubmit(value: Record<string, unknown>): DownloadSubmitPayload {
+  if (!onlyKeys(value, ["url", "library_id", "root_binding", "category"])) {
     throw new HttpError(400, "download_submit payload has an invalid shape");
   }
   const url = boundedUtf8String(value.url, "url", MAX_DOWNLOAD_URL_BYTES);
@@ -551,8 +553,57 @@ function parseDownloadSubmit(value: Record<string, unknown>): Record<string, unk
   return {
     url,
     library_id: parseLibraryId(value.library_id),
+    root_binding: parseRequiredRootBinding(value.root_binding),
     ...(value.category === undefined ? {} : { category: parseRelativeDirectory(value.category) }),
   };
+}
+
+const MIGRATION_DISCOVERY_WARNING_KINDS = [
+  "disappeared",
+  "unreadable",
+  "oversized",
+  "malformed",
+  "source_binding_mismatch",
+  "source_unavailable",
+  "enumeration_failed",
+  "maintenance_failed",
+] as const;
+
+function validateMigrationDiscoveryWarnings(library: Record<string, unknown>): void {
+  const warnings = library.migration_discovery_warnings;
+  if (warnings !== undefined) {
+    if (!Array.isArray(warnings) || warnings.length > MAX_MIGRATION_DISCOVERY_WARNINGS) {
+      throw new HttpError(400, `library.migration_discovery_warnings must contain at most ${MAX_MIGRATION_DISCOVERY_WARNINGS} entries`);
+    }
+    for (const [index, candidate] of warnings.entries()) {
+      if (!isRecord(candidate)) throw new HttpError(400, `library.migration_discovery_warnings[${index}] must be an object`);
+      const kind = candidate.kind;
+      if (!MIGRATION_DISCOVERY_WARNING_KINDS.includes(kind as typeof MIGRATION_DISCOVERY_WARNING_KINDS[number])) {
+        throw new HttpError(400, `library.migration_discovery_warnings[${index}].kind is invalid`);
+      }
+      const rootLevelEnumeration = kind === "enumeration_failed"
+        && candidate.source_library_id === ""
+        && candidate.record_name === "";
+      if (rootLevelEnumeration) {
+        // A registry-level enumeration failure has no single source library or manifest.
+      } else {
+        parseLibraryId(candidate.source_library_id, `library.migration_discovery_warnings[${index}].source_library_id`);
+        const sourceLevelWithoutManifest = candidate.record_name === ""
+          && (kind === "source_unavailable" || kind === "maintenance_failed" || kind === "enumeration_failed");
+        if (!sourceLevelWithoutManifest) {
+          const recordName = boundedUtf8String(candidate.record_name, `library.migration_discovery_warnings[${index}].record_name`, 160);
+          if (recordName === "." || recordName === ".." || recordName.includes("/") || recordName.includes("\\")) {
+            throw new HttpError(400, `library.migration_discovery_warnings[${index}].record_name must be a basename`);
+          }
+        }
+      }
+      boundedUtf8String(candidate.message, `library.migration_discovery_warnings[${index}].message`, 192);
+    }
+  }
+  const omitted = library.migration_discovery_warning_omitted_count;
+  if (omitted !== undefined && (!Number.isSafeInteger(omitted) || (omitted as number) < 0)) {
+    throw new HttpError(400, "library.migration_discovery_warning_omitted_count must be a non-negative safe integer");
+  }
 }
 
 function validateAppliedSettings(value: unknown): void {
@@ -637,6 +688,7 @@ function validateLibraryDescriptors(library: Record<string, unknown>): void {
     (!Array.isArray(library.migrations) || library.migrations.length > 32)) {
     throw new HttpError(400, "library.migrations must contain at most 32 entries");
   }
+  validateMigrationDiscoveryWarnings(library);
 }
 
 export function validateActionRequest(value: unknown): ActionRequest {

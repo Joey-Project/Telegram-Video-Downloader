@@ -75,6 +75,11 @@ export interface BoundLibraryMutationIdentity extends Record<string, unknown> {
   root_binding: string;
 }
 
+export interface DownloadSubmitPayload extends BoundLibraryMutationIdentity {
+  url: string;
+  category?: string;
+}
+
 export interface LocalSnapshot {
   revision?: string;
   state_version: number;
@@ -85,6 +90,13 @@ export interface LocalSnapshot {
     items: unknown[];
     categories: string[];
     warnings: string[];
+    migration_discovery_warnings?: Array<{
+      source_library_id: string;
+      record_name: string;
+      kind: "disappeared" | "unreadable" | "oversized" | "malformed" | "source_binding_mismatch" | "source_unavailable" | "enumeration_failed" | "maintenance_failed";
+      message: string;
+    }>;
+    migration_discovery_warning_omitted_count?: number;
   };
   previews: unknown[];
   operations: unknown[];

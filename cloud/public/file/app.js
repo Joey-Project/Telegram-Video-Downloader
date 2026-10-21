@@ -13,9 +13,10 @@ import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
 import { validateTargetRelativeDirectory } from "./target-directory.js";
 import { boundedFolderSuggestions, buildMigrationPreviewPayload, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget, statusOf } from "./library-view.js";
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
-import { renderMigrationHistory } from "./migration-rendering.js";
+import { renderMigrationDiscoveryWarnings, renderMigrationHistory } from "./migration-rendering.js";
 import { migrationPreviewDraftKey, migrationPreviewPageWindow, renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
 import { inspectDownloadSubmissionHistory, releaseDownloadSubmissionTracking } from "./download-submission-history.js";
+import { buildDownloadSubmitPayload, isBoundDownloadLibraryOption } from "./download-submit.js";
 
 const API = "/api";
 const CACHE_KEY = "file-manager.snapshot.v1";
@@ -125,7 +126,9 @@ function renderDownloadStatus() {
   if (!status || !submit || !clearWait) return;
   const submission = state.downloadSubmission;
   const history = inspectDownloadSubmissionHistory(submission, state.snapshot);
-  submit.disabled = Boolean(submission) || !libraryCanOperate(byId("download-library-select")?.value || activeLibraryId());
+  const selectedOption = byId("download-library-select")?.selectedOptions?.[0];
+  const hasBoundLibrary = isBoundDownloadLibraryOption(selectedOption);
+  submit.disabled = Boolean(submission) || !libraryCanOperate(selectedOption?.value || activeLibraryId()) || !hasBoundLibrary;
   clearWait.classList.toggle("hidden", history.kind !== "outside_recent_history");
   if (submission?.seq !== null && submission?.seq !== undefined) {
     if (history.kind === "pending") {
@@ -146,6 +149,9 @@ function renderDownloadStatus() {
     status.classList.add("warning-text");
   } else if (submission) {
     status.textContent = "Saved in this browser. It will be sent when the connection is available; no destination has been changed yet.";
+    status.classList.add("warning-text");
+  } else if (!hasBoundLibrary) {
+    status.textContent = "This library registration identity is unavailable. Refresh the page before adding a download.";
     status.classList.add("warning-text");
   } else {
     status.textContent = state.downloadMessage ?? "Paste a video or collection URL. The selected library and category are saved with this task.";
@@ -186,7 +192,7 @@ function settleDownloadSubmission() {
 
 function activeLibraryOptions(selectedId = activeLibraryId()) {
   return mediaLibraryEntries(state.snapshot).map((entry) =>
-    `<option value="${escapeHtml(entry.id)}" ${entry.id === selectedId ? "selected" : ""} ${libraryCanOperate(entry.id) ? "" : "disabled"}>${escapeHtml(entry.name)}${entry.is_default === true ? " · default" : ""}${libraryCanOperate(entry.id) ? "" : " · offline"}</option>`,
+    `<option value="${escapeHtml(entry.id)}" data-root-binding="${escapeHtml(entry.root_binding ?? "")}" ${entry.id === selectedId ? "selected" : ""} ${libraryCanOperate(entry.id) ? "" : "disabled"}>${escapeHtml(entry.name)}${entry.is_default === true ? " · default" : ""}${libraryCanOperate(entry.id) ? "" : " · offline"}</option>`,
   ).join("");
 }
 
@@ -1046,11 +1052,17 @@ function renderMigrations() {
   const previews = migrationPreviewEntries();
   retireMigrationConflictDrafts(previews);
   byId("migration-preview-list").innerHTML = previews.map(renderMigrationPreview).join("");
-  byId("migration-progress-list").innerHTML = renderMigrationHistory({
-    migrations: state.snapshot?.library?.migrations,
-    libraries: mediaLibraryEntries(state.snapshot),
+  const library = state.snapshot?.library;
+  const libraries = mediaLibraryEntries(state.snapshot);
+  byId("migration-progress-list").innerHTML = renderMigrationDiscoveryWarnings({
+    warnings: library?.migration_discovery_warnings,
+    omittedCount: library?.migration_discovery_warning_omitted_count,
+    libraries,
+  }) + renderMigrationHistory({
+    migrations: library?.migrations,
+    libraries,
     libraryId: activeLibraryId(),
-    omittedCount: state.snapshot?.library?.migration_omitted_count,
+    omittedCount: library?.migration_omitted_count,
   });
 }
 
@@ -1413,13 +1425,19 @@ function bindEvents() {
   byId("download-form").addEventListener("submit", (event) => {
     event.preventDefault();
     const url = byId("download-url").value.trim();
-    const libraryId = byId("download-library-select").value;
     const category = byId("download-category").value.trim();
     const { directory, error } = validateTargetRelativeDirectory(category);
     if (error) return showToast(error);
     if (!url) return showToast("Enter a video or collection URL first.");
+    const selectedOption = byId("download-library-select").selectedOptions[0];
+    const payload = buildDownloadSubmitPayload({ url, selectedOption, category: directory });
+    if (!payload) {
+      state.downloadMessage = "This library registration identity is unavailable. Refresh the page before adding a download.";
+      renderDownloadStatus();
+      return showToast(state.downloadMessage);
+    }
     state.downloadMessage = null;
-    submitAction("download_submit", { url, library_id: libraryId, category: directory });
+    submitAction("download_submit", payload);
   });
   byId("migration-scope").addEventListener("change", renderMigrations);
   byId("migration-target").addEventListener("change", renderMigrations);

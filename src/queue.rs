@@ -2685,7 +2685,37 @@ impl QueueManager {
         }
     }
 
-    pub fn create(&self, mut task: TaskRecord) -> Result<bool> {
+    pub fn create(&self, task: TaskRecord) -> Result<bool> {
+        self.create_with_root_binding(task, None)
+    }
+
+    /// Create a video task only while its destination still has the identity shown to the
+    /// caller. The binding check and queue write share the queue operation lock, and the
+    /// destination root is revalidated under its queue-operation lock immediately before the
+    /// first task/index mutation.
+    pub fn create_video_task_with_root_binding(
+        &self,
+        task: TaskRecord,
+        library_id: &str,
+        expected_binding: &str,
+    ) -> Result<bool> {
+        validate_library_root_binding_token(expected_binding)?;
+        if matches!(task.job, JobRequest::Pdf { .. })
+            || task
+                .destination
+                .as_ref()
+                .is_none_or(|destination| destination.library_id != library_id)
+        {
+            bail!("library root identity changed; refresh settings and retry");
+        }
+        self.create_with_root_binding(task, Some((library_id, expected_binding)))
+    }
+
+    fn create_with_root_binding(
+        &self,
+        mut task: TaskRecord,
+        expected_binding: Option<(&str, &str)>,
+    ) -> Result<bool> {
         if let Some(snapshot) = task.bilibili_attempt.as_mut() {
             snapshot.sanitize_errors();
         }
@@ -2699,6 +2729,12 @@ impl QueueManager {
                 .destination
                 .as_ref()
                 .expect("video task destination was frozen");
+            if let Some((library_id, expected_binding)) = expected_binding {
+                if destination.library_id != library_id {
+                    bail!("library root identity changed; refresh settings and retry");
+                }
+                require_registry_root_binding(&libraries, library_id, expected_binding)?;
+            }
             let snapshot = libraries.snapshot();
             validate_task_destination(&snapshot, destination)?;
             Some(
@@ -2737,6 +2773,12 @@ impl QueueManager {
         // Revalidate while holding the destination queue-operation lock immediately before the
         // first task/index write. Root identity is inode-bound; ordinary child churn is allowed.
         if let Some(library) = video_library.as_ref() {
+            if let Some((library_id, expected_binding)) = expected_binding {
+                if library.id != library_id {
+                    bail!("library root identity changed; refresh settings and retry");
+                }
+                self.require_video_library_root_binding_unlocked(library_id, expected_binding)?;
+            }
             self.validate_video_library_for_task_unlocked(&store, library)?;
         }
         store.create_task(&mut task)?;
@@ -8063,6 +8105,59 @@ mod tests {
                 .expect("the restored root should accept a task"),
             "the restored original root should accept the default enqueue"
         );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn guarded_video_creation_rejects_binding_for_a_different_task_destination() {
+        let temp_root = temp_queue_root("guarded-create-destination-binding-mismatch");
+        let config = test_video_config(&temp_root);
+        let archive_root = temp_root.join("archive");
+        fs::create_dir_all(&archive_root).expect("archive root should create");
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let default_destination = queue
+            .default_video_destination()
+            .expect("default destination should resolve");
+        let archive = queue
+            .register_video_library("Archive", &archive_root, None, false, false)
+            .expect("archive should register");
+        let archive_binding = queue
+            .registry_snapshot()
+            .expect("registry snapshot should load")
+            .libraries
+            .into_iter()
+            .find(|library| library.id == archive.id)
+            .and_then(|library| library.root_binding_token())
+            .expect("archive should have a bound registration");
+        let default_index_path = config
+            .downloads
+            .video_dir
+            .join(QUEUE_DIRECTORY)
+            .join(INDEX_FILE);
+        let archive_index_path = archive_root.join(QUEUE_DIRECTORY).join(INDEX_FILE);
+        let default_index_before = fs::read(&default_index_path).unwrap();
+        let archive_index_before = fs::read(&archive_index_path).unwrap();
+        let task_id = "guarded-create-destination-binding-mismatch";
+        let mut task = test_task(
+            task_id,
+            JobRequest::Youtube {
+                url: "https://www.youtube.com/watch?v=destination-mismatch".to_string(),
+            },
+        );
+        task.destination = Some(default_destination);
+
+        let error = queue
+            .create_video_task_with_root_binding(task, &archive.id, &archive_binding)
+            .expect_err("the binding must belong to the task's frozen destination");
+        assert!(
+            error.to_string().contains("root identity changed"),
+            "unexpected mismatch error: {error:#}"
+        );
+        assert!(queue.get(task_id).unwrap().is_none());
+        assert_eq!(fs::read(default_index_path).unwrap(), default_index_before);
+        assert_eq!(fs::read(archive_index_path).unwrap(), archive_index_before);
 
         drop(queue);
         let _ = fs::remove_dir_all(temp_root);

@@ -39,6 +39,10 @@ static PREVIEW_MAINTENANCE_CURSOR: OnceLock<PreviewMaintenanceCursor> = OnceLock
 
 const PREVIEW_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 const PREVIEW_MAINTENANCE_WARNING_BYTES: usize = 512;
+pub(crate) const MAX_MIGRATION_DISCOVERY_WARNINGS: usize = 16;
+const MIGRATION_DISCOVERY_LIBRARY_ID_BYTES: usize = 128;
+const MIGRATION_DISCOVERY_RECORD_NAME_BYTES: usize = 160;
+const MIGRATION_DISCOVERY_MESSAGE_BYTES: usize = 192;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct PreviewMaintenanceReport {
@@ -46,6 +50,170 @@ pub(crate) struct PreviewMaintenanceReport {
     pub(crate) retired: bool,
     pub(crate) compacted: bool,
     pub(crate) warning: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MigrationDiscoveryWarningKind {
+    Disappeared,
+    Unreadable,
+    Oversized,
+    Malformed,
+    SourceBindingMismatch,
+    SourceUnavailable,
+    EnumerationFailed,
+    MaintenanceFailed,
+}
+
+impl MigrationDiscoveryWarningKind {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Disappeared => {
+                "A migration record disappeared while discovery was reading it. It was retained for recovery."
+            }
+            Self::Unreadable => {
+                "A migration record could not be read safely. It was retained for recovery."
+            }
+            Self::Oversized => {
+                "A migration record exceeds the safe read limit. It was retained for recovery."
+            }
+            Self::Malformed => "A migration record is malformed. It was retained for recovery.",
+            Self::SourceBindingMismatch => {
+                "A migration record is bound to a different source library. It was retained for recovery."
+            }
+            Self::SourceUnavailable => {
+                "This library's migration registry is unavailable or no longer matches its registration. Migration recovery is paused."
+            }
+            Self::EnumerationFailed => {
+                "Migration records could not be enumerated safely. Recovery may be incomplete."
+            }
+            Self::MaintenanceFailed => {
+                "Migration preview maintenance could not be checked. No migration record was changed."
+            }
+        }
+    }
+}
+
+pub(crate) fn migration_record_warning_kind(error: &str) -> Option<MigrationDiscoveryWarningKind> {
+    let error = error.to_ascii_lowercase();
+    let state_file_error =
+        error.contains("migration state file") || error.contains("media-library state file");
+    if state_file_error && error.contains("exceeds its size limit") {
+        Some(MigrationDiscoveryWarningKind::Oversized)
+    } else if error.contains("migration status disappeared while listing")
+        || error.contains("migration job does not exist")
+        || (state_file_error && error.contains("disappeared"))
+    {
+        Some(MigrationDiscoveryWarningKind::Disappeared)
+    } else if (error.contains("failed to parse") && error.contains("migration job"))
+        || error.contains("migration state filename is invalid")
+    {
+        Some(MigrationDiscoveryWarningKind::Malformed)
+    } else if error.contains("persisted migration source binding")
+        || error.contains("persisted migration library binding")
+    {
+        Some(MigrationDiscoveryWarningKind::SourceBindingMismatch)
+    } else if error.contains("registered media-library root")
+        && (error.contains("changed") || error.contains("unavailable"))
+    {
+        Some(MigrationDiscoveryWarningKind::SourceUnavailable)
+    } else if state_file_error {
+        Some(MigrationDiscoveryWarningKind::Unreadable)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct MigrationDiscoveryWarning {
+    pub(crate) source_library_id: String,
+    pub(crate) record_name: String,
+    pub(crate) kind: MigrationDiscoveryWarningKind,
+    pub(crate) message: String,
+}
+
+impl MigrationDiscoveryWarning {
+    pub(crate) fn new(
+        source_library_id: &str,
+        record_name: &str,
+        kind: MigrationDiscoveryWarningKind,
+    ) -> Self {
+        Self {
+            source_library_id: truncate_discovery_field(
+                source_library_id,
+                MIGRATION_DISCOVERY_LIBRARY_ID_BYTES,
+            ),
+            record_name: truncate_discovery_field(
+                record_name,
+                MIGRATION_DISCOVERY_RECORD_NAME_BYTES,
+            ),
+            kind,
+            message: truncate_discovery_field(kind.message(), MIGRATION_DISCOVERY_MESSAGE_BYTES),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MigrationDiscoveryReport {
+    pub(crate) statuses: Vec<MigrationStatus>,
+    pub(crate) warnings: Vec<MigrationDiscoveryWarning>,
+    pub(crate) omitted_count: usize,
+}
+
+impl MigrationDiscoveryReport {
+    fn push_warning(&mut self, warning: MigrationDiscoveryWarning) {
+        self.warnings.push(warning);
+        self.warnings.sort_by(discovery_warning_order);
+        if self.warnings.len() > MAX_MIGRATION_DISCOVERY_WARNINGS {
+            self.warnings.pop();
+            self.omitted_count = self.omitted_count.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MigrationDiscoveryWarnings {
+    pub(crate) warnings: Vec<MigrationDiscoveryWarning>,
+    pub(crate) omitted_count: usize,
+}
+
+impl MigrationDiscoveryWarnings {
+    pub(crate) fn push(&mut self, warning: MigrationDiscoveryWarning) {
+        self.warnings.push(warning);
+        self.warnings.sort_by(discovery_warning_order);
+        if self.warnings.len() > MAX_MIGRATION_DISCOVERY_WARNINGS {
+            self.warnings.pop();
+            self.omitted_count = self.omitted_count.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn include_report(&mut self, mut report: MigrationDiscoveryReport) {
+        self.omitted_count = self.omitted_count.saturating_add(report.omitted_count);
+        for warning in report.warnings.drain(..) {
+            self.push(warning);
+        }
+    }
+}
+
+fn discovery_warning_order(
+    left: &MigrationDiscoveryWarning,
+    right: &MigrationDiscoveryWarning,
+) -> std::cmp::Ordering {
+    left.source_library_id
+        .cmp(&right.source_library_id)
+        .then_with(|| left.record_name.cmp(&right.record_name))
+        .then_with(|| left.kind.cmp(&right.kind))
+}
+
+fn truncate_discovery_field(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2122,6 +2290,109 @@ impl MigrationEngine {
         }
         statuses.sort_by(|left, right| right.id.cmp(&left.id));
         Ok(statuses)
+    }
+
+    /// Lists only independently validated jobs and reports damaged records without allowing one
+    /// bad file to block recovery of other jobs. Destructive dependency checks must continue to
+    /// use `list_for_source`, which intentionally fails closed on any untrusted record.
+    pub(crate) fn list_for_discovery(
+        source: &LibraryManager,
+        source_library_id: &str,
+    ) -> MigrationDiscoveryReport {
+        let names = match source.migration_state_names() {
+            Ok(names) => names,
+            Err(_) => {
+                let mut report = MigrationDiscoveryReport::default();
+                report.push_warning(MigrationDiscoveryWarning::new(
+                    source_library_id,
+                    "",
+                    MigrationDiscoveryWarningKind::EnumerationFailed,
+                ));
+                return report;
+            }
+        };
+        Self::list_for_discovery_with_reader(source, source_library_id, names, |name| {
+            source.migration_read_state(name, MAX_STATE_BYTES)
+        })
+    }
+
+    fn list_for_discovery_with_reader(
+        source: &LibraryManager,
+        source_library_id: &str,
+        mut names: Vec<String>,
+        mut read_state: impl FnMut(&str) -> Result<Option<Vec<u8>>>,
+    ) -> MigrationDiscoveryReport {
+        names.retain(|name| name.starts_with(JOB_STATE_PREFIX));
+        names.sort();
+        let source_identity = source.migration_root_identity();
+        let source_root = source.migration_root_path();
+        let mut report = MigrationDiscoveryReport::default();
+        for name in names {
+            if !valid_job_state_name(&name) {
+                report.push_warning(MigrationDiscoveryWarning::new(
+                    source_library_id,
+                    &name,
+                    MigrationDiscoveryWarningKind::Malformed,
+                ));
+                continue;
+            }
+            let bytes = match read_state(&name) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    report.push_warning(MigrationDiscoveryWarning::new(
+                        source_library_id,
+                        &name,
+                        MigrationDiscoveryWarningKind::Disappeared,
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    let kind = migration_record_warning_kind(&format!("{error:#}"))
+                        .unwrap_or(MigrationDiscoveryWarningKind::Unreadable);
+                    report.push_warning(MigrationDiscoveryWarning::new(
+                        source_library_id,
+                        &name,
+                        kind,
+                    ));
+                    continue;
+                }
+            };
+            let job: JobDocument = match decode_state(&bytes, "migration job") {
+                Ok(job) => job,
+                Err(_) => {
+                    report.push_warning(MigrationDiscoveryWarning::new(
+                        source_library_id,
+                        &name,
+                        MigrationDiscoveryWarningKind::Malformed,
+                    ));
+                    continue;
+                }
+            };
+            if job.preview.id.is_empty() || job_state_name(&job.preview.id) != name {
+                report.push_warning(MigrationDiscoveryWarning::new(
+                    source_library_id,
+                    &name,
+                    MigrationDiscoveryWarningKind::Malformed,
+                ));
+                continue;
+            }
+            if job.source.device != source_identity.device()
+                || job.source.inode != source_identity.inode()
+                || job.source.root != source_root
+            {
+                report.push_warning(MigrationDiscoveryWarning::new(
+                    source_library_id,
+                    &name,
+                    MigrationDiscoveryWarningKind::SourceBindingMismatch,
+                ));
+                continue;
+            }
+            report.statuses.push(status_from_job(&job));
+        }
+        report
+            .statuses
+            .sort_by(|left, right| right.id.cmp(&left.id));
+        report
     }
 
     /// Examines at most one deterministically rotating source preview on each discovery pass.
@@ -4621,6 +4892,16 @@ fn preview_state_name(id: &str) -> String {
 
 fn job_state_name(id: &str) -> String {
     format!("{JOB_STATE_PREFIX}{id}{STATE_SUFFIX}")
+}
+
+fn valid_job_state_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 160
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && name.starts_with(JOB_STATE_PREFIX)
+        && name.ends_with(STATE_SUFFIX)
 }
 
 fn new_migration_id() -> String {

@@ -889,6 +889,146 @@ async fn migration_pause_survives_runtime_restart_until_explicit_resume() {
 }
 
 #[tokio::test]
+async fn migration_discovery_skips_damaged_record_and_recovers_other_library_after_restart() {
+    let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "migration-discovery-isolates-bad-source-record",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let secondary_root = fixture.root.join("secondary-source");
+    fs::create_dir(&secondary_root).expect("secondary source root should create");
+    let secondary_id = queue
+        .register_video_library("Secondary", &secondary_root, None, false, false)
+        .expect("secondary source library should register")
+        .id;
+    let source_media = secondary_root.join("recoverable.mp4");
+    fs::write(&source_media, b"recoverable migration after restart")
+        .expect("secondary source media should write");
+
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let (damaged_source_runtime, _) =
+        crate::media_library_bot::scoped_runtime(&runtime, Some(&fixture.source_library_id))
+            .expect("default source should scope");
+    let damaged_source = crate::open_cloud_library_manager(
+        &damaged_source_runtime.bot,
+        Arc::clone(&runtime.inbox),
+        None,
+    )
+    .expect("default source manager should open");
+    let damaged_record_name = "migration-job-damaged-discovery.json";
+    let damaged_record_bytes = b"{ malformed durable migration record";
+    damaged_source
+        .migration_write_state(damaged_record_name, damaged_record_bytes)
+        .expect("malformed discovery record should be persisted");
+
+    let engine = migration_engine_for_test(&runtime, &secondary_id, &fixture.target_library_id);
+    let preview = engine
+        .preview(&crate::library_migration::MigrationRequest {
+            scope: crate::library_migration::MigrationScope::Library,
+            item_ids: Vec::new(),
+            conflict: crate::library::ConflictPolicy::Skip,
+            item_conflicts: Default::default(),
+            include_incomplete_tasks: false,
+            set_target_default_on_success: false,
+            task_impacts: Vec::new(),
+            warnings: Vec::new(),
+        })
+        .expect("secondary migration preview should persist");
+    engine
+        .confirm(&preview.id, &preview.revision)
+        .expect("healthy migration should be confirmed before restart");
+    engine
+        .set_runtime_context(
+            &preview.id,
+            crate::library_migration::MigrationRuntimeContext {
+                database_epoch: crate::cloud::TEST_DATABASE_EPOCH.to_string(),
+                preview_seq: 4_901,
+                chat_id: None,
+                message_id: None,
+                delivery: crate::library_migration::MigrationDeliveryState::Pending,
+            },
+        )
+        .expect("healthy migration should retain its restart epoch");
+    drop(engine);
+    drop(damaged_source);
+    drop(damaged_source_runtime);
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+
+    let reopened_queue = Arc::new(
+        QueueManager::open(&fixture.config).expect("queue should reopen after runtime restart"),
+    );
+    let reopened_inbox = Arc::new(
+        CloudInbox::open_for_epoch(&fixture.video_root, crate::cloud::TEST_DATABASE_EPOCH)
+            .expect("same-epoch inbox should reopen"),
+    );
+    let reopened_runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&reopened_queue),
+        Arc::clone(&reopened_inbox),
+    );
+
+    crate::library_migration_bot::discover_for_test(&reopened_runtime)
+        .await
+        .expect("one damaged source record should not abort discovery");
+    let warning = reopened_runtime
+        .migration_discovery_warnings
+        .lock()
+        .await
+        .warnings
+        .iter()
+        .find(|warning| {
+            warning.source_library_id == fixture.source_library_id
+                && warning.record_name == damaged_record_name
+                && warning.kind
+                    == crate::library_migration::MigrationDiscoveryWarningKind::Malformed
+        })
+        .cloned()
+        .expect("damaged source record should be explicitly reported");
+    assert!(warning.message.contains("malformed"));
+    assert_eq!(
+        damaged_record_bytes.as_slice(),
+        fs::read(
+            fixture
+                .video_root
+                .join(".telegram-video-downloader-library")
+                .join(damaged_record_name)
+        )
+        .expect("damaged migration record should remain untouched")
+    );
+
+    let discovered = wait_for_migration_status(&reopened_runtime, &preview.id, |status| {
+        status.status == crate::library_migration::MigrationRunStatus::Completed
+    })
+    .await;
+    assert_eq!(discovered.source_library_id, secondary_id);
+    assert_eq!(discovered.success_count, 1);
+    wait_for_migration_runner(&reopened_runtime, &preview.id, false).await;
+    assert!(
+        !source_media.exists(),
+        "healthy recovered job should clean its exact source after publication"
+    );
+    assert_eq!(
+        fs::read(fixture.archive_root.join("recoverable.mp4"))
+            .expect("healthy recovered destination should exist"),
+        b"recoverable migration after restart"
+    );
+
+    drop(reopened_runtime);
+    drop(reopened_inbox);
+    drop(reopened_queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[tokio::test]
 async fn terminal_migration_keeps_library_registered_until_queue_handoff_ack_after_restart() {
     let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
     let (fixture, queue, inbox) = create_migration_fixture(

@@ -109,3 +109,29 @@ export function renderMigrationHistory({ migrations, libraries = [], libraryId, 
   // The backend has already ordered the bounded snapshot by recovery priority.
   return `${noticeMarkup}${relevant.map((migration) => renderMigrationProgress(migration, libraries)).join("")}`;
 }
+
+export function renderMigrationDiscoveryWarnings({ warnings, libraries = [], omittedCount }) {
+  const rows = Array.isArray(warnings) ? warnings.slice(0, 16) : [];
+  const omitted = countValue(omittedCount);
+  if (rows.length === 0 && omitted === 0) return "";
+  const details = rows.map((warning) => {
+    const sourceId = typeof warning?.source_library_id === "string" ? warning.source_library_id : "";
+    const source = libraries.find((entry) => entry.id === sourceId);
+    const sourceLabel = sourceId === "" ? "Migration registry" : source?.name ?? `Library ${sourceId}`;
+    const record = typeof warning?.record_name === "string" ? warning.record_name : "";
+    const recordLabel = record || (warning?.kind === "source_unavailable"
+      ? "Library root"
+      : warning?.kind === "maintenance_failed"
+        ? "Preview maintenance"
+        : warning?.kind === "enumeration_failed" && sourceId !== ""
+          ? "Library scan"
+          : "");
+    const message = typeof warning?.message === "string" ? warning.message.slice(0, 192) : "Migration record state needs attention.";
+    const kind = statusText(warning?.kind ?? "unknown");
+    return `<div class="preview-line"><span>${escapeHtml(sourceLabel)}${recordLabel ? `<br><span class="field-hint">${escapeHtml(recordLabel)}</span>` : ""}</span><strong class="skip">${escapeHtml(kind)}</strong><p class="field-hint">${escapeHtml(message)}</p></div>`;
+  }).join("");
+  const omittedNotice = omitted > 0
+    ? `<p class="field-hint">${omitted.toLocaleString()} additional migration discovery warning${omitted === 1 ? " was" : "s were"} omitted from this view.</p>`
+    : "";
+  return `<article class="stack-card" role="status"><div class="stack-card-head"><div><h3>Migration discovery needs attention</h3><p>Some migration records could not be confirmed. Review these warnings before starting a new migration or retrying affected work.</p>${omittedNotice}</div><span class="state-pill pending">Needs attention</span></div><div class="preview-table">${details}</div></article>`;
+}

@@ -6,8 +6,9 @@ use super::*;
 use crate::file_manager::MigrationScanResult;
 use crate::library::Presence;
 use crate::library_migration::{
-    MigrationControl, MigrationDeliveryState, MigrationEngine, MigrationPreview, MigrationRequest,
-    MigrationRunStatus, MigrationRuntimeContext, MigrationScope, MigrationStatus,
+    MigrationControl, MigrationDeliveryState, MigrationDiscoveryWarning,
+    MigrationDiscoveryWarningKind, MigrationDiscoveryWarnings, MigrationEngine, MigrationPreview,
+    MigrationRequest, MigrationRunStatus, MigrationRuntimeContext, MigrationScope, MigrationStatus,
     MigrationTaskImpact, validate_migration_scan_paths,
 };
 use crate::media_libraries::TaskDestination;
@@ -770,6 +771,26 @@ async fn start(runtime: CloudBotRuntime, status: MigrationStatus) {
         let source = status.source_library_id.clone();
         if let Err(error) = run(&runtime, status).await {
             warn!(migration_id=%id,error=%redact_sensitive_text(&format!("{error:#}")),"media-library migration paused for recovery");
+            if let Some(kind) =
+                crate::library_migration::migration_record_warning_kind(&format!("{error:#}"))
+            {
+                let record_name = if matches!(
+                    kind,
+                    MigrationDiscoveryWarningKind::SourceUnavailable
+                        | MigrationDiscoveryWarningKind::MaintenanceFailed
+                        | MigrationDiscoveryWarningKind::EnumerationFailed
+                ) {
+                    String::new()
+                } else {
+                    format!("migration-job-{id}.json")
+                };
+                runtime
+                    .migration_discovery_warnings
+                    .lock()
+                    .await
+                    .push(MigrationDiscoveryWarning::new(&source, &record_name, kind));
+                runtime.state_notify.notify_one();
+            }
             let worker = runtime.clone();
             let lookup = id.clone();
             let diagnostic =
@@ -809,27 +830,76 @@ pub(super) async fn watch(runtime: CloudBotRuntime) {
 
 async fn discover(runtime: &CloudBotRuntime) -> Result<()> {
     let worker = runtime.clone();
-    let statuses = tokio::task::spawn_blocking(move || {
+    let discovered = tokio::task::spawn_blocking(move || {
+        let mut discovered = MigrationDiscoveryWarnings::default();
+        let libraries = match worker.bot.queue.registry_snapshot() {
+            Ok(snapshot) => snapshot.libraries,
+            Err(error) => {
+                warn!(error=%redact_sensitive_text(&format!("{error:#}")), "media-library registry could not be enumerated for migration discovery");
+                discovered.push(MigrationDiscoveryWarning::new(
+                    "",
+                    "",
+                    MigrationDiscoveryWarningKind::EnumerationFailed,
+                ));
+                return (Vec::new(), discovered);
+            }
+        };
         let mut statuses = Vec::new();
-        for library in worker.bot.queue.registry_snapshot()?.libraries {
-            if let Ok(source) = manager(&worker, &library.id) {
-                match MigrationEngine::maintain_source(&source) {
-                    Ok(report) => {
-                        if let Some(warning) = report.warning {
-                            warn!(library_id=%library.id, warning=%warning, "media-library preview maintenance needs attention");
-                        }
-                    }
-                    Err(error) => {
-                        warn!(library_id=%library.id, error=%redact_sensitive_text(&format!("{error:#}")), "media-library preview maintenance could not complete");
+        for library in libraries {
+            let source = match manager(&worker, &library.id) {
+                Ok(source) => source,
+                Err(error) => {
+                    warn!(library_id=%library.id, error=%redact_sensitive_text(&format!("{error:#}")), "media-library root is unavailable during migration discovery");
+                    discovered.push(MigrationDiscoveryWarning::new(
+                        &library.id,
+                        "",
+                        MigrationDiscoveryWarningKind::SourceUnavailable,
+                    ));
+                    continue;
+                }
+            };
+            match MigrationEngine::maintain_source(&source) {
+                Ok(report) => {
+                    if let Some(warning) = report.warning {
+                        warn!(library_id=%library.id, warning=%redact_sensitive_text(&warning), "media-library preview maintenance needs attention");
+                        discovered.push(MigrationDiscoveryWarning::new(
+                            &library.id,
+                            "",
+                            MigrationDiscoveryWarningKind::MaintenanceFailed,
+                        ));
                     }
                 }
-                statuses.extend(MigrationEngine::list_for_source(&source)?);
+                Err(error) => {
+                    warn!(library_id=%library.id, error=%redact_sensitive_text(&format!("{error:#}")), "media-library preview maintenance could not complete");
+                    discovered.push(MigrationDiscoveryWarning::new(
+                        &library.id,
+                        "",
+                        MigrationDiscoveryWarningKind::MaintenanceFailed,
+                    ));
+                }
             }
+            let report = MigrationEngine::list_for_discovery(&source, &library.id);
+            statuses.extend(report.statuses.iter().cloned());
+            discovered.include_report(report);
         }
-        Ok::<_, anyhow::Error>(statuses)
+        (statuses, discovered)
     })
-    .await??;
-    for status in statuses {
+    .await;
+    let discovered = match discovered {
+        Ok(discovered) => discovered,
+        Err(error) => {
+            let mut warnings = MigrationDiscoveryWarnings::default();
+            warnings.push(MigrationDiscoveryWarning::new(
+                "",
+                "",
+                MigrationDiscoveryWarningKind::EnumerationFailed,
+            ));
+            *runtime.migration_discovery_warnings.lock().await = warnings;
+            return Err(error).context("migration discovery worker failed");
+        }
+    };
+    *runtime.migration_discovery_warnings.lock().await = discovered.1;
+    for status in discovered.0 {
         publish_status(runtime, status.clone()).await;
         start(runtime.clone(), status).await;
     }

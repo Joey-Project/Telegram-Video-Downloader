@@ -50,6 +50,11 @@ a replacement directory at the same pathname is rejected while task and staging 
 bound to the original directory.
 The selected root is checked again before enqueue writes queue state, so a replacement between
 configuration lookup and task creation cannot redirect durable task records.
+**Download here** also keeps the registration binding displayed by its form in the queued request.
+The desktop compares that binding atomically with task creation. Removing and re-registering a
+library at the same path cannot redirect an older browser retry, even when the directory object
+itself is unchanged. Missing, malformed or stale bindings are rejected; refresh the library view
+and explicitly submit a new request rather than upgrading the old queued request.
 Before writing a new video task, every registered queue must be searchable to prove the task ID
 is unused. If a library is offline, creation refuses that uncertain absence; a safely found existing
 task remains an idempotent replay. Reconnecting the original library allows replay without moving
@@ -105,6 +110,11 @@ ordinary child-entry changes remain supported.
 Registered cloud file and migration managers retain the verified queue root's open directory
 descriptor during metadata initialization. They do not reopen the pathname after validation,
 so a directory replacement cannot receive another library's recovery metadata.
+Restart discovery isolates malformed, oversized, missing or identity-mismatched job records.
+Valid jobs in the same library and other libraries remain discoverable and recoverable. Bounded
+warnings identify records needing attention. Existing records remain in place, and unverified
+jobs never start. Library removal still uses strict dependency checks, so an unreadable record
+does not establish that the library has no remaining migration dependencies.
 Starting a migration requires both endpoint IDs to resolve to registered libraries. Removing a
 previously selected target disables that preview's Start control.
 Polling and scope changes preserve a selected target while it remains registered and distinct

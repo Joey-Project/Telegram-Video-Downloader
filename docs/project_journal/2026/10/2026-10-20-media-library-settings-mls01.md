@@ -102,19 +102,23 @@ superseded_by: ""
 | 范围 | 最终结果 |
 | --- | --- |
 | Rust 1.99.1 格式及差异空白检查 | `cargo fmt --all -- --check`、`git diff --check` 通过 |
-| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,187 通过、0 失败、16 个既有忽略项 |
+| Rust 全量测试 | `cargo test --locked --offline --all-targets`：1,194 通过、0 失败、16 个既有忽略项 |
 | Rust 静态检查及构建 | `cargo clippy --all-targets --locked --offline -- -D warnings`、`cargo build --locked --offline --bin telegram-video-downloader` 通过 |
-| Cloud / Node 25.8.2 | 类型检查通过；209 项测试通过；Wrangler 4.149.0 dry-run 通过，53 个静态资源 |
+| Cloud / Node 25.8.2 | 类型检查通过；232 项测试通过；Wrangler 4.149.0 dry-run 通过，55 个静态资源 |
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
 - Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review11/`；后者记录 26 项定向回归，新增目录对象绑定和取消登记后同路径复用的扫描缓存回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
-- 最新 Rust 验证日志位于 `.codex-tmp/mls01-review13/`：`focused-root-binding-review13-final2.log`、`focused-settings-binding-e2e-review13-final.log`、`focused-cache-remove-binding-review13-final.log`、`fmt-review13-final2.log`、`clippy-review13-final3.log`、`build-review13-final2.log` 和 `tests-review13-final2.log`。完整 1,187 项测试通过，用时 146.08 秒；覆盖登记标识持久化、旧数据摘要稳定、同目录及替代目录重登记后的四操作拒绝、合法新请求和子项变化。
-- 本轮 Rust 中间失败保留于 `focused-root-binding-review13-final.log`（测试队列变量笔误）、`clippy-review13-final.log`（旧无身份修改入口仅被测试使用）和 `tests-review13-final.log`（旧缓存 E2E 的正常请求缺少新增身份字段）。修正测试数据、收窄测试专用入口后，原扫描发布锁及缓存断言保留；最终格式、静态检查、构建和全量测试均重新通过，未放宽缺失身份的拒绝逻辑。
+- 最新 Rust 验证日志位于 `.codex-tmp/mls01-review14/`：`download-binding-tests-retry1.log`、`queue-binding-test.log`、`migration-discovery-focused-final2.log`、`migration-warning-classifier-final.log`、`final-rustfmt-final.log`、`final-clippy.log`、`final-build.log` 和 `final-all-target-tests.log`。完整 1,194 项测试通过，用时 141.60 秒；覆盖旧下载登记标识、同路径替代目录、目标 ID 不一致、逐条发现错误隔离，以及重建队列和运行时后恢复另一媒体库的正常迁移。
+- 本轮中间失败独立保留：`download-binding-focused-initial.log`（新处理代码的任务 ID 移后使用、测试集合断言缺少引用）、`download-binding-tests.log`（同名测试重复定义）和 `migration-discovery-focused-final.log`（来源绑定测试先违反预览 ID/文件名规则、重启测试尚持有旧运行时）。修正具体代码或测试数据后，保留唯一测试副本、精确错误类别和真实重新打开队列的断言；格式、Clippy、构建和完整测试在最终冻结代码上重新通过，未放宽生产队列所有权规则。
+- 前一轮 `.codex-tmp/mls01-review13/` 的 `focused-root-binding-review13-final2.log`、`focused-settings-binding-e2e-review13-final.log`、`focused-cache-remove-binding-review13-final.log`、`fmt-review13-final2.log`、`clippy-review13-final3.log`、`build-review13-final2.log` 和 `tests-review13-final2.log` 记录当时 1,187 项通过结果，覆盖登记标识持久化、旧数据摘要稳定、同目录及替代目录重登记后的四操作拒绝、合法新请求和子项变化。
+- 前一轮 Rust 中间失败保留于 `focused-root-binding-review13-final.log`（测试队列变量笔误）、`clippy-review13-final.log`（旧无身份修改入口仅被测试使用）和 `tests-review13-final.log`（旧缓存 E2E 的正常请求缺少新增身份字段）。修正测试数据、收窄测试专用入口后，原扫描发布锁及缓存断言保留；最终格式、静态检查、构建和全量测试均重新通过，未放宽缺失身份的拒绝逻辑。
 - 前一轮 `.codex-tmp/mls01-review12/` 保留确定性的目录验证后替换回归及当时 1,185 项全量通过结果。生产入口改为消费已验证句柄后，将旧路径构造入口及 import 限定为测试编译；两次中间 Clippy 失败分别保留为 `rust-clippy-review12-final.log` 和 `rust-clippy-review12-final2.log`，未抑制警告。
 - 上游合并后的 Rust 验证日志保留于 `.codex-tmp/mls01-ci-update/`。多 P 选择改进要求既有目标冻结 E2E 补齐 `page_count` 字段；该定向回归和当时 1,184 项全量测试通过。
 - 更早一轮的 Rust 验证日志为 `mls01-review11/tests-review11-final.log`、`clippy-review11-final.log`、`build-review11-final.log` 和 `focused-review11-final2.log`。该轮首次定向编译缺少测试用的 `serde_json::Value` import，修正后重跑通过，首次失败日志独立保留为 `focused-review11-final.log`。更早的共享 build-dir 沙盒访问失败也单独保留；之后的 Cargo 命令从首次执行起使用窄提权。
-- 最新 Cloud 本地全量测试、类型检查和 dry-run 日志位于 `.codex-tmp/mls01-review13/`，分别为 `cloud-test-final.log`、`cloud-typecheck-final.log` 和 `cloud-build-dry-run-final.log`。完整 209 项测试通过；新增渲染身份请求、全部已发布迁移可达、2,400 个冲突项的单页窗口、跨页选择和修订隔离回归。仅使用本地 mock，打包命令明确以 `--dry-run` 结束。
-- 本轮文件页首次定向验证的两处测试预期错误保留于 `file-focused-review13.log`，修正默认冲突策略和卡片内字段顺序断言后，最终 `file-focused-review13-final.log` 的 4 项定向测试通过。设置侧首次测试查询遗漏既有 `action:` 请求 ID 前缀，只保留了工具输出；派生说明位于 `focused-check-note.md`，未将其描述为完整原始日志。最终全量日志由有界 runner 独立保存。
+- 最新 Cloud 本地全量测试、类型检查和 dry-run 日志位于 `.codex-tmp/mls01-review14/`，分别为 `final-cloud-tests-4.log`、`final-cloud-typecheck-3.log` 和 `final-cloud-build-3.log`。完整 232 项测试通过；覆盖实际渲染登记标识、旧下载请求拒绝、空分类语义，以及有界迁移发现警告的形状、空记录名和独立提示。仅使用本地 mock，打包命令明确以 `--dry-run` 结束。
+- 本轮 Cloud 首次最终格式验证失败保留为 `final-cloud-tests-3.log`（231 通过、1 失败）：来源已知但无法枚举记录的警告没有文件名，验证器错误地走了非空字符串分支。修正合法分支后，保留原断言并重跑完整测试、类型和打包检查通过。更早成功日志对应此前文案或警告协议，作为中间证据保留。
+- 前一轮 `.codex-tmp/mls01-review13/` 的 `cloud-test-final.log`、`cloud-typecheck-final.log` 和 `cloud-build-dry-run-final.log` 记录当时 209 项通过结果，覆盖渲染身份请求、全部已发布迁移可达、2,400 个冲突项的单页窗口、跨页选择和修订隔离。
+- 前一轮文件页首次定向验证的两处测试预期错误保留于 `file-focused-review13.log`，修正默认冲突策略和卡片内字段顺序断言后，最终 `file-focused-review13-final.log` 的 4 项定向测试通过。设置侧首次测试查询遗漏既有 `action:` 请求 ID 前缀，只保留了工具输出；派生说明位于 `focused-check-note.md`，未将其描述为完整原始日志。最终全量日志由有界 runner 独立保存。
 - 前一轮 Cloud 验证日志保留于 `.codex-tmp/mls01-review12/`，覆盖 5 项下载历史回执回归和 3 项时间戳单位回归；当时完整 196 项测试通过。
 - 前一轮 Cloud 日志保留于 `.codex-tmp/mls01-review11/`，覆盖跨标签页永久拒绝、队列移除失败、401/403 与暂态重试，以及目录对象替换和旧快照隔离。首次全量测试发现草稿同步遗漏目录身份字段，修正后通过；测试替身及声明的类型错误也已修正，失败日志分别保留为 `full-cloud-tests.log` 和 `cloud-typecheck.log`。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
@@ -123,6 +127,15 @@ superseded_by: ""
 
 ## PR regression coverage
 
+- Restart discovery uses an independent bounded per-job report. An invalid or unreadable
+  migration record requires attention while healthy jobs remain published and recoverable.
+  Discovery leaves existing records in place, and strict library-removal dependency checks remain
+  unchanged rather than interpreting an unreadable job as an absent dependency.
+- File download requests retain their rendered registration binding across browser retries.
+  Missing, malformed and stale bindings fail closed, including old durable requests; the final
+  enqueue compares the registration under the task-creation lock. Re-registering the same
+  path or directory object cannot redirect an old request, while ordinary child changes remain
+  supported and an explicitly blank category still selects the library root.
 - Identity-sensitive settings requests carry the displayed opaque root binding. Default, category,
   rename and unregister mutations reject missing or stale bindings under the same lock as the
   registry change, preventing an old tab from targeting a same-path replacement registration.

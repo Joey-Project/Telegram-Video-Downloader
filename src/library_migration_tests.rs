@@ -2516,3 +2516,172 @@ async fn legacy_completed_handoff_without_final_ack_keeps_source_controls() {
     assert!(fixture.payload_path.exists());
     assert!(fixture.staging_path.join(".owner.json").exists());
 }
+
+#[test]
+fn migration_discovery_isolates_bad_job_records_and_preserves_them() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let fixture = Fixture::new("discovery-record-isolation");
+    let source = fixture.engine.source.as_ref();
+    let malformed_name = job_state_name("malformed");
+    source
+        .migration_write_state(&malformed_name, b"not a migration job")
+        .expect("malformed record should be writable for the fixture");
+
+    let mut mismatched = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("valid migration should load");
+    mismatched.preview.id = "source-mismatch".to_string();
+    mismatched.source.device = mismatched.source.device.saturating_add(1);
+    let mismatch_name = job_state_name("source-mismatch");
+    source
+        .migration_write_state(
+            &mismatch_name,
+            &serde_json::to_vec(&mismatched).expect("mismatched job should serialize"),
+        )
+        .expect("mismatched record should be writable for the fixture");
+
+    let oversized_name = job_state_name("oversized");
+    let oversized_path = source
+        .migration_root_path()
+        .join(".telegram-video-downloader-library")
+        .join(&oversized_name);
+    let oversized_file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&oversized_path)
+        .expect("oversized record should create");
+    oversized_file
+        .set_len(MAX_STATE_BYTES as u64 + 1)
+        .expect("sparse oversized record should extend");
+    drop(oversized_file);
+
+    let disappeared_name = job_state_name("disappeared");
+    let mut names = source
+        .migration_state_names()
+        .expect("migration records should enumerate");
+    names.push(disappeared_name.clone());
+    let report =
+        MigrationEngine::list_for_discovery_with_reader(source, "source-library", names, |name| {
+            if name == disappeared_name {
+                Ok(None)
+            } else {
+                source.migration_read_state(name, MAX_STATE_BYTES)
+            }
+        });
+
+    assert_eq!(report.statuses.len(), 1);
+    assert_eq!(report.statuses[0].id, fixture.migration_id);
+    assert_eq!(report.omitted_count, 0);
+    let kinds = report
+        .warnings
+        .iter()
+        .map(|warning| (warning.record_name.as_str(), warning.kind))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(kinds.contains(&(
+        malformed_name.as_str(),
+        MigrationDiscoveryWarningKind::Malformed
+    )));
+    assert!(kinds.contains(&(
+        oversized_name.as_str(),
+        MigrationDiscoveryWarningKind::Oversized
+    )));
+    assert!(
+        kinds.contains(&(
+            mismatch_name.as_str(),
+            MigrationDiscoveryWarningKind::SourceBindingMismatch
+        )),
+        "unexpected discovery warnings: {:?}",
+        report.warnings
+    );
+    assert!(kinds.contains(&(
+        disappeared_name.as_str(),
+        MigrationDiscoveryWarningKind::Disappeared
+    )));
+    assert!(report.warnings.iter().all(|warning| {
+        warning.source_library_id == "source-library"
+            && warning.message.len() <= MIGRATION_DISCOVERY_MESSAGE_BYTES
+            && warning.record_name.len() <= MIGRATION_DISCOVERY_RECORD_NAME_BYTES
+    }));
+
+    assert_eq!(
+        source
+            .migration_read_state(&malformed_name, MAX_STATE_BYTES)
+            .expect("malformed record should remain readable")
+            .as_deref(),
+        Some(b"not a migration job".as_slice())
+    );
+    assert_eq!(
+        fs::metadata(&oversized_path)
+            .expect("oversized record should remain present")
+            .len(),
+        MAX_STATE_BYTES as u64 + 1
+    );
+    assert!(
+        MigrationEngine::list_for_source(source).is_err(),
+        "strict dependency listing must continue to fail closed"
+    );
+}
+
+#[test]
+fn migration_discovery_warning_projection_is_bounded_and_sorted() {
+    let mut warnings = MigrationDiscoveryWarnings::default();
+    for index in (0..MAX_MIGRATION_DISCOVERY_WARNINGS + 8).rev() {
+        warnings.push(MigrationDiscoveryWarning::new(
+            &format!("library-{index:02}"),
+            &format!("migration-job-{index:02}.json"),
+            MigrationDiscoveryWarningKind::Malformed,
+        ));
+    }
+    warnings.push(MigrationDiscoveryWarning::new(
+        &format!("{}é", "x".repeat(127)),
+        &format!("{}é", "record".repeat(30)),
+        MigrationDiscoveryWarningKind::Unreadable,
+    ));
+
+    assert_eq!(warnings.warnings.len(), MAX_MIGRATION_DISCOVERY_WARNINGS);
+    assert_eq!(warnings.omitted_count, 9);
+    assert!(
+        warnings
+            .warnings
+            .windows(2)
+            .all(|pair| { discovery_warning_order(&pair[0], &pair[1]).is_le() })
+    );
+    assert!(warnings.warnings.iter().all(|warning| {
+        warning.source_library_id.len() <= MIGRATION_DISCOVERY_LIBRARY_ID_BYTES
+            && warning.record_name.len() <= MIGRATION_DISCOVERY_RECORD_NAME_BYTES
+            && warning.message.len() <= MIGRATION_DISCOVERY_MESSAGE_BYTES
+    }));
+}
+
+#[test]
+fn migration_record_warning_classifier_ignores_unrelated_execution_errors() {
+    assert_eq!(
+        migration_record_warning_kind(
+            "task disappeared while migration was acquiring output leases"
+        ),
+        None,
+        "queue-task failures must not be presented as damaged migration records"
+    );
+    assert_eq!(
+        migration_record_warning_kind("migration task staging file exceeded its size limit"),
+        None,
+        "task payload failures must remain task-transfer errors"
+    );
+    assert_eq!(
+        migration_record_warning_kind("migration job does not exist in this source library"),
+        Some(MigrationDiscoveryWarningKind::Disappeared)
+    );
+    assert_eq!(
+        migration_record_warning_kind("media-library state file exceeds its size limit"),
+        Some(MigrationDiscoveryWarningKind::Oversized)
+    );
+    assert_eq!(
+        migration_record_warning_kind(
+            "persisted migration source binding no longer matches this library"
+        ),
+        Some(MigrationDiscoveryWarningKind::SourceBindingMismatch)
+    );
+}
