@@ -26,6 +26,12 @@ superseded_by:
 - Short-link failure notification is sent before that retry loop, and README now documents that replay mode cannot handle Telegram-only Bilibili choices.
 - README describes the new Telegram prompt. No live Telegram or Bilibili smoke test has been run.
 
+## Follow-up: Single-Page Prompt and Existing-Part Skip
+- Multi-page video links, including explicit `?p=N`, ask whether to download the linked P (or P1) or all P. A one-page standalone video starts directly; collection membership still offers the whole-collection action.
+- When an all-P download finds compatible downloaded parts, the duplicate prompt offers `Skip downloaded`; the missing-entry plan downloads only remaining page indices and revalidates skipped media before reporting completion.
+- The same missing-entry selection continues to support season entries. Unsupported media-only modes do not offer skip.
+- Follow-up branch and PR/merge/deployment evidence will be recorded after the exact PR head passes review and CI.
+
 ## Evidence
 - `cargo fmt --check` passed.
 - `cargo test builds_bilibili_selection_keyboard_and_applies_selection` passed.
