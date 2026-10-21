@@ -108,14 +108,18 @@ superseded_by: ""
 | 本机服务 / Python 3.14.5 | 101 项测试、LaunchAgent mock integration 和 shell syntax 检查通过 |
 
 - Cargo gate 显式使用本 worktree 的 `target` 和既有共享 build-dir；未覆盖已安装程序。审查回归日志保留于 `.codex-tmp/mls01-review2/` 至 `.codex-tmp/mls01-review11/`；后者记录 26 项定向回归，新增目录对象绑定和取消登记后同路径复用的扫描缓存回归。服务辅助验证日志保留于首次实施的 `.codex-tmp/mls01/`。
-- 最新 Rust 验证日志为 `mls01-review11/tests-review11-final.log`、`clippy-review11-final.log`、`build-review11-final.log` 和 `focused-review11-final2.log`。本轮首次定向编译缺少测试用的 `serde_json::Value` import，修正后重跑通过，首次失败日志独立保留为 `focused-review11-final.log`。上一轮共享 build-dir 的沙盒访问失败也单独保留；本轮 Cargo 命令从首次执行起使用窄提权。
-- 最新 Cloud 全量测试、类型检查和本地 dry-run 日志为同目录下的 `full-cloud-tests-3.log`、`cloud-typecheck-2.log` 和 `cloud-build-dry-run.log`。新增浏览器测试覆盖跨标签页永久拒绝、队列移除失败、401/403 与暂态重试，以及目录对象替换和旧快照隔离。首次全量测试发现草稿同步遗漏目录身份字段，修正后通过；测试替身及声明的类型错误也已修正，失败日志分别保留为 `full-cloud-tests.log` 和 `cloud-typecheck.log`。
+- 最新 Rust 验证日志位于 `.codex-tmp/mls01-ci-update/`：`focused-page-choice.log`、`fmt-all.log`、`clippy-all-targets.log`、`build-debug-bin.log` 和 `tests-all-targets.log`。合并上游多 P 选择改进后，补齐既有目标冻结 E2E 的 `page_count` 字段；该定向回归和 1,184 项全量测试通过。
+- 前一轮审查的 Rust 验证日志为 `mls01-review11/tests-review11-final.log`、`clippy-review11-final.log`、`build-review11-final.log` 和 `focused-review11-final2.log`。该轮首次定向编译缺少测试用的 `serde_json::Value` import，修正后重跑通过，首次失败日志独立保留为 `focused-review11-final.log`。更早的共享 build-dir 沙盒访问失败也单独保留；之后的 Cargo 命令从首次执行起使用窄提权。
+- 最新 Cloud 本地全量测试、类型检查和 dry-run 日志位于 `.codex-tmp/mls01-review11/`，分别为 `full-cloud-tests-3.log`、`cloud-typecheck-2.log` 和 `cloud-build-dry-run.log`。新增浏览器测试覆盖跨标签页永久拒绝、队列移除失败、401/403 与暂态重试，以及目录对象替换和旧快照隔离。首次全量测试发现草稿同步遗漏目录身份字段，修正后通过；测试替身及声明的类型错误也已修正，失败日志分别保留为 `full-cloud-tests.log` 和 `cloud-typecheck.log`。
 - 新增媒体库/迁移 E2E 没有忽略项。代表性覆盖包括 `media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e`（视频/NFO/ASS、未勾选时任务及片段保留）、`media_library_migration_uses_per_bundle_conflict_choices_mock_e2e`（实际 Skip/KeepBoth）、`partial_task_migration_keep_both_rewrites_published_paths_mock_e2e`（已发布路径重写）和两项片段/队列交接后的恢复用例。
 - 大片段恢复用例使用 8–16 MiB 的合成文件；独立运行整体耗时约 15 秒。迁移完成等待设为明确的 60 秒上限，以容纳全量测试共享输出槽及调试模式校验开销，并保留超时状态诊断。全量测试随后通过；未改动生产迁移等待逻辑。
 - 测试使用临时本地目录、合成媒体/片段、fake 下载工具及 mock Telegram/cloud。恢复测试通过重建 runtime/queue 和持久状态重放模拟中断；未向真实 Telegram/Cloudflare 发送请求，未操作生产媒体或终止部署进程。
 
 ## PR regression coverage
 
+- The frozen-destination callback E2E supplies the total page count required by
+  the updated multi-page selection prompt, retaining its P2 selection and
+  destination-library/category assertions after upstream merges.
 - Browser request outcomes distinguish accepted sequences from permanent rejections. A helping
   tab persists a rejection before dequeue, allowing the origin to leave pending state without
   restoring the rejected payload; retryable errors and owner-authentication gates remain distinct.

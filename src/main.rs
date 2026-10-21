@@ -21122,6 +21122,7 @@ mod tests {
                 job,
                 &BilibiliSelectionPrompt::VideoPages {
                     page: Some(2),
+                    page_count: 2,
                     collection: None,
                 },
                 BilibiliSelectionCallbackAction::Current,
