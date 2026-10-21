@@ -15,6 +15,7 @@ import { boundedFolderSuggestions, buildMigrationPreviewPayload, canOperateOnReg
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
 import { renderMigrationHistory } from "./migration-rendering.js";
 import { renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
+import { inspectDownloadSubmissionHistory, releaseDownloadSubmissionTracking } from "./download-submission-history.js";
 
 const API = "/api";
 const CACHE_KEY = "file-manager.snapshot.v1";
@@ -120,16 +121,26 @@ function renderLibrarySelector() {
 function renderDownloadStatus() {
   const status = byId("download-status");
   const submit = byId("download-submit");
-  if (!status || !submit) return;
+  const clearWait = byId("download-clear-wait");
+  if (!status || !submit || !clearWait) return;
   const submission = state.downloadSubmission;
+  const history = inspectDownloadSubmissionHistory(submission, state.snapshot);
   submit.disabled = Boolean(submission) || !libraryCanOperate(byId("download-library-select")?.value || activeLibraryId());
+  clearWait.classList.toggle("hidden", history.kind !== "outside_recent_history");
   if (submission?.seq !== null && submission?.seq !== undefined) {
-    const pending = (Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : [])
-      .find((request) => request.seq === submission.seq);
-    status.textContent = pending
-      ? "Saved in the cloud inbox. Waiting for your computer; this request is not applied yet."
-      : "Your computer received this request. Waiting for its local result.";
-    status.classList.remove("warning-text");
+    if (history.kind === "pending") {
+      status.textContent = "Saved in the cloud inbox. Waiting for your computer; this request is not applied yet.";
+      status.classList.remove("warning-text");
+    } else if (history.kind === "outside_recent_history") {
+      status.textContent = "This request is outside the recent status history. Its result is unknown and it has not been resent. You can clear this browser's waiting status after checking your computer.";
+      status.classList.add("warning-text");
+    } else if (history.kind === "recorded") {
+      status.textContent = "Your computer has this request. Waiting for its local result.";
+      status.classList.remove("warning-text");
+    } else {
+      status.textContent = "The current snapshot does not show this request's local result. It has not been resent; wait for a fresh status update.";
+      status.classList.add("warning-text");
+    }
   } else if (submission?.rejected === true) {
     status.textContent = submission.error ?? "This request was rejected. It remains paused until browser storage is available.";
     status.classList.add("warning-text");
@@ -145,8 +156,8 @@ function renderDownloadStatus() {
 function settleDownloadSubmission() {
   const submission = state.downloadSubmission;
   if (!submission || !Number.isSafeInteger(submission.seq)) return;
-  const operation = (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [])
-    .find((entry) => entry?.kind === "download_submit" && entry.seq === submission.seq);
+  const history = inspectDownloadSubmissionHistory(submission, state.snapshot);
+  const operation = history.kind === "recorded" ? history.operation : null;
   if (!operation) return;
   if (operation.status === "completed") {
     const result = operation.result && typeof operation.result === "object" ? operation.result : {};
@@ -1318,6 +1329,14 @@ function bindEvents() {
   byId("download-here").addEventListener("click", () => openDownloadForm());
   byId("download-close").addEventListener("click", closeDownloadForm);
   byId("download-cancel").addEventListener("click", closeDownloadForm);
+  byId("download-clear-wait").addEventListener("click", () => {
+    if (!releaseDownloadSubmissionTracking(state, state.snapshot)) {
+      renderDownloadStatus();
+      return;
+    }
+    renderDownloadStatus();
+    showToast(state.downloadMessage);
+  });
   byId("download-dialog").addEventListener("click", (event) => { if (event.target === byId("download-dialog")) closeDownloadForm(); });
   byId("download-library-select").addEventListener("change", () => {
     updateDownloadFormOptions();

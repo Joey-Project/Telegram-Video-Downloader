@@ -23,9 +23,10 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::downloader::video_output_lock_file;
+#[cfg(test)]
+use crate::file_provider::platform_queue_file_provider;
 use crate::file_provider::{
     QueueFileProvider, classify_deadlock_error, is_file_provider_access_error,
-    platform_queue_file_provider,
 };
 use crate::library::{
     BatchMoveResult, BatchStatus, CollectionMetadata, Confidence, ConflictPolicy, FileMovePreview,
@@ -1117,10 +1118,12 @@ struct StoreGuards {
 }
 
 impl LibraryManager {
+    #[cfg(test)]
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_provider(root, platform_queue_file_provider())
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with_provider(
         root_path: impl AsRef<Path>,
         provider: Arc<dyn QueueFileProvider>,
@@ -1128,6 +1131,7 @@ impl LibraryManager {
         Self::open_with_provider_and_optional_preview_cleanup_gate(root_path, provider, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with_provider_and_preview_cleanup_gate(
         root_path: impl AsRef<Path>,
         provider: Arc<dyn QueueFileProvider>,
@@ -1138,6 +1142,7 @@ impl LibraryManager {
         Ok(manager)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_with_preview_cleanup_gate(
         root_path: impl AsRef<Path>,
         preview_cleanup_gate: Arc<dyn PreviewCleanupGate>,
@@ -1147,6 +1152,7 @@ impl LibraryManager {
         Ok(manager)
     }
 
+    #[cfg(test)]
     fn open_with_provider_and_optional_preview_cleanup_gate(
         root_path: impl AsRef<Path>,
         provider: Arc<dyn QueueFileProvider>,
@@ -1169,6 +1175,43 @@ impl LibraryManager {
             .map_err(|error| classify_deadlock_error(&root_path, "read", error))?;
         let root =
             rooted.ok_or_else(|| anyhow!("File Provider supplied no download-root accessor"))?;
+        Self::initialize_with_bound_root(root, provider, preview_cleanup_gate)
+    }
+
+    /// Open a library manager on a queue-validated root descriptor without reopening its path.
+    /// The descriptor is revalidated before any library metadata is initialized.
+    pub(crate) fn open_with_bound_root_and_provider_and_preview_cleanup_gate(
+        root: RootedFs,
+        provider: Arc<dyn QueueFileProvider>,
+        preview_cleanup_gate: Arc<dyn PreviewCleanupGate>,
+    ) -> Result<Self> {
+        let root_path = root.logical_root_path().to_path_buf();
+        let mut root_seen = false;
+        let mut bind_root = |accessor_path: &Path| -> Result<()> {
+            let coordinated = coordinated_path_under_root(&root, accessor_path)?;
+            if coordinated != root_path {
+                bail!("coordinated media-library root changed during access");
+            }
+            root.list_root_directory()?;
+            root_seen = true;
+            Ok(())
+        };
+        provider
+            .coordinate_read(&root_path, &mut bind_root)
+            .map_err(|error| classify_deadlock_error(&root_path, "read", error))?;
+        if !root_seen {
+            bail!("File Provider supplied no bound download-root accessor");
+        }
+        Self::initialize_with_bound_root(root, provider, Some(preview_cleanup_gate))
+    }
+
+    fn initialize_with_bound_root(
+        root: RootedFs,
+        provider: Arc<dyn QueueFileProvider>,
+        preview_cleanup_gate: Option<Arc<dyn PreviewCleanupGate>>,
+    ) -> Result<Self> {
+        root.validate_configured_root()
+            .context("registered media-library root changed before metadata initialization")?;
         let library_dir = root.logical_root_path().join(LIBRARY_DIRECTORY);
         let library_dir_identity =
             ensure_private_directory(&root, provider.as_ref(), &library_dir)?;

@@ -4210,16 +4210,38 @@ fn open_cloud_library_manager(
     inbox: Arc<CloudInbox>,
     file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
 ) -> Result<LibraryManager> {
-    match file_provider {
-        Some(file_provider) => LibraryManager::open_with_provider_and_preview_cleanup_gate(
-            &bot.config.downloads.video_dir,
-            file_provider,
-            inbox,
-        ),
-        None => {
-            LibraryManager::open_with_preview_cleanup_gate(&bot.config.downloads.video_dir, inbox)
-        }
-    }
+    open_cloud_library_manager_after_root_validation(bot, inbox, file_provider, || Ok(()))
+}
+
+#[cfg(test)]
+fn open_cloud_library_manager_with_test_hook(
+    bot: &BotContext,
+    inbox: Arc<CloudInbox>,
+    file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
+    before_manager_initialization: impl FnOnce() -> Result<()>,
+) -> Result<LibraryManager> {
+    open_cloud_library_manager_after_root_validation(
+        bot,
+        inbox,
+        file_provider,
+        before_manager_initialization,
+    )
+}
+
+fn open_cloud_library_manager_after_root_validation(
+    bot: &BotContext,
+    inbox: Arc<CloudInbox>,
+    file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
+    before_manager_initialization: impl FnOnce() -> Result<()>,
+) -> Result<LibraryManager> {
+    let library_id = media_library_bot::original_library_id_from_bot(bot)?;
+    let root = bot.queue.verified_video_library_root(&library_id)?;
+    before_manager_initialization()?;
+    LibraryManager::open_with_bound_root_and_provider_and_preview_cleanup_gate(
+        root,
+        file_provider.unwrap_or_else(crate::file_provider::platform_queue_file_provider),
+        inbox,
+    )
 }
 
 fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {

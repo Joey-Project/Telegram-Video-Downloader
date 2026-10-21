@@ -1317,6 +1317,53 @@ impl QueueManager {
         Ok(())
     }
 
+    /// Return the already-open queue root after refreshing and verifying its registered
+    /// device/inode binding. Callers that open another store on this root must use this
+    /// descriptor instead of reopening `MediaLibrary::root` by pathname.
+    pub(crate) fn verified_video_library_root(&self, library_id: &str) -> Result<RootedFs> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let library = self
+            .registry_snapshot()?
+            .libraries
+            .into_iter()
+            .find(|library| library.id == library_id)
+            .ok_or_else(|| anyhow!("unknown media library {library_id}"))?;
+
+        self.refresh_video_library_unlocked(library.clone())?;
+        self.require_video_library_available(library_id)?;
+
+        let store = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .find(|registered| registered.library_id == library_id && registered.available)
+            .map(|registered| registered.store.clone())
+            .ok_or_else(|| anyhow!("media library {library_id} has no available queue store"))?;
+
+        self.validate_video_library_for_task_unlocked(&store, &library)
+            .with_context(|| format!("media library {library_id} root binding is unavailable"))?;
+        let binding = self
+            .media_libraries
+            .lock()
+            .map_err(poisoned_lock)?
+            .root_binding(library_id);
+        let identity = store.root.root_identity();
+        if binding != Some((identity.device(), identity.inode())) {
+            bail!("media library {library_id} root does not match its persisted queue identity");
+        }
+        if let Err(error) = store.root.validate_configured_root() {
+            // A replacement can occur after the coordinated refresh but before the caller uses
+            // this descriptor. Refresh once more so the public availability projection records
+            // the mismatch; the caller still receives the original verification failure.
+            self.refresh_video_library_unlocked(library)?;
+            return Err(error).context(format!(
+                "media library {library_id} root changed after queue identity validation"
+            ));
+        }
+        Ok(store.root.clone())
+    }
+
     fn refresh_video_library_unlocked(&self, library: MediaLibrary) -> Result<()> {
         let root = match coordinate_directory_root(self.pdf.file_provider.as_ref(), &library.root) {
             Ok(root) => root,

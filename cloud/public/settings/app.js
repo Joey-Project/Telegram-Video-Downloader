@@ -6,6 +6,7 @@ import { validateTargetRelativeDirectory } from "/file/target-directory.js";
 import { mediaLibraryAvailability, mediaLibraryEntries } from "/file/library-view.js";
 import { captureLibraryEditorFocus, libraryDraftFieldValue, reconcileLibraryDrafts, restoreLibraryEditorFocus, setLibraryDraftField } from "./library-drafts.js";
 import { takeRejectedSettingsActions } from "./local-action-rejections.js";
+import { timeAgoMilliseconds, timeAgoSeconds } from "./time-format.js";
 
 const API = "/api";
 const ACTION_QUEUE_KEY = "file-manager.actions.v1";
@@ -38,15 +39,6 @@ const formatTime = (value) => {
   const date = new Date(Number(value) * 1000);
   if (!Number.isFinite(date.getTime()) || date.getTime() <= 0) return "Not available";
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
-};
-const timeAgo = (value) => {
-  const timestamp = Number(value) * 1000;
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return "Not yet";
-  const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
-  if (seconds < 60) return "Just now";
-  if (seconds < 3_600) return `${Math.floor(seconds / 60)} min ago`;
-  if (seconds < 86_400) return `${Math.floor(seconds / 3_600)} hr ago`;
-  return `${Math.floor(seconds / 86_400)} days ago`;
 };
 const formatBytes = (value) => {
   const bytes = Number(value);
@@ -343,7 +335,7 @@ function renderSync() {
     : snapshot.stale ? "Showing the last saved settings" : "Settings are synced";
   byId("sync-detail").textContent = !synced
     ? "Applied settings appear here after the desktop app connects."
-    : `Last desktop contact ${timeAgo(snapshot.last_seen)}. New requests stay pending until local execution finishes.`;
+    : `Last desktop contact ${timeAgoMilliseconds(snapshot.last_seen)}. New requests stay pending until local execution finishes.`;
 }
 
 function libraryDescriptor(entry) {
@@ -439,8 +431,8 @@ function renderPending() {
     .filter((entry) => SETTINGS_KINDS.has(entry?.kind) && ["pending", "processing", "retryable"].includes(String(entry?.status)));
   const rows = [];
   for (const action of local) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(action.kind))}</h3><p>Saved in this browser retry queue. No local change has been applied.</p></div><span class="state-pill pending">Browser queue</span></div></article>`);
-  for (const request of pending) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(request.kind))}</h3><p>Saved in the cloud inbox. Waiting for the desktop; applied settings have not changed yet.</p></div><span class="state-pill pending">Waiting · #${escapeHtml(request.seq)}</span></div><p>Received ${escapeHtml(timeAgo(request.created_at))}</p></article>`);
-  for (const operation of inProgress) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(operation.kind))}</h3><p>${escapeHtml(operation.error ?? "The desktop received this request and is working on it.")}</p></div><span class="state-pill pending">${escapeHtml(statusLabel(operation.status))}</span></div>${operation.updated_at ? `<p>Updated ${escapeHtml(timeAgo(operation.updated_at))}</p>` : ""}</article>`);
+  for (const request of pending) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(request.kind))}</h3><p>Saved in the cloud inbox. Waiting for the desktop; applied settings have not changed yet.</p></div><span class="state-pill pending">Waiting · #${escapeHtml(request.seq)}</span></div><p>Received ${escapeHtml(timeAgoMilliseconds(request.created_at))}</p></article>`);
+  for (const operation of inProgress) rows.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(kindLabel(operation.kind))}</h3><p>${escapeHtml(operation.error ?? "The desktop received this request and is working on it.")}</p></div><span class="state-pill pending">${escapeHtml(statusLabel(operation.status))}</span></div>${operation.updated_at ? `<p>Updated ${escapeHtml(timeAgoSeconds(operation.updated_at))}</p>` : ""}</article>`);
   byId("waiting-list").innerHTML = rows.length
     ? rows.join("")
     : '<div class="empty-state"><div class="empty-art" aria-hidden="true">✓</div><h2>Nothing is waiting</h2><p>New library requests appear here until the desktop finishes them.</p></div>';
@@ -468,7 +460,7 @@ function renderOperations() {
       const label = kindLabel(entry.kind);
       const root = result.root ?? result.path;
       const detail = [message, root, result.name, result.default_category].filter(Boolean).join(" · ");
-      return `<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(label)}</h3><p>${escapeHtml(detail)}</p>${entry.error ? `<p class="warning-text">${escapeHtml(entry.error)}</p>` : ""}</div><span class="state-pill${isFailure ? " pending" : isCompleted ? "" : " pending"}">${escapeHtml(statusLabel(entry.status))}</span></div>${entry.updated_at ? `<p>Updated ${escapeHtml(timeAgo(entry.updated_at))}</p>` : ""}</article>`;
+      return `<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(label)}</h3><p>${escapeHtml(detail)}</p>${entry.error ? `<p class="warning-text">${escapeHtml(entry.error)}</p>` : ""}</div><span class="state-pill${isFailure ? " pending" : isCompleted ? "" : " pending"}">${escapeHtml(statusLabel(entry.status))}</span></div>${entry.updated_at ? `<p>Updated ${escapeHtml(timeAgoSeconds(entry.updated_at))}</p>` : ""}</article>`;
     }).join("")
     : '<div class="empty-state"><div class="empty-art" aria-hidden="true">◷</div><h2>No local settings receipts yet</h2><p>Completed and failed settings requests will appear here.</p></div>';
 }

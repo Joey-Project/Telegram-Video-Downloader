@@ -16,6 +16,10 @@ library/category. PDF destinations retain their existing independent configurati
 An explicitly empty category selects the library root; an omitted category uses that library's
 configured default. Removing a video registration that shares the PDF root retains PDF queue
 ownership until the process releases the PDF store.
+If an accepted download request has left the recent operation history, the File Mini App can
+offer an explicit control to clear its browser waiting notice. This does not establish the
+request's outcome, cancel the task, or submit it again. Check the Telegram queue before choosing
+to submit another request.
 
 The settings page distinguishes applied local settings from requests waiting for the desktop.
 An offline snapshot is a last known view, not evidence that a requested setting was applied.
@@ -90,6 +94,9 @@ A rejected refresh keeps the old preview usable and does not leave an orphan rep
 Migration preview and discovery validate each registered root's availability and saved directory
 identity before opening its metadata, including both endpoints. Replaced roots are rejected;
 ordinary child-entry changes remain supported.
+Registered cloud file and migration managers retain the verified queue root's open directory
+descriptor during metadata initialization. They do not reopen the pathname after validation,
+so a directory replacement cannot receive another library's recovery metadata.
 Starting a migration requires both endpoint IDs to resolve to registered libraries. Removing a
 previously selected target disables that preview's Start control.
 Polling and scope changes preserve a selected target while it remains registered and distinct

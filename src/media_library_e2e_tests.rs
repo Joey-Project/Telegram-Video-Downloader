@@ -490,6 +490,99 @@ async fn migration_preview_and_discovery_reject_replaced_registered_roots() {
     let _ = fs::remove_dir_all(&root);
 }
 
+#[tokio::test]
+async fn cloud_manager_open_rejects_root_replaced_after_queue_validation() {
+    let root = temp_cloud_bot_dir("cloud-manager-bound-root-race");
+    let video_root = root.join("videos");
+    let displaced_root = root.join("videos-original");
+    let replacement_root = root.join("videos-replacement");
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = video_root.clone();
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("configured roots should create");
+    let original_media = b"original media must remain on the registered inode";
+    let original_nfo = b"original sidecar metadata";
+    fs::write(video_root.join("clip.mp4"), original_media).expect("registered media should write");
+    fs::write(video_root.join("clip.nfo"), original_nfo).expect("registered sidecar should write");
+    let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&video_root).expect("cloud inbox should open on the stable root"),
+    );
+    let runtime = make_runtime(telegram, config, Arc::clone(&queue), Arc::clone(&inbox));
+
+    let baseline = open_cloud_library_manager(&runtime.bot, Arc::clone(&inbox), None)
+        .expect("manager should open on the registered root");
+    let snapshot = baseline
+        .migration_scan()
+        .expect("baseline scan should see registered media");
+    assert_eq!(snapshot.items.len(), 1);
+    drop(baseline);
+
+    let replacement_media = b"replacement media must not be touched";
+    let replacement_nfo = b"replacement sidecar must not be touched";
+    let opened =
+        open_cloud_library_manager_with_test_hook(&runtime.bot, Arc::clone(&inbox), None, || {
+            fs::rename(&video_root, &displaced_root)?;
+            fs::create_dir(&video_root)?;
+            fs::write(video_root.join("clip.mp4"), replacement_media)?;
+            fs::write(video_root.join("clip.nfo"), replacement_nfo)?;
+            Ok(())
+        });
+    assert!(
+        opened.is_err(),
+        "manager initialization must reject replacement after the queue returned its bound root"
+    );
+
+    for private_name in [
+        ".telegram-video-downloader-library",
+        ".telegram-video-downloader-queue",
+        ".telegram-video-downloader.lock",
+        ".telegram-video-downloader-staging",
+    ] {
+        assert!(
+            !video_root.join(private_name).exists(),
+            "replacement root must not receive {private_name}"
+        );
+    }
+    assert_eq!(
+        fs::read(video_root.join("clip.mp4")).unwrap(),
+        replacement_media
+    );
+    assert_eq!(
+        fs::read(video_root.join("clip.nfo")).unwrap(),
+        replacement_nfo
+    );
+    assert_eq!(
+        fs::read(displaced_root.join("clip.mp4")).unwrap(),
+        original_media
+    );
+    assert_eq!(
+        fs::read(displaced_root.join("clip.nfo")).unwrap(),
+        original_nfo
+    );
+
+    fs::rename(&video_root, &replacement_root).expect("replacement should move aside");
+    fs::rename(&displaced_root, &video_root).expect("registered directory object should restore");
+    fs::write(video_root.join("ordinary-child-churn.mp4"), b"new child")
+        .expect("same-root child churn should remain allowed");
+    let restored = open_cloud_library_manager(&runtime.bot, Arc::clone(&inbox), None)
+        .expect("manager should reopen after restoring the registered root object");
+    let snapshot = restored
+        .migration_scan()
+        .expect("restored root should scan after ordinary child churn");
+    assert_eq!(snapshot.items.len(), 2);
+
+    drop(restored);
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&root);
+}
+
 fn expire_migration_preview_for_test(video_root: &Path, preview_id: &str) -> PathBuf {
     let path = video_root
         .join(".telegram-video-downloader-library")
