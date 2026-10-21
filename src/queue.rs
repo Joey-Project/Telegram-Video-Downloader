@@ -1413,6 +1413,57 @@ impl QueueManager {
         Ok(store.root.clone())
     }
 
+    /// Verify the caller's displayed registration token before refreshing the root, then return
+    /// the already-open queue root only if the registered store is still available and bound to
+    /// the same persisted device/inode. The operation lock keeps the registration stable across
+    /// token validation, refresh, and handle selection; child entries and timestamps are not part
+    /// of the binding.
+    pub(crate) fn verified_video_library_root_with_binding(
+        &self,
+        library_id: &str,
+        expected_binding: &str,
+    ) -> Result<RootedFs> {
+        validate_library_root_binding_token(expected_binding)?;
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        self.require_video_library_root_binding_unlocked(library_id, expected_binding)?;
+
+        let library = self
+            .registry_snapshot()?
+            .libraries
+            .into_iter()
+            .find(|library| library.id == library_id)
+            .ok_or_else(|| anyhow!("unknown media library {library_id}"))?;
+
+        // The expected token is checked before this refresh can recover queue state or create an
+        // owner lock at the configured path.
+        self.refresh_video_library_unlocked(library)?;
+        self.require_video_library_available(library_id)?;
+        self.require_video_library_root_binding_unlocked(library_id, expected_binding)?;
+
+        let store = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .find(|registered| registered.library_id == library_id && registered.available)
+            .map(|registered| registered.store.clone())
+            .ok_or_else(|| anyhow!("media library {library_id} has no available queue store"))?;
+        let identity = store.root.root_identity();
+        let registry_identity = self
+            .media_libraries
+            .lock()
+            .map_err(poisoned_lock)?
+            .root_binding(library_id);
+        if registry_identity != Some((identity.device(), identity.inode())) {
+            bail!("media library {library_id} root does not match its persisted queue identity");
+        }
+        store
+            .root
+            .validate_configured_root()
+            .with_context(|| format!("media library {library_id} root identity changed"))?;
+        Ok(store.root)
+    }
+
     /// Verify both displayed registration tokens before refreshing either queue root, then
     /// return the two already-open roots only after each root still matches its persisted
     /// identity. Callers can initialize root-bound managers from these handles without looking

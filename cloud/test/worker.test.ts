@@ -1316,6 +1316,11 @@ async function ownerRequest(path: string, initData: string, options: RequestInit
     try {
       const action = JSON.parse(body) as Record<string, unknown>;
       if (typeof action.request_id === "string" && typeof action.kind === "string" && action.payload && typeof action.payload === "object") {
+        if (["file_preview", "legacy_import"].includes(action.kind)) {
+          const payload = action.payload as Record<string, unknown>;
+          if (!Object.prototype.hasOwnProperty.call(payload, "library_id")) payload.library_id = "library-test";
+          if (!Object.prototype.hasOwnProperty.call(payload, "root_binding")) payload.root_binding = TEST_ROOT_BINDING;
+        }
         if (!Object.prototype.hasOwnProperty.call(action, "queued_at_ms")
             && !Object.prototype.hasOwnProperty.call(action, "replay_expires_at_ms")) {
           const queuedAt = testActionReplayWindows.get(action.request_id) ?? Date.now();
@@ -1974,6 +1979,181 @@ describe("Mini App identity and actions", () => {
     expect(await testEnv.DB.prepare("SELECT seq FROM inbox WHERE dedup_key = ?").bind(`action:${requestId}`).first()).toBeNull();
     const after = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
     expect(after?.count).toBe(before?.count);
+  });
+
+  it("requires a valid displayed library binding for file previews and legacy imports before inbox writes", async () => {
+    const initData = await signInitData();
+    const queuedAt = Date.now();
+    const malformed = "v1:not-a-root-binding";
+    const cases = [
+      {
+        requestId: "00000000-0000-4000-8000-000000009320",
+        kind: "file_preview",
+        payload: { library_id: "library-test", item_ids: ["item-a"], target_relative_dir: "Films" },
+      },
+      {
+        requestId: "00000000-0000-4000-8000-000000009321",
+        kind: "file_preview",
+        payload: { library_id: "library-test", root_binding: malformed, item_ids: ["item-a"], target_relative_dir: "Films" },
+      },
+      {
+        requestId: "00000000-0000-4000-8000-000000009322",
+        kind: "legacy_import",
+        payload: { library_id: "library-test", text: "older links" },
+      },
+      {
+        requestId: "00000000-0000-4000-8000-000000009323",
+        kind: "legacy_import",
+        payload: { library_id: "library-test", root_binding: malformed, text: "older links" },
+      },
+    ];
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    const notifierIdsBefore = await listDurableObjectIds(testEnv.NOTIFIER);
+
+    for (const [index, testCase] of cases.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        headers: { "x-test-exact-action-body": "true" },
+        body: JSON.stringify({
+          request_id: testCase.requestId,
+          kind: testCase.kind,
+          payload: testCase.payload,
+          queued_at_ms: queuedAt + index,
+          replay_expires_at_ms: queuedAt + index + ACTION_REPLAY_WINDOW_MS,
+        }),
+      });
+      expect(response.status, testCase.requestId).toBe(400);
+      expect(await responseJson<{ error: string }>(response)).toMatchObject({
+        error: "root_binding must be an opaque root identity token",
+      });
+    }
+
+    const afterInvalid = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(afterInvalid?.count).toBe(before?.count);
+    expect(await listDurableObjectIds(testEnv.NOTIFIER)).toEqual(notifierIdsBefore);
+
+    const validActions = [
+      {
+        request_id: "00000000-0000-4000-8000-000000009324",
+        kind: "file_preview",
+        payload: { library_id: "library-test", root_binding: TEST_ROOT_BINDING, item_ids: ["item-a"], target_relative_dir: "Films" },
+      },
+      {
+        request_id: "00000000-0000-4000-8000-000000009325",
+        kind: "legacy_import",
+        payload: { library_id: "library-test", root_binding: TEST_ROOT_BINDING, text: "older links" },
+      },
+    ];
+    for (const [index, action] of validActions.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        headers: { "x-test-exact-action-body": "true" },
+        body: JSON.stringify({
+          ...action,
+          queued_at_ms: queuedAt + cases.length + index,
+          replay_expires_at_ms: queuedAt + cases.length + index + ACTION_REPLAY_WINDOW_MS,
+        }),
+      });
+      expect(response.status, action.kind).toBe(202);
+    }
+
+    const afterValid = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(afterValid?.count).toBe((before?.count ?? 0) + validActions.length);
+    const backlog = await responseJson<{ requests: Array<{ kind: string; payload: Record<string, unknown> }> }>(await localRequests());
+    for (const action of validActions) {
+      const stored = backlog.requests.find((request) => request.kind === action.kind && request.payload.library_id === "library-test");
+      expect(stored?.payload.root_binding).toBe(TEST_ROOT_BINDING);
+    }
+  });
+
+  it("requires a valid displayed library binding for file previews and legacy imports before inbox writes", async () => {
+    const initData = await signInitData();
+    const queuedAt = Date.now();
+    const malformed = "v1:not-a-root-binding";
+    const cases: Array<{
+      requestId: string;
+      kind: "file_preview" | "legacy_import";
+      payload: Record<string, unknown>;
+    }> = [
+      {
+        requestId: "00000000-0000-4000-8000-000000009320",
+        kind: "file_preview",
+        payload: { library_id: "library-test", item_ids: ["item-a"], target_relative_dir: "Films" },
+      },
+      {
+        requestId: "00000000-0000-4000-8000-000000009321",
+        kind: "file_preview",
+        payload: { library_id: "library-test", root_binding: malformed, item_ids: ["item-a"], target_relative_dir: "Films" },
+      },
+      {
+        requestId: "00000000-0000-4000-8000-000000009322",
+        kind: "legacy_import",
+        payload: { library_id: "library-test", text: "older links" },
+      },
+      {
+        requestId: "00000000-0000-4000-8000-000000009323",
+        kind: "legacy_import",
+        payload: { library_id: "library-test", root_binding: malformed, text: "older links" },
+      },
+    ];
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    const notifierIdsBefore = await listDurableObjectIds(testEnv.NOTIFIER);
+
+    for (const [index, testCase] of cases.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        headers: { "x-test-exact-action-body": "true" },
+        body: JSON.stringify({
+          request_id: testCase.requestId,
+          kind: testCase.kind,
+          payload: testCase.payload,
+          queued_at_ms: queuedAt + index,
+          replay_expires_at_ms: queuedAt + index + ACTION_REPLAY_WINDOW_MS,
+        }),
+      });
+      expect(response.status, testCase.requestId).toBe(400);
+      expect(await responseJson<{ error: string }>(response)).toMatchObject({
+        error: "root_binding must be an opaque root identity token",
+      });
+    }
+
+    const afterInvalid = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(afterInvalid?.count).toBe(before?.count);
+    expect(await listDurableObjectIds(testEnv.NOTIFIER)).toEqual(notifierIdsBefore);
+
+    const validActions = [
+      {
+        request_id: "00000000-0000-4000-8000-000000009324",
+        kind: "file_preview",
+        payload: { library_id: "library-test", root_binding: TEST_ROOT_BINDING, item_ids: ["item-a"], target_relative_dir: "Films" },
+      },
+      {
+        request_id: "00000000-0000-4000-8000-000000009325",
+        kind: "legacy_import",
+        payload: { library_id: "library-test", root_binding: TEST_ROOT_BINDING, text: "older links" },
+      },
+    ];
+    for (const [index, action] of validActions.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        headers: { "x-test-exact-action-body": "true" },
+        body: JSON.stringify({
+          ...action,
+          queued_at_ms: queuedAt + cases.length + index,
+          replay_expires_at_ms: queuedAt + cases.length + index + ACTION_REPLAY_WINDOW_MS,
+        }),
+      });
+      expect(response.status, action.kind).toBe(202);
+    }
+
+    const afterValid = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(afterValid?.count).toBe((before?.count ?? 0) + validActions.length);
+    for (const action of validActions) {
+      const stored = await testEnv.DB.prepare("SELECT kind, payload_json FROM inbox WHERE dedup_key = ?")
+        .bind(`action:${action.request_id}`).first<{ kind: string; payload_json: string }>();
+      expect(stored?.kind).toBe(action.kind);
+      expect(JSON.parse(stored?.payload_json ?? "null")).toMatchObject(action.payload);
+    }
   });
 
   it("rejects malformed replay windows before D1 writes", async () => {

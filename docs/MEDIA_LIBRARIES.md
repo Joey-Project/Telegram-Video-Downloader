@@ -75,6 +75,18 @@ Cached items stay visible but read-only until a successful scan. Refresh and lib
 remain available so the user can recover or inspect another library.
 Compacted file previews retain their original library ID, including reload-required placeholders.
 Explicit malformed IDs are omitted rather than assigned to the currently selected library.
+Move and metadata-edit preview requests also retain the registration binding displayed when
+the user submitted them. The desktop checks that binding before scanning or opening library
+metadata. The resulting preview keeps the original binding through restart, cloud compaction
+and confirmation. Removing and registering a library at the same path invalidates an older
+request or preview, even if restored files have the same item IDs. Missing, malformed or stale
+bindings require a fresh preview from the current library view.
+Legacy-import requests and their metadata-edit suggestions retain the same original binding.
+An older unbound import result cannot supply an editable draft for a replacement registration;
+request fresh suggestions from the current library view first.
+If polling detects a changed registration for the selected library, the page clears its selected
+media, open detail and metadata-mapping draft. Ordinary updates to the same registration retain
+those choices.
 The media total remains the full reported count when the cloud retains only part of an item list;
 the page discloses that filters and pagination apply to the retained rows.
 The `/file` and `/settings` pages keep locally queued actions with their originating surface,

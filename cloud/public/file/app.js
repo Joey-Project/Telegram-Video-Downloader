@@ -19,6 +19,7 @@ import { inspectDownloadSubmissionHistory, releaseDownloadSubmissionTracking } f
 import { dismissUnknownFileAction, isUnknownDeliveryAction, markUnknownFileAction, unknownFileActionForKind } from "./delivery-outcome.js";
 import { buildDownloadSubmitPayload, isBoundDownloadLibraryOption } from "./download-submit.js";
 import { createFileQueuedAction, fileActionRequestBody } from "./file-action-dispatch.js";
+import { buildFilePreviewPayloadFromRenderedOption, buildLegacyMetadataPreviewPayloadFromRenderedOption, buildSelectedFilePreviewPayloadFromRenderedOption, clearFileIdentityScopedStateOnSnapshot, fileOperationIdentityMatches, fileOperationLibraryIdentity } from "./file-preview-identity.js";
 
 const API = "/api";
 const CACHE_KEY = "file-manager.snapshot.v1";
@@ -68,6 +69,17 @@ const snapshotValue = () => state.snapshot ?? { synced: false, stale: true, libr
 
 function libraryCanOperate(libraryId = activeLibraryId()) {
   return canOperateOnRegisteredMediaLibrary(state.snapshot, libraryId);
+}
+
+function filePreviewPayload(fields, expectedIdentity = null) {
+  const libraryOption = byId("library-select")?.selectedOptions?.[0];
+  if (libraryOption?.value !== activeLibraryId()) return null;
+  return buildFilePreviewPayloadFromRenderedOption({
+    ownerSnapshot: state.snapshot,
+    libraryOption,
+    expectedIdentity,
+    fields,
+  });
 }
 
 function migrationLibraryId(operation, result, field) {
@@ -290,6 +302,7 @@ function showPrivateAccessGate(message) {
 }
 
 function acceptFreshSnapshot(snapshot) {
+  clearFileIdentityScopedStateOnSnapshot(state, state.snapshot, snapshot);
   Object.assign(state, acceptOwnerSnapshot(snapshot, state));
   settleMigrationConflictRefreshes();
   normalizeLibraryContext();
@@ -596,9 +609,16 @@ async function submitAction(kind, payload, { onQueued } = {}) {
     renderDownloadStatus();
     return false;
   }
+  if (["file_preview", "legacy_import"].includes(kind)) {
+    const libraryId = String(payload?.library_id ?? "");
+    if (!fileOperationIdentityMatches(state.snapshot, { result: payload }, libraryId)) {
+      showToast("This action does not match a verified library registration. Refresh the library and create a new preview or import.");
+      return false;
+    }
+  }
   const unavailableLibraryAction = (() => {
     if (["file_preview", "legacy_import"].includes(kind)) {
-      return !libraryCanOperate(String(payload?.library_id ?? activeLibraryId()));
+      return !libraryCanOperate(String(payload?.library_id ?? ""));
     }
     if (kind === "download_submit") return !libraryCanOperate(String(payload?.library_id ?? ""));
     if (kind === "library_migration_preview") {
@@ -607,7 +627,9 @@ async function submitAction(kind, payload, { onQueued } = {}) {
     }
     if (kind === "file_confirm") {
       const preview = previews().find((entry) => entry.id === payload?.preview_id);
-      return preview ? !libraryCanOperate(String(preview.library_id || activeLibraryId())) : false;
+      const libraryId = String(payload?.library_id ?? "");
+      return !preview || !fileOperationIdentityMatches(state.snapshot, preview, libraryId)
+        || !libraryCanOperate(libraryId);
     }
     if (kind === "library_migration_confirm") {
       const preview = migrationPreviewEntries().find((entry) => entry.id === payload?.preview_id);
@@ -887,8 +909,9 @@ function renderWaiting() {
 }
 
 function operationPreview(operation) {
-  if (operation?.preview && typeof operation.preview === "object") return { id: operation.preview_id ?? operation.preview.id, revision: operation.revision ?? operation.preview.revision, preview: operation.preview, status: operation.status, library_id: operationLibraryId(operation) };
-  if (operation?.result?.preview && typeof operation.result.preview === "object") return { id: operation.preview_id ?? operation.result.preview_id ?? operation.result.preview.id, revision: operation.revision ?? operation.result.revision ?? operation.result.preview.revision, preview: operation.result.preview, status: operation.status, library_id: operationLibraryId(operation) };
+  const identity = fileOperationLibraryIdentity(operation);
+  if (operation?.preview && typeof operation.preview === "object") return { id: operation.preview_id ?? operation.preview.id, revision: operation.revision ?? operation.preview.revision, preview: operation.preview, status: operation.status, ...(identity ?? {}) };
+  if (operation?.result?.preview && typeof operation.result.preview === "object") return { id: operation.preview_id ?? operation.result.preview_id ?? operation.result.preview.id, revision: operation.revision ?? operation.result.revision ?? operation.result.preview.revision, preview: operation.result.preview, status: operation.status, ...(identity ?? {}) };
   return null;
 }
 
@@ -906,7 +929,7 @@ function previews() {
       reload_required: preview.reload_required === true,
       reason: preview.reason,
       status: preview.status,
-      library_id: preview.library_id ?? preview.source_library_id ?? "",
+      ...(fileOperationLibraryIdentity(preview) ?? {}),
     });
   }
   for (const operation of Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []) {
@@ -917,7 +940,7 @@ function previews() {
   for (const value of collected) {
     if (value.id && value.revision) unique.set(`${value.id}:${value.revision}`, value);
   }
-  return [...unique.values()].reverse().filter((entry) => operationMatchesLibrary(entry, activeLibraryId()));
+  return [...unique.values()].reverse().filter((entry) => !entry.library_id || entry.library_id === activeLibraryId());
 }
 
 function describePreview(preview) {
@@ -1085,11 +1108,14 @@ function renderPreviews() {
       const reason = entry.reason || "Preview details were omitted from the saved snapshot. Request a fresh preview before confirming.";
       return `<article class="stack-card"><div class="stack-card-head"><div><h3>Preview needs to be regenerated</h3><p>${escapeHtml(reason)}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
     }
+    if (!fileOperationIdentityMatches(state.snapshot, entry, entry.library_id ?? "")) {
+      return `<article class="stack-card"><div class="stack-card-head"><div><h3>Preview needs refreshing</h3><p>This saved preview does not have a verified identity for the current library registration. No changes were applied; request a fresh preview before confirming.</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+    }
     const preview = entry.preview;
     const hasMetadataChanges = hasMetadataPreviewChanges(preview);
     const hasMoveItems = Array.isArray(preview.items) && preview.items.length > 0;
     const title = hasMetadataChanges && hasMoveItems ? "Move and update metadata" : hasMetadataChanges ? "Update metadata" : "Move files";
-    const libraryId = entry.library_id || activeLibraryId();
+    const libraryId = typeof entry.library_id === "string" ? entry.library_id : "";
     const canConfirm = libraryCanOperate(libraryId);
     const offlineMessage = canConfirm ? "" : `<p class="field-hint">This library is offline or showing a saved scan. Reconnect it and refresh before confirming.</p>`;
     return `<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(preview.target_relative_dir ?? "Metadata only · file locations stay the same")} · Conflict: ${escapeHtml(preview.conflict ?? "skip")}</p>${offlineMessage}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${describePreview(preview)}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}" data-library-id="${escapeHtml(libraryId)}" ${canConfirm ? "" : "disabled"}>Confirm changes</button></div></article>`;
@@ -1116,6 +1142,18 @@ function renderLegacyMappings() {
     state.legacyPage = 0;
     container.classList.remove("hidden");
     container.innerHTML = `<p class="warning-text">${escapeHtml(detailsWarning || `The latest legacy import is ${statusText(latest.status)}.${failure} A completed, complete import report is required before mapping hints.`)}</p>`;
+    state.manualPickerKey = null;
+    state.manualPickerQuery = "";
+    return;
+  }
+  const importIdentity = fileOperationLibraryIdentity(operation);
+  if (!importIdentity || importIdentity.library_id !== activeLibraryId()
+      || !fileOperationIdentityMatches(state.snapshot, operation, activeLibraryId())) {
+    state.legacyOperation = null;
+    state.legacyOperationKey = null;
+    state.legacyPage = 0;
+    container.classList.remove("hidden");
+    container.innerHTML = `<p class="warning-text">This legacy import has no verified identity for the current library registration. Submit a fresh import before mapping metadata.</p>`;
     state.manualPickerKey = null;
     state.manualPickerQuery = "";
     return;
@@ -1177,7 +1215,7 @@ function renderLegacyMappings() {
   const pagination = page.pageCount > 1 ? `<div class="mapping-pagination" aria-label="Legacy mapping pages">${previousPage}<span>Page ${page.page + 1} of ${page.pageCount}</span>${nextPage}</div>` : "";
   const newerImportNotice = importSelection.latest !== operation ? `<p class="warning-text">A newer legacy import did not save a complete successful report. Showing the latest completed import; see request history for the newer result.</p>` : "";
   const emptyMessage = hints.length === 0 ? `<p class="field-hint">No hints or possible media matches were found.</p>` : "";
-  container.innerHTML = `<p class="mapping-title">Choose a video for each legacy hint</p>${newerImportNotice}${warnings.length ? `<p class="warning-text">${warnings.map(escapeHtml).join(" · ")}</p>` : ""}<p class="field-hint">${displayedRange}</p>${rows.length ? rows.join("") : emptyMessage}${pagination}<div class="mapping-actions"><button id="preview-metadata" class="primary-button" type="button" ${choices.length && libraryCanOperate() ? "" : "disabled"}>Preview selected updates <span aria-hidden="true">→</span></button></div>`;
+  container.innerHTML = `<p class="mapping-title">Choose a video for each legacy hint</p>${newerImportNotice}${warnings.length ? `<p class="warning-text">${warnings.map(escapeHtml).join(" · ")}</p>` : ""}<p class="field-hint">${displayedRange}</p>${rows.length ? rows.join("") : emptyMessage}${pagination}<div class="mapping-actions"><button id="preview-metadata" class="primary-button" type="button" ${choices.length && importIdentity && fileOperationIdentityMatches(state.snapshot, operation, activeLibraryId()) && libraryCanOperate() ? "" : "disabled"}>Preview selected updates <span aria-hidden="true">→</span></button></div>`;
   for (const key of state.legacySelection.keys()) if (!validKeys.has(key)) state.legacySelection.delete(key);
 }
 
@@ -1343,6 +1381,11 @@ function render() {
 function previewSelectedLegacy() {
   const operation = state.legacyOperation;
   if (!operation) return;
+  const importIdentity = fileOperationLibraryIdentity(operation);
+  if (!importIdentity || importIdentity.library_id !== activeLibraryId()
+      || !fileOperationIdentityMatches(state.snapshot, operation, activeLibraryId())) {
+    return showToast("This legacy import no longer matches the displayed library registration. Refresh the library and submit a fresh import.");
+  }
   const choices = buildLegacyMappingChoices(
     state.legacyOperationKey,
     operation.result.hints,
@@ -1367,7 +1410,14 @@ function previewSelectedLegacy() {
     "empty-fields": "Choose at least one metadata field to apply.",
   };
   if (result.error) return showToast(messages[result.error] ?? "Review the selected legacy mappings.");
-  submitAction("file_preview", { library_id: activeLibraryId(), metadata_patches: result.patches, rename: false, conflict: "skip" });
+  const payload = buildLegacyMetadataPreviewPayloadFromRenderedOption({
+    ownerSnapshot: state.snapshot,
+    libraryOption: byId("library-select")?.selectedOptions?.[0],
+    importOperation: operation,
+    fields: { metadata_patches: result.patches, rename: false, conflict: "skip" },
+  });
+  if (!payload) return showToast("The displayed library registration changed. Refresh and submit a fresh import before previewing metadata.");
+  submitAction("file_preview", payload);
 }
 
 function selectVisible() {
@@ -1500,17 +1550,27 @@ function bindEvents() {
     if (state.selected.size > MAX_SELECTED_ITEMS) return showToast(`Choose at most ${MAX_SELECTED_ITEMS} videos per request.`);
     const { directory, error } = validateTargetRelativeDirectory(byId("target-dir").value);
     if (error) return showToast(error);
-    submitAction("file_preview", { library_id: activeLibraryId(), item_ids: [...state.selected], target_relative_dir: directory, rename: byId("rename-toggle").checked, conflict: byId("conflict-select").value });
+    const libraryOption = byId("library-select")?.selectedOptions?.[0];
+    const payload = buildSelectedFilePreviewPayloadFromRenderedOption({
+      state,
+      ownerSnapshot: state.snapshot,
+      libraryOption,
+      fields: { target_relative_dir: directory, rename: byId("rename-toggle").checked, conflict: byId("conflict-select").value },
+    });
+    if (!payload) return showToast("The displayed library identity is unavailable or changed. Refresh the page before previewing file changes.");
+    submitAction("file_preview", payload);
   });
   byId("legacy-text").addEventListener("input", (event) => { byId("legacy-size").textContent = `${new TextEncoder().encode(event.target.value).byteLength.toLocaleString()} / 256 KB`; });
   byId("import-legacy").addEventListener("click", async () => {
     if (!libraryCanOperate()) return showToast("This library is offline or showing a saved scan. Reconnect it before importing metadata.");
+    const importIdentityPayload = filePreviewPayload({});
+    if (!importIdentityPayload) return showToast("The displayed library identity is unavailable or changed. Refresh the page before importing metadata.");
     let text = byId("legacy-text").value;
     const fileInput = byId("legacy-file");
     if (!text && fileInput?.files?.[0]) {
       return submitLegacyFileImport(
         fileInput.files[0],
-        (value) => submitAction("legacy_import", { text: value, library_id: activeLibraryId() }),
+        (value) => submitAction("legacy_import", { text: value, library_id: importIdentityPayload.library_id, root_binding: importIdentityPayload.root_binding }),
         showToast,
         MAX_LEGACY_BYTES,
       );
@@ -1518,7 +1578,7 @@ function bindEvents() {
     const bytes = new TextEncoder().encode(text).byteLength;
     if (bytes === 0) return showToast("Paste legacy text or choose a text file first.");
     if (bytes > MAX_LEGACY_BYTES) return showToast("Legacy text exceeds the 256 KB limit.");
-    submitAction("legacy_import", { text, library_id: activeLibraryId() });
+    submitAction("legacy_import", { text, library_id: importIdentityPayload.library_id, root_binding: importIdentityPayload.root_binding });
   });
   byId("legacy-text").addEventListener("paste", async (event) => {
     if (byId("legacy-text").value) return;
@@ -1782,13 +1842,17 @@ function bindEvents() {
     if (details) { state.detailId = details.dataset.details; renderDetail(); return; }
     const confirm = event.target.closest("[data-confirm]");
     if (confirm) {
-      if (!libraryCanOperate(confirm.dataset.libraryId || activeLibraryId())) {
+      if (!libraryCanOperate(confirm.dataset.libraryId || "")) {
         showToast("This library is offline or showing a saved scan. Reconnect it and refresh before confirming.");
         return;
       }
       const matchingPreview = previews().find((entry) => entry.id === confirm.dataset.confirm && entry.revision === confirm.dataset.revision);
       if (!matchingPreview || isIncompletePreview(matchingPreview)) {
         showToast("This preview is incomplete. Request a fresh preview before confirming.");
+        return;
+      }
+      if (!fileOperationIdentityMatches(state.snapshot, matchingPreview, confirm.dataset.libraryId || "")) {
+        showToast("This preview no longer matches the library registration. Request a fresh preview before confirming.");
         return;
       }
       confirm.disabled = true;

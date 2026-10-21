@@ -232,8 +232,10 @@ pub(super) async fn unconfirmable_previews(
     runtime: &CloudBotRuntime,
     records: &[InboxRecord],
 ) -> (HashSet<u64>, bool) {
-    let mut file_previews = BTreeMap::<Option<String>, Vec<(String, String, u64)>>::new();
+    let mut file_previews =
+        BTreeMap::<(Option<String>, Option<String>), Vec<(String, String, u64)>>::new();
     let mut migration_previews = BTreeMap::<String, Vec<(String, String, u64)>>::new();
+    let mut unconfirmable_sequences = HashSet::new();
     let mut failed = false;
     for record in records {
         if record.status != InboxStatus::AwaitingConfirmation {
@@ -242,17 +244,40 @@ pub(super) async fn unconfirmable_previews(
         match record.request.kind.as_str() {
             "file_preview" => {
                 if let Some((preview_id, revision)) = cloud_preview_identity(record) {
-                    let library_id = record
+                    let request_library_id = record
+                        .request
+                        .payload
+                        .get("library_id")
+                        .and_then(Value::as_str);
+                    let result_library_id = record
                         .result
                         .as_ref()
-                        .and_then(|result| result["library_id"].as_str())
-                        .or_else(|| record.request.payload["library_id"].as_str())
-                        .map(str::to_string);
-                    file_previews.entry(library_id).or_default().push((
-                        preview_id,
-                        revision,
-                        record.request.seq,
-                    ));
+                        .and_then(|result| result.get("library_id"))
+                        .and_then(Value::as_str);
+                    let request_root_binding = record
+                        .request
+                        .payload
+                        .get("root_binding")
+                        .and_then(Value::as_str);
+                    let result_root_binding = record
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("root_binding"))
+                        .and_then(Value::as_str);
+                    let library_id = request_library_id
+                        .zip(result_library_id)
+                        .filter(|(request, result)| request == result)
+                        .map(|(library_id, _)| library_id.to_string());
+                    let root_binding = request_root_binding
+                        .zip(result_root_binding)
+                        .filter(|(request, result)| request == result)
+                        .map(|(binding, _)| binding.to_string());
+                    file_previews
+                        .entry((library_id, root_binding))
+                        .or_default()
+                        .push((preview_id, revision, record.request.seq));
+                } else {
+                    unconfirmable_sequences.insert(record.request.seq);
                 }
             }
             "library_migration_preview" => {
@@ -287,22 +312,36 @@ pub(super) async fn unconfirmable_previews(
         }
     }
 
-    let mut unconfirmable_sequences = HashSet::new();
-    for (library_id, entries) in file_previews {
-        let library_id = library_id
-            .map(Ok)
-            .unwrap_or_else(|| original_library_id(runtime));
-        let scoped = library_id
-            .and_then(|id| scoped_runtime(runtime, Some(&id)).map(|(runtime, _)| runtime));
+    for ((library_id, root_binding), entries) in file_previews {
+        let (Some(library_id), Some(root_binding)) = (library_id, root_binding) else {
+            unconfirmable_sequences.extend(entries.iter().map(|(_, _, seq)| *seq));
+            continue;
+        };
+        match runtime.bot.queue.registry_snapshot() {
+            Ok(registry) => {
+                let matches_registered_binding = registry
+                    .libraries
+                    .iter()
+                    .find(|library| library.id == library_id)
+                    .and_then(|library| library.root_binding_token())
+                    .is_some_and(|registered| registered == root_binding);
+                if !matches_registered_binding {
+                    unconfirmable_sequences.extend(entries.iter().map(|(_, _, seq)| *seq));
+                    continue;
+                }
+            }
+            Err(error) => {
+                failed = true;
+                warn!(error = %redact_sensitive_text(&format!("{error:#}")), "could not read the registry while verifying file preview bindings");
+                continue;
+            }
+        }
         let keys = entries
             .iter()
             .map(|(preview_id, revision, _)| (preview_id.clone(), revision.clone()))
             .collect::<Vec<_>>();
-        let result = match scoped {
-            Ok(scoped) => cloud_unconfirmable_preview_ids(&scoped, &keys).await,
-            Err(error) => Err(error),
-        };
-        match result {
+        match cloud_unconfirmable_file_preview_ids(runtime, &library_id, &root_binding, &keys).await
+        {
             Ok(ids) => {
                 for (preview_id, _, seq) in entries {
                     if ids.contains(&preview_id) {

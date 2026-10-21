@@ -348,7 +348,7 @@ function parseLibraryName(value: unknown, field = "name"): string {
 }
 
 function parsePreviewPayload(value: unknown): FilePreviewPayload {
-  if (!isRecord(value) || !onlyKeys(value, ["library_id", "item_ids", "target_relative_dir", "rename", "conflict", "metadata_patches"])) {
+  if (!isRecord(value) || !onlyKeys(value, ["library_id", "root_binding", "item_ids", "target_relative_dir", "rename", "conflict", "metadata_patches"])) {
     throw new HttpError(400, "file_preview payload has an invalid shape");
   }
 
@@ -394,7 +394,7 @@ function parsePreviewPayload(value: unknown): FilePreviewPayload {
   }
 
   return {
-    ...parseOptionalLibraryId(value.library_id),
+    ...parseBoundLibraryMutationIdentity(value),
     ...(itemIds === undefined ? {} : { item_ids: itemIds }),
     ...(targetRelativeDir === undefined ? {} : { target_relative_dir: targetRelativeDir }),
     rename,
@@ -738,9 +738,9 @@ export function validateActionRequest(value: unknown): ActionRequest {
       };
       break;
     case "legacy_import": {
-      if (!onlyKeys(value.payload, ["text", "library_id"])) throw new HttpError(400, "legacy_import payload has an invalid shape");
+      if (!onlyKeys(value.payload, ["text", "library_id", "root_binding"])) throw new HttpError(400, "legacy_import payload has an invalid shape");
       const text = boundedLegacyText(value.payload.text);
-      payload = { text, ...parseOptionalLibraryId(value.payload.library_id) };
+      payload = { text, ...parseBoundLibraryMutationIdentity(value.payload) };
       break;
     }
     case "download_submit":

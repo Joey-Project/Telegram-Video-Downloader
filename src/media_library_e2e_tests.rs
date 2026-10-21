@@ -64,6 +64,31 @@ fn library_root_binding(queue: &QueueManager, library_id: &str) -> String {
         .expect("registered library should have a bound root token")
 }
 
+async fn scan_file_item_id(
+    runtime: &CloudBotRuntime,
+    seq: u64,
+    library_id: &str,
+    relative_path: &str,
+) -> String {
+    let scan = run_library_management_test_request(
+        runtime,
+        seq,
+        "library_scan",
+        serde_json::json!({ "library_id": library_id }),
+    )
+    .await;
+    assert_eq!(scan.status, InboxStatus::Completed, "{:?}", scan.error);
+    scan.result.expect("library scan should return a snapshot")["items"]
+        .as_array()
+        .expect("library snapshot should include items")
+        .iter()
+        .find(|item| item["relative_path"] == relative_path)
+        .expect("requested media should appear in the library snapshot")["id"]
+        .as_str()
+        .expect("library item should have a stable identifier")
+        .to_string()
+}
+
 fn snapshot_library_metadata_tree(
     root: &Path,
 ) -> std::collections::BTreeMap<PathBuf, (bool, Vec<u8>)> {
@@ -4630,6 +4655,614 @@ async fn stale_settings_bindings_cannot_mutate_a_reregistered_same_root() {
     drop(runtime);
     drop(inbox);
     drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[tokio::test]
+async fn file_preview_requires_current_registration_binding_and_confirms_saved_binding_after_restart()
+ {
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "file-preview-same-root-binding",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let media = fixture.archive_root.join("clip.mp4");
+    let nfo = fixture.archive_root.join("clip.nfo");
+    let original_media = b"same-root registration media";
+    let original_nfo = b"<movie><title>Original title</title></movie>";
+    fs::write(&media, original_media).expect("source media should write");
+    fs::write(&nfo, original_nfo).expect("source NFO should write");
+    let first_root_identity = crate::safe_fs::RootedFs::new(&fixture.archive_root)
+        .expect("first registration root should open")
+        .root_identity();
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+
+    let first_binding = library_root_binding(&queue, &fixture.target_library_id);
+    let first_item_id =
+        scan_file_item_id(&runtime, 32_001, &fixture.target_library_id, "clip.mp4").await;
+    let removed_first = run_library_management_test_request(
+        &runtime,
+        32_002,
+        "library_remove",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": first_binding,
+        }),
+    )
+    .await;
+    assert_eq!(
+        removed_first.status,
+        InboxStatus::Completed,
+        "{:?}",
+        removed_first.error
+    );
+
+    let manager_metadata = fixture
+        .archive_root
+        .join(".telegram-video-downloader-library");
+    if manager_metadata.exists() {
+        fs::remove_dir_all(&manager_metadata)
+            .expect("A's manager metadata should be absent before B's stale previews");
+    }
+    let registered_second = run_library_management_test_request(
+        &runtime,
+        32_003,
+        "library_register",
+        serde_json::json!({
+            "name": "Archive B",
+            "path": fixture.archive_root,
+            "set_default": false,
+            "create_directory": false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        registered_second.status,
+        InboxStatus::Completed,
+        "{:?}",
+        registered_second.error
+    );
+    let registered_b = queue
+        .registry_snapshot()
+        .expect("B registration should be readable")
+        .libraries
+        .into_iter()
+        .find(|library| library.id == fixture.target_library_id)
+        .expect("B should reuse the path-derived ID");
+    let second_binding = registered_b
+        .root_binding_token()
+        .expect("B should expose a registration token");
+    assert_ne!(
+        second_binding, first_binding,
+        "unregistering and registering the same directory creates a new binding"
+    );
+    assert_eq!(
+        first_root_identity,
+        crate::safe_fs::RootedFs::new(&fixture.archive_root)
+            .expect("same directory object should still open")
+            .root_identity(),
+        "A and B use the same directory object"
+    );
+
+    let stale_move = run_library_management_test_request(
+        &runtime,
+        32_004,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": first_binding,
+            "item_ids": [first_item_id],
+            "target_relative_dir": "stale-move",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(stale_move.status, InboxStatus::Failed);
+    assert!(
+        stale_move
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("library root identity changed"))
+    );
+    let stale_patch = run_library_management_test_request(
+        &runtime,
+        32_005,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": first_binding,
+            "item_ids": [first_item_id],
+            "metadata_patches": [{ "item_id": first_item_id, "title": "Stale title" }],
+        }),
+    )
+    .await;
+    assert_eq!(stale_patch.status, InboxStatus::Failed);
+    assert!(
+        stale_patch
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("library root identity changed"))
+    );
+    for (seq, payload) in [
+        (
+            32_006,
+            serde_json::json!({
+                "library_id": fixture.target_library_id,
+                "item_ids": [first_item_id],
+                "target_relative_dir": "missing-binding",
+            }),
+        ),
+        (
+            32_007,
+            serde_json::json!({
+                "library_id": fixture.target_library_id,
+                "root_binding": "v1:not-a-token",
+                "item_ids": [first_item_id],
+                "metadata_patches": [{ "item_id": first_item_id, "title": "Invalid binding" }],
+            }),
+        ),
+    ] {
+        let invalid =
+            run_library_management_test_request(&runtime, seq, "file_preview", payload).await;
+        assert_eq!(invalid.status, InboxStatus::Failed);
+        assert!(
+            invalid
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("root_binding"))
+        );
+    }
+    assert!(
+        !manager_metadata.exists(),
+        "stale and invalid previews must reject before manager initialization"
+    );
+    assert_eq!(
+        snapshot_library_metadata_tree(&fixture.archive_root),
+        std::collections::BTreeMap::new()
+    );
+    assert_eq!(fs::read(&media).unwrap(), original_media);
+    assert_eq!(fs::read(&nfo).unwrap(), original_nfo);
+    assert!(!fixture.archive_root.join("stale-move/clip.mp4").exists());
+
+    let child = fixture.archive_root.join("ordinary-child");
+    fs::create_dir(&child).expect("ordinary child should create");
+    fs::remove_dir(&child).expect("ordinary child should remove");
+    assert_eq!(
+        library_root_binding(&queue, &fixture.target_library_id),
+        second_binding
+    );
+    let second_item_id =
+        scan_file_item_id(&runtime, 32_008, &fixture.target_library_id, "clip.mp4").await;
+    assert_eq!(
+        second_item_id, first_item_id,
+        "the same media keeps its stable item ID"
+    );
+    let valid_preview = run_library_management_test_request(
+        &runtime,
+        32_009,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": second_binding,
+            "item_ids": [second_item_id],
+            "metadata_patches": [{ "item_id": second_item_id, "title": "Verified B title" }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        valid_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        valid_preview.error
+    );
+    let valid_result = valid_preview.result.expect("B preview should be durable");
+    assert_eq!(valid_result["library_id"], fixture.target_library_id);
+    assert_eq!(valid_result["root_binding"], second_binding);
+    let preview_id = valid_result["preview_id"].as_str().unwrap().to_string();
+    let revision = valid_result["revision"].as_str().unwrap().to_string();
+    let persisted_result = inbox.record(32_009).unwrap().unwrap().result.unwrap();
+    assert_eq!(persisted_result["library_id"], fixture.target_library_id);
+    assert_eq!(persisted_result["root_binding"], second_binding);
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    runtime.signal_epoch_fatal();
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+
+    let reopened_queue =
+        Arc::new(QueueManager::open(&fixture.config).expect("queue should reopen"));
+    let reopened_inbox = Arc::new(
+        CloudInbox::open_for_epoch(&fixture.video_root, crate::cloud::TEST_DATABASE_EPOCH)
+            .expect("same-epoch inbox should reopen"),
+    );
+    let reopened_runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&reopened_queue),
+        Arc::clone(&reopened_inbox),
+    );
+    let reopened_dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
+    let confirmed = run_library_management_test_request(
+        &reopened_runtime,
+        32_010,
+        "file_confirm",
+        serde_json::json!({ "preview_id": preview_id, "revision": revision }),
+    )
+    .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    assert_eq!(
+        library_root_binding(&reopened_queue, &fixture.target_library_id),
+        second_binding
+    );
+    assert!(
+        fs::read_to_string(&nfo)
+            .expect("confirmed B metadata should read")
+            .contains("Verified B title")
+    );
+
+    reopened_dispatcher.abort();
+    let _ = reopened_dispatcher.await;
+    reopened_runtime.signal_epoch_fatal();
+    drop(reopened_runtime);
+    drop(reopened_inbox);
+    drop(reopened_queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[tokio::test]
+async fn file_preview_and_saved_confirmation_reject_replaced_root_binding() {
+    let (telegram, _requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "file-preview-replaced-root-binding",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let media = fixture.archive_root.join("clip.mp4");
+    let nfo = fixture.archive_root.join("clip.nfo");
+    fs::write(&media, b"original root media").expect("A media should write");
+    fs::write(&nfo, b"<movie><title>Original A</title></movie>").expect("A NFO should write");
+    let first_root_identity = crate::safe_fs::RootedFs::new(&fixture.archive_root)
+        .expect("A root should open")
+        .root_identity();
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let first_binding = library_root_binding(&queue, &fixture.target_library_id);
+    let first_item_id =
+        scan_file_item_id(&runtime, 33_001, &fixture.target_library_id, "clip.mp4").await;
+    let valid_preview = run_library_management_test_request(
+        &runtime,
+        33_002,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": first_binding,
+            "item_ids": [first_item_id],
+            "target_relative_dir": "pending-move",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(
+        valid_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        valid_preview.error
+    );
+    let preview_result = valid_preview.result.expect("A preview should persist");
+    assert_eq!(preview_result["library_id"], fixture.target_library_id);
+    assert_eq!(preview_result["root_binding"], first_binding);
+    let preview_id = preview_result["preview_id"].as_str().unwrap().to_string();
+    let revision = preview_result["revision"].as_str().unwrap().to_string();
+
+    let removed_first = run_library_management_test_request(
+        &runtime,
+        33_003,
+        "library_remove",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": first_binding,
+        }),
+    )
+    .await;
+    assert_eq!(
+        removed_first.status,
+        InboxStatus::Completed,
+        "{:?}",
+        removed_first.error
+    );
+    let displaced_root = fixture.root.join("archive-displaced");
+    fs::rename(&fixture.archive_root, &displaced_root).expect("A root should move aside");
+    fs::create_dir(&fixture.archive_root).expect("replacement root should reuse A's path");
+    fs::write(&media, b"replacement root media").expect("replacement media should write");
+    fs::write(&nfo, b"<movie><title>Replacement C</title></movie>")
+        .expect("replacement NFO should write");
+    let registered_second = run_library_management_test_request(
+        &runtime,
+        33_004,
+        "library_register",
+        serde_json::json!({
+            "name": "Archive C",
+            "path": fixture.archive_root,
+            "set_default": false,
+            "create_directory": false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        registered_second.status,
+        InboxStatus::Completed,
+        "{:?}",
+        registered_second.error
+    );
+    let registered_c = queue
+        .registry_snapshot()
+        .unwrap()
+        .libraries
+        .into_iter()
+        .find(|library| library.id == fixture.target_library_id)
+        .expect("C should reuse the path-derived library ID");
+    let second_binding = registered_c.root_binding_token().unwrap();
+    assert_ne!(
+        first_binding, second_binding,
+        "replacement registration changes the token"
+    );
+    assert_ne!(
+        first_root_identity,
+        crate::safe_fs::RootedFs::new(&fixture.archive_root)
+            .expect("replacement root should open")
+            .root_identity(),
+        "replacement root is a different directory object"
+    );
+    let metadata_root = fixture
+        .archive_root
+        .join(".telegram-video-downloader-library");
+    assert!(
+        !metadata_root.exists(),
+        "registering C should not create manager metadata"
+    );
+    let replacement_entries_before = fs::read_dir(&fixture.archive_root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let registry_before =
+        fs::read(crate::media_libraries::registry_path(None, &fixture.video_root).unwrap())
+            .unwrap();
+
+    for (seq, payload, expected_error) in [
+        (
+            33_005,
+            serde_json::json!({
+                "library_id": fixture.target_library_id,
+                "root_binding": first_binding,
+                "item_ids": [first_item_id],
+                "target_relative_dir": "stale-move",
+                "conflict": "skip",
+            }),
+            "library root identity changed",
+        ),
+        (
+            33_006,
+            serde_json::json!({
+                "library_id": fixture.target_library_id,
+                "root_binding": first_binding,
+                "item_ids": [first_item_id],
+                "metadata_patches": [{ "item_id": first_item_id, "title": "Stale title" }],
+            }),
+            "library root identity changed",
+        ),
+    ] {
+        let stale =
+            run_library_management_test_request(&runtime, seq, "file_preview", payload).await;
+        assert_eq!(stale.status, InboxStatus::Failed);
+        assert!(
+            stale
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains(expected_error))
+        );
+        assert!(
+            !metadata_root.exists(),
+            "stale preview must reject before manager initialization"
+        );
+        assert_eq!(fs::read(&media).unwrap(), b"replacement root media");
+        assert_eq!(
+            fs::read(&nfo).unwrap(),
+            b"<movie><title>Replacement C</title></movie>"
+        );
+        assert!(!fixture.archive_root.join("stale-move/clip.mp4").exists());
+    }
+    let stale_import = run_library_management_test_request(
+        &runtime,
+        33_007,
+        "legacy_import",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": first_binding,
+            "text": "https://www.bilibili.com/video/BV1xx411c7mD",
+        }),
+    )
+    .await;
+    assert_eq!(stale_import.status, InboxStatus::Failed);
+    assert!(
+        stale_import
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("library root identity changed"))
+    );
+    assert!(
+        !metadata_root.exists(),
+        "stale legacy import must reject before replacement manager initialization"
+    );
+    assert_eq!(fs::read(&media).unwrap(), b"replacement root media");
+    assert_eq!(
+        fs::read(&nfo).unwrap(),
+        b"<movie><title>Replacement C</title></movie>"
+    );
+    let projected_state = build_cloud_state_snapshot(&runtime)
+        .await
+        .expect("state projection should classify the saved A preview without opening B")
+        .expect("cloud state should remain available");
+    assert!(
+        projected_state
+            .previews
+            .iter()
+            .all(|preview| preview["preview_id"] != preview_id),
+        "the stale A preview must not be projected as actionable for replacement C"
+    );
+    assert!(
+        !metadata_root.exists(),
+        "projecting the saved A preview must not initialize replacement C metadata"
+    );
+    assert_eq!(fs::read(&media).unwrap(), b"replacement root media");
+    assert_eq!(
+        fs::read(&nfo).unwrap(),
+        b"<movie><title>Replacement C</title></movie>"
+    );
+    assert_eq!(
+        fs::read_dir(&fixture.archive_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        replacement_entries_before,
+        "stale preview/import should not add replacement-root metadata"
+    );
+    assert_eq!(
+        fs::read(crate::media_libraries::registry_path(None, &fixture.video_root).unwrap())
+            .unwrap(),
+        registry_before,
+        "stale preview should not rewrite the registration"
+    );
+
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    runtime.signal_epoch_fatal();
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+
+    let reopened_queue =
+        Arc::new(QueueManager::open(&fixture.config).expect("queue should reopen"));
+    let reopened_inbox = Arc::new(
+        CloudInbox::open_for_epoch(&fixture.video_root, crate::cloud::TEST_DATABASE_EPOCH)
+            .expect("same-epoch inbox should reopen"),
+    );
+    let reopened_runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&reopened_queue),
+        Arc::clone(&reopened_inbox),
+    );
+    let reopened_dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
+    let stale_confirm = run_library_management_test_request(
+        &reopened_runtime,
+        33_008,
+        "file_confirm",
+        serde_json::json!({ "preview_id": preview_id, "revision": revision }),
+    )
+    .await;
+    assert_eq!(stale_confirm.status, InboxStatus::Failed);
+    assert!(
+        stale_confirm
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("library root identity changed"))
+    );
+    assert!(
+        !metadata_root.exists(),
+        "stale confirmation must reject before manager initialization"
+    );
+    assert_eq!(fs::read(&media).unwrap(), b"replacement root media");
+    assert_eq!(
+        fs::read(&nfo).unwrap(),
+        b"<movie><title>Replacement C</title></movie>"
+    );
+
+    let child = fixture.archive_root.join("ordinary-child");
+    fs::create_dir(&child).expect("ordinary child should create");
+    fs::remove_dir(&child).expect("ordinary child should remove");
+    assert_eq!(
+        library_root_binding(&reopened_queue, &fixture.target_library_id),
+        second_binding
+    );
+    let replacement_item_id = scan_file_item_id(
+        &reopened_runtime,
+        33_009,
+        &fixture.target_library_id,
+        "clip.mp4",
+    )
+    .await;
+    let valid_replacement_preview = run_library_management_test_request(
+        &reopened_runtime,
+        33_010,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": second_binding,
+            "item_ids": [replacement_item_id],
+            "metadata_patches": [{ "item_id": replacement_item_id, "title": "Verified C title" }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        valid_replacement_preview.status,
+        InboxStatus::AwaitingConfirmation
+    );
+    assert_eq!(
+        valid_replacement_preview.result.as_ref().unwrap()["library_id"],
+        fixture.target_library_id
+    );
+    assert_eq!(
+        valid_replacement_preview.result.as_ref().unwrap()["root_binding"],
+        second_binding
+    );
+    let replacement_result = valid_replacement_preview.result.unwrap();
+    let confirmed_replacement = run_library_management_test_request(
+        &reopened_runtime,
+        33_011,
+        "file_confirm",
+        serde_json::json!({
+            "preview_id": replacement_result["preview_id"],
+            "revision": replacement_result["revision"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        confirmed_replacement.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed_replacement.error
+    );
+    assert!(
+        fs::read_to_string(&nfo)
+            .expect("confirmed C metadata should read")
+            .contains("Verified C title")
+    );
+
+    reopened_dispatcher.abort();
+    let _ = reopened_dispatcher.await;
+    reopened_runtime.signal_epoch_fatal();
+    drop(reopened_runtime);
+    drop(reopened_inbox);
+    drop(reopened_queue);
     stop_fake_telegram_api(shutdown, server).await;
     let _ = fs::remove_dir_all(&fixture.root);
 }

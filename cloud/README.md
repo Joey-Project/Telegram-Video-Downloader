@@ -46,6 +46,12 @@ Acknowledged rows are retained for seven days. Browser rows with an expired or u
 window require manual outcome checking; they must not be assigned a new timestamp or ID.
 Migration-preview payloads additionally require the displayed `source_root_binding` and
 `target_root_binding`; the Worker preserves them for validation by the desktop.
+File-preview and legacy-import payloads require the displayed `library_id` and `root_binding`.
+Metadata-edit drafts retain the import result's original binding. Retrying a saved action must
+preserve that original binding; a fresh snapshot must not upgrade an older request to a
+replacement registration.
+File confirmation validates the binding in its durable preview receipt; a caller cannot replace
+that saved binding with a newer registration token.
 
 The first request-list read bootstraps the D1 `database_epoch`; the desktop must send it in `X-Cloud-Database-Epoch` on subsequent request-list, acknowledgment, state, and WebSocket calls. Writes and WebSocket handshakes without a valid epoch fail closed. Acknowledgments carry a `receipts` array containing each request's `seq`, `request_id`, `payload_hash`, `kind`, and `created_at`; the Worker checks every existing row's identity before acknowledging any row in the batch. If a pending sequence collides with a different durable local envelope, the desktop may request conditional epoch rotation only when the current D1 row still matches that request's stable ID, payload hash, kind, and creation time. Rotation clears the old library snapshot but preserves inbox rows; the desktop restarts against a separate local inbox namespace. Older local receipt directories are retained and their previews require a fresh preview before confirmation.
 

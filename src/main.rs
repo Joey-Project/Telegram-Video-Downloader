@@ -539,7 +539,8 @@ where
         runtime,
         failure_context,
         CloudLibraryFailurePolicy::MarkUnavailable,
-        move |context, inbox| {
+        None,
+        move |context, inbox, _root| {
             operation(context, inbox)
                 .map(|(value, snapshot)| (value, CloudLibrarySnapshotUpdate::Publish(snapshot)))
         },
@@ -547,10 +548,16 @@ where
     .await
 }
 
-async fn run_cloud_library_operation_with_snapshot_update<T>(
+async fn run_cloud_library_operation_preserving_availability_with_root_binding<T>(
     runtime: &CloudBotRuntime,
+    library_id: String,
+    root_binding: String,
     failure_context: &'static str,
-    operation: impl FnOnce(BotContext, Arc<CloudInbox>) -> Result<(T, CloudLibrarySnapshotUpdate)>
+    operation: impl FnOnce(
+        BotContext,
+        Arc<CloudInbox>,
+        crate::safe_fs::RootedFs,
+    ) -> Result<(T, LibrarySnapshot)>
     + Send
     + 'static,
 ) -> Result<T>
@@ -561,25 +568,10 @@ where
         runtime,
         failure_context,
         CloudLibraryFailurePolicy::PreserveAvailability,
-        operation,
-    )
-    .await
-}
-
-async fn run_cloud_library_operation_preserving_availability<T>(
-    runtime: &CloudBotRuntime,
-    failure_context: &'static str,
-    operation: impl FnOnce(BotContext, Arc<CloudInbox>) -> Result<(T, LibrarySnapshot)> + Send + 'static,
-) -> Result<T>
-where
-    T: Send + 'static,
-{
-    run_cloud_library_operation_with_snapshot_update_and_policy(
-        runtime,
-        failure_context,
-        CloudLibraryFailurePolicy::PreserveAvailability,
-        move |context, inbox| {
-            operation(context, inbox)
+        Some((library_id, root_binding)),
+        move |context, inbox, root| {
+            let root = root.context("verified library root is missing")?;
+            operation(context, inbox, root)
                 .map(|(value, snapshot)| (value, CloudLibrarySnapshotUpdate::Publish(snapshot)))
         },
     )
@@ -590,7 +582,12 @@ async fn run_cloud_library_operation_with_snapshot_update_and_policy<T>(
     runtime: &CloudBotRuntime,
     failure_context: &'static str,
     failure_policy: CloudLibraryFailurePolicy,
-    operation: impl FnOnce(BotContext, Arc<CloudInbox>) -> Result<(T, CloudLibrarySnapshotUpdate)>
+    expected_root_binding: Option<(String, String)>,
+    operation: impl FnOnce(
+        BotContext,
+        Arc<CloudInbox>,
+        Option<crate::safe_fs::RootedFs>,
+    ) -> Result<(T, CloudLibrarySnapshotUpdate)>
     + Send
     + 'static,
 ) -> Result<T>
@@ -609,6 +606,12 @@ where
         .as_deref()
         .context("library operation has no registered queue store for its root")?
         .to_string();
+    if expected_root_binding
+        .as_ref()
+        .is_some_and(|(expected_library_id, _)| expected_library_id != &selected_queue_library_id)
+    {
+        bail!("library root identity changed; refresh settings and retry");
+    }
     let default_library_id = settings.default_library_id;
     let io_lease = library_migration_bot::try_acquire_library_io(
         runtime,
@@ -629,8 +632,16 @@ where
     let worker = tokio::task::spawn_blocking(move || {
         let _io_lease = blocking_io_lease;
         let result = (|| {
-            refresh_and_require_library_queue_available(&queue, &selected_library_id_for_worker)?;
-            operation(context, inbox)
+            let verified_root = if let Some((library_id, root_binding)) = expected_root_binding {
+                Some(queue.verified_video_library_root_with_binding(&library_id, &root_binding)?)
+            } else {
+                refresh_and_require_library_queue_available(
+                    &queue,
+                    &selected_library_id_for_worker,
+                )?;
+                None
+            };
+            operation(context, inbox, verified_root)
         })();
         (result, publication_guard)
     })
@@ -3164,7 +3175,12 @@ async fn dispatch_cloud_management(
     runtime: &CloudBotRuntime,
     request: &CloudRequest,
 ) -> Result<CloudDispatchOutcome> {
-    media_library_bot::refresh_library_bindings(runtime).await?;
+    if !matches!(
+        request.kind.as_str(),
+        "file_preview" | "file_confirm" | "legacy_import"
+    ) {
+        media_library_bot::refresh_library_bindings(runtime).await?;
+    }
     if let Some(result) = library_migration_bot::dispatch(runtime, request).await {
         return result;
     }
@@ -3172,14 +3188,50 @@ async fn dispatch_cloud_management(
         return result;
     }
     let mut owned_request = request.clone();
-    let requested_library_id = match owned_request
-        .payload
-        .as_object_mut()
-        .and_then(|payload| payload.remove("library_id"))
-    {
+    let binding_scoped_action = matches!(request.kind.as_str(), "file_preview" | "legacy_import");
+    let requested_library_id_value = if binding_scoped_action {
+        owned_request
+            .payload
+            .as_object()
+            .and_then(|payload| payload.get("library_id"))
+            .cloned()
+    } else {
+        owned_request
+            .payload
+            .as_object_mut()
+            .and_then(|payload| payload.remove("library_id"))
+    };
+    let requested_library_id = match requested_library_id_value {
         Some(serde_json::Value::String(id)) => Some(id),
+        Some(_) | None if binding_scoped_action => {
+            return Ok(cloud_dispatch_failure("library_id must be a string"));
+        }
         Some(_) => return Ok(cloud_dispatch_failure("library_id must be a string")),
         None => None,
+    };
+    let requested_root_binding = if binding_scoped_action {
+        let Some(root_binding) = owned_request
+            .payload
+            .get("root_binding")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(cloud_dispatch_failure(
+                "root_binding must be an opaque root identity token",
+            ));
+        };
+        let library_id = requested_library_id
+            .as_deref()
+            .expect("binding-scoped action requires library_id");
+        if let Err(error) = runtime
+            .bot
+            .queue
+            .require_video_library_root_binding(library_id, root_binding)
+        {
+            return Ok(cloud_dispatch_failure(format!("{error:#}")));
+        }
+        Some(root_binding.to_string())
+    } else {
+        None
     };
     let selected = if matches!(
         request.kind.as_str(),
@@ -3224,8 +3276,12 @@ async fn dispatch_cloud_management(
             })
         }
         "file_preview" => {
-            let payload: FilePreviewPayload = match serde_json::from_value(request.payload.clone())
-            {
+            let mut operation_payload = request.payload.clone();
+            if let Some(fields) = operation_payload.as_object_mut() {
+                fields.remove("library_id");
+                fields.remove("root_binding");
+            }
+            let payload: FilePreviewPayload = match serde_json::from_value(operation_payload) {
                 Ok(payload) => payload,
                 Err(error) => {
                     return Ok(cloud_dispatch_failure(format!(
@@ -3237,31 +3293,57 @@ async fn dispatch_cloud_management(
                 Ok(parsed) => parsed,
                 Err(error) => return Ok(cloud_dispatch_failure(error)),
             };
+            let library_id = requested_library_id
+                .clone()
+                .expect("file_preview requires library_id");
+            let root_binding = requested_root_binding
+                .clone()
+                .expect("file_preview requires root_binding");
             let legacy_imports = if parsed
                 .hint_indices
                 .iter()
                 .any(|(_, hint_index)| hint_index.is_some())
             {
-                cloud_completed_legacy_import_records(runtime).await?
+                cloud_completed_legacy_import_records(runtime, &library_id, &root_binding).await?
             } else {
                 Vec::new()
             };
             let receipt_seq = request.seq;
-            let preview = run_cloud_library_operation_preserving_availability(
+            let library_id_for_worker = library_id.clone();
+            let root_binding_for_worker = root_binding.clone();
+            #[cfg(test)]
+            let file_provider = runtime.test_file_provider.clone();
+            #[cfg(not(test))]
+            let file_provider = None;
+            let preview = run_cloud_library_operation_preserving_availability_with_root_binding(
                 runtime,
+                library_id.clone(),
+                root_binding.clone(),
                 "file preview worker failed",
-                move |context, inbox| {
-                    create_cloud_file_preview(&context, parsed, &legacy_imports, inbox, receipt_seq)
+                move |context, inbox, root| {
+                    create_cloud_file_preview(
+                        &context,
+                        parsed,
+                        CloudFilePreviewContext {
+                            legacy_imports,
+                            inbox,
+                            receipt_seq,
+                            library_id: library_id_for_worker,
+                            root_binding: root_binding_for_worker,
+                            file_provider,
+                            root,
+                        },
+                    )
                 },
             )
             .await?;
             Ok(CloudDispatchOutcome {
                 status: InboxStatus::AwaitingConfirmation,
-                result: Some({
-                    let mut result = cloud_file_preview_result(&preview);
-                    result["library_id"] = serde_json::json!(selected.as_ref().map(|(_, id)| id));
-                    result
-                }),
+                result: Some(cloud_file_preview_result(
+                    &preview,
+                    &library_id,
+                    &root_binding,
+                )),
                 error: None,
                 related_preview: None,
             })
@@ -3287,13 +3369,37 @@ async fn dispatch_cloud_management(
                     "This preview is no longer awaiting confirmation. Run a fresh preview.",
                 ));
             };
-            let source_library_id = preview_record
-                .result
-                .as_ref()
-                .and_then(|result| result["library_id"].as_str())
+            let Some(preview_result) = preview_record.result.as_ref() else {
+                return Ok(cloud_dispatch_failure(
+                    "The persisted preview is incomplete. Run a fresh preview.",
+                ));
+            };
+            let Some(source_library_id) = preview_result
+                .get("library_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty() && id.trim() == *id)
                 .map(str::to_string)
-                .map(Ok)
-                .unwrap_or_else(|| media_library_bot::original_library_id(runtime))?;
+            else {
+                return Ok(cloud_dispatch_failure(
+                    "The persisted preview is missing its library identity. Run a fresh preview.",
+                ));
+            };
+            let Some(root_binding) = preview_result
+                .get("root_binding")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            else {
+                return Ok(cloud_dispatch_failure(
+                    "The persisted preview is missing its root identity. Run a fresh preview.",
+                ));
+            };
+            if let Err(error) = runtime
+                .bot
+                .queue
+                .require_video_library_root_binding(&source_library_id, &root_binding)
+            {
+                return Ok(cloud_dispatch_failure(format!("{error:#}")));
+            }
             if requested_library_id
                 .as_ref()
                 .is_some_and(|id| id != &source_library_id)
@@ -3328,9 +3434,13 @@ async fn dispatch_cloud_management(
             }
             let preview_seq = preview_record.request.seq;
             let preview_key = (payload.preview_id.clone(), payload.revision.clone());
-            let unconfirmable =
-                cloud_unconfirmable_preview_ids(runtime, std::slice::from_ref(&preview_key))
-                    .await?;
+            let unconfirmable = cloud_unconfirmable_file_preview_ids(
+                runtime,
+                &source_library_id,
+                &root_binding,
+                std::slice::from_ref(&preview_key),
+            )
+            .await?;
             if unconfirmable.contains(&payload.preview_id) {
                 return Ok(cloud_file_confirm_failure(
                     preview_seq,
@@ -3355,12 +3465,15 @@ async fn dispatch_cloud_management(
             let file_provider = None;
             #[cfg(test)]
             let refresh_failure = Arc::clone(&runtime.test_library_refresh_failure);
-            let result = match run_cloud_library_operation_with_snapshot_update(
+            let result = match run_cloud_library_operation_with_snapshot_update_and_policy(
                 runtime,
                 "file confirmation worker failed",
-                move |context, inbox| {
+                CloudLibraryFailurePolicy::PreserveAvailability,
+                Some((source_library_id.clone(), root_binding.clone())),
+                move |context, inbox, root| {
                     execute_cloud_file_preview_with_provider(
                         &context,
+                        root.context("verified library root is missing")?,
                         &preview_id_for_execution,
                         &revision_for_execution,
                         file_provider,
@@ -3458,8 +3571,12 @@ async fn dispatch_cloud_management(
             })
         }
         "legacy_import" => {
-            let payload: LegacyImportPayload = match serde_json::from_value(request.payload.clone())
-            {
+            let mut operation_payload = request.payload.clone();
+            if let Some(fields) = operation_payload.as_object_mut() {
+                fields.remove("library_id");
+                fields.remove("root_binding");
+            }
+            let payload: LegacyImportPayload = match serde_json::from_value(operation_payload) {
                 Ok(payload) => payload,
                 Err(error) => {
                     return Ok(cloud_dispatch_failure(format!(
@@ -3472,20 +3589,33 @@ async fn dispatch_cloud_management(
                     "legacy_import payload exceeds the 256 KiB limit",
                 ));
             }
+            let library_id = requested_library_id
+                .clone()
+                .expect("legacy_import requires library_id");
+            let root_binding = requested_root_binding
+                .clone()
+                .expect("legacy_import requires root_binding");
             let text = payload.text;
-            let (report, library_revision) = run_cloud_library_operation_preserving_availability(
-                runtime,
-                "legacy import worker failed",
-                move |context, inbox| {
-                    let (report, snapshot) = import_cloud_legacy_metadata(&context, &text, inbox)?;
-                    Ok(((report, snapshot.revision.clone()), snapshot))
-                },
-            )
-            .await?;
+            let library_id_for_result = library_id.clone();
+            let root_binding_for_result = root_binding.clone();
+            let (report, library_revision) =
+                run_cloud_library_operation_preserving_availability_with_root_binding(
+                    runtime,
+                    library_id,
+                    root_binding,
+                    "legacy import worker failed",
+                    move |context, inbox, root| {
+                        let (report, snapshot) =
+                            import_cloud_legacy_metadata(&context, &text, inbox, root)?;
+                        Ok(((report, snapshot.revision.clone()), snapshot))
+                    },
+                )
+                .await?;
             Ok(CloudDispatchOutcome {
                 status: InboxStatus::Completed,
                 result: Some(serde_json::json!({
-                    "library_id": selected.as_ref().map(|(_, id)| id),
+                    "library_id": library_id_for_result,
+                    "root_binding": root_binding_for_result,
                     "revision": report.revision,
                     "hints": report.hints,
                     "warnings": report.warnings,
@@ -3700,19 +3830,32 @@ struct PreparedFilePreview {
     hint_indices: Vec<(String, Option<usize>)>,
 }
 
+struct CloudFilePreviewContext {
+    legacy_imports: Vec<InboxRecord>,
+    inbox: Arc<CloudInbox>,
+    receipt_seq: u64,
+    library_id: String,
+    root_binding: String,
+    file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
+    root: crate::safe_fs::RootedFs,
+}
+
 fn create_cloud_file_preview(
     bot: &BotContext,
     prepared: PreparedFilePreview,
-    legacy_imports: &[InboxRecord],
-    inbox: Arc<CloudInbox>,
-    receipt_seq: u64,
+    context: CloudFilePreviewContext,
 ) -> Result<(MovePreview, LibrarySnapshot)> {
-    let mut receipt = inbox
-        .record(receipt_seq)?
+    let mut receipt = context
+        .inbox
+        .record(context.receipt_seq)?
         .context("cloud preview request receipt is missing")?;
-    let library_id = media_library_bot::original_library_id_from_bot(bot)?;
-    receipt.request.payload["library_id"] = serde_json::json!(library_id);
-    let manager = open_cloud_library_manager(bot, inbox, None)?;
+    receipt.request.payload["library_id"] = serde_json::json!(context.library_id);
+    receipt.request.payload["root_binding"] = serde_json::json!(context.root_binding);
+    let manager = open_cloud_library_manager_with_bound_root(
+        context.root,
+        context.inbox,
+        context.file_provider,
+    )?;
     let hints = queue_source_hints(bot)?;
     manager.preview_with_hints_and_patches_and_snapshot_validator_and_preview_guard(
         PreviewBuildRequest {
@@ -3730,7 +3873,7 @@ fn create_cloud_file_preview(
         |snapshot| {
             validate_legacy_metadata_patches(
                 snapshot,
-                legacy_imports,
+                &context.legacy_imports,
                 &prepared.patches,
                 &prepared.hint_indices,
             )
@@ -3739,23 +3882,36 @@ fn create_cloud_file_preview(
     )
 }
 
-fn cloud_file_preview_result(preview: &MovePreview) -> serde_json::Value {
+fn cloud_file_preview_result(
+    preview: &MovePreview,
+    library_id: &str,
+    root_binding: &str,
+) -> serde_json::Value {
     serde_json::json!({
         "preview_id": preview.id,
         "revision": preview.revision,
+        "library_id": library_id,
+        "root_binding": root_binding,
         "preview": preview,
     })
 }
 
 fn validate_cloud_file_preview_receipt(receipt: &InboxRecord, preview: &MovePreview) -> Result<()> {
+    let library_id = receipt
+        .request
+        .payload
+        .get("library_id")
+        .and_then(serde_json::Value::as_str)
+        .context("file preview receipt is missing its library ID")?;
+    let root_binding = receipt
+        .request
+        .payload
+        .get("root_binding")
+        .and_then(serde_json::Value::as_str)
+        .context("file preview receipt is missing its root binding")?;
     let mut generated = receipt.clone();
     generated.status = InboxStatus::AwaitingConfirmation;
-    generated.result = Some(cloud_file_preview_result(preview));
-    if let Some(library_id) = receipt.request.payload.get("library_id")
-        && let Some(result) = generated.result.as_mut()
-    {
-        result["library_id"] = library_id.clone();
-    }
+    generated.result = Some(cloud_file_preview_result(preview, library_id, root_binding));
     generated.error = None;
     generated.next_attempt_at = 0;
     if generated.compact_oversized_result()? {
@@ -3858,30 +4014,24 @@ fn metadata_patch_matches_legacy_hint(patch: &MetadataPatch, hint: &SourceHint) 
 
 async fn cloud_completed_legacy_import_records(
     runtime: &CloudBotRuntime,
+    library_id: &str,
+    root_binding: &str,
 ) -> Result<Vec<InboxRecord>> {
     let inbox = Arc::clone(&runtime.inbox);
-    let selected_id = runtime
-        .bot
-        .queue
-        .registry_snapshot()?
-        .libraries
-        .into_iter()
-        .find(|library| {
-            media_library_bot::same_root(&library.root, &runtime.bot.config.downloads.video_dir)
-        })
-        .map(|library| library.id);
-    let original_id = media_library_bot::original_library_id(runtime).ok();
+    let library_id = library_id.to_string();
+    let root_binding = root_binding.to_string();
     tokio::task::spawn_blocking(move || {
         let mut records = inbox.completed_legacy_import_records_bounded()?;
         records.retain(|record| {
-            let id = record
-                .result
-                .as_ref()
-                .and_then(|result| result["library_id"].as_str())
-                .or_else(|| record.request.payload["library_id"].as_str())
-                .map(str::to_owned)
-                .or_else(|| original_id.clone());
-            id == selected_id
+            let result = record.result.as_ref();
+            let result_library_id = result
+                .and_then(|result| result.get("library_id"))
+                .and_then(serde_json::Value::as_str);
+            let result_root_binding = result
+                .and_then(|result| result.get("root_binding"))
+                .and_then(serde_json::Value::as_str);
+            result_library_id == Some(library_id.as_str())
+                && result_root_binding == Some(root_binding.as_str())
         });
         Ok(records)
     })
@@ -3906,26 +4056,39 @@ fn cloud_preview_identity(record: &InboxRecord) -> Option<(String, String)> {
     Some((preview_id, revision))
 }
 
-async fn cloud_unconfirmable_preview_ids(
+async fn cloud_unconfirmable_file_preview_ids(
     runtime: &CloudBotRuntime,
+    library_id: &str,
+    root_binding: &str,
     preview_keys: &[(String, String)],
 ) -> Result<HashSet<String>> {
     if preview_keys.is_empty() {
         return Ok(HashSet::new());
     }
-    let bot = runtime.bot.clone();
-    let inbox = Arc::clone(&runtime.inbox);
+    let library_id = library_id.to_string();
+    let root_binding = root_binding.to_string();
     let preview_keys = preview_keys.to_vec();
+    let io_lease =
+        library_migration_bot::try_acquire_library_io(runtime, std::slice::from_ref(&library_id))
+            .await?;
+    let publication_guard = Arc::clone(&runtime.library_scan_publication_gate)
+        .lock_owned()
+        .await;
+    let queue = Arc::clone(&runtime.bot.queue);
+    let inbox = Arc::clone(&runtime.inbox);
     #[cfg(test)]
     let file_provider = runtime.test_file_provider.clone();
     #[cfg(not(test))]
     let file_provider = None;
     tokio::task::spawn_blocking(move || {
-        let manager = open_cloud_library_manager(&bot, inbox, file_provider)?;
+        let _io_lease = io_lease;
+        let _publication_guard = publication_guard;
+        let root = queue.verified_video_library_root_with_binding(&library_id, &root_binding)?;
+        let manager = open_cloud_library_manager_with_bound_root(root, inbox, file_provider)?;
         manager.unconfirmable_preview_ids(&preview_keys)
     })
     .await
-    .context("cloud preview confirmability worker failed")?
+    .context("bound cloud preview confirmability worker failed")?
 }
 
 async fn cloud_awaiting_confirmation_record(
@@ -4179,6 +4342,7 @@ fn render_cloud_batch_result_with_refresh_warning(
 
 fn execute_cloud_file_preview_with_provider(
     bot: &BotContext,
+    root: crate::safe_fs::RootedFs,
     preview_id: &str,
     revision: &str,
     file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
@@ -4188,7 +4352,16 @@ fn execute_cloud_file_preview_with_provider(
     (crate::library::BatchMoveResult, Option<String>),
     CloudLibrarySnapshotUpdate,
 )> {
-    let manager = open_cloud_library_manager(bot, inbox, file_provider)?;
+    let manager = open_cloud_library_manager_with_bound_root(root, inbox, file_provider)?;
+    let preview_key = (preview_id.to_string(), revision.to_string());
+    if manager
+        .unconfirmable_preview_ids(std::slice::from_ref(&preview_key))?
+        .contains(preview_id)
+    {
+        bail!(
+            "This preview is no longer confirmable in the current local file session. Run a fresh preview."
+        );
+    }
     let result = manager.execute_preview(preview_id, revision)?;
     #[cfg(test)]
     let injected_refresh_error = test_library_refresh_failure
@@ -4230,8 +4403,9 @@ fn import_cloud_legacy_metadata(
     bot: &BotContext,
     text: &str,
     inbox: Arc<CloudInbox>,
+    root: crate::safe_fs::RootedFs,
 ) -> Result<(crate::library::LegacyImportReport, LibrarySnapshot)> {
-    let manager = open_cloud_library_manager(bot, inbox, None)?;
+    let manager = open_cloud_library_manager_with_bound_root(root, inbox, None)?;
     let hints = queue_source_hints(bot)?;
     let report = manager.import_legacy_with_hints(text, &hints)?;
     let snapshot = manager.scan(&queue_source_hints(bot)?)?;
@@ -4249,6 +4423,18 @@ fn open_cloud_library_manager(
     file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
 ) -> Result<LibraryManager> {
     open_cloud_library_manager_after_root_validation(bot, inbox, file_provider, || Ok(()))
+}
+
+fn open_cloud_library_manager_with_bound_root(
+    root: crate::safe_fs::RootedFs,
+    inbox: Arc<CloudInbox>,
+    file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
+) -> Result<LibraryManager> {
+    LibraryManager::open_with_bound_root_and_provider_and_preview_cleanup_gate(
+        root,
+        file_provider.unwrap_or_else(crate::file_provider::platform_queue_file_provider),
+        inbox,
+    )
 }
 
 #[cfg(test)]

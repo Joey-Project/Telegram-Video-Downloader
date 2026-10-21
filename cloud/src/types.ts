@@ -57,13 +57,16 @@ export interface LibraryMigrationPreviewPayload {
   supersedes_revision?: string;
 }
 
-export interface FilePreviewPayload {
-  library_id?: string;
+export interface FilePreviewPayload extends BoundLibraryMutationIdentity {
   item_ids?: string[];
   target_relative_dir?: string;
   rename?: boolean;
   conflict?: ConflictPolicy;
   metadata_patches?: MetadataPatch[];
+}
+
+export interface LegacyImportPayload extends BoundLibraryMutationIdentity {
+  text: string;
 }
 
 export interface ActionRequest {

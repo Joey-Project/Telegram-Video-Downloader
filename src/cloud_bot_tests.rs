@@ -1133,6 +1133,15 @@ fn cloud_test_root_binding(queue: &QueueManager, library_id: &str) -> String {
         .expect("registered library should have a root binding")
 }
 
+fn cloud_test_default_library_binding(queue: &QueueManager) -> (String, String) {
+    let library_id = queue
+        .default_video_destination()
+        .expect("default video library should resolve")
+        .library_id;
+    let root_binding = cloud_test_root_binding(queue, &library_id);
+    (library_id, root_binding)
+}
+
 fn bound_migration_preview_payload(
     queue: &QueueManager,
     source_library_id: &str,
@@ -1536,12 +1545,14 @@ async fn media_library_settings_and_scoped_file_management_mock_e2e() {
         .as_str()
         .unwrap()
         .to_string();
+    let original_binding = cloud_test_root_binding(&queue, &original_id);
     let preview = run_library_management_test_request(
         &runtime,
         704,
         "file_preview",
         serde_json::json!({
             "library_id": original_id, "item_ids": [item_id],
+            "root_binding": original_binding,
             "target_relative_dir": "organized", "conflict": "skip",
         }),
     )
@@ -1554,6 +1565,7 @@ async fn media_library_settings_and_scoped_file_management_mock_e2e() {
     );
     let preview = preview.result.unwrap();
     assert_eq!(preview["library_id"], original_id);
+    assert_eq!(preview["root_binding"], original_binding);
     let wrong = run_library_management_test_request(&runtime, 705, "file_confirm", serde_json::json!({
         "library_id": archive_id, "preview_id": preview["preview_id"], "revision": preview["revision"],
     })).await;
@@ -1666,6 +1678,7 @@ async fn media_library_dispatch_rejects_replaced_roots_and_recovers_scoped_roots
         .register_video_library("Archive", &archive_root, None, false, false)
         .expect("secondary library should register")
         .id;
+    let original_binding = cloud_test_root_binding(&queue, &library_id);
     let inbox = Arc::new(open_runtime_test_inbox(&video_root).expect("test inbox should open"));
     let runtime = make_runtime(
         telegram,
@@ -1752,6 +1765,7 @@ async fn media_library_dispatch_rejects_replaced_roots_and_recovers_scoped_roots
         "file_preview",
         serde_json::json!({
             "library_id": library_id,
+            "root_binding": original_binding,
             "item_ids": [baseline_item_id],
             "target_relative_dir": "organized",
             "conflict": "skip",
@@ -1810,6 +1824,7 @@ async fn media_library_dispatch_rejects_replaced_roots_and_recovers_scoped_roots
         "file_preview",
         serde_json::json!({
             "library_id": library_id,
+            "root_binding": original_binding,
             "item_ids": [recovered_item_id],
             "target_relative_dir": "organized",
             "conflict": "skip",
@@ -3339,6 +3354,7 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
         .ensure_runtime_dirs()
         .expect("test download roots should create");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -3375,7 +3391,11 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
         .persist(CloudRequest {
             seq: 83,
             kind: "file_preview".to_string(),
-            payload: serde_json::json!({"item_ids": ["item-a"]}),
+            payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
+                "item_ids": ["item-a"]
+            }),
             created_at: 100,
             extra: serde_json::Map::new(),
         })
@@ -3384,6 +3404,8 @@ async fn retryable_file_confirmation_receipt_keeps_preview_available() {
         .update(83, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": "retryable-preview",
                 "revision": "revision-retryable",
                 "preview": preview,
@@ -3528,6 +3550,11 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
         .expect("file move should produce a persistent preview");
     let preview_id = preview.id.clone();
     let preview_revision = preview.revision.clone();
+    let (library_id, root_binding) = {
+        let queue =
+            QueueManager::open(&config).expect("task queue should open for preview binding");
+        cloud_test_default_library_binding(&queue)
+    };
     let preview_manifest = config
         .downloads
         .video_dir
@@ -3549,6 +3576,8 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
             seq: 83,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "item_ids": [item_id],
                 "target_relative_dir": "organized"
             }),
@@ -3562,6 +3591,8 @@ async fn preexpiry_confirmation_survives_scan_and_restart_after_preview_expiry()
             record.result = Some(serde_json::json!({
                 "preview_id": preview_id,
                 "revision": preview_revision,
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview": preview,
             }));
         })
@@ -3884,6 +3915,7 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
     let preview_revision = preview.revision.clone();
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -3891,7 +3923,12 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
         .persist(CloudRequest {
             seq: 83,
             kind: "file_preview".to_string(),
-            payload: serde_json::json!({"item_ids": [item_id], "target_relative_dir": "organized"}),
+            payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
+                "item_ids": [item_id],
+                "target_relative_dir": "organized"
+            }),
             created_at: 100,
             extra: serde_json::Map::new(),
         })
@@ -3900,6 +3937,8 @@ async fn retryable_file_provider_confirmation_can_resume_the_same_preview() {
         .update(83, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id.clone(),
                 "revision": preview_revision.clone(),
                 "preview": preview,
@@ -4048,6 +4087,7 @@ async fn nonretryable_skipped_confirmation_requires_fresh_preview() {
     .expect("conflicting target should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -4082,7 +4122,12 @@ async fn nonretryable_skipped_confirmation_requires_fresh_preview() {
         .persist(CloudRequest {
             seq: 83,
             kind: "file_preview".to_string(),
-            payload: serde_json::json!({"item_ids": [item_id], "target_relative_dir": "Existing"}),
+            payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
+                "item_ids": [item_id],
+                "target_relative_dir": "Existing"
+            }),
             created_at: now_millis(),
             extra: serde_json::Map::new(),
         })
@@ -4091,6 +4136,8 @@ async fn nonretryable_skipped_confirmation_requires_fresh_preview() {
         .update(83, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id.clone(),
                 "revision": preview_revision.clone(),
                 "preview": preview,
@@ -4218,6 +4265,7 @@ async fn completed_file_confirmation_is_preserved_when_library_refresh_fails() {
     .expect("NFO fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -4264,6 +4312,8 @@ async fn completed_file_confirmation_is_preserved_when_library_refresh_fails() {
             seq: 86,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "item_ids": [item_id],
                 "target_relative_dir": "organized"
             }),
@@ -4275,6 +4325,8 @@ async fn completed_file_confirmation_is_preserved_when_library_refresh_fails() {
         .update(86, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id,
                 "revision": preview_revision,
                 "preview": preview,
@@ -4422,6 +4474,7 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
     fs::write(&source_nfo, original_nfo).expect("NFO fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -4446,6 +4499,8 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
             seq: 1,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "metadata_patches": [{
                     "item_id": item_id,
                     "title": "Must require a completed import",
@@ -4482,6 +4537,8 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
             seq: 2,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "metadata_patches": [{
                     "item_id": item_id,
                     "title": "Manual title",
@@ -4508,6 +4565,8 @@ async fn manual_metadata_patch_without_legacy_import_can_preview_and_confirm() {
         .result
         .as_ref()
         .expect("manual preview should store its result");
+    assert_eq!(preview_result["library_id"], library_id);
+    assert_eq!(preview_result["root_binding"], root_binding);
     let preview_id = preview_result["preview_id"]
         .as_str()
         .expect("manual preview should include an id")
@@ -4594,6 +4653,7 @@ async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() 
     }
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(open_runtime_test_inbox(&video_root).expect("cloud inbox should open"));
     let library = LibraryManager::open(&video_root).expect("library manager should open");
     let snapshot = library
@@ -4627,7 +4687,11 @@ async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() 
     let large_request = CloudRequest {
         seq: 1,
         kind: "file_preview".to_string(),
-        payload: serde_json::json!({"metadata_patches": patches}),
+        payload: serde_json::json!({
+            "library_id": library_id,
+            "root_binding": root_binding,
+            "metadata_patches": patches,
+        }),
         created_at: now_millis(),
         extra: serde_json::Map::new(),
     };
@@ -4684,6 +4748,8 @@ async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() 
             seq: 2,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "metadata_patches": [{
                     "item_id": item_ids[0],
                     "title": "Small preview",
@@ -4710,6 +4776,8 @@ async fn oversized_cloud_file_preview_is_rejected_before_manifest_persistence() 
         .result
         .as_ref()
         .expect("confirmable preview should keep its receipt result");
+    assert_eq!(result["library_id"], library_id);
+    assert_eq!(result["root_binding"], root_binding);
     let preview_id = result["preview_id"]
         .as_str()
         .expect("preview receipt should include its ID")
@@ -4993,6 +5061,7 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
     .expect("library media fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let library =
         LibraryManager::open(&config.downloads.video_dir).expect("library manager should open");
     let snapshot = library
@@ -5041,7 +5110,11 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
         .persist(CloudRequest {
             seq: LEGACY_IMPORT_SEQ,
             kind: "legacy_import".to_string(),
-            payload: serde_json::json!({"text":"Imported title https://www.bilibili.com/video/BV1xx411c7mD"}),
+            payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
+                "text":"Imported title https://www.bilibili.com/video/BV1xx411c7mD"
+            }),
             created_at: now_millis(),
             extra: serde_json::Map::new(),
         })
@@ -5050,6 +5123,8 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
         .update(LEGACY_IMPORT_SEQ, |record| {
             record.status = InboxStatus::Completed;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "hints": hints,
                 "candidates": [candidate],
             }));
@@ -5109,6 +5184,8 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
         seq: PREVIEW_SEQ,
         kind: "file_preview".to_string(),
         payload: serde_json::json!({
+            "library_id": library_id,
+            "root_binding": root_binding,
             "metadata_patches": [{
                 "item_id": item_id,
                 "title": "Imported title",
@@ -5153,6 +5230,22 @@ async fn dispatched_legacy_mapping_survives_management_history_eviction_and_reop
         .expect("file preview receipt should load")
         .expect("file preview receipt should remain present");
     assert_eq!(preview_receipt.status, InboxStatus::AwaitingConfirmation);
+    assert_eq!(
+        preview_receipt
+            .result
+            .as_ref()
+            .and_then(|result| result["library_id"].as_str()),
+        Some(library_id.as_str()),
+        "the durable preview must retain the library whose identity was captured"
+    );
+    assert_eq!(
+        preview_receipt
+            .result
+            .as_ref()
+            .and_then(|result| result["root_binding"].as_str()),
+        Some(root_binding.as_str()),
+        "the durable preview must retain its original root binding"
+    );
     let stored_preview = preview_receipt
         .result
         .as_ref()
@@ -6332,6 +6425,7 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
     let source_path = config.downloads.video_dir.join("clip.mp4");
     fs::write(&source_path, b"original media contents").expect("media fixture should write");
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -6362,7 +6456,12 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
         .persist(CloudRequest {
             seq: 41,
             kind: "file_preview".to_string(),
-            payload: serde_json::json!({"item_ids": [item_id], "target_relative_dir": "organized"}),
+            payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
+                "item_ids": [item_id],
+                "target_relative_dir": "organized"
+            }),
             created_at: now_millis(),
             extra: serde_json::Map::new(),
         })
@@ -6371,6 +6470,8 @@ async fn failed_file_confirmation_edits_the_started_batch_message() {
         .update(41, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id,
                 "revision": preview_revision,
                 "preview": preview,
@@ -7404,6 +7505,7 @@ async fn completed_file_move_retries_primary_and_preview_receipts_without_repeat
     fs::write(&source_path, b"fixture-video").expect("media fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox_provider = Arc::new(FailOnceInboxFileProvider::default());
     let inbox_provider_trait: Arc<dyn QueueFileProvider> = inbox_provider.clone();
     let inbox = Arc::new(
@@ -7448,6 +7550,8 @@ async fn completed_file_move_retries_primary_and_preview_receipts_without_repeat
             seq: preview_seq,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "item_ids": [item_id],
                 "target_relative_dir": "organized"
             }),
@@ -7459,6 +7563,8 @@ async fn completed_file_move_retries_primary_and_preview_receipts_without_repeat
         .update(preview_seq, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id,
                 "revision": preview_revision,
                 "telegram_status_delivery": "sent",
@@ -7585,6 +7691,7 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
     fs::write(&source_path, b"fixture-video").expect("media fixture should write");
 
     let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let (library_id, root_binding) = cloud_test_default_library_binding(&queue);
     let inbox = Arc::new(
         open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
     );
@@ -7624,6 +7731,8 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
             seq: preview_seq,
             kind: "file_preview".to_string(),
             payload: serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "item_ids": [item_id],
                 "target_relative_dir": "organized"
             }),
@@ -7635,6 +7744,8 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
         .update(preview_seq, |record| {
             record.status = InboxStatus::AwaitingConfirmation;
             record.result = Some(serde_json::json!({
+                "library_id": library_id,
+                "root_binding": root_binding,
                 "preview_id": preview_id.clone(),
                 "revision": preview_revision.clone(),
                 "preview": preview,
@@ -7681,7 +7792,10 @@ async fn cloud_preview_projection_and_confirmation_recheck_live_anchors() {
         .expect("preview operation should remain visible while its live anchor exists");
     assert_eq!(confirmable_operation["status"], "awaiting_confirmation");
     assert!(confirmable_state.previews.iter().any(|entry| {
-        entry["preview_id"] == preview_id && entry["revision"] == preview_revision
+        entry["preview_id"] == preview_id
+            && entry["revision"] == preview_revision
+            && entry["library_id"] == library_id
+            && entry["root_binding"] == root_binding
     }));
 
     release_preview_anchors(&preview_id);
