@@ -3175,6 +3175,397 @@ async fn cloud_queue_hints_use_only_persisted_verified_episode_receipts() {
     std::fs::remove_dir_all(root).expect("test download roots should clean up");
 }
 
+fn pgc_test_stable_media_id(cid: u64, epid: u64) -> String {
+    format!("bvid:BV1xx411c7mD:aid:100001:cid:{cid}:epid:{epid}")
+}
+
+struct PgcFixtureCollection {
+    title: &'static str,
+    id: &'static str,
+    order: u32,
+}
+
+struct PgcFixtureEntry {
+    index: u32,
+    stable_media_id: String,
+    nfo_collection: Option<PgcFixtureCollection>,
+}
+
+struct PgcFixtureTaskSpec {
+    ordinal: usize,
+    task_id: &'static str,
+    url: &'static str,
+    collection_title: Option<&'static str>,
+    entries: Vec<PgcFixtureEntry>,
+    with_verified_attempt: bool,
+}
+
+fn add_completed_bilibili_plan_fixture(
+    queue: &QueueManager,
+    video_root: &Path,
+    spec: PgcFixtureTaskSpec,
+) -> Vec<String> {
+    let PgcFixtureTaskSpec {
+        ordinal,
+        task_id,
+        url,
+        collection_title,
+        entries,
+        with_verified_attempt,
+    } = spec;
+    let mut relative_paths = Vec::new();
+    let mut stable_media_ids = Vec::new();
+    let mut group_entries = Vec::new();
+    let mut media_hashes = BTreeMap::new();
+
+    for entry in &entries {
+        let index = entry.index;
+        let stable_media_id = &entry.stable_media_id;
+        let relative_path = format!("{task_id}/episode-{index:02}.mp4");
+        let media_path = video_root.join(&relative_path);
+        fs::create_dir_all(media_path.parent().expect("fixture media has a parent"))
+            .expect("fixture episode directory should create");
+        fs::write(&media_path, b"synthetic, silent media fixture")
+            .expect("fixture episode should write");
+
+        let identity = parse_bilibili_stable_media_id(stable_media_id)
+            .expect("fixture Bilibili identity should parse");
+        let mut nfo = format!("<movie><title>Episode {index:02}</title>");
+        for source_id in &identity.source_ids {
+            let (kind, value) = if source_id.starts_with("BV") {
+                ("bilibili", source_id.as_str())
+            } else if let Some(value) = source_id.strip_prefix("av") {
+                ("bilibili-aid", value)
+            } else if let Some(value) = source_id.strip_prefix("cid") {
+                ("bilibili-cid", value)
+            } else if let Some(value) = source_id.strip_prefix("ep") {
+                ("bilibili-epid", value)
+            } else {
+                continue;
+            };
+            nfo.push_str(&format!("<uniqueid type=\"{kind}\">{value}</uniqueid>"));
+        }
+        nfo.push_str("<trailer>https://www.bilibili.com/bangumi/media/md1376</trailer><studio>番剧</studio><premiered>2010-04-03</premiered><year>2010</year>");
+        if let Some(existing_collection) = &entry.nfo_collection {
+            nfo.push_str(&format!(
+                "<set>{}</set><setid>{}</setid><settype>curated</settype><episode>{}</episode>",
+                existing_collection.title, existing_collection.id, existing_collection.order
+            ));
+        }
+        nfo.push_str("</movie>");
+        fs::write(media_path.with_extension("nfo"), nfo).expect("fixture episode NFO should write");
+
+        relative_paths.push(relative_path);
+        stable_media_ids.push(stable_media_id.clone());
+        group_entries.push(crate::queue::BilibiliGroupEntryIdentity {
+            index,
+            title: format!("Episode {index:02}"),
+            stable_media_id: stable_media_id.clone(),
+        });
+        media_hashes.insert(media_path.display().to_string(), "a".repeat(64));
+    }
+
+    let mut record = TaskRecord::new(
+        task_id.to_string(),
+        ordinal as i64 + 1,
+        ordinal as i64 + 1,
+        123_456_789,
+        Some(123_456_789),
+        ordinal,
+        JobRequest::Bilibili {
+            url: url.to_string(),
+            selection: None,
+        },
+    );
+    record.status = TaskStatus::Completed;
+    record.saved_location = relative_paths
+        .first()
+        .map(|path| video_root.join(path).display().to_string());
+    record.primary_media_hashes = media_hashes;
+    let publication_namespace = record.bilibili_publication_namespace();
+    record.plan = Some(PlanValidationSnapshot {
+        stable_media_ids,
+        title: collection_title.map(str::to_string),
+        bilibili_publication_namespace: Some(publication_namespace),
+        bilibili_group_entries: group_entries,
+        ..PlanValidationSnapshot::default()
+    });
+    if with_verified_attempt {
+        let mut attempt = BilibiliAttemptSnapshot::new_independent(
+            collection_title
+                .expect("verified PGC attempt fixtures should have a title")
+                .to_string(),
+            entries.iter().map(|entry| {
+                (
+                    entry.index,
+                    format!("Episode {:02}", entry.index),
+                    Some(entry.stable_media_id.clone()),
+                )
+            }),
+            0,
+        );
+        attempt.bilibili_publication_namespace = Some(record.bilibili_publication_namespace());
+        for entry in &entries {
+            let media_path = video_root.join(format!("{task_id}/episode-{:02}.mp4", entry.index));
+            attempt.entry_verified_with_outputs(
+                entry.index,
+                vec![media_path.clone()],
+                BTreeMap::from([(media_path.display().to_string(), "a".repeat(64))]),
+            );
+        }
+        attempt.finish(BilibiliAttemptOutcome::Verified);
+        record.bilibili_attempt = Some(attempt);
+    }
+    queue
+        .create(record)
+        .expect("completed Bilibili fixture record should persist");
+
+    relative_paths
+}
+
+fn cloud_snapshot_item_for_path<'a>(
+    items: &'a [serde_json::Value],
+    relative_path: &str,
+) -> &'a serde_json::Value {
+    items
+        .iter()
+        .find(|item| item["relative_path"] == relative_path)
+        .unwrap_or_else(|| panic!("cloud snapshot should contain {relative_path}"))
+}
+
+#[tokio::test]
+async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
+    let root = temp_cloud_bot_dir("pgc-collection-cloud-snapshot");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config.telegram.allowed_chat_ids = vec![123_456_789];
+    config
+        .ensure_runtime_dirs()
+        .expect("temporary media roots should create");
+    let file_provider: Arc<dyn QueueFileProvider> = Arc::new(MockQueueFileProvider::default());
+    let queue = Arc::new(
+        QueueManager::open_with_file_provider(&config, Arc::clone(&file_provider))
+            .expect("task queue should open"),
+    );
+    let inbox = Arc::new(
+        open_runtime_test_inbox_with_file_provider(
+            &config.downloads.video_dir,
+            Arc::clone(&file_provider),
+        )
+        .expect("cloud inbox should open"),
+    );
+
+    // Match the persisted `/bangumi/media/md1376` plan shape: one explicit PGC URL,
+    // one title, stable episode identities, publication namespace, and ordered group entries.
+    let md1376_entries = (1..=203_u32)
+        .map(|index| PgcFixtureEntry {
+            index,
+            stable_media_id: pgc_test_stable_media_id(
+                9_000 + u64::from(index),
+                10_000 + u64::from(index),
+            ),
+            nfo_collection: None,
+        })
+        .collect::<Vec<_>>();
+    let md1376_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 0,
+            task_id: "pgc-md1376",
+            url: "https://www.bilibili.com/bangumi/media/md1376",
+            collection_title: Some("家庭教师HITMAN REBORN!"),
+            entries: md1376_entries,
+            with_verified_attempt: true,
+        },
+    );
+    let ss_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 1,
+            task_id: "pgc-ss8621",
+            url: "https://www.bilibili.com/bangumi/play/ss8621",
+            collection_title: Some("Synthetic SS Season"),
+            entries: vec![
+                PgcFixtureEntry {
+                    index: 1,
+                    stable_media_id: pgc_test_stable_media_id(50_001, 60_001),
+                    nfo_collection: Some(PgcFixtureCollection {
+                        title: "Existing NFO Collection",
+                        id: "nfo-curated-set",
+                        order: 41,
+                    }),
+                },
+                PgcFixtureEntry {
+                    index: 2,
+                    stable_media_id: pgc_test_stable_media_id(50_002, 60_002),
+                    nfo_collection: None,
+                },
+            ],
+            with_verified_attempt: false,
+        },
+    );
+    let ep_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 2,
+            task_id: "pgc-ep-single",
+            url: "https://www.bilibili.com/bangumi/play/ep11001",
+            collection_title: Some("Single Episode Title"),
+            entries: vec![PgcFixtureEntry {
+                index: 1,
+                stable_media_id: pgc_test_stable_media_id(70_001, 70_001),
+                nfo_collection: None,
+            }],
+            with_verified_attempt: false,
+        },
+    );
+    let repeated_episode_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 3,
+            task_id: "pgc-one-distinct-episode",
+            url: "https://www.bilibili.com/bangumi/media/md9000",
+            collection_title: Some("Insufficient Episode Evidence"),
+            entries: vec![
+                PgcFixtureEntry {
+                    index: 1,
+                    stable_media_id: pgc_test_stable_media_id(30_001, 30_001),
+                    nfo_collection: None,
+                },
+                PgcFixtureEntry {
+                    index: 2,
+                    stable_media_id: pgc_test_stable_media_id(30_002, 30_001),
+                    nfo_collection: None,
+                },
+            ],
+            with_verified_attempt: false,
+        },
+    );
+    let untitled_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 4,
+            task_id: "pgc-without-title",
+            url: "https://www.bilibili.com/bangumi/media/md9001",
+            collection_title: None,
+            entries: vec![
+                PgcFixtureEntry {
+                    index: 1,
+                    stable_media_id: pgc_test_stable_media_id(40_001, 40_001),
+                    nfo_collection: None,
+                },
+                PgcFixtureEntry {
+                    index: 2,
+                    stable_media_id: pgc_test_stable_media_id(40_002, 40_002),
+                    nfo_collection: None,
+                },
+            ],
+            with_verified_attempt: false,
+        },
+    );
+
+    let (telegram, mut telegram_requests, telegram_shutdown, telegram_server) =
+        spawn_fake_telegram_api().await;
+    let runtime = make_runtime(
+        telegram,
+        config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let manager = open_cloud_library_manager_with_test_hook(
+        &runtime.bot,
+        Arc::clone(&inbox),
+        Some(Arc::clone(&file_provider)),
+        || Ok(()),
+    )
+    .expect("temporary library manager should open with the mock provider");
+    let snapshot = manager
+        .scan(&queue_source_hints(&runtime.bot).expect("persisted queue hints should load"))
+        .expect("temporary media library scan should finish");
+    let default_library_id = queue
+        .default_video_destination()
+        .expect("temporary default library should resolve")
+        .library_id;
+    *runtime.library_snapshot.lock().await = Some(snapshot.clone());
+    runtime
+        .library_snapshots
+        .lock()
+        .await
+        .insert(default_library_id, snapshot);
+    let cloud_snapshot = build_cloud_state_snapshot(&runtime)
+        .await
+        .expect("cloud snapshot should serialize")
+        .expect("runtime should publish a cloud snapshot");
+    let items = cloud_snapshot.library["items"]
+        .as_array()
+        .expect("cloud library should contain scanned items");
+    assert_eq!(md1376_paths.len(), 203);
+    assert_eq!(
+        items.len(),
+        210,
+        "cloud snapshot should retain every fixture item"
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item["collection"]["id"] == "md1376")
+            .count(),
+        203,
+        "cloud snapshot should retain all 203 PGC collection annotations"
+    );
+
+    let md_first = cloud_snapshot_item_for_path(items, &md1376_paths[0]);
+    assert_eq!(md_first["collection"]["id"], "md1376");
+    assert_eq!(md_first["collection"]["title"], "家庭教师HITMAN REBORN!");
+    assert_eq!(md_first["collection"]["order"], 1);
+    assert_eq!(md_first["metadata_status"], "complete");
+    let md_last_path = md1376_paths
+        .last()
+        .expect("203-entry PGC fixture should have a last episode");
+    let md_last = cloud_snapshot_item_for_path(items, md_last_path);
+    assert_eq!(md_last["collection"]["id"], "md1376");
+    assert_eq!(md_last["collection"]["order"], 203);
+    assert_eq!(md_last["collection"]["part_id"], "10203");
+    assert_eq!(md_last["metadata_status"], "complete");
+
+    let ss_first = cloud_snapshot_item_for_path(items, &ss_paths[0]);
+    assert_eq!(ss_first["collection"]["id"], "nfo-curated-set");
+    assert_eq!(ss_first["collection"]["title"], "Existing NFO Collection");
+    assert_eq!(ss_first["collection"]["order"], 41);
+    let ss_second = cloud_snapshot_item_for_path(items, &ss_paths[1]);
+    assert_eq!(ss_second["collection"]["id"], "ss8621");
+    assert_eq!(ss_second["collection"]["title"], "Synthetic SS Season");
+    assert_eq!(ss_second["collection"]["kind"], "bilibili_season");
+    assert_eq!(ss_second["collection"]["order"], 2);
+    assert_eq!(ss_second["collection"]["part_id"], "60002");
+
+    for path in [
+        &ep_paths[0],
+        &repeated_episode_paths[0],
+        &repeated_episode_paths[1],
+        &untitled_paths[0],
+        &untitled_paths[1],
+    ] {
+        assert!(
+            cloud_snapshot_item_for_path(items, path)["collection"].is_null(),
+            "single/duplicate-episode evidence and missing titles must not infer a collection"
+        );
+    }
+
+    assert!(take_cloud_test_telegram_requests(&mut telegram_requests).is_empty());
+    stop_fake_telegram_api(telegram_shutdown, telegram_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    fs::remove_dir_all(root).expect("temporary fixture roots should clean up");
+}
+
 #[test]
 fn local_transient_retries_back_off_to_one_minute() {
     assert_eq!(cloud_retry_delay_seconds(1), 5);

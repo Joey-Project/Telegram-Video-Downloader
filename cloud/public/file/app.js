@@ -746,7 +746,7 @@ function itemRow(item, selectionEnabled = true) {
     <input class="row-check" type="checkbox" aria-label="Select ${escapeHtml(item.title ?? item.relative_path)}" data-select-item="${escapeHtml(id)}" ${selected ? "checked" : ""} ${isPresentMedia(item) && selectionEnabled ? "" : "disabled"}>
     <div class="media-icon" aria-hidden="true">▣</div>
     <div class="media-main"><div class="media-title"><span>${escapeHtml(item.title || item.relative_path || "Untitled video")}</span></div><div class="media-path">${escapeHtml(item.relative_path || "Path unavailable")}</div></div>
-    <div class="media-meta"><span><i class="status-dot ${escapeHtml(presence)}"></i>${displayStatus}</span><span>${formatBytes(item.bytes)}</span>${dims ? `<span>${dims}</span>` : ""}${codec ? `<span>${codec}</span>` : ""}<button class="details-button" type="button" data-details="${escapeHtml(id)}">Details</button></div>
+    <div class="media-actions"><div class="media-meta"><span><i class="status-dot ${escapeHtml(presence)}"></i>${displayStatus}</span><span>${formatBytes(item.bytes)}</span>${dims ? `<span>${dims}</span>` : ""}${codec ? `<span>${codec}</span>` : ""}</div><button class="details-button media-details" type="button" data-details="${escapeHtml(id)}">Details</button></div>
   </article>`;
 }
 
@@ -858,6 +858,10 @@ function renderLibrary() {
   byId("conflict-select").disabled = !canOperate;
   byId("preview-move").disabled = !canOperate || state.selected.size === 0;
   byId("import-legacy").disabled = !canOperate;
+  const selectionActions = byId("selection-actions");
+  selectionActions.classList.toggle("hidden", state.selected.size === 0);
+  byId("selection-count").textContent = `${state.selected.size} ${state.selected.size === 1 ? "item" : "items"} selected`;
+  byId("organize-selected").disabled = !canOperate || state.selected.size === 0;
 }
 
 function operationTitle(operation) {
@@ -1543,6 +1547,19 @@ function bindEvents() {
   byId("category-filter").addEventListener("input", () => { state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
   byId("status-filter").addEventListener("change", () => { state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
   byId("select-visible").addEventListener("click", selectVisible);
+  byId("organize-selected").addEventListener("click", () => {
+    if (!state.selected.size) return;
+    if (!libraryCanOperate()) return showToast("This library is offline or showing a saved scan. Reconnect it before changing files.");
+    state.view = "organizing";
+    render();
+    const moveCard = byId("move-files-card");
+    moveCard?.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+    moveCard?.focus({ preventScroll: true });
+  });
+  byId("clear-selection").addEventListener("click", () => {
+    state.selected.clear();
+    render();
+  });
   byId("target-dir").addEventListener("input", renderFilters);
   byId("root-target").addEventListener("click", () => { byId("target-dir").value = ""; renderFilters(); byId("target-dir").focus(); });
   byId("preview-move").addEventListener("click", () => {

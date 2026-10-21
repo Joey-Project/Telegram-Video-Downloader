@@ -63,7 +63,7 @@
               <datalist id="category-folders"></datalist>
               <select id="status-filter" class="select-control" aria-label="Filter by file status"><option value="">All statuses</option><option value="present">Available</option><option value="unavailable">Unavailable</option><option value="missing">Missing</option><option value="unknown">Unknown</option></select>
               <button id="download-here" class="secondary-button" type="button">Download here</button>
-              <button id="select-visible" class="quiet-button" type="button">Select visible</button>
+              <button id="select-visible" class="quiet-button" type="button">Select this page</button>
             </div>
             <div class="library-context"><span id="library-local-status" class="badge">Availability not reported</span><code id="library-location">Media root unavailable</code><a class="small-button" href="/settings/">Manage libraries</a></div>
             <div id="library-summary" class="section-summary"></div>
@@ -85,7 +85,7 @@
 
           <section id="view-organizing" class="view-panel hidden">
             <div class="panel-heading"><div><p class="eyebrow">SAFE CHANGES</p><h2>Review before applying</h2><p>Every move and metadata update needs a preview and a separate confirmation.</p></div></div>
-            <section class="organize-card">
+            <section id="move-files-card" class="organize-card" tabindex="-1">
               <div class="organize-card-heading"><span class="step-number">1</span><div><h3>Move selected files</h3><p>Choose a destination and review the complete plan before moving anything.</p></div></div>
               <div class="organize-controls">
                 <label class="field-label" for="target-dir">Destination folder <span class="field-hint">Use / for nested folders. Leave blank for the library root.</span></label>
@@ -125,6 +125,13 @@
             <div id="preview-list" class="stack-list"></div>
             <div id="operation-list" class="stack-list"></div>
           </section>
+          <aside id="selection-actions" class="selection-actions hidden" role="region" aria-label="Selection actions" aria-live="polite">
+            <div class="selection-actions-inner">
+              <span id="selection-count" class="selection-count"></span>
+              <button id="organize-selected" class="primary-button" type="button">Organize selected</button>
+              <button id="clear-selection" class="quiet-button" type="button">Clear selection</button>
+            </div>
+          </aside>
         </div>
       </main>
       <footer class="footer"><span>Actions run on your connected computer.</span><span id="queued-actions"></span></footer>
