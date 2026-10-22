@@ -65,6 +65,9 @@ struct FakeCloudApiState {
     state_posts: StdMutex<Vec<serde_json::Value>>,
     state_post_statuses: StdMutex<Vec<u16>>,
     state_post_response_headers: StdMutex<Vec<Vec<(String, String)>>>,
+    state_chunks: StdMutex<HashMap<(String, String), String>>,
+    state_chunk_posts: AtomicUsize,
+    state_chunk_statuses: StdMutex<Vec<u16>>,
 }
 
 struct PauseOnDirectoryReadProvider {
@@ -288,8 +291,9 @@ async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTel
     let request_path = request_line
         .split_whitespace()
         .nth(1)
-        .context("fake HTTP request path was missing")?;
-    let method = request_path
+        .context("fake HTTP request path was missing")?
+        .to_string();
+    let mut method = request_path
         .split('?')
         .next()
         .context("fake HTTP request target was missing")?
@@ -330,7 +334,14 @@ async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTel
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
-    let body = if content_length == 0 {
+    let body = if let Some(hash) = request_path.strip_prefix("/api/local/state/chunks/") {
+        method = "state_chunk".to_string();
+        serde_json::json!({
+            "sha256": hash,
+            "data": std::str::from_utf8(&bytes[header_end..body_end])
+                .context("fake snapshot chunk should be UTF-8")?,
+        })
+    } else if content_length == 0 {
         serde_json::json!({})
     } else {
         serde_json::from_slice(&bytes[header_end..body_end])
@@ -425,6 +436,42 @@ async fn spawn_fake_cloud_api(
     .await
 }
 
+fn decode_fake_chunked_snapshot(
+    body: &serde_json::Value,
+    chunks: &HashMap<(String, String), String>,
+    epoch: &str,
+) -> Result<serde_json::Value> {
+    let decode_partition = |name: &str| -> Result<serde_json::Value> {
+        let refs = body[name]["chunks"]
+            .as_array()
+            .context("chunk refs should be an array")?;
+        let mut bytes = Vec::new();
+        for reference in refs {
+            let hash = reference["sha256"]
+                .as_str()
+                .context("chunk hash should be a string")?;
+            let data = chunks
+                .get(&(epoch.to_string(), hash.to_string()))
+                .context("snapshot chunk is missing")?;
+            anyhow::ensure!(
+                Some(data.len() as u64) == reference["bytes"].as_u64(),
+                "chunk byte count must match"
+            );
+            bytes.extend_from_slice(data.as_bytes());
+        }
+        anyhow::ensure!(
+            Some(bytes.len() as u64) == body[name]["bytes"].as_u64(),
+            "partition byte count must match"
+        );
+        serde_json::from_slice(&bytes).context("snapshot partition should be JSON")
+    };
+    let mut state = decode_partition("state")?;
+    state["library"] = decode_partition("library")?;
+    state["state_version"] = body["state_version"].clone();
+    state["reported_at"] = body["reported_at"].clone();
+    Ok(state)
+}
+
 async fn spawn_fake_cloud_api_with_epoch(
     inbox_root: PathBuf,
     pending: Vec<CloudRequest>,
@@ -456,6 +503,9 @@ async fn spawn_fake_cloud_api_with_epoch(
         state_posts: StdMutex::new(Vec::new()),
         state_post_statuses: StdMutex::new(Vec::new()),
         state_post_response_headers: StdMutex::new(Vec::new()),
+        state_chunks: StdMutex::new(HashMap::new()),
+        state_chunk_posts: AtomicUsize::new(0),
+        state_chunk_statuses: StdMutex::new(Vec::new()),
     });
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let task_state = Arc::clone(&state);
@@ -473,8 +523,52 @@ async fn spawn_fake_cloud_api_with_epoch(
                         stream.write_all(fake_http_response(401, &serde_json::json!({"error":"unauthorized"})).as_bytes()).await?;
                         continue;
                     }
+                    let decoded_chunked = if request.method == "state"
+                        && request.body["format"] == "chunked-v1"
+                        && request.database_epoch.as_deref() == Some(task_state.database_epoch.lock().unwrap().as_str())
+                    {
+                        let decoded = {
+                            let epoch = task_state.database_epoch.lock().unwrap().clone();
+                            let chunks = task_state.state_chunks.lock().unwrap();
+                            decode_fake_chunked_snapshot(&request.body, &chunks, &epoch)
+                        };
+                        match decoded {
+                            Ok(body) => Some(body),
+                            Err(_) => {
+                                task_state.state_posts.lock().unwrap().push(serde_json::json!({
+                                    "status": 428, "wire_format": "chunked-v1",
+                                    "state_version": request.body["state_version"],
+                                }));
+                                stream.write_all(fake_http_response(428, &serde_json::json!({"error":"snapshot chunks missing"})).as_bytes()).await?;
+                                continue;
+                            }
+                        }
+                    } else { None };
                     let mut response_headers = Vec::new();
                     let (status, payload) = match request.method.as_str() {
+                        "state_chunk" => {
+                            let epoch = task_state.database_epoch.lock().unwrap().clone();
+                            if request.database_epoch.as_deref() != Some(epoch.as_str()) {
+                                response_headers.push(("X-Cloud-Database-Epoch".to_string(), epoch));
+                                (409, serde_json::json!({"error":"database epoch changed"}))
+                            } else {
+                                task_state.state_chunk_posts.fetch_add(1, AtomicOrdering::SeqCst);
+                                let hash = request.body["sha256"].as_str().unwrap_or_default();
+                                let data = request.body["data"].as_str().unwrap_or_default();
+                                if data.len() > 32 * 1024 || format!("{:x}", Sha256::digest(data.as_bytes())) != hash {
+                                    (400, serde_json::json!({"error":"chunk integrity mismatch"}))
+                                } else {
+                                    let status = {
+                                        let mut statuses = task_state.state_chunk_statuses.lock().unwrap();
+                                        if statuses.is_empty() { 200 } else { statuses.remove(0) }
+                                    };
+                                    if (200..300).contains(&status) {
+                                        task_state.state_chunks.lock().unwrap().insert((epoch, hash.to_string()), data.to_string());
+                                    }
+                                    (status, serde_json::json!({"stored": (200..300).contains(&status)}))
+                                }
+                            }
+                        }
                         "requests" => {
                             task_state.fetch_count.fetch_add(1, AtomicOrdering::SeqCst);
                             let pending = task_state.pending.lock().expect("fake cloud state lock should not poison").clone();
@@ -586,8 +680,26 @@ async fn spawn_fake_cloud_api_with_epoch(
                                 response_headers.push(("X-Cloud-Database-Epoch".to_string(), current_epoch));
                                 (409, serde_json::json!({"error":"database epoch changed"}))
                             } else {
-                            let library = &request.body["library"];
-                            let mut content = request.body.clone();
+                            let wire_format = request.body["format"].as_str().unwrap_or("legacy");
+                            let state_body = if let Some(body) = decoded_chunked {
+                                body
+                            } else if wire_format == "prepared-v1" {
+                                let mut body: serde_json::Value = serde_json::from_str(
+                                    request.body["state_json"].as_str()
+                                        .context("prepared state partition should be a string")?
+                                ).context("prepared state partition should parse")?;
+                                body["library"] = serde_json::from_str(
+                                    request.body["library_json"].as_str()
+                                        .context("prepared library partition should be a string")?
+                                ).context("prepared library partition should parse")?;
+                                body["state_version"] = request.body["state_version"].clone();
+                                body["reported_at"] = request.body["reported_at"].clone();
+                                body
+                            } else {
+                                request.body.clone()
+                            };
+                            let library = &state_body["library"];
+                            let mut content = state_body.clone();
                             if let Some(content) = content.as_object_mut() {
                                 content.remove("reported_at");
                                 content.remove("state_version");
@@ -641,7 +753,11 @@ async fn spawn_fake_cloud_api_with_epoch(
                                 .as_array()
                                 .into_iter()
                                 .flatten()
-                                .map(|descriptor| serde_json::json!({
+                                .map(|descriptor| {
+                                    let snapshot = descriptor.get("snapshot")
+                                        .filter(|value| value.is_object())
+                                        .or_else(|| (descriptor["id"] == library["default_library_id"]).then_some(library));
+                                    serde_json::json!({
                                     "id": descriptor["id"],
                                     "availability": descriptor["availability"],
                                     "media_count": descriptor["media_count"],
@@ -649,11 +765,12 @@ async fn spawn_fake_cloud_api_with_epoch(
                                     "free_bytes": descriptor["free_bytes"],
                                     "incomplete_task_count": descriptor["incomplete_task_count"],
                                     "staging_bytes": descriptor["staging_bytes"],
-                                    "snapshot_ready": descriptor["snapshot"]["ready"],
-                                    "snapshot_incomplete": descriptor["snapshot"]["incomplete"],
-                                }))
+                                    "has_nested_snapshot": descriptor.get("snapshot").is_some(),
+                                    "snapshot_ready": snapshot.and_then(|value| value.get("ready")),
+                                    "snapshot_incomplete": snapshot.and_then(|value| value.get("incomplete")),
+                                })})
                                 .collect::<Vec<_>>();
-                            let operations = &request.body["operations"];
+                            let operations = &state_body["operations"];
                             let operations_bytes = serde_json::to_vec(operations)
                                 .context("fake state operations should serialize")?;
                             let operation_hash = format!("{:x}", Sha256::digest(&operations_bytes));
@@ -674,7 +791,7 @@ async fn spawn_fake_cloud_api_with_epoch(
                             let library_warning_bytes = serde_json::to_vec(&library["warnings"])
                                 .context("fake library warnings should serialize")?
                                 .len();
-                            let tasks = request.body["tasks"].clone();
+                            let tasks = state_body["tasks"].clone();
                             let status = {
                                 let mut statuses = task_state.state_post_statuses
                                     .lock()
@@ -683,9 +800,10 @@ async fn spawn_fake_cloud_api_with_epoch(
                             };
                             let summary = serde_json::json!({
                                 "status": status,
-                                "state_version": request.body["state_version"],
-                                "reported_at": request.body["reported_at"],
-                                "revision": request.body["revision"],
+                                "wire_format": wire_format,
+                                "state_version": state_body["state_version"],
+                                "reported_at": state_body["reported_at"],
+                                "revision": state_body["revision"],
                                 "content_hash": content_hash,
                                 "stable_content_hash": stable_content_hash,
                                 "state_field_hashes": state_field_hashes,

@@ -35,6 +35,7 @@ async fn cloud_state_reporter_retries_transient_failure_with_same_content_and_sy
     runtime.state_notify.notify_one();
 
     let posts = wait_for_state_posts(&cloud_state, 2).await;
+    assert_eq!(posts[0]["wire_format"], "chunked-v1");
     assert_eq!(posts[0]["status"], 503);
     assert_eq!(posts[1]["status"], 200);
     assert_eq!(posts[0]["state_version"], posts[1]["state_version"]);
@@ -51,6 +52,139 @@ async fn cloud_state_reporter_retries_transient_failure_with_same_content_and_sy
     assert_eq!(posts[2]["revision"], "updated");
     assert!(posts[2]["state_version"].as_u64() > posts[1]["state_version"].as_u64());
     assert_ne!(posts[2]["content_hash"], posts[1]["content_hash"]);
+
+    reporter.abort();
+    let _ = reporter.await;
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn cloud_state_retry_backoff_grows_to_a_cap_and_resets_after_success() {
+    let base = Duration::from_secs(5);
+    let cap = Duration::from_secs(300);
+    let mut backoff = CloudStateRetryBackoff::new(base, cap);
+    let expected_ceilings = [5, 10, 20, 40, 80, 160, 300, 300];
+
+    for seconds in expected_ceilings {
+        let ceiling = backoff.ceiling();
+        assert_eq!(ceiling, Duration::from_secs(seconds));
+        let delay = backoff.next_delay();
+        assert!(
+            delay >= ceiling / 2,
+            "jitter must not collapse to a tight retry"
+        );
+        assert!(
+            delay <= ceiling,
+            "jitter must stay below the current ceiling"
+        );
+    }
+
+    backoff.reset();
+
+    assert_eq!(backoff.ceiling(), base);
+    let first_retry_after_reset = backoff.next_delay();
+    assert!(first_retry_after_reset >= base / 2);
+    assert!(first_retry_after_reset <= base);
+}
+
+#[tokio::test]
+async fn cloud_state_retry_backoff_grows_resets_and_ignores_notifications_while_pending() {
+    let root = temp_cloud_bot_dir("state-reporter-backoff-reset");
+    let mut config = AppConfig::for_test();
+    config.downloads.video_dir = root.join("videos");
+    config.downloads.pdf_dir = root.join("pdfs");
+    config
+        .ensure_runtime_dirs()
+        .expect("test download roots should create");
+    let queue = Arc::new(QueueManager::open(&config).expect("task queue should open"));
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&config.downloads.video_dir).expect("cloud inbox should open"),
+    );
+    let (cloud_base_url, cloud_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(config.downloads.video_dir.clone(), Vec::new()).await;
+    cloud_state
+        .state_post_statuses
+        .lock()
+        .expect("fake state status lock should not poison")
+        .extend([503, 503, 200, 503, 200]);
+
+    let mut runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        config,
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    runtime.client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("initial"));
+    let retry_base = Duration::from_millis(120);
+    let reporter = tokio::spawn(cloud_state_reporter_with_retry_policy(
+        runtime.clone(),
+        Duration::from_secs(30),
+        retry_base,
+        Duration::from_secs(1),
+    ));
+    runtime.state_notify.notify_one();
+
+    let posts = wait_for_state_posts(&cloud_state, 1).await;
+    assert_eq!(posts[0]["status"], 503);
+    runtime.state_notify.notify_one();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(
+        cloud_state
+            .state_posts
+            .lock()
+            .expect("fake state post lock should not poison")
+            .len(),
+        1,
+        "state changes must not bypass a pending delivery's retry delay"
+    );
+
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 3),
+    )
+    .await
+    .expect("the pending content should retry and recover");
+    for post in &posts[..3] {
+        assert_eq!(post["state_version"], posts[0]["state_version"]);
+        assert_eq!(post["content_hash"], posts[0]["content_hash"]);
+    }
+    assert_eq!(posts[1]["status"], 503);
+    assert_eq!(posts[2]["status"], 200);
+    let first_retry_delay =
+        posts[1]["reported_at"].as_u64().unwrap() - posts[0]["reported_at"].as_u64().unwrap();
+    let second_retry_delay =
+        posts[2]["reported_at"].as_u64().unwrap() - posts[1]["reported_at"].as_u64().unwrap();
+    assert!(first_retry_delay >= (retry_base / 2).as_millis() as u64);
+    assert!(second_retry_delay >= retry_base.as_millis() as u64);
+
+    *runtime.library_snapshot.lock().await = Some(empty_cloud_test_library_snapshot("updated"));
+    runtime.state_notify.notify_one();
+    let posts = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_state_posts(&cloud_state, 5),
+    )
+    .await
+    .expect("the changed snapshot should be delivered after the prior success");
+    assert_eq!(posts[3]["status"], 503);
+    assert_eq!(posts[3]["revision"], "updated");
+    assert_eq!(posts[4]["status"], 200);
+    assert_eq!(posts[3]["state_version"], posts[4]["state_version"]);
+    assert_eq!(posts[3]["content_hash"], posts[4]["content_hash"]);
+    let delay_after_success =
+        posts[4]["reported_at"].as_u64().unwrap() - posts[3]["reported_at"].as_u64().unwrap();
+    assert!(
+        delay_after_success >= (retry_base / 2).as_millis() as u64,
+        "the retry after a successful delivery should use the reset first-step range"
+    );
 
     reporter.abort();
     let _ = reporter.await;
@@ -225,6 +359,11 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
     runtime.state_notify.notify_one();
     let posts = wait_for_state_posts(&cloud_state, 1).await;
     assert_eq!(posts[0]["status"], 200);
+    assert_eq!(
+        posts[0]["library_descriptor_status"][0]["has_nested_snapshot"], false,
+        "the top-level default snapshot should not be serialized a second time in its descriptor"
+    );
+    assert_eq!(posts[0]["library_descriptor_status"][0]["media_count"], 1);
     assert_eq!(posts[0]["revision"], "cached-library-revision");
     assert_eq!(posts[0]["library_scanned_at"], 1_800_000_123_u64);
     assert_eq!(posts[0]["library_item_count"], 1);
@@ -304,6 +443,10 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
     assert_eq!(
         posts[2]["library_descriptor_status"][0]["availability"],
         "available"
+    );
+    assert_eq!(
+        posts[2]["library_descriptor_status"][0]["has_nested_snapshot"],
+        false
     );
     assert!(
         posts[2]["library_descriptor_status"][0]["free_bytes"]
@@ -953,6 +1096,8 @@ async fn cloud_state_reporter_advances_same_version_conflict_and_heartbeats_the_
     let first = wait_for_state_posts(&cloud_state, 1).await;
     assert_eq!(first[0]["status"], 409);
     assert_eq!(first[0]["state_version"], 1);
+    let chunk_uploads_after_conflict = cloud_state.state_chunk_posts.load(AtomicOrdering::SeqCst);
+    assert!(chunk_uploads_after_conflict > 0);
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(
         cloud_state
@@ -974,6 +1119,11 @@ async fn cloud_state_reporter_advances_same_version_conflict_and_heartbeats_the_
     assert_eq!(posts[1]["state_version"], 2);
     assert_eq!(posts[0]["content_hash"], posts[1]["content_hash"]);
     assert_ne!(posts[0]["reported_at"], posts[1]["reported_at"]);
+    assert_eq!(
+        cloud_state.state_chunk_posts.load(AtomicOrdering::SeqCst),
+        chunk_uploads_after_conflict,
+        "version rebases must reuse durable content-addressed chunks"
+    );
 
     let posts = tokio::time::timeout(
         Duration::from_secs(3),
@@ -1184,8 +1334,9 @@ async fn cloud_state_reporter_retries_unknown_conflicts_and_paces_version_exhaus
             .as_u64()
             .expect("reported_at should be Unix milliseconds");
         assert!(
-            later_reported_at.abs_diff(earlier_reported_at) >= retry_backoff.as_millis() as u64,
-            "unknown conflicts must wait for the configured retry backoff"
+            later_reported_at.abs_diff(earlier_reported_at)
+                >= (retry_backoff / 2).as_millis() as u64,
+            "unknown conflicts must wait at least half of the current jitter ceiling"
         );
     }
 
@@ -1388,6 +1539,126 @@ async fn cloud_state_reporter_stops_when_remote_database_epoch_changes() {
     drop(inbox);
     drop(queue);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cloud_state_chunk_cache_retries_partial_uploads_and_clears_after_manifest_428() {
+    let root = temp_cloud_bot_dir("state-chunk-cache-recovery");
+    let (cloud_base_url, cloud_server_state, cloud_shutdown, cloud_server) =
+        spawn_fake_cloud_api(root.clone(), Vec::new()).await;
+    cloud_server_state
+        .state_chunk_statuses
+        .lock()
+        .expect("fake chunk-status lock should not poison")
+        .extend([200, 503, 200]);
+    let client = CloudClient::with_test_base_url(&cloud_base_url)
+        .expect("test cloud client should use localhost");
+    let library = serde_json::json!({
+        "revision": "chunk-cache-library",
+        "scanned_at": 1,
+        "items": [{"id": "chunk-cache-item", "title": "x".repeat(40_000)}],
+        "categories": [],
+        "warnings": [],
+    });
+    let state = direct_chunk_test_state(&library);
+
+    let first = client.post_state(&state).await;
+    assert!(matches!(
+        first,
+        Err(CloudStatePostError::HttpStatus(status))
+            if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    ));
+    let first_chunk_upload_count = cloud_server_state
+        .state_chunk_posts
+        .load(AtomicOrdering::SeqCst);
+    assert_eq!(
+        first_chunk_upload_count, 3,
+        "fixture should span three distinct chunks"
+    );
+    assert!(
+        cloud_server_state
+            .state_posts
+            .lock()
+            .expect("fake state-post lock should not poison")
+            .is_empty(),
+        "a failed chunk must prevent manifest publication"
+    );
+
+    client
+        .post_state(&state)
+        .await
+        .expect("retry should reuse successful chunks and upload the missing chunk");
+    assert_eq!(
+        cloud_server_state
+            .state_chunk_posts
+            .load(AtomicOrdering::SeqCst),
+        first_chunk_upload_count + 1
+    );
+    assert_eq!(
+        cloud_server_state.state_posts.lock().unwrap()[0]["wire_format"],
+        "chunked-v1"
+    );
+
+    cloud_server_state
+        .state_chunks
+        .lock()
+        .expect("fake stored-chunk lock should not poison")
+        .clear();
+    let missing_chunks = client.post_state(&state).await;
+    assert!(matches!(
+        missing_chunks,
+        Err(CloudStatePostError::HttpStatus(status))
+            if status == reqwest::StatusCode::PRECONDITION_REQUIRED
+    ));
+    assert!(
+        CloudStatePostError::HttpStatus(reqwest::StatusCode::PRECONDITION_REQUIRED).is_retryable()
+    );
+    assert_eq!(
+        cloud_server_state
+            .state_chunk_posts
+            .load(AtomicOrdering::SeqCst),
+        first_chunk_upload_count + 1,
+        "the client should observe missing chunks before reuploading"
+    );
+
+    client
+        .post_state(&state)
+        .await
+        .expect("428 must clear the epoch cache so the next attempt restores chunks");
+    assert_eq!(
+        cloud_server_state
+            .state_chunk_posts
+            .load(AtomicOrdering::SeqCst),
+        first_chunk_upload_count + 1 + 3
+    );
+    assert_eq!(
+        cloud_server_state
+            .state_posts
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()["status"],
+        200
+    );
+
+    stop_fake_cloud_api(cloud_shutdown, cloud_server).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn direct_chunk_test_state(library: &serde_json::Value) -> CloudState<'_> {
+    CloudState {
+        state_version: 1,
+        revision: Some("chunk-cache-state"),
+        reported_at: now_millis(),
+        library,
+        previews: &[],
+        operations: &[],
+        tasks: &[],
+        settings: CloudSettings {
+            download_dir: "/media",
+            applied: None,
+        },
+    }
 }
 
 fn queue_state_post_response(

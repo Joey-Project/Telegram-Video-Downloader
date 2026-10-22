@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { boundedFolderSuggestions, buildMigrationPreviewPayload, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnMediaLibrary, canOperateOnRegisteredMediaLibrary, collectionIdentity, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget } from "../public/file/library-view.js";
+import { acceptOwnerSnapshot } from "../public/file/snapshot-session.js";
 import { updateSelectionWithinLimit } from "../public/file/selection-limit.js";
 import { renderMigrationPreview } from "../public/file/migration-preview-rendering.js";
 import { escapeHtml } from "../public/file/preview-rendering.js";
@@ -36,6 +37,131 @@ describe("bounded library views", () => {
     expect(archive.id).toBe("archive");
     expect(operationMatchesLibrary({ kind: "file_confirm", result: { library_id: "archive" } }, "archive")).toBe(true);
     expect(operationMatchesLibrary({ kind: "file_confirm", result: { library_id: "main" } }, "archive")).toBe(false);
+  });
+
+  it("resolves the compact top-level default snapshot without borrowing it for another library", () => {
+    const snapshot = {
+      settings: {
+        download_dir: "/Volumes/Main",
+        applied: {
+          default_library_id: "main",
+          libraries: [
+            { id: "main", name: "Main", root: "/Volumes/Main", default_category: "Films", is_default: true },
+            { id: "archive", name: "Archive", root: "/Volumes/Archive", default_category: "Old", is_default: false },
+          ],
+        },
+      },
+      library: {
+        revision: "main-revision-7",
+        scanned_at: 1_800_000_000,
+        root_label: "Main",
+        ready: true,
+        default_library_id: "main",
+        items: [{ id: "main-item", title: "Main video", relative_path: "Films/Main.mkv" }],
+        categories: ["Films", "Shows"],
+        warnings: [],
+        libraries: [
+          { id: "main", availability: "available", media_count: 3 },
+          { id: "archive", availability: "available", media_count: 1, snapshot: { revision: "archive-revision-2", items: [{ id: "archive-item" }], categories: ["Old"] } },
+        ],
+      },
+    };
+
+    const entries = mediaLibraryEntries(snapshot);
+    const main = resolveMediaLibrary(snapshot, "main");
+    const archive = resolveMediaLibrary(snapshot, "archive");
+
+    expect(entries[0]).toMatchObject({ id: "main", default_category: "Films", media_count: 3, availability: "available" });
+    expect(entries[0]).not.toHaveProperty("snapshot");
+    expect(main.snapshot).toMatchObject({
+      revision: "main-revision-7",
+      scanned_at: 1_800_000_000,
+      items: [{ id: "main-item" }],
+      categories: ["Films", "Shows"],
+    });
+    expect(archive.snapshot).toMatchObject({ revision: "archive-revision-2", items: [{ id: "archive-item" }] });
+    expect(mediaSnapshotInfo(main.descriptor, main.snapshot)).toMatchObject({ totalCount: 3, retainedCount: 1 });
+    expect(canOperateOnMediaLibrary(main.descriptor)).toBe(true);
+
+    const withoutNestedSnapshots = structuredClone(snapshot);
+    delete (withoutNestedSnapshots.library.libraries[1] as { snapshot?: unknown }).snapshot;
+    expect(resolveMediaLibrary(withoutNestedSnapshots, "archive").snapshot).toBeNull();
+  });
+
+  it("keeps compact default availability, stale, and root-binding gates authoritative", () => {
+    const rootBinding = `v1:${"a".repeat(64)}`;
+    const base = {
+      settings: { applied: { default_library_id: "main", libraries: [{ id: "main", name: "Main", root: "/Volumes/Main", root_binding: rootBinding, is_default: true }] } },
+      library: {
+        default_library_id: "main",
+        root_binding: rootBinding,
+        revision: "main-revision",
+        ready: true,
+        items: [{ id: "main-item" }],
+        categories: ["Films"],
+        libraries: [{ id: "main", root_binding: rootBinding, availability: "available", media_count: 1 }],
+      },
+    };
+
+    const offline = structuredClone(base);
+    offline.library.libraries[0]!.availability = "offline";
+    const stale = structuredClone(base);
+    Object.assign(stale.library.libraries[0]!, { snapshot_stale: true });
+    const replaced = structuredClone(base);
+    replaced.library.libraries[0]!.root_binding = `v1:${"b".repeat(64)}`;
+
+    expect(resolveMediaLibrary(offline, "main").snapshot).toBeNull();
+    expect(canOperateOnRegisteredMediaLibrary(offline, "main")).toBe(false);
+    expect(resolveMediaLibrary(stale, "main").snapshot).toBeNull();
+    expect(canOperateOnRegisteredMediaLibrary(stale, "main")).toBe(false);
+    expect(resolveMediaLibrary(replaced, "main").snapshot).toBeNull();
+    expect(mediaLibraryEntries(replaced)[0]).toMatchObject({ availability: "unavailable", snapshot_stale: true });
+    expect(canOperateOnRegisteredMediaLibrary(replaced, "main")).toBe(false);
+  });
+
+  it("does not let snapshot refresh retain an old nested default over a fresh compact snapshot", () => {
+    const rootBinding = `v1:${"c".repeat(64)}`;
+    const previous = acceptOwnerSnapshot({
+      settings: { applied: { default_library_id: "main", libraries: [{ id: "main", root: "/Volumes/Main", root_binding: rootBinding }] } },
+      library: {
+        default_library_id: "main",
+        items: [{ id: "old-top-level" }],
+        categories: [],
+        libraries: [{ id: "main", root: "/Volumes/Main", root_binding: rootBinding, availability: "available", snapshot: { ready: true, revision: "old", items: [{ id: "old-nested" }] } }],
+      },
+    });
+    const offline = acceptOwnerSnapshot({
+      settings: { applied: { default_library_id: "main", libraries: [{ id: "main", root: "/Volumes/Main", root_binding: rootBinding }] } },
+      library: {
+        default_library_id: "main",
+        items: [],
+        categories: [],
+        libraries: [{ id: "main", root: "/Volumes/Main", root_binding: rootBinding, availability: "offline", snapshot: null }],
+      },
+    }, previous);
+    expect(resolveMediaLibrary(offline.snapshot, "main").snapshot?.items).toMatchObject([{ id: "old-nested", presence: "unavailable" }]);
+    expect(canOperateOnRegisteredMediaLibrary(offline.snapshot, "main")).toBe(false);
+
+    const compactFresh = acceptOwnerSnapshot({
+      settings: { applied: { default_library_id: "main", libraries: [{ id: "main", root: "/Volumes/Main", root_binding: rootBinding }] } },
+      library: {
+        default_library_id: "main",
+        revision: "compact-fresh-revision",
+        ready: true,
+        items: [{ id: "fresh-top-level" }],
+        categories: ["Fresh"],
+        libraries: [{ id: "main", root: "/Volumes/Main", root_binding: rootBinding, availability: "available", media_count: 1 }],
+      },
+    }, offline);
+
+    expect(mediaLibraryEntries(compactFresh.snapshot)[0]).not.toHaveProperty("snapshot_stale");
+    expect(resolveMediaLibrary(compactFresh.snapshot, "main").snapshot).toMatchObject({
+      revision: "compact-fresh-revision",
+      items: [{ id: "fresh-top-level" }],
+      categories: ["Fresh"],
+    });
+    expect(JSON.stringify(compactFresh.snapshot)).not.toContain("old-nested");
+    expect(canOperateOnRegisteredMediaLibrary(compactFresh.snapshot, "main")).toBe(true);
   });
 
   it("does not merge a live descriptor from a different root binding into the registered library", () => {

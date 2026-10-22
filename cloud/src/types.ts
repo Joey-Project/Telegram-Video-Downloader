@@ -126,6 +126,44 @@ export interface LocalSnapshot {
   };
 }
 
+export interface PreparedSnapshotContent {
+  snapshot: LocalSnapshot;
+  libraryJson: string;
+  stateJson: string;
+}
+
+export interface SnapshotChunkDescriptor {
+  sha256: string;
+  bytes: number;
+}
+
+export interface SnapshotChunkManifest {
+  bytes: number;
+  chunks: SnapshotChunkDescriptor[];
+}
+
+export interface ChunkedSnapshotContent {
+  state_version: number;
+  reported_at: number;
+  library_revision: string;
+  library: SnapshotChunkManifest;
+  state: SnapshotChunkManifest;
+}
+
+export interface ChunkedStoredSnapshot {
+  transport: "chunked-v1";
+  format: "chunked-v1";
+  database_epoch: string;
+  synced: true;
+  state_version: number;
+  library_revision: string;
+  reported_at: number;
+  last_seen: number;
+  stale: boolean;
+  library: SnapshotChunkManifest;
+  state: SnapshotChunkManifest;
+}
+
 export class HttpError extends Error {
   constructor(
     readonly status: number,

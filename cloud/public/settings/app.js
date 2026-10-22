@@ -1,9 +1,10 @@
 import { ACTION_QUEUE_LIMIT, ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_SETTINGS, appendAction, consumeRejectedActionReceipts, createQueuedAction, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "/file/action-queue.js";
 import { HttpResponseError } from "/file/http-error.js";
+import { loadOwnerSnapshot } from "/file/snapshot-loader.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "/file/snapshot-session.js";
 import { escapeHtml } from "/file/preview-rendering.js";
 import { validateTargetRelativeDirectory } from "/file/target-directory.js";
-import { mediaLibraryAvailability, mediaLibraryEntries } from "/file/library-view.js";
+import { mediaLibraryAvailability, mediaLibraryEntries, resolveMediaLibrary } from "/file/library-view.js";
 import { buildLibraryMutationPayload, isValidLibraryRootBinding } from "./library-actions.js";
 import { captureLibraryEditorFocus, libraryDraftFieldValue, reconcileLibraryDrafts, restoreLibraryEditorFocus, setLibraryDraftField } from "./library-drafts.js";
 import { takeRejectedSettingsActions } from "./local-action-rejections.js";
@@ -388,7 +389,8 @@ function renderLibraryCard(rawEntry) {
     : availability === "offline"
       ? "Offline · last saved view only"
       : availability === "available" ? "Available on the desktop" : "Availability not reported";
-  const snapshot = entry.snapshot && typeof entry.snapshot === "object" ? entry.snapshot : null;
+  const resolvedSnapshot = resolveMediaLibrary(state.snapshot, id).snapshot;
+  const snapshot = entry.snapshot && typeof entry.snapshot === "object" ? entry.snapshot : resolvedSnapshot;
   const mediaCount = Number.isSafeInteger(entry.media_count)
     ? Number(entry.media_count)
     : Array.isArray(snapshot?.items) ? snapshot.items.length : null;
@@ -669,7 +671,7 @@ async function refreshState({ quiet = false } = {}) {
   recoverSettingsActionReceipts();
   state.loading = true;
   try {
-    const fresh = await api("/state");
+    const fresh = await loadOwnerSnapshot((path, headers) => api(path, { headers }));
     Object.assign(state, acceptOwnerSnapshot(fresh, state));
     byId("auth-gate").classList.add("hidden");
     byId("app-content").classList.remove("hidden");

@@ -531,6 +531,9 @@ pub(super) async fn attach_library_views(
         }
         views.push(view);
     }
+    if let Some(default_snapshot) = selected.as_ref() {
+        deduplicate_default_library_snapshot(&mut views, default_id, default_snapshot);
+    }
     let mut library = selected.unwrap_or(legacy);
     library["libraries"] = json!(views);
     library["default_library_id"] = json!(default_id);
@@ -538,6 +541,22 @@ pub(super) async fn attach_library_views(
     library["migrations"] = history;
     library["migration_omitted_count"] = json!(omitted);
     Ok(library)
+}
+
+fn deduplicate_default_library_snapshot(
+    views: &mut [Value],
+    default_id: &str,
+    default_snapshot: &Value,
+) {
+    for view in views {
+        if view["id"].as_str() != Some(default_id) || view.get("snapshot") != Some(default_snapshot)
+        {
+            continue;
+        }
+        if let Some(fields) = view.as_object_mut() {
+            fields.remove("snapshot");
+        }
+    }
 }
 
 pub(super) async fn dispatch(
@@ -864,6 +883,49 @@ async fn submit_download(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_library_snapshot_dedup_keeps_top_level_and_other_library_data() {
+        let default_snapshot = json!({
+            "revision":"primary-current", "scanned_at":200,
+            "items":[{"id":"primary-item"}], "categories":["current"],
+        });
+        let stale_archive_snapshot = json!({
+            "revision":"archive-stale", "scanned_at":100,
+            "items":[{"id":"archive-item"}], "categories":["old"],
+        });
+        let mut top_level = default_snapshot.clone();
+        let mut views = vec![
+            json!({"id":"primary", "media_count":1, "snapshot":default_snapshot}),
+            json!({"id":"archive", "media_count":1, "snapshot":stale_archive_snapshot}),
+        ];
+
+        deduplicate_default_library_snapshot(&mut views, "primary", &top_level);
+        top_level["libraries"] = json!(views);
+
+        assert_eq!(top_level["items"], json!([{"id":"primary-item"}]));
+        assert!(top_level["libraries"][0].get("snapshot").is_none());
+        assert_eq!(
+            top_level["libraries"][1]["snapshot"]["revision"], "archive-stale",
+            "a nondefault library's stale snapshot remains available"
+        );
+        assert_eq!(
+            top_level["libraries"][1]["snapshot"]["items"],
+            json!([{"id":"archive-item"}])
+        );
+    }
+
+    #[test]
+    fn default_library_snapshot_dedup_preserves_a_stale_default_copy() {
+        let current = json!({"revision":"current", "items":[{"id":"new"}]});
+        let stale = json!({"revision":"stale", "items":[{"id":"old"}]});
+        let mut views = vec![json!({"id":"primary", "snapshot":stale})];
+
+        deduplicate_default_library_snapshot(&mut views, "primary", &current);
+
+        assert_eq!(views[0]["snapshot"]["revision"], "stale");
+        assert_eq!(views[0]["snapshot"]["items"], json!([{"id":"old"}]));
+    }
 
     #[test]
     fn cloud_migration_history_is_bounded_and_prioritizes_recovery() {

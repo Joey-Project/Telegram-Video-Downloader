@@ -7,6 +7,10 @@ import type {
   FilePreviewPayload,
   LocalSnapshot,
   MetadataPatch,
+  ChunkedSnapshotContent,
+  SnapshotChunkDescriptor,
+  SnapshotChunkManifest,
+  PreparedSnapshotContent,
   RequestKind,
 } from "./types";
 
@@ -18,6 +22,12 @@ export const MAX_ACTION_BODY_BYTES = MAX_LEGACY_TEXT_BYTES * 6 + MAX_ACTION_BODY
 export const ACTION_REPLAY_WINDOW_MS = 6 * 24 * 60 * 60 * 1_000;
 const MAX_ACTION_CLOCK_SKEW_MS = 5 * 60 * 1_000;
 export const MAX_STATE_BODY_BYTES = 12 * 1024 * 1024;
+export const MAX_CHUNKED_SNAPSHOT_MANIFEST_BODY_BYTES = 64 * 1024;
+export const MAX_SNAPSHOT_CONTENT_CHUNK_BYTES = 32 * 1024;
+export const MAX_CHUNKED_SNAPSHOT_BYTES = MAX_STATE_BODY_BYTES;
+export const MAX_CHUNKED_SNAPSHOT_CHUNKS = 386;
+export const MAX_SNAPSHOT_JSON_NODES = 1_000_000;
+export const MAX_JSON_COMPLEXITY_DEPTH = 48;
 export const MAX_TARGET_RELATIVE_DIR_BYTES = 1_024;
 export const MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES = 255;
 export const MAX_SELECTED_ITEMS = 100;
@@ -41,6 +51,13 @@ export async function readJsonBody(
   request: Request,
   maxBytes: number,
 ): Promise<unknown> {
+  return (await readJsonBodyWithByteLength(request, maxBytes)).value;
+}
+
+export async function readJsonBodyWithByteLength(
+  request: Request,
+  maxBytes: number,
+): Promise<{ value: unknown; byteLength: number }> {
   const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
   if (contentType !== "application/json") {
     throw new HttpError(415, "Content-Type must be application/json");
@@ -90,22 +107,70 @@ export async function readJsonBody(
   }
 
   try {
-    return JSON.parse(text) as unknown;
+    return { value: JSON.parse(text) as unknown, byteLength: totalBytes };
   } catch {
     throw new HttpError(400, "Request body is not valid JSON");
   }
 }
 
+export async function readUtf8ChunkBody(
+  request: Request,
+  maxBytes = MAX_SNAPSHOT_CONTENT_CHUNK_BYTES,
+): Promise<{ bytes: Uint8Array<ArrayBuffer>; data: string }> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/octet-stream") {
+    throw new HttpError(415, "Content-Type must be application/octet-stream");
+  }
+
+  const declaredLength = request.headers.get("content-length");
+  if (declaredLength !== null) {
+    const length = Number(declaredLength);
+    if (!Number.isSafeInteger(length) || length < 0) throw new HttpError(400, "Invalid Content-Length");
+    if (length > maxBytes) throw new HttpError(413, "Snapshot content chunk is too large");
+  }
+  if (request.body === null) throw new HttpError(400, "Request body is required");
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  while (true) {
+    const part = await reader.read();
+    if (part.done) break;
+    totalBytes += part.value.byteLength;
+    if (totalBytes > maxBytes) {
+      await reader.cancel();
+      throw new HttpError(413, "Snapshot content chunk is too large");
+    }
+    chunks.push(part.value);
+  }
+  if (totalBytes === 0) throw new HttpError(400, "Snapshot content chunk must not be empty");
+
+  const bytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  let data: string;
+  try {
+    data = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    throw new HttpError(400, "Snapshot content chunk must be valid UTF-8");
+  }
+  return { bytes, data };
+}
+
 export function canonicalJson(
   value: unknown,
-  options: { maxNodes?: number; complexityStatus?: number } = {},
+  options: { maxNodes?: number; maxDepth?: number; complexityStatus?: number } = {},
 ): string {
   const maxNodes = options.maxNodes ?? 100_000;
+  const maxDepth = options.maxDepth ?? MAX_JSON_COMPLEXITY_DEPTH;
   const complexityStatus = options.complexityStatus ?? 400;
   let nodes = 0;
   const visit = (current: unknown, depth: number): string => {
     nodes += 1;
-    if (nodes > maxNodes || depth > 48) {
+    if (nodes > maxNodes || depth > maxDepth) {
       throw new HttpError(complexityStatus, "JSON structure is too complex");
     }
     if (current === null || typeof current !== "object") {
@@ -121,6 +186,24 @@ export function canonicalJson(
     return `{${keys.map((key) => `${JSON.stringify(key)}:${visit(object[key], depth + 1)}`).join(",")}}`;
   };
   return visit(value, 0);
+}
+
+function assertSnapshotJsonComplexity(value: unknown): void {
+  let nodes = 0;
+  const visit = (current: unknown, depth: number): void => {
+    nodes += 1;
+    if (nodes > MAX_SNAPSHOT_JSON_NODES || depth > MAX_JSON_COMPLEXITY_DEPTH) {
+      throw new HttpError(413, "JSON structure is too complex");
+    }
+    if (Array.isArray(current)) {
+      for (const item of current) visit(item, depth + 1);
+    } else if (isRecord(current)) {
+      for (const key in current) {
+        if (Object.hasOwn(current, key)) visit(current[key], depth + 1);
+      }
+    }
+  };
+  visit(value, 0);
 }
 
 export async function sha256Hex(value: string): Promise<string> {
@@ -860,6 +943,112 @@ export function validateSnapshot(value: unknown): LocalSnapshot {
   if (value.settings.applied !== undefined) validateAppliedSettings(value.settings.applied);
   validateLibraryDescriptors(library);
   return value as unknown as LocalSnapshot;
+}
+
+export function validatePreparedSnapshot(value: unknown): PreparedSnapshotContent {
+  if (!isRecord(value) || !onlyKeys(value, ["format", "state_version", "reported_at", "library_json", "state_json"]) ||
+    !["format", "state_version", "reported_at", "library_json", "state_json"].every((key) => Object.hasOwn(value, key))) {
+    throw new HttpError(400, "Prepared snapshot envelope has an invalid shape");
+  }
+  if (value.format !== "prepared-v1" || typeof value.library_json !== "string" || typeof value.state_json !== "string") {
+    throw new HttpError(400, "Prepared snapshot envelope has an invalid format");
+  }
+
+  let library: unknown;
+  let state: unknown;
+  try {
+    library = JSON.parse(value.library_json) as unknown;
+  } catch {
+    throw new HttpError(400, "Prepared library JSON is invalid");
+  }
+  try {
+    state = JSON.parse(value.state_json) as unknown;
+  } catch {
+    throw new HttpError(400, "Prepared state JSON is invalid");
+  }
+  if (!isRecord(library) || !isRecord(state)) {
+    throw new HttpError(400, "Prepared library and state JSON must contain objects");
+  }
+  if (!onlyKeys(state, ["revision", "previews", "operations", "tasks", "settings"]) ||
+    !["previews", "operations", "tasks", "settings"].every((key) => Object.hasOwn(state, key))) {
+    throw new HttpError(400, "Prepared state JSON has an invalid shape");
+  }
+
+  assertSnapshotJsonComplexity(library);
+  assertSnapshotJsonComplexity(state);
+  const snapshot = validateSnapshot({
+    state_version: value.state_version,
+    reported_at: value.reported_at,
+    library,
+    ...state,
+  });
+  return { snapshot, libraryJson: value.library_json, stateJson: value.state_json };
+}
+
+function validateSnapshotChunkManifest(value: unknown, field: string): SnapshotChunkManifest {
+  if (!isRecord(value) || !onlyKeys(value, ["bytes", "chunks"]) ||
+    !Object.hasOwn(value, "bytes") || !Object.hasOwn(value, "chunks")) {
+    throw new HttpError(400, `${field} manifest has an invalid shape`);
+  }
+  if (!Number.isSafeInteger(value.bytes) || (value.bytes as number) <= 0 ||
+    (value.bytes as number) > MAX_CHUNKED_SNAPSHOT_BYTES) {
+    throw new HttpError(413, `${field} manifest byte length is invalid`);
+  }
+  if (!Array.isArray(value.chunks) || value.chunks.length === 0 ||
+    value.chunks.length > MAX_CHUNKED_SNAPSHOT_CHUNKS) {
+    throw new HttpError(400, `${field} manifest must contain between 1 and ${MAX_CHUNKED_SNAPSHOT_CHUNKS} chunks`);
+  }
+  let totalBytes = 0;
+  const chunks: SnapshotChunkDescriptor[] = [];
+  for (const [index, candidate] of value.chunks.entries()) {
+    if (!isRecord(candidate) || !onlyKeys(candidate, ["sha256", "bytes"]) ||
+      !Object.hasOwn(candidate, "sha256") || !Object.hasOwn(candidate, "bytes") ||
+      typeof candidate.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(candidate.sha256) ||
+      !Number.isSafeInteger(candidate.bytes) || (candidate.bytes as number) < 1 ||
+      (candidate.bytes as number) > MAX_SNAPSHOT_CONTENT_CHUNK_BYTES) {
+      throw new HttpError(400, `${field}.chunks[${index}] is malformed`);
+    }
+    totalBytes += candidate.bytes as number;
+    if (totalBytes > MAX_CHUNKED_SNAPSHOT_BYTES) {
+      throw new HttpError(413, `${field} manifest exceeds the snapshot size limit`);
+    }
+    chunks.push({ sha256: candidate.sha256, bytes: candidate.bytes as number });
+  }
+  if (totalBytes !== value.bytes) throw new HttpError(400, `${field} manifest byte length does not match its chunks`);
+  return { bytes: value.bytes as number, chunks };
+}
+
+export function validateChunkedSnapshot(value: unknown): ChunkedSnapshotContent {
+  if (!isRecord(value) || !onlyKeys(value, ["format", "state_version", "reported_at", "library_revision", "library", "state"]) ||
+    !["format", "state_version", "reported_at", "library_revision", "library", "state"].every((key) => Object.hasOwn(value, key))) {
+    throw new HttpError(400, "Chunked snapshot envelope has an invalid shape");
+  }
+  if (value.format !== "chunked-v1") throw new HttpError(400, "Chunked snapshot envelope has an invalid format");
+  if (!Number.isSafeInteger(value.state_version) || (value.state_version as number) <= 0) {
+    throw new HttpError(400, "state_version must be a positive safe integer");
+  }
+  if (!Number.isSafeInteger(value.reported_at) || (value.reported_at as number) <= 0) {
+    throw new HttpError(400, "reported_at must be a positive Unix millisecond timestamp");
+  }
+  if (typeof value.library_revision !== "string" || value.library_revision.length === 0 ||
+    value.library_revision.length > 256 || /[\u0000-\u001f\u007f]/u.test(value.library_revision)) {
+    throw new HttpError(400, "library_revision is invalid");
+  }
+  const library = validateSnapshotChunkManifest(value.library, "library");
+  const state = validateSnapshotChunkManifest(value.state, "state");
+  if (library.chunks.length + state.chunks.length > MAX_CHUNKED_SNAPSHOT_CHUNKS) {
+    throw new HttpError(413, "Snapshot exceeds the content chunk limit");
+  }
+  if (library.bytes + state.bytes > MAX_CHUNKED_SNAPSHOT_BYTES) {
+    throw new HttpError(413, "Snapshot exceeds the storage size limit");
+  }
+  return {
+    state_version: value.state_version as number,
+    reported_at: value.reported_at as number,
+    library_revision: value.library_revision,
+    library,
+    state,
+  };
 }
 
 export function parseLimit(value: string | null, maximum = 500): number {

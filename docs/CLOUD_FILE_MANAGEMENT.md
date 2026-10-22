@@ -54,10 +54,58 @@ Local service requests carry the fixed shared secret in their `Authorization: Be
 | `GET /api/local/requests?limit=100` | Fetch the oldest unacknowledged requests |
 | `POST /api/local/ack` | Confirm local durable receipt, not execution completion |
 | `POST /api/local/state` | Publish local state and operation results |
+| `POST /api/local/state/chunks/<sha256>` | Persist a bounded, epoch-bound snapshot chunk |
 | `GET /api/state` | Read the latest local snapshot and safely expose unacknowledged request summaries |
 | `GET /api/library` | Read the media library snapshot |
+| `GET /api/snapshot/chunks/<sha256>` | Read an owner-authorized snapshot chunk |
 | `POST /api/actions` | Submit a file-management action |
 | `GET /settings/` | Open the separate owner-only library settings Mini App |
+
+### Snapshot preparation and retry
+
+The Rust service prepares the library and state JSON partitions locally, checks
+their structure, and splits their UTF-8 bytes into chunks of at most 32 KiB.
+The state partition contains `revision` when present, `previews`, `operations`,
+`tasks`, and `settings`. Each chunk is addressed by its SHA-256 and database epoch.
+The Worker verifies the bounded chunk's actual bytes before durable storage;
+acknowledged chunks can be reused without uploading them on every heartbeat.
+
+A small `chunked-v1` request commits the ordered chunk descriptors, partition
+byte counts, library revision, state version, and report timestamp. The Worker
+checks the manifest's bounds, derives domain-separated identities from the
+ordered descriptors, and atomically verifies all referenced chunks while
+applying the existing epoch and version checks. A failed or partial upload
+cannot replace the currently published snapshot. Missing staged chunks return
+428, clear the local acknowledgement cache, and are uploaded again.
+
+The two partitions together remain limited to 12 MiB. The manifest is limited
+to 64 KiB and at most 386 chunks. Full JSON parsing and the 48-level, one-million
+node bounds run on the local host and in the Mini App, rather than processing
+the whole library in one Worker invocation. Owner reads return the small
+manifest; the Mini App fetches authenticated, epoch-bound chunks with bounded
+concurrency, verifies their hashes, and assembles the complete snapshot before
+updating its owner session. Chunks are not persisted in browser storage.
+
+A size rejection uses the existing explicitly marked snapshot compaction;
+local media and recovery data are retained. Old unreferenced staged chunks are
+eligible for bounded cleanup; the published snapshot's chunks remain protected.
+
+The default library's items appear only in the top-level library snapshot.
+Nondefault libraries retain their nested snapshots. Both Mini Apps resolve the
+default descriptor against the top-level snapshot while preserving offline and
+stale-snapshot restrictions.
+
+The Worker also accepts legacy and `prepared-v1` snapshot requests, with their
+existing validation. Apply the additive D1 migration and deploy the Worker
+before the new Rust executable. A Worker rollback requires a compatible legacy
+snapshot to be published first; retain the new Worker while rolling back only
+the local executable. A format or chunk-boundary change can produce a different
+identity for equal JSON values; the existing
+409 response and stored-version hint rebase the pending upload onto a fresh
+version. Retries after an uncertain response preserve the pending content and
+version. Repeated failures use capped exponential backoff with jitter, and a
+successful upload resets that backoff. Ingress receipt and durable-local-save
+before ACK remain independent of snapshot publication.
 
 Example move preview:
 

@@ -2,6 +2,7 @@ import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, consumeRejectedActi
 import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
+import { loadOwnerSnapshot } from "./snapshot-loader.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limit.js";
 import { MAX_MANUAL_TARGET_OPTIONS, searchPresentManualTargets } from "./manual-target-picker.js";
@@ -348,7 +349,7 @@ async function refreshState({ quiet = false } = {}) {
   recoverFileActionReceipts();
   state.loading = true;
   try {
-    const fresh = await api("/state");
+    const fresh = await loadOwnerSnapshot((path, headers) => api(path, { headers }));
     acceptFreshSnapshot(fresh);
     setConnection(fresh.synced ? (fresh.stale ? "stale" : "live") : "", fresh.synced ? (fresh.stale ? "Contact is overdue" : "Computer connected") : "Waiting for computer");
     render();

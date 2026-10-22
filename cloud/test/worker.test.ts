@@ -42,6 +42,7 @@ import {
   MAX_TARGET_RELATIVE_DIR_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_BYTES,
   MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES,
   readJsonBody,
+  sha256Hex,
   validateSnapshot,
 } from "../src/validation";
 import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue, getDatabaseEpoch, storeSnapshot } from "../src/store";
@@ -3009,6 +3010,77 @@ describe("Mini App identity and actions", () => {
 });
 
 describe("local client API and state snapshots", () => {
+  it("serves compact chunk manifests and owner-authenticated content chunks", async () => {
+    const epoch = await getDatabaseEpoch(testEnv.DB);
+    const upload = async (data: string) => {
+      const source = textEncoder.encode(data);
+      const bytes = new Uint8Array(source.byteLength);
+      bytes.set(source);
+      const sha256 = await sha256Hex(data);
+      const response = await SELF.fetch(new Request(`${workerUrl}/api/local/state/chunks/${sha256}`, {
+        method: "POST",
+        headers: { ...localHeaders(), "content-type": "application/octet-stream" },
+        body: bytes.buffer,
+      }));
+      expect(response.status).toBe(200);
+      return { sha256, bytes: source.byteLength };
+    };
+    const library = await upload('{"revision":"owner-library","items":["🙂"]}');
+    const state = await upload('{"settings":{"download_dir":"/Videos"},"tasks":[]}');
+    const manifest = (chunk: { sha256: string; bytes: number }) => ({ bytes: chunk.bytes, chunks: [chunk] });
+    const committed = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({
+        format: "chunked-v1",
+        state_version: 1,
+        reported_at: Date.now(),
+        library_revision: "owner-library",
+        library: manifest(library),
+        state: manifest(state),
+      }),
+    }));
+    expect(committed.status).toBe(200);
+
+    const owner = await signInitData();
+    const stateResponse = await ownerRequest("/api/state", owner);
+    expect(stateResponse.status).toBe(200);
+    const ownerState = await responseJson<{
+      format: string;
+      database_epoch: string;
+      library: { bytes: number; chunks: Array<{ sha256: string; bytes: number }> };
+      state: { bytes: number; chunks: Array<{ sha256: string; bytes: number }> };
+    }>(stateResponse);
+    expect(ownerState).toMatchObject({
+      format: "chunked-v1",
+      database_epoch: epoch,
+      library: manifest(library),
+      state: manifest(state),
+    });
+
+    const libraryResponse = await ownerRequest("/api/library", owner);
+    expect(libraryResponse.status).toBe(200);
+    expect(await responseJson<{ format: string; database_epoch: string; library: unknown }>(libraryResponse))
+      .toMatchObject({ format: "chunked-v1", database_epoch: epoch, library: manifest(library) });
+
+    const chunkPath = `/api/snapshot/chunks/${library.sha256}`;
+    const missingEpoch = await ownerRequest(chunkPath, owner);
+    const staleEpoch = await ownerRequest(chunkPath, owner, {
+      headers: { "X-Cloud-Database-Epoch": "ffffffffffffffffffffffffffffffff" },
+    });
+    const chunkResponse = await ownerRequest(chunkPath, owner, {
+      headers: { "X-Cloud-Database-Epoch": epoch },
+    });
+    expect(missingEpoch.status).toBe(428);
+    expect(staleEpoch.status).toBe(409);
+    expect(staleEpoch.headers.get("X-Cloud-Database-Epoch")).toBe(epoch);
+    expect(chunkResponse.status).toBe(200);
+    expect(await responseJson<{ sha256: string; data: string }>(chunkResponse)).toEqual({
+      sha256: library.sha256,
+      data: '{"revision":"owner-library","items":["🙂"]}',
+    });
+  });
+
   it.each([
     { label: "same", paddingBytes: 0 },
     { label: "different", paddingBytes: 500_100 },
