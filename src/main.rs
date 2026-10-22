@@ -19,6 +19,7 @@ mod library_migration;
 mod library_migration_bot;
 mod media_libraries;
 mod media_library_bot;
+mod pgc_metadata_backfill;
 mod queue;
 mod redaction;
 mod router;
@@ -3258,6 +3259,20 @@ async fn dispatch_cloud_management(
             {
                 return Ok(cloud_dispatch_failure("library_scan payload must be empty"));
             }
+            if let Some((scoped_runtime, library_id)) = selected.as_ref()
+                && let Some(root_binding) = pgc_metadata_backfill::current_root_binding(
+                    Arc::clone(&scoped_runtime.bot.queue),
+                    library_id.clone(),
+                )
+                .await
+            {
+                pgc_metadata_backfill::backfill_legacy_pgc_metadata(
+                    scoped_runtime,
+                    library_id,
+                    &root_binding,
+                )
+                .await;
+            }
             let snapshot = run_cloud_library_operation(
                 runtime,
                 "media-library scan worker failed",
@@ -4503,8 +4518,6 @@ fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
                         })
                         .cloned()
                         .collect::<std::collections::BTreeSet<_>>();
-                    let has_multiple_parts =
-                        !is_collection && planned.len() > 1 && !repeated_bvids.is_empty();
                     let has_multiple_entries = attempt.entries.len() > 1;
                     let collection_title = record
                         .plan
@@ -4512,6 +4525,24 @@ fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
                         .and_then(|plan| plan.title.as_deref())
                         .filter(|title| !title.trim().is_empty())
                         .map(str::to_string);
+                    let explicit_pgc_source_url = is_explicit_bilibili_bangumi_source_url(url);
+                    let pgc_season_id =
+                        bilibili_pgc_canonical_collection_id(url, record.plan.as_ref());
+                    let is_pgc_season = pgc_season_id.is_some()
+                        && collection_title.is_some()
+                        && has_bilibili_episode_id(
+                            stable_ids.iter().map(String::as_str).chain(
+                                attempt
+                                    .entries
+                                    .iter()
+                                    .map(|entry| entry.stable_media_id.as_str()),
+                            ),
+                        );
+                    let has_multiple_parts = !is_collection
+                        && !explicit_pgc_source_url
+                        && pgc_season_id.is_none()
+                        && planned.len() > 1
+                        && !repeated_bvids.is_empty();
 
                     for entry in &attempt.entries {
                         let has_output_receipt = entry.state == BilibiliAttemptEntryState::Verified
@@ -4548,10 +4579,12 @@ fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
                         if relative_paths.is_empty() {
                             continue;
                         }
-                        let collection = if is_collection || has_multiple_parts {
+                        let collection = if is_collection || has_multiple_parts || is_pgc_season {
                             collection_title.as_ref().map(|title| {
                                 crate::library::CollectionMetadata {
-                                    id: if has_multiple_parts {
+                                    id: if is_pgc_season {
+                                        pgc_season_id.clone()
+                                    } else if has_multiple_parts {
                                         parsed_id.bvid.clone()
                                     } else {
                                         None
@@ -4559,6 +4592,8 @@ fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
                                     title: title.clone(),
                                     kind: if is_collection {
                                         "bilibili_collection".to_string()
+                                    } else if is_pgc_season {
+                                        "bilibili_season".to_string()
                                     } else {
                                         "multi_part".to_string()
                                     },
@@ -4577,6 +4612,8 @@ fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
                                 source_ids: source_ids.clone(),
                                 title: if is_collection
                                     || has_multiple_parts
+                                    || is_pgc_season
+                                    || explicit_pgc_source_url
                                     || has_multiple_entries
                                 {
                                     None
@@ -4614,14 +4651,22 @@ fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
                     })
                     .cloned()
                     .collect::<std::collections::BTreeSet<_>>();
-                let has_multiple_parts =
-                    !is_collection && parsed.len() > 1 && !repeated_bvids.is_empty();
                 let collection_title = record
                     .plan
                     .as_ref()
                     .and_then(|plan| plan.title.as_deref())
                     .filter(|title| !title.trim().is_empty())
                     .map(str::to_string);
+                let explicit_pgc_source_url = is_explicit_bilibili_bangumi_source_url(url);
+                let pgc_season_id = bilibili_pgc_canonical_collection_id(url, record.plan.as_ref());
+                let is_pgc_season = pgc_season_id.is_some()
+                    && collection_title.is_some()
+                    && has_bilibili_episode_id(stable_ids.iter().map(String::as_str));
+                let has_multiple_parts = !is_collection
+                    && !explicit_pgc_source_url
+                    && pgc_season_id.is_none()
+                    && parsed.len() > 1
+                    && !repeated_bvids.is_empty();
 
                 if !parsed.is_empty() {
                     for (index, parsed_id) in parsed.iter().enumerate() {
@@ -4639,10 +4684,12 @@ fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
                         if source_ids.is_empty() {
                             continue;
                         }
-                        let collection = if is_collection || has_multiple_parts {
+                        let collection = if is_collection || has_multiple_parts || is_pgc_season {
                             collection_title.as_ref().map(|title| {
                                 crate::library::CollectionMetadata {
-                                    id: if has_multiple_parts {
+                                    id: if is_pgc_season {
+                                        pgc_season_id.clone()
+                                    } else if has_multiple_parts {
                                         parsed_id.bvid.clone()
                                     } else {
                                         None
@@ -4650,10 +4697,27 @@ fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
                                     title: title.clone(),
                                     kind: if is_collection {
                                         "bilibili_collection".to_string()
+                                    } else if is_pgc_season {
+                                        "bilibili_season".to_string()
                                     } else {
                                         "multi_part".to_string()
                                     },
-                                    order: Some((index + 1).try_into().unwrap_or(u32::MAX)),
+                                    order: if is_pgc_season {
+                                        stable_ids.get(index).and_then(|stable_id| {
+                                            record.plan.as_ref().and_then(|plan| {
+                                                plan.bilibili_pgc_episode_orders
+                                                    .iter()
+                                                    .chain(plan.bilibili_group_entries.iter())
+                                                    .find(|entry| {
+                                                        entry.stable_media_id.as_str()
+                                                            == stable_id.as_str()
+                                                    })
+                                                    .map(|entry| entry.index)
+                                            })
+                                        })
+                                    } else {
+                                        Some((index + 1).try_into().unwrap_or(u32::MAX))
+                                    },
                                     part_id: parsed_id
                                         .epid
                                         .clone()
@@ -4667,7 +4731,11 @@ fn queue_source_hints(bot: &BotContext) -> Result<Vec<SourceHint>> {
                             source_ids,
                             // A collection-level plan title must not replace each entry's NFO
                             // title. Normal one-video tasks still seed their own title.
-                            title: if is_collection || has_multiple_parts {
+                            title: if is_collection
+                                || has_multiple_parts
+                                || is_pgc_season
+                                || explicit_pgc_source_url
+                            {
                                 None
                             } else {
                                 record.plan.as_ref().and_then(|plan| plan.title.clone())
@@ -4763,6 +4831,98 @@ fn parse_bilibili_stable_media_id(value: &str) -> Option<ParsedBilibiliStableMed
         epid,
         source_ids,
     })
+}
+
+fn bilibili_pgc_collection_id_from_url(raw_url: &str) -> Option<String> {
+    let url = url::Url::parse(raw_url).ok()?;
+    if !matches!(url.scheme(), "https" | "http") {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    if host != "bilibili.com" && !host.ends_with(".bilibili.com") {
+        return None;
+    }
+
+    let segments = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() != 3 || segments[0] != "bangumi" {
+        return None;
+    }
+    let prefix = match (segments[1], segments[2].get(..2)?) {
+        ("media", "md") => "md",
+        ("play", "ss") => "ss",
+        _ => return None,
+    };
+    let digits = segments[2].strip_prefix(prefix)?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let id = digits.parse::<u64>().ok().filter(|id| *id > 0)?;
+    Some(format!("{prefix}{id}"))
+}
+
+fn bilibili_pgc_canonical_collection_id(
+    raw_url: &str,
+    plan: Option<&PlanValidationSnapshot>,
+) -> Option<String> {
+    let stored_season_id = plan
+        .and_then(|plan| plan.bilibili_pgc_season_id)
+        .filter(|season_id| *season_id > 0);
+    if let Some(season_id) = stored_season_id {
+        return Some(format!("ss{season_id}"));
+    }
+
+    bilibili_pgc_collection_id_from_url(raw_url).filter(|source_id| source_id.starts_with("ss"))
+}
+
+fn is_explicit_bilibili_bangumi_source_url(raw_url: &str) -> bool {
+    if bilibili_pgc_collection_id_from_url(raw_url).is_some() {
+        return true;
+    }
+
+    let Ok(url) = url::Url::parse(raw_url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "https" | "http") {
+        return false;
+    }
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    if host != "bilibili.com" && !host.ends_with(".bilibili.com") {
+        return false;
+    }
+
+    let Some(segments) = url.path_segments() else {
+        return false;
+    };
+    let segments = segments
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() != 3 || segments[0] != "bangumi" || segments[1] != "play" {
+        return false;
+    }
+    let Some(digits) = segments[2].strip_prefix("ep") else {
+        return false;
+    };
+    !digits.is_empty()
+        && digits.bytes().all(|byte| byte.is_ascii_digit())
+        && digits.parse::<u64>().is_ok_and(|episode_id| episode_id > 0)
+}
+
+fn has_bilibili_episode_id<'a>(stable_ids: impl IntoIterator<Item = &'a str>) -> bool {
+    stable_ids
+        .into_iter()
+        .filter_map(parse_bilibili_stable_media_id)
+        .any(|identity| {
+            identity
+                .epid
+                .as_deref()
+                .and_then(|epid| epid.parse::<u64>().ok())
+                .is_some_and(|epid| epid > 0)
+        })
 }
 
 fn published_primary_relative_paths(record: &TaskRecord, root: &std::path::Path) -> Vec<String> {

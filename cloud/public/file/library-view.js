@@ -278,6 +278,50 @@ export function statusOf(item) {
   return String(item?.presence ?? "unknown").toLowerCase();
 }
 
+export function collectionIdentity(collection) {
+  if (typeof collection === "string") {
+    const title = collection.trim();
+    return title ? JSON.stringify(["", "title", title]) : JSON.stringify(["uncollected"]);
+  }
+  if (!collection || typeof collection !== "object") return JSON.stringify(["uncollected"]);
+
+  const kind = typeof collection.kind === "string" ? collection.kind.trim() : "";
+  const id = typeof collection.id === "string" ? collection.id.trim() : "";
+  const title = String(collection.title ?? "").trim();
+  return id
+    ? JSON.stringify([kind, "id", id])
+    : JSON.stringify([kind, "title", title]);
+}
+
+function collectionOrder(item) {
+  const order = item?.collection?.order;
+  return Number.isSafeInteger(order) && order >= 0 ? order : null;
+}
+
+function libraryTitle(item) {
+  return String(item?.title ?? item?.relative_path ?? "");
+}
+
+function sortLibraryItems(items) {
+  const titleSorted = [...items].sort((left, right) => libraryTitle(left).localeCompare(libraryTitle(right)));
+  const groups = new Map();
+  for (const item of titleSorted) {
+    const identity = collectionIdentity(item?.collection);
+    if (!groups.has(identity)) groups.set(identity, []);
+    groups.get(identity).push(item);
+  }
+
+  return [...groups.values()].flatMap((group) => group
+    .map((item, index) => ({ item, index, order: collectionOrder(item) }))
+    .sort((left, right) => {
+      if (left.order !== null && right.order !== null && left.order !== right.order) return left.order - right.order;
+      if (left.order !== null && right.order === null) return -1;
+      if (left.order === null && right.order !== null) return 1;
+      return libraryTitle(left.item).localeCompare(libraryTitle(right.item)) || left.index - right.index;
+    })
+    .map(({ item }) => item));
+}
+
 export function needsOrganizing(item) {
   const confidence = String(item?.confidence ?? "low").toLowerCase();
   const metadata = String(item?.metadata_status ?? "unknown").toLowerCase();
@@ -287,12 +331,13 @@ export function needsOrganizing(item) {
 
 export function filterLibraryItems(items, { query = "", category = "", status = "" } = {}) {
   const normalizedQuery = String(query).trim().toLocaleLowerCase();
-  return (Array.isArray(items) ? items : []).filter((item) => {
+  const filtered = (Array.isArray(items) ? items : []).filter((item) => {
     const text = [item?.title, item?.relative_path, item?.id, ...(Array.isArray(item?.source_ids) ? item.source_ids : [])].join(" ").toLocaleLowerCase();
     return (!normalizedQuery || text.includes(normalizedQuery))
       && (!category || itemFolder(item) === category)
       && (!status || statusOf(item) === status);
-  }).sort((left, right) => String(left?.title ?? left?.relative_path ?? "").localeCompare(String(right?.title ?? right?.relative_path ?? "")));
+  });
+  return sortLibraryItems(filtered);
 }
 
 export function paginateLibraryItems(items, page, pageSize = LIBRARY_PAGE_SIZE) {
@@ -319,10 +364,11 @@ export function groupLibraryItems(items) {
   for (const item of Array.isArray(items) ? items : []) {
     const collection = typeof item?.collection === "string" ? item.collection : item?.collection?.title;
     const title = collection || "Uncollected";
-    if (!groups.has(title)) groups.set(title, []);
-    groups.get(title).push(item);
+    const identity = collectionIdentity(item?.collection);
+    if (!groups.has(identity)) groups.set(identity, { title, items: [] });
+    groups.get(identity).items.push(item);
   }
-  return [...groups.entries()].map(([title, entries]) => ({ title, items: entries }));
+  return [...groups.values()];
 }
 
 export function boundedFolderSuggestions(folders, query = "", limit = MAX_FOLDER_SUGGESTIONS) {

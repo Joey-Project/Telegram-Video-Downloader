@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -55,6 +56,7 @@ const MAX_HISTORY_INDEX_ENTRIES: usize = 10_000;
 const MAX_PERSISTED_MEDIA_HASHES: usize = 128;
 const MAX_PERSISTED_MEDIA_HASH_BYTES: usize = 256 * 1024;
 const QUEUE_PAGE_SIZE: usize = 10;
+const MAX_PGC_BACKFILL_INDEX_CANDIDATES: usize = 64;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn validate_library_root_binding_token(binding: &str) -> Result<()> {
@@ -193,6 +195,13 @@ pub struct PlanValidationSnapshot {
     /// Internal task-lifetime identity for durable Bilibili publication receipts.
     #[serde(default)]
     pub bilibili_publication_namespace: Option<String>,
+    /// Canonical PGC season identity resolved from Bilibili metadata.
+    #[serde(default)]
+    pub bilibili_pgc_season_id: Option<u64>,
+    /// Original season indices for selected PGC episodes; this does not mark group execution
+    /// or publication-receipt ownership.
+    #[serde(default)]
+    pub bilibili_pgc_episode_orders: Vec<BilibiliGroupEntryIdentity>,
     /// Entries whose stream availability probe completed, including entries with no streams.
     #[serde(default)]
     pub bilibili_resolved_stream_ids: Vec<String>,
@@ -207,6 +216,11 @@ impl PlanValidationSnapshot {
         let mut differences = Vec::new();
         if self.stable_media_ids != current.stable_media_ids {
             differences.push("media identity");
+        }
+        if self.bilibili_pgc_season_id.is_some()
+            && self.bilibili_pgc_season_id != current.bilibili_pgc_season_id
+        {
+            differences.push("PGC season identity");
         }
         let previous_resolved_stream_ids = self
             .bilibili_resolved_stream_ids
@@ -231,7 +245,20 @@ impl PlanValidationSnapshot {
             .iter()
             .map(|entry| (entry.stable_media_id.as_str(), entry.index))
             .collect::<BTreeMap<_, _>>();
-        if previous_episode_numbers != current_episode_numbers {
+        let previous_pgc_episode_numbers = self
+            .bilibili_pgc_episode_orders
+            .iter()
+            .map(|entry| (entry.stable_media_id.as_str(), entry.index))
+            .collect::<BTreeMap<_, _>>();
+        let current_pgc_episode_numbers = current
+            .bilibili_pgc_episode_orders
+            .iter()
+            .map(|entry| (entry.stable_media_id.as_str(), entry.index))
+            .collect::<BTreeMap<_, _>>();
+        if previous_episode_numbers != current_episode_numbers
+            || (!previous_pgc_episode_numbers.is_empty()
+                && previous_pgc_episode_numbers != current_pgc_episode_numbers)
+        {
             differences.push("episode numbering");
         }
         if self.selected_format_ids != current.selected_format_ids {
@@ -600,6 +627,33 @@ fn verified_bilibili_receipt_keys(record: &TaskRecord) -> BTreeSet<VerifiedBilib
             (entry.index, entry.stable_media_id.clone(), outputs)
         })
         .collect()
+}
+
+fn is_pgc_metadata_backfill_candidate(record: &TaskRecord) -> bool {
+    is_stable_published_terminal_bilibili_record(record)
+        && record
+            .plan
+            .as_ref()
+            .is_some_and(|plan| plan.bilibili_pgc_season_id.is_none())
+}
+
+fn is_stable_published_terminal_bilibili_record(record: &TaskRecord) -> bool {
+    if !matches!(
+        record.status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+    ) || record.destination_transfer.is_some()
+        || record.destination_transfer_phase.is_some()
+        || record.destination_transfer_ack.is_some()
+        || !matches!(&record.job, JobRequest::Bilibili { .. })
+    {
+        return false;
+    }
+
+    if record.bilibili_attempt.is_some() {
+        !verified_bilibili_receipt_keys(record).is_empty()
+    } else {
+        record.status == TaskStatus::Completed && record.saved_location.is_some()
+    }
 }
 
 fn reconcile_accepted_bilibili_attempt(
@@ -1295,6 +1349,62 @@ impl QueueManager {
         validate_library_root_binding_token(expected_binding)?;
         let registry = self.media_libraries.lock().map_err(poisoned_lock)?;
         require_registry_root_binding(&registry, library_id, expected_binding)
+    }
+
+    fn pgc_backfill_store_unlocked(
+        &self,
+        library_id: &str,
+        expected_binding: &str,
+    ) -> Result<Option<(MediaLibrary, DownloadStore)>> {
+        if validate_library_root_binding_token(expected_binding).is_err() {
+            return Ok(None);
+        }
+
+        let (library, root_identity) = {
+            let registry = self.media_libraries.lock().map_err(poisoned_lock)?;
+            let Some(library) = registry.library(library_id).cloned() else {
+                return Ok(None);
+            };
+            if library.root_binding_token().as_deref() != Some(expected_binding) {
+                return Ok(None);
+            }
+            let Some(root_identity) = registry.root_binding(library_id) else {
+                return Ok(None);
+            };
+            (library, root_identity)
+        };
+
+        let store = self
+            .video_libraries
+            .read()
+            .map_err(poisoned_lock)?
+            .iter()
+            .find(|registered| registered.library_id == library_id && registered.available)
+            .map(|registered| registered.store.clone());
+        let Some(store) = store else {
+            return Ok(None);
+        };
+        let identity = store.root.root_identity();
+        if (identity.device(), identity.inode()) != root_identity
+            || store.root.validate_configured_root().is_err()
+        {
+            return Ok(None);
+        }
+
+        Ok(Some((library, store)))
+    }
+
+    /// Revalidate the registration token against its persisted root object and the open queue
+    /// store without refreshing or reconciling queue state.
+    pub(crate) fn pgc_backfill_root_binding_valid(
+        &self,
+        library_id: &str,
+        expected_binding: &str,
+    ) -> Result<bool> {
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        Ok(self
+            .pgc_backfill_store_unlocked(library_id, expected_binding)?
+            .is_some())
     }
 
     /// Check the displayed identity before callers perform any root-dependent preflight work.
@@ -3065,6 +3175,206 @@ impl QueueManager {
         });
         records.sort_by_key(|record| std::cmp::Reverse(record.updated_at));
         Ok(records)
+    }
+
+    /// Read a bounded, stable page of published Bilibili records that may need legacy PGC
+    /// identity metadata. The persisted task ID is the scan cursor, so a large library never
+    /// requires loading its complete queue or history before applying the read budget.
+    pub(crate) fn published_backfill_candidates(
+        &self,
+        library_id: &str,
+        expected_binding: &str,
+        after_task_id: Option<&str>,
+        max_candidates: usize,
+    ) -> Result<(Vec<TaskRecord>, Option<String>)> {
+        if let Some(after_task_id) = after_task_id {
+            validate_task_id(after_task_id)?;
+        }
+
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let (library, store) = self
+            .pgc_backfill_store_unlocked(library_id, expected_binding)?
+            .ok_or_else(|| anyhow!("media library root binding is unavailable for PGC backfill"))?;
+        let store_identity = store.root.root_identity();
+        let queue_identity = store.queue_identity;
+        let queue_dir = store.queue_dir.clone();
+        let operation_lock_path = store.operation_lock_path.clone();
+        let _store_operation_lock = store.lock_queue_operations()?;
+
+        let Some((confirmed_library, confirmed_store)) =
+            self.pgc_backfill_store_unlocked(library_id, expected_binding)?
+        else {
+            bail!("media library root binding changed before PGC backfill scan");
+        };
+        if confirmed_library.id != library.id
+            || confirmed_store.root.root_identity() != store_identity
+            || confirmed_store.queue_identity != queue_identity
+            || confirmed_store.queue_dir != queue_dir
+            || confirmed_store.operation_lock_path != operation_lock_path
+        {
+            bail!("media library queue store changed before PGC backfill scan");
+        }
+
+        let scan_limit = max_candidates.min(MAX_PGC_BACKFILL_INDEX_CANDIDATES);
+        if scan_limit == 0 {
+            return Ok((Vec::new(), after_task_id.map(str::to_owned)));
+        }
+
+        let index = store.read_index()?;
+        let lower_bound = after_task_id
+            .map(|task_id| Bound::Excluded(task_id.to_owned()))
+            .unwrap_or(Bound::Unbounded);
+        let mut visited = 0;
+        let mut cursor = None;
+        let mut records = Vec::new();
+
+        for (task_id, entry) in index
+            .tasks
+            .range((lower_bound, Bound::<String>::Unbounded))
+            .take(scan_limit)
+        {
+            visited += 1;
+            cursor = Some(task_id.clone());
+            if entry.move_target.is_some() {
+                continue;
+            }
+
+            let active_path = store.task_path(task_id)?;
+            let history_path = store.terminal_history_path(task_id)?;
+            if entry.record_path != active_path && entry.record_path != history_path {
+                continue;
+            }
+
+            let Some(record) = store.read_record(&entry.record_path)? else {
+                continue;
+            };
+            if record.id != *task_id || record.chat_id != entry.chat_id {
+                bail!("task index points to a mismatched record for task {task_id}");
+            }
+            if record.revision != entry.revision || record.updated_at != entry.updated_at {
+                continue;
+            }
+            if !is_pgc_metadata_backfill_candidate(&record) {
+                continue;
+            }
+            if let Some(destination) = record.destination.as_ref()
+                && (destination.library_id != library.id
+                    || !same_trusted_root_path(&destination.root, &library.root)?)
+            {
+                continue;
+            }
+
+            records.push(record);
+        }
+
+        let next_cursor = (visited == scan_limit).then_some(cursor).flatten();
+        Ok((records, next_cursor))
+    }
+
+    /// Fill legacy PGC metadata only while the published queue record still matches the
+    /// resolver's snapshot. The save path preserves task ordering and activity metadata and does
+    /// not migrate terminal sidecars or clean publication receipts.
+    pub(crate) fn backfill_pgc_season_id_if_unchanged(
+        &self,
+        library_id: &str,
+        expected_binding: &str,
+        snapshot: &TaskRecord,
+        season_id: u64,
+        episode_orders: &[BilibiliGroupEntryIdentity],
+    ) -> Result<bool> {
+        if season_id == 0 || episode_orders.is_empty() {
+            return Ok(false);
+        }
+
+        let _guard = self.operation_lock.lock().map_err(poisoned_lock)?;
+        let Some((library, store)) =
+            self.pgc_backfill_store_unlocked(library_id, expected_binding)?
+        else {
+            return Ok(false);
+        };
+        let store_identity = store.root.root_identity();
+        let queue_identity = store.queue_identity;
+        let queue_dir = store.queue_dir.clone();
+        let operation_lock_path = store.operation_lock_path.clone();
+        let _store_operation_lock = store.lock_queue_operations()?;
+
+        let Some((confirmed_library, confirmed_store)) =
+            self.pgc_backfill_store_unlocked(library_id, expected_binding)?
+        else {
+            return Ok(false);
+        };
+        if confirmed_library.id != library.id
+            || confirmed_store.root.root_identity() != store_identity
+            || confirmed_store.queue_identity != queue_identity
+            || confirmed_store.queue_dir != queue_dir
+            || confirmed_store.operation_lock_path != operation_lock_path
+        {
+            return Ok(false);
+        }
+
+        let mut index = store.read_index()?;
+        let Some(entry) = index.tasks.get(&snapshot.id).cloned() else {
+            return Ok(false);
+        };
+        if entry.chat_id != snapshot.chat_id || entry.move_target.is_some() {
+            return Ok(false);
+        }
+        let active_path = store.task_path(&snapshot.id)?;
+        let history_path = store.terminal_history_path(&snapshot.id)?;
+        if entry.record_path != active_path && entry.record_path != history_path {
+            return Ok(false);
+        }
+
+        let Some(mut record) = store.read_record(&entry.record_path)? else {
+            return Ok(false);
+        };
+        if record.id != snapshot.id
+            || record.chat_id != snapshot.chat_id
+            || record.generation != snapshot.generation
+            || record.job != snapshot.job
+            || record.status != snapshot.status
+            || record.plan != snapshot.plan
+            || record.revision != snapshot.revision
+            || record.updated_at != snapshot.updated_at
+            || record.revision != entry.revision
+            || record.updated_at != entry.updated_at
+            || !is_stable_published_terminal_bilibili_record(&record)
+        {
+            return Ok(false);
+        }
+        if let Some(destination) = record.destination.as_ref()
+            && (destination.library_id != library.id
+                || !same_trusted_root_path(&destination.root, &library.root)?)
+        {
+            return Ok(false);
+        }
+
+        let Some(plan) = record.plan.as_mut() else {
+            return Ok(false);
+        };
+        if plan
+            .bilibili_pgc_season_id
+            .is_some_and(|current_season_id| current_season_id != season_id)
+        {
+            return Ok(false);
+        }
+
+        let mut changed = false;
+        if plan.bilibili_pgc_season_id.is_none() {
+            plan.bilibili_pgc_season_id = Some(season_id);
+            changed = true;
+        }
+        if plan.bilibili_pgc_episode_orders.is_empty() {
+            plan.bilibili_pgc_episode_orders = episode_orders.to_vec();
+            changed = true;
+        }
+        if !changed {
+            return Ok(false);
+        }
+
+        store.save_pgc_backfill_record_metadata(&mut record, &mut index, entry)?;
+        self.state_change_notify.notify_one();
+        Ok(true)
     }
 
     pub fn page_count(&self, chat_id: i64, history: bool) -> Result<usize> {
@@ -7005,6 +7315,23 @@ impl DownloadStore {
         Ok(record)
     }
 
+    fn save_pgc_backfill_record_metadata(
+        &self,
+        record: &mut TaskRecord,
+        index: &mut StoreIndex,
+        mut entry: TaskIndexEntry,
+    ) -> Result<()> {
+        if index.tasks.get(&record.id) != Some(&entry) || entry.move_target.is_some() {
+            bail!("task index changed before PGC metadata backfill save");
+        }
+
+        record.revision = record.revision.saturating_add(1);
+        self.write_record(&entry.record_path, record)?;
+        entry.revision = record.revision;
+        index.tasks.insert(record.id.clone(), entry);
+        self.write_index(index)
+    }
+
     fn remove_task_for_transfer(&self, transfer: &TaskDestinationTransfer) -> Result<()> {
         let mut index = self.read_index()?;
         let Some(index_entry) = index.tasks.get(&transfer.task_id).cloned() else {
@@ -7790,6 +8117,363 @@ mod tests {
         fs::create_dir_all(&config.downloads.video_dir).unwrap();
         fs::create_dir_all(&config.downloads.pdf_dir).unwrap();
         config
+    }
+
+    fn pgc_backfill_library_binding(queue: &QueueManager, library_id: &str) -> String {
+        queue
+            .registry_snapshot()
+            .expect("library registry should load")
+            .libraries
+            .into_iter()
+            .find(|library| library.id == library_id)
+            .and_then(|library| library.root_binding_token())
+            .expect("registered library should have a root binding")
+    }
+
+    fn legacy_published_bilibili_task(id: &str) -> TaskRecord {
+        let mut task = bilibili_task(id);
+        task.status = TaskStatus::Completed;
+        task.saved_location = Some(format!("/videos/{id}.mp4"));
+        task.plan = Some(grouped_plan(
+            "Legacy PGC season",
+            None,
+            &[(16, "Episode 16", "epid:16"), (17, "Episode 17", "epid:17")],
+        ));
+        task
+    }
+
+    fn sample_pgc_episode_orders() -> Vec<BilibiliGroupEntryIdentity> {
+        vec![
+            BilibiliGroupEntryIdentity {
+                index: 2,
+                title: "Episode 16".to_string(),
+                stable_media_id: "epid:16".to_string(),
+            },
+            BilibiliGroupEntryIdentity {
+                index: 3,
+                title: "Episode 17".to_string(),
+                stable_media_id: "epid:17".to_string(),
+            },
+        ]
+    }
+
+    fn move_task_record_to_history(queue: &QueueManager, task_id: &str) {
+        let source = queue
+            .video
+            .task_path(task_id)
+            .expect("active queue path should resolve");
+        let history = queue
+            .video
+            .terminal_history_path(task_id)
+            .expect("history path should resolve");
+        queue
+            .video
+            .ensure_private_history_directory()
+            .expect("history directory should be private");
+        fs::rename(source, &history).expect("terminal record should move to history");
+
+        let mut index = queue.video.read_index().expect("queue index should load");
+        let entry = index
+            .tasks
+            .get_mut(task_id)
+            .expect("task should remain indexed");
+        entry.record_path = history;
+        entry.move_target = None;
+        queue
+            .video
+            .write_index(&index)
+            .expect("history path should persist in the index");
+    }
+
+    #[test]
+    fn pgc_backfill_reads_a_bounded_cursor_page_from_the_registered_store() {
+        let directory = temp_queue_root("pgc-backfill-bounded-candidates");
+        let config = test_video_config(&directory);
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let provider_trait: Arc<dyn QueueFileProvider> = provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, provider_trait)
+            .expect("queue should open");
+        let library_id = queue.registry_snapshot().unwrap().default_library_id;
+        let binding = pgc_backfill_library_binding(&queue, &library_id);
+        let mut index = queue.video.read_index().expect("queue index should load");
+
+        for number in 0..70 {
+            let id = format!("pgc-backfill-{number:03}");
+            let mut record = legacy_published_bilibili_task(&id);
+            record.destination = None;
+            record.updated_at = 10_000 + number;
+            let path = queue.video.task_path(&id).unwrap();
+            queue.video.write_record(&path, &record).unwrap();
+            index.tasks.insert(
+                id,
+                TaskIndexEntry {
+                    chat_id: record.chat_id,
+                    record_path: path,
+                    move_target: None,
+                    revision: record.revision,
+                    updated_at: record.updated_at,
+                },
+            );
+        }
+        queue.video.write_index(&index).unwrap();
+
+        let reads_before = provider.read_paths().len();
+        let (first_page, cursor) = queue
+            .published_backfill_candidates(&library_id, &binding, None, 200)
+            .expect("bounded candidate page should load");
+        let read_paths = provider.read_paths();
+        let scan_read_paths = &read_paths[reads_before..];
+        let task_record_paths = (0..70)
+            .map(|number| {
+                queue
+                    .video
+                    .task_path(&format!("pgc-backfill-{number:03}"))
+                    .unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        let task_record_read_paths = scan_read_paths
+            .iter()
+            .filter(|path| task_record_paths.contains(*path))
+            .collect::<Vec<_>>();
+        let task_record_reads = scan_read_paths
+            .iter()
+            .filter(|path| task_record_paths.contains(*path))
+            .count();
+        let unique_task_record_reads = task_record_read_paths
+            .iter()
+            .map(|path| path.as_path())
+            .collect::<BTreeSet<_>>()
+            .len();
+        let index_path = queue.video.index_path();
+        let index_reads = scan_read_paths
+            .iter()
+            .filter(|path| path.as_path() == index_path.as_path())
+            .count();
+        assert_eq!(first_page.len(), MAX_PGC_BACKFILL_INDEX_CANDIDATES);
+        assert_eq!(first_page.first().unwrap().id, "pgc-backfill-000");
+        assert_eq!(first_page.last().unwrap().id, "pgc-backfill-063");
+        assert_eq!(cursor.as_deref(), Some("pgc-backfill-063"));
+        assert!(
+            task_record_reads <= MAX_PGC_BACKFILL_INDEX_CANDIDATES,
+            "bounded scan read {task_record_reads} task records across {} coordinated reads (index reads: {index_reads})",
+            scan_read_paths.len(),
+        );
+        assert_eq!(task_record_reads, first_page.len());
+        assert_eq!(unique_task_record_reads, task_record_reads);
+        assert_eq!(index_reads, 1);
+
+        let (second_page, cursor) = queue
+            .published_backfill_candidates(&library_id, &binding, cursor.as_deref(), 200)
+            .expect("remaining candidate page should load");
+        assert_eq!(second_page.len(), 6);
+        assert_eq!(second_page.first().unwrap().id, "pgc-backfill-064");
+        assert_eq!(second_page.last().unwrap().id, "pgc-backfill-069");
+        assert_eq!(cursor, None);
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pgc_backfill_cas_preserves_history_and_receipt_metadata() {
+        let directory = temp_queue_root("pgc-backfill-metadata-cas");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let library_id = queue.registry_snapshot().unwrap().default_library_id;
+        let binding = pgc_backfill_library_binding(&queue, &library_id);
+        let archive_root = directory.join("archive");
+        fs::create_dir_all(&archive_root).expect("archive root should exist");
+        let archive = queue
+            .register_video_library("Archive", &archive_root, None, false, false)
+            .expect("second library should register");
+        let archive_binding = pgc_backfill_library_binding(&queue, &archive.id);
+
+        let id = "pgc-backfill-history-cas";
+        let mut task = legacy_published_bilibili_task(id);
+        task.destination = None;
+        task.generation = 8;
+        task.user_actions = 13;
+        let namespace = task.bilibili_publication_namespace();
+        let mut attempt = verified_grouped_attempt();
+        attempt.bilibili_publication_namespace = Some(namespace.clone());
+        for entry in &mut attempt.entries {
+            entry.state = BilibiliAttemptEntryState::Verified;
+            entry.stable_media_id = format!("epid:{}", entry.index);
+            let media_path = config
+                .downloads
+                .video_dir
+                .join(format!("{}-published.mp4", entry.index));
+            entry.published_media_paths = vec![media_path.clone()];
+            entry.published_media_hashes =
+                BTreeMap::from([(media_path.to_string_lossy().into_owned(), "a".repeat(64))]);
+        }
+        task.bilibili_attempt = Some(attempt);
+        task.plan.as_mut().unwrap().bilibili_publication_namespace = Some(namespace.clone());
+        queue
+            .video
+            .create_task(&mut task)
+            .expect("legacy destination-less record should be stored");
+        let receipt_path = add_private_group_receipt_fixture(
+            &queue.video.root,
+            &namespace,
+            &format!("{}.json", "a".repeat(64)),
+        );
+        let receipt_before = fs::read(&receipt_path).unwrap();
+        move_task_record_to_history(&queue, id);
+
+        let history_path = queue.video.terminal_history_path(id).unwrap();
+        let before = queue
+            .video
+            .read_record(&history_path)
+            .unwrap()
+            .expect("history task should load");
+        let before_attempt_bytes = serde_json::to_vec(&before.bilibili_attempt).unwrap();
+        let before_index = queue.video.read_index().unwrap();
+        let before_entry = before_index.tasks[id].clone();
+        let before_activity = before_index.chat_activity.clone();
+        let orders = sample_pgc_episode_orders();
+
+        assert!(
+            !queue
+                .backfill_pgc_season_id_if_unchanged(
+                    &archive.id,
+                    &archive_binding,
+                    &before,
+                    77,
+                    &orders,
+                )
+                .unwrap()
+        );
+        assert!(
+            !queue
+                .backfill_pgc_season_id_if_unchanged(
+                    &library_id,
+                    &archive_binding,
+                    &before,
+                    77,
+                    &orders,
+                )
+                .unwrap()
+        );
+        let mut stale_generation = before.clone();
+        stale_generation.generation += 1;
+        assert!(
+            !queue
+                .backfill_pgc_season_id_if_unchanged(
+                    &library_id,
+                    &binding,
+                    &stale_generation,
+                    77,
+                    &orders,
+                )
+                .unwrap()
+        );
+        let mut stale_plan = before.clone();
+        stale_plan.plan.as_mut().unwrap().title = Some("changed plan".to_string());
+        assert!(
+            !queue
+                .backfill_pgc_season_id_if_unchanged(
+                    &library_id,
+                    &binding,
+                    &stale_plan,
+                    77,
+                    &orders,
+                )
+                .unwrap()
+        );
+        let mut stale_status = before.clone();
+        stale_status.status = TaskStatus::Failed;
+        assert!(
+            !queue
+                .backfill_pgc_season_id_if_unchanged(
+                    &library_id,
+                    &binding,
+                    &stale_status,
+                    77,
+                    &orders,
+                )
+                .unwrap()
+        );
+
+        assert!(
+            queue
+                .backfill_pgc_season_id_if_unchanged(&library_id, &binding, &before, 77, &orders)
+                .unwrap()
+        );
+        let after = queue
+            .video
+            .read_record(&history_path)
+            .unwrap()
+            .expect("history record should remain at its original path");
+        let after_index = queue.video.read_index().unwrap();
+        let after_entry = &after_index.tasks[id];
+        assert_eq!(
+            after.plan.as_ref().unwrap().bilibili_pgc_season_id,
+            Some(77)
+        );
+        assert_eq!(
+            after.plan.as_ref().unwrap().bilibili_pgc_episode_orders,
+            orders
+        );
+        assert_eq!(after.destination, None, "legacy destination stays unset");
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.activity_revision, before.activity_revision);
+        assert_eq!(after.user_actions, before.user_actions);
+        assert_eq!(after.bilibili_attempt, before.bilibili_attempt);
+        assert_eq!(
+            serde_json::to_vec(&after.bilibili_attempt).unwrap(),
+            before_attempt_bytes
+        );
+        assert_eq!(
+            after.plan.as_ref().unwrap().bilibili_publication_namespace,
+            Some(namespace)
+        );
+        assert_eq!(after_entry.record_path, before_entry.record_path);
+        assert_eq!(after_entry.move_target, None);
+        assert_eq!(after_entry.updated_at, before_entry.updated_at);
+        assert_eq!(after_entry.revision, after.revision);
+        assert_eq!(after_index.chat_activity, before_activity);
+        assert_eq!(fs::read(receipt_path).unwrap(), receipt_before);
+
+        assert!(
+            !queue
+                .backfill_pgc_season_id_if_unchanged(
+                    &library_id,
+                    &binding,
+                    &after,
+                    99,
+                    &sample_pgc_episode_orders(),
+                )
+                .unwrap()
+        );
+        let mut conflicting_orders = orders.clone();
+        conflicting_orders[0].index += 100;
+        // Existing season metadata is never overwritten, and nonempty episode orders are retained.
+        assert!(
+            !queue
+                .backfill_pgc_season_id_if_unchanged(
+                    &library_id,
+                    &binding,
+                    &after,
+                    77,
+                    &conflicting_orders,
+                )
+                .unwrap()
+        );
+        let preserved = queue
+            .video
+            .read_record(&history_path)
+            .unwrap()
+            .expect("history record should remain readable");
+        assert_eq!(
+            preserved.plan.as_ref().unwrap().bilibili_pgc_episode_orders,
+            orders
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
     }
 
     fn task_transfer_fixture(label: &str) -> (PathBuf, AppConfig, QueueManager, TaskDestination) {

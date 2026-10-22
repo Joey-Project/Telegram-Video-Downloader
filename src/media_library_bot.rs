@@ -201,6 +201,14 @@ pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
     let default_id = settings.default_library_id.clone();
     for library in settings.libraries {
         let (scoped, _) = scoped_runtime(runtime, Some(&library.id))?;
+        if let Some(root_binding) = library.root_binding_token() {
+            crate::pgc_metadata_backfill::backfill_legacy_pgc_metadata(
+                &scoped,
+                &library.id,
+                &root_binding,
+            )
+            .await;
+        }
         let result = run_cloud_library_operation(
             &scoped,
             "media-library refresh worker failed",

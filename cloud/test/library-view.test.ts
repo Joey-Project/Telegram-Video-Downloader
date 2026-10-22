@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { boundedFolderSuggestions, buildMigrationPreviewPayload, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnMediaLibrary, canOperateOnRegisteredMediaLibrary, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget } from "../public/file/library-view.js";
+import { boundedFolderSuggestions, buildMigrationPreviewPayload, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnMediaLibrary, canOperateOnRegisteredMediaLibrary, collectionIdentity, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget } from "../public/file/library-view.js";
 import { updateSelectionWithinLimit } from "../public/file/selection-limit.js";
 import { renderMigrationPreview } from "../public/file/migration-preview-rendering.js";
 import { escapeHtml } from "../public/file/preview-rendering.js";
@@ -354,6 +354,67 @@ describe("bounded library views", () => {
     expect(firstPage.items.every((item) => item.title.toLowerCase().includes("needle"))).toBe(true);
     expect(secondPage.items[0]?.id).not.toBe(firstPage.items[0]?.id);
     expect(paginateLibraryItems(filtered, 100).page).toBe(4);
+  });
+
+  it("honors numeric episode order inside stable collection blocks", () => {
+    const items = [
+      { id: "episode-10", title: "Episode 1", collection: { id: "series-a", title: "Series A", kind: "series", order: 10 } },
+      { id: "episode-2", title: "Episode 2", collection: { id: "series-a", title: "Series A", kind: "series", order: 2 } },
+      { id: "episode-1", title: "Episode 10", collection: { id: "series-a", title: "Series A", kind: "series", order: 1 } },
+      { id: "other-series-1", title: "Episode 0", collection: { id: "series-b", title: "Series B", kind: "series", order: 1 } },
+    ];
+    const filtered = filterLibraryItems(items);
+    const groups = groupLibraryItems(filtered);
+
+    expect(groups.map(({ title, items: entries }) => ({ title, ids: entries.map((item) => item.id) }))).toEqual([
+      { title: "Series B", ids: ["other-series-1"] },
+      { title: "Series A", ids: ["episode-1", "episode-2", "episode-10"] },
+    ]);
+  });
+
+  it("uses filesystem collection identity for grouping and keeps same-title IDs separate", () => {
+    const first = { id: "same-id-first", title: "Episode 1", collection: { id: " series-a ", title: "Series", kind: " tv " } };
+    const renamed = { id: "same-id-renamed", title: "Episode 2", collection: { id: "series-a", title: "Series renamed", kind: "tv", order: 2 } };
+    const sameTitleOtherId = { id: "other-series", title: "Episode 3", collection: { id: "series-b", title: "Series", kind: "tv" } };
+    const groups = groupLibraryItems([first, renamed, sameTitleOtherId]);
+
+    expect(collectionIdentity(first.collection)).toBe(collectionIdentity(renamed.collection));
+    expect(collectionIdentity(first.collection)).not.toBe(collectionIdentity(sameTitleOtherId.collection));
+    expect(groups).toEqual([
+      { title: "Series", items: [first, renamed] },
+      { title: "Series", items: [sameTitleOtherId] },
+    ]);
+  });
+
+  it("sorts known episode orders before missing orders with title fallback", () => {
+    const items = [
+      { id: "missing-2", title: "Episode 2", collection: { id: "series", title: "Series", kind: "series", order: null } },
+      { id: "order-10", title: "Episode 1", collection: { id: "series", title: "Series", kind: "series", order: 10 } },
+      { id: "invalid-order", title: "Episode 11", collection: { id: "series", title: "Series", kind: "series", order: -1 } },
+      { id: "order-1", title: "Episode 10", collection: { id: "series", title: "Series", kind: "series", order: 1 } },
+      { id: "missing-1", title: "Episode 3", collection: { id: "series", title: "Series", kind: "series" } },
+    ];
+
+    expect(filterLibraryItems(items).map((item) => item.id)).toEqual([
+      "order-1", "order-10", "invalid-order", "missing-2", "missing-1",
+    ]);
+  });
+
+  it("paginates an ordered collection only after its episodes are sorted numerically", () => {
+    const items = Array.from({ length: 51 }, (_, index) => {
+      const order = index + 1;
+      return {
+        id: `episode-${order}`,
+        title: `Episode ${String(52 - order).padStart(2, "0")}`,
+        collection: { id: "series", title: "Series", kind: "series", order },
+      };
+    });
+    const filtered = filterLibraryItems(items);
+    const firstPage = paginateLibraryItems(filtered, 0);
+    const secondPage = paginateLibraryItems(filtered, 1);
+
+    expect(firstPage.items.map((item) => item.id)).toEqual(Array.from({ length: 50 }, (_, index) => `episode-${index + 1}`));
+    expect(secondPage.items.map((item) => item.id)).toEqual(["episode-51"]);
   });
 
   it("caps media rows even when one collection spans multiple pages", () => {

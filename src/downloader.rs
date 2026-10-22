@@ -1875,6 +1875,7 @@ struct BilibiliGroupEntry {
 struct BilibiliEpisodeGroupInventory {
     title: String,
     source: BilibiliGroupSource,
+    pgc_season_id: Option<u64>,
     entries: Vec<BilibiliGroupEntry>,
     output_template: Option<String>,
     // The selected collection folder is a direct child of downloads.video_dir. Keep this
@@ -2115,6 +2116,19 @@ impl BilibiliEpisodeGroupInventory {
                 .map(|entry| entry.stable_media_id.clone())
                 .collect(),
             media_profile: Some(media_profile),
+            bilibili_pgc_season_id: self.pgc_season_id,
+            bilibili_pgc_episode_orders: if self.source == BilibiliGroupSource::Season {
+                self.entries
+                    .iter()
+                    .map(|entry| BilibiliGroupEntryIdentity {
+                        index: entry.download.index,
+                        title: entry.download.title.clone(),
+                        stable_media_id: entry.stable_media_id.clone(),
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
             bilibili_group_entries: self
                 .entries
                 .iter()
@@ -2270,6 +2284,7 @@ async fn resolve_bilibili_episode_group_inventory(
     let mut output_folder = None;
     let mut storage_relative_output_folder = None;
     let mut output_folder_identity = None;
+    let mut pgc_season_id = None;
     let (title, source, entries) = match resolved {
         ResolvedContent::Video(video) => {
             let bvid = video.bvid.clone();
@@ -2289,6 +2304,7 @@ async fn resolve_bilibili_episode_group_inventory(
             (video.title, BilibiliGroupSource::Video, entries)
         }
         ResolvedContent::Season(season) => {
+            pgc_season_id = season.season.season_id.filter(|id| *id > 0);
             let entries: Vec<BilibiliDownloadEntry> = season
                 .selected_episodes
                 .into_iter()
@@ -2390,6 +2406,7 @@ async fn resolve_bilibili_episode_group_inventory(
     Ok(BilibiliEpisodeGroupInventory {
         title: nonempty_collection_title(&title),
         source,
+        pgc_season_id,
         entries,
         output_template,
         output_folder,
@@ -5591,8 +5608,8 @@ async fn inspect_job_plan_inner(
                 .await;
             }
             let client = bilibili_core::client(config)?;
-            let plan = if matches!(selection, Some(BilibiliSelection::Missing)) {
-                plan_bilibili_missing_entries(
+            let (plan, pgc_season_id) = if matches!(selection, Some(BilibiliSelection::Missing)) {
+                let missing = plan_bilibili_missing_entries(
                     config,
                     &client,
                     url,
@@ -5605,8 +5622,11 @@ async fn inspect_job_plan_inner(
                         send_bilibili_planning_progress(progress.as_ref(), stage, done, total)
                     },
                 )
-                .await?
-                .plan
+                .await?;
+                (
+                    missing.plan,
+                    bilibili_pgc_season_id_from_resolved(&missing.resolved),
+                )
             } else {
                 probe_bilibili_plan_with_mode_and_progress(
                     &client,
@@ -5618,7 +5638,26 @@ async fn inspect_job_plan_inner(
                 )
                 .await?
             };
-            Ok(bilibili_plan_validation_snapshot(&plan, &options))
+            let mut snapshot = bilibili_plan_validation_snapshot(&plan, &options);
+            if let Some(season_id) = pgc_season_id {
+                snapshot.bilibili_pgc_season_id = Some(season_id);
+                snapshot.bilibili_pgc_episode_orders = plan
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.index > 0 && entry.epid.is_some_and(|epid| epid > 0))
+                    .map(|entry| BilibiliGroupEntryIdentity {
+                        index: entry.index,
+                        title: entry.title.clone(),
+                        stable_media_id: bilibili_plan_stable_media_id(
+                            entry.bvid.as_deref(),
+                            entry.aid,
+                            entry.cid,
+                            entry.epid,
+                        ),
+                    })
+                    .collect();
+            }
+            Ok(snapshot)
         }
     }
 }
@@ -13220,8 +13259,8 @@ async fn probe_bilibili_plan_with_mode_and_progress(
     mode: DownloadMode,
     timeout: Duration,
     progress: Option<&JobProgressSender>,
-) -> Result<bbdown_core::DownloadPlan> {
-    bilibili_planning::plan_download_with_progress(
+) -> Result<(bbdown_core::DownloadPlan, Option<u64>)> {
+    let (plan, resolved) = bilibili_planning::plan_download_with_progress(
         client,
         url,
         bilibili_core::selection(selection),
@@ -13230,8 +13269,99 @@ async fn probe_bilibili_plan_with_mode_and_progress(
         |_, _| {},
         |stage, done, total| send_bilibili_planning_progress(progress, stage, done, total),
     )
+    .await?;
+    Ok((plan, bilibili_pgc_season_id_from_resolved(&resolved)))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BilibiliPgcSeasonIdentity {
+    pub season_id: u64,
+    pub episode_orders: BTreeMap<u64, u32>,
+}
+
+/// Resolves only season metadata from an explicit Bilibili PGC URL.
+///
+/// This deliberately rejects episode URLs: an episode's stable ID does not prove a season.
+pub(crate) async fn resolve_bilibili_pgc_season_identity(
+    config: &AppConfig,
+    url: &str,
+) -> Result<Option<BilibiliPgcSeasonIdentity>> {
+    if !is_explicit_bilibili_pgc_season_url(url) {
+        return Ok(None);
+    }
+
+    let client = bilibili_core::client(config)?;
+    let resolved = tokio_timeout(
+        BILIBILI_METADATA_PROBE_TIMEOUT,
+        client.resolve_input(url, Some(Selection::All)),
+    )
     .await
-    .map(|(plan, _)| plan)
+    .map_err(|_| anyhow!("Bilibili PGC metadata resolution timed out"))?
+    .map_err(|_| anyhow!("failed to resolve Bilibili PGC season metadata"))?;
+    let ResolvedContent::Season(resolution) = resolved else {
+        return Ok(None);
+    };
+    let Some(season_id) = resolution.season.season_id.filter(|id| *id > 0) else {
+        return Ok(None);
+    };
+    let mut episode_orders = BTreeMap::new();
+    for episode in resolution.season.episodes {
+        if episode.epid == 0 || episode.index == 0 {
+            continue;
+        }
+        if episode_orders.insert(episode.epid, episode.index).is_some() {
+            bail!("Bilibili PGC metadata contains duplicate episode identities");
+        }
+    }
+    Ok(Some(BilibiliPgcSeasonIdentity {
+        season_id,
+        episode_orders,
+    }))
+}
+
+fn bilibili_pgc_season_id_from_resolved(resolved: &ResolvedContent) -> Option<u64> {
+    match resolved {
+        ResolvedContent::Season(resolution) => resolution
+            .season
+            .season_id
+            .filter(|season_id| *season_id > 0),
+        ResolvedContent::Video(_) | ResolvedContent::Collection(_) => None,
+    }
+}
+
+fn is_explicit_bilibili_pgc_season_url(raw_url: &str) -> bool {
+    let Ok(url) = url::Url::parse(raw_url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    if host != "bilibili.com" && !host.ends_with(".bilibili.com") {
+        return false;
+    }
+    let segments = url
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() != 3 || segments[0] != "bangumi" {
+        return false;
+    }
+    let prefix = match (segments[1], segments[2].get(..2)) {
+        ("media", Some("md")) => "md",
+        ("play", Some("ss")) => "ss",
+        _ => return false,
+    };
+    let Some(id) = segments[2].strip_prefix(prefix) else {
+        return false;
+    };
+    !id.is_empty()
+        && id.bytes().all(|byte| byte.is_ascii_digit())
+        && id.parse::<u64>().is_ok_and(|id| id > 0)
 }
 
 fn send_bilibili_planning_progress(
@@ -22541,6 +22671,7 @@ mod tests {
         BilibiliEpisodeGroupInventory {
             title: "Test group".to_string(),
             source: BilibiliGroupSource::Video,
+            pgc_season_id: None,
             entries: (1..=count).map(test_group_entry).collect(),
             output_template: None,
             output_folder: None,
@@ -23220,6 +23351,45 @@ mod tests {
                 "setting: {setting}"
             );
         }
+    }
+
+    #[test]
+    fn pgc_season_identity_allows_legacy_fill_and_rejects_known_changes() {
+        let legacy = PlanValidationSnapshot::default();
+        let resolved = PlanValidationSnapshot {
+            bilibili_pgc_season_id: Some(123),
+            bilibili_pgc_episode_orders: vec![BilibiliGroupEntryIdentity {
+                index: 10,
+                title: "Episode 10".to_string(),
+                stable_media_id: "epid:10".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert!(
+            legacy.blocking_differences(&resolved).is_empty(),
+            "legacy plans should be able to acquire validated canonical season and order metadata"
+        );
+
+        let mut changed = resolved.clone();
+        changed.bilibili_pgc_season_id = Some(456);
+        assert_eq!(
+            resolved.blocking_differences(&changed),
+            vec!["PGC season identity"]
+        );
+
+        let mut renumbered = resolved.clone();
+        renumbered.bilibili_pgc_episode_orders[0].index = 9;
+        assert_eq!(
+            resolved.blocking_differences(&renumbered),
+            vec!["episode numbering"]
+        );
+
+        let missing = PlanValidationSnapshot::default();
+        assert_eq!(
+            resolved.blocking_differences(&missing),
+            vec!["PGC season identity", "episode numbering"],
+            "a known canonical identity must not silently disappear on revalidation"
+        );
     }
 
     #[test]
@@ -29446,6 +29616,136 @@ mod tests {
             !request.contains("/pgc/player/web/v2/playurl") || !request.contains("ep_id=3002")
         }));
         let _ = fs::remove_dir_all(output_root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pgc_metadata_only_resolver_returns_canonical_season_and_absolute_orders() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock API listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("mock API address should read")
+        );
+        let requests = Arc::new(StdMutex::new(Vec::<String>::new()));
+        let server_requests = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0_u8; 8192];
+                let Ok(read) = stream.read(&mut request).await else {
+                    break;
+                };
+                let request = String::from_utf8_lossy(&request[..read]).into_owned();
+                let request_line = request.lines().next().unwrap_or_default().to_string();
+                server_requests
+                    .lock()
+                    .expect("request log should lock")
+                    .push(request_line.clone());
+                let body = if request_line.contains("/pgc/review/user") {
+                    serde_json::json!({
+                        "code": 0,
+                        "result": {"media": {"new_ep": {"id": 1010}}}
+                    })
+                } else if request_line.contains("/pgc/view/web/season") {
+                    let season_id = if request_line.contains("season_id=888") {
+                        888
+                    } else {
+                        777
+                    };
+                    let episodes = (1_u64..=10)
+                        .map(|index| {
+                            serde_json::json!({
+                                "aid": 10_000 + index,
+                                "bvid": format!("BV{index}"),
+                                "cid": 20_000 + index,
+                                "id": 30_000 + index,
+                                "ep_id": 1_000 + index,
+                                "title": format!("Episode {index}")
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    serde_json::json!({
+                        "code": 0,
+                        "result": {
+                            "season_id": season_id,
+                            "title": "Mock PGC season",
+                            "episodes": episodes
+                        }
+                    })
+                } else {
+                    serde_json::json!({"code": -404, "message": "unexpected mock request"})
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let credential_root = temp_test_dir("pgc-metadata-only-resolver-credentials");
+        let mut config = test_config();
+        config.bilibili.auth.credential_file = credential_root.join("credentials.json");
+        config.bilibili.auth.state_path = credential_root.join("auth.json");
+        config.bilibili.extra_args = vec![
+            "--pgc-base".to_string(),
+            base_url,
+            "--request-timeout-seconds".to_string(),
+            "2".to_string(),
+        ];
+        let md = resolve_bilibili_pgc_season_identity(
+            &config,
+            "https://www.bilibili.com/bangumi/media/md123",
+        )
+        .await
+        .expect("metadata-only PGC resolution should use the mock API")
+        .expect("explicit md URL should resolve as a PGC season");
+        assert_eq!(md.season_id, 777);
+        assert_eq!(md.episode_orders.len(), 10);
+        assert_eq!(md.episode_orders.get(&1010), Some(&10));
+
+        let episode_url = resolve_bilibili_pgc_season_identity(
+            &config,
+            "https://www.bilibili.com/bangumi/play/ep1010",
+        )
+        .await
+        .expect("episode URL should be rejected without a network request");
+        assert!(episode_url.is_none());
+
+        let ss = resolve_bilibili_pgc_season_identity(
+            &config,
+            "https://www.bilibili.com/bangumi/play/ss888",
+        )
+        .await
+        .expect("metadata-only SS resolution should use the mock API")
+        .expect("explicit ss URL should resolve as a PGC season");
+        assert_eq!(ss.season_id, 888);
+        assert_eq!(ss.episode_orders.get(&1010), Some(&10));
+        server.abort();
+
+        let requests = requests.lock().expect("request log should lock");
+        assert_eq!(requests.len(), 3, "episode URL must not issue a request");
+        assert!(requests.iter().any(|request| {
+            request.contains("/pgc/review/user") && request.contains("media_id=123")
+        }));
+        assert!(requests.iter().any(|request| {
+            request.contains("/pgc/view/web/season") && request.contains("ep_id=1010")
+        }));
+        assert!(requests.iter().any(|request| {
+            request.contains("/pgc/view/web/season") && request.contains("season_id=888")
+        }));
+        let _ = fs::remove_dir_all(credential_root);
     }
 
     #[cfg(unix)]
