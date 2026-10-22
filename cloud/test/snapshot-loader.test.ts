@@ -32,7 +32,7 @@ describe("owner snapshot loader", () => {
     const fetchJson = vi.fn(async () => ownerSnapshot);
 
     await expect(loadOwnerSnapshot(fetchJson)).resolves.toBe(ownerSnapshot);
-    expect(fetchJson).toHaveBeenCalledExactlyOnceWith("/state");
+    expect(fetchJson).toHaveBeenCalledExactlyOnceWith("/state", { "X-Snapshot-Format": "chunked-v1" });
   });
 
   it("assembles library and state partitions with owner epoch headers and bounded concurrency", async () => {
@@ -71,7 +71,7 @@ describe("owner snapshot loader", () => {
       library: { revision: "library-revision", items: expect.arrayContaining([{ id: "large-0", title: "x".repeat(4_000) }]) },
       settings: { download_dir: "/srv/media" },
     });
-    expect(fetchJson.mock.calls[0]?.[0]).toBe("/state");
+    expect(fetchJson.mock.calls[0]).toEqual(["/state", { "X-Snapshot-Format": "chunked-v1" }]);
     expect(maximumInFlight).toBeGreaterThan(1);
     expect(maximumInFlight).toBeLessThanOrEqual(4);
   });

@@ -3043,7 +3043,45 @@ describe("local client API and state snapshots", () => {
     expect(committed.status).toBe(200);
 
     const owner = await signInitData();
-    const stateResponse = await ownerRequest("/api/state", owner);
+    const contentChunkReads: string[] = [];
+    const observedDb = new Proxy(testEnv.DB, {
+      get(target, property) {
+        if (property === "prepare") {
+          return (query: string) => {
+            if (/FROM snapshot_content_chunks/iu.test(query)) contentChunkReads.push(query);
+            return target.prepare(query);
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const ownerRead = (path: string, snapshotFormat?: string, includeOwner = true) => {
+      const headers = new Headers();
+      if (includeOwner) headers.set("x-telegram-init-data", owner);
+      if (snapshotFormat !== undefined) headers.set("X-Snapshot-Format", snapshotFormat);
+      return worker.fetch(new Request(`${workerUrl}${path}`, { headers }), { ...testEnv, DB: observedDb } as Env);
+    };
+    const upgradeError = {
+      error: "A new Mini App version is available. Close and reopen it from Telegram.",
+      code: "snapshot_client_upgrade_required",
+    };
+    for (const path of ["/api/state", "/api/library"] as const) {
+      expect((await ownerRead(path, "chunked-v2", false)).status).toBe(401);
+      for (const capability of [undefined, "chunked-v2"]) {
+        const response = await ownerRead(path, capability);
+        expect(response.status).toBe(426);
+        const body = await responseJson<Record<string, unknown>>(response);
+        expect(body).toEqual(upgradeError);
+        expect(body).not.toHaveProperty("library");
+        expect(body).not.toHaveProperty("state");
+      }
+    }
+    expect(contentChunkReads).toEqual([]);
+
+    const stateResponse = await ownerRequest("/api/state", owner, {
+      headers: { "X-Snapshot-Format": "chunked-v1" },
+    });
     expect(stateResponse.status).toBe(200);
     const ownerState = await responseJson<{
       format: string;
@@ -3058,7 +3096,9 @@ describe("local client API and state snapshots", () => {
       state: manifest(state),
     });
 
-    const libraryResponse = await ownerRequest("/api/library", owner);
+    const libraryResponse = await ownerRequest("/api/library", owner, {
+      headers: { "X-Snapshot-Format": "chunked-v1" },
+    });
     expect(libraryResponse.status).toBe(200);
     expect(await responseJson<{ format: string; database_epoch: string; library: unknown }>(libraryResponse))
       .toMatchObject({ format: "chunked-v1", database_epoch: epoch, library: manifest(library) });
@@ -3079,6 +3119,28 @@ describe("local client API and state snapshots", () => {
       sha256: library.sha256,
       data: '{"revision":"owner-library","items":["🙂"]}',
     });
+  });
+
+  it("keeps legacy owner response shapes independent of snapshot format capability", async () => {
+    const legacy = localSnapshot({ state_version: 1 }) as unknown as LocalSnapshot;
+    await storeSnapshot(testEnv.DB, legacy);
+    const owner = await signInitData();
+
+    for (const path of ["/api/state", "/api/library"] as const) {
+      for (const capability of [undefined, "chunked-v2", "chunked-v1"]) {
+        const headers = capability === undefined ? {} : { "X-Snapshot-Format": capability };
+        const response = await ownerRequest(path, owner, { headers });
+        expect(response.status).toBe(200);
+        const body = await responseJson<Record<string, unknown>>(response);
+        expect(body).not.toHaveProperty("format");
+        if (path === "/api/state") {
+          expect(body.library).toMatchObject({ revision: "library-hash-a", items: [] });
+          expect(body).not.toHaveProperty("state");
+        } else {
+          expect(body.library).toMatchObject({ revision: "library-hash-a", items: [] });
+        }
+      }
+    }
   });
 
   it.each([

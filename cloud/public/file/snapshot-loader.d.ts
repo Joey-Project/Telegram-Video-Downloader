@@ -5,7 +5,7 @@ export type SnapshotJsonFetcher = (
   headers?: SnapshotRequestHeaders,
 ) => Promise<unknown>;
 
-/** Load a legacy owner snapshot or fetch and validate all chunks in a chunked-v1 manifest. */
+/** Request chunked-v1 when loading an owner snapshot, while accepting legacy full responses. */
 export function loadOwnerSnapshot(fetchJson: SnapshotJsonFetcher): Promise<unknown>;
 
 /** Create a page-local loader with bounded, verified, in-memory chunk reuse. */

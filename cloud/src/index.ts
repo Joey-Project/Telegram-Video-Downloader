@@ -239,6 +239,18 @@ async function handleLocalWebSocket(request: Request, env: Env): Promise<Respons
   return env.NOTIFIER.getByName(NOTIFIER_ID).fetch(request);
 }
 
+function requireChunkedSnapshotCapability(request: Request): void {
+  if (request.headers.get("X-Snapshot-Format") === "chunked-v1") return;
+  throw new HttpError(
+    426,
+    "A new Mini App version is available. Close and reopen it from Telegram.",
+    undefined,
+    undefined,
+    undefined,
+    "snapshot_client_upgrade_required",
+  );
+}
+
 async function handleState(request: Request, env: Env): Promise<Response> {
   await requireOwner(request, env);
   const [snapshot, pendingRequests] = await Promise.all([
@@ -246,6 +258,7 @@ async function handleState(request: Request, env: Env): Promise<Response> {
     getPendingSummary(env.DB, CLOUD_REQUEST_PAGE_SIZE),
   ]);
   if (snapshot?.transport === "chunked-v1") {
+    requireChunkedSnapshotCapability(request);
     return json({
       format: "chunked-v1",
       state_version: snapshot.state_version,
@@ -270,6 +283,7 @@ async function handleLibrary(request: Request, env: Env): Promise<Response> {
     return json({ synced: false, library: null, reported_at: null, last_seen: null, stale: true });
   }
   if (snapshot.transport === "chunked-v1") {
+    requireChunkedSnapshotCapability(request);
     return json({
       format: "chunked-v1",
       database_epoch: snapshot.database_epoch,

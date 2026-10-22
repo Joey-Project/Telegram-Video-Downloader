@@ -102,6 +102,12 @@ Nondefault libraries retain their nested snapshots. Both Mini Apps resolve the
 default descriptor against the top-level snapshot while preserving offline and
 stale-snapshot restrictions.
 
+Owner clients opt in to manifest responses with `X-Snapshot-Format: chunked-v1`.
+If a chunked snapshot is active, an older page without that capability receives
+HTTP 426 with a close-and-reopen prompt, preserving its prior snapshot through
+the existing failed-refresh path. The Worker does not rebuild full JSON for old
+pages. Legacy snapshot responses keep their original shape.
+
 The Worker also accepts legacy and `prepared-v1` snapshot requests, with their
 existing validation. Apply the additive D1 migration and deploy the Worker
 before the new Rust executable. A Worker rollback requires a compatible legacy

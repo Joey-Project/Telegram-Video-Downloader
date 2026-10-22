@@ -248,7 +248,7 @@ function validateAssembledShape(library, state) {
 }
 
 async function loadOwnerSnapshotWithCache(fetchJson, cache) {
-  const response = await fetchJson("/state");
+  const response = await fetchJson("/state", { "X-Snapshot-Format": "chunked-v1" });
   if (!isRecord(response) || typeof response.format !== "string" || !response.format.startsWith("chunked-")) {
     cache?.clear();
     return response;

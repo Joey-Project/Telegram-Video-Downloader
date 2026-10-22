@@ -2120,6 +2120,39 @@ async fn media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e
             confirm.error
         );
         let id = preview["id"].as_str().unwrap().to_string();
+        // The runner keeps its durable status Queued while waiting for the process-global
+        // output lease. Give that shared test-suite admission its own bounded budget so it
+        // cannot consume the completion budget for actual migration work.
+        let admission = tokio::time::timeout(MIGRATION_TEST_COMPLETION_TIMEOUT, async {
+            loop {
+                let status = runtime.migrations.lock().await.get(&id).cloned();
+                let runner_active = runtime.migration_runners.lock().await.contains(&id);
+                if status.as_ref().is_some_and(|status| {
+                    status.status != crate::library_migration::MigrationRunStatus::Queued
+                }) || !runner_active
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if admission.is_err() {
+            let diagnostic = tokio::time::timeout(Duration::from_secs(1), async {
+                let status = runtime
+                    .migrations
+                    .lock()
+                    .await
+                    .get(&id)
+                    .map(|status| status.status);
+                let runner_active = runtime.migration_runners.lock().await.contains(&id);
+                (status, runner_active)
+            })
+            .await;
+            panic!(
+                "migration did not leave Queued while waiting for shared output-slot admission: id={id}, state={diagnostic:?}"
+            );
+        }
         let status = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let status = runtime.migrations.lock().await.get(&id).cloned();
@@ -2131,8 +2164,26 @@ async fn media_library_migration_bundles_and_unfinished_choice_mock_telegram_e2e
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("migration should reach a recoverable terminal checkpoint");
+        .await;
+        let status = match status {
+            Ok(status) => status,
+            Err(_) => {
+                let diagnostic = tokio::time::timeout(Duration::from_secs(1), async {
+                    let status = runtime
+                        .migrations
+                        .lock()
+                        .await
+                        .get(&id)
+                        .map(|status| status.status);
+                    let runner_active = runtime.migration_runners.lock().await.contains(&id);
+                    (status, runner_active)
+                })
+                .await;
+                panic!(
+                    "migration did not reach a recoverable terminal checkpoint after output-slot admission: id={id}, state={diagnostic:?}"
+                );
+            }
+        };
         assert_eq!(
             status.status,
             crate::library_migration::MigrationRunStatus::Completed,
