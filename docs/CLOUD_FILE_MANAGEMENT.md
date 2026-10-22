@@ -84,11 +84,16 @@ node bounds run on the local host and in the Mini App, rather than processing
 the whole library in one Worker invocation. Owner reads return the small
 manifest; the Mini App fetches authenticated, epoch-bound chunks with bounded
 concurrency, verifies their hashes, and assembles the complete snapshot before
-updating its owner session. Chunks are not persisted in browser storage.
+updating its owner session. Each page reuses only hash-verified chunks in a
+bounded in-memory cache, while authenticating the manifest on every refresh.
+Epoch changes or failed refreshes clear the cache. Chunks are not persisted in
+browser storage.
 
 A size rejection uses the existing explicitly marked snapshot compaction;
-local media and recovery data are retained. Old unreferenced staged chunks are
-eligible for bounded cleanup; the published snapshot's chunks remain protected.
+local media and recovery data are retained. New commits and identical-version
+heartbeats clean up at most 32 unreferenced chunks older than one hour. Cleanup
+requires the current epoch and exact active snapshot; published chunks remain
+protected even when the library stops changing.
 
 The default library's items appear only in the top-level library snapshot.
 Nondefault libraries retain their nested snapshots. Both Mini Apps resolve the

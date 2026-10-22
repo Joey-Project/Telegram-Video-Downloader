@@ -108,12 +108,83 @@ function parsePartition(chunks, descriptor) {
   return JSON.parse(json);
 }
 
-async function fetchPartitions(fetchJson, manifest) {
-  const chunks = { library: new Array(manifest.library.chunks.length), state: new Array(manifest.state.chunks.length) };
-  const jobs = [
-    ...manifest.library.chunks.map((chunk, index) => ({ partition: "library", index, chunk })),
-    ...manifest.state.chunks.map((chunk, index) => ({ partition: "state", index, chunk })),
-  ];
+function chunkCacheKey(databaseEpoch, sha256) {
+  return `${databaseEpoch}:${sha256}`;
+}
+
+function createChunkCache() {
+  const entries = new Map();
+  let bytes = 0;
+  let databaseEpoch = null;
+
+  function remove(key) {
+    const entry = entries.get(key);
+    if (!entry) return;
+    entries.delete(key);
+    bytes -= entry.bytes;
+  }
+
+  function clear() {
+    entries.clear();
+    bytes = 0;
+    databaseEpoch = null;
+  }
+
+  function retainManifest(manifest) {
+    if (databaseEpoch !== manifest.databaseEpoch) {
+      clear();
+      databaseEpoch = manifest.databaseEpoch;
+    }
+    const refs = new Set([
+      ...manifest.library.chunks.map((chunk) => chunkCacheKey(databaseEpoch, chunk.sha256)),
+      ...manifest.state.chunks.map((chunk) => chunkCacheKey(databaseEpoch, chunk.sha256)),
+    ]);
+    for (const key of entries.keys()) {
+      if (!refs.has(key)) remove(key);
+    }
+  }
+
+  function get(key, expectedBytes) {
+    const entry = entries.get(key);
+    if (!entry) return undefined;
+    if (entry.bytes !== expectedBytes) {
+      remove(key);
+      invalidSnapshot("cached chunk byte count does not match the manifest");
+    }
+    entries.delete(key);
+    entries.set(key, entry);
+    return entry.data;
+  }
+
+  function set(key, data, entryBytes) {
+    remove(key);
+    entries.set(key, { data, bytes: entryBytes });
+    bytes += entryBytes;
+    while (entries.size > MAX_CHUNKS || bytes > MAX_TOTAL_BYTES) {
+      remove(entries.keys().next().value);
+    }
+  }
+
+  return { clear, get, retainManifest, set };
+}
+
+async function fetchPartitions(fetchJson, manifest, cache) {
+  const values = new Map();
+  const jobsByKey = new Map();
+  for (const chunk of [...manifest.library.chunks, ...manifest.state.chunks]) {
+    const key = chunkCacheKey(manifest.databaseEpoch, chunk.sha256);
+    const existing = jobsByKey.get(key);
+    if (existing && existing.chunk.bytes !== chunk.bytes) {
+      invalidSnapshot("duplicate chunk byte counts do not match");
+    }
+    if (!existing) jobsByKey.set(key, { key, chunk });
+  }
+  const jobs = [];
+  for (const job of jobsByKey.values()) {
+    const cached = cache?.get(job.key, job.chunk.bytes);
+    if (cached === undefined) jobs.push(job);
+    else values.set(job.key, cached);
+  }
   let nextIndex = 0;
   let failed = false;
   let failure;
@@ -124,7 +195,9 @@ async function fetchPartitions(fetchJson, manifest) {
       nextIndex += 1;
       if (!job) return;
       try {
-        chunks[job.partition][job.index] = await fetchChunk(fetchJson, job.chunk, manifest.databaseEpoch);
+        const data = await fetchChunk(fetchJson, job.chunk, manifest.databaseEpoch);
+        cache?.set(job.key, data, job.chunk.bytes);
+        values.set(job.key, data);
       } catch (error) {
         if (!failed || isAuthorizationFailure(error) && !isAuthorizationFailure(failure)) failure = error;
         failed = true;
@@ -134,8 +207,8 @@ async function fetchPartitions(fetchJson, manifest) {
   }));
   if (failed) throw failure;
   return [
-    parsePartition(chunks.library, manifest.library),
-    parsePartition(chunks.state, manifest.state),
+    parsePartition(manifest.library.chunks.map((chunk) => values.get(chunkCacheKey(manifest.databaseEpoch, chunk.sha256))), manifest.library),
+    parsePartition(manifest.state.chunks.map((chunk) => values.get(chunkCacheKey(manifest.databaseEpoch, chunk.sha256))), manifest.state),
   ];
 }
 
@@ -174,19 +247,18 @@ function validateAssembledShape(library, state) {
   }
 }
 
-/**
- * Load a legacy owner snapshot or assemble a chunked-v1 snapshot. The callback
- * must perform the existing authenticated, no-store JSON request for the path
- * and optional headers it receives.
- */
-export async function loadOwnerSnapshot(fetchJson) {
+async function loadOwnerSnapshotWithCache(fetchJson, cache) {
   const response = await fetchJson("/state");
-  if (!isRecord(response) || typeof response.format !== "string" || !response.format.startsWith("chunked-")) return response;
+  if (!isRecord(response) || typeof response.format !== "string" || !response.format.startsWith("chunked-")) {
+    cache?.clear();
+    return response;
+  }
   if (response.format !== "chunked-v1") invalidSnapshot("chunked manifest format is unsupported");
 
   const manifest = validateManifest(response);
   validateJsonComplexity(response);
-  const [library, state] = await fetchPartitions(fetchJson, manifest);
+  cache?.retainManifest(manifest);
+  const [library, state] = await fetchPartitions(fetchJson, manifest, cache);
   validateJsonComplexity(library);
   validateJsonComplexity(state);
   validateAssembledShape(library, state);
@@ -203,4 +275,35 @@ export async function loadOwnerSnapshot(fetchJson) {
     pending_requests: manifest.pendingRequests,
   };
   return snapshot;
+}
+
+/**
+ * Load a legacy owner snapshot or assemble a chunked-v1 snapshot. The callback
+ * must perform the existing authenticated, no-store JSON request for the path
+ * and optional headers it receives.
+ */
+export async function loadOwnerSnapshot(fetchJson) {
+  return loadOwnerSnapshotWithCache(fetchJson, null);
+}
+
+/**
+ * Create a page-local snapshot loader that reuses verified raw chunks in memory.
+ * Each call still fetches the authenticated manifest and parses fresh objects.
+ */
+export function createOwnerSnapshotLoader() {
+  const cache = createChunkCache();
+  let pending = Promise.resolve();
+
+  return (fetchJson) => {
+    const result = pending.then(async () => {
+      try {
+        return await loadOwnerSnapshotWithCache(fetchJson, cache);
+      } catch (error) {
+        cache.clear();
+        throw error;
+      }
+    });
+    pending = result.catch(() => undefined);
+    return result;
+  };
 }

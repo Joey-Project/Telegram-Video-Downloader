@@ -696,6 +696,57 @@ export async function storeSnapshot(
   return { ignoredOutOfOrder: false };
 }
 
+function pruneOrphanSnapshotChunks(
+  db: D1Database,
+  now: number,
+  expectedEpoch: string,
+  stateVersion: number,
+  libraryHash: string,
+  stateHash: string,
+): D1PreparedStatement {
+  return db.prepare(
+    `DELETE FROM snapshot_content_chunks
+     WHERE EXISTS (
+       SELECT 1 FROM cloud_database_meta
+       WHERE id = 1 AND epoch = ?
+     )
+       AND EXISTS (
+         SELECT 1 FROM snapshot_meta
+         WHERE id = 1 AND transport = 'chunked-v1' AND state_version = ?
+           AND library_hash = ? AND state_hash = ?
+       )
+       AND rowid IN (
+         SELECT orphan.rowid
+         FROM snapshot_content_chunks AS orphan
+         WHERE orphan.created_at < ?
+           AND (
+             orphan.database_epoch <> ?
+             OR orphan.sha256 NOT IN (
+               SELECT json_extract(ref.value, '$.sha256')
+               FROM snapshot_meta AS meta,
+                 json_each(COALESCE(meta.library_manifest_json, '{}'), '$.chunks') AS ref
+               WHERE meta.id = 1 AND meta.transport = 'chunked-v1'
+               UNION
+               SELECT json_extract(ref.value, '$.sha256')
+               FROM snapshot_meta AS meta,
+                 json_each(COALESCE(meta.state_manifest_json, '{}'), '$.chunks') AS ref
+               WHERE meta.id = 1 AND meta.transport = 'chunked-v1'
+             )
+           )
+         ORDER BY orphan.created_at ASC, orphan.sha256 ASC
+         LIMIT ?
+       )`,
+  ).bind(
+    expectedEpoch,
+    stateVersion,
+    libraryHash,
+    stateHash,
+    now - SNAPSHOT_CHUNK_RETENTION_MS,
+    expectedEpoch,
+    SNAPSHOT_CHUNK_PRUNE_BATCH_SIZE,
+  );
+}
+
 export async function storeChunkedSnapshot(
   db: D1Database,
   snapshot: ChunkedSnapshotContent,
@@ -751,15 +802,26 @@ export async function storeChunkedSnapshot(
       await assertDatabaseEpoch(db, expectedEpoch);
       throw new HttpError(428, "Snapshot content chunks are missing or have invalid byte lengths");
     }
-    if (now - prior.received_at >= HEARTBEAT_WRITE_INTERVAL_MS) {
-      const heartbeat = await db.prepare(
+    const heartbeatStatements = now - prior.received_at >= HEARTBEAT_WRITE_INTERVAL_MS
+      ? [db.prepare(
         `UPDATE snapshot_meta
          SET reported_at = MAX(reported_at, ?), received_at = ?
          WHERE id = 1 AND transport = 'chunked-v1' AND state_version = ?
            AND library_hash = ? AND state_hash = ?
            AND EXISTS (SELECT 1 FROM cloud_database_meta WHERE id = 1 AND epoch = ?)`,
-      ).bind(snapshot.reported_at, now, snapshot.state_version, libraryHash, stateHash, expectedEpoch).run();
-      if (!heartbeat.success) throw new Error("D1 snapshot heartbeat update failed");
+      ).bind(snapshot.reported_at, now, snapshot.state_version, libraryHash, stateHash, expectedEpoch)]
+      : [];
+    heartbeatStatements.push(pruneOrphanSnapshotChunks(
+      db,
+      now,
+      expectedEpoch,
+      snapshot.state_version,
+      libraryHash,
+      stateHash,
+    ));
+    const heartbeatResults = await db.batch(heartbeatStatements);
+    if (heartbeatResults.some((result) => !result.success)) {
+      throw new Error("D1 snapshot heartbeat maintenance failed");
     }
     const [latestEpochResult, latestSnapshotResult] = await readLatest();
     if (!latestEpochResult?.success) throw new Error("D1 database epoch read failed");
@@ -829,33 +891,13 @@ export async function storeChunkedSnapshot(
          AND EXISTS (SELECT 1 FROM cloud_database_meta WHERE id = 1 AND epoch = ?)
      )`,
   ).bind(snapshot.state_version, libraryHash, stateHash, expectedEpoch);
-  const pruneOrphanChunks = db.prepare(
-    `DELETE FROM snapshot_content_chunks
-     WHERE rowid IN (
-       SELECT orphan.rowid
-       FROM snapshot_content_chunks AS orphan
-       WHERE orphan.created_at < ?
-         AND (
-           orphan.database_epoch <> ?
-           OR orphan.sha256 NOT IN (
-             SELECT json_extract(ref.value, '$.sha256')
-             FROM snapshot_meta AS meta,
-               json_each(COALESCE(meta.library_manifest_json, '{}'), '$.chunks') AS ref
-             WHERE meta.id = 1 AND meta.transport = 'chunked-v1'
-             UNION
-             SELECT json_extract(ref.value, '$.sha256')
-             FROM snapshot_meta AS meta,
-               json_each(COALESCE(meta.state_manifest_json, '{}'), '$.chunks') AS ref
-             WHERE meta.id = 1 AND meta.transport = 'chunked-v1'
-           )
-         )
-       ORDER BY orphan.created_at ASC, orphan.sha256 ASC
-       LIMIT ?
-     )`,
-  ).bind(
-    now - SNAPSHOT_CHUNK_RETENTION_MS,
+  const pruneOrphanChunks = pruneOrphanSnapshotChunks(
+    db,
+    now,
     expectedEpoch,
-    SNAPSHOT_CHUNK_PRUNE_BATCH_SIZE,
+    snapshot.state_version,
+    libraryHash,
+    stateHash,
   );
   const results = await db.batch([commit, clearLegacyChunks, pruneOrphanChunks]);
   if (results.some((result) => !result.success)) throw new Error("D1 chunked snapshot commit failed");

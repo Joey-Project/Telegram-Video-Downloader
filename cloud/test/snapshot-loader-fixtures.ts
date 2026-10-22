@@ -28,7 +28,7 @@ async function sha256(value: string): Promise<string> {
 
 export async function makeChunkedSnapshot(
   snapshot: Record<string, any>,
-  { chunkBytes = 32 * 1024 }: { chunkBytes?: number } = {},
+  { chunkBytes = 32 * 1024, databaseEpoch = TEST_DATABASE_EPOCH }: { chunkBytes?: number; databaseEpoch?: string } = {},
 ): Promise<{ manifest: Record<string, any>; chunks: Map<string, string> }> {
   if (chunkBytes < 4 || chunkBytes > 32 * 1024) throw new Error("Test chunk size is outside the allowed range");
   const {
@@ -57,7 +57,7 @@ export async function makeChunkedSnapshot(
   return {
     manifest: {
       format: "chunked-v1",
-      database_epoch: TEST_DATABASE_EPOCH,
+      database_epoch: databaseEpoch,
       state_version: stateVersion,
       reported_at: reportedAt,
       library_revision: library.revision,

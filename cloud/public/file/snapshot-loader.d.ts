@@ -7,3 +7,6 @@ export type SnapshotJsonFetcher = (
 
 /** Load a legacy owner snapshot or fetch and validate all chunks in a chunked-v1 manifest. */
 export function loadOwnerSnapshot(fetchJson: SnapshotJsonFetcher): Promise<unknown>;
+
+/** Create a page-local loader with bounded, verified, in-memory chunk reuse. */
+export function createOwnerSnapshotLoader(): (fetchJson: SnapshotJsonFetcher) => Promise<unknown>;

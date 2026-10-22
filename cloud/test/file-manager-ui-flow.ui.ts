@@ -156,7 +156,7 @@ describe("file manager UI flow", () => {
     expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected");
 
     element<HTMLButtonElement>("#refresh-button").click();
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2 * (1 + manifest.library.chunks.length + manifest.state.chunks.length)));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2 + manifest.library.chunks.length + manifest.state.chunks.length));
     await vi.waitFor(() => expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected"));
     element<HTMLButtonElement>("#clear-selection").click();
     expect(tray.classList.contains("hidden")).toBe(true);

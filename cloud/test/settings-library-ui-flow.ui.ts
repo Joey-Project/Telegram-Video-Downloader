@@ -137,7 +137,7 @@ describe("settings library UI flow", () => {
     const action = JSON.parse(String(actionRequest?.[1]?.body));
     expect(action).toMatchObject({ kind: "library_scan", payload: { library_id: LIBRARY_ID } });
     const snapshotRequestCount = 1 + manifest.library.chunks.length + manifest.state.chunks.length;
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(snapshotRequestCount * 2 + 1));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(snapshotRequestCount + 2));
   });
 
   it("keeps settings private when a chunk does not match its manifest", async () => {

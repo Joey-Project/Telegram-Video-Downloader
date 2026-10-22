@@ -94,6 +94,30 @@ async function uploadChunk(data: string): Promise<{ sha256: string; bytes: numbe
   return { sha256, bytes: bytes.byteLength };
 }
 
+async function seedOldOrphanChunks(epoch: string, count: number, createdAt: number, label: string): Promise<void> {
+  const chunks = await Promise.all(Array.from({ length: count }, async (_, index) => {
+    const data = `${label}-${index}`;
+    return { data, sha256: await sha256Hex(data), bytes: encoder.encode(data).byteLength };
+  }));
+  await testEnv.DB.batch(chunks.map(({ data, sha256, bytes }) => testEnv.DB.prepare(
+    `INSERT INTO snapshot_content_chunks (database_epoch, sha256, byte_length, data, created_at)
+     VALUES (?, ?, ?, ?, ?)`,
+  ).bind(epoch, sha256, bytes, data, createdAt)));
+}
+
+async function countOldOrphanChunks(
+  epoch: string,
+  createdAt: number,
+  activeHashes: [string, string],
+): Promise<number> {
+  const row = await testEnv.DB.prepare(
+    `SELECT COUNT(*) AS count
+     FROM snapshot_content_chunks
+     WHERE database_epoch = ? AND created_at = ? AND sha256 NOT IN (?, ?)`,
+  ).bind(epoch, createdAt, ...activeHashes).first<{ count: number }>();
+  return row?.count ?? 0;
+}
+
 function chunkManifest(chunks: Array<{ sha256: string; bytes: number }>): {
   bytes: number;
   chunks: Array<{ sha256: string; bytes: number }>;
@@ -334,6 +358,94 @@ describe("snapshot storage", () => {
     ).bind(await getDatabaseEpoch(testEnv.DB), stateChunks[0]!.sha256).run();
     const missingHeartbeatChunk = await postState(chunkedEnvelope(2, libraryChunks, stateChunks));
     expect(missingHeartbeatChunk.status).toBe(428);
+  });
+
+  it("drains bounded old orphans on identical heartbeats while preserving active chunks", async () => {
+    const libraryText = '{"revision":"heartbeat-gc-library","items":[]}';
+    const stateText = '{"settings":{"heartbeat_gc":true},"tasks":[]}';
+    const libraryChunks = [await uploadChunk(libraryText)];
+    const stateChunks = [await uploadChunk(stateText)];
+    expect((await postState(chunkedEnvelope(1, libraryChunks, stateChunks))).status).toBe(200);
+
+    const epoch = await getDatabaseEpoch(testEnv.DB);
+    const staleAt = Date.now() - 2 * 60 * 60 * 1000;
+    await seedOldOrphanChunks(epoch, 40, staleAt, `heartbeat-gc-${Date.now()}`);
+    const activeHashes: [string, string] = [libraryChunks[0]!.sha256, stateChunks[0]!.sha256];
+    await testEnv.DB.prepare(
+      "UPDATE snapshot_content_chunks SET created_at = ? WHERE database_epoch = ? AND sha256 IN (?, ?)",
+    ).bind(staleAt, epoch, ...activeHashes).run();
+    expect(await countOldOrphanChunks(epoch, staleAt, activeHashes)).toBe(40);
+
+    expect((await postState(chunkedEnvelope(1, libraryChunks, stateChunks))).status).toBe(200);
+    expect(await countOldOrphanChunks(epoch, staleAt, activeHashes)).toBe(8);
+
+    expect((await postState(chunkedEnvelope(1, libraryChunks, stateChunks))).status).toBe(200);
+    expect(await countOldOrphanChunks(epoch, staleAt, activeHashes)).toBe(0);
+    await expect(readSnapshotContentChunk(testEnv.DB, epoch, activeHashes[0]))
+      .resolves.toEqual({ sha256: activeHashes[0], data: libraryText });
+    await expect(readSnapshotContentChunk(testEnv.DB, epoch, activeHashes[1]))
+      .resolves.toEqual({ sha256: activeHashes[1], data: stateText });
+  });
+
+  it("does not prune chunks if the database epoch changes during a commit or heartbeat", async () => {
+    const libraryText = '{"revision":"stale-gc-library","items":[]}';
+    const stateText = '{"settings":{"stale_gc":true},"tasks":[]}';
+    const libraryChunks = [await uploadChunk(libraryText)];
+    const stateChunks = [await uploadChunk(stateText)];
+    expect((await postState(chunkedEnvelope(1, libraryChunks, stateChunks))).status).toBe(200);
+
+    const epoch = await getDatabaseEpoch(testEnv.DB);
+    const staleAt = Date.now() - 2 * 60 * 60 * 1000;
+    await seedOldOrphanChunks(epoch, 40, staleAt, `stale-gc-${Date.now()}`);
+    const activeHashes: [string, string] = [libraryChunks[0]!.sha256, stateChunks[0]!.sha256];
+    await testEnv.DB.prepare(
+      "UPDATE snapshot_content_chunks SET created_at = ? WHERE database_epoch = ? AND sha256 IN (?, ?)",
+    ).bind(staleAt, epoch, ...activeHashes).run();
+    expect(await countOldOrphanChunks(epoch, staleAt, activeHashes)).toBe(40);
+
+    try {
+      await testEnv.DB.prepare(
+        `CREATE TRIGGER rotate_epoch_after_snapshot_commit
+         AFTER UPDATE OF state_version ON snapshot_meta
+         WHEN NEW.state_version <> OLD.state_version
+         BEGIN
+           UPDATE cloud_database_meta
+           SET epoch = CASE
+             WHEN epoch = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' THEN 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+             ELSE 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+           END
+           WHERE id = 1;
+         END`,
+      ).run();
+      const commitAfterEpochChange = await postState(chunkedEnvelope(2, libraryChunks, stateChunks));
+      expect(commitAfterEpochChange.status).toBe(409);
+      expect(await countOldOrphanChunks(epoch, staleAt, activeHashes)).toBe(40);
+
+      await testEnv.DB.prepare("DROP TRIGGER rotate_epoch_after_snapshot_commit").run();
+      await testEnv.DB.prepare("UPDATE cloud_database_meta SET epoch = ? WHERE id = 1").bind(epoch).run();
+      await testEnv.DB.prepare("UPDATE snapshot_meta SET received_at = ? WHERE id = 1")
+        .bind(Date.now() - 60_000).run();
+      await testEnv.DB.prepare(
+        `CREATE TRIGGER rotate_epoch_after_snapshot_heartbeat
+         AFTER UPDATE OF received_at ON snapshot_meta
+         WHEN NEW.received_at <> OLD.received_at
+         BEGIN
+           UPDATE cloud_database_meta
+           SET epoch = CASE
+             WHEN epoch = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' THEN 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+             ELSE 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+           END
+           WHERE id = 1;
+         END`,
+      ).run();
+      const heartbeatAfterEpochChange = await postState(chunkedEnvelope(2, libraryChunks, stateChunks));
+      expect(heartbeatAfterEpochChange.status).toBe(409);
+      expect(await countOldOrphanChunks(epoch, staleAt, activeHashes)).toBe(40);
+    } finally {
+      await testEnv.DB.prepare("DROP TRIGGER IF EXISTS rotate_epoch_after_snapshot_commit").run();
+      await testEnv.DB.prepare("DROP TRIGGER IF EXISTS rotate_epoch_after_snapshot_heartbeat").run();
+      await testEnv.DB.prepare("UPDATE cloud_database_meta SET epoch = ? WHERE id = 1").bind(epoch).run();
+    }
   });
 
   it("keeps manifest commits bounded, rejects missing refs, and accepts the 386-reference ceiling", async () => {
