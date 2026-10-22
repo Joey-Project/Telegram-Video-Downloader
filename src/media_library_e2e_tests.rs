@@ -1,5 +1,20 @@
 use super::*;
 
+const MANAGEMENT_DISPATCH_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+// The dispatcher detaches each request child; its sole permit lives until the child drops the
+// runtime clone passed through dispatch_cloud_record, so acquiring it drains that clone.
+async fn wait_for_management_dispatch_idle(runtime: &CloudBotRuntime) {
+    let permit = tokio_timeout(
+        MANAGEMENT_DISPATCH_DRAIN_TIMEOUT,
+        runtime.management_dispatch.acquire(),
+    )
+    .await
+    .expect("detached management dispatch should finish before queue restart")
+    .expect("management dispatch semaphore should remain open");
+    drop(permit);
+}
+
 struct MigrationFixture {
     root: PathBuf,
     video_root: PathBuf,
@@ -4874,6 +4889,7 @@ async fn file_preview_requires_current_registration_binding_and_confirms_saved_b
     dispatcher.abort();
     let _ = dispatcher.await;
     runtime.signal_epoch_fatal();
+    wait_for_management_dispatch_idle(&runtime).await;
     drop(runtime);
     drop(inbox);
     drop(queue);
@@ -4917,6 +4933,7 @@ async fn file_preview_requires_current_registration_binding_and_confirms_saved_b
     reopened_dispatcher.abort();
     let _ = reopened_dispatcher.await;
     reopened_runtime.signal_epoch_fatal();
+    wait_for_management_dispatch_idle(&reopened_runtime).await;
     drop(reopened_runtime);
     drop(reopened_inbox);
     drop(reopened_queue);
