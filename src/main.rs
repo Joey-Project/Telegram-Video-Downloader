@@ -26,8 +26,9 @@ mod router;
 mod safe_fs;
 mod telegram;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::RandomState};
 use std::future::Future;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 #[cfg(test)]
@@ -108,6 +109,7 @@ static PENDING_BILIBILI_SELECTION_JOBS: OnceLock<Mutex<HashMap<u64, PendingBilib
 static PENDING_COLLECTION_DETAILS: OnceLock<Mutex<HashMap<u64, PendingCollectionDetails>>> =
     OnceLock::new();
 const CLOUD_STATE_UPLOAD_SOFT_LIMIT_BYTES: usize = 10 * 1024 * 1024;
+const CLOUD_STATE_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 const CLOUD_STATE_PREVIEW_ENTRY_LIMIT: usize = 100;
 const CLOUD_TASK_SUMMARY_LIMIT: usize = 100;
 const CLOUD_TASK_SUMMARY_LABEL_LIMIT_BYTES: usize = 1024;
@@ -512,6 +514,61 @@ struct CloudStateSnapshot {
     tasks: Vec<serde_json::Value>,
     download_dir: String,
     settings_applied: serde_json::Value,
+}
+
+struct CloudStateRetryBackoff {
+    base: Duration,
+    max: Duration,
+    failures: u32,
+    jitter_state: u64,
+}
+
+impl CloudStateRetryBackoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        let minimum = Duration::from_millis(1);
+        let base = base.max(minimum);
+        let max = max.max(base);
+        let mut hasher = RandomState::new().build_hasher();
+        std::time::SystemTime::now().hash(&mut hasher);
+        std::process::id().hash(&mut hasher);
+        let jitter_state = hasher.finish().max(1);
+        Self {
+            base,
+            max,
+            failures: 0,
+            jitter_state,
+        }
+    }
+
+    fn ceiling(&self) -> Duration {
+        self.base
+            .saturating_mul(1_u32 << self.failures.min(31))
+            .min(self.max)
+    }
+
+    fn next_random(&mut self) -> u64 {
+        // Xorshift supplies inexpensive per-reporter jitter; it is not used for security.
+        let mut value = self.jitter_state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.jitter_state = value.max(1);
+        self.jitter_state
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let ceiling_millis = self.ceiling().as_millis();
+        let lower_millis = ceiling_millis / 2;
+        let jitter_range = ceiling_millis.saturating_sub(lower_millis);
+        let delay_millis = lower_millis
+            .saturating_add(u128::from(self.next_random()) % jitter_range.saturating_add(1));
+        self.failures = self.failures.saturating_add(1).min(31);
+        Duration::from_millis(u64::try_from(delay_millis).unwrap_or(u64::MAX))
+    }
+
+    fn reset(&mut self) {
+        self.failures = 0;
+    }
 }
 
 enum CloudLibrarySnapshotUpdate {
@@ -988,7 +1045,7 @@ impl CloudStateSnapshot {
                 applied: Some(&self.settings_applied),
             },
         };
-        Ok(serde_json::to_vec(&state)?.len())
+        state.encoded_wire_size()
     }
 
     fn compact_operation_receipts(&mut self) -> bool {
@@ -1029,7 +1086,9 @@ impl CloudStateSnapshot {
             .and_then(serde_json::Value::as_array_mut)
         {
             for library in libraries {
-                let snapshot = &mut library["snapshot"];
+                let Some(snapshot) = library.get_mut("snapshot") else {
+                    continue;
+                };
                 let (categories_changed, omitted) = if let Some(categories) = snapshot
                     .get_mut("categories")
                     .and_then(serde_json::Value::as_array_mut)
@@ -1812,7 +1871,7 @@ async fn cloud_state_reporter_with_heartbeat(runtime: CloudBotRuntime, period: D
 async fn cloud_state_reporter_with_retry_policy(
     runtime: CloudBotRuntime,
     period: Duration,
-    retry_backoff: Duration,
+    retry_backoff_base: Duration,
     version_exhausted_backoff: Duration,
 ) {
     let mut heartbeat = interval(period);
@@ -1824,6 +1883,8 @@ async fn cloud_state_reporter_with_retry_policy(
     let mut published_oversized_source_fingerprint: Option<Vec<u8>> = None;
     let mut published_oversized_snapshot: Option<CloudStateSnapshot> = None;
     let mut pending: Option<PendingCloudState> = None;
+    let mut retry_backoff =
+        CloudStateRetryBackoff::new(retry_backoff_base, CLOUD_STATE_RETRY_BACKOFF_MAX);
 
     loop {
         if runtime.epoch_fatal.is_signaled() {
@@ -1901,7 +1962,7 @@ async fn cloud_state_reporter_with_retry_policy(
                                 sleep(if exhausted {
                                     version_exhausted_backoff
                                 } else {
-                                    retry_backoff
+                                    retry_backoff.next_delay()
                                 })
                                 .await;
                                 runtime.state_notify.notify_one();
@@ -1919,7 +1980,7 @@ async fn cloud_state_reporter_with_retry_policy(
                 Ok(None) => continue,
                 Err(error) => {
                     warn!(error = %format!("{error:#}"), "failed to assemble local cloud state");
-                    sleep(Duration::from_secs(5)).await;
+                    sleep(retry_backoff.next_delay()).await;
                     runtime.state_notify.notify_one();
                     continue;
                 }
@@ -1946,6 +2007,7 @@ async fn cloud_state_reporter_with_retry_policy(
                     .as_ref()
                     .map(|_| state.snapshot.clone());
                 pending = None;
+                retry_backoff.reset();
             }
             Err(error) if error.is_payload_too_large() => {
                 let Some(rejected) = pending.take() else {
@@ -1979,7 +2041,7 @@ async fn cloud_state_reporter_with_retry_policy(
                                     sleep(if exhausted {
                                         version_exhausted_backoff
                                     } else {
-                                        retry_backoff
+                                        retry_backoff.next_delay()
                                     })
                                     .await;
                                     runtime.state_notify.notify_one();
@@ -2058,7 +2120,7 @@ async fn cloud_state_reporter_with_retry_policy(
                         // Keep the same snapshot and fingerprint, and pace repeated version
                         // conflicts so a stale or continuously advancing server cannot cause
                         // a tight loop of counter writes.
-                        sleep(retry_backoff).await;
+                        sleep(retry_backoff.next_delay()).await;
                     }
                     Err(version_error) => {
                         let exhausted = is_state_version_exhausted(&version_error);
@@ -2073,7 +2135,7 @@ async fn cloud_state_reporter_with_retry_policy(
                         sleep(if exhausted {
                             version_exhausted_backoff
                         } else {
-                            retry_backoff
+                            retry_backoff.next_delay()
                         })
                         .await;
                     }
@@ -2086,7 +2148,7 @@ async fn cloud_state_reporter_with_retry_policy(
                     state_version = failed_version,
                     "cloud returned HTTP 409 without a valid X-Cloud-State-Version hint; retrying the same state with backoff (check Worker compatibility and its response header)"
                 );
-                sleep(retry_backoff).await;
+                sleep(retry_backoff.next_delay()).await;
             }
             Err(CloudStatePostError::HttpStatus(status))
                 if status == reqwest::StatusCode::BAD_REQUEST =>
@@ -2098,7 +2160,7 @@ async fn cloud_state_reporter_with_retry_policy(
                 // The Worker rejects future `reported_at` values, but the timestamp is
                 // refreshed for each POST and excluded from the content fingerprint. Keep
                 // this snapshot pending so correcting a temporarily skewed clock can recover.
-                sleep(retry_backoff).await;
+                sleep(retry_backoff.next_delay()).await;
             }
             Err(CloudStatePostError::DatabaseEpochChanged { expected, actual }) => {
                 warn!(
@@ -2134,7 +2196,7 @@ async fn cloud_state_reporter_with_retry_policy(
                 );
                 // Reuse the exact state version and content on retry. If the previous request
                 // reached the Worker before a timeout, its idempotence check accepts this copy.
-                sleep(retry_backoff).await;
+                sleep(retry_backoff.next_delay()).await;
             }
         }
     }

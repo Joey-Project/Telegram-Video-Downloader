@@ -42,6 +42,7 @@ import {
   MAX_TARGET_RELATIVE_DIR_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_BYTES,
   MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES,
   readJsonBody,
+  sha256Hex,
   validateSnapshot,
 } from "../src/validation";
 import { ACKED_INBOX_PRUNE_BATCH_SIZE, ACKED_INBOX_REPLAY_RETENTION_MS, enqueue, getDatabaseEpoch, storeSnapshot } from "../src/store";
@@ -3009,6 +3010,139 @@ describe("Mini App identity and actions", () => {
 });
 
 describe("local client API and state snapshots", () => {
+  it("serves compact chunk manifests and owner-authenticated content chunks", async () => {
+    const epoch = await getDatabaseEpoch(testEnv.DB);
+    const upload = async (data: string) => {
+      const source = textEncoder.encode(data);
+      const bytes = new Uint8Array(source.byteLength);
+      bytes.set(source);
+      const sha256 = await sha256Hex(data);
+      const response = await SELF.fetch(new Request(`${workerUrl}/api/local/state/chunks/${sha256}`, {
+        method: "POST",
+        headers: { ...localHeaders(), "content-type": "application/octet-stream" },
+        body: bytes.buffer,
+      }));
+      expect(response.status).toBe(200);
+      return { sha256, bytes: source.byteLength };
+    };
+    const library = await upload('{"revision":"owner-library","items":["🙂"]}');
+    const state = await upload('{"settings":{"download_dir":"/Videos"},"tasks":[]}');
+    const manifest = (chunk: { sha256: string; bytes: number }) => ({ bytes: chunk.bytes, chunks: [chunk] });
+    const committed = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify({
+        format: "chunked-v1",
+        state_version: 1,
+        reported_at: Date.now(),
+        library_revision: "owner-library",
+        library: manifest(library),
+        state: manifest(state),
+      }),
+    }));
+    expect(committed.status).toBe(200);
+
+    const owner = await signInitData();
+    const contentChunkReads: string[] = [];
+    const observedDb = new Proxy(testEnv.DB, {
+      get(target, property) {
+        if (property === "prepare") {
+          return (query: string) => {
+            if (/FROM snapshot_content_chunks/iu.test(query)) contentChunkReads.push(query);
+            return target.prepare(query);
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const ownerRead = (path: string, snapshotFormat?: string, includeOwner = true) => {
+      const headers = new Headers();
+      if (includeOwner) headers.set("x-telegram-init-data", owner);
+      if (snapshotFormat !== undefined) headers.set("X-Snapshot-Format", snapshotFormat);
+      return worker.fetch(new Request(`${workerUrl}${path}`, { headers }), { ...testEnv, DB: observedDb } as Env);
+    };
+    const upgradeError = {
+      error: "A new Mini App version is available. Close and reopen it from Telegram.",
+      code: "snapshot_client_upgrade_required",
+    };
+    for (const path of ["/api/state", "/api/library"] as const) {
+      expect((await ownerRead(path, "chunked-v2", false)).status).toBe(401);
+      for (const capability of [undefined, "chunked-v2"]) {
+        const response = await ownerRead(path, capability);
+        expect(response.status).toBe(426);
+        const body = await responseJson<Record<string, unknown>>(response);
+        expect(body).toEqual(upgradeError);
+        expect(body).not.toHaveProperty("library");
+        expect(body).not.toHaveProperty("state");
+      }
+    }
+    expect(contentChunkReads).toEqual([]);
+
+    const stateResponse = await ownerRequest("/api/state", owner, {
+      headers: { "X-Snapshot-Format": "chunked-v1" },
+    });
+    expect(stateResponse.status).toBe(200);
+    const ownerState = await responseJson<{
+      format: string;
+      database_epoch: string;
+      library: { bytes: number; chunks: Array<{ sha256: string; bytes: number }> };
+      state: { bytes: number; chunks: Array<{ sha256: string; bytes: number }> };
+    }>(stateResponse);
+    expect(ownerState).toMatchObject({
+      format: "chunked-v1",
+      database_epoch: epoch,
+      library: manifest(library),
+      state: manifest(state),
+    });
+
+    const libraryResponse = await ownerRequest("/api/library", owner, {
+      headers: { "X-Snapshot-Format": "chunked-v1" },
+    });
+    expect(libraryResponse.status).toBe(200);
+    expect(await responseJson<{ format: string; database_epoch: string; library: unknown }>(libraryResponse))
+      .toMatchObject({ format: "chunked-v1", database_epoch: epoch, library: manifest(library) });
+
+    const chunkPath = `/api/snapshot/chunks/${library.sha256}`;
+    const missingEpoch = await ownerRequest(chunkPath, owner);
+    const staleEpoch = await ownerRequest(chunkPath, owner, {
+      headers: { "X-Cloud-Database-Epoch": "ffffffffffffffffffffffffffffffff" },
+    });
+    const chunkResponse = await ownerRequest(chunkPath, owner, {
+      headers: { "X-Cloud-Database-Epoch": epoch },
+    });
+    expect(missingEpoch.status).toBe(428);
+    expect(staleEpoch.status).toBe(409);
+    expect(staleEpoch.headers.get("X-Cloud-Database-Epoch")).toBe(epoch);
+    expect(chunkResponse.status).toBe(200);
+    expect(await responseJson<{ sha256: string; data: string }>(chunkResponse)).toEqual({
+      sha256: library.sha256,
+      data: '{"revision":"owner-library","items":["🙂"]}',
+    });
+  });
+
+  it("keeps legacy owner response shapes independent of snapshot format capability", async () => {
+    const legacy = localSnapshot({ state_version: 1 }) as unknown as LocalSnapshot;
+    await storeSnapshot(testEnv.DB, legacy);
+    const owner = await signInitData();
+
+    for (const path of ["/api/state", "/api/library"] as const) {
+      for (const capability of [undefined, "chunked-v2", "chunked-v1"]) {
+        const headers = capability === undefined ? {} : { "X-Snapshot-Format": capability };
+        const response = await ownerRequest(path, owner, { headers });
+        expect(response.status).toBe(200);
+        const body = await responseJson<Record<string, unknown>>(response);
+        expect(body).not.toHaveProperty("format");
+        if (path === "/api/state") {
+          expect(body.library).toMatchObject({ revision: "library-hash-a", items: [] });
+          expect(body).not.toHaveProperty("state");
+        } else {
+          expect(body.library).toMatchObject({ revision: "library-hash-a", items: [] });
+        }
+      }
+    }
+  });
+
   it.each([
     { label: "same", paddingBytes: 0 },
     { label: "different", paddingBytes: 500_100 },

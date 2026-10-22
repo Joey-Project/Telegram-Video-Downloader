@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
+import { webcrypto } from "node:crypto";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
 
 const LIBRARY_ID = "test-library";
 const ROOT_BINDING = `v1:${"a".repeat(64)}`;
@@ -19,6 +21,7 @@ const ownerSnapshot = {
         name: "Test library",
         root: "/srv/media",
         root_binding: ROOT_BINDING,
+        default_category: "Films",
         availability: "available",
         available: true,
         is_default: true,
@@ -26,29 +29,21 @@ const ownerSnapshot = {
     },
   },
   library: {
+    revision: "compact-ui-revision",
+    scanned_at: Math.floor(Date.now() / 1000),
+    root_label: "Test library",
+    ready: true,
     default_library_id: LIBRARY_ID,
-    libraries: [{
-      id: LIBRARY_ID,
-      name: "Test library",
-      root: "/srv/media",
-      root_binding: ROOT_BINDING,
-      availability: "available",
-      available: true,
-      is_default: true,
-      snapshot: {
-        ready: true,
-        scanned_at: Math.floor(Date.now() / 1000),
-        total_count: 2,
-        retained_count: 2,
-        items: [
-          { id: "item-alpha", title: "Alpha video", relative_path: "Films/Alpha.mkv", presence: "present", bytes: 1024 },
-          { id: "item-beta", title: "Beta video", relative_path: "Films/Beta.mkv", presence: "present", bytes: 2048 },
-          { id: "series-a-1", title: "Shared episode 1", relative_path: "Series/A1.mkv", presence: "present", collection: { id: "series-a", title: "Shared Series", kind: "series", order: 1 } },
-          { id: "series-a-2", title: "Shared episode 2", relative_path: "Series/A2.mkv", presence: "present", collection: { id: "series-a", title: "Shared Series renamed", kind: "series", order: 2 } },
-          { id: "series-b-1", title: "Shared episode 3", relative_path: "Series/B1.mkv", presence: "present", collection: { id: "series-b", title: "Shared Series", kind: "series", order: 1 } },
-        ],
-      },
-    }],
+    items: [
+      { id: "item-alpha", title: "Alpha video", relative_path: "Films/Alpha.mkv", presence: "present", bytes: 1024 },
+      { id: "item-beta", title: "Beta video", relative_path: "Films/Beta.mkv", presence: "present", bytes: 2048 },
+      { id: "series-a-1", title: "Shared episode 1", relative_path: "Series/A1.mkv", presence: "present", collection: { id: "series-a", title: "Shared Series", kind: "series", order: 1 } },
+      { id: "series-a-2", title: "Shared episode 2", relative_path: "Series/A2.mkv", presence: "present", collection: { id: "series-a", title: "Shared Series renamed", kind: "series", order: 2 } },
+      { id: "series-b-1", title: "Shared episode 3", relative_path: "Series/B1.mkv", presence: "present", collection: { id: "series-b", title: "Shared Series", kind: "series", order: 1 } },
+    ],
+    categories: ["Films", "Series", "Shows"],
+    warnings: [],
+    libraries: [{ id: LIBRARY_ID, availability: "available", available: true, is_default: true }],
   },
   pending_requests: [],
   tasks: [],
@@ -75,6 +70,8 @@ afterEach(async () => {
 describe("file manager UI flow", () => {
   it("shows and clears selected items, navigates to the move card, and exposes mobile Details", async () => {
     vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const { manifest, chunks } = await makeChunkedSnapshot(ownerSnapshot);
 
     const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
     const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
@@ -94,13 +91,19 @@ describe("file manager UI flow", () => {
     });
 
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      expect(String(input)).toBe("/api/state");
       expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ownerSnapshot,
-      } as Response;
+      expect(init?.cache).toBe("no-store");
+      if (String(input) === "/api/state") {
+        expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
+        return { ok: true, status: 200, json: async () => manifest } as Response;
+      }
+      const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
+      if (chunkPath) {
+        expect(new Headers(init?.headers).get("X-Cloud-Database-Epoch")).toBe(TEST_DATABASE_EPOCH);
+        const sha256 = chunkPath[1]!;
+        return { ok: true, status: 200, json: async () => ({ sha256, data: chunks.get(sha256) }) } as Response;
+      }
+      throw new Error(`Unexpected request ${String(input)}`);
     });
     vi.stubGlobal("fetch", fetchMock);
     window.fetch = fetchMock as typeof window.fetch;
@@ -109,9 +112,18 @@ describe("file manager UI flow", () => {
     // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
     await import("../public/file/app.js");
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1 + manifest.library.chunks.length + manifest.state.chunks.length);
+    expect((element<HTMLElement>("#library-select") as unknown as { value: string }).value).toBe(LIBRARY_ID);
+    expect(element<HTMLOptionElement>("#library-select option").disabled).toBe(false);
+    expect([...document.querySelectorAll<HTMLOptionElement>("#category-folders option")].map((option) => option.value)).toEqual(expect.arrayContaining(["Films", "Series", "Shows"]));
 
     expect(element<HTMLButtonElement>("#select-visible").textContent?.trim()).toBe("Select this page");
+    element<HTMLButtonElement>("#download-here").click();
+    expect((element<HTMLElement>("#download-library-select") as unknown as { value: string }).value).toBe(LIBRARY_ID);
+    expect(element<HTMLInputElement>("#download-category").value).toBe("Films");
+    expect([...document.querySelectorAll<HTMLOptionElement>("#download-categories option")].map((option) => option.value)).toEqual(expect.arrayContaining(["Films", "Series", "Shows"]));
+    expect(element<HTMLButtonElement>("#download-submit").disabled).toBe(false);
+    element<HTMLButtonElement>("#download-cancel").click();
     const detailsButton = element<HTMLButtonElement>('[data-details="item-alpha"]');
     expect(detailsButton.classList.contains("media-details")).toBe(true);
     expect(detailsButton.closest(".media-actions")).not.toBeNull();
@@ -145,7 +157,7 @@ describe("file manager UI flow", () => {
     expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected");
 
     element<HTMLButtonElement>("#refresh-button").click();
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2 + manifest.library.chunks.length + manifest.state.chunks.length));
     await vi.waitFor(() => expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected"));
     element<HTMLButtonElement>("#clear-selection").click();
     expect(tray.classList.contains("hidden")).toBe(true);
@@ -170,5 +182,71 @@ describe("file manager UI flow", () => {
     expect(css).toMatch(/(?:^|[;{])\s*text-size-adjust:\s*100%/u);
     expect(css).toContain("env(safe-area-inset-bottom");
     expect(css).toMatch(/\.media-details\s*\{[^}]*min-height:\s*36px/su);
+  });
+
+  it("keeps the verified library visible and stale after a snapshot-format upgrade response", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const { manifest, chunks } = await makeChunkedSnapshot(ownerSnapshot);
+
+    const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
+    const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
+    expect(body).toBeDefined();
+    document.body.innerHTML = body!;
+    Object.defineProperty(window, "Telegram", {
+      configurable: true,
+      value: { WebApp: { initData: MOCK_INIT_DATA, ready: vi.fn(), expand: vi.fn() } },
+    });
+    Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+    vi.stubGlobal("localStorage", window.localStorage);
+
+    let stateRequests = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/api/state") {
+        expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
+        expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
+        expect(init?.cache).toBe("no-store");
+        stateRequests += 1;
+        if (stateRequests === 1) return { ok: true, status: 200, json: async () => manifest } as Response;
+        return {
+          ok: false,
+          status: 426,
+          json: async () => ({
+            error: "Mini App client upgrade required",
+            required_format: "chunked-v1",
+            library: { items: [], categories: [] },
+            settings: {},
+          }),
+        } as Response;
+      }
+      const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
+      if (chunkPath) {
+        expect(new Headers(init?.headers).get("X-Cloud-Database-Epoch")).toBe(TEST_DATABASE_EPOCH);
+        const sha256 = chunkPath[1]!;
+        return { ok: true, status: 200, json: async () => ({ sha256, data: chunks.get(sha256) }) } as Response;
+      }
+      throw new Error(`Unexpected request ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.fetch = fetchMock as typeof window.fetch;
+
+    vi.resetModules();
+    // The browser entry has no declarations because it is executed for its side effects.
+    // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
+    await import("../public/file/app.js");
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+    expect(element<HTMLButtonElement>('[data-details="item-alpha"]')).toBeDefined();
+
+    element<HTMLButtonElement>("#refresh-button").click();
+    await vi.waitFor(() => expect(stateRequests).toBe(2));
+    await vi.waitFor(() => expect(element<HTMLElement>("#sync-title").textContent).toBe("No recent computer contact"));
+
+    expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false);
+    expect(element<HTMLButtonElement>('[data-details="item-alpha"]')).toBeDefined();
+    expect([...document.querySelectorAll<HTMLOptionElement>("#category-folders option")].map((option) => option.value)).toEqual(expect.arrayContaining(["Films", "Series", "Shows"]));
+    expect(fetchMock.mock.calls.filter(([input]) => String(input) === "/api/state")).toHaveLength(2);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/snapshot/chunks/"))).toHaveLength(
+      new Set([...manifest.library.chunks, ...manifest.state.chunks].map((chunk: { sha256: string }) => chunk.sha256)).size,
+    );
   });
 });

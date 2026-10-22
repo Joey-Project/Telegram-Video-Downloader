@@ -1224,10 +1224,8 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
     assert_eq!(replacement_view["availability"], "unknown");
     assert_eq!(replacement_view["media_count"], Value::Null);
     assert!(
-        replacement_view["snapshot"]["items"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+        replacement_view.get("snapshot").is_none(),
+        "the default snapshot should be present only at the top level"
     );
     assert_eq!(projected_without_scan["default_library_id"], archive.id);
     assert!(
@@ -1237,8 +1235,9 @@ async fn media_library_remove_clears_reused_id_cache_after_scan_publication() {
             .is_empty(),
         "the top-level selected view must not expose the old default snapshot"
     );
+    assert_eq!(projected_without_scan["ready"], false);
     assert_ne!(
-        replacement_view["snapshot"]["items"], old_view["snapshot"]["items"],
+        projected_without_scan["items"], old_view["snapshot"]["items"],
         "reusing the same path-derived ID must not leak the old root's media list"
     );
 

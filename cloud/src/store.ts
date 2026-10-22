@@ -1,6 +1,23 @@
 import { HttpError } from "./types";
-import type { InboxEnvelope, LocalSnapshot, RequestKind } from "./types";
-import { canonicalJson, MAX_WEBHOOK_BODY_BYTES, sha256Hex } from "./validation";
+import type {
+  ChunkedSnapshotContent,
+  ChunkedStoredSnapshot,
+  InboxEnvelope,
+  LocalSnapshot,
+  PreparedSnapshotContent,
+  RequestKind,
+  SnapshotChunkManifest,
+} from "./types";
+import {
+  canonicalJson,
+  MAX_CHUNKED_SNAPSHOT_BYTES,
+  MAX_SNAPSHOT_CONTENT_CHUNK_BYTES,
+  MAX_JSON_COMPLEXITY_DEPTH,
+  MAX_SNAPSHOT_JSON_NODES,
+  MAX_WEBHOOK_BODY_BYTES,
+  sha256Hex,
+  validateChunkedSnapshot,
+} from "./validation";
 
 interface InboxRow {
   seq: number;
@@ -21,12 +38,23 @@ interface SnapshotMetaRow {
   library_chunk_count: number;
   state_hash: string;
   state_chunk_count: number;
+  transport: "legacy" | "chunked-v1";
+  library_manifest_json: string | null;
+  state_manifest_json: string | null;
 }
 
 interface SnapshotChunkRow {
   kind: "library" | "state";
   part: number;
   data: string;
+}
+
+interface SnapshotContentChunkRow {
+  database_epoch: string;
+  sha256: string;
+  byte_length: number;
+  data: string;
+  created_at: number;
 }
 
 export interface EnqueueResult {
@@ -58,7 +86,12 @@ interface DatabaseEpochRow {
 const SNAPSHOT_CHUNK_BYTES = 500_000;
 const MAX_SNAPSHOT_BYTES = 12 * 1024 * 1024;
 const MAX_SNAPSHOT_CHUNKS = 24;
-const MAX_SNAPSHOT_CANONICAL_JSON_NODES = 1_000_000;
+const SNAPSHOT_CHUNKED_HASH_DOMAIN = "telegram-video-downloader/chunked-v1/";
+const SNAPSHOT_CHUNK_PRUNE_BATCH_SIZE = 32;
+const SNAPSHOT_CHUNK_RETENTION_MS = 60 * 60 * 1000;
+const SNAPSHOT_META_SELECT = `SELECT state_version, reported_at, received_at, library_revision, library_hash,
+       library_chunk_count, state_hash, state_chunk_count, transport, library_manifest_json, state_manifest_json
+       FROM snapshot_meta WHERE id = 1`;
 const HEARTBEAT_WRITE_INTERVAL_MS = 30_000;
 const SNAPSHOT_STALE_AFTER_MS = 10 * 60_000;
 // Keep acknowledged idempotency keys reserved for a bounded replay window.
@@ -380,18 +413,104 @@ export async function rotateDatabaseEpochOnSequenceConflict(
   return { rotated: results[0]?.meta.changes === 1, database_epoch: actual };
 }
 
-function splitUtf8(value: string): string[] {
-  const bytes = new TextEncoder().encode(value);
+async function sha256HexBytes(bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function normalizedManifestJson(manifest: SnapshotChunkManifest): string {
+  return JSON.stringify({
+    bytes: manifest.bytes,
+    chunks: manifest.chunks.map(({ sha256, bytes }) => ({ sha256, bytes })),
+  });
+}
+
+async function hashSnapshotManifest(kind: "library" | "state", manifestJson: string): Promise<string> {
+  const bytes = new TextEncoder().encode(`${SNAPSHOT_CHUNKED_HASH_DOMAIN}${kind}\0${manifestJson}`);
+  return sha256HexBytes(bytes);
+}
+
+export async function storeSnapshotContentChunk(
+  db: D1Database,
+  expectedEpoch: string,
+  expectedHash: string,
+  bytes: Uint8Array<ArrayBuffer>,
+  data: string,
+): Promise<void> {
+  if (!isDatabaseEpoch(expectedEpoch)) throw new HttpError(400, "Cloud database epoch is invalid");
+  if (!/^[0-9a-f]{64}$/u.test(expectedHash)) throw new HttpError(400, "Snapshot content chunk hash is invalid");
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_SNAPSHOT_CONTENT_CHUNK_BYTES) {
+    throw new HttpError(413, "Snapshot content chunk is too large");
+  }
+  const encodedData = new TextEncoder().encode(data);
+  if (encodedData.byteLength !== bytes.byteLength || encodedData.some((byte, index) => byte !== bytes[index])) {
+    throw new HttpError(400, "Snapshot content chunk bytes are inconsistent");
+  }
+  const actualHash = await sha256HexBytes(bytes);
+  if (actualHash !== expectedHash) throw new HttpError(400, "Snapshot content chunk hash does not match its URL");
+
+  const result = await db.prepare(
+    `INSERT INTO snapshot_content_chunks (database_epoch, sha256, byte_length, data, created_at)
+     SELECT ?, ?, ?, ?, ?
+     WHERE EXISTS (SELECT 1 FROM cloud_database_meta WHERE id = 1 AND epoch = ?)
+     ON CONFLICT(database_epoch, sha256) DO UPDATE SET created_at = excluded.created_at
+     WHERE snapshot_content_chunks.byte_length = excluded.byte_length
+       AND snapshot_content_chunks.data = excluded.data`,
+  ).bind(expectedEpoch, expectedHash, bytes.byteLength, data, Date.now(), expectedEpoch).run();
+  if (!result.success) throw new Error("D1 snapshot content chunk write failed");
+  if (result.meta.changes === 1) return;
+  await assertDatabaseEpoch(db, expectedEpoch);
+  throw new Error("Stored snapshot content chunk conflicts with its content address");
+}
+
+export async function readSnapshotContentChunk(
+  db: D1Database,
+  expectedEpoch: string,
+  expectedHash: string,
+): Promise<{ sha256: string; data: string } | null> {
+  if (!isDatabaseEpoch(expectedEpoch)) throw new HttpError(400, "Cloud database epoch is invalid");
+  if (!/^[0-9a-f]{64}$/u.test(expectedHash)) throw new HttpError(400, "Snapshot content chunk hash is invalid");
+  const row = await db.prepare(
+    `SELECT database_epoch, sha256, byte_length, data, created_at
+     FROM snapshot_content_chunks
+     WHERE database_epoch = ? AND sha256 = ?
+       AND EXISTS (SELECT 1 FROM cloud_database_meta WHERE id = 1 AND epoch = ?)`,
+  ).bind(expectedEpoch, expectedHash, expectedEpoch).first<SnapshotContentChunkRow>();
+  if (row === null) {
+    await assertDatabaseEpoch(db, expectedEpoch);
+    return null;
+  }
+  const bytes = new TextEncoder().encode(row.data);
+  if (row.database_epoch !== expectedEpoch || row.sha256 !== expectedHash ||
+    row.byte_length !== bytes.byteLength || bytes.byteLength > MAX_SNAPSHOT_CONTENT_CHUNK_BYTES ||
+    await sha256HexBytes(bytes) !== expectedHash) {
+    throw new Error("Stored snapshot content chunk integrity check failed");
+  }
+  return { sha256: expectedHash, data: row.data };
+}
+
+function utf8ChunkEnd(bytes: Uint8Array, start: number): number {
+  let end = Math.min(start + SNAPSHOT_CHUNK_BYTES, bytes.length);
+  while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+  if (end === start) throw new Error("Unable to split snapshot at a UTF-8 boundary");
+  return end;
+}
+
+function countUtf8Chunks(bytes: Uint8Array): number {
   if (bytes.byteLength > MAX_SNAPSHOT_BYTES) {
     throw new HttpError(413, "Snapshot exceeds the storage size limit");
   }
+  let count = 0;
+  for (let start = 0; start < bytes.length; count += 1) start = utf8ChunkEnd(bytes, start);
+  return count;
+}
+
+function splitUtf8(bytes: Uint8Array): string[] {
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const chunks: string[] = [];
   let start = 0;
   while (start < bytes.length) {
-    let end = Math.min(start + SNAPSHOT_CHUNK_BYTES, bytes.length);
-    while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end -= 1;
-    if (end === start) throw new Error("Unable to split snapshot at a UTF-8 boundary");
+    const end = utf8ChunkEnd(bytes, start);
     chunks.push(decoder.decode(bytes.subarray(start, end)));
     start = end;
   }
@@ -407,22 +526,26 @@ export async function storeSnapshot(
   db: D1Database,
   snapshot: LocalSnapshot,
   expectedEpoch?: string,
+  prepared?: Pick<PreparedSnapshotContent, "libraryJson" | "stateJson">,
 ): Promise<{ ignoredOutOfOrder: boolean }> {
   const epoch = expectedEpoch ?? await readDatabaseEpoch(db);
   if (!isDatabaseEpoch(epoch)) throw new HttpError(400, "Cloud database epoch is invalid");
-  const snapshotCanonicalJsonOptions = { maxNodes: MAX_SNAPSHOT_CANONICAL_JSON_NODES, complexityStatus: 413 };
-  const libraryJson = canonicalJson(snapshot.library, snapshotCanonicalJsonOptions);
-  const stateJson = canonicalJson(stateOnly(snapshot), snapshotCanonicalJsonOptions);
+  const snapshotCanonicalJsonOptions = {
+    maxNodes: MAX_SNAPSHOT_JSON_NODES,
+    maxDepth: MAX_JSON_COMPLEXITY_DEPTH,
+    complexityStatus: 413,
+  };
+  const libraryJson = prepared?.libraryJson ?? canonicalJson(snapshot.library, snapshotCanonicalJsonOptions);
+  const stateJson = prepared?.stateJson ?? canonicalJson(stateOnly(snapshot), snapshotCanonicalJsonOptions);
+  const encoder = new TextEncoder();
+  const libraryBytes = encoder.encode(libraryJson);
+  const stateBytes = encoder.encode(stateJson);
   const [libraryHash, stateHash, readResults] = await Promise.all([
-    sha256Hex(libraryJson),
-    sha256Hex(stateJson),
+    sha256HexBytes(libraryBytes),
+    sha256HexBytes(stateBytes),
     db.batch<DatabaseEpochRow | SnapshotMetaRow>([
       db.prepare("SELECT epoch FROM cloud_database_meta WHERE id = 1"),
-      db.prepare(
-        `SELECT state_version, reported_at, received_at, library_revision, library_hash,
-                library_chunk_count, state_hash, state_chunk_count
-         FROM snapshot_meta WHERE id = 1`,
-      ),
+      db.prepare(SNAPSHOT_META_SELECT),
     ]),
   ]);
   const epochResult = readResults[0];
@@ -435,9 +558,9 @@ export async function storeSnapshot(
   if (currentEpoch.epoch !== epoch) throw epochChanged(epoch, currentEpoch.epoch);
   if (!snapshotResult?.success) throw new Error("D1 snapshot metadata read failed");
   const prior = snapshotResult.results[0] as SnapshotMetaRow | undefined ?? null;
-  const libraryChunks = splitUtf8(libraryJson);
-  const stateChunks = splitUtf8(stateJson);
-  if (libraryChunks.length + stateChunks.length > MAX_SNAPSHOT_CHUNKS) {
+  const libraryChunkCount = countUtf8Chunks(libraryBytes);
+  const stateChunkCount = countUtf8Chunks(stateBytes);
+  if (libraryChunkCount + stateChunkCount > MAX_SNAPSHOT_CHUNKS) {
     throw new HttpError(413, "Snapshot exceeds the storage chunk limit");
   }
   const now = Date.now();
@@ -446,6 +569,7 @@ export async function storeSnapshot(
   }
 
   const contentMatches = prior !== null &&
+    prior.transport === "legacy" &&
     prior.library_revision === snapshot.library.revision &&
     prior.library_hash === libraryHash &&
     prior.state_hash === stateHash;
@@ -455,22 +579,30 @@ export async function storeSnapshot(
 
   const heartbeatDue = prior === null || now - prior.received_at >= HEARTBEAT_WRITE_INTERVAL_MS;
   if (prior !== null && snapshot.state_version === prior.state_version && contentMatches) {
-    if (heartbeatDue) {
-      const heartbeat = await db.prepare(
+    const heartbeatStatements = heartbeatDue
+      ? [db.prepare(
         `UPDATE snapshot_meta
          SET reported_at = MAX(reported_at, ?), received_at = ?
-         WHERE id = 1 AND state_version = ? AND library_hash = ? AND state_hash = ?
+         WHERE id = 1 AND transport = 'legacy' AND state_version = ? AND library_hash = ? AND state_hash = ?
            AND EXISTS (SELECT 1 FROM cloud_database_meta WHERE id = 1 AND epoch = ?)`,
-      ).bind(snapshot.reported_at, now, snapshot.state_version, libraryHash, stateHash, epoch).run();
-      if (!heartbeat.success) throw new Error("D1 snapshot heartbeat update failed");
+      ).bind(snapshot.reported_at, now, snapshot.state_version, libraryHash, stateHash, epoch)]
+      : [];
+    heartbeatStatements.push(pruneOrphanSnapshotChunks(
+      db,
+      now,
+      epoch,
+      "legacy",
+      snapshot.state_version,
+      libraryHash,
+      stateHash,
+    ));
+    const heartbeatResults = await db.batch(heartbeatStatements);
+    if (heartbeatResults.some((result) => !result.success)) {
+      throw new Error("D1 snapshot heartbeat maintenance failed");
     }
     const [epochRead, latestRead] = await db.batch<DatabaseEpochRow | SnapshotMetaRow>([
       db.prepare("SELECT epoch FROM cloud_database_meta WHERE id = 1"),
-      db.prepare(
-        `SELECT state_version, reported_at, received_at, library_revision, library_hash,
-                library_chunk_count, state_hash, state_chunk_count
-         FROM snapshot_meta WHERE id = 1`,
-      ),
+      db.prepare(SNAPSHOT_META_SELECT),
     ]);
     if (!epochRead?.success) throw new Error("D1 database epoch read failed");
     const latestEpoch = epochRead.results[0] as DatabaseEpochRow | undefined;
@@ -487,6 +619,8 @@ export async function storeSnapshot(
     return { ignoredOutOfOrder: false };
   }
 
+  const libraryChunks = splitUtf8(libraryBytes);
+  const stateChunks = splitUtf8(stateBytes);
   const versionGate = "(NOT EXISTS (SELECT 1 FROM snapshot_meta WHERE id = 1) OR (SELECT state_version FROM snapshot_meta WHERE id = 1) < ?)";
   const epochGate = "EXISTS (SELECT 1 FROM cloud_database_meta WHERE id = 1 AND epoch = ?)";
   const statements: D1PreparedStatement[] = [
@@ -521,8 +655,9 @@ export async function storeSnapshot(
   statements.push(db.prepare(
     `INSERT INTO snapshot_meta (
        id, state_version, reported_at, received_at, library_revision, library_hash,
-       library_chunk_count, state_hash, state_chunk_count
-     ) SELECT 1, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${epochGate}
+       library_chunk_count, state_hash, state_chunk_count, transport,
+       library_manifest_json, state_manifest_json
+     ) SELECT 1, ?, ?, ?, ?, ?, ?, ?, ?, 'legacy', NULL, NULL WHERE ${epochGate}
      ON CONFLICT(id) DO UPDATE SET
        state_version = excluded.state_version,
        reported_at = MAX(snapshot_meta.reported_at, excluded.reported_at),
@@ -531,7 +666,10 @@ export async function storeSnapshot(
        library_hash = excluded.library_hash,
        library_chunk_count = excluded.library_chunk_count,
        state_hash = excluded.state_hash,
-       state_chunk_count = excluded.state_chunk_count
+       state_chunk_count = excluded.state_chunk_count,
+       transport = 'legacy',
+       library_manifest_json = NULL,
+       state_manifest_json = NULL
      WHERE excluded.state_version > snapshot_meta.state_version`,
   ).bind(
     snapshot.state_version,
@@ -544,16 +682,21 @@ export async function storeSnapshot(
     stateChunks.length,
     epoch,
   ));
+  statements.push(pruneOrphanSnapshotChunks(
+    db,
+    now,
+    epoch,
+    "legacy",
+    snapshot.state_version,
+    libraryHash,
+    stateHash,
+  ));
   const results = await db.batch(statements);
   if (results.some((result) => !result.success)) throw new Error("D1 snapshot batch failed");
 
   const [epochRead, latestRead] = await db.batch<DatabaseEpochRow | SnapshotMetaRow>([
     db.prepare("SELECT epoch FROM cloud_database_meta WHERE id = 1"),
-    db.prepare(
-      `SELECT state_version, reported_at, received_at, library_revision, library_hash,
-              library_chunk_count, state_hash, state_chunk_count
-       FROM snapshot_meta WHERE id = 1`,
-    ),
+    db.prepare(SNAPSHOT_META_SELECT),
   ]);
   if (!epochRead?.success) throw new Error("D1 database epoch read failed");
   const latestEpoch = epochRead.results[0] as DatabaseEpochRow | undefined;
@@ -574,7 +717,240 @@ export async function storeSnapshot(
   return { ignoredOutOfOrder: false };
 }
 
+function pruneOrphanSnapshotChunks(
+  db: D1Database,
+  now: number,
+  expectedEpoch: string,
+  transport: SnapshotMetaRow["transport"],
+  stateVersion: number,
+  libraryHash: string,
+  stateHash: string,
+): D1PreparedStatement {
+  return db.prepare(
+    `DELETE FROM snapshot_content_chunks
+     WHERE EXISTS (
+       SELECT 1 FROM cloud_database_meta
+       WHERE id = 1 AND epoch = ?
+     )
+       AND EXISTS (
+         SELECT 1 FROM snapshot_meta
+         WHERE id = 1 AND transport = ? AND state_version = ?
+           AND library_hash = ? AND state_hash = ?
+       )
+       AND rowid IN (
+         SELECT orphan.rowid
+         FROM snapshot_content_chunks AS orphan
+         WHERE orphan.created_at < ?
+           AND (
+             orphan.database_epoch <> ?
+             OR orphan.sha256 NOT IN (
+               SELECT json_extract(ref.value, '$.sha256')
+               FROM snapshot_meta AS meta,
+                 json_each(COALESCE(meta.library_manifest_json, '{}'), '$.chunks') AS ref
+               WHERE meta.id = 1 AND meta.transport = 'chunked-v1'
+               UNION
+               SELECT json_extract(ref.value, '$.sha256')
+               FROM snapshot_meta AS meta,
+                 json_each(COALESCE(meta.state_manifest_json, '{}'), '$.chunks') AS ref
+               WHERE meta.id = 1 AND meta.transport = 'chunked-v1'
+             )
+           )
+         ORDER BY orphan.created_at ASC, orphan.sha256 ASC
+         LIMIT ?
+       )`,
+  ).bind(
+    expectedEpoch,
+    transport,
+    stateVersion,
+    libraryHash,
+    stateHash,
+    now - SNAPSHOT_CHUNK_RETENTION_MS,
+    expectedEpoch,
+    SNAPSHOT_CHUNK_PRUNE_BATCH_SIZE,
+  );
+}
+
+export async function storeChunkedSnapshot(
+  db: D1Database,
+  snapshot: ChunkedSnapshotContent,
+  expectedEpoch: string,
+): Promise<void> {
+  if (!isDatabaseEpoch(expectedEpoch)) throw new HttpError(400, "Cloud database epoch is invalid");
+  const libraryManifestJson = normalizedManifestJson(snapshot.library);
+  const stateManifestJson = normalizedManifestJson(snapshot.state);
+  const [libraryHash, stateHash] = await Promise.all([
+    hashSnapshotManifest("library", libraryManifestJson),
+    hashSnapshotManifest("state", stateManifestJson),
+  ]);
+  const referencedChunks = JSON.stringify([
+    ...snapshot.library.chunks.map(({ sha256, bytes }) => ({ sha256, bytes })),
+    ...snapshot.state.chunks.map(({ sha256, bytes }) => ({ sha256, bytes })),
+  ]);
+  const readLatest = () => db.batch<DatabaseEpochRow | SnapshotMetaRow>([
+    db.prepare("SELECT epoch FROM cloud_database_meta WHERE id = 1"),
+    db.prepare(SNAPSHOT_META_SELECT),
+  ]);
+  const [epochResult, snapshotResult] = await readLatest();
+  if (!epochResult?.success) throw new Error("D1 database epoch read failed");
+  const currentEpoch = epochResult.results[0] as DatabaseEpochRow | undefined;
+  if (currentEpoch === undefined || !isDatabaseEpoch(currentEpoch.epoch)) {
+    throw new Error("D1 database epoch is missing or invalid");
+  }
+  if (currentEpoch.epoch !== expectedEpoch) throw epochChanged(expectedEpoch, currentEpoch.epoch);
+  if (!snapshotResult?.success) throw new Error("D1 snapshot metadata read failed");
+  const prior = snapshotResult.results[0] as SnapshotMetaRow | undefined ?? null;
+
+  if (prior !== null && snapshot.state_version < prior.state_version) {
+    throw new HttpError(409, "Snapshot state_version is older than the stored state", prior.state_version);
+  }
+  const contentMatches = prior !== null && prior.transport === "chunked-v1" &&
+    prior.library_revision === snapshot.library_revision &&
+    prior.library_hash === libraryHash && prior.state_hash === stateHash;
+  if (prior !== null && snapshot.state_version === prior.state_version && !contentMatches) {
+    throw new HttpError(409, "Snapshot state_version was reused with different content", prior.state_version);
+  }
+
+  const now = Date.now();
+  if (contentMatches && prior !== null && snapshot.state_version === prior.state_version) {
+    const missingChunk = await db.prepare(
+      `SELECT 1 AS missing
+       FROM json_each(?) AS ref
+       LEFT JOIN snapshot_content_chunks AS chunk
+         ON chunk.database_epoch = ? AND chunk.sha256 = json_extract(ref.value, '$.sha256')
+       WHERE chunk.sha256 IS NULL
+          OR chunk.byte_length <> CAST(json_extract(ref.value, '$.bytes') AS INTEGER)
+       LIMIT 1`,
+    ).bind(referencedChunks, expectedEpoch).first<{ missing: number }>();
+    if (missingChunk !== null) {
+      await assertDatabaseEpoch(db, expectedEpoch);
+      throw new HttpError(428, "Snapshot content chunks are missing or have invalid byte lengths");
+    }
+    const heartbeatStatements = now - prior.received_at >= HEARTBEAT_WRITE_INTERVAL_MS
+      ? [db.prepare(
+        `UPDATE snapshot_meta
+         SET reported_at = MAX(reported_at, ?), received_at = ?
+         WHERE id = 1 AND transport = 'chunked-v1' AND state_version = ?
+           AND library_hash = ? AND state_hash = ?
+           AND EXISTS (SELECT 1 FROM cloud_database_meta WHERE id = 1 AND epoch = ?)`,
+      ).bind(snapshot.reported_at, now, snapshot.state_version, libraryHash, stateHash, expectedEpoch)]
+      : [];
+    heartbeatStatements.push(pruneOrphanSnapshotChunks(
+      db,
+      now,
+      expectedEpoch,
+      "chunked-v1",
+      snapshot.state_version,
+      libraryHash,
+      stateHash,
+    ));
+    const heartbeatResults = await db.batch(heartbeatStatements);
+    if (heartbeatResults.some((result) => !result.success)) {
+      throw new Error("D1 snapshot heartbeat maintenance failed");
+    }
+    const [latestEpochResult, latestSnapshotResult] = await readLatest();
+    if (!latestEpochResult?.success) throw new Error("D1 database epoch read failed");
+    const latestEpoch = latestEpochResult.results[0] as DatabaseEpochRow | undefined;
+    if (latestEpoch === undefined || !isDatabaseEpoch(latestEpoch.epoch)) {
+      throw new Error("D1 database epoch is missing or invalid");
+    }
+    if (latestEpoch.epoch !== expectedEpoch) throw epochChanged(expectedEpoch, latestEpoch.epoch);
+    if (!latestSnapshotResult?.success) throw new Error("D1 snapshot metadata read failed");
+    const latest = latestSnapshotResult.results[0] as SnapshotMetaRow | undefined ?? null;
+    if (latest === null || latest.state_version !== snapshot.state_version ||
+      latest.transport !== "chunked-v1" || latest.library_hash !== libraryHash || latest.state_hash !== stateHash) {
+      throw new HttpError(409, "Snapshot was superseded by a newer local state", latest?.state_version);
+    }
+    return;
+  }
+
+  const commit = db.prepare(
+    `INSERT INTO snapshot_meta (
+       id, state_version, reported_at, received_at, library_revision, library_hash,
+       library_chunk_count, state_hash, state_chunk_count, transport,
+       library_manifest_json, state_manifest_json
+     )
+     SELECT 1, ?, ?, ?, ?, ?, ?, ?, ?, 'chunked-v1', ?, ?
+     WHERE EXISTS (SELECT 1 FROM cloud_database_meta WHERE id = 1 AND epoch = ?)
+       AND NOT EXISTS (
+         SELECT 1 FROM json_each(?) AS ref
+         LEFT JOIN snapshot_content_chunks AS chunk
+           ON chunk.database_epoch = ? AND chunk.sha256 = json_extract(ref.value, '$.sha256')
+         WHERE chunk.sha256 IS NULL
+            OR chunk.byte_length <> CAST(json_extract(ref.value, '$.bytes') AS INTEGER)
+       )
+     ON CONFLICT(id) DO UPDATE SET
+       state_version = excluded.state_version,
+       reported_at = MAX(snapshot_meta.reported_at, excluded.reported_at),
+       received_at = excluded.received_at,
+       library_revision = excluded.library_revision,
+       library_hash = excluded.library_hash,
+       library_chunk_count = excluded.library_chunk_count,
+       state_hash = excluded.state_hash,
+       state_chunk_count = excluded.state_chunk_count,
+       transport = 'chunked-v1',
+       library_manifest_json = excluded.library_manifest_json,
+       state_manifest_json = excluded.state_manifest_json
+     WHERE excluded.state_version > snapshot_meta.state_version`,
+  ).bind(
+    snapshot.state_version,
+    snapshot.reported_at,
+    now,
+    snapshot.library_revision,
+    libraryHash,
+    snapshot.library.chunks.length,
+    stateHash,
+    snapshot.state.chunks.length,
+    libraryManifestJson,
+    stateManifestJson,
+    expectedEpoch,
+    referencedChunks,
+    expectedEpoch,
+  );
+  const clearLegacyChunks = db.prepare(
+    `DELETE FROM snapshot_chunks
+     WHERE EXISTS (
+       SELECT 1 FROM snapshot_meta
+       WHERE id = 1 AND transport = 'chunked-v1' AND state_version = ?
+         AND library_hash = ? AND state_hash = ?
+         AND EXISTS (SELECT 1 FROM cloud_database_meta WHERE id = 1 AND epoch = ?)
+     )`,
+  ).bind(snapshot.state_version, libraryHash, stateHash, expectedEpoch);
+  const pruneOrphanChunks = pruneOrphanSnapshotChunks(
+    db,
+    now,
+    expectedEpoch,
+    "chunked-v1",
+    snapshot.state_version,
+    libraryHash,
+    stateHash,
+  );
+  const results = await db.batch([commit, clearLegacyChunks, pruneOrphanChunks]);
+  if (results.some((result) => !result.success)) throw new Error("D1 chunked snapshot commit failed");
+
+  const [latestEpochResult, latestSnapshotResult] = await readLatest();
+  if (!latestEpochResult?.success) throw new Error("D1 database epoch read failed");
+  const latestEpoch = latestEpochResult.results[0] as DatabaseEpochRow | undefined;
+  if (latestEpoch === undefined || !isDatabaseEpoch(latestEpoch.epoch)) {
+    throw new Error("D1 database epoch is missing or invalid");
+  }
+  if (latestEpoch.epoch !== expectedEpoch) throw epochChanged(expectedEpoch, latestEpoch.epoch);
+  if (!latestSnapshotResult?.success) throw new Error("D1 snapshot metadata read failed");
+  const latest = latestSnapshotResult.results[0] as SnapshotMetaRow | undefined ?? null;
+  if (latest !== null && latest.state_version > snapshot.state_version) {
+    throw new HttpError(409, "Snapshot was superseded by a newer local state", latest.state_version);
+  }
+  if (latest !== null && latest.state_version === snapshot.state_version) {
+    if (latest.transport !== "chunked-v1" || latest.library_revision !== snapshot.library_revision ||
+      latest.library_hash !== libraryHash || latest.state_hash !== stateHash) {
+      throw new HttpError(409, "Snapshot state_version was reused with different content", latest.state_version);
+    }
+    return;
+  }
+  throw new HttpError(428, "Snapshot content chunks are missing or have invalid byte lengths");
+}
+
 export interface StoredSnapshot {
+  transport?: "legacy";
   synced: true;
   state_version: number;
   revision: string | null;
@@ -588,18 +964,73 @@ export interface StoredSnapshot {
   settings: { download_dir: string };
 }
 
-export async function readSnapshot(db: D1Database): Promise<StoredSnapshot | null> {
-  const [metaResult, chunksResult] = await db.batch<SnapshotMetaRow | SnapshotChunkRow>([
+export async function readSnapshot(db: D1Database): Promise<StoredSnapshot | ChunkedStoredSnapshot | null> {
+  const [metaResult, epochResult, chunksResult] = await db.batch<SnapshotMetaRow | DatabaseEpochRow | SnapshotChunkRow>([
+    db.prepare(SNAPSHOT_META_SELECT),
+    db.prepare("SELECT epoch FROM cloud_database_meta WHERE id = 1"),
     db.prepare(
-      `SELECT state_version, reported_at, received_at, library_revision, library_hash,
-              library_chunk_count, state_hash, state_chunk_count
-       FROM snapshot_meta WHERE id = 1`,
+      `SELECT kind, part, data FROM snapshot_chunks
+       WHERE EXISTS (SELECT 1 FROM snapshot_meta WHERE id = 1 AND transport = 'legacy')
+       ORDER BY kind ASC, part ASC`,
     ),
-    db.prepare("SELECT kind, part, data FROM snapshot_chunks ORDER BY kind ASC, part ASC"),
   ]);
   if (!metaResult?.success) throw new Error("D1 snapshot metadata read failed");
   const meta = metaResult.results[0] as SnapshotMetaRow | undefined;
   if (meta === undefined) return null;
+
+  if (meta.transport === "chunked-v1") {
+    if (!epochResult?.success) throw new Error("D1 database epoch read failed");
+    const epoch = epochResult.results[0] as DatabaseEpochRow | undefined;
+    if (epoch === undefined || !isDatabaseEpoch(epoch.epoch)) throw new Error("D1 database epoch is missing or invalid");
+    if (meta.library_manifest_json === null || meta.state_manifest_json === null) {
+      throw new Error("Stored chunked snapshot manifest is missing");
+    }
+    let parsedLibrary: unknown;
+    let parsedState: unknown;
+    try {
+      parsedLibrary = JSON.parse(meta.library_manifest_json) as unknown;
+      parsedState = JSON.parse(meta.state_manifest_json) as unknown;
+    } catch {
+      throw new Error("Stored chunked snapshot manifest is invalid JSON");
+    }
+    let snapshot: ChunkedSnapshotContent;
+    try {
+      snapshot = validateChunkedSnapshot({
+        format: "chunked-v1",
+        state_version: meta.state_version,
+        reported_at: meta.reported_at,
+        library_revision: meta.library_revision,
+        library: parsedLibrary,
+        state: parsedState,
+      });
+    } catch {
+      throw new Error("Stored chunked snapshot manifest is malformed");
+    }
+    const [libraryHash, stateHash] = await Promise.all([
+      hashSnapshotManifest("library", normalizedManifestJson(snapshot.library)),
+      hashSnapshotManifest("state", normalizedManifestJson(snapshot.state)),
+    ]);
+    if (libraryHash !== meta.library_hash || stateHash !== meta.state_hash ||
+      snapshot.library.chunks.length !== meta.library_chunk_count ||
+      snapshot.state.chunks.length !== meta.state_chunk_count) {
+      throw new Error("Stored chunked snapshot manifest integrity check failed");
+    }
+    if (!chunksResult?.success) throw new Error("D1 snapshot chunks read failed");
+    if (chunksResult.results.length !== 0) throw new Error("Legacy snapshot chunks remain beside a chunked snapshot");
+    return {
+      transport: "chunked-v1",
+      format: "chunked-v1",
+      database_epoch: epoch.epoch,
+      synced: true,
+      state_version: meta.state_version,
+      library_revision: meta.library_revision,
+      reported_at: meta.reported_at,
+      last_seen: meta.received_at,
+      stale: Date.now() - meta.received_at > SNAPSHOT_STALE_AFTER_MS,
+      library: snapshot.library,
+      state: snapshot.state,
+    };
+  }
 
   if (!chunksResult?.success) throw new Error("D1 snapshot chunks read failed");
   const chunks = chunksResult.results as SnapshotChunkRow[];

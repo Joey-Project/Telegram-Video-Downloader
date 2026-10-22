@@ -65,6 +65,8 @@ function retainLibrarySnapshots(previousSnapshot, incomingSnapshot) {
 
   const previous = mergedLibraryDescriptors(previousSnapshot);
   const incoming = mergedLibraryDescriptors(incomingSnapshot);
+  const incomingDefaultId = incomingSnapshot?.settings?.applied?.default_library_id
+    ?? incomingSnapshot?.library?.default_library_id;
   const previousDefaultId = previousSnapshot?.settings?.applied?.default_library_id
     ?? previousSnapshot?.library?.default_library_id;
   const libraries = nextLibraries.map((entry) => {
@@ -99,7 +101,16 @@ function retainLibrarySnapshots(previousSnapshot, incomingSnapshot) {
     if (!priorSnapshot || typeof priorSnapshot !== "object"
       || !Array.isArray(priorSnapshot.items) || priorSnapshot.ready === false) return entry;
 
-    const currentSnapshot = current.snapshot;
+    // Compact snapshots keep the default library's items at library.items and
+    // omit the duplicate descriptor.snapshot. Treat that top-level value as
+    // the current default view when deciding whether a previously cached view
+    // should be retained as stale.
+    const currentSnapshot = current.snapshot && typeof current.snapshot === "object"
+      ? current.snapshot
+      : entry.id === incomingDefaultId && incomingSnapshot?.library
+          && typeof incomingSnapshot.library === "object"
+        ? incomingSnapshot.library
+        : null;
     const snapshotReady = currentSnapshot && typeof currentSnapshot === "object"
       && currentSnapshot.ready !== false && Array.isArray(currentSnapshot.items);
     const availability = String(current.availability ?? "").toLowerCase();

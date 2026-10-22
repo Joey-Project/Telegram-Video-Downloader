@@ -12,17 +12,26 @@ import {
   getPendingSummary,
   isDatabaseEpoch,
   readSnapshot,
+  readSnapshotContentChunk,
   rotateDatabaseEpochOnSequenceConflict,
+  storeChunkedSnapshot,
+  storeSnapshotContentChunk,
   storeSnapshot,
 } from "./store";
 import {
   MAX_ACTION_BODY_BYTES,
+  MAX_CHUNKED_SNAPSHOT_MANIFEST_BODY_BYTES,
   MAX_STATE_BODY_BYTES,
   MAX_WEBHOOK_BODY_BYTES,
+  isRecord,
   parseLimit,
   readJsonBody,
+  readJsonBodyWithByteLength,
+  readUtf8ChunkBody,
   isOwnerPrivateTelegramUpdate,
   validateActionRequest,
+  validateChunkedSnapshot,
+  validatePreparedSnapshot,
   validateSnapshot,
   validateTelegramUpdate,
 } from "./validation";
@@ -156,13 +165,33 @@ async function handleLocalAck(request: Request, env: Env): Promise<Response> {
   return json({ acked: await acknowledge(env.DB, receipts, databaseEpoch) });
 }
 
+async function handleLocalSnapshotChunk(request: Request, env: Env, sha256: string): Promise<Response> {
+  requireLocalAuthorization(request, env);
+  const databaseEpoch = await assertDatabaseEpoch(env.DB, request.headers.get("X-Cloud-Database-Epoch"));
+  const { bytes, data } = await readUtf8ChunkBody(request);
+  await storeSnapshotContentChunk(env.DB, databaseEpoch, sha256, bytes, data);
+  return json({ stored: true, sha256 });
+}
+
 async function handleLocalState(request: Request, env: Env): Promise<Response> {
   requireLocalAuthorization(request, env);
   const databaseEpoch = await assertDatabaseEpoch(env.DB, request.headers.get("X-Cloud-Database-Epoch"));
-  const snapshot = validateSnapshot(await readJsonBody(request, MAX_STATE_BODY_BYTES));
+  const { value: body, byteLength } = await readJsonBodyWithByteLength(request, MAX_STATE_BODY_BYTES);
+  if (isRecord(body) && body.format === "chunked-v1") {
+    if (byteLength > MAX_CHUNKED_SNAPSHOT_MANIFEST_BODY_BYTES) {
+      throw new HttpError(413, "Chunked snapshot manifest request is too large");
+    }
+    const snapshot = validateChunkedSnapshot(body);
+    const now = Date.now();
+    if (snapshot.reported_at > now + 60_000) throw new HttpError(400, "reported_at is too far in the future");
+    await storeChunkedSnapshot(env.DB, snapshot, databaseEpoch);
+    return json({ stored: true, last_seen: now });
+  }
+  const prepared = isRecord(body) && Object.hasOwn(body, "format") ? validatePreparedSnapshot(body) : undefined;
+  const snapshot = prepared?.snapshot ?? validateSnapshot(body);
   const now = Date.now();
   if (snapshot.reported_at > now + 60_000) throw new HttpError(400, "reported_at is too far in the future");
-  await storeSnapshot(env.DB, snapshot, databaseEpoch);
+  await storeSnapshot(env.DB, snapshot, databaseEpoch, prepared);
   return json({ stored: true, last_seen: now });
 }
 
@@ -210,12 +239,40 @@ async function handleLocalWebSocket(request: Request, env: Env): Promise<Respons
   return env.NOTIFIER.getByName(NOTIFIER_ID).fetch(request);
 }
 
+function requireChunkedSnapshotCapability(request: Request): void {
+  if (request.headers.get("X-Snapshot-Format") === "chunked-v1") return;
+  throw new HttpError(
+    426,
+    "A new Mini App version is available. Close and reopen it from Telegram.",
+    undefined,
+    undefined,
+    undefined,
+    "snapshot_client_upgrade_required",
+  );
+}
+
 async function handleState(request: Request, env: Env): Promise<Response> {
   await requireOwner(request, env);
   const [snapshot, pendingRequests] = await Promise.all([
     readSnapshot(env.DB),
     getPendingSummary(env.DB, CLOUD_REQUEST_PAGE_SIZE),
   ]);
+  if (snapshot?.transport === "chunked-v1") {
+    requireChunkedSnapshotCapability(request);
+    return json({
+      format: "chunked-v1",
+      state_version: snapshot.state_version,
+      reported_at: snapshot.reported_at,
+      library_revision: snapshot.library_revision,
+      library: snapshot.library,
+      state: snapshot.state,
+      synced: true,
+      last_seen: snapshot.last_seen,
+      stale: snapshot.stale,
+      pending_requests: pendingRequests,
+      database_epoch: snapshot.database_epoch,
+    });
+  }
   return json({ ...(snapshot ?? emptySnapshot()), pending_requests: pendingRequests });
 }
 
@@ -225,6 +282,20 @@ async function handleLibrary(request: Request, env: Env): Promise<Response> {
   if (snapshot === null) {
     return json({ synced: false, library: null, reported_at: null, last_seen: null, stale: true });
   }
+  if (snapshot.transport === "chunked-v1") {
+    requireChunkedSnapshotCapability(request);
+    return json({
+      format: "chunked-v1",
+      database_epoch: snapshot.database_epoch,
+      state_version: snapshot.state_version,
+      library_revision: snapshot.library_revision,
+      synced: true,
+      library: snapshot.library,
+      reported_at: snapshot.reported_at,
+      last_seen: snapshot.last_seen,
+      stale: snapshot.stale,
+    });
+  }
   return json({
     synced: true,
     library: snapshot.library,
@@ -232,6 +303,14 @@ async function handleLibrary(request: Request, env: Env): Promise<Response> {
     last_seen: snapshot.last_seen,
     stale: snapshot.stale,
   });
+}
+
+async function handleSnapshotContentChunk(request: Request, env: Env, sha256: string): Promise<Response> {
+  await requireOwner(request, env);
+  const databaseEpoch = await assertDatabaseEpoch(env.DB, request.headers.get("X-Cloud-Database-Epoch"));
+  const chunk = await readSnapshotContentChunk(env.DB, databaseEpoch, sha256);
+  if (chunk === null) return json({ error: "Snapshot content chunk not found" }, 404);
+  return json(chunk);
 }
 
 async function dispatch(request: Request, env: Env): Promise<Response> {
@@ -258,6 +337,11 @@ async function dispatch(request: Request, env: Env): Promise<Response> {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
     return handleLocalState(request, env);
   }
+  const localChunkMatch = /^\/api\/local\/state\/chunks\/([0-9a-f]{64})$/u.exec(path);
+  if (localChunkMatch !== null) {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    return handleLocalSnapshotChunk(request, env, localChunkMatch[1]!);
+  }
   if (path === "/api/local/ws") return handleLocalWebSocket(request, env);
   if (path === "/api/state") {
     if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
@@ -266,6 +350,11 @@ async function dispatch(request: Request, env: Env): Promise<Response> {
   if (path === "/api/library") {
     if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
     return handleLibrary(request, env);
+  }
+  const ownerChunkMatch = /^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u.exec(path);
+  if (ownerChunkMatch !== null) {
+    if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+    return handleSnapshotContentChunk(request, env, ownerChunkMatch[1]!);
   }
   if (path === "/api/actions") {
     if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);

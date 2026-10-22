@@ -5,7 +5,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::CloudConfig;
 use crate::file_manager::{PreviewCleanupGate, PreviewCleanupOutcome};
@@ -17,11 +17,12 @@ use crate::safe_fs::{
     BoundFile, EntryIdentity, RootedFs,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -42,6 +43,14 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_LEGACY_IMPORT_BYTES: usize = 256 * 1024;
 const MAX_MANAGEMENT_STATE_RECORDS: usize = 100;
 const MAX_COMPLETED_LEGACY_IMPORT_RECORDS: usize = 100;
+const CLOUD_STATE_CHUNK_BYTES: usize = 32 * 1024;
+const MAX_CLOUD_STATE_CHUNKS: usize = 386;
+const MAX_CLOUD_STATE_PARTITION_BYTES: usize = 12 * 1024 * 1024;
+const CLOUD_STATE_CHUNK_ACK_CACHE_ENTRIES: usize = 768;
+const CLOUD_STATE_CHUNK_ACK_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const CLOUD_STATE_CHUNK_UPLOAD_CONCURRENCY: usize = 4;
+const MAX_CLOUD_STATE_JSON_DEPTH: usize = 48;
+const MAX_CLOUD_STATE_JSON_NODES: usize = 1_000_000;
 pub(crate) const CLOUD_REQUEST_PAGE_SIZE: usize = 100;
 // Keep terminal local receipts through the same replay window as D1 ACK tombstones.
 const CLOUD_INBOX_TERMINAL_REPLAY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -51,6 +60,20 @@ const CLOUD_INBOX_ABANDONED_PREVIEW_RETENTION: Duration = CLOUD_INBOX_TERMINAL_R
 const CLOUD_INBOX_SCAN_MAX_NAMES: usize = 32;
 const CLOUD_INBOX_SCAN_MAX_BYTES: usize = 8 * 1024 * 1024;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct CloudStateComplexityExceeded;
+
+impl std::fmt::Display for CloudStateComplexityExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "cloud state JSON exceeds local complexity limits"
+        )
+    }
+}
+
+impl std::error::Error for CloudStateComplexityExceeded {}
 
 pub type CloudWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -229,6 +252,151 @@ pub struct CloudState<'a> {
     pub settings: CloudSettings<'a>,
 }
 
+impl CloudState<'_> {
+    /// Encode stable JSON partitions locally and divide them into content-addressed chunks.
+    /// The Worker validates each bounded chunk and commits a small manifest.
+    fn chunked_snapshot(&self, enforce_complexity_limits: bool) -> Result<PreparedCloudState> {
+        if enforce_complexity_limits {
+            validate_cloud_json_complexity(self.library)?;
+        }
+        let library_json = serde_json::to_vec(self.library)
+            .context("failed to serialize the cloud library partition")?;
+        let mut contents = serde_json::json!({
+            "operations": self.operations,
+            "previews": self.previews,
+            "settings": self.settings,
+            "tasks": self.tasks,
+        });
+        if let Some(revision) = self.revision {
+            contents["revision"] = serde_json::Value::String(revision.to_string());
+        }
+        if enforce_complexity_limits {
+            validate_cloud_json_complexity(&contents)?;
+        }
+        let state_json = serde_json::to_vec(&contents)
+            .context("failed to serialize the cloud state partition")?;
+
+        let library_revision = match self.library.get("revision").and_then(Value::as_str) {
+            Some(revision) => revision,
+            None if !enforce_complexity_limits => "",
+            None => bail!("cloud library revision must be a string"),
+        };
+        let mut unique_chunks = BTreeMap::<String, Vec<u8>>::new();
+        let library_refs = chunk_cloud_partition(&library_json, &mut unique_chunks)?;
+        let state_refs = chunk_cloud_partition(&state_json, &mut unique_chunks)?;
+        let total_partition_bytes = library_json.len().saturating_add(state_json.len());
+        let total_chunk_references = library_refs.len().saturating_add(state_refs.len());
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "format": "chunked-v1",
+            "state_version": self.state_version,
+            "reported_at": self.reported_at,
+            "library_revision": library_revision,
+            "library": { "bytes": library_json.len(), "chunks": library_refs },
+            "state": { "bytes": state_json.len(), "chunks": state_refs },
+        }))
+        .context("failed to serialize the chunked cloud state manifest")?;
+        // Budget logical partition bytes rather than only unique uploads. Repeated content can
+        // reuse an ACKed chunk on the wire, but the Worker still has to represent every byte in
+        // the two committed partitions.
+        let wire_size = total_partition_bytes.saturating_add(manifest.len());
+        Ok(PreparedCloudState {
+            manifest,
+            chunks: unique_chunks
+                .into_iter()
+                .map(|(sha256, bytes)| CloudStateChunk { sha256, bytes })
+                .collect(),
+            total_partition_bytes,
+            total_chunk_references,
+            wire_size,
+        })
+    }
+
+    pub(crate) fn encoded_wire_size(&self) -> Result<usize> {
+        // Keep sizing available to the compactor even when the upload admission complexity cap
+        // is exceeded; post_state performs the bounded admission check after compaction has had
+        // a chance to reduce the snapshot.
+        Ok(self.chunked_snapshot(false)?.wire_size)
+    }
+}
+
+#[derive(Debug)]
+struct CloudStateChunk {
+    sha256: String,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct PreparedCloudState {
+    manifest: Vec<u8>,
+    chunks: Vec<CloudStateChunk>,
+    total_partition_bytes: usize,
+    total_chunk_references: usize,
+    wire_size: usize,
+}
+
+fn validate_cloud_json_complexity(value: &Value) -> Result<()> {
+    let mut pending = vec![(value, 0_usize)];
+    let mut nodes = 0_usize;
+    while let Some((current, depth)) = pending.pop() {
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_CLOUD_STATE_JSON_NODES {
+            return Err(CloudStateComplexityExceeded.into());
+        }
+        if depth > MAX_CLOUD_STATE_JSON_DEPTH {
+            return Err(CloudStateComplexityExceeded.into());
+        }
+        match current {
+            Value::Array(items) => {
+                pending.extend(items.iter().map(|item| (item, depth + 1)));
+            }
+            Value::Object(fields) => {
+                pending.extend(fields.values().map(|item| (item, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn chunk_cloud_partition(
+    bytes: &[u8],
+    unique_chunks: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<Vec<Value>> {
+    let text = std::str::from_utf8(bytes).context("serialized cloud state must be UTF-8")?;
+    let mut references = Vec::new();
+    let mut start = 0_usize;
+    while start < text.len() {
+        let mut end = start
+            .saturating_add(CLOUD_STATE_CHUNK_BYTES)
+            .min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        // A UTF-8 code point is at most four bytes, so this cannot produce an empty chunk.
+        anyhow::ensure!(
+            end > start,
+            "failed to split UTF-8 cloud state at a character boundary"
+        );
+        let chunk = text.as_bytes()[start..end].to_vec();
+        let sha256 = format!("{:x}", Sha256::digest(&chunk));
+        match unique_chunks.get(&sha256) {
+            Some(existing) if existing != &chunk => {
+                bail!("cloud state SHA-256 collision detected while preparing chunks");
+            }
+            Some(_) => {}
+            None => {
+                unique_chunks.insert(sha256.clone(), chunk.clone());
+            }
+        }
+        references.push(serde_json::json!({
+            "sha256": sha256,
+            "bytes": chunk.len(),
+        }));
+        start = end;
+    }
+    Ok(references)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CloudSettings<'a> {
     pub download_dir: &'a str,
@@ -242,6 +410,7 @@ pub struct CloudClient {
     client: Client,
     authorization: HeaderValue,
     database_epoch: Option<String>,
+    acknowledged_state_chunks: Arc<Mutex<BTreeMap<(String, String), Instant>>>,
 }
 
 fn parse_cloud_state_version_hint(bytes: &[u8]) -> Option<u64> {
@@ -270,6 +439,7 @@ impl CloudStatePostError {
                     || *status == reqwest::StatusCode::FORBIDDEN
                     || *status == reqwest::StatusCode::CONFLICT
                     || *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || *status == reqwest::StatusCode::PRECONDITION_REQUIRED
                     || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
                     || status.is_server_error()
             }
@@ -328,6 +498,7 @@ impl CloudClient {
                 .context("failed to initialize local cloud client")?,
             authorization,
             database_epoch: None,
+            acknowledged_state_chunks: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -342,6 +513,95 @@ impl CloudClient {
         }
         self.database_epoch = Some(epoch);
         Ok(self)
+    }
+
+    fn state_chunk_is_acknowledged(&self, epoch: &str, sha256: &str) -> bool {
+        let now = Instant::now();
+        let Ok(mut cache) = self.acknowledged_state_chunks.lock() else {
+            return false;
+        };
+        cache.retain(|_, acknowledged_at| {
+            now.saturating_duration_since(*acknowledged_at) < CLOUD_STATE_CHUNK_ACK_CACHE_TTL
+        });
+        cache.contains_key(&(epoch.to_string(), sha256.to_string()))
+    }
+
+    fn remember_acknowledged_state_chunk(&self, epoch: &str, sha256: &str) {
+        let now = Instant::now();
+        let Ok(mut cache) = self.acknowledged_state_chunks.lock() else {
+            return;
+        };
+        cache.retain(|_, acknowledged_at| {
+            now.saturating_duration_since(*acknowledged_at) < CLOUD_STATE_CHUNK_ACK_CACHE_TTL
+        });
+        let key = (epoch.to_string(), sha256.to_string());
+        if let Some(acknowledged_at) = cache.get_mut(&key) {
+            *acknowledged_at = now;
+            return;
+        }
+        while cache.len() >= CLOUD_STATE_CHUNK_ACK_CACHE_ENTRIES {
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, acknowledged_at)| **acknowledged_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
+        cache.insert(key, now);
+    }
+
+    fn clear_acknowledged_state_chunks(&self, epoch: &str) {
+        if let Ok(mut cache) = self.acknowledged_state_chunks.lock() {
+            cache.retain(|(cached_epoch, _), _| cached_epoch != epoch);
+        }
+    }
+
+    async fn upload_state_chunk(
+        &self,
+        expected_epoch: &str,
+        chunk: CloudStateChunk,
+    ) -> std::result::Result<(), CloudStatePostError> {
+        if self.state_chunk_is_acknowledged(expected_epoch, &chunk.sha256) {
+            return Ok(());
+        }
+        let url = self
+            .api_url(&format!("api/local/state/chunks/{}", chunk.sha256))
+            .map_err(CloudStatePostError::Transport)?;
+        let response = self
+            .client
+            .post(url)
+            .header(AUTHORIZATION, self.authorization.clone())
+            .header("X-Cloud-Database-Epoch", expected_epoch)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(chunk.bytes)
+            .send()
+            .await
+            .map_err(|error| {
+                CloudStatePostError::Transport(
+                    anyhow!(error).context("failed to upload local cloud state chunk"),
+                )
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            self.remember_acknowledged_state_chunk(expected_epoch, &chunk.sha256);
+            Ok(())
+        } else {
+            if status == reqwest::StatusCode::CONFLICT
+                && let Some(actual) = database_epoch_from_header(response.headers())
+                && actual != expected_epoch
+            {
+                return Err(CloudStatePostError::DatabaseEpochChanged {
+                    expected: expected_epoch.to_string(),
+                    actual,
+                });
+            }
+            if status == reqwest::StatusCode::PRECONDITION_REQUIRED {
+                self.clear_acknowledged_state_chunks(expected_epoch);
+            }
+            Err(CloudStatePostError::HttpStatus(status))
+        }
     }
 
     pub(crate) fn database_epoch(&self) -> Result<&str> {
@@ -568,6 +828,36 @@ impl CloudClient {
             .database_epoch()
             .map_err(CloudStatePostError::Transport)?
             .to_string();
+        let prepared = match state.chunked_snapshot(true) {
+            Ok(prepared) => prepared,
+            Err(error)
+                if error
+                    .downcast_ref::<CloudStateComplexityExceeded>()
+                    .is_some() =>
+            {
+                return Err(CloudStatePostError::HttpStatus(
+                    reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+                ));
+            }
+            Err(error) => return Err(CloudStatePostError::Transport(error)),
+        };
+        if prepared.total_partition_bytes > MAX_CLOUD_STATE_PARTITION_BYTES
+            || prepared.total_chunk_references > MAX_CLOUD_STATE_CHUNKS
+        {
+            return Err(CloudStatePostError::HttpStatus(
+                reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            ));
+        }
+
+        let upload_results = stream::iter(prepared.chunks)
+            .map(|chunk| self.upload_state_chunk(&expected, chunk))
+            .buffer_unordered(CLOUD_STATE_CHUNK_UPLOAD_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for result in upload_results {
+            result?;
+        }
+
         let url = self
             .api_url("api/local/state")
             .map_err(CloudStatePostError::Transport)?;
@@ -576,7 +866,8 @@ impl CloudClient {
             .post(url)
             .header(AUTHORIZATION, self.authorization.clone())
             .header("X-Cloud-Database-Epoch", expected.as_str())
-            .json(state)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(prepared.manifest)
             .send()
             .await
             .map_err(|error| {
@@ -587,6 +878,9 @@ impl CloudClient {
         let status = response.status();
         if status.is_success() {
             Ok(())
+        } else if status == reqwest::StatusCode::PRECONDITION_REQUIRED {
+            self.clear_acknowledged_state_chunks(&expected);
+            Err(CloudStatePostError::HttpStatus(status))
         } else if status == reqwest::StatusCode::CONFLICT {
             if let Some(actual) = database_epoch_from_header(response.headers())
                 && actual != expected
@@ -4723,12 +5017,173 @@ mod tests {
     }
 
     #[test]
+    fn chunked_cloud_state_preserves_partitions_and_accounts_for_wire_bytes() {
+        let library = json!({
+            "revision": "library-1", "scanned_at": 42,
+            "items": [{"title": "家庭教师\"\\\n🎬", "bytes": 1_234_567_890_u64}],
+            "categories": ["Anime"], "warnings": [],
+        });
+        let operations = vec![json!({"result": {"title": "完成"}})];
+        let settings = json!({"libraries": []});
+        let state = CloudState {
+            state_version: 123,
+            revision: Some("state-1"),
+            reported_at: 456,
+            library: &library,
+            previews: &[],
+            operations: &operations,
+            tasks: &[],
+            settings: CloudSettings {
+                download_dir: "/media",
+                applied: Some(&settings),
+            },
+        };
+        let prepared = state
+            .chunked_snapshot(true)
+            .expect("chunked state should encode");
+        assert_eq!(state.encoded_wire_size().unwrap(), prepared.wire_size);
+        let envelope: Value = serde_json::from_slice(&prepared.manifest).unwrap();
+        assert_eq!(envelope["format"], "chunked-v1");
+        assert_eq!(envelope["state_version"], 123);
+        assert_eq!(envelope["reported_at"], 456);
+        assert_eq!(envelope["library_revision"], "library-1");
+        let chunk_map = prepared
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.sha256.as_str(), chunk.bytes.as_slice()))
+            .collect::<BTreeMap<_, _>>();
+        let decode_partition = |name: &str| {
+            let mut bytes = Vec::new();
+            for reference in envelope[name]["chunks"].as_array().unwrap() {
+                let hash = reference["sha256"].as_str().unwrap();
+                let chunk = chunk_map.get(hash).unwrap();
+                assert_eq!(reference["bytes"], chunk.len());
+                bytes.extend_from_slice(chunk);
+            }
+            assert_eq!(envelope[name]["bytes"], bytes.len());
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        };
+        assert_eq!(decode_partition("library"), library);
+        let contents = decode_partition("state");
+        assert_eq!(contents["revision"], "state-1");
+        assert_eq!(contents["operations"], json!(operations));
+        assert_eq!(contents["settings"]["applied"], settings);
+        for reserved in ["library", "state_version", "reported_at"] {
+            assert!(contents.get(reserved).is_none());
+        }
+        let mut refreshed = state.clone();
+        refreshed.reported_at += 1;
+        let retry = refreshed.chunked_snapshot(true).unwrap();
+        let retry_envelope: Value = serde_json::from_slice(&retry.manifest).unwrap();
+        assert_eq!(retry_envelope["library"], envelope["library"]);
+        assert_eq!(retry_envelope["state"], envelope["state"]);
+        assert_eq!(retry.chunks.len(), prepared.chunks.len());
+        assert_ne!(retry_envelope["reported_at"], envelope["reported_at"]);
+    }
+
+    #[test]
+    fn chunked_cloud_state_omits_optional_revision() {
+        let library = json!({"revision": "test", "scanned_at": 0, "items": [], "categories": [], "warnings": []});
+        let state = CloudState {
+            state_version: 1,
+            revision: None,
+            reported_at: 1,
+            library: &library,
+            previews: &[],
+            operations: &[],
+            tasks: &[],
+            settings: CloudSettings {
+                download_dir: "/media",
+                applied: None,
+            },
+        };
+        let prepared = state.chunked_snapshot(true).unwrap();
+        let envelope: Value = serde_json::from_slice(&prepared.manifest).unwrap();
+        let chunks = prepared
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.sha256.as_str(), chunk.bytes.as_slice()))
+            .collect::<BTreeMap<_, _>>();
+        let mut contents = Vec::new();
+        for reference in envelope["state"]["chunks"].as_array().unwrap() {
+            contents.extend_from_slice(chunks[reference["sha256"].as_str().unwrap()]);
+        }
+        let contents: Value = serde_json::from_slice(&contents).unwrap();
+        assert!(contents.get("revision").is_none());
+        assert_eq!(contents["settings"], json!({"download_dir": "/media"}));
+    }
+
+    #[test]
+    fn cloud_state_chunks_respect_utf8_boundaries_and_fixed_byte_limit() {
+        let source = format!(
+            "{}🎬{}",
+            "x".repeat(CLOUD_STATE_CHUNK_BYTES - 1),
+            "y".repeat(17)
+        );
+        let mut unique = BTreeMap::new();
+        let refs = chunk_cloud_partition(source.as_bytes(), &mut unique).unwrap();
+        let mut rebuilt = Vec::new();
+        for reference in refs {
+            let sha256 = reference["sha256"].as_str().unwrap();
+            let bytes = &unique[sha256];
+            assert!(bytes.len() <= CLOUD_STATE_CHUNK_BYTES);
+            std::str::from_utf8(bytes).expect("each chunk must remain valid UTF-8");
+            assert_eq!(reference["bytes"], bytes.len());
+            rebuilt.extend_from_slice(bytes);
+        }
+        assert_eq!(rebuilt, source.as_bytes());
+    }
+
+    #[test]
+    fn cloud_state_complexity_admission_does_not_block_compaction_sizing() {
+        let mut nested = Value::Null;
+        for _ in 0..=MAX_CLOUD_STATE_JSON_DEPTH {
+            nested = json!({"nested": nested});
+        }
+        let library = json!({
+            "revision": "deep-library",
+            "scanned_at": 1,
+            "items": [],
+            "categories": [],
+            "warnings": [],
+            "extra": nested,
+        });
+        let state = CloudState {
+            state_version: 1,
+            revision: None,
+            reported_at: 1,
+            library: &library,
+            previews: &[],
+            operations: &[],
+            tasks: &[],
+            settings: CloudSettings {
+                download_dir: "/media",
+                applied: None,
+            },
+        };
+
+        let error = state
+            .chunked_snapshot(true)
+            .expect_err("deep state should fail upload admission");
+        assert!(
+            error
+                .downcast_ref::<CloudStateComplexityExceeded>()
+                .is_some()
+        );
+        assert!(
+            state.encoded_wire_size().is_ok(),
+            "the reporter still needs a byte estimate so compaction can run"
+        );
+    }
+
+    #[test]
     fn cloud_state_post_errors_classify_transient_and_payload_rejections() {
         for status in [
             reqwest::StatusCode::UNAUTHORIZED,
             reqwest::StatusCode::FORBIDDEN,
             reqwest::StatusCode::CONFLICT,
             reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::PRECONDITION_REQUIRED,
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             reqwest::StatusCode::INTERNAL_SERVER_ERROR,
         ] {
