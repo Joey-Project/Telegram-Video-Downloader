@@ -118,6 +118,13 @@ async function countOldOrphanChunks(
   return row?.count ?? 0;
 }
 
+async function countChunksAt(epoch: string, createdAt: number): Promise<number> {
+  const row = await testEnv.DB.prepare(
+    "SELECT COUNT(*) AS count FROM snapshot_content_chunks WHERE database_epoch = ? AND created_at = ?",
+  ).bind(epoch, createdAt).first<{ count: number }>();
+  return row?.count ?? 0;
+}
+
 function chunkManifest(chunks: Array<{ sha256: string; bytes: number }>): {
   bytes: number;
   chunks: Array<{ sha256: string; bytes: number }>;
@@ -385,6 +392,143 @@ describe("snapshot storage", () => {
       .resolves.toEqual({ sha256: activeHashes[0], data: libraryText });
     await expect(readSnapshotContentChunk(testEnv.DB, epoch, activeHashes[1]))
       .resolves.toEqual({ sha256: activeHashes[1], data: stateText });
+  });
+
+  it("prunes chunked content after a prepared rollback and drains the remainder on legacy heartbeats", async () => {
+    const libraryText = '{"revision":"rollback-library","items":[]}';
+    const stateText = '{"settings":{"rollback":true},"tasks":[]}';
+    const libraryChunks = [await uploadChunk(libraryText)];
+    const stateChunks = [await uploadChunk(stateText)];
+    expect((await postState(chunkedEnvelope(1, libraryChunks, stateChunks))).status).toBe(200);
+
+    const epoch = await getDatabaseEpoch(testEnv.DB);
+    const staleAt = Date.now() - 2 * 60 * 60 * 1000;
+    await seedOldOrphanChunks(epoch, 40, staleAt, `legacy-rollback-gc-${Date.now()}`);
+    const retiredHashes: [string, string] = [libraryChunks[0]!.sha256, stateChunks[0]!.sha256];
+    await testEnv.DB.prepare(
+      "UPDATE snapshot_content_chunks SET created_at = ? WHERE database_epoch = ? AND sha256 IN (?, ?)",
+    ).bind(staleAt, epoch, ...retiredHashes).run();
+    const stagingText = '{"staging":"retain during legacy cleanup"}';
+    const stagingChunk = await uploadChunk(stagingText);
+    expect(await countChunksAt(epoch, staleAt)).toBe(42);
+
+    const { libraryJson, stateJson } = validPreparedParts();
+    expect((await postState(preparedEnvelope(2, libraryJson, stateJson))).status).toBe(200);
+    expect((await testEnv.DB.prepare("SELECT state_version, transport FROM snapshot_meta WHERE id = 1")
+      .first<{ state_version: number; transport: string }>())).toEqual({ state_version: 2, transport: "legacy" });
+    expect(await countChunksAt(epoch, staleAt)).toBe(10);
+    await expect(readSnapshotContentChunk(testEnv.DB, epoch, stagingChunk.sha256))
+      .resolves.toEqual({ sha256: stagingChunk.sha256, data: stagingText });
+
+    expect((await postState(preparedEnvelope(2, libraryJson, stateJson))).status).toBe(200);
+    expect(await countChunksAt(epoch, staleAt)).toBe(0);
+    await expect(readSnapshotContentChunk(testEnv.DB, epoch, stagingChunk.sha256))
+      .resolves.toEqual({ sha256: stagingChunk.sha256, data: stagingText });
+    expect((await readSnapshot(testEnv.DB))?.transport ?? "legacy").toBe("legacy");
+  });
+
+  it("does not let a stale legacy commit prune a newer chunked snapshot", async () => {
+    const initialLibrary = [await uploadChunk('{"revision":"race-library-v1","items":[]}')];
+    const initialState = [await uploadChunk('{"settings":{"race":1},"tasks":[]}')];
+    expect((await postState(chunkedEnvelope(1, initialLibrary, initialState))).status).toBe(200);
+
+    const epoch = await getDatabaseEpoch(testEnv.DB);
+    const staleAt = Date.now() - 2 * 60 * 60 * 1000;
+    await seedOldOrphanChunks(epoch, 40, staleAt, `legacy-race-gc-${Date.now()}`);
+    const winningLibraryText = '{"revision":"race-library-v2","items":[]}';
+    const winningStateText = '{"settings":{"race":2},"tasks":[]}';
+    const winningLibrary = [await uploadChunk(winningLibraryText)];
+    const winningState = [await uploadChunk(winningStateText)];
+    const winningLibraryManifest = chunkManifest(winningLibrary);
+    const winningStateManifest = chunkManifest(winningState);
+    const winningLibraryManifestJson = JSON.stringify(winningLibraryManifest);
+    const winningStateManifestJson = JSON.stringify(winningStateManifest);
+    const winningLibraryHash = await sha256Hex(
+      `telegram-video-downloader/chunked-v1/library\0${winningLibraryManifestJson}`,
+    );
+    const winningStateHash = await sha256Hex(
+      `telegram-video-downloader/chunked-v1/state\0${winningStateManifestJson}`,
+    );
+    await testEnv.DB.prepare(
+      "UPDATE snapshot_content_chunks SET created_at = ? WHERE database_epoch = ? AND sha256 IN (?, ?)",
+    ).bind(staleAt, epoch, winningLibrary[0]!.sha256, winningState[0]!.sha256).run();
+
+    try {
+      await testEnv.DB.prepare(
+        `CREATE TRIGGER replace_legacy_commit_with_chunked_winner
+         AFTER UPDATE OF state_version ON snapshot_meta
+         WHEN NEW.state_version = 2 AND NEW.transport = 'legacy'
+         BEGIN
+           UPDATE snapshot_meta
+           SET library_revision = 'race-library-v2',
+               library_hash = '${winningLibraryHash}',
+               library_chunk_count = 1,
+               state_hash = '${winningStateHash}',
+               state_chunk_count = 1,
+               transport = 'chunked-v1',
+               library_manifest_json = '${winningLibraryManifestJson}',
+               state_manifest_json = '${winningStateManifestJson}'
+           WHERE id = 1;
+           DELETE FROM snapshot_chunks;
+         END`,
+      ).run();
+
+      const { libraryJson, stateJson } = validPreparedParts();
+      const staleLegacyCommit = await postState(preparedEnvelope(2, libraryJson, stateJson));
+      expect(staleLegacyCommit.status).toBe(409);
+      expect((await testEnv.DB.prepare("SELECT state_version, transport FROM snapshot_meta WHERE id = 1")
+        .first<{ state_version: number; transport: string }>())).toEqual({ state_version: 2, transport: "chunked-v1" });
+      expect(await countChunksAt(epoch, staleAt)).toBe(42);
+      const winner = await readSnapshot(testEnv.DB);
+      expect(winner?.transport).toBe("chunked-v1");
+      if (winner?.transport !== "chunked-v1") throw new Error("Expected the concurrent chunked snapshot to remain active");
+      expect(winner.library).toEqual(winningLibraryManifest);
+      expect(winner.state).toEqual(winningStateManifest);
+      await expect(readSnapshotContentChunk(testEnv.DB, epoch, winningLibrary[0]!.sha256))
+        .resolves.toEqual({ sha256: winningLibrary[0]!.sha256, data: winningLibraryText });
+      await expect(readSnapshotContentChunk(testEnv.DB, epoch, winningState[0]!.sha256))
+        .resolves.toEqual({ sha256: winningState[0]!.sha256, data: winningStateText });
+    } finally {
+      await testEnv.DB.prepare("DROP TRIGGER IF EXISTS replace_legacy_commit_with_chunked_winner").run();
+    }
+  });
+
+  it("does not prune content chunks when the database epoch changes during a legacy commit", async () => {
+    const libraryChunks = [await uploadChunk('{"revision":"legacy-epoch-library","items":[]}')];
+    const stateChunks = [await uploadChunk('{"settings":{"legacy_epoch":true},"tasks":[]}')];
+    expect((await postState(chunkedEnvelope(1, libraryChunks, stateChunks))).status).toBe(200);
+
+    const epoch = await getDatabaseEpoch(testEnv.DB);
+    const staleAt = Date.now() - 2 * 60 * 60 * 1000;
+    await seedOldOrphanChunks(epoch, 40, staleAt, `legacy-epoch-gc-${Date.now()}`);
+    const retiredHashes: [string, string] = [libraryChunks[0]!.sha256, stateChunks[0]!.sha256];
+    await testEnv.DB.prepare(
+      "UPDATE snapshot_content_chunks SET created_at = ? WHERE database_epoch = ? AND sha256 IN (?, ?)",
+    ).bind(staleAt, epoch, ...retiredHashes).run();
+    expect(await countChunksAt(epoch, staleAt)).toBe(42);
+
+    try {
+      await testEnv.DB.prepare(
+        `CREATE TRIGGER rotate_epoch_after_legacy_commit
+         AFTER UPDATE OF state_version ON snapshot_meta
+         WHEN NEW.state_version = 2 AND NEW.transport = 'legacy'
+         BEGIN
+           UPDATE cloud_database_meta
+           SET epoch = CASE
+             WHEN epoch = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' THEN 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+             ELSE 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+           END
+           WHERE id = 1;
+         END`,
+      ).run();
+      const { libraryJson, stateJson } = validPreparedParts();
+      const staleEpochCommit = await postState(preparedEnvelope(2, libraryJson, stateJson));
+      expect(staleEpochCommit.status).toBe(409);
+      expect(await countChunksAt(epoch, staleAt)).toBe(42);
+    } finally {
+      await testEnv.DB.prepare("DROP TRIGGER IF EXISTS rotate_epoch_after_legacy_commit").run();
+      await testEnv.DB.prepare("UPDATE cloud_database_meta SET epoch = ? WHERE id = 1").bind(epoch).run();
+    }
   });
 
   it("does not prune chunks if the database epoch changes during a commit or heartbeat", async () => {

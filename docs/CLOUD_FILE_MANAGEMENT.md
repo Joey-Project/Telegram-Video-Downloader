@@ -93,7 +93,9 @@ A size rejection uses the existing explicitly marked snapshot compaction;
 local media and recovery data are retained. New commits and identical-version
 heartbeats clean up at most 32 unreferenced chunks older than one hour. Cleanup
 requires the current epoch and exact active snapshot; published chunks remain
-protected even when the library stops changing.
+protected even when the library stops changing. Legacy and `prepared-v1`
+commits and heartbeats retire the former content chunks under the same bounds
+after a local-executable rollback.
 
 The default library's items appear only in the top-level library snapshot.
 Nondefault libraries retain their nested snapshots. Both Mini Apps resolve the
@@ -104,8 +106,9 @@ The Worker also accepts legacy and `prepared-v1` snapshot requests, with their
 existing validation. Apply the additive D1 migration and deploy the Worker
 before the new Rust executable. A Worker rollback requires a compatible legacy
 snapshot to be published first; retain the new Worker while rolling back only
-the local executable. A format or chunk-boundary change can produce a different
-identity for equal JSON values; the existing
+the local executable. The old executable restores full-snapshot processing, so
+verify publication and CPU usage before accepting that rollback. A format or
+chunk-boundary change can produce a different identity for equal JSON values; the existing
 409 response and stored-version hint rebase the pending upload onto a fresh
 version. Retries after an uncertain response preserve the pending content and
 version. Repeated failures use capped exponential backoff with jitter, and a

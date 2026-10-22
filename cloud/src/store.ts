@@ -579,14 +579,26 @@ export async function storeSnapshot(
 
   const heartbeatDue = prior === null || now - prior.received_at >= HEARTBEAT_WRITE_INTERVAL_MS;
   if (prior !== null && snapshot.state_version === prior.state_version && contentMatches) {
-    if (heartbeatDue) {
-      const heartbeat = await db.prepare(
+    const heartbeatStatements = heartbeatDue
+      ? [db.prepare(
         `UPDATE snapshot_meta
          SET reported_at = MAX(reported_at, ?), received_at = ?
-         WHERE id = 1 AND state_version = ? AND library_hash = ? AND state_hash = ?
+         WHERE id = 1 AND transport = 'legacy' AND state_version = ? AND library_hash = ? AND state_hash = ?
            AND EXISTS (SELECT 1 FROM cloud_database_meta WHERE id = 1 AND epoch = ?)`,
-      ).bind(snapshot.reported_at, now, snapshot.state_version, libraryHash, stateHash, epoch).run();
-      if (!heartbeat.success) throw new Error("D1 snapshot heartbeat update failed");
+      ).bind(snapshot.reported_at, now, snapshot.state_version, libraryHash, stateHash, epoch)]
+      : [];
+    heartbeatStatements.push(pruneOrphanSnapshotChunks(
+      db,
+      now,
+      epoch,
+      "legacy",
+      snapshot.state_version,
+      libraryHash,
+      stateHash,
+    ));
+    const heartbeatResults = await db.batch(heartbeatStatements);
+    if (heartbeatResults.some((result) => !result.success)) {
+      throw new Error("D1 snapshot heartbeat maintenance failed");
     }
     const [epochRead, latestRead] = await db.batch<DatabaseEpochRow | SnapshotMetaRow>([
       db.prepare("SELECT epoch FROM cloud_database_meta WHERE id = 1"),
@@ -670,6 +682,15 @@ export async function storeSnapshot(
     stateChunks.length,
     epoch,
   ));
+  statements.push(pruneOrphanSnapshotChunks(
+    db,
+    now,
+    epoch,
+    "legacy",
+    snapshot.state_version,
+    libraryHash,
+    stateHash,
+  ));
   const results = await db.batch(statements);
   if (results.some((result) => !result.success)) throw new Error("D1 snapshot batch failed");
 
@@ -700,6 +721,7 @@ function pruneOrphanSnapshotChunks(
   db: D1Database,
   now: number,
   expectedEpoch: string,
+  transport: SnapshotMetaRow["transport"],
   stateVersion: number,
   libraryHash: string,
   stateHash: string,
@@ -712,7 +734,7 @@ function pruneOrphanSnapshotChunks(
      )
        AND EXISTS (
          SELECT 1 FROM snapshot_meta
-         WHERE id = 1 AND transport = 'chunked-v1' AND state_version = ?
+         WHERE id = 1 AND transport = ? AND state_version = ?
            AND library_hash = ? AND state_hash = ?
        )
        AND rowid IN (
@@ -738,6 +760,7 @@ function pruneOrphanSnapshotChunks(
        )`,
   ).bind(
     expectedEpoch,
+    transport,
     stateVersion,
     libraryHash,
     stateHash,
@@ -815,6 +838,7 @@ export async function storeChunkedSnapshot(
       db,
       now,
       expectedEpoch,
+      "chunked-v1",
       snapshot.state_version,
       libraryHash,
       stateHash,
@@ -895,6 +919,7 @@ export async function storeChunkedSnapshot(
     db,
     now,
     expectedEpoch,
+    "chunked-v1",
     snapshot.state_version,
     libraryHash,
     stateHash,
