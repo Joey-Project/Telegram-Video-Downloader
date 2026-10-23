@@ -734,30 +734,116 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         Arc::clone(&reopened_inbox),
     );
     let reopened_dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
-    crate::library_migration_bot::discover_for_test(&reopened_runtime)
-        .await
-        .expect("durable migration history should reload after restart");
-    wait_for_snapshot_migration_runner_idle(&reopened_runtime, &first_migration_id).await;
 
-    let source_after_first_move =
-        rescan_snapshot_library(&reopened_runtime, 9_111, &fixture.source_library_id).await;
-    let first_source_history_item = snapshot_item(
-        source_after_first_move["items"]
-            .as_array()
-            .expect("source rescan should contain its missing history item"),
-        &original_source_id,
+    assert!(
+        reopened_runtime.library_snapshots.lock().await.is_empty(),
+        "a simulated cold start must begin without cached library scans"
     );
+    let legacy_engine = crate::cloud_bot_tests::media_library_e2e_tests::migration_engine_for_test(
+        &reopened_runtime,
+        &fixture.source_library_id,
+        &fixture.target_library_id,
+    );
+    legacy_engine
+        .make_job_legacy_for_test(&first_migration_id)
+        .expect("test should strip the optional target birth from the completed durable job");
+    let legacy_status = legacy_engine
+        .status(&first_migration_id)
+        .expect("legacy status should load")
+        .expect("legacy job should remain present");
+    assert_eq!(legacy_status.items[0].target_physical_identity, None);
+    drop(legacy_engine);
+
+    let migration_lease = crate::library_migration_bot::acquire_library_io(
+        &reopened_runtime,
+        &[
+            fixture.source_library_id.clone(),
+            fixture.target_library_id.clone(),
+        ],
+    )
+    .await
+    .expect("test should hold both library gates exclusively");
+    {
+        let runner_waiting_notify =
+            Arc::clone(&reopened_runtime.test_migration_runner_gate_waiting);
+        let runner_waiting = runner_waiting_notify.notified();
+        tokio::pin!(runner_waiting);
+        runner_waiting.as_mut().enable();
+        crate::library_migration_bot::discover_for_test(&reopened_runtime)
+            .await
+            .expect("discovery should schedule the durable completed-job runner");
+        tokio::time::timeout(Duration::from_secs(10), &mut runner_waiting)
+            .await
+            .expect("completed-job runner should wait for the held exclusive lease");
+    }
+
+    let refresh_waiting_notify = Arc::clone(&reopened_runtime.test_management_admission_waiting);
+    let refresh_waiting = refresh_waiting_notify.notified();
+    tokio::pin!(refresh_waiting);
+    refresh_waiting.as_mut().enable();
+    let refresh_runtime = reopened_runtime.clone();
+    let mut refresh_task =
+        tokio::spawn(
+            async move { crate::media_library_bot::refresh_libraries(&refresh_runtime).await },
+        );
+    tokio::time::timeout(Duration::from_secs(30), &mut refresh_waiting)
+        .await
+        .expect("cold-start refresh should reach the contended management admission gate");
+    assert!(
+        !refresh_task.is_finished(),
+        "background refresh must wait until the migration lease is released"
+    );
+    assert!(
+        reopened_runtime.library_snapshots.lock().await.is_empty(),
+        "refresh must not publish a target scan while waiting for migration admission"
+    );
+
+    let interactive_scan = run_library_management_test_request(
+        &reopened_runtime,
+        9_111,
+        "library_scan",
+        serde_json::json!({ "library_id": fixture.target_library_id }),
+    )
+    .await;
+    assert_eq!(interactive_scan.status, InboxStatus::Failed);
+    assert!(
+        interactive_scan
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("active migration")),
+        "interactive scan should remain fail-fast while the exclusive lease is held: {:?}",
+        interactive_scan.error
+    );
+
+    drop(migration_lease);
+    wait_for_snapshot_migration_runner_idle(&reopened_runtime, &first_migration_id).await;
+    tokio::time::timeout(Duration::from_secs(60), &mut refresh_task)
+        .await
+        .expect("cold-start background refresh should complete after migration releases admission")
+        .expect("cold-start background refresh task should not panic")
+        .expect("cold-start background refresh should scan the registered libraries");
+
+    let first_refresh_snapshot = build_cloud_state_snapshot(&reopened_runtime)
+        .await
+        .expect("cloud snapshot should include the cold-start refresh")
+        .expect("runtime should publish a cloud snapshot");
+    let source_after_first_move =
+        snapshot_library_items(&first_refresh_snapshot.library, &fixture.source_library_id);
+    let first_source_history_item = snapshot_item(&source_after_first_move, &original_source_id);
     assert_eq!(first_source_history_item["presence"], "missing");
-    let first_target_scan =
-        rescan_snapshot_library(&reopened_runtime, 9_112, &fixture.target_library_id).await;
-    let first_target_id = first_target_scan["items"]
-        .as_array()
-        .unwrap()
+    assert!(
+        first_source_history_item.get("moved_to").is_none(),
+        "legacy history without a birth proof must stay unlinked until bounded verification"
+    );
+    let first_target_items =
+        snapshot_library_items(&first_refresh_snapshot.library, &fixture.target_library_id);
+    let first_target_item = first_target_items
         .iter()
         .find(|item| item["relative_path"] == "clip.mp4" && item["presence"] == "present")
-        .expect("first target scan should identify the migrated media")["id"]
+        .expect("cold-start refresh should discover the migrated target item");
+    let first_target_id = first_target_item["id"]
         .as_str()
-        .expect("migrated target should have a new item identity")
+        .expect("migrated target should have a stable item identity")
         .to_string();
     assert_ne!(first_target_id, original_source_id);
     let first_target_identity_before_rename = cached_item_physical_identity(
@@ -768,8 +854,60 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
     .await;
     assert!(
         first_target_identity_before_rename.has_complete_birth(),
-        "the migrated target should retain a complete creation identity"
+        "the background target scan should retain its in-memory creation identity"
     );
+    let persisted_first_status = reopened_runtime
+        .migrations
+        .lock()
+        .await
+        .get(&first_migration_id)
+        .cloned()
+        .expect("discovery should hydrate the completed migration status");
+    assert_eq!(
+        persisted_first_status.items[0].target_item_id.as_deref(),
+        Some(first_target_id.as_str()),
+        "the durable migration should retain the verified target item identity"
+    );
+    assert_eq!(
+        persisted_first_status.items[0].target_physical_identity,
+        None
+    );
+
+    crate::library_migration_bot::discover_for_test(&reopened_runtime)
+        .await
+        .expect("a discovery pass after target refresh should retry legacy verification");
+    wait_for_snapshot_migration_runner_idle(&reopened_runtime, &first_migration_id).await;
+    let upgraded_first_status = reopened_runtime
+        .migrations
+        .lock()
+        .await
+        .get(&first_migration_id)
+        .cloned()
+        .expect("background verification should publish upgraded migration status");
+    assert_eq!(
+        upgraded_first_status.items[0].target_physical_identity,
+        Some(first_target_identity_before_rename),
+        "bounded verification should persist the exact target creation identity"
+    );
+    let upgraded_projection = build_cloud_state_snapshot(&reopened_runtime)
+        .await
+        .expect("upgraded snapshot should build")
+        .expect("runtime should publish an upgraded snapshot");
+    let upgraded_source_items =
+        snapshot_library_items(&upgraded_projection.library, &fixture.source_library_id);
+    let upgraded_source_item = snapshot_item(&upgraded_source_items, &original_source_id);
+    assert_eq!(upgraded_source_item["presence"], "missing");
+    assert_eq!(
+        upgraded_source_item["moved_to"]["library_id"],
+        fixture.target_library_id
+    );
+    assert_eq!(upgraded_source_item["moved_to"]["library_name"], "Archive");
+    assert_eq!(upgraded_source_item["moved_to"]["item_id"], first_target_id);
+    assert_eq!(
+        upgraded_source_item["moved_to"]["relative_path"],
+        "clip.mp4"
+    );
+
     let renamed_relative_path = "renamed.mp4";
     fs::rename(
         fixture.archive_root.join("clip.mp4"),
@@ -853,9 +991,8 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
     assert_eq!(legacy_status.items[0].target_physical_identity, None);
     drop(legacy_engine);
 
-    // Hold both libraries' read admission while discovery starts the completed-job upgrader.
-    // This gives the test a deterministic snapshot of the legacy state before its bounded hash.
-    let migration_lease = crate::library_migration_bot::try_acquire_library_io(
+    // Hold read admission so the renamed legacy target stays unverified before its bounded hash.
+    let renamed_legacy_lease = crate::library_migration_bot::try_acquire_library_io(
         &reopened_runtime,
         &[
             fixture.source_library_id.clone(),
@@ -863,7 +1000,7 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         ],
     )
     .await
-    .expect("test should hold the libraries before the background upgrade starts");
+    .expect("test should hold the libraries before the renamed legacy upgrade starts");
     {
         let runner_waiting_notify =
             Arc::clone(&reopened_runtime.test_migration_runner_gate_waiting);
@@ -872,7 +1009,7 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         runner_waiting.as_mut().enable();
         crate::library_migration_bot::discover_for_test(&reopened_runtime)
             .await
-            .expect("discovery should schedule legacy completed-job verification");
+            .expect("discovery should schedule renamed legacy completed-job verification");
         tokio::time::timeout(Duration::from_secs(10), &mut runner_waiting)
             .await
             .expect("legacy verifier should wait for the held library lease");
@@ -889,7 +1026,7 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
             .is_none(),
         "a durable target identity without a birth proof must not be trusted yet"
     );
-    drop(migration_lease);
+    drop(renamed_legacy_lease);
     wait_for_snapshot_migration_runner_idle(&reopened_runtime, &first_migration_id).await;
     let upgraded_first_status = reopened_runtime
         .migrations

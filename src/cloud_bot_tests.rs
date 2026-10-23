@@ -1443,6 +1443,7 @@ fn make_runtime(
         )),
         migration_runners: Arc::new(Mutex::new(HashSet::new())),
         library_io_gates: library_migration_bot::LibraryIoGateRegistry::default(),
+        test_management_admission_waiting: Arc::new(Notify::new()),
         test_migration_runner_gate_waiting: Arc::new(Notify::new()),
         test_migration_runner_gate_acquired: Arc::new(Notify::new()),
         library_scan_warning: Arc::new(Mutex::new(None)),
