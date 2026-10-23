@@ -364,7 +364,7 @@ function clearCachedSnapshot() {
 
 function showPrivateAccessGate(message) {
   state.detailId = null;
-  state.selected.clear();
+  clearSelectedItems();
   state.legacyOperation = null;
   state.legacyOperationKey = null;
   state.legacySelection.clear();
@@ -376,7 +376,9 @@ function showPrivateAccessGate(message) {
 }
 
 function acceptFreshSnapshot(snapshot) {
-  clearFileIdentityScopedStateOnSnapshot(state, state.snapshot, snapshot);
+  if (clearFileIdentityScopedStateOnSnapshot(state, state.snapshot, snapshot)) {
+    state.groupSelectionLimitNotice = null;
+  }
   Object.assign(state, acceptOwnerSnapshot(snapshot, state));
   settleMigrationConflictRefreshes();
   normalizeLibraryContext();
@@ -790,7 +792,13 @@ function updateSelectedItems(candidateIds, selected) {
   const result = updateSelectionWithinLimit(state.selected, candidateIds, selected);
   state.selected.clear();
   for (const id of result.ids) state.selected.add(id);
+  state.groupSelectionLimitNotice = null;
   return result.omittedCount;
+}
+
+function clearSelectedItems() {
+  state.selected.clear();
+  state.groupSelectionLimitNotice = null;
 }
 
 function selectionLimitMessage(omittedCount = 0) {
@@ -899,7 +907,13 @@ function renderLibrary() {
   const library = activeLibrarySnapshot();
   const canOperate = libraryCanOperate();
   const availableIds = new Set(presentMediaItems(libraryItems()).map((item) => String(item.id)));
-  for (const id of state.selected) if (!availableIds.has(id)) state.selected.delete(id);
+  let prunedSelection = false;
+  for (const id of state.selected) {
+    if (availableIds.has(id)) continue;
+    state.selected.delete(id);
+    prunedSelection = true;
+  }
+  if (prunedSelection) state.groupSelectionLimitNotice = null;
   renderFilters();
   const items = filteredItems();
   const needsItems = items.filter(needsOrganizing);
@@ -1566,8 +1580,7 @@ function openMovedTarget(button) {
 
   state.libraryId = target.library_id;
   state.view = "library";
-  state.selected.clear();
-  state.groupSelectionLimitNotice = null;
+  clearSelectedItems();
   state.detailId = null;
   state.query = "";
   state.libraryPage = 0;
@@ -1604,8 +1617,7 @@ function bindEvents() {
   document.querySelectorAll("[data-scan]").forEach((button) => button.addEventListener("click", () => submitAction("library_scan", { library_id: activeLibraryId() })));
   byId("library-select").addEventListener("change", () => {
     state.libraryId = byId("library-select").value;
-    state.selected.clear();
-    state.groupSelectionLimitNotice = null;
+    clearSelectedItems();
     state.detailId = null;
     state.legacyOperation = null;
     state.legacyOperationKey = null;
@@ -1722,7 +1734,7 @@ function bindEvents() {
     moveCard?.focus({ preventScroll: true });
   });
   byId("clear-selection").addEventListener("click", () => {
-    state.selected.clear();
+    clearSelectedItems();
     render();
   });
   byId("target-dir").addEventListener("input", renderFilters);

@@ -329,6 +329,7 @@ async fn cloud_state_reporter_publishes_scan_failure_with_cached_snapshot_then_c
         metadata_status: MetadataStatus::Complete,
         integrity_status: IntegrityStatus::Verified,
         presence: Presence::Present,
+        physical_identity: None,
     });
     cached_snapshot.warnings = vec!["existing library warning".to_string()];
     let mut unavailable_projection =
@@ -553,6 +554,7 @@ async fn cloud_state_reporter_retries_413_with_new_incomplete_snapshot_then_sync
             metadata_status: MetadataStatus::Complete,
             integrity_status: IntegrityStatus::Verified,
             presence: Presence::Present,
+            physical_identity: None,
         })
         .collect();
     *runtime.library_snapshot.lock().await = Some(library);
@@ -693,6 +695,7 @@ async fn cloud_state_reporter_bounds_large_library_warnings_and_categories_with_
                 metadata_status: MetadataStatus::Complete,
                 integrity_status: IntegrityStatus::Verified,
                 presence: Presence::Present,
+                physical_identity: None,
             })
             .collect();
         *runtime.library_snapshot.lock().await = Some(snapshot);
@@ -952,6 +955,7 @@ async fn cloud_state_reporter_omits_oversized_items_and_recovers_full_source_aft
         metadata_status: MetadataStatus::Complete,
         integrity_status: IntegrityStatus::Verified,
         presence: Presence::Present,
+        physical_identity: None,
     });
     library.items.push(LibraryItem {
         id: "small-later-item".to_string(),
@@ -969,6 +973,7 @@ async fn cloud_state_reporter_omits_oversized_items_and_recovers_full_source_aft
         metadata_status: MetadataStatus::Complete,
         integrity_status: IntegrityStatus::Verified,
         presence: Presence::Present,
+        physical_identity: None,
     });
     let original_library = library.clone();
     *runtime.library_snapshot.lock().await = Some(original_library.clone());
@@ -1017,6 +1022,7 @@ async fn cloud_state_reporter_omits_oversized_items_and_recovers_full_source_aft
         metadata_status: MetadataStatus::Complete,
         integrity_status: IntegrityStatus::Verified,
         presence: Presence::Present,
+        physical_identity: None,
     });
     *runtime.library_snapshot.lock().await = Some(changed_library);
     runtime.state_notify.notify_one();

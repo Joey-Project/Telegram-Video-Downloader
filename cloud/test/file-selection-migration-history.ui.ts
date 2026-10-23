@@ -341,7 +341,16 @@ describe("mobile library selection and moved history", () => {
     expect(element<HTMLElement>("#toast").textContent).toContain("Only 100 items can be selected");
     expect(element<HTMLElement>("#toast").textContent).toContain("2 more were left unselected");
 
+    const cappedHistoryGroup = [...document.querySelectorAll<HTMLInputElement>("#library-list [data-select-group]")]
+      .find((checkbox) => checkbox.closest("summary")?.textContent?.includes("History"));
+    expect(cappedHistoryGroup).toBeDefined();
+    cappedHistoryGroup!.click();
+    expect(element<HTMLElement>("#selection-count").textContent).toBe("100 items selected");
+    expect(element<HTMLElement>(".group-selection-cap-note").textContent).toContain("1 additional present item");
+
     click("#clear-selection");
+    expect(element<HTMLElement>("#selection-count").textContent).toBe("0 items selected");
+    expect(document.querySelector(".group-selection-cap-note")).toBeNull();
     setInputValue("#search-input", "History");
     expect(document.querySelectorAll("#library-list [data-item-row]")).toHaveLength(5);
     const movedRow = element<HTMLElement>('#library-list [data-item-row="source-moved-item"]');

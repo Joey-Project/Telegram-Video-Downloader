@@ -198,6 +198,160 @@ impl Fixture {
     }
 }
 
+fn reopen_fixture_engine(fixture: &Fixture) -> MigrationEngine {
+    let source = Arc::new(
+        LibraryManager::open_with_provider(
+            fixture._source_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("source library should reopen after simulated restart"),
+    );
+    let target = Arc::new(
+        LibraryManager::open_with_provider(
+            fixture._target_root.path(),
+            Arc::new(MockQueueFileProvider::default()),
+        )
+        .expect("target library should reopen after simulated restart"),
+    );
+    MigrationEngine::new("source-library", source, "target-library", target)
+        .expect("migration engine should reopen after simulated restart")
+}
+
+#[test]
+fn legacy_target_birth_requires_a_bounded_hash_and_persists_across_restart() {
+    let fixture = Fixture::new("legacy-target-birth-upgrade");
+    fixture.drive_to_completion();
+    let target_snapshot = fixture
+        .engine
+        .target
+        .migration_scan()
+        .expect("target should scan after the completed migration");
+    let target_item = target_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4" && item.presence == Presence::Present)
+        .expect("current target should be present");
+    let target_identity = target_item
+        .physical_identity
+        .expect("present target should have its physical identity");
+    assert!(target_identity.has_complete_birth());
+
+    fixture
+        .engine
+        .make_job_legacy_for_test(&fixture.migration_id)
+        .expect("test should remove the optional target birth from the durable job");
+    let legacy_status = fixture
+        .engine
+        .status(&fixture.migration_id)
+        .expect("legacy status should load")
+        .expect("legacy job should remain present");
+    assert_eq!(legacy_status.items[0].target_physical_identity, None);
+
+    let upgrade = fixture
+        .engine
+        .upgrade_one_legacy_target_birth(&fixture.migration_id, &target_snapshot)
+        .expect("legacy target should receive a bounded content verification");
+    assert!(upgrade.attempted);
+    assert!(!upgrade.remaining);
+    assert_eq!(
+        upgrade.status.items[0].target_physical_identity,
+        Some(target_identity),
+        "only a matching size/content/access/object proof should restore the target birth"
+    );
+    let upgraded_job = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("upgraded durable job should load");
+    let upgraded_primary = &upgraded_job.groups[0].files[0];
+    assert_eq!(
+        upgraded_primary.target_birth_seconds,
+        target_identity.birth_seconds
+    );
+    assert_eq!(
+        upgraded_primary.target_birth_nanoseconds,
+        target_identity.birth_nanoseconds
+    );
+    assert_eq!(upgraded_primary.legacy_birth_verification_attempt, None);
+
+    let reopened = reopen_fixture_engine(&fixture);
+    let reloaded_status = reopened
+        .status(&fixture.migration_id)
+        .expect("reloaded status should load")
+        .expect("reloaded job should remain present");
+    assert_eq!(
+        reloaded_status.items[0].target_physical_identity,
+        Some(target_identity),
+        "the verified target birth should survive an engine restart"
+    );
+    let no_op_upgrade = reopened
+        .upgrade_one_legacy_target_birth(&fixture.migration_id, &target_snapshot)
+        .expect("an already upgraded job should be skipped without another hash");
+    assert!(!no_op_upgrade.attempted);
+    assert!(!no_op_upgrade.remaining);
+    assert_eq!(no_op_upgrade.status, reloaded_status);
+}
+
+#[test]
+fn legacy_target_birth_wrong_sha_is_rejected_without_repeating_the_hash() {
+    let fixture = Fixture::new("legacy-target-birth-wrong-sha");
+    fixture.drive_to_completion();
+    let target_snapshot = fixture
+        .engine
+        .target
+        .migration_scan()
+        .expect("target should scan after the completed migration");
+    let target_item = target_snapshot
+        .items
+        .iter()
+        .find(|item| item.relative_path == "clip.mp4" && item.presence == Presence::Present)
+        .expect("current target should be present");
+    let target_identity = target_item
+        .physical_identity
+        .expect("present target should have its physical identity");
+    assert!(target_identity.has_complete_birth());
+
+    fixture
+        .engine
+        .make_job_legacy_for_test(&fixture.migration_id)
+        .expect("test should remove the optional target birth from the durable job");
+    fixture
+        .engine
+        .set_wrong_legacy_primary_sha_for_test(&fixture.migration_id)
+        .expect("test should corrupt the saved content proof");
+    let rejected = fixture
+        .engine
+        .upgrade_one_legacy_target_birth(&fixture.migration_id, &target_snapshot)
+        .expect("wrong saved SHA should be recorded as a safe mismatch");
+    assert!(rejected.attempted);
+    assert!(!rejected.remaining);
+    assert_eq!(rejected.status.items[0].target_physical_identity, None);
+    let rejected_job = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("mismatch checkpoint should persist");
+    assert_eq!(
+        rejected_job.groups[0].files[0].legacy_birth_verification_attempt,
+        Some(target_identity),
+        "the mismatch should be keyed to the observed physical fingerprint"
+    );
+
+    let repeated = fixture
+        .engine
+        .upgrade_one_legacy_target_birth(&fixture.migration_id, &target_snapshot)
+        .expect("the same failed physical object should not be hashed again");
+    assert!(!repeated.attempted);
+    assert!(!repeated.remaining);
+    assert_eq!(repeated.status.items[0].target_physical_identity, None);
+    let repeated_job = fixture
+        .engine
+        .load_job(&fixture.migration_id)
+        .expect("repeated no-op should keep the checkpoint readable");
+    assert_eq!(
+        repeated_job.groups[0].files[0].legacy_birth_verification_attempt,
+        Some(target_identity)
+    );
+}
+
 fn unconfirmed_preview(label: &str) -> (TestRoot, TestRoot, MigrationEngine, MigrationPreview) {
     let source_root = TestRoot::new(&format!("{label}-source"));
     let target_root = TestRoot::new(&format!("{label}-target"));

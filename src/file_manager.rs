@@ -33,7 +33,7 @@ use crate::library::{
     HintOrigin, IntegrityStatus, LegacyCandidate, LegacyImportReport, LibraryAttachment,
     LibraryItem, LibrarySnapshot, MAX_LEGACY_HINTS, MetadataFieldChange, MetadataPatch,
     MetadataPatchPreview, MetadataStatus, MoveOutcome, MovePreview, MovePreviewItem,
-    MoveResultItem, Presence, SourceHint,
+    MoveResultItem, PhysicalItemIdentity, Presence, SourceHint,
 };
 use crate::media_libraries::{TaskTransferControl, TaskTransferEntryKind, TaskTransferFile};
 use crate::safe_fs::{
@@ -794,6 +794,13 @@ pub(crate) enum PreviewCleanupOutcome {
     NotRemoved,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LegacyTargetVerification {
+    Missing,
+    Mismatch(PhysicalItemIdentity),
+    Match(PhysicalItemIdentity),
+}
+
 /// Coordinates preview cleanup with durable Cloud confirmation receipt updates.
 pub(crate) trait PreviewCleanupGate: Send + Sync {
     fn remove_preview_if_unconfirmed(
@@ -1326,6 +1333,97 @@ impl LibraryManager {
                 return Ok(false);
             }
             Ok(file.sha256()? == expected_digest)
+        })
+    }
+
+    /// Captures the current physical identity of an exact rooted target without reading its
+    /// contents. Birth time may be unavailable; callers that need durable identity proof must
+    /// reject identities without the complete birth pair.
+    pub(crate) fn migration_physical_identity(
+        &self,
+        relative_path: &str,
+        expected_device: u64,
+        expected_inode: u64,
+    ) -> Result<Option<PhysicalItemIdentity>> {
+        let absolute = self.absolute_path(relative_path)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration target path changed during identity capture");
+            }
+            let Some(file) = self.root.open_bound_file(coordinated)? else {
+                return Ok(None);
+            };
+            let before = fingerprint(&file)?;
+            let before_identity = physical_item_identity(&before);
+            let after = fingerprint(&file)?;
+            let after_identity = physical_item_identity(&after);
+            if !same_physical_item_descriptor(&before, &after) {
+                bail!("migration target identity changed during metadata capture");
+            }
+            Ok((before_identity.device == expected_device
+                && before_identity.inode == expected_inode)
+                .then_some(after_identity))
+        })
+    }
+
+    /// Verifies legacy target evidence against one rooted descriptor and one content pass.
+    /// Missing is distinct from a present mismatch; filesystem and provider errors remain errors.
+    pub(crate) fn migration_verify_legacy_target(
+        &self,
+        relative_path: &str,
+        expected_identity: EntryIdentity,
+        expected_size: u64,
+        expected_access: BoundFileAccessPolicy,
+        expected_sha256: &str,
+    ) -> Result<LegacyTargetVerification> {
+        let absolute = self.absolute_path(relative_path)?;
+        let expected_digest = parse_sha256(expected_sha256)?;
+        self.coordinate_read(&absolute, |coordinated| {
+            if coordinated != absolute {
+                bail!("coordinated migration target path changed during exact verification");
+            }
+            let Some(file) = self.root.open_bound_file(coordinated)? else {
+                return Ok(LegacyTargetVerification::Missing);
+            };
+
+            let before = fingerprint(&file)?;
+            let before_access = file.access_policy()?;
+            let before_identity = physical_item_identity(&before);
+            if !before_identity.has_complete_birth() {
+                bail!(
+                    "legacy migration target birth identity is unavailable; exact verification cannot be completed"
+                );
+            }
+
+            let proof_mismatch = !expected_identity.is_file()
+                || before.identity != expected_identity
+                || before.size != expected_size
+                || before_access != expected_access;
+            let actual_sha256 = if proof_mismatch {
+                None
+            } else {
+                Some(file.sha256()?)
+            };
+            let after = fingerprint(&file)?;
+            let after_access = file.access_policy()?;
+            let after_identity = physical_item_identity(&after);
+            if !same_physical_item_descriptor(&before, &after)
+                || before.size != after.size
+                || before_access != after_access
+                || !after_identity.has_complete_birth()
+            {
+                bail!(
+                    "legacy migration target identity, birth, size, or access policy changed during exact verification"
+                );
+            }
+
+            if proof_mismatch
+                || actual_sha256.is_some_and(|digest| digest != expected_digest)
+            {
+                Ok(LegacyTargetVerification::Mismatch(after_identity))
+            } else {
+                Ok(LegacyTargetVerification::Match(after_identity))
+            }
         })
     }
 
@@ -2326,8 +2424,12 @@ impl LibraryManager {
             if self.root.bound_entry_identity(&entry)? != Some(expected) {
                 bail!("migration state file was replaced before atomic update");
             }
+            // SafeFs uses one verification bound for both the original and staged files. Keep
+            // the bound large enough for either exact document; the checkpoint callback below
+            // still verifies the staged file against `contents.len()` and the requested bytes.
             let verify_bytes = usize::try_from(snapshot.proof.size_bytes)
-                .context("migration state snapshot size does not fit in memory")?;
+                .context("migration state snapshot size does not fit in memory")?
+                .max(contents.len());
             let temporary = private_temp_sibling(coordinated);
             let expected_replacement_hash = sha256_bytes(contents);
             let mut verify_original = |staged_entry: &crate::safe_fs::BoundEntry,
@@ -5067,6 +5169,31 @@ impl LibraryManager {
         let mut suppressed_unavailable_paths = HashSet::new();
         for (item_index, item) in videos.iter_mut().enumerate() {
             let Some(fingerprint) = fingerprints.get(&item.relative_path) else {
+                if let Some(identity) = scanned_primary_identities
+                    .get(&item.relative_path)
+                    .filter(|identity| identity.is_file())
+                {
+                    let matching_records = old_by_path_and_walk_identity
+                        .get(&(
+                            item.relative_path.clone(),
+                            identity.device(),
+                            identity.inode(),
+                        ))
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|id| old_records.get(id))
+                        .filter(|record| record.file_type == "regular_file")
+                        .collect::<Vec<_>>();
+                    if matching_records.len() == 1 {
+                        let record = matching_records[0];
+                        item.physical_identity = Some(PhysicalItemIdentity::from_parts(
+                            record.device,
+                            record.inode,
+                            record.birth_seconds,
+                            record.birth_nanoseconds,
+                        ));
+                    }
+                }
                 if item.presence == Presence::Unavailable
                     && matches!(
                         item.metadata_status,
@@ -5123,6 +5250,7 @@ impl LibraryManager {
                 }
                 continue;
             };
+            item.physical_identity = Some(physical_item_identity(fingerprint));
             let mut item_queue_metadata = queue_metadata[item_index].clone();
             let key = index_object_key(fingerprint);
             let exact = old_by_path_and_identity
@@ -5255,6 +5383,14 @@ impl LibraryManager {
             if observed.contains(id) {
                 continue;
             }
+            record.item.physical_identity = (record.file_type == "regular_file").then(|| {
+                PhysicalItemIdentity::from_parts(
+                    record.device,
+                    record.inode,
+                    record.birth_seconds,
+                    record.birth_nanoseconds,
+                )
+            });
             if let Some(metadata_status) = unavailable_records_to_publish.get(id) {
                 record.item.presence = Presence::Unavailable;
                 record.item.metadata_status = *metadata_status;
@@ -5671,6 +5807,7 @@ impl LibraryManager {
                         confidence: Confidence::Low,
                         metadata_status: status,
                         integrity_status: IntegrityStatus::Unverified,
+                        physical_identity: None,
                         presence: Presence::Unavailable,
                     },
                     sidecar_title_present: false,
@@ -5888,6 +6025,7 @@ impl LibraryManager {
                 confidence,
                 metadata_status,
                 integrity_status: IntegrityStatus::Unverified,
+                physical_identity: fingerprint.as_ref().map(physical_item_identity),
                 presence,
             },
             sidecar_title_present,
@@ -6990,6 +7128,22 @@ fn fingerprint(file: &BoundFile) -> Result<FileFingerprint> {
         birth_seconds: birth.as_ref().map(|time| time.as_secs() as i64),
         birth_nanoseconds: birth.map(|time| time.subsec_nanos() as i64),
     })
+}
+
+fn physical_item_identity(fingerprint: &FileFingerprint) -> PhysicalItemIdentity {
+    PhysicalItemIdentity::from_parts(
+        fingerprint.identity.device(),
+        fingerprint.identity.inode(),
+        fingerprint.birth_seconds,
+        fingerprint.birth_nanoseconds,
+    )
+}
+
+fn same_physical_item_descriptor(left: &FileFingerprint, right: &FileFingerprint) -> bool {
+    left.identity.is_file()
+        && right.identity.is_file()
+        && left.identity == right.identity
+        && physical_item_identity(left) == physical_item_identity(right)
 }
 
 fn token_for_bound_file(file: &BoundFile) -> Result<(String, String)> {
@@ -10427,6 +10581,172 @@ mod tests {
             .expect("library manager should open against the isolated fixture")
     }
 
+    #[test]
+    fn migration_state_replacement_supports_growth_and_shrink_with_snapshot_cas() {
+        const STATE_NAME: &str = "migration-checkpoint-growth.json";
+        const ORIGINAL: &[u8] = br#"{"version":1}"#;
+        const GROWN: &[u8] = br#"{"version":2,"birth_seconds":1792713600,"birth_nanoseconds":0}"#;
+        const SHRUNK: &[u8] = br#"{"version":3}"#;
+
+        let root = TemporaryRoot::new("migration-state-growth-shrink");
+        let manager = manager(&root);
+        manager
+            .migration_write_state(STATE_NAME, ORIGINAL)
+            .expect("initial migration state should be written");
+        let original = manager
+            .migration_read_state_snapshot(STATE_NAME, 64 * 1024 * 1024)
+            .expect("initial migration state snapshot should be read")
+            .expect("initial migration state should exist");
+
+        manager
+            .migration_replace_state_if_unchanged(STATE_NAME, &original, GROWN)
+            .expect("migration state should grow when its checkpoint adds birth identity");
+        assert_eq!(
+            manager
+                .migration_read_state(STATE_NAME, 64 * 1024 * 1024)
+                .expect("grown migration state should be readable"),
+            Some(GROWN.to_vec())
+        );
+
+        let stale_error = manager
+            .migration_replace_state_if_unchanged(STATE_NAME, &original, b"stale")
+            .expect_err("the original snapshot proof must not replace a newer checkpoint");
+        assert!(format!("{stale_error:#}").contains("identity or content changed"));
+        assert_eq!(
+            manager
+                .migration_read_state(STATE_NAME, 64 * 1024 * 1024)
+                .expect("grown migration state should remain readable after stale CAS"),
+            Some(GROWN.to_vec())
+        );
+
+        let grown = manager
+            .migration_read_state_snapshot(STATE_NAME, 64 * 1024 * 1024)
+            .expect("grown migration state snapshot should be read")
+            .expect("grown migration state should exist");
+        manager
+            .migration_replace_state_if_unchanged(STATE_NAME, &grown, SHRUNK)
+            .expect("migration state should shrink when an update removes checkpoint data");
+        assert_eq!(
+            manager
+                .migration_read_state(STATE_NAME, 64 * 1024 * 1024)
+                .expect("shrunk migration state should be readable"),
+            Some(SHRUNK.to_vec())
+        );
+    }
+
+    #[test]
+    fn legacy_target_verification_ignores_mtime_only_changes() {
+        let root = TemporaryRoot::new("legacy-target-mtime-change");
+        let path = root.path().join("clip.mp4");
+        fs::write(&path, b"original-data").expect("media fixture should write");
+        let manager = manager(&root);
+        let file = manager
+            .read_media_file(&path)
+            .expect("media fixture should open")
+            .expect("media fixture should be present");
+        let before = fingerprint(&file).expect("media fingerprint should be available");
+        let expected_identity = physical_item_identity(&before);
+        let expected_access = file
+            .access_policy()
+            .expect("media access policy should be available");
+        if !expected_identity.has_complete_birth() {
+            let error = manager
+                .migration_verify_legacy_target(
+                    "clip.mp4",
+                    before.identity,
+                    before.size,
+                    expected_access,
+                    &sha256_bytes(b"original-data"),
+                )
+                .expect_err("a missing birth pair should be unverifiable");
+            assert!(format!("{error:#}").contains("birth identity is unavailable"));
+            return;
+        }
+        drop(file);
+
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("media should open for timestamp-only update")
+            .set_modified(SystemTime::now() + Duration::from_secs(3_600))
+            .expect("media mtime should update without changing content");
+
+        let after_file = manager
+            .read_media_file(&path)
+            .expect("media should reopen after mtime-only update")
+            .expect("media should remain present after mtime-only update");
+        let after =
+            fingerprint(&after_file).expect("updated media fingerprint should be available");
+        assert_eq!(
+            (after.birth_seconds, after.birth_nanoseconds),
+            (before.birth_seconds, before.birth_nanoseconds),
+            "setting a future mtime should preserve the protected birth identity"
+        );
+        drop(after_file);
+
+        let result = manager
+            .migration_verify_legacy_target(
+                "clip.mp4",
+                before.identity,
+                before.size,
+                expected_access,
+                &sha256_bytes(b"original-data"),
+            )
+            .expect("mtime-only changes should remain verifiable");
+        assert_eq!(result, LegacyTargetVerification::Match(expected_identity));
+    }
+
+    #[test]
+    fn legacy_target_verification_reports_a_stable_replacement_as_mismatch() {
+        let root = TemporaryRoot::new("legacy-target-replacement");
+        let path = root.path().join("clip.mp4");
+        let archived = root.path().join("old-clip.mp4");
+        fs::write(&path, b"original-data").expect("media fixture should write");
+        let manager = manager(&root);
+        let original = manager
+            .read_media_file(&path)
+            .expect("media fixture should open")
+            .expect("media fixture should be present");
+        let before = fingerprint(&original).expect("media fingerprint should be available");
+        let expected_access = original
+            .access_policy()
+            .expect("media access policy should be available");
+        if !physical_item_identity(&before).has_complete_birth() {
+            let error = manager
+                .migration_verify_legacy_target(
+                    "clip.mp4",
+                    before.identity,
+                    before.size,
+                    expected_access,
+                    &sha256_bytes(b"original-data"),
+                )
+                .expect_err("a missing birth pair should be unverifiable");
+            assert!(format!("{error:#}").contains("birth identity is unavailable"));
+            return;
+        }
+        drop(original);
+
+        fs::rename(&path, &archived).expect("original media should remain available as evidence");
+        fs::write(&path, b"replaced-data").expect("replacement media should write");
+
+        let result = manager
+            .migration_verify_legacy_target(
+                "clip.mp4",
+                before.identity,
+                before.size,
+                expected_access,
+                &sha256_bytes(b"original-data"),
+            )
+            .expect("stable replacement should be classified");
+        let LegacyTargetVerification::Mismatch(actual) = result else {
+            panic!("replacement should not match legacy target evidence: {result:?}");
+        };
+        assert_ne!(
+            (actual.device, actual.inode),
+            (before.identity.device(), before.identity.inode())
+        );
+    }
+
     struct FailOneMediaReadProvider {
         target: PathBuf,
         armed: std::sync::Mutex<HashSet<PathBuf>>,
@@ -10636,6 +10956,7 @@ mod tests {
             confidence: Confidence::Low,
             metadata_status: MetadataStatus::Unknown,
             integrity_status: IntegrityStatus::Unverified,
+            physical_identity: None,
             presence,
         }
     }
@@ -17466,6 +17787,7 @@ mod tests {
             confidence: Confidence::High,
             metadata_status: MetadataStatus::Complete,
             integrity_status: IntegrityStatus::Unverified,
+            physical_identity: None,
             presence: Presence::Present,
         };
         let stem = standard_media_stem(&item);

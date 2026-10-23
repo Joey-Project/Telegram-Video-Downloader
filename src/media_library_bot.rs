@@ -14,7 +14,7 @@ const MAX_MIGRATION_PROVENANCE_CHAIN_HOPS: usize = 64;
 struct LibraryItemLocation {
     library_id: String,
     item_id: String,
-    relative_path: String,
+    physical_identity: crate::library::PhysicalItemIdentity,
 }
 
 #[derive(Clone, Debug)]
@@ -59,22 +59,31 @@ fn migration_moved_to_projections(
                 .is_some_and(|status| status.available)
     };
 
-    let mut present_items = HashSet::new();
+    let mut present_items = HashMap::new();
     for (library_id, snapshot) in snapshots {
         if !available_library(library_id) {
             continue;
         }
-        present_items.extend(
-            snapshot
-                .items
-                .iter()
-                .filter(|item| item.presence == Presence::Present)
-                .map(|item| LibraryItemLocation {
+        for item in snapshot
+            .items
+            .iter()
+            .filter(|item| item.presence == Presence::Present)
+        {
+            let Some(physical_identity) = item
+                .physical_identity
+                .filter(crate::library::PhysicalItemIdentity::has_complete_birth)
+            else {
+                continue;
+            };
+            present_items.insert(
+                LibraryItemLocation {
                     library_id: library_id.clone(),
                     item_id: item.id.clone(),
-                    relative_path: item.relative_path.clone(),
-                }),
-        );
+                    physical_identity,
+                },
+                item.relative_path.clone(),
+            );
+        }
     }
 
     let mut destinations = HashMap::<LibraryItemLocation, MigrationDestination>::new();
@@ -91,16 +100,24 @@ fn migration_moved_to_projections(
             {
                 continue;
             }
+            let (Some(source_identity), Some(target_identity)) = (
+                item.source_physical_identity
+                    .filter(crate::library::PhysicalItemIdentity::has_complete_birth),
+                item.target_physical_identity
+                    .filter(crate::library::PhysicalItemIdentity::has_complete_birth),
+            ) else {
+                continue;
+            };
             let source = LibraryItemLocation {
                 library_id: migration.source_library_id.clone(),
                 item_id: item.item_id.clone(),
-                relative_path: item.source_path.clone(),
+                physical_identity: source_identity,
             };
             let destination = MigrationDestination {
                 location: LibraryItemLocation {
                     library_id: migration.target_library_id.clone(),
                     item_id: target_item_id.clone(),
-                    relative_path: item.target_path.clone(),
+                    physical_identity: target_identity,
                 },
                 created_at: migration.created_at,
                 migration_id: migration.id.clone(),
@@ -124,7 +141,7 @@ fn migration_moved_to_projections(
             if !visited.insert(current.clone()) {
                 break;
             }
-            if present_items.contains(&current) {
+            if present_items.contains_key(&current) {
                 resolved = Some(current.clone());
                 break;
             }
@@ -136,6 +153,9 @@ fn migration_moved_to_projections(
         let Some(destination) = resolved else {
             continue;
         };
+        let Some(relative_path) = present_items.get(&destination) else {
+            continue;
+        };
         let Some(library_name) = library_names.get(&destination.library_id) else {
             continue;
         };
@@ -145,7 +165,7 @@ fn migration_moved_to_projections(
                 library_id: destination.library_id,
                 library_name: library_name.clone(),
                 item_id: destination.item_id,
-                relative_path: destination.relative_path,
+                relative_path: relative_path.clone(),
             },
         );
     }
@@ -163,8 +183,12 @@ fn clear_snapshot_moved_to(snapshot: &mut Value) {
 fn attach_snapshot_moved_to(
     snapshot: &mut Value,
     source_library_id: &str,
+    scanned_snapshot: Option<&crate::library::LibrarySnapshot>,
     projections: &HashMap<LibraryItemLocation, MovedToProjection>,
 ) {
+    let Some(scanned_snapshot) = scanned_snapshot else {
+        return;
+    };
     for item in snapshot["items"].as_array_mut().into_iter().flatten() {
         if item["presence"].as_str() != Some("missing") {
             continue;
@@ -174,10 +198,27 @@ fn attach_snapshot_moved_to(
         else {
             continue;
         };
+        let mut source_items = scanned_snapshot.items.iter().filter(|source_item| {
+            source_item.id == item_id
+                && source_item.relative_path == relative_path
+                && source_item.presence == crate::library::Presence::Missing
+        });
+        let Some(source_item) = source_items.next() else {
+            continue;
+        };
+        if source_items.next().is_some() {
+            continue;
+        }
+        let Some(physical_identity) = source_item
+            .physical_identity
+            .filter(crate::library::PhysicalItemIdentity::has_complete_birth)
+        else {
+            continue;
+        };
         let location = LibraryItemLocation {
             library_id: source_library_id.to_string(),
             item_id: item_id.to_string(),
-            relative_path: relative_path.to_string(),
+            physical_identity,
         };
         let Some(destination) = projections.get(&location) else {
             continue;
@@ -724,7 +765,7 @@ pub(super) async fn attach_library_views(
             .map(|bytes| json!(bytes))
             .unwrap_or(Value::Null);
         if warning.is_none() && status.is_some_and(|status| status.available) {
-            attach_snapshot_moved_to(&mut snapshot, id, &moved_to);
+            attach_snapshot_moved_to(&mut snapshot, id, cached, &moved_to);
         }
         view["snapshot"] = snapshot.clone();
         if id == default_id {

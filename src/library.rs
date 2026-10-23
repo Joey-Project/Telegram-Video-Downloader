@@ -14,6 +14,40 @@ pub struct LibrarySnapshot {
     pub warnings: Vec<String>,
 }
 
+/// Physical identity captured from a bound media descriptor or retained index record.
+/// A birth timestamp is trustworthy only when both components are available.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub(crate) struct PhysicalItemIdentity {
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) birth_seconds: Option<i64>,
+    pub(crate) birth_nanoseconds: Option<i64>,
+}
+
+impl PhysicalItemIdentity {
+    pub(crate) fn from_parts(
+        device: u64,
+        inode: u64,
+        birth_seconds: Option<i64>,
+        birth_nanoseconds: Option<i64>,
+    ) -> Self {
+        let (birth_seconds, birth_nanoseconds) = match (birth_seconds, birth_nanoseconds) {
+            (Some(seconds), Some(nanoseconds)) => (Some(seconds), Some(nanoseconds)),
+            _ => (None, None),
+        };
+        Self {
+            device,
+            inode,
+            birth_seconds,
+            birth_nanoseconds,
+        }
+    }
+
+    pub(crate) fn has_complete_birth(&self) -> bool {
+        self.birth_seconds.is_some() && self.birth_nanoseconds.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LibraryItem {
     /// A persistent identity for this physical copy, independent of its current path.
@@ -34,6 +68,8 @@ pub struct LibraryItem {
     pub confidence: Confidence,
     pub metadata_status: MetadataStatus,
     pub integrity_status: IntegrityStatus,
+    #[serde(skip)]
+    pub(crate) physical_identity: Option<PhysicalItemIdentity>,
     pub presence: Presence,
 }
 

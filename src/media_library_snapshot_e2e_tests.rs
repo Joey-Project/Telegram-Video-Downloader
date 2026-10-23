@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use super::media_library_e2e_tests::{create_migration_fixture, scan_file_item_id};
 use super::*;
 use crate::file_provider::{FileProviderAccessError, QueueFileProvider};
-use crate::library::Presence;
+use crate::library::{PhysicalItemIdentity, Presence};
 use anyhow::Result;
 use serde_json::Value;
 
@@ -143,6 +143,56 @@ fn snapshot_library_items(library: &Value, library_id: &str) -> Vec<Value> {
         .as_array()
         .expect("non-default library snapshot should retain nested items")
         .clone()
+}
+
+async fn cached_item_physical_identity(
+    runtime: &CloudBotRuntime,
+    library_id: &str,
+    item_id: &str,
+) -> PhysicalItemIdentity {
+    runtime
+        .library_snapshots
+        .lock()
+        .await
+        .get(library_id)
+        .expect("library scan should cache its snapshot")
+        .items
+        .iter()
+        .find(|item| item.id == item_id)
+        .expect("cached snapshot should retain the requested item")
+        .physical_identity
+        .expect("scanned file should carry its in-memory physical identity")
+}
+
+async fn inject_cached_item_physical_identity(
+    runtime: &CloudBotRuntime,
+    library_id: &str,
+    item_id: &str,
+    identity: PhysicalItemIdentity,
+) {
+    let mut snapshots = runtime.library_snapshots.lock().await;
+    let item = snapshots
+        .get_mut(library_id)
+        .expect("library scan should cache its snapshot")
+        .items
+        .iter_mut()
+        .find(|item| item.id == item_id)
+        .expect("cached snapshot should retain the requested item");
+    item.physical_identity = Some(identity);
+}
+
+fn same_object_with_different_birth(mut identity: PhysicalItemIdentity) -> PhysicalItemIdentity {
+    assert!(
+        identity.has_complete_birth(),
+        "fixture should expose complete physical creation time"
+    );
+    identity.birth_seconds = Some(
+        identity
+            .birth_seconds
+            .expect("fixture should expose complete physical creation time")
+            .saturating_add(1),
+    );
+    identity
 }
 
 #[tokio::test]
@@ -710,6 +760,48 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         .expect("migrated target should have a new item identity")
         .to_string();
     assert_ne!(first_target_id, original_source_id);
+    let first_target_identity_before_rename = cached_item_physical_identity(
+        &reopened_runtime,
+        &fixture.target_library_id,
+        &first_target_id,
+    )
+    .await;
+    assert!(
+        first_target_identity_before_rename.has_complete_birth(),
+        "the migrated target should retain a complete creation identity"
+    );
+    let renamed_relative_path = "renamed.mp4";
+    fs::rename(
+        fixture.archive_root.join("clip.mp4"),
+        fixture.archive_root.join(renamed_relative_path),
+    )
+    .expect("migrated target media should rename within its library");
+    fs::rename(
+        fixture.archive_root.join("clip.nfo"),
+        fixture.archive_root.join("renamed.nfo"),
+    )
+    .expect("migrated target sidecar should rename with its media");
+    let renamed_target_id = scan_file_item_id(
+        &reopened_runtime,
+        9_113,
+        &fixture.target_library_id,
+        renamed_relative_path,
+    )
+    .await;
+    assert_eq!(
+        renamed_target_id, first_target_id,
+        "renaming within one library should preserve the physical item identity"
+    );
+    let first_target_identity_after_rename = cached_item_physical_identity(
+        &reopened_runtime,
+        &fixture.target_library_id,
+        &renamed_target_id,
+    )
+    .await;
+    assert_eq!(
+        first_target_identity_after_rename, first_target_identity_before_rename,
+        "an in-library rename should preserve the item's creation identity"
+    );
     let persisted_first_status = reopened_runtime
         .migrations
         .lock()
@@ -721,6 +813,11 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         persisted_first_status.items[0].target_item_id.as_deref(),
         Some(first_target_id.as_str()),
         "the durable migration should retain the verified target item identity"
+    );
+    assert_eq!(
+        persisted_first_status.items[0].target_physical_identity,
+        Some(first_target_identity_after_rename),
+        "the reloaded job's physical target proof should match the renamed file"
     );
     let after_first_snapshot = build_cloud_state_snapshot(&reopened_runtime)
         .await
@@ -736,19 +833,99 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
     );
     assert_eq!(source_history_item["moved_to"]["library_name"], "Archive");
     assert_eq!(source_history_item["moved_to"]["item_id"], first_target_id);
-    assert_eq!(source_history_item["moved_to"]["relative_path"], "clip.mp4");
+    assert_eq!(
+        source_history_item["moved_to"]["relative_path"], renamed_relative_path,
+        "moved history should use the current path after an in-library rename"
+    );
+
+    let legacy_engine = crate::cloud_bot_tests::media_library_e2e_tests::migration_engine_for_test(
+        &reopened_runtime,
+        &fixture.source_library_id,
+        &fixture.target_library_id,
+    );
+    legacy_engine
+        .make_job_legacy_for_test(&first_migration_id)
+        .expect("test should strip the optional target birth from the completed durable job");
+    let legacy_status = legacy_engine
+        .status(&first_migration_id)
+        .expect("legacy status should load")
+        .expect("legacy job should remain present");
+    assert_eq!(legacy_status.items[0].target_physical_identity, None);
+    drop(legacy_engine);
+
+    // Hold both libraries' read admission while discovery starts the completed-job upgrader.
+    // This gives the test a deterministic snapshot of the legacy state before its bounded hash.
+    let migration_lease = crate::library_migration_bot::try_acquire_library_io(
+        &reopened_runtime,
+        &[
+            fixture.source_library_id.clone(),
+            fixture.target_library_id.clone(),
+        ],
+    )
+    .await
+    .expect("test should hold the libraries before the background upgrade starts");
+    {
+        let runner_waiting_notify =
+            Arc::clone(&reopened_runtime.test_migration_runner_gate_waiting);
+        let runner_waiting = runner_waiting_notify.notified();
+        tokio::pin!(runner_waiting);
+        runner_waiting.as_mut().enable();
+        crate::library_migration_bot::discover_for_test(&reopened_runtime)
+            .await
+            .expect("discovery should schedule legacy completed-job verification");
+        tokio::time::timeout(Duration::from_secs(10), &mut runner_waiting)
+            .await
+            .expect("legacy verifier should wait for the held library lease");
+    }
+    let legacy_projection = build_cloud_state_snapshot(&reopened_runtime)
+        .await
+        .expect("legacy snapshot should build before its hash upgrade")
+        .expect("runtime should publish a legacy snapshot");
+    let legacy_source_items =
+        snapshot_library_items(&legacy_projection.library, &fixture.source_library_id);
+    assert!(
+        snapshot_item(&legacy_source_items, &original_source_id)
+            .get("moved_to")
+            .is_none(),
+        "a durable target identity without a birth proof must not be trusted yet"
+    );
+    drop(migration_lease);
+    wait_for_snapshot_migration_runner_idle(&reopened_runtime, &first_migration_id).await;
+    let upgraded_first_status = reopened_runtime
+        .migrations
+        .lock()
+        .await
+        .get(&first_migration_id)
+        .cloned()
+        .expect("background verification should publish upgraded migration status");
+    assert_eq!(
+        upgraded_first_status.items[0].target_physical_identity,
+        Some(first_target_identity_after_rename),
+        "bounded verification should persist the exact target creation identity"
+    );
+    let upgraded_projection = build_cloud_state_snapshot(&reopened_runtime)
+        .await
+        .expect("upgraded snapshot should build")
+        .expect("runtime should publish the upgraded snapshot");
+    let upgraded_source_items =
+        snapshot_library_items(&upgraded_projection.library, &fixture.source_library_id);
+    assert_eq!(
+        snapshot_item(&upgraded_source_items, &original_source_id)["moved_to"]["relative_path"],
+        renamed_relative_path,
+        "verified legacy history should recover its link at the current target path"
+    );
 
     let second_source_id = scan_file_item_id(
         &reopened_runtime,
-        9_113,
+        9_114,
         &fixture.target_library_id,
-        "clip.mp4",
+        renamed_relative_path,
     )
     .await;
     assert_eq!(second_source_id, first_target_id);
     let second_migration_id = start_selected_snapshot_migration(
         &reopened_runtime,
-        9_114,
+        9_115,
         &fixture.target_library_id,
         &final_library.id,
         &second_source_id,
@@ -757,11 +934,19 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
     let second_status =
         wait_for_snapshot_migration_completion(&reopened_runtime, &second_migration_id).await;
     assert_eq!(second_status.success_count, 1);
+    assert_eq!(
+        second_status.items[0].source_physical_identity,
+        Some(first_target_identity_after_rename),
+        "the second migration should bind the renamed item's original physical identity"
+    );
     wait_for_snapshot_migration_runner_idle(&reopened_runtime, &second_migration_id).await;
-    assert!(!fixture.archive_root.join("clip.mp4").exists());
-    assert!(!fixture.archive_root.join("clip.nfo").exists());
-    assert_eq!(fs::read(final_root.join("clip.mp4")).unwrap(), media_bytes);
-    assert_eq!(fs::read(final_root.join("clip.nfo")).unwrap(), nfo_bytes);
+    assert!(!fixture.archive_root.join(renamed_relative_path).exists());
+    assert!(!fixture.archive_root.join("renamed.nfo").exists());
+    assert_eq!(
+        fs::read(final_root.join(renamed_relative_path)).unwrap(),
+        media_bytes
+    );
+    assert_eq!(fs::read(final_root.join("renamed.nfo")).unwrap(), nfo_bytes);
 
     reopened_runtime.signal_epoch_fatal();
     reopened_dispatcher.abort();
@@ -789,6 +974,18 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         .expect("both durable migration jobs should reload after restart");
     wait_for_snapshot_migration_runner_idle(&final_runtime, &first_migration_id).await;
     wait_for_snapshot_migration_runner_idle(&final_runtime, &second_migration_id).await;
+    let reloaded_first_status = final_runtime
+        .migrations
+        .lock()
+        .await
+        .get(&first_migration_id)
+        .cloned()
+        .expect("the upgraded first job should reload after the second restart");
+    assert_eq!(
+        reloaded_first_status.items[0].target_physical_identity,
+        Some(first_target_identity_after_rename),
+        "the legacy birth upgrade should persist across a later process restart"
+    );
 
     let source_final_scan =
         rescan_snapshot_library(&final_runtime, 9_121, &fixture.source_library_id).await;
@@ -799,12 +996,21 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["relative_path"] == "clip.mp4" && item["presence"] == "present")
+        .find(|item| {
+            item["relative_path"] == renamed_relative_path && item["presence"] == "present"
+        })
         .expect("final target scan should identify the current migrated media")["id"]
         .as_str()
         .expect("final target should have its own item identity")
         .to_string();
+    let final_target_identity =
+        cached_item_physical_identity(&final_runtime, &final_library.id, &final_target_id).await;
     assert_ne!(final_target_id, first_target_id);
+    assert_eq!(
+        second_status.items[0].target_physical_identity,
+        Some(final_target_identity),
+        "the second durable migration should bind the present final target"
+    );
     let final_history_snapshot = build_cloud_state_snapshot(&final_runtime)
         .await
         .expect("cloud snapshot should rebuild from reloaded history and fresh scans")
@@ -815,12 +1021,25 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         snapshot_library_items(&final_history_snapshot.library, &fixture.target_library_id);
     let source_history_item = snapshot_item(&source_items, &original_source_id);
     let intermediate_history_item = snapshot_item(&intermediate_items, &first_target_id);
+    assert_eq!(
+        cached_item_physical_identity(
+            &final_runtime,
+            &fixture.target_library_id,
+            &first_target_id,
+        )
+        .await,
+        first_target_identity_after_rename,
+        "a missing intermediate history entry should reload its indexed birth identity"
+    );
     for history_item in [source_history_item, intermediate_history_item] {
         assert_eq!(history_item["presence"], "missing");
         assert_eq!(history_item["moved_to"]["library_id"], final_library.id);
         assert_eq!(history_item["moved_to"]["library_name"], "Final Archive");
         assert_eq!(history_item["moved_to"]["item_id"], final_target_id);
-        assert_eq!(history_item["moved_to"]["relative_path"], "clip.mp4");
+        assert_eq!(
+            history_item["moved_to"]["relative_path"],
+            renamed_relative_path
+        );
     }
     let durable_history = final_history_snapshot.library["migrations"]
         .as_array()
@@ -833,21 +1052,159 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         durable_second_job["items"][0]["target_item_id"],
         final_target_id
     );
+    assert!(
+        durable_second_job["items"][0]
+            .get("target_physical_identity")
+            .is_none(),
+        "internal physical proof must never appear in serialized migration history"
+    );
+    let durable_first_job = durable_history
+        .iter()
+        .find(|job| job["id"] == first_migration_id)
+        .expect("reloaded snapshot should include the upgraded first migration job");
+    assert_eq!(
+        durable_first_job["items"][0]["target_item_id"],
+        first_target_id
+    );
+    assert!(
+        durable_first_job["items"][0]
+            .get("target_physical_identity")
+            .is_none(),
+        "legacy birth evidence should remain internal after restart"
+    );
     assert_eq!(source_final_scan["items"].as_array().unwrap().len(), 1);
     assert_eq!(
         intermediate_final_scan["items"].as_array().unwrap().len(),
         1
     );
 
+    // Keep the deterministic item ID, path, device, and inode fixed while changing only the
+    // captured creation time. This models inode reuse without relying on the filesystem to reuse
+    // an inode during the test.
+    let replacement_final_identity = same_object_with_different_birth(final_target_identity);
+    assert_eq!(
+        replacement_final_identity.device,
+        final_target_identity.device
+    );
+    assert_eq!(
+        replacement_final_identity.inode,
+        final_target_identity.inode
+    );
+    assert_ne!(
+        replacement_final_identity.birth_seconds,
+        final_target_identity.birth_seconds
+    );
+    inject_cached_item_physical_identity(
+        &final_runtime,
+        &final_library.id,
+        &final_target_id,
+        replacement_final_identity,
+    )
+    .await;
+    let changed_birth_target_snapshot = build_cloud_state_snapshot(&final_runtime)
+        .await
+        .expect("snapshot should rebuild after deterministic creation-time replacement")
+        .expect("runtime should publish after deterministic creation-time replacement");
+    for (library_id, history_id) in [
+        (&fixture.source_library_id, &original_source_id),
+        (&fixture.target_library_id, &first_target_id),
+    ] {
+        let items = snapshot_library_items(&changed_birth_target_snapshot.library, library_id);
+        assert!(
+            snapshot_item(&items, history_id).get("moved_to").is_none(),
+            "same ID/path/device/inode with a different creation time must break the moved-to chain"
+        );
+    }
+    inject_cached_item_physical_identity(
+        &final_runtime,
+        &final_library.id,
+        &final_target_id,
+        final_target_identity,
+    )
+    .await;
+
+    // Simulate B being replaced with the same stable ID/path/device/inode but a different birth
+    // before B→C was recorded. The injected B→C source proof matches that replacement, so B can
+    // still point to C; A→B's old target proof must not chain through it.
+    let original_second_source_identity = second_status.items[0]
+        .source_physical_identity
+        .expect("second migration should retain B's physical source proof");
+    let replaced_intermediate_identity =
+        same_object_with_different_birth(original_second_source_identity);
+    assert_eq!(
+        replaced_intermediate_identity.device,
+        original_second_source_identity.device
+    );
+    assert_eq!(
+        replaced_intermediate_identity.inode,
+        original_second_source_identity.inode
+    );
+    assert_ne!(
+        replaced_intermediate_identity.birth_seconds,
+        original_second_source_identity.birth_seconds
+    );
+    inject_cached_item_physical_identity(
+        &final_runtime,
+        &fixture.target_library_id,
+        &first_target_id,
+        replaced_intermediate_identity,
+    )
+    .await;
+    {
+        let mut migrations = final_runtime.migrations.lock().await;
+        let status = migrations
+            .get_mut(&second_migration_id)
+            .expect("reloaded second migration should remain published");
+        status.items[0].source_physical_identity = Some(replaced_intermediate_identity);
+    }
+    let replaced_intermediate_snapshot = build_cloud_state_snapshot(&final_runtime)
+        .await
+        .expect("snapshot should rebuild after deterministic intermediate replacement")
+        .expect("runtime should publish after deterministic intermediate replacement");
+    let replaced_intermediate_items = snapshot_library_items(
+        &replaced_intermediate_snapshot.library,
+        &fixture.target_library_id,
+    );
+    assert_eq!(
+        snapshot_item(&replaced_intermediate_items, &first_target_id)["moved_to"]["item_id"],
+        final_target_id,
+        "the B→C edge should remain valid for the injected replacement identity"
+    );
+    let replaced_source_items = snapshot_library_items(
+        &replaced_intermediate_snapshot.library,
+        &fixture.source_library_id,
+    );
+    assert!(
+        snapshot_item(&replaced_source_items, &original_source_id)
+            .get("moved_to")
+            .is_none(),
+        "A→B must not chain through B's replacement creation identity"
+    );
+    inject_cached_item_physical_identity(
+        &final_runtime,
+        &fixture.target_library_id,
+        &first_target_id,
+        original_second_source_identity,
+    )
+    .await;
+    {
+        let mut migrations = final_runtime.migrations.lock().await;
+        let status = migrations
+            .get_mut(&second_migration_id)
+            .expect("reloaded second migration should remain published");
+        status.items[0].source_physical_identity = Some(original_second_source_identity);
+    }
+
     // A missing target and a replacement at the same path must not keep an old link alive.
-    fs::remove_file(final_root.join("clip.mp4")).expect("final target media should be removable");
+    fs::remove_file(final_root.join(renamed_relative_path))
+        .expect("final target media should be removable");
     let missing_target_scan =
         rescan_snapshot_library(&final_runtime, 9_124, &final_library.id).await;
     let missing_target_id = missing_target_scan["items"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["relative_path"] == "clip.mp4")
+        .find(|item| item["relative_path"] == renamed_relative_path)
         .expect("target scan should retain the missing media history")["id"]
         .as_str()
         .expect("missing target history should retain its item identity")
@@ -875,7 +1232,7 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
     }
 
     fs::write(
-        final_root.join("clip.mp4"),
+        final_root.join(renamed_relative_path),
         b"replacement media at the same path",
     )
     .expect("replacement target media should write");
@@ -885,7 +1242,9 @@ async fn moved_history_follows_verified_migration_targets_after_restart_and_degr
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["relative_path"] == "clip.mp4" && item["presence"] == "present")
+        .find(|item| {
+            item["relative_path"] == renamed_relative_path && item["presence"] == "present"
+        })
         .expect("replacement target should scan as present")["id"]
         .as_str()
         .expect("replacement should receive a physical-copy identity")

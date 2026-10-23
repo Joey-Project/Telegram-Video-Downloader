@@ -18,7 +18,7 @@ use crate::file_manager::{
     LibraryManager, MigrationPlanOutcome, MigrationPlannedFile, MigrationPlannedGroup,
     MigrationScanResult, MigrationStateFileProof,
 };
-use crate::library::{ConflictPolicy, LibrarySnapshot, Presence};
+use crate::library::{ConflictPolicy, LibrarySnapshot, PhysicalItemIdentity, Presence};
 use crate::media_libraries::{
     TaskTransferControl, TaskTransferControlKind, TaskTransferEntryKind, TaskTransferFile,
     TaskTransferPlan,
@@ -370,12 +370,25 @@ pub(crate) struct MigrationStatusItem {
     pub(crate) target_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) target_item_id: Option<String>,
+    /// Private object proofs used by the cloud projection. These are reconstructed from the
+    /// durable file checkpoint and must never be included in the public migration history.
+    #[serde(skip)]
+    pub(crate) source_physical_identity: Option<PhysicalItemIdentity>,
+    #[serde(skip)]
+    pub(crate) target_physical_identity: Option<PhysicalItemIdentity>,
     pub(crate) bytes: u64,
     #[serde(default)]
     pub(crate) error: Option<String>,
     #[serde(default)]
     pub(crate) failure_kind: Option<MigrationFailureKind>,
     pub(crate) files: Vec<MigrationFileStatus>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct LegacyTargetBirthUpgrade {
+    pub(crate) status: MigrationStatus,
+    pub(crate) attempted: bool,
+    pub(crate) remaining: bool,
 }
 
 /// Runtime status never includes serialized task plans, queue tokens, or Telegram identifiers.
@@ -614,10 +627,32 @@ struct FileCheckpoint {
     #[serde(default)]
     target_identity: Option<SerializedIdentity>,
     #[serde(default)]
+    target_birth_seconds: Option<i64>,
+    #[serde(default)]
+    target_birth_nanoseconds: Option<i64>,
+    /// A legacy hash mismatch is remembered for the observed physical object so a background
+    /// discovery tick does not repeatedly hash the same large file. A changed birth identity
+    /// can still be checked again.
+    #[serde(default)]
+    legacy_birth_verification_attempt: Option<PhysicalItemIdentity>,
+    #[serde(default)]
     target_access_policy: Option<SerializedAccessPolicy>,
     source_removed: bool,
     #[serde(default)]
     source_cleanup_intent: bool,
+}
+
+#[derive(Clone)]
+struct LegacyBirthCandidate {
+    group_index: usize,
+    file_index: usize,
+    target_item_id: String,
+    target_path: String,
+    target_identity: SerializedIdentity,
+    expected_size: u64,
+    expected_access: BoundFileAccessPolicy,
+    expected_sha256: String,
+    current_identity: PhysicalItemIdentity,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1379,6 +1414,9 @@ impl MigrationEngine {
                         verified_chunks: 0,
                         published: false,
                         target_identity: None,
+                        target_birth_seconds: None,
+                        target_birth_nanoseconds: None,
+                        legacy_birth_verification_attempt: None,
                         target_access_policy: None,
                         source_removed: false,
                         source_cleanup_intent: false,
@@ -1737,6 +1775,173 @@ impl MigrationEngine {
         let job: JobDocument = decode_state(&bytes, "migration job")?;
         self.validate_job_bindings(&job)?;
         Ok(Some(status_from_job(&job)))
+    }
+
+    /// Upgrades at most one legacy primary target per background runner pass. The file hash is
+    /// performed without holding the durable state lock; a saved state-file proof is then used
+    /// for compare-and-swap so a concurrent checkpoint can never be overwritten.
+    pub(crate) fn upgrade_one_legacy_target_birth(
+        &self,
+        migration_id: &str,
+        target_snapshot: &LibrarySnapshot,
+    ) -> Result<LegacyTargetBirthUpgrade> {
+        let state_name = job_state_name(migration_id);
+        let (saved_state, original_job, candidate) = {
+            let _state_lock = self.source.migration_state_lock()?;
+            let saved_state = self
+                .source
+                .migration_read_state_snapshot(&state_name, MAX_STATE_BYTES)?
+                .ok_or_else(|| anyhow!("migration job disappeared before target proof upgrade"))?;
+            let job: JobDocument = decode_state(&saved_state.contents, "migration job")?;
+            self.validate_job_bindings(&job)?;
+            let candidate = matches!(
+                job.status,
+                MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+            )
+            .then(|| legacy_birth_candidate(&job, target_snapshot))
+            .flatten();
+            (saved_state, job, candidate)
+        };
+        let Some(candidate) = candidate else {
+            return Ok(LegacyTargetBirthUpgrade {
+                status: status_from_job(&original_job),
+                attempted: false,
+                remaining: false,
+            });
+        };
+
+        let verification = self.target.migration_verify_legacy_target(
+            &candidate.target_path,
+            candidate.target_identity.to_entry_identity(),
+            candidate.expected_size,
+            candidate.expected_access,
+            &candidate.expected_sha256,
+        )?;
+        if verification == crate::file_manager::LegacyTargetVerification::Missing {
+            return Ok(LegacyTargetBirthUpgrade {
+                status: status_from_job(&original_job),
+                attempted: false,
+                remaining: false,
+            });
+        }
+
+        let _state_lock = self.source.migration_state_lock()?;
+        let Some(current_state) = self
+            .source
+            .migration_read_state_snapshot(&state_name, MAX_STATE_BYTES)?
+        else {
+            return Ok(LegacyTargetBirthUpgrade {
+                status: status_from_job(&original_job),
+                attempted: false,
+                remaining: false,
+            });
+        };
+        if current_state.proof != saved_state.proof {
+            let current_job: JobDocument = decode_state(&current_state.contents, "migration job")?;
+            self.validate_job_bindings(&current_job)?;
+            return Ok(LegacyTargetBirthUpgrade {
+                status: status_from_job(&current_job),
+                attempted: false,
+                remaining: legacy_birth_candidate(&current_job, target_snapshot).is_some(),
+            });
+        }
+        let mut job: JobDocument = decode_state(&current_state.contents, "migration job")?;
+        self.validate_job_bindings(&job)?;
+        let mut record_mismatch_warning = false;
+        let candidate_still_current = job.groups.get(candidate.group_index).is_some_and(|group| {
+            completed_primary_target_item_id(group).as_deref()
+                == Some(candidate.target_item_id.as_str())
+                && group.files.get(candidate.file_index).is_some_and(|file| {
+                    file.target_identity == Some(candidate.target_identity)
+                        && file.source_removed
+                        && !(file.target_birth_seconds.is_some()
+                            && file.target_birth_nanoseconds.is_some())
+                })
+        });
+        if !candidate_still_current {
+            return Ok(LegacyTargetBirthUpgrade {
+                status: status_from_job(&job),
+                attempted: false,
+                remaining: legacy_birth_candidate(&job, target_snapshot).is_some(),
+            });
+        }
+        {
+            let Some(file) = job
+                .groups
+                .get_mut(candidate.group_index)
+                .and_then(|group| group.files.get_mut(candidate.file_index))
+            else {
+                return Ok(LegacyTargetBirthUpgrade {
+                    status: status_from_job(&job),
+                    attempted: false,
+                    remaining: false,
+                });
+            };
+            match verification {
+                crate::file_manager::LegacyTargetVerification::Match(identity) => {
+                    if !identity.has_complete_birth() {
+                        bail!("legacy target verification returned an incomplete birth identity");
+                    }
+                    file.target_birth_seconds = identity.birth_seconds;
+                    file.target_birth_nanoseconds = identity.birth_nanoseconds;
+                    file.legacy_birth_verification_attempt = None;
+                }
+                crate::file_manager::LegacyTargetVerification::Mismatch(_) => {
+                    // Key the attempt to the scanned physical fingerprint. If the scan is stale,
+                    // this suppresses repeated hashes until a later scan observes a new object.
+                    file.legacy_birth_verification_attempt = Some(candidate.current_identity);
+                    record_mismatch_warning = true;
+                }
+                crate::file_manager::LegacyTargetVerification::Missing => unreachable!(),
+            }
+        }
+        if record_mismatch_warning {
+            record_runtime_warning(
+                &mut job,
+                "A target verification attempt did not match its saved content proof. Only verified targets are linked to source history.",
+            );
+        }
+        self.source.migration_replace_state_if_unchanged(
+            &state_name,
+            &current_state,
+            &encode_state(&job)?,
+        )?;
+        let remaining = legacy_birth_candidate(&job, target_snapshot).is_some();
+        Ok(LegacyTargetBirthUpgrade {
+            status: status_from_job(&job),
+            attempted: true,
+            remaining,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn make_job_legacy_for_test(&self, migration_id: &str) -> Result<()> {
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        for group in &mut job.groups {
+            if let Some(primary) = completed_primary_file_mut(group) {
+                primary.target_birth_seconds = None;
+                primary.target_birth_nanoseconds = None;
+                primary.legacy_birth_verification_attempt = None;
+            }
+        }
+        self.save_job(&job)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_wrong_legacy_primary_sha_for_test(&self, migration_id: &str) -> Result<()> {
+        let _state_lock = self.source.migration_state_lock()?;
+        let mut job = self.load_job(migration_id)?;
+        self.validate_job_bindings(&job)?;
+        let primary = job
+            .groups
+            .iter_mut()
+            .find_map(completed_primary_file_mut)
+            .ok_or_else(|| anyhow!("completed migration primary file does not exist"))?;
+        primary.plan.proof.sha256 =
+            "0000000000000000000000000000000000000000000000000000000000000000".into();
+        self.save_job(&job)
     }
 
     pub(crate) fn attach_task_transfer(
@@ -2932,6 +3137,14 @@ impl MigrationEngine {
                                 "published migration target failed exact inode, access, or content verification"
                             );
                         }
+                    }
+                    if let Some(physical_identity) = self.target.migration_physical_identity(
+                        &file.plan.target_path,
+                        target_identity.device(),
+                        target_identity.inode(),
+                    )? {
+                        file.target_birth_seconds = physical_identity.birth_seconds;
+                        file.target_birth_nanoseconds = physical_identity.birth_nanoseconds;
                     }
                     file.published = true;
                     group.status = MigrationItemPhase::Publishing;
@@ -4163,16 +4376,7 @@ fn terminal_finalization_pending(job: &JobDocument) -> bool {
 }
 
 fn completed_primary_target_item_id(group: &GroupCheckpoint) -> Option<String> {
-    if group.status != MigrationItemPhase::Complete {
-        return None;
-    }
-    let primary = group.files.iter().find(|file| {
-        file.plan.source_path == group.plan.source_path
-            && file.plan.target_path == group.plan.target_path
-    })?;
-    if !primary.published || !primary.source_removed {
-        return None;
-    }
+    let primary = completed_primary_file(group)?;
     let identity = primary.target_identity?;
     Some(
         crate::file_manager::physical_item_id_from_migration_checkpoint(
@@ -4181,6 +4385,120 @@ fn completed_primary_target_item_id(group: &GroupCheckpoint) -> Option<String> {
             &primary.plan.target_path,
         ),
     )
+}
+
+fn completed_primary_file(group: &GroupCheckpoint) -> Option<&FileCheckpoint> {
+    if group.status != MigrationItemPhase::Complete {
+        return None;
+    }
+    let primary = group.files.iter().find(|file| {
+        file.plan.source_path == group.plan.source_path
+            && file.plan.target_path == group.plan.target_path
+    })?;
+    (primary.published && primary.source_removed).then_some(primary)
+}
+
+#[cfg(test)]
+fn completed_primary_file_mut(group: &mut GroupCheckpoint) -> Option<&mut FileCheckpoint> {
+    if group.status != MigrationItemPhase::Complete {
+        return None;
+    }
+    let primary = group.files.iter_mut().find(|file| {
+        file.plan.source_path == group.plan.source_path
+            && file.plan.target_path == group.plan.target_path
+    })?;
+    (primary.published && primary.source_removed).then_some(primary)
+}
+
+fn primary_source_physical_identity(group: &GroupCheckpoint) -> Option<PhysicalItemIdentity> {
+    let primary = completed_primary_file(group)?;
+    Some(PhysicalItemIdentity {
+        device: primary.plan.proof.device,
+        inode: primary.plan.proof.inode,
+        birth_seconds: primary.plan.proof.birth_seconds,
+        birth_nanoseconds: primary.plan.proof.birth_nanoseconds,
+    })
+    .filter(PhysicalItemIdentity::has_complete_birth)
+}
+
+fn primary_target_physical_identity(group: &GroupCheckpoint) -> Option<PhysicalItemIdentity> {
+    let primary = completed_primary_file(group)?;
+    let identity = primary.target_identity?;
+    Some(PhysicalItemIdentity {
+        device: identity.device,
+        inode: identity.inode,
+        birth_seconds: primary.target_birth_seconds,
+        birth_nanoseconds: primary.target_birth_nanoseconds,
+    })
+    .filter(PhysicalItemIdentity::has_complete_birth)
+}
+
+fn legacy_birth_candidate(
+    job: &JobDocument,
+    target_snapshot: &LibrarySnapshot,
+) -> Option<LegacyBirthCandidate> {
+    if !matches!(
+        job.status,
+        MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+    ) {
+        return None;
+    }
+    for (group_index, group) in job.groups.iter().enumerate() {
+        let Some(primary) = completed_primary_file(group) else {
+            continue;
+        };
+        if primary.plan.proof.birth_seconds.is_none()
+            || primary.plan.proof.birth_nanoseconds.is_none()
+            || (primary.target_birth_seconds.is_some()
+                && primary.target_birth_nanoseconds.is_some())
+        {
+            continue;
+        }
+        let Some(target_identity) = primary.target_identity else {
+            continue;
+        };
+        let Some(target_item_id) = completed_primary_target_item_id(group) else {
+            continue;
+        };
+        let mut matching_items = target_snapshot
+            .items
+            .iter()
+            .filter(|item| item.id == target_item_id && item.presence == Presence::Present);
+        let Some(target_item) = matching_items.next() else {
+            continue;
+        };
+        if matching_items.next().is_some() {
+            continue;
+        }
+        let Some(current_identity) = target_item.physical_identity else {
+            continue;
+        };
+        if !current_identity.has_complete_birth()
+            || current_identity.device != target_identity.device
+            || current_identity.inode != target_identity.inode
+            || primary.legacy_birth_verification_attempt == Some(current_identity)
+        {
+            continue;
+        }
+        let Some(target_access) = primary.target_access_policy else {
+            continue;
+        };
+        return Some(LegacyBirthCandidate {
+            group_index,
+            file_index: group.files.iter().position(|file| {
+                file.plan.source_path == primary.plan.source_path
+                    && file.plan.target_path == primary.plan.target_path
+            })?,
+            target_item_id,
+            target_path: target_item.relative_path.clone(),
+            target_identity,
+            expected_size: primary.plan.proof.size,
+            expected_access: target_access.to_bound_file_access_policy(),
+            expected_sha256: primary.plan.proof.sha256.clone(),
+            current_identity,
+        });
+    }
+    None
 }
 
 fn status_from_job(job: &JobDocument) -> MigrationStatus {
@@ -4194,6 +4512,8 @@ fn status_from_job(job: &JobDocument) -> MigrationStatus {
             source_path: group.plan.source_path.clone(),
             target_path: group.plan.target_path.clone(),
             target_item_id: completed_primary_target_item_id(group),
+            source_physical_identity: primary_source_physical_identity(group),
+            target_physical_identity: primary_target_physical_identity(group),
             bytes: group.plan.files.iter().map(|file| file.proof.size).sum(),
             error: group.error.clone(),
             failure_kind: group.failure_kind,

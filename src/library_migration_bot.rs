@@ -1194,7 +1194,7 @@ async fn edit_status_with_context(
 async fn run(
     runtime: &CloudBotRuntime,
     initial: MigrationStatus,
-    _io_lease: LibraryIoLease,
+    io_lease: LibraryIoLease,
 ) -> Result<()> {
     let worker = runtime.clone();
     let source_id = initial.source_library_id.clone();
@@ -1219,11 +1219,17 @@ async fn run(
     }
     if initial.status == MigrationRunStatus::Stopped {
         let status = finish_task_transfers(runtime, &engine, &initial, None).await?;
+        let status =
+            upgrade_legacy_target_birth_once(runtime, &engine, &status, Arc::clone(&io_lease))
+                .await;
         publish_status(runtime, status).await;
         return Ok(());
     }
     if initial.status == MigrationRunStatus::Completed {
         let status = finish_task_transfers(runtime, &engine, &initial, None).await?;
+        let status =
+            upgrade_legacy_target_birth_once(runtime, &engine, &status, Arc::clone(&io_lease))
+                .await;
         if status.status == MigrationRunStatus::Completed {
             apply_success_default(runtime, &engine, &status).await?;
         }
@@ -1304,6 +1310,9 @@ async fn run(
         if terminal {
             let status =
                 finish_task_transfers(runtime, &engine, &status, Some(Arc::clone(&guards))).await?;
+            let status =
+                upgrade_legacy_target_birth_once(runtime, &engine, &status, Arc::clone(&io_lease))
+                    .await;
             if status.status == MigrationRunStatus::Completed {
                 apply_success_default(runtime, &engine, &status).await?;
             }
@@ -1313,6 +1322,76 @@ async fn run(
             return Ok(());
         }
         tokio::task::yield_now().await;
+    }
+}
+
+async fn upgrade_legacy_target_birth_once(
+    runtime: &CloudBotRuntime,
+    engine: &MigrationEngine,
+    status: &MigrationStatus,
+    io_lease: LibraryIoLease,
+) -> MigrationStatus {
+    if !matches!(
+        status.status,
+        MigrationRunStatus::Completed | MigrationRunStatus::Stopped
+    ) {
+        return status.clone();
+    }
+    let unavailable = runtime.library_unavailable.lock().await;
+    if unavailable.contains_key(&status.target_library_id) {
+        return status.clone();
+    }
+    drop(unavailable);
+    let target_snapshot = runtime
+        .library_snapshots
+        .lock()
+        .await
+        .get(&status.target_library_id)
+        .cloned();
+    let Some(target_snapshot) = target_snapshot else {
+        return status.clone();
+    };
+
+    let worker = engine.clone();
+    let id = status.id.clone();
+    let target_id = status.target_library_id.clone();
+    let queue = Arc::clone(&runtime.bot.queue);
+    let retained_io_lease = Arc::clone(&io_lease);
+    match tokio::task::spawn_blocking(move || {
+        let _io_lease = retained_io_lease;
+        let availability = queue.video_library_statuses()?;
+        if !availability
+            .get(&target_id)
+            .is_some_and(|library| library.available)
+        {
+            return Ok(None);
+        }
+        worker
+            .upgrade_one_legacy_target_birth(&id, &target_snapshot)
+            .map(Some)
+    })
+    .await
+    {
+        Ok(Ok(Some(upgrade))) => {
+            if upgrade.remaining {
+                tracing::debug!(migration_id=%status.id, "legacy target verification will continue on a later discovery pass");
+            }
+            if upgrade.attempted {
+                runtime.state_notify.notify_one();
+            }
+            upgrade.status
+        }
+        Ok(Ok(None)) => status.clone(),
+        Ok(Err(error)) => {
+            // A failed read, unavailable provider, or CAS race leaves the job status intact.
+            // Another discovery pass can retry once the target scan is usable.
+            warn!(migration_id=%status.id,error=%redact_sensitive_text(&format!("{error:#}")),"legacy migration target proof upgrade did not complete");
+            status.clone()
+        }
+        Err(error) => {
+            warn!(migration_id=%status.id,error=%error,"legacy migration target proof worker failed");
+            status.clone()
+        }
     }
 }
 

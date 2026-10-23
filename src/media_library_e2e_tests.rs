@@ -156,7 +156,7 @@ fn snapshot_library_metadata_tree(
     entries
 }
 
-fn migration_engine_for_test(
+pub(super) fn migration_engine_for_test(
     runtime: &CloudBotRuntime,
     source_library_id: &str,
     target_library_id: &str,
