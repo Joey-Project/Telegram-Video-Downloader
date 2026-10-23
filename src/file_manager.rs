@@ -7626,7 +7626,22 @@ fn physical_item_id(fingerprint: &FileFingerprint, relative_path: &str) -> Strin
 fn physical_item_id_from_identity(identity: EntryIdentity, relative_path: &str) -> String {
     // Path participates only to keep two hard-link names distinct. The persisted index carries
     // the same ID across a unique Finder move by matching object identity and creation time.
-    let raw = format!("{}:{}:{relative_path}", identity.device(), identity.inode());
+    physical_item_id_from_device_inode(identity.device(), identity.inode(), relative_path)
+}
+
+/// Rebuild the scanned item ID from a durable migration checkpoint's saved target identity.
+/// Keep this formula shared with the scanner so status projection can match a target without
+/// reopening or hashing media files.
+pub(crate) fn physical_item_id_from_migration_checkpoint(
+    device: u64,
+    inode: u64,
+    relative_path: &str,
+) -> String {
+    physical_item_id_from_device_inode(device, inode, relative_path)
+}
+
+fn physical_item_id_from_device_inode(device: u64, inode: u64, relative_path: &str) -> String {
+    let raw = format!("{device}:{inode}:{relative_path}");
     format!("copy-{}", &sha256_bytes(raw.as_bytes())[..24])
 }
 

@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -7,6 +8,188 @@ use serde_json::{Value, json};
 use super::*;
 
 const CLOUD_MIGRATION_HISTORY_LIMIT: usize = 32;
+const MAX_MIGRATION_PROVENANCE_CHAIN_HOPS: usize = 64;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LibraryItemLocation {
+    library_id: String,
+    item_id: String,
+    relative_path: String,
+}
+
+#[derive(Clone, Debug)]
+struct MigrationDestination {
+    location: LibraryItemLocation,
+    created_at: u64,
+    migration_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MovedToProjection {
+    library_id: String,
+    library_name: String,
+    item_id: String,
+    relative_path: String,
+}
+
+fn migration_moved_to_projections(
+    migrations: &BTreeMap<String, crate::library_migration::MigrationStatus>,
+    library_descriptors: &[Value],
+    snapshots: &BTreeMap<String, crate::library::LibrarySnapshot>,
+    unavailable: &BTreeMap<String, String>,
+    availability: &BTreeMap<String, crate::media_libraries::MediaLibraryStatus>,
+) -> HashMap<LibraryItemLocation, MovedToProjection> {
+    use crate::library::Presence;
+    use crate::library_migration::MigrationItemPhase;
+
+    let library_names = library_descriptors
+        .iter()
+        .filter_map(|descriptor| {
+            Some((
+                descriptor.get("id")?.as_str()?.to_string(),
+                descriptor.get("name")?.as_str()?.to_string(),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let available_library = |library_id: &str| {
+        library_names.contains_key(library_id)
+            && !unavailable.contains_key(library_id)
+            && availability
+                .get(library_id)
+                .is_some_and(|status| status.available)
+    };
+
+    let mut present_items = HashSet::new();
+    for (library_id, snapshot) in snapshots {
+        if !available_library(library_id) {
+            continue;
+        }
+        present_items.extend(
+            snapshot
+                .items
+                .iter()
+                .filter(|item| item.presence == Presence::Present)
+                .map(|item| LibraryItemLocation {
+                    library_id: library_id.clone(),
+                    item_id: item.id.clone(),
+                    relative_path: item.relative_path.clone(),
+                }),
+        );
+    }
+
+    let mut destinations = HashMap::<LibraryItemLocation, MigrationDestination>::new();
+    for migration in migrations.values() {
+        for item in &migration.items {
+            let Some(target_item_id) = item.target_item_id.as_ref() else {
+                continue;
+            };
+            if item.status != MigrationItemPhase::Complete
+                || item.item_id.is_empty()
+                || item.source_path.is_empty()
+                || item.target_path.is_empty()
+                || target_item_id.is_empty()
+            {
+                continue;
+            }
+            let source = LibraryItemLocation {
+                library_id: migration.source_library_id.clone(),
+                item_id: item.item_id.clone(),
+                relative_path: item.source_path.clone(),
+            };
+            let destination = MigrationDestination {
+                location: LibraryItemLocation {
+                    library_id: migration.target_library_id.clone(),
+                    item_id: target_item_id.clone(),
+                    relative_path: item.target_path.clone(),
+                },
+                created_at: migration.created_at,
+                migration_id: migration.id.clone(),
+            };
+            let should_replace = destinations.get(&source).is_none_or(|existing| {
+                (destination.created_at, &destination.migration_id)
+                    > (existing.created_at, &existing.migration_id)
+            });
+            if should_replace {
+                destinations.insert(source, destination);
+            }
+        }
+    }
+
+    let mut projections = HashMap::new();
+    for (source, first_destination) in &destinations {
+        let mut current = first_destination.location.clone();
+        let mut visited = HashSet::new();
+        let mut resolved = None;
+        for _ in 0..MAX_MIGRATION_PROVENANCE_CHAIN_HOPS {
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            if present_items.contains(&current) {
+                resolved = Some(current.clone());
+                break;
+            }
+            let Some(next) = destinations.get(&current) else {
+                break;
+            };
+            current = next.location.clone();
+        }
+        let Some(destination) = resolved else {
+            continue;
+        };
+        let Some(library_name) = library_names.get(&destination.library_id) else {
+            continue;
+        };
+        projections.insert(
+            source.clone(),
+            MovedToProjection {
+                library_id: destination.library_id,
+                library_name: library_name.clone(),
+                item_id: destination.item_id,
+                relative_path: destination.relative_path,
+            },
+        );
+    }
+    projections
+}
+
+fn clear_snapshot_moved_to(snapshot: &mut Value) {
+    for item in snapshot["items"].as_array_mut().into_iter().flatten() {
+        if let Some(fields) = item.as_object_mut() {
+            fields.remove("moved_to");
+        }
+    }
+}
+
+fn attach_snapshot_moved_to(
+    snapshot: &mut Value,
+    source_library_id: &str,
+    projections: &HashMap<LibraryItemLocation, MovedToProjection>,
+) {
+    for item in snapshot["items"].as_array_mut().into_iter().flatten() {
+        if item["presence"].as_str() != Some("missing") {
+            continue;
+        }
+        let (Some(item_id), Some(relative_path)) =
+            (item["id"].as_str(), item["relative_path"].as_str())
+        else {
+            continue;
+        };
+        let location = LibraryItemLocation {
+            library_id: source_library_id.to_string(),
+            item_id: item_id.to_string(),
+            relative_path: relative_path.to_string(),
+        };
+        let Some(destination) = projections.get(&location) else {
+            continue;
+        };
+        item["moved_to"] = json!({
+            "library_id": destination.library_id,
+            "library_name": destination.library_name,
+            "item_id": destination.item_id,
+            "relative_path": destination.relative_path,
+        });
+    }
+}
 
 fn cloud_migration_history(
     migrations: &BTreeMap<String, crate::library_migration::MigrationStatus>,
@@ -429,7 +612,7 @@ async fn cloud_migration_preview_confirmability(
 pub(super) async fn attach_library_views(
     runtime: &CloudBotRuntime,
     applied: &Value,
-    legacy: Value,
+    mut legacy: Value,
 ) -> Result<Value> {
     let snapshots = runtime.library_snapshots.lock().await.clone();
     let unavailable = runtime.library_unavailable.lock().await.clone();
@@ -475,6 +658,20 @@ pub(super) async fn attach_library_views(
             }
         }
     };
+    let migration_statuses = runtime.migrations.lock().await;
+    let moved_to = migration_moved_to_projections(
+        &migration_statuses,
+        applied["libraries"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        &snapshots,
+        &unavailable,
+        &availability,
+    );
+    let (history, omitted) = cloud_migration_history(&migration_statuses)?;
+    drop(migration_statuses);
+
     let mut views = Vec::new();
     let mut selected = None;
     for descriptor in applied["libraries"].as_array().into_iter().flatten() {
@@ -491,6 +688,7 @@ pub(super) async fn attach_library_views(
                 "warnings": ["The local media-library scan has not completed."], "ready": false,
             })
         };
+        clear_snapshot_moved_to(&mut snapshot);
         let warning = unavailable.get(id);
         if let Some(warning) = warning {
             merge_cloud_library_scan_warning(&mut snapshot, warning);
@@ -525,6 +723,9 @@ pub(super) async fn attach_library_views(
             .and_then(|summary| summary.staging_bytes)
             .map(|bytes| json!(bytes))
             .unwrap_or(Value::Null);
+        if warning.is_none() && status.is_some_and(|status| status.available) {
+            attach_snapshot_moved_to(&mut snapshot, id, &moved_to);
+        }
         view["snapshot"] = snapshot.clone();
         if id == default_id {
             selected = Some(snapshot);
@@ -534,10 +735,15 @@ pub(super) async fn attach_library_views(
     if let Some(default_snapshot) = selected.as_ref() {
         deduplicate_default_library_snapshot(&mut views, default_id, default_snapshot);
     }
-    let mut library = selected.unwrap_or(legacy);
+    let mut library = match selected {
+        Some(snapshot) => snapshot,
+        None => {
+            clear_snapshot_moved_to(&mut legacy);
+            legacy
+        }
+    };
     library["libraries"] = json!(views);
     library["default_library_id"] = json!(default_id);
-    let (history, omitted) = cloud_migration_history(&*runtime.migrations.lock().await)?;
     library["migrations"] = history;
     library["migration_omitted_count"] = json!(omitted);
     Ok(library)

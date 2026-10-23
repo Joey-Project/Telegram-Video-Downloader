@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { boundedFolderSuggestions, buildMigrationPreviewPayload, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnMediaLibrary, canOperateOnRegisteredMediaLibrary, collectionIdentity, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, LIBRARY_PAGE_SIZE, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget } from "../public/file/library-view.js";
+import { boundedFolderSuggestions, buildMigrationPreviewPayload, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnMediaLibrary, canOperateOnRegisteredMediaLibrary, collectionIdentity, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, LIBRARY_PAGE_SIZE, librarySelectionCounts, MAX_FOLDER_SUGGESTIONS, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, movedToTarget, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget } from "../public/file/library-view.js";
 import { acceptOwnerSnapshot } from "../public/file/snapshot-session.js";
 import { updateSelectionWithinLimit } from "../public/file/selection-limit.js";
 import { renderMigrationPreview } from "../public/file/migration-preview-rendering.js";
@@ -510,6 +510,66 @@ describe("bounded library views", () => {
       { title: "Series", items: [first, renamed] },
       { title: "Series", items: [sameTitleOtherId] },
     ]);
+  });
+
+  it("keeps verified moved records in library history but out of Needs organizing", () => {
+    const moved = {
+      id: "source-item",
+      title: "Moved episode",
+      relative_path: "Shows/episode.mkv",
+      presence: "missing",
+      confidence: "low",
+      metadata_status: "unknown",
+      moved_to: {
+        library_id: "archive",
+        library_name: "Archive",
+        item_id: "target-item",
+        relative_path: "Shows/episode.mkv",
+      },
+    };
+    const ordinaryMissing = { id: "ordinary-missing", title: "Ordinary missing", presence: "missing" };
+    const presentWithStaleMove = {
+      id: "present-source",
+      presence: "present",
+      confidence: "low",
+      metadata_status: "unknown",
+      moved_to: moved.moved_to,
+    };
+    const incompleteMove = { id: "incomplete-move", presence: "missing", moved_to: { ...moved.moved_to, item_id: " " } };
+
+    expect(movedToTarget(moved)).toEqual(moved.moved_to);
+    expect(filterLibraryItems([moved, ordinaryMissing]).map((item) => item.id)).toEqual(["source-item", "ordinary-missing"]);
+    expect(needsOrganizing(moved)).toBe(false);
+    expect(needsOrganizing(ordinaryMissing)).toBe(true);
+    expect(movedToTarget(presentWithStaleMove)).toBeNull();
+    expect(needsOrganizing(presentWithStaleMove)).toBe(true);
+    expect(movedToTarget(incompleteMove)).toBeNull();
+    expect(needsOrganizing(incompleteMove)).toBe(true);
+  });
+
+  it("counts current-page selection eligibility separately from unavailable and read-only rows", () => {
+    const items = [
+      { id: "present-selected", presence: "present" },
+      { id: "present-open", presence: "present" },
+      { id: "missing", presence: "missing" },
+      { id: "unavailable", presence: "unavailable" },
+      { id: "unknown", presence: "unknown" },
+    ];
+
+    expect(librarySelectionCounts(items, new Set(["present-selected"]), true)).toEqual({
+      totalCount: 5,
+      selectedCount: 1,
+      selectableCount: 2,
+      skippedUnavailableCount: 3,
+      readOnlyCount: 0,
+    });
+    expect(librarySelectionCounts(items, new Set(["present-selected"]), false)).toEqual({
+      totalCount: 5,
+      selectedCount: 1,
+      selectableCount: 0,
+      skippedUnavailableCount: 3,
+      readOnlyCount: 2,
+    });
   });
 
   it("sorts known episode orders before missing orders with title fallback", () => {

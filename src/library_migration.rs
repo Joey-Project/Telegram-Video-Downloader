@@ -368,6 +368,8 @@ pub(crate) struct MigrationStatusItem {
     pub(crate) status: MigrationItemPhase,
     pub(crate) source_path: String,
     pub(crate) target_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) target_item_id: Option<String>,
     pub(crate) bytes: u64,
     #[serde(default)]
     pub(crate) error: Option<String>,
@@ -4160,6 +4162,27 @@ fn terminal_finalization_pending(job: &JobDocument) -> bool {
     handoff_cleanup_pending || default_update_pending
 }
 
+fn completed_primary_target_item_id(group: &GroupCheckpoint) -> Option<String> {
+    if group.status != MigrationItemPhase::Complete {
+        return None;
+    }
+    let primary = group.files.iter().find(|file| {
+        file.plan.source_path == group.plan.source_path
+            && file.plan.target_path == group.plan.target_path
+    })?;
+    if !primary.published || !primary.source_removed {
+        return None;
+    }
+    let identity = primary.target_identity?;
+    Some(
+        crate::file_manager::physical_item_id_from_migration_checkpoint(
+            identity.device,
+            identity.inode,
+            &primary.plan.target_path,
+        ),
+    )
+}
+
 fn status_from_job(job: &JobDocument) -> MigrationStatus {
     let task_transfers = task_transfer_statuses_from_job(job);
     let items = job
@@ -4170,6 +4193,7 @@ fn status_from_job(job: &JobDocument) -> MigrationStatus {
             status: group.status,
             source_path: group.plan.source_path.clone(),
             target_path: group.plan.target_path.clone(),
+            target_item_id: completed_primary_target_item_id(group),
             bytes: group.plan.files.iter().map(|file| file.proof.size).sum(),
             error: group.error.clone(),
             failure_kind: group.failure_kind,

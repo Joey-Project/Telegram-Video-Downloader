@@ -278,6 +278,42 @@ export function statusOf(item) {
   return String(item?.presence ?? "unknown").toLowerCase();
 }
 
+export function movedToTarget(item) {
+  if (statusOf(item) !== "missing") return null;
+  const target = item?.moved_to;
+  if (!target || typeof target !== "object" || Array.isArray(target)) return null;
+  const libraryId = target.library_id;
+  const libraryName = target.library_name;
+  const itemId = target.item_id;
+  const relativePath = target.relative_path;
+  if (!validLibraryIdentity(libraryId)
+      || typeof libraryName !== "string" || !libraryName.trim()
+      || typeof itemId !== "string" || !itemId.trim() || itemId.trim() !== itemId
+      || /[\u0000-\u001f\u007f]/u.test(itemId)
+      || typeof relativePath !== "string" || !relativePath.trim()) return null;
+  return {
+    library_id: libraryId,
+    library_name: libraryName,
+    item_id: itemId,
+    relative_path: relativePath,
+  };
+}
+
+export function librarySelectionCounts(items, selectedIds, canOperate) {
+  const rows = Array.isArray(items) ? items : [];
+  const selected = selectedIds && typeof selectedIds[Symbol.iterator] === "function"
+    ? new Set(selectedIds)
+    : new Set();
+  const presentCount = rows.filter((item) => statusOf(item) === "present").length;
+  return {
+    totalCount: rows.length,
+    selectedCount: rows.filter((item) => selected.has(String(item?.id ?? ""))).length,
+    selectableCount: canOperate ? presentCount : 0,
+    skippedUnavailableCount: rows.length - presentCount,
+    readOnlyCount: canOperate ? 0 : presentCount,
+  };
+}
+
 export function collectionIdentity(collection) {
   if (typeof collection === "string") {
     const title = collection.trim();
@@ -323,6 +359,7 @@ function sortLibraryItems(items) {
 }
 
 export function needsOrganizing(item) {
+  if (movedToTarget(item)) return false;
   const confidence = String(item?.confidence ?? "low").toLowerCase();
   const metadata = String(item?.metadata_status ?? "unknown").toLowerCase();
   const hasCollection = Boolean(item?.collection && (typeof item.collection === "string" ? item.collection.trim() : item.collection.title));

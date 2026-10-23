@@ -3,6 +3,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use super::media_library_e2e_tests::{create_migration_fixture, scan_file_item_id};
 use super::*;
 use crate::file_provider::{FileProviderAccessError, QueueFileProvider};
 use crate::library::Presence;
@@ -10,6 +11,139 @@ use anyhow::Result;
 use serde_json::Value;
 
 const SNAPSHOT_TEST_CHAT_ID: i64 = 123_456_789;
+
+async fn wait_for_snapshot_migration_completion(
+    runtime: &CloudBotRuntime,
+    migration_id: &str,
+) -> crate::library_migration::MigrationStatus {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let status = runtime.migrations.lock().await.get(migration_id).cloned();
+            if let Some(status) = status
+                && status.status == crate::library_migration::MigrationRunStatus::Completed
+            {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("mock migration should complete within the test deadline")
+}
+
+async fn wait_for_snapshot_migration_runner_idle(runtime: &CloudBotRuntime, migration_id: &str) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if !runtime
+                .migration_runners
+                .lock()
+                .await
+                .contains(migration_id)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("mock migration runner should settle before scanning");
+}
+
+async fn rescan_snapshot_library(runtime: &CloudBotRuntime, seq: u64, library_id: &str) -> Value {
+    let record = run_library_management_test_request(
+        runtime,
+        seq,
+        "library_scan",
+        serde_json::json!({ "library_id": library_id }),
+    )
+    .await;
+    assert_eq!(record.status, InboxStatus::Completed, "{:?}", record.error);
+    record
+        .result
+        .expect("library scan should return its snapshot")
+}
+
+async fn start_selected_snapshot_migration(
+    runtime: &CloudBotRuntime,
+    seq: u64,
+    source_library_id: &str,
+    target_library_id: &str,
+    item_id: &str,
+) -> String {
+    let preview_record = run_library_management_test_request(
+        runtime,
+        seq,
+        "library_migration_preview",
+        bound_migration_preview_payload(
+            &runtime.bot.queue,
+            source_library_id,
+            target_library_id,
+            serde_json::json!({
+                "scope": "selected",
+                "item_ids": [item_id],
+                "conflict": "skip",
+                "include_incomplete_tasks": false,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        preview_record.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview_record.error
+    );
+    let preview = preview_record
+        .result
+        .expect("migration preview should persist before confirmation");
+    let migration_id = preview["id"]
+        .as_str()
+        .expect("migration preview should contain its durable ID")
+        .to_string();
+    let confirmation = run_library_management_test_request(
+        runtime,
+        seq + 1,
+        "library_migration_confirm",
+        serde_json::json!({ "preview_id": preview["id"], "revision": preview["revision"] }),
+    )
+    .await;
+    assert_eq!(
+        confirmation.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmation.error
+    );
+    migration_id
+}
+
+fn snapshot_item<'a>(items: &'a [Value], item_id: &str) -> &'a Value {
+    items
+        .iter()
+        .find(|item| item["id"] == item_id)
+        .expect("snapshot should retain the requested library item")
+}
+
+fn snapshot_library_view<'a>(library: &'a Value, library_id: &str) -> &'a Value {
+    library["libraries"]
+        .as_array()
+        .expect("cloud library snapshot should include registered libraries")
+        .iter()
+        .find(|view| view["id"] == library_id)
+        .expect("cloud snapshot should include the registered library view")
+}
+
+fn snapshot_library_items(library: &Value, library_id: &str) -> Vec<Value> {
+    if library["default_library_id"] == library_id {
+        return library["items"]
+            .as_array()
+            .expect("default library snapshot should retain its top-level items")
+            .clone();
+    }
+    snapshot_library_view(library, library_id)["snapshot"]["items"]
+        .as_array()
+        .expect("non-default library snapshot should retain nested items")
+        .clone()
+}
 
 #[tokio::test]
 async fn cloud_snapshot_projects_video_library_ids_and_authorized_incomplete_counts() {
@@ -471,6 +605,377 @@ async fn cloud_snapshot_compacts_large_migration_task_details_with_stable_aggreg
     drop(inbox);
     drop(queue);
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn moved_history_follows_verified_migration_targets_after_restart_and_degrades_safely() {
+    let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "moved-history-provenance",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let final_root = fixture.root.join("final-archive");
+    fs::create_dir_all(&final_root).expect("final archive root should create");
+    let final_library = queue
+        .register_video_library("Final Archive", &final_root, None, false, false)
+        .expect("final archive should register");
+    let media_bytes = b"synthetic moved-history video bytes";
+    let nfo_bytes = b"<movie><title>Moved history fixture</title></movie>";
+    fs::write(fixture.video_root.join("clip.mp4"), media_bytes).expect("source media should write");
+    fs::write(fixture.video_root.join("clip.nfo"), nfo_bytes).expect("source sidecar should write");
+
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let source_scan = rescan_snapshot_library(&runtime, 9_101, &fixture.source_library_id).await;
+    let original_source_id = source_scan["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "clip.mp4" && item["presence"] == "present")
+        .expect("source scan should identify the present media")["id"]
+        .as_str()
+        .expect("source item should have its persistent identity")
+        .to_string();
+    let first_migration_id = start_selected_snapshot_migration(
+        &runtime,
+        9_102,
+        &fixture.source_library_id,
+        &fixture.target_library_id,
+        &original_source_id,
+    )
+    .await;
+    let first_status = wait_for_snapshot_migration_completion(&runtime, &first_migration_id).await;
+    assert_eq!(first_status.success_count, 1);
+    wait_for_snapshot_migration_runner_idle(&runtime, &first_migration_id).await;
+    assert!(!fixture.video_root.join("clip.mp4").exists());
+    assert!(!fixture.video_root.join("clip.nfo").exists());
+    assert_eq!(
+        fs::read(fixture.archive_root.join("clip.mp4")).unwrap(),
+        media_bytes
+    );
+    assert_eq!(
+        fs::read(fixture.archive_root.join("clip.nfo")).unwrap(),
+        nfo_bytes
+    );
+
+    runtime.signal_epoch_fatal();
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+
+    let reopened_queue = Arc::new(
+        QueueManager::open(&fixture.config).expect("queue should reload after simulated restart"),
+    );
+    let reopened_inbox = Arc::new(
+        CloudInbox::open_for_epoch(&fixture.video_root, crate::cloud::TEST_DATABASE_EPOCH)
+            .expect("same-epoch inbox should reload after simulated restart"),
+    );
+    let reopened_runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&reopened_queue),
+        Arc::clone(&reopened_inbox),
+    );
+    let reopened_dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
+    crate::library_migration_bot::discover_for_test(&reopened_runtime)
+        .await
+        .expect("durable migration history should reload after restart");
+    wait_for_snapshot_migration_runner_idle(&reopened_runtime, &first_migration_id).await;
+
+    let source_after_first_move =
+        rescan_snapshot_library(&reopened_runtime, 9_111, &fixture.source_library_id).await;
+    let first_source_history_item = snapshot_item(
+        source_after_first_move["items"]
+            .as_array()
+            .expect("source rescan should contain its missing history item"),
+        &original_source_id,
+    );
+    assert_eq!(first_source_history_item["presence"], "missing");
+    let first_target_scan =
+        rescan_snapshot_library(&reopened_runtime, 9_112, &fixture.target_library_id).await;
+    let first_target_id = first_target_scan["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "clip.mp4" && item["presence"] == "present")
+        .expect("first target scan should identify the migrated media")["id"]
+        .as_str()
+        .expect("migrated target should have a new item identity")
+        .to_string();
+    assert_ne!(first_target_id, original_source_id);
+    let persisted_first_status = reopened_runtime
+        .migrations
+        .lock()
+        .await
+        .get(&first_migration_id)
+        .cloned()
+        .expect("discovery should hydrate the completed migration status");
+    assert_eq!(
+        persisted_first_status.items[0].target_item_id.as_deref(),
+        Some(first_target_id.as_str()),
+        "the durable migration should retain the verified target item identity"
+    );
+    let after_first_snapshot = build_cloud_state_snapshot(&reopened_runtime)
+        .await
+        .expect("cloud snapshot should include reloaded migration history")
+        .expect("runtime should publish a cloud snapshot");
+    let first_source_view =
+        snapshot_library_items(&after_first_snapshot.library, &fixture.source_library_id);
+    let source_history_item = snapshot_item(&first_source_view, &original_source_id);
+    assert_eq!(source_history_item["presence"], "missing");
+    assert_eq!(
+        source_history_item["moved_to"]["library_id"],
+        fixture.target_library_id
+    );
+    assert_eq!(source_history_item["moved_to"]["library_name"], "Archive");
+    assert_eq!(source_history_item["moved_to"]["item_id"], first_target_id);
+    assert_eq!(source_history_item["moved_to"]["relative_path"], "clip.mp4");
+
+    let second_source_id = scan_file_item_id(
+        &reopened_runtime,
+        9_113,
+        &fixture.target_library_id,
+        "clip.mp4",
+    )
+    .await;
+    assert_eq!(second_source_id, first_target_id);
+    let second_migration_id = start_selected_snapshot_migration(
+        &reopened_runtime,
+        9_114,
+        &fixture.target_library_id,
+        &final_library.id,
+        &second_source_id,
+    )
+    .await;
+    let second_status =
+        wait_for_snapshot_migration_completion(&reopened_runtime, &second_migration_id).await;
+    assert_eq!(second_status.success_count, 1);
+    wait_for_snapshot_migration_runner_idle(&reopened_runtime, &second_migration_id).await;
+    assert!(!fixture.archive_root.join("clip.mp4").exists());
+    assert!(!fixture.archive_root.join("clip.nfo").exists());
+    assert_eq!(fs::read(final_root.join("clip.mp4")).unwrap(), media_bytes);
+    assert_eq!(fs::read(final_root.join("clip.nfo")).unwrap(), nfo_bytes);
+
+    reopened_runtime.signal_epoch_fatal();
+    reopened_dispatcher.abort();
+    let _ = reopened_dispatcher.await;
+    drop(reopened_runtime);
+    drop(reopened_inbox);
+    drop(reopened_queue);
+
+    let final_queue = Arc::new(
+        QueueManager::open(&fixture.config).expect("queue should reload after the second move"),
+    );
+    let final_inbox = Arc::new(
+        CloudInbox::open_for_epoch(&fixture.video_root, crate::cloud::TEST_DATABASE_EPOCH)
+            .expect("cloud inbox should reopen after the second move"),
+    );
+    let final_runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&final_queue),
+        Arc::clone(&final_inbox),
+    );
+    let final_dispatcher = tokio::spawn(cloud_request_dispatcher(final_runtime.clone()));
+    crate::library_migration_bot::discover_for_test(&final_runtime)
+        .await
+        .expect("both durable migration jobs should reload after restart");
+    wait_for_snapshot_migration_runner_idle(&final_runtime, &first_migration_id).await;
+    wait_for_snapshot_migration_runner_idle(&final_runtime, &second_migration_id).await;
+
+    let source_final_scan =
+        rescan_snapshot_library(&final_runtime, 9_121, &fixture.source_library_id).await;
+    let intermediate_final_scan =
+        rescan_snapshot_library(&final_runtime, 9_122, &fixture.target_library_id).await;
+    let final_target_scan = rescan_snapshot_library(&final_runtime, 9_123, &final_library.id).await;
+    let final_target_id = final_target_scan["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "clip.mp4" && item["presence"] == "present")
+        .expect("final target scan should identify the current migrated media")["id"]
+        .as_str()
+        .expect("final target should have its own item identity")
+        .to_string();
+    assert_ne!(final_target_id, first_target_id);
+    let final_history_snapshot = build_cloud_state_snapshot(&final_runtime)
+        .await
+        .expect("cloud snapshot should rebuild from reloaded history and fresh scans")
+        .expect("runtime should publish a cloud snapshot");
+    let source_items =
+        snapshot_library_items(&final_history_snapshot.library, &fixture.source_library_id);
+    let intermediate_items =
+        snapshot_library_items(&final_history_snapshot.library, &fixture.target_library_id);
+    let source_history_item = snapshot_item(&source_items, &original_source_id);
+    let intermediate_history_item = snapshot_item(&intermediate_items, &first_target_id);
+    for history_item in [source_history_item, intermediate_history_item] {
+        assert_eq!(history_item["presence"], "missing");
+        assert_eq!(history_item["moved_to"]["library_id"], final_library.id);
+        assert_eq!(history_item["moved_to"]["library_name"], "Final Archive");
+        assert_eq!(history_item["moved_to"]["item_id"], final_target_id);
+        assert_eq!(history_item["moved_to"]["relative_path"], "clip.mp4");
+    }
+    let durable_history = final_history_snapshot.library["migrations"]
+        .as_array()
+        .expect("snapshot should expose durable migration history");
+    let durable_second_job = durable_history
+        .iter()
+        .find(|job| job["id"] == second_migration_id)
+        .expect("reloaded snapshot should include the second migration job");
+    assert_eq!(
+        durable_second_job["items"][0]["target_item_id"],
+        final_target_id
+    );
+    assert_eq!(source_final_scan["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        intermediate_final_scan["items"].as_array().unwrap().len(),
+        1
+    );
+
+    // A missing target and a replacement at the same path must not keep an old link alive.
+    fs::remove_file(final_root.join("clip.mp4")).expect("final target media should be removable");
+    let missing_target_scan =
+        rescan_snapshot_library(&final_runtime, 9_124, &final_library.id).await;
+    let missing_target_id = missing_target_scan["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "clip.mp4")
+        .expect("target scan should retain the missing media history")["id"]
+        .as_str()
+        .expect("missing target history should retain its item identity")
+        .to_string();
+    assert_eq!(missing_target_id, final_target_id);
+    let missing_target_snapshot = build_cloud_state_snapshot(&final_runtime)
+        .await
+        .expect("snapshot should rebuild after target removal")
+        .expect("runtime should publish after target removal");
+    for library_id in [&fixture.source_library_id, &fixture.target_library_id] {
+        let items = snapshot_library_items(&missing_target_snapshot.library, library_id);
+        assert!(
+            snapshot_item(
+                &items,
+                if library_id == &fixture.source_library_id {
+                    &original_source_id
+                } else {
+                    &first_target_id
+                }
+            )
+            .get("moved_to")
+            .is_none(),
+            "missing final target must invalidate every earlier moved-to link"
+        );
+    }
+
+    fs::write(
+        final_root.join("clip.mp4"),
+        b"replacement media at the same path",
+    )
+    .expect("replacement target media should write");
+    let replaced_target_scan =
+        rescan_snapshot_library(&final_runtime, 9_125, &final_library.id).await;
+    let replacement_target_id = replaced_target_scan["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "clip.mp4" && item["presence"] == "present")
+        .expect("replacement target should scan as present")["id"]
+        .as_str()
+        .expect("replacement should receive a physical-copy identity")
+        .to_string();
+    assert_ne!(replacement_target_id, final_target_id);
+    let replaced_target_snapshot = build_cloud_state_snapshot(&final_runtime)
+        .await
+        .expect("snapshot should rebuild after target replacement")
+        .expect("runtime should publish after target replacement");
+    for library_id in [&fixture.source_library_id, &fixture.target_library_id] {
+        let items = snapshot_library_items(&replaced_target_snapshot.library, library_id);
+        let historical_id = if library_id == &fixture.source_library_id {
+            &original_source_id
+        } else {
+            &first_target_id
+        };
+        assert!(
+            snapshot_item(&items, historical_id)
+                .get("moved_to")
+                .is_none(),
+            "a different physical target at the same path must not retain a moved-to link"
+        );
+    }
+
+    final_runtime.library_unavailable.lock().await.insert(
+        final_library.id.clone(),
+        "synthetic target scan unavailable".to_string(),
+    );
+    let unavailable_target_snapshot = build_cloud_state_snapshot(&final_runtime)
+        .await
+        .expect("snapshot should retain cached data while marking the target unavailable")
+        .expect("runtime should publish with an unavailable target");
+    assert_eq!(
+        snapshot_library_view(&unavailable_target_snapshot.library, &final_library.id)["availability"],
+        "unavailable"
+    );
+    for library_id in [&fixture.source_library_id, &fixture.target_library_id] {
+        let items = snapshot_library_items(&unavailable_target_snapshot.library, library_id);
+        let historical_id = if library_id == &fixture.source_library_id {
+            &original_source_id
+        } else {
+            &first_target_id
+        };
+        assert!(
+            snapshot_item(&items, historical_id)
+                .get("moved_to")
+                .is_none(),
+            "an unavailable target must invalidate every earlier moved-to link"
+        );
+    }
+    final_runtime
+        .library_unavailable
+        .lock()
+        .await
+        .remove(&final_library.id);
+
+    fs::write(fixture.video_root.join("clip.mp4"), media_bytes)
+        .expect("reappearing source media should write");
+    let reappeared_scan =
+        rescan_snapshot_library(&final_runtime, 9_126, &fixture.source_library_id).await;
+    let reappeared_item = reappeared_scan["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["relative_path"] == "clip.mp4" && item["presence"] == "present")
+        .expect("reappeared source should scan as present");
+    assert!(
+        reappeared_item.get("moved_to").is_none(),
+        "a source path that reappears must not be reported as a missing moved item"
+    );
+    let reappeared_snapshot = build_cloud_state_snapshot(&final_runtime)
+        .await
+        .expect("snapshot should rebuild after source reappearance")
+        .expect("runtime should publish after source reappearance");
+    let source_items =
+        snapshot_library_items(&reappeared_snapshot.library, &fixture.source_library_id);
+    let source_path_item = source_items
+        .iter()
+        .find(|item| item["relative_path"] == "clip.mp4" && item["presence"] == "present")
+        .expect("source snapshot should show the reappeared media");
+    assert!(source_path_item.get("moved_to").is_none());
+
+    final_runtime.signal_epoch_fatal();
+    final_dispatcher.abort();
+    let _ = final_dispatcher.await;
+    drop(final_runtime);
+    drop(final_inbox);
+    drop(final_queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(&fixture.root);
 }
 
 #[test]
