@@ -1311,6 +1311,72 @@ fn queue_index_contents(root: &Path) -> Vec<u8> {
         .expect("queue index should be readable")
 }
 
+fn queue_history_contains(queue: &QueueManager, chat_id: i64, task_id: &str) -> bool {
+    let page_count = queue
+        .page_count(chat_id, true)
+        .expect("completed task history page count should load");
+    (0..page_count).any(|page| {
+        queue
+            .list(chat_id, true, page)
+            .expect("completed task history page should load")
+            .iter()
+            .any(|record| record.id == task_id)
+    })
+}
+
+fn publish_task_record_as_legacy_media_sidecar(video_root: &Path, task_id: &str) -> PathBuf {
+    let index_path = video_root.join(".telegram-video-downloader-queue/index.json");
+    let mut index: serde_json::Value = serde_json::from_slice(&queue_index_contents(video_root))
+        .expect("queue index should decode for the legacy sidecar fixture");
+    let indexed_path = PathBuf::from(
+        index["tasks"][task_id]["record_path"]
+            .as_str()
+            .expect("task index should store its record path"),
+    );
+    assert!(
+        !indexed_path.is_absolute(),
+        "current queue fixture paths should be root-relative"
+    );
+    let source_path = video_root.join(indexed_path);
+    let sidecar_path = video_root
+        .join(task_id)
+        .join(format!(".telegram-video-downloader-task-{task_id}.json"));
+    fs::rename(&source_path, &sidecar_path)
+        .expect("completed task record should move beside its published media");
+    let relative_sidecar_path = sidecar_path
+        .strip_prefix(video_root)
+        .expect("legacy sidecar should remain beneath the media root")
+        .to_string_lossy()
+        .into_owned();
+    index["tasks"][task_id]["record_path"] = serde_json::json!(relative_sidecar_path);
+    index["tasks"][task_id]["move_target"] = serde_json::Value::Null;
+    fs::write(
+        index_path,
+        serde_json::to_vec(&index).expect("legacy sidecar index should encode"),
+    )
+    .expect("legacy sidecar path should persist in the queue index");
+    sidecar_path
+}
+
+fn set_legacy_saved_location_display(video_root: &Path, task_id: &str, display: &str) {
+    let index: serde_json::Value = serde_json::from_slice(&queue_index_contents(video_root))
+        .expect("queue index should decode for the legacy display-path fixture");
+    let record_path = index["tasks"][task_id]["record_path"]
+        .as_str()
+        .expect("task index should store its record path");
+    let record_path = video_root.join(record_path);
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &fs::read(&record_path).expect("legacy task record should be readable"),
+    )
+    .expect("legacy task record should decode");
+    record["saved_location"] = serde_json::json!(display);
+    fs::write(
+        record_path,
+        serde_json::to_vec(&record).expect("legacy task record should encode"),
+    )
+    .expect("legacy display path should persist in the task record");
+}
+
 fn open_runtime_test_inbox_with_file_provider(
     root: &Path,
     file_provider: Arc<dyn QueueFileProvider>,
@@ -3557,11 +3623,115 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
             task_id: "pgc-md1376",
             url: "https://www.bilibili.com/bangumi/media/md1376",
             collection_title: Some("家庭教师HITMAN REBORN!"),
-            canonical_season_id: Some(1376),
+            canonical_season_id: None,
             entries: md1376_entries,
             with_verified_attempt: true,
         },
     );
+    let md1376_sidecar_path =
+        publish_task_record_as_legacy_media_sidecar(&config.downloads.video_dir, "pgc-md1376");
+    let md1376_before_backfill = queue
+        .get("pgc-md1376")
+        .expect("legacy md1376 task should load from its sidecar")
+        .expect("legacy md1376 task should remain indexed");
+    let md1376_before_plan = md1376_before_backfill
+        .plan
+        .as_ref()
+        .expect("legacy md1376 plan should persist");
+    assert_eq!(md1376_before_backfill.status, TaskStatus::Completed);
+    assert_eq!(md1376_before_plan.bilibili_pgc_season_id, None);
+    assert!(md1376_before_plan.bilibili_pgc_episode_orders.is_empty());
+    assert_eq!(md1376_before_plan.bilibili_group_entries.len(), 203);
+    let md1376_before_attempt = serde_json::to_value(&md1376_before_backfill.bilibili_attempt)
+        .expect("legacy md1376 receipt should serialize");
+    let md1376_before_hashes = md1376_before_backfill.primary_media_hashes.clone();
+    let md1376_before_saved_location = md1376_before_backfill.saved_location.clone();
+    let md1376_first_bytes = fs::read(config.downloads.video_dir.join(&md1376_paths[0]))
+        .expect("first published episode should be readable before backfill");
+    let md1376_last_bytes = fs::read(
+        config.downloads.video_dir.join(
+            md1376_paths
+                .last()
+                .expect("203-entry fixture should have a final episode"),
+        ),
+    )
+    .expect("last published episode should be readable before backfill");
+    let legacy_multi_output_paths = add_completed_bilibili_plan_fixture(
+        &queue,
+        &config.downloads.video_dir,
+        PgcFixtureTaskSpec {
+            ordinal: 12,
+            task_id: "pgc-legacy-multi-output",
+            url: "https://www.bilibili.com/bangumi/media/md20000",
+            collection_title: Some("Legacy Multi-output Season"),
+            canonical_season_id: None,
+            entries: vec![
+                PgcFixtureEntry {
+                    index: 1,
+                    stable_media_id: pgc_test_stable_media_id(120_001, 20_001),
+                    nfo_collection: None,
+                },
+                PgcFixtureEntry {
+                    index: 2,
+                    stable_media_id: pgc_test_stable_media_id(120_002, 20_002),
+                    nfo_collection: None,
+                },
+            ],
+            with_verified_attempt: false,
+        },
+    );
+    let legacy_multi_output_saved_location = legacy_multi_output_paths
+        .iter()
+        .map(|path| config.downloads.video_dir.join(path).display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    set_legacy_saved_location_display(
+        &config.downloads.video_dir,
+        "pgc-legacy-multi-output",
+        &legacy_multi_output_saved_location,
+    );
+    for path in &legacy_multi_output_paths {
+        let nfo_path = config.downloads.video_dir.join(path).with_extension("nfo");
+        let nfo = fs::read_to_string(&nfo_path)
+            .expect("legacy multi-output fixture NFO should be readable")
+            .replace(
+                "https://www.bilibili.com/bangumi/media/md1376",
+                "https://www.bilibili.com/bangumi/media/md20000",
+            );
+        fs::write(nfo_path, nfo).expect("legacy multi-output NFO should use its source URL");
+    }
+    let legacy_multi_output_sidecar_path = publish_task_record_as_legacy_media_sidecar(
+        &config.downloads.video_dir,
+        "pgc-legacy-multi-output",
+    );
+    let legacy_multi_output_before = queue
+        .get("pgc-legacy-multi-output")
+        .expect("legacy multi-output task should load from its sidecar")
+        .expect("legacy multi-output task should remain indexed");
+    assert_eq!(legacy_multi_output_before.status, TaskStatus::Completed);
+    assert!(legacy_multi_output_before.bilibili_attempt.is_none());
+    assert_eq!(
+        legacy_multi_output_before.saved_location.as_deref(),
+        Some(legacy_multi_output_saved_location.as_str())
+    );
+    assert_eq!(
+        legacy_multi_output_before.primary_media_hashes.len(),
+        legacy_multi_output_paths.len(),
+        "each legacy output should have independent persisted primary-media evidence"
+    );
+    let legacy_multi_output_hashes = legacy_multi_output_before.primary_media_hashes.clone();
+    let legacy_multi_output_plan = legacy_multi_output_before
+        .plan
+        .as_ref()
+        .expect("legacy multi-output plan should persist")
+        .clone();
+    let legacy_multi_output_media = legacy_multi_output_paths
+        .iter()
+        .map(|path| {
+            fs::read(config.downloads.video_dir.join(path))
+                .expect("legacy multi-output media should be readable before backfill")
+        })
+        .collect::<Vec<_>>();
     let ss_paths = add_completed_bilibili_plan_fixture(
         &queue,
         &config.downloads.video_dir,
@@ -3794,6 +3964,13 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
     let legacy_before_saved_location = legacy_before_backfill.saved_location.clone();
     let resolver_url = "https://www.bilibili.com/bangumi/media/md18102";
     let resolver_episode_id = 95_102_u64;
+    let legacy_multi_output_resolver_url = "https://www.bilibili.com/bangumi/media/md20000";
+    let legacy_multi_output_episode_orders =
+        BTreeMap::from([(20_001_u64, 1_u32), (20_002_u64, 2_u32)]);
+    let md1376_resolver_url = "https://www.bilibili.com/bangumi/media/md1376";
+    let md1376_resolver_episode_orders = (1..=203_u32)
+        .map(|index| (10_000 + u64::from(index), index))
+        .collect::<BTreeMap<_, _>>();
     let backfill_cursor =
         crate::pgc_metadata_backfill::backfill_legacy_pgc_metadata_with_resolver_for_test(
             Arc::clone(&queue),
@@ -3802,11 +3979,24 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
             &root_binding,
             None,
             move |_config: Arc<AppConfig>, url: String| {
-                let identity =
-                    (url == resolver_url).then(|| crate::downloader::BilibiliPgcSeasonIdentity {
+                let identity = if url == md1376_resolver_url {
+                    Some(crate::downloader::BilibiliPgcSeasonIdentity {
+                        season_id: 1376,
+                        episode_orders: md1376_resolver_episode_orders.clone(),
+                    })
+                } else if url == legacy_multi_output_resolver_url {
+                    Some(crate::downloader::BilibiliPgcSeasonIdentity {
+                        season_id: 20_001,
+                        episode_orders: legacy_multi_output_episode_orders.clone(),
+                    })
+                } else if url == resolver_url {
+                    Some(crate::downloader::BilibiliPgcSeasonIdentity {
                         season_id: 18_102,
                         episode_orders: BTreeMap::from([(resolver_episode_id, 10)]),
-                    });
+                    })
+                } else {
+                    None
+                };
                 async move { Ok(identity) }
             },
         )
@@ -3814,6 +4004,110 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
     assert!(
         backfill_cursor.is_some(),
         "legacy metadata backfill pass should run against the temporary queue"
+    );
+    let md1376_after_backfill = queue
+        .get("pgc-md1376")
+        .expect("backfilled md1376 task should load")
+        .expect("backfilled md1376 sidecar should remain indexed");
+    assert_eq!(md1376_after_backfill.status, md1376_before_backfill.status);
+    assert!(md1376_after_backfill.revision > md1376_before_backfill.revision);
+    assert_eq!(
+        md1376_after_backfill.updated_at,
+        md1376_before_backfill.updated_at
+    );
+    assert_eq!(
+        md1376_after_backfill.generation,
+        md1376_before_backfill.generation
+    );
+    assert_eq!(
+        md1376_after_backfill.activity_revision,
+        md1376_before_backfill.activity_revision
+    );
+    assert_eq!(
+        md1376_after_backfill.user_actions,
+        md1376_before_backfill.user_actions
+    );
+    assert_eq!(
+        md1376_after_backfill.primary_media_hashes,
+        md1376_before_hashes
+    );
+    assert_eq!(
+        md1376_after_backfill.saved_location,
+        md1376_before_saved_location
+    );
+    assert_eq!(
+        serde_json::to_value(&md1376_after_backfill.bilibili_attempt)
+            .expect("backfilled md1376 receipt should serialize"),
+        md1376_before_attempt,
+        "metadata-only backfill must preserve published episode receipts"
+    );
+    let md1376_after_plan = md1376_after_backfill
+        .plan
+        .as_ref()
+        .expect("backfilled md1376 plan should remain present");
+    assert_eq!(md1376_after_plan.bilibili_pgc_season_id, Some(1376));
+    assert_eq!(md1376_after_plan.bilibili_pgc_episode_orders.len(), 203);
+    assert_eq!(
+        md1376_after_plan.bilibili_group_entries,
+        md1376_before_plan.bilibili_group_entries
+    );
+    for (episode_id, expected_order) in [(10_001_u64, 1_u32), (10_203, 203)] {
+        let stable_media_id = pgc_test_stable_media_id(9_000 + (episode_id - 10_000), episode_id);
+        assert_eq!(
+            md1376_after_plan
+                .bilibili_pgc_episode_orders
+                .iter()
+                .find(|entry| entry.stable_media_id == stable_media_id)
+                .map(|entry| entry.index),
+            Some(expected_order),
+            "resolver order should be retained for episode {expected_order}"
+        );
+    }
+    let md1376_index: serde_json::Value =
+        serde_json::from_slice(&queue_index_contents(&config.downloads.video_dir))
+            .expect("queue index should decode after metadata backfill");
+    assert_eq!(
+        md1376_index["tasks"]["pgc-md1376"]["record_path"],
+        "pgc-md1376/.telegram-video-downloader-task-pgc-md1376.json"
+    );
+    assert!(md1376_sidecar_path.is_file());
+    assert!(
+        !config
+            .downloads
+            .video_dir
+            .join(".telegram-video-downloader-queue/task-pgc-md1376.json")
+            .exists(),
+        "metadata backfill must not move the legacy task sidecar into the active queue"
+    );
+    assert_eq!(
+        md1376_index["tasks"]["pgc-md1376"]["revision"],
+        md1376_after_backfill.revision
+    );
+    assert_eq!(
+        md1376_index["tasks"]["pgc-md1376"]["updated_at"],
+        md1376_before_backfill.updated_at
+    );
+    assert!(
+        queue_history_contains(&queue, 123_456_789, "pgc-md1376"),
+        "backfilled md1376 task should remain in completed history across all pages"
+    );
+    assert_eq!(
+        fs::read(config.downloads.video_dir.join(&md1376_paths[0]))
+            .expect("first published episode should remain readable"),
+        md1376_first_bytes,
+        "PGC metadata backfill must not redownload or rewrite episode media"
+    );
+    assert_eq!(
+        fs::read(
+            config.downloads.video_dir.join(
+                md1376_paths
+                    .last()
+                    .expect("203-entry fixture should have a final episode")
+            )
+        )
+        .expect("last published episode should remain readable"),
+        md1376_last_bytes,
+        "PGC metadata backfill must not redownload or rewrite episode media"
     );
     let backfilled_record = queue
         .get("pgc-legacy-md-single-order10")
@@ -3837,6 +4131,98 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
         backfilled_plan.bilibili_group_entries.is_empty(),
         "metadata backfill must not turn one selected episode into independent group execution"
     );
+
+    let legacy_multi_output_after = queue
+        .get("pgc-legacy-multi-output")
+        .expect("backfilled legacy multi-output task should load")
+        .expect("backfilled legacy multi-output sidecar should remain indexed");
+    assert_eq!(
+        legacy_multi_output_after.status,
+        legacy_multi_output_before.status
+    );
+    assert!(
+        legacy_multi_output_after.revision > legacy_multi_output_before.revision,
+        "metadata-only backfill should advance the record revision"
+    );
+    assert_eq!(
+        legacy_multi_output_after.updated_at,
+        legacy_multi_output_before.updated_at
+    );
+    assert_eq!(
+        legacy_multi_output_after.generation,
+        legacy_multi_output_before.generation
+    );
+    assert_eq!(
+        legacy_multi_output_after.activity_revision,
+        legacy_multi_output_before.activity_revision
+    );
+    assert_eq!(
+        legacy_multi_output_after.user_actions,
+        legacy_multi_output_before.user_actions
+    );
+    assert!(legacy_multi_output_after.bilibili_attempt.is_none());
+    assert_eq!(
+        legacy_multi_output_after.primary_media_hashes, legacy_multi_output_hashes,
+        "metadata-only backfill must preserve both primary-media path/hash entries"
+    );
+    assert_eq!(
+        legacy_multi_output_after.saved_location.as_deref(),
+        Some(legacy_multi_output_saved_location.as_str()),
+        "legacy comma-separated display path must remain byte-for-byte unchanged"
+    );
+    let legacy_multi_output_after_plan = legacy_multi_output_after
+        .plan
+        .as_ref()
+        .expect("backfilled legacy multi-output plan should remain present");
+    assert_eq!(
+        legacy_multi_output_after_plan.bilibili_pgc_season_id,
+        Some(20_001)
+    );
+    assert_eq!(
+        legacy_multi_output_after_plan
+            .bilibili_pgc_episode_orders
+            .len(),
+        2
+    );
+    for (episode_id, expected_order) in [(20_001_u64, 1_u32), (20_002, 2)] {
+        let stable_media_id = pgc_test_stable_media_id(100_000 + episode_id, episode_id);
+        assert_eq!(
+            legacy_multi_output_after_plan
+                .bilibili_pgc_episode_orders
+                .iter()
+                .find(|entry| entry.stable_media_id == stable_media_id)
+                .map(|entry| entry.index),
+            Some(expected_order)
+        );
+    }
+    assert_eq!(
+        legacy_multi_output_after_plan.bilibili_group_entries,
+        legacy_multi_output_plan.bilibili_group_entries,
+        "metadata backfill must preserve the original plan entries"
+    );
+    let legacy_multi_output_index: serde_json::Value =
+        serde_json::from_slice(&queue_index_contents(&config.downloads.video_dir))
+            .expect("queue index should decode after multi-output backfill");
+    assert_eq!(
+        legacy_multi_output_index["tasks"]["pgc-legacy-multi-output"]["record_path"],
+        "pgc-legacy-multi-output/.telegram-video-downloader-task-pgc-legacy-multi-output.json"
+    );
+    assert!(legacy_multi_output_sidecar_path.is_file());
+    assert!(
+        queue_history_contains(&queue, 123_456_789, "pgc-legacy-multi-output"),
+        "metadata backfill must preserve the completed task across history pages"
+    );
+    for (path, before_bytes) in legacy_multi_output_paths
+        .iter()
+        .zip(&legacy_multi_output_media)
+    {
+        assert_eq!(
+            fs::read(config.downloads.video_dir.join(path))
+                .expect("legacy multi-output media should remain readable"),
+            *before_bytes,
+            "PGC metadata backfill must not redownload or rewrite published media"
+        );
+    }
 
     let (telegram, mut telegram_requests, telegram_shutdown, telegram_server) =
         spawn_fake_telegram_api().await;
@@ -3889,16 +4275,18 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
     assert_eq!(md1376_paths.len(), 203);
     assert_eq!(
         items.len(),
-        218,
+        220,
         "cloud snapshot should retain every fixture item"
     );
     assert_eq!(
         items
             .iter()
-            .filter(|item| item["collection"]["id"] == "ss1376")
+            .filter(|item| {
+                item["collection"]["id"] == "ss1376" || item["collection"]["id"] == "ss20001"
+            })
             .count(),
-        203,
-        "cloud snapshot should retain all 203 PGC collection annotations"
+        205,
+        "cloud snapshot should retain each resolved PGC collection annotation"
     );
 
     let md_first = cloud_snapshot_item_for_path(items, &md1376_paths[0]);
@@ -3914,6 +4302,18 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
     assert_eq!(md_last["collection"]["order"], 203);
     assert_eq!(md_last["collection"]["part_id"], "10203");
     assert_eq!(md_last["metadata_status"], "complete");
+
+    for (path, order, part_id) in [
+        (&legacy_multi_output_paths[0], 1, "20001"),
+        (&legacy_multi_output_paths[1], 2, "20002"),
+    ] {
+        let item = cloud_snapshot_item_for_path(items, path);
+        assert_eq!(item["collection"]["id"], "ss20001");
+        assert_eq!(item["collection"]["title"], "Legacy Multi-output Season");
+        assert_eq!(item["collection"]["kind"], "bilibili_season");
+        assert_eq!(item["collection"]["order"], order);
+        assert_eq!(item["collection"]["part_id"], part_id);
+    }
 
     let ss_first = cloud_snapshot_item_for_path(items, &ss_paths[0]);
     assert_eq!(ss_first["collection"]["id"], "nfo-curated-set");

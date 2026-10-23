@@ -3239,9 +3239,7 @@ impl QueueManager {
                 continue;
             }
 
-            let active_path = store.task_path(task_id)?;
-            let history_path = store.terminal_history_path(task_id)?;
-            if entry.record_path != active_path && entry.record_path != history_path {
+            if !pgc_backfill_record_path_shape(&store, task_id, &entry.record_path)? {
                 continue;
             }
 
@@ -3255,6 +3253,9 @@ impl QueueManager {
                 continue;
             }
             if !is_pgc_metadata_backfill_candidate(&record) {
+                continue;
+            }
+            if !pgc_backfill_record_path_matches(&store, &record, &entry.record_path)? {
                 continue;
             }
             if let Some(destination) = record.destination.as_ref()
@@ -3319,9 +3320,7 @@ impl QueueManager {
         if entry.chat_id != snapshot.chat_id || entry.move_target.is_some() {
             return Ok(false);
         }
-        let active_path = store.task_path(&snapshot.id)?;
-        let history_path = store.terminal_history_path(&snapshot.id)?;
-        if entry.record_path != active_path && entry.record_path != history_path {
+        if !pgc_backfill_record_path_shape(&store, &snapshot.id, &entry.record_path)? {
             return Ok(false);
         }
 
@@ -3330,8 +3329,14 @@ impl QueueManager {
         };
         if record.id != snapshot.id
             || record.chat_id != snapshot.chat_id
+            || record.original_url != snapshot.original_url
             || record.generation != snapshot.generation
             || record.job != snapshot.job
+            || record.destination != snapshot.destination
+            || record.saved_location != snapshot.saved_location
+            || record.primary_media_hashes != snapshot.primary_media_hashes
+            || record.primary_media_hash_manifest != snapshot.primary_media_hash_manifest
+            || record.bilibili_attempt != snapshot.bilibili_attempt
             || record.status != snapshot.status
             || record.plan != snapshot.plan
             || record.revision != snapshot.revision
@@ -3340,6 +3345,9 @@ impl QueueManager {
             || record.updated_at != entry.updated_at
             || !is_stable_published_terminal_bilibili_record(&record)
         {
+            return Ok(false);
+        }
+        if !pgc_backfill_record_path_matches(&store, &record, &entry.record_path)? {
             return Ok(false);
         }
         if let Some(destination) = record.destination.as_ref()
@@ -6773,11 +6781,7 @@ impl DownloadStore {
     fn normalize_media_path(&self, path: &Path) -> Result<PathBuf> {
         let normalized_path = crate::media_libraries::normalize_trusted_macos_alias(path)?;
         let relative = self
-            .root_aliases
-            .iter()
-            .filter_map(|root| crate::media_libraries::normalize_trusted_macos_alias(root).ok())
-            .find_map(|root| normalized_path.strip_prefix(root).ok())
-            .or_else(|| normalized_path.strip_prefix(self.root.root_path()).ok())
+            .media_path_relative_to_root(&normalized_path)
             .ok_or_else(|| {
                 anyhow!("published media path is outside its configured download root")
             })?;
@@ -6789,6 +6793,80 @@ impl DownloadStore {
             bail!("published media path is not a file within its configured download root");
         }
         Ok(self.root_path.join(relative))
+    }
+
+    fn normalize_media_path_if_within_root(&self, path: &Path) -> Result<Option<PathBuf>> {
+        let normalized_path = crate::media_libraries::normalize_trusted_macos_alias(path)?;
+        let Some(relative) = self.media_path_relative_to_root(&normalized_path) else {
+            return Ok(None);
+        };
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.root_path.join(relative)))
+    }
+
+    fn normalize_saved_location_if_within_root(
+        &self,
+        path: &Path,
+    ) -> Result<Option<(PathBuf, bool)>> {
+        let normalized_path = crate::media_libraries::normalize_trusted_macos_alias(path)?;
+        let Some(relative) = self.media_path_relative_to_root(&normalized_path) else {
+            return Ok(None);
+        };
+        if relative.as_os_str().is_empty() {
+            // Bilibili groups can persist the configured output root itself as their folder.
+            // Its descriptor is the authoritative directory identity; do not try to bind the
+            // root as a child entry.
+            self.root.validate_configured_root()?;
+            if !self.root.root_identity().is_dir() {
+                return Ok(None);
+            }
+            return Ok(Some((self.root_path.clone(), true)));
+        }
+        if relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Ok(None);
+        }
+        let normalized_path = self.root_path.join(relative);
+        let Some(identity) = self
+            .root
+            .entry_identity_if_parent_exists(&normalized_path)?
+        else {
+            return Ok(None);
+        };
+        let is_directory = if identity.is_dir() {
+            true
+        } else if identity.is_file() {
+            false
+        } else {
+            return Ok(None);
+        };
+        Ok(Some((normalized_path, is_directory)))
+    }
+
+    fn media_path_relative_to_root(&self, normalized_path: &Path) -> Option<PathBuf> {
+        self.root_aliases
+            .iter()
+            .filter_map(|root| crate::media_libraries::normalize_trusted_macos_alias(root).ok())
+            .find_map(|root| {
+                normalized_path
+                    .strip_prefix(root)
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
+            .or_else(|| {
+                normalized_path
+                    .strip_prefix(self.root.root_path())
+                    .ok()
+                    .map(Path::to_path_buf)
+            })
     }
 
     fn ensure_private_directory(&self) -> Result<()> {
@@ -7720,10 +7798,182 @@ fn bump_chat_activity(index: &mut StoreIndex, chat_id: i64) -> u64 {
     activity.revision
 }
 
+fn pgc_backfill_record_path_shape(
+    store: &DownloadStore,
+    task_id: &str,
+    path: &Path,
+) -> Result<bool> {
+    if path == store.task_path(task_id)? || path == store.terminal_history_path(task_id)? {
+        return Ok(true);
+    }
+
+    // This is only a pre-read gate. A legacy sidecar with the task's exact persisted basename
+    // may be read through RootedFs, then must match the publication-derived destination below.
+    let expected_name = format!(".telegram-video-downloader-task-{task_id}.json");
+    Ok(path.starts_with(&store.root_path)
+        && path.file_name() == Some(std::ffi::OsStr::new(&expected_name)))
+}
+
+enum PgcBackfillSidecarEvidence {
+    OutputPaths(Vec<PathBuf>),
+    SavedLocation { path: PathBuf, is_directory: bool },
+}
+
+fn pgc_backfill_record_path_matches(
+    store: &DownloadStore,
+    record: &TaskRecord,
+    path: &Path,
+) -> Result<bool> {
+    if path == store.task_path(&record.id)? || path == store.terminal_history_path(&record.id)? {
+        return Ok(true);
+    }
+    if !pgc_backfill_record_path_shape(store, &record.id, path)? {
+        return Ok(false);
+    }
+
+    let Some(media_paths) = pgc_backfill_published_media_paths(store, record)? else {
+        return Ok(false);
+    };
+    let expected_path = match media_paths {
+        PgcBackfillSidecarEvidence::OutputPaths(media_paths) => {
+            sidecar_destination(&store.root_path, record, &media_paths)?
+        }
+        PgcBackfillSidecarEvidence::SavedLocation {
+            path: saved_location,
+            is_directory,
+        } => {
+            let mut normalized_record = record.clone();
+            normalized_record.saved_location = Some(saved_location.to_string_lossy().into_owned());
+            sidecar_destination_with_saved_location_kind(
+                &store.root_path,
+                &normalized_record,
+                &[],
+                Some(is_directory),
+            )?
+        }
+    };
+    Ok(expected_path.as_deref() == Some(path))
+}
+
+fn pgc_backfill_published_media_paths(
+    store: &DownloadStore,
+    record: &TaskRecord,
+) -> Result<Option<PgcBackfillSidecarEvidence>> {
+    let paths = if record.bilibili_attempt.is_some() {
+        // Attempt receipts bind each output to a verified group entry. Do not fall back to
+        // display metadata when an attempt has no usable receipt.
+        let paths = verified_bilibili_receipt_keys(record)
+            .into_iter()
+            .flat_map(|(_, _, outputs)| outputs.into_iter().map(|(path, _)| path))
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        paths
+    } else if !record.primary_media_hashes.is_empty() {
+        // Inline verified hashes retain the exact output path list. A compact manifest does
+        // not; the two encodings should never coexist, so reject inconsistent legacy records.
+        if record.primary_media_hash_manifest.is_some() {
+            return Ok(None);
+        }
+        record
+            .primary_media_hashes
+            .keys()
+            .map(|path| PathBuf::from(path.as_str()))
+            .collect::<Vec<_>>()
+    } else if let Some(manifest) = &record.primary_media_hash_manifest {
+        // The compact manifest contains only a count and aggregate digest. It can identify a
+        // single saved path, but cannot safely recover a multi-output path list. A rooted
+        // directory remains an unambiguous sidecar destination even for a multi-output record.
+        match manifest.file_count {
+            1 => return pgc_backfill_saved_location_evidence(store, record),
+            2.. => {
+                let Some(evidence) = pgc_backfill_saved_location_evidence(store, record)? else {
+                    return Ok(None);
+                };
+                return Ok(matches!(
+                    &evidence,
+                    PgcBackfillSidecarEvidence::SavedLocation {
+                        is_directory: true,
+                        ..
+                    }
+                )
+                .then_some(evidence));
+            }
+            _ => return Ok(None),
+        }
+    } else {
+        // saved_location is display text and may contain commas from multiple output paths or
+        // from a literal filename. Treat it as one path, never split it. Known multi-entry
+        // records without exact persisted output paths are ambiguous unless the saved value is
+        // itself a rooted directory that identifies their common sidecar destination.
+        if record.media_entries_total > 1 {
+            let Some(evidence) = pgc_backfill_saved_location_evidence(store, record)? else {
+                return Ok(None);
+            };
+            return Ok(matches!(
+                &evidence,
+                PgcBackfillSidecarEvidence::SavedLocation {
+                    is_directory: true,
+                    ..
+                }
+            )
+            .then_some(evidence));
+        }
+        return pgc_backfill_saved_location_evidence(store, record);
+    };
+
+    if paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut normalized_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        let Some(path) = store.normalize_media_path_if_within_root(&path)? else {
+            // A malformed or out-of-root persisted path invalidates this candidate, not the
+            // entire bounded page. Errors validating a trusted macOS alias still propagate.
+            return Ok(None);
+        };
+        normalized_paths.push(path);
+    }
+    normalized_paths.sort();
+    normalized_paths.dedup();
+    Ok(Some(PgcBackfillSidecarEvidence::OutputPaths(
+        normalized_paths,
+    )))
+}
+
+fn pgc_backfill_saved_location_evidence(
+    store: &DownloadStore,
+    record: &TaskRecord,
+) -> Result<Option<PgcBackfillSidecarEvidence>> {
+    let Some(location) = record.saved_location.as_deref() else {
+        return Ok(None);
+    };
+    let Some((path, is_directory)) =
+        store.normalize_saved_location_if_within_root(Path::new(location))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PgcBackfillSidecarEvidence::SavedLocation {
+        path,
+        is_directory,
+    }))
+}
+
 fn sidecar_destination(
     root: &Path,
     record: &TaskRecord,
     media_paths: &[PathBuf],
+) -> Result<Option<PathBuf>> {
+    sidecar_destination_with_saved_location_kind(root, record, media_paths, None)
+}
+
+fn sidecar_destination_with_saved_location_kind(
+    root: &Path,
+    record: &TaskRecord,
+    media_paths: &[PathBuf],
+    saved_location_is_directory: Option<bool>,
 ) -> Result<Option<PathBuf>> {
     let mut parents = media_paths
         .iter()
@@ -7733,7 +7983,8 @@ fn sidecar_destination(
         && let Some(location) = &record.saved_location
     {
         let path = Path::new(location);
-        if path.is_dir() {
+        let is_directory = saved_location_is_directory.unwrap_or_else(|| path.is_dir());
+        if is_directory {
             parents.push(path.to_path_buf());
         } else if let Some(parent) = path.parent() {
             parents.push(parent.to_path_buf());
@@ -8130,6 +8381,45 @@ mod tests {
             .expect("registered library should have a root binding")
     }
 
+    fn move_pgc_backfill_record_to_sidecar(
+        queue: &QueueManager,
+        record: &mut TaskRecord,
+        media_paths: &[PathBuf],
+    ) -> PathBuf {
+        let id = record.id.clone();
+        queue
+            .video
+            .create_task(record)
+            .expect("legacy PGC task should be stored");
+        let active_path = queue.video.task_path(&id).unwrap();
+        let sidecar_path = sidecar_destination(&queue.video.root_path, record, media_paths)
+            .unwrap()
+            .expect("published media should have a sidecar destination");
+        fs::rename(&active_path, &sidecar_path)
+            .expect("task record should move to its legacy sidecar");
+        let mut index = queue.video.read_index().unwrap();
+        index.tasks.get_mut(&id).unwrap().record_path = sidecar_path.clone();
+        queue.video.write_index(&index).unwrap();
+        sidecar_path
+    }
+
+    #[cfg(target_os = "macos")]
+    fn alternate_trusted_system_alias(path: &Path) -> PathBuf {
+        for (alias, target) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            if let Ok(suffix) = path.strip_prefix(alias) {
+                return target.join(suffix);
+            }
+            if let Ok(suffix) = path.strip_prefix(target) {
+                return alias.join(suffix);
+            }
+        }
+        panic!("test path should use a supported macOS system alias");
+    }
+
     fn legacy_published_bilibili_task(id: &str) -> TaskRecord {
         let mut task = bilibili_task(id);
         task.status = TaskStatus::Completed;
@@ -8269,6 +8559,436 @@ mod tests {
         assert_eq!(second_page.first().unwrap().id, "pgc-backfill-064");
         assert_eq!(second_page.last().unwrap().id, "pgc-backfill-069");
         assert_eq!(cursor, None);
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pgc_backfill_accepts_legacy_published_sidecar_without_moving_it() {
+        let directory = temp_queue_root("pgc-backfill-legacy-sidecar");
+        let config = test_video_config(&directory);
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let provider_trait: Arc<dyn QueueFileProvider> = provider.clone();
+        let queue = QueueManager::open_with_file_provider(&config, provider_trait)
+            .expect("queue should open");
+        let library_id = queue.registry_snapshot().unwrap().default_library_id;
+        let binding = pgc_backfill_library_binding(&queue, &library_id);
+        let id = "pgc-backfill-legacy-sidecar";
+        let published_directory = config.downloads.video_dir.join("published-season");
+        fs::create_dir_all(&published_directory).expect("published directory should exist");
+        let media_path = published_directory.join("episode-16.mp4");
+        fs::write(&media_path, b"published media fixture").expect("media fixture should write");
+
+        let mut record = legacy_published_bilibili_task(id);
+        record.destination = None;
+        record.saved_location = Some(media_path.to_string_lossy().into_owned());
+        queue
+            .video
+            .create_task(&mut record)
+            .expect("legacy task should be stored");
+        let active_path = queue.video.task_path(id).unwrap();
+        let sidecar_path = sidecar_destination(&queue.video.root_path, &record, &[])
+            .unwrap()
+            .expect("published media should have a sidecar destination");
+        fs::rename(&active_path, &sidecar_path)
+            .expect("task record should move to its legacy sidecar");
+        let mut index = queue.video.read_index().expect("queue index should load");
+        index.tasks.get_mut(id).unwrap().record_path = sidecar_path.clone();
+        queue
+            .video
+            .write_index(&index)
+            .expect("sidecar path should persist in the index");
+
+        let before = queue.video.read_record(&sidecar_path).unwrap().unwrap();
+        let before_activity = queue.video.read_index().unwrap().chat_activity;
+        let (candidates, cursor) = queue
+            .published_backfill_candidates(&library_id, &binding, None, 64)
+            .expect("legacy sidecar candidate scan should succeed");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, id);
+        assert_eq!(cursor, None);
+
+        let orders = sample_pgc_episode_orders();
+        let wrong_directory = config.downloads.video_dir.join("unrelated-directory");
+        fs::create_dir_all(&wrong_directory).expect("unrelated directory should exist");
+        let wrong_sidecar_path = wrong_directory.join(sidecar_path.file_name().unwrap());
+        queue
+            .video
+            .write_record(&wrong_sidecar_path, &before)
+            .expect("wrong-directory sidecar fixture should write");
+        let mut index = queue.video.read_index().expect("queue index should load");
+        index.tasks.get_mut(id).unwrap().record_path = wrong_sidecar_path.clone();
+        queue
+            .video
+            .write_index(&index)
+            .expect("wrong-directory sidecar path should persist");
+        let reads_before_wrong_directory_scan = provider.read_paths().len();
+        let (wrong_directory_candidates, _) = queue
+            .published_backfill_candidates(&library_id, &binding, None, 64)
+            .expect("wrong-directory candidate should be safely skipped");
+        assert!(wrong_directory_candidates.is_empty());
+        assert!(
+            provider.read_paths()[reads_before_wrong_directory_scan..]
+                .contains(&wrong_sidecar_path)
+        );
+        assert!(
+            !queue
+                .backfill_pgc_season_id_if_unchanged(&library_id, &binding, &before, 77, &orders)
+                .expect("wrong-directory CAS should safely reject")
+        );
+
+        let mut index = queue.video.read_index().expect("queue index should load");
+        let wrong_name_path = published_directory.join("unrelated.json");
+        queue
+            .video
+            .write_record(&wrong_name_path, &before)
+            .expect("arbitrary sibling JSON fixture should write");
+        index.tasks.get_mut(id).unwrap().record_path = wrong_name_path.clone();
+        queue
+            .video
+            .write_index(&index)
+            .expect("arbitrary sibling JSON path should persist");
+        let reads_before_wrong_name_scan = provider.read_paths().len();
+        let (wrong_name_candidates, _) = queue
+            .published_backfill_candidates(&library_id, &binding, None, 64)
+            .expect("arbitrary sibling JSON should be skipped before reading");
+        assert!(wrong_name_candidates.is_empty());
+        assert!(!provider.read_paths()[reads_before_wrong_name_scan..].contains(&wrong_name_path));
+        assert!(
+            !queue
+                .backfill_pgc_season_id_if_unchanged(&library_id, &binding, &before, 77, &orders)
+                .expect("arbitrary sibling JSON CAS should safely reject")
+        );
+
+        let mut index = queue.video.read_index().expect("queue index should load");
+        index.tasks.get_mut(id).unwrap().record_path = sidecar_path.clone();
+        queue
+            .video
+            .write_index(&index)
+            .expect("published sidecar path should be restored");
+        assert!(
+            queue
+                .backfill_pgc_season_id_if_unchanged(&library_id, &binding, &before, 77, &orders)
+                .expect("metadata-only sidecar backfill should succeed")
+        );
+
+        let after = queue
+            .video
+            .read_record(&sidecar_path)
+            .unwrap()
+            .expect("legacy sidecar should remain readable");
+        assert_eq!(
+            after.plan.as_ref().unwrap().bilibili_pgc_season_id,
+            Some(77)
+        );
+        assert_eq!(
+            after.plan.as_ref().unwrap().bilibili_pgc_episode_orders,
+            orders
+        );
+        assert_eq!(after.saved_location, before.saved_location);
+        assert_eq!(after.status, before.status);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.bilibili_attempt, before.bilibili_attempt);
+        assert_eq!(
+            queue.video.read_index().unwrap().tasks[id].record_path,
+            sidecar_path
+        );
+        assert_eq!(
+            queue.video.read_index().unwrap().chat_activity,
+            before_activity
+        );
+        assert!(
+            !active_path.exists(),
+            "backfill must not recreate the active queue record"
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pgc_backfill_accepts_comma_outputs_with_old_root_spelling() {
+        let directory = temp_queue_root("pgc-backfill-old-root-spelling");
+        let config = test_video_config(&directory);
+        let provider = Arc::new(MockQueueFileProvider::default());
+        let provider_trait: Arc<dyn QueueFileProvider> = provider;
+        let queue = QueueManager::open_with_file_provider(&config, provider_trait)
+            .expect("queue should open");
+        let library_id = queue.registry_snapshot().unwrap().default_library_id;
+        let binding = pgc_backfill_library_binding(&queue, &library_id);
+
+        let published_directory = config.downloads.video_dir.join("published-season");
+        fs::create_dir_all(&published_directory).expect("published directory should exist");
+        let media_paths = vec![
+            published_directory.join("episode, 16.mp4"),
+            published_directory.join("episode17.mp4"),
+        ];
+        for path in &media_paths {
+            fs::write(path, b"published media fixture").expect("media fixture should write");
+        }
+        let old_spelling_paths = media_paths
+            .iter()
+            .map(|path| alternate_trusted_system_alias(path))
+            .collect::<Vec<_>>();
+        for (old_path, current_path) in old_spelling_paths.iter().zip(&media_paths) {
+            assert_ne!(old_path, current_path);
+            assert_eq!(
+                crate::media_libraries::normalize_trusted_macos_alias(old_path).unwrap(),
+                crate::media_libraries::normalize_trusted_macos_alias(current_path).unwrap(),
+                "fixture should use a supported alias for the same path"
+            );
+        }
+
+        let id = "pgc-backfill-alias-root";
+        let mut record = legacy_published_bilibili_task(id);
+        record.destination = None;
+        record.media_entries_total = 2;
+        record.media_entries_completed = 2;
+        record.saved_location = Some(
+            old_spelling_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        record.primary_media_hashes = old_spelling_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.to_string_lossy().into_owned(), format!("{index:064x}")))
+            .collect();
+        let before_saved_location = record.saved_location.clone();
+        let before_hashes = record.primary_media_hashes.clone();
+        let sidecar_path = move_pgc_backfill_record_to_sidecar(&queue, &mut record, &media_paths);
+
+        let later_directory = config.downloads.video_dir.join("later-season");
+        fs::create_dir_all(&later_directory).expect("later directory should exist");
+        let later_media = later_directory.join("episode.mp4");
+        fs::write(&later_media, b"later media fixture").expect("media fixture should write");
+        let later_id = "pgc-backfill-later-valid";
+        let mut later = legacy_published_bilibili_task(later_id);
+        later.destination = None;
+        later.media_entries_total = 1;
+        later.saved_location = Some(later_media.to_string_lossy().into_owned());
+        later.primary_media_hashes =
+            BTreeMap::from([(later_media.to_string_lossy().into_owned(), "b".repeat(64))]);
+        let later_sidecar = move_pgc_backfill_record_to_sidecar(
+            &queue,
+            &mut later,
+            std::slice::from_ref(&later_media),
+        );
+
+        let (candidates, cursor) = queue
+            .published_backfill_candidates(&library_id, &binding, None, 64)
+            .expect("legacy sidecars should be checked without losing later candidates");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![id, later_id]
+        );
+        assert_eq!(cursor, None);
+
+        let before = queue
+            .video
+            .read_record(&sidecar_path)
+            .unwrap()
+            .expect("old-root-spelling sidecar should remain readable");
+        assert!(
+            queue
+                .backfill_pgc_season_id_if_unchanged(
+                    &library_id,
+                    &binding,
+                    &before,
+                    77,
+                    &sample_pgc_episode_orders(),
+                )
+                .expect("old-root-spelling sidecar CAS should succeed")
+        );
+        let after = queue
+            .video
+            .read_record(&sidecar_path)
+            .unwrap()
+            .expect("backfilled sidecar should remain readable");
+        assert_eq!(after.saved_location, before_saved_location);
+        assert_eq!(after.primary_media_hashes, before_hashes);
+        assert_eq!(
+            queue.video.read_index().unwrap().tasks[later_id].record_path,
+            later_sidecar
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pgc_backfill_skips_unsafe_paths_without_losing_later_candidate() {
+        let directory = temp_queue_root("pgc-backfill-ambiguous-manifest");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let library_id = queue.registry_snapshot().unwrap().default_library_id;
+        let binding = pgc_backfill_library_binding(&queue, &library_id);
+
+        let published_directory = config.downloads.video_dir.join("manifest-season");
+        fs::create_dir_all(&published_directory).expect("published directory should exist");
+        let media_paths = vec![
+            published_directory.join("episode-16.mp4"),
+            published_directory.join("episode-17.mp4"),
+        ];
+        for path in &media_paths {
+            fs::write(path, b"published media fixture").expect("media fixture should write");
+        }
+
+        let outside_id = "pgc-backfill-a-outside-evidence";
+        let mut outside = legacy_published_bilibili_task(outside_id);
+        outside.destination = None;
+        outside.media_entries_total = 1;
+        outside.saved_location = Some(media_paths[0].to_string_lossy().into_owned());
+        outside.primary_media_hashes =
+            BTreeMap::from([("/outside-root/episode.mp4".into(), "e".repeat(64))]);
+        move_pgc_backfill_record_to_sidecar(
+            &queue,
+            &mut outside,
+            std::slice::from_ref(&media_paths[0]),
+        );
+
+        let missing_id = "pgc-backfill-b-missing-location";
+        let mut missing = legacy_published_bilibili_task(missing_id);
+        missing.destination = None;
+        missing.media_entries_total = 1;
+        missing.saved_location = Some(
+            published_directory
+                .join("missing-episode.mp4")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        move_pgc_backfill_record_to_sidecar(
+            &queue,
+            &mut missing,
+            std::slice::from_ref(&media_paths[1]),
+        );
+
+        let ambiguous_id = "pgc-backfill-ambiguous-manifest";
+        let mut ambiguous = legacy_published_bilibili_task(ambiguous_id);
+        ambiguous.destination = None;
+        ambiguous.media_entries_total = 2;
+        ambiguous.media_entries_completed = 2;
+        ambiguous.saved_location = Some(
+            media_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        ambiguous.primary_media_hash_manifest = Some(PrimaryMediaHashManifest {
+            file_count: 2,
+            sha256: "a".repeat(64),
+        });
+        let ambiguous_sidecar =
+            move_pgc_backfill_record_to_sidecar(&queue, &mut ambiguous, &media_paths);
+
+        let later_directory = config.downloads.video_dir.join("later-season");
+        fs::create_dir_all(&later_directory).expect("later directory should exist");
+        let later_media = later_directory.join("episode.mp4");
+        fs::write(&later_media, b"later media fixture").expect("media fixture should write");
+        let later_id = "pgc-backfill-z-later-valid";
+        let mut later = legacy_published_bilibili_task(later_id);
+        later.destination = None;
+        later.media_entries_total = 1;
+        later.saved_location = Some(later_media.to_string_lossy().into_owned());
+        later.primary_media_hashes =
+            BTreeMap::from([(later_media.to_string_lossy().into_owned(), "b".repeat(64))]);
+        move_pgc_backfill_record_to_sidecar(&queue, &mut later, std::slice::from_ref(&later_media));
+
+        let (candidates, cursor) = queue
+            .published_backfill_candidates(&library_id, &binding, None, 64)
+            .expect("ambiguous manifest should skip only its own record");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![later_id]
+        );
+        assert_eq!(cursor, None);
+        let ambiguous_before = queue
+            .video
+            .read_record(&ambiguous_sidecar)
+            .unwrap()
+            .expect("ambiguous sidecar should remain readable");
+        assert!(
+            !queue
+                .backfill_pgc_season_id_if_unchanged(
+                    &library_id,
+                    &binding,
+                    &ambiguous_before,
+                    77,
+                    &sample_pgc_episode_orders(),
+                )
+                .expect("ambiguous manifest CAS should safely reject")
+        );
+
+        drop(queue);
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn pgc_backfill_accepts_rooted_directory_saved_locations() {
+        let directory = temp_queue_root("pgc-backfill-directory-saved-location");
+        let config = test_video_config(&directory);
+        let queue = QueueManager::open(&config).expect("queue should open");
+        let library_id = queue.registry_snapshot().unwrap().default_library_id;
+        let binding = pgc_backfill_library_binding(&queue, &library_id);
+
+        let root_id = "pgc-backfill-a-output-root";
+        let mut root_record = legacy_published_bilibili_task(root_id);
+        root_record.destination = None;
+        root_record.media_entries_total = 2;
+        root_record.primary_media_hash_manifest = Some(PrimaryMediaHashManifest {
+            file_count: 2,
+            sha256: "c".repeat(64),
+        });
+        root_record.saved_location = Some(queue.video.root_path.to_string_lossy().into_owned());
+        let root_sidecar = queue
+            .video
+            .root_path
+            .join(format!(".telegram-video-downloader-task-{root_id}.json"));
+        queue.video.create_task(&mut root_record).unwrap();
+        let active_root_record = queue.video.task_path(root_id).unwrap();
+        fs::rename(&active_root_record, &root_sidecar).unwrap();
+        let mut index = queue.video.read_index().unwrap();
+        index.tasks.get_mut(root_id).unwrap().record_path = root_sidecar.clone();
+        queue.video.write_index(&index).unwrap();
+
+        let subdirectory = queue.video.root_path.join("published-season");
+        fs::create_dir_all(&subdirectory).expect("published directory should exist");
+        let subdirectory_id = "pgc-backfill-b-output-subdirectory";
+        let mut subdirectory_record = legacy_published_bilibili_task(subdirectory_id);
+        subdirectory_record.destination = None;
+        subdirectory_record.media_entries_total = 2;
+        subdirectory_record.primary_media_hash_manifest = Some(PrimaryMediaHashManifest {
+            file_count: 2,
+            sha256: "d".repeat(64),
+        });
+        subdirectory_record.saved_location = Some(subdirectory.to_string_lossy().into_owned());
+        let subdirectory_sidecar =
+            move_pgc_backfill_record_to_sidecar(&queue, &mut subdirectory_record, &[]);
+
+        let (candidates, _) = queue
+            .published_backfill_candidates(&library_id, &binding, None, 64)
+            .expect("rooted directory saved locations should remain eligible");
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![root_id, subdirectory_id]
+        );
+        assert!(root_sidecar.exists());
+        assert!(subdirectory_sidecar.exists());
 
         drop(queue);
         let _ = fs::remove_dir_all(directory);
