@@ -420,10 +420,19 @@ pub(super) fn same_root(left: &Path, right: &Path) -> bool {
 }
 
 pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; media-library refresh is stopped");
+    }
     refresh_library_bindings(runtime).await?;
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; media-library refresh is stopped");
+    }
     let settings = runtime.bot.queue.registry_snapshot()?;
     let default_id = settings.default_library_id.clone();
     for library in settings.libraries {
+        if runtime.epoch_fatal.is_signaled() {
+            bail!("cloud database epoch changed; media-library refresh is stopped");
+        }
         let (scoped, _) = scoped_runtime(runtime, Some(&library.id))?;
         if let Some(root_binding) = library.root_binding_token() {
             crate::pgc_metadata_backfill::backfill_legacy_pgc_metadata(
@@ -433,13 +442,19 @@ pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
             )
             .await;
         }
-        let result = run_cloud_library_operation(
+        if runtime.epoch_fatal.is_signaled() {
+            bail!("cloud database epoch changed; media-library refresh is stopped");
+        }
+        let result = run_cloud_library_refresh_operation(
             &scoped,
             "media-library refresh worker failed",
             |context, inbox| Ok(((), scan_cloud_library(&context, inbox)?)),
         )
         .await;
         if let Err(error) = result {
+            if runtime.epoch_fatal.is_signaled() {
+                return Err(error);
+            }
             warn!(library_id = %library.id, error = %redact_sensitive_text(&format!("{error:#}")), "media-library refresh failed");
         }
     }

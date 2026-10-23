@@ -452,6 +452,8 @@ struct CloudBotRuntime {
     test_migration_runner_gate_waiting: Arc<Notify>,
     #[cfg(test)]
     test_migration_runner_gate_acquired: Arc<Notify>,
+    #[cfg(test)]
+    test_management_admission_waiting: Arc<Notify>,
     library_scan_warning: Arc<Mutex<Option<String>>>,
     library_scan_publication_gate: Arc<Mutex<()>>,
     telegram_dispatch: Arc<Semaphore>,
@@ -582,6 +584,12 @@ enum CloudLibraryFailurePolicy {
     PreserveAvailability,
 }
 
+#[derive(Clone, Copy)]
+enum CloudLibraryAdmission {
+    TryManagement,
+    WaitManagement,
+}
+
 /// Serializes each library scan through publishing its snapshot or failure warning.
 /// The scan itself runs on a blocking thread, but the async guard stays held until the
 /// result is visible to the cloud state reporter.
@@ -597,6 +605,29 @@ where
         runtime,
         failure_context,
         CloudLibraryFailurePolicy::MarkUnavailable,
+        CloudLibraryAdmission::TryManagement,
+        None,
+        move |context, inbox, _root| {
+            operation(context, inbox)
+                .map(|(value, snapshot)| (value, CloudLibrarySnapshotUpdate::Publish(snapshot)))
+        },
+    )
+    .await
+}
+
+async fn run_cloud_library_refresh_operation<T>(
+    runtime: &CloudBotRuntime,
+    failure_context: &'static str,
+    operation: impl FnOnce(BotContext, Arc<CloudInbox>) -> Result<(T, LibrarySnapshot)> + Send + 'static,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    run_cloud_library_operation_with_snapshot_update_and_policy(
+        runtime,
+        failure_context,
+        CloudLibraryFailurePolicy::MarkUnavailable,
+        CloudLibraryAdmission::WaitManagement,
         None,
         move |context, inbox, _root| {
             operation(context, inbox)
@@ -626,6 +657,7 @@ where
         runtime,
         failure_context,
         CloudLibraryFailurePolicy::PreserveAvailability,
+        CloudLibraryAdmission::TryManagement,
         Some((library_id, root_binding)),
         move |context, inbox, root| {
             let root = root.context("verified library root is missing")?;
@@ -640,6 +672,7 @@ async fn run_cloud_library_operation_with_snapshot_update_and_policy<T>(
     runtime: &CloudBotRuntime,
     failure_context: &'static str,
     failure_policy: CloudLibraryFailurePolicy,
+    admission: CloudLibraryAdmission,
     expected_root_binding: Option<(String, String)>,
     operation: impl FnOnce(
         BotContext,
@@ -671,11 +704,22 @@ where
         bail!("library root identity changed; refresh settings and retry");
     }
     let default_library_id = settings.default_library_id;
-    let io_lease = library_migration_bot::try_acquire_library_io(
-        runtime,
-        std::slice::from_ref(&selected_queue_library_id),
-    )
-    .await?;
+    let io_lease = match admission {
+        CloudLibraryAdmission::TryManagement => {
+            library_migration_bot::try_acquire_library_io(
+                runtime,
+                std::slice::from_ref(&selected_queue_library_id),
+            )
+            .await?
+        }
+        CloudLibraryAdmission::WaitManagement => {
+            library_migration_bot::acquire_management_library_io(
+                runtime,
+                std::slice::from_ref(&selected_queue_library_id),
+            )
+            .await?
+        }
+    };
     let publication_guard = Arc::clone(&runtime.library_scan_publication_gate)
         .lock_owned()
         .await;
@@ -1743,6 +1787,8 @@ async fn run_cloud_bot(
         test_migration_runner_gate_waiting: Arc::new(Notify::new()),
         #[cfg(test)]
         test_migration_runner_gate_acquired: Arc::new(Notify::new()),
+        #[cfg(test)]
+        test_management_admission_waiting: Arc::new(Notify::new()),
         library_scan_warning: Arc::new(Mutex::new(None)),
         library_scan_publication_gate: Arc::new(Mutex::new(())),
         telegram_dispatch: Arc::new(Semaphore::new(1)),
@@ -3546,6 +3592,7 @@ async fn dispatch_cloud_management(
                 runtime,
                 "file confirmation worker failed",
                 CloudLibraryFailurePolicy::PreserveAvailability,
+                CloudLibraryAdmission::TryManagement,
                 Some((source_library_id.clone(), root_binding.clone())),
                 move |context, inbox, root| {
                     execute_cloud_file_preview_with_provider(

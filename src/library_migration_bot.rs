@@ -85,6 +85,28 @@ impl LibraryIoGateRegistry {
         }
         Ok(Arc::new(LibraryIoGuard { _guards: guards }))
     }
+
+    pub(crate) async fn acquire_management(
+        &self,
+        library_ids: &[String],
+        contention_notify: Option<Arc<Notify>>,
+    ) -> Result<LibraryIoLease> {
+        let gates = self.gates_for(library_ids).await?;
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in gates {
+            let guard = match Arc::clone(&gate).try_read_owned() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    if let Some(notify) = &contention_notify {
+                        notify.notify_one();
+                    }
+                    gate.read_owned().await
+                }
+            };
+            guards.push(LibraryIoPermit::Management { _guard: guard });
+        }
+        Ok(Arc::new(LibraryIoGuard { _guards: guards }))
+    }
 }
 
 pub(crate) async fn try_acquire_library_io(
@@ -92,6 +114,30 @@ pub(crate) async fn try_acquire_library_io(
     library_ids: &[String],
 ) -> Result<LibraryIoLease> {
     runtime.library_io_gates.try_acquire(library_ids).await
+}
+
+pub(crate) async fn acquire_management_library_io(
+    runtime: &CloudBotRuntime,
+    library_ids: &[String],
+) -> Result<LibraryIoLease> {
+    if runtime.epoch_fatal.is_signaled() {
+        bail!("cloud database epoch changed; library publication is stopped");
+    }
+    #[cfg(test)]
+    let contention_notify = Some(Arc::clone(&runtime.test_management_admission_waiting));
+    #[cfg(not(test))]
+    let contention_notify = None;
+    let lease = tokio::select! {
+        _ = runtime.epoch_fatal.notified() => {
+            bail!("cloud database epoch changed; library publication is stopped");
+        }
+        lease = runtime.library_io_gates.acquire_management(library_ids, contention_notify) => lease?,
+    };
+    if runtime.epoch_fatal.is_signaled() {
+        drop(lease);
+        bail!("cloud database epoch changed; library publication is stopped");
+    }
+    Ok(lease)
 }
 
 pub(crate) async fn acquire_library_io(

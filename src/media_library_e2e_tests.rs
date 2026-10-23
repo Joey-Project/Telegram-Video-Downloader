@@ -409,6 +409,125 @@ async fn expired_migration_preview_projects_stale_without_hiding_a_live_preview(
 }
 
 #[tokio::test]
+async fn background_library_refresh_wait_cancels_on_epoch_fatal_without_publishing() {
+    let (fixture, queue, inbox) = create_migration_fixture(
+        "background-refresh-epoch-fatal-admission",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let runtime = make_runtime(
+        TelegramClient::with_test_api_base_url(
+            TEST_TELEGRAM_TOKEN.to_string(),
+            "http://127.0.0.1:1".to_string(),
+        ),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let cached_snapshot = scan_order_test_snapshot("cached-before-background-refresh");
+    *runtime.library_snapshot.lock().await = Some(cached_snapshot.clone());
+    {
+        let mut snapshots = runtime.library_snapshots.lock().await;
+        snapshots.insert(fixture.source_library_id.clone(), cached_snapshot.clone());
+        snapshots.insert(fixture.target_library_id.clone(), cached_snapshot.clone());
+    }
+
+    let registered_library_ids = vec![
+        fixture.source_library_id.clone(),
+        fixture.target_library_id.clone(),
+    ];
+    let exclusive =
+        crate::library_migration_bot::acquire_library_io(&runtime, &registered_library_ids)
+            .await
+            .expect("exclusive fixture admission should acquire both registered libraries");
+
+    let admission_waiting = Arc::clone(&runtime.test_management_admission_waiting);
+    let waiting = admission_waiting.notified();
+    tokio::pin!(waiting);
+    waiting.as_mut().enable();
+    let refresh_runtime = runtime.clone();
+    let mut refresh =
+        tokio::spawn(
+            async move { crate::media_library_bot::refresh_libraries(&refresh_runtime).await },
+        );
+    tokio::time::timeout(Duration::from_secs(10), &mut waiting)
+        .await
+        .expect("background refresh should reach the contended management admission gate");
+
+    assert_eq!(
+        runtime
+            .library_snapshot
+            .lock()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.revision.as_str()),
+        Some("cached-before-background-refresh"),
+        "waiting refresh must preserve the currently published default snapshot"
+    );
+    {
+        let snapshots = runtime.library_snapshots.lock().await;
+        assert_eq!(
+            snapshots
+                .get(&fixture.source_library_id)
+                .map(|snapshot| snapshot.revision.as_str()),
+            Some("cached-before-background-refresh"),
+            "waiting refresh must not publish a source-library snapshot"
+        );
+        assert_eq!(
+            snapshots
+                .get(&fixture.target_library_id)
+                .map(|snapshot| snapshot.revision.as_str()),
+            Some("cached-before-background-refresh"),
+            "waiting refresh must not publish a target-library snapshot"
+        );
+    }
+
+    runtime.signal_epoch_fatal();
+    let refresh_result = tokio::time::timeout(Duration::from_secs(5), &mut refresh)
+        .await
+        .expect("epoch fatal should cancel the management admission wait")
+        .expect("background refresh task should join");
+    let error = refresh_result.expect_err("epoch-fatal refresh should return an error");
+    assert!(
+        format!("{error:#}").contains("epoch changed"),
+        "refresh should report the fatal epoch cancellation: {error:#}"
+    );
+
+    assert_eq!(
+        runtime
+            .library_snapshot
+            .lock()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.revision.as_str()),
+        Some("cached-before-background-refresh"),
+        "epoch-fatal refresh must not replace the published default snapshot"
+    );
+    {
+        let snapshots = runtime.library_snapshots.lock().await;
+        assert_eq!(
+            snapshots
+                .get(&fixture.source_library_id)
+                .map(|snapshot| snapshot.revision.as_str()),
+            Some("cached-before-background-refresh"),
+            "epoch-fatal refresh must not publish a source-library snapshot"
+        );
+        assert_eq!(
+            snapshots
+                .get(&fixture.target_library_id)
+                .map(|snapshot| snapshot.revision.as_str()),
+            Some("cached-before-background-refresh"),
+            "epoch-fatal refresh must not publish a target-library snapshot"
+        );
+    }
+
+    drop(exclusive);
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    let _ = fs::remove_dir_all(&fixture.root);
+}
+
+#[tokio::test]
 async fn migration_preview_and_discovery_reject_replaced_registered_roots() {
     let root = temp_cloud_bot_dir("migration-root-identity-gate");
     let video_root = root.join("videos");
