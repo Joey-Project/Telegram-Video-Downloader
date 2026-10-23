@@ -143,6 +143,8 @@ describe("settings library UI flow", () => {
     const sockets = installMockWebSocket();
     let currentManifest = manifest;
     let stateRequests = 0;
+    let failFirstChunk = true;
+    let failNextStateResponse = false;
     const responseChunks = new Map(chunks);
 
     const html = await readFile(resolve(process.cwd(), "public/settings/index.html"), "utf8");
@@ -175,6 +177,10 @@ describe("settings library UI flow", () => {
         expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
         expect(init?.cache).toBe("no-store");
         stateRequests += 1;
+        if (failNextStateResponse) {
+          failNextStateResponse = false;
+          return { ok: false, status: 503, json: async () => ({}) } as Response;
+        }
         return { ok: true, status: 200, json: async () => currentManifest } as Response;
       }
       const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
@@ -183,6 +189,10 @@ describe("settings library UI flow", () => {
         expect(new Headers(init?.headers).get("X-Cloud-Database-Epoch")).toBe(TEST_DATABASE_EPOCH);
         expect(init?.cache).toBe("no-store");
         const sha256 = chunkPath[1]!;
+        if (failFirstChunk) {
+          failFirstChunk = false;
+          return { ok: false, status: 503, json: async () => ({}) } as Response;
+        }
         return { ok: true, status: 200, json: async () => ({ sha256, data: responseChunks.get(sha256) }) } as Response;
       }
       if (String(input) === "/api/actions") {
@@ -195,11 +205,17 @@ describe("settings library UI flow", () => {
     window.fetch = fetchMock as typeof window.fetch;
 
     vi.resetModules();
+    const firstReadAt = Date.now();
     // The browser entry has no declarations because it is executed for its side effects.
     // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
     await import("../public/settings/app.js");
-    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
     await vi.waitFor(() => expect(stateRequests).toBe(1));
+    expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(true);
+    expect(element<HTMLElement>("#auth-gate").classList.contains("hidden")).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(stateRequests).toBe(2));
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+    expect(Date.now() - firstReadAt).toBeLessThan(5 * 60 * 1_000);
     expect(sockets).toHaveLength(1);
     expect(sockets[0]?.protocols).toEqual([UPDATE_PROTOCOL, syntheticCredentials.localSharedSecret.value]);
 
@@ -218,7 +234,7 @@ describe("settings library UI flow", () => {
     const action = JSON.parse(String(actionRequest?.[1]?.body));
     expect(action).toMatchObject({ kind: "library_scan", payload: { library_id: LIBRARY_ID } });
     const snapshotRequestCount = 1 + manifest.library.chunks.length + manifest.state.chunks.length;
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(snapshotRequestCount + 3));
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(snapshotRequestCount + 5));
 
     const pushedSnapshot = {
       ...ownerSnapshot,
@@ -237,8 +253,15 @@ describe("settings library UI flow", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     sockets[0]?.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 1, reason: "inbox" });
     await vi.advanceTimersByTimeAsync(1_000);
-    await vi.waitFor(() => expect(stateRequests).toBe(statesBeforePush + 1));
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(statesBeforePush));
     await vi.waitFor(() => expect(element<HTMLInputElement>('[data-category-form="main-library"] input[name="default_category"]').value).toBe("Shows"));
+
+    failNextStateResponse = true;
+    const statesBeforeManualFailure = stateRequests;
+    element<HTMLButtonElement>("#refresh-button").click();
+    await vi.waitFor(() => expect(stateRequests).toBe(statesBeforeManualFailure + 1));
+    await vi.waitFor(() => expect(element<HTMLElement>("#toast").textContent).toContain("Request failed (503)"));
+    expect(element<HTMLInputElement>('[data-category-form="main-library"] input[name="default_category"]').value).toBe("Shows");
   });
 
   it("keeps settings private when a chunk does not match its manifest", async () => {

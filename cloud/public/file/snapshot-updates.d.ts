@@ -1,6 +1,7 @@
 export type SnapshotUpdatesStatus = "connecting" | "live" | "fallback" | "offline" | "paused" | "expired";
 
 export interface SnapshotUpdatesRefreshOptions {
+  /** Background refreshes are quiet; explicit calls default to false. */
   quiet: boolean;
 }
 
@@ -32,6 +33,7 @@ export interface SnapshotUpdatesOptions {
 export interface SnapshotUpdatesController {
   start(): void;
   stop(): void;
+  /** Pass `{ quiet: true }` for background refreshes; omitted options remain user-visible. */
   refresh(options?: Partial<SnapshotUpdatesRefreshOptions>): Promise<void>;
 }
 

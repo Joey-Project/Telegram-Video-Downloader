@@ -560,4 +560,156 @@ describe("snapshot updates browser flows", () => {
     expect(api).toHaveBeenCalledTimes(sessionCallsAfterExpiry);
     expect(mockSockets.sockets).toHaveLength(1);
   });
+
+  it("backs off failed live refreshes and preserves a queued explicit refresh", async () => {
+    vi.useFakeTimers();
+    const mockSockets = addMockWebSocket({ autoReady: false });
+    const heldRefresh = deferred();
+    const quietValues: boolean[] = [];
+    const refreshStartedAt: number[] = [];
+    let calls = 0;
+    const refresh = vi.fn(async ({ quiet }: { quiet: boolean }) => {
+      calls += 1;
+      quietValues.push(quiet);
+      refreshStartedAt.push(Date.now());
+      if (calls === 1) {
+        await heldRefresh.promise;
+        heldRefresh.markSettled();
+      }
+      if ([1, 2, 4].includes(calls)) throw new Error("temporary refresh failure");
+    });
+    const api = vi.fn(async () => sessionResponse());
+    const controller = createSnapshotUpdates({
+      api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
+      refresh,
+      environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, random: () => 0.5 },
+    });
+    controller.start();
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
+    const socket = mockSockets.sockets[0]!;
+    await vi.waitFor(() => expect(socket.readyState).toBe(MockWebSocket.OPEN));
+    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+
+    const queuedManualRefresh = controller.refresh();
+    const queuedManualOutcome = queuedManualRefresh.then(
+      () => ({ error: null }),
+      (error: unknown) => ({ error }),
+    );
+    let queuedManualSettled = false;
+    void queuedManualRefresh.then(() => { queuedManualSettled = true; }, () => { queuedManualSettled = true; });
+    heldRefresh.resolve();
+    await heldRefresh.settled;
+    const elapsedSinceFirstAttempt = Date.now() - refreshStartedAt[0]!;
+    await vi.advanceTimersByTimeAsync(Math.max(0, 999 - elapsedSinceFirstAttempt));
+    if (Date.now() - refreshStartedAt[0]! < 1_000) {
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(queuedManualSettled).toBe(false);
+    }
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+    expect(quietValues).toEqual([true, false]);
+    expect(refreshStartedAt[1]! - refreshStartedAt[0]!).toBeGreaterThanOrEqual(1_000);
+    const queuedManualResult = await queuedManualOutcome;
+    expect(queuedManualResult.error).toBeInstanceOf(Error);
+    expect((queuedManualResult.error as Error).message).toBe("temporary refresh failure");
+
+    for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    const elapsedSinceSecondAttempt = Date.now() - refreshStartedAt[1]!;
+    await vi.advanceTimersByTimeAsync(Math.max(0, 1_999 - elapsedSinceSecondAttempt));
+    if (Date.now() - refreshStartedAt[1]! < 2_000) expect(refresh).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(3));
+    expect(quietValues[2]).toBe(true);
+    expect(refreshStartedAt[2]! - refreshStartedAt[1]!).toBeGreaterThanOrEqual(2_000);
+
+    const explicitRefreshAfterSuccess = controller.refresh();
+    const explicitRefreshOutcome = explicitRefreshAfterSuccess.then(
+      () => ({ error: null }),
+      (error: unknown) => ({ error }),
+    );
+    const elapsedSinceThirdAttempt = Date.now() - refreshStartedAt[2]!;
+    await vi.advanceTimersByTimeAsync(Math.max(0, 999 - elapsedSinceThirdAttempt));
+    if (Date.now() - refreshStartedAt[2]! < 1_000) expect(refresh).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(4));
+    expect(quietValues[3]).toBe(false);
+    expect(refreshStartedAt[3]! - refreshStartedAt[2]!).toBeGreaterThanOrEqual(1_000);
+    const explicitRefreshResult = await explicitRefreshOutcome;
+    expect(explicitRefreshResult.error).toBeInstanceOf(Error);
+    expect((explicitRefreshResult.error as Error).message).toBe("temporary refresh failure");
+
+    for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    const elapsedSinceFourthAttempt = Date.now() - refreshStartedAt[3]!;
+    await vi.advanceTimersByTimeAsync(Math.max(0, 999 - elapsedSinceFourthAttempt));
+    if (Date.now() - refreshStartedAt[3]! < 1_000) expect(refresh).toHaveBeenCalledTimes(4);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(5));
+    expect(quietValues[4]).toBe(true);
+    expect(refreshStartedAt[4]! - refreshStartedAt[3]!).toBeGreaterThanOrEqual(1_000);
+    controller.stop();
+  });
+
+  it("clears failed-refresh retries on hidden lifecycle pauses and 4401 expiry", async () => {
+    vi.useFakeTimers();
+    const mockSockets = addMockWebSocket({ autoReady: true });
+    const lifecycleHandlers = new Map<string, () => void>();
+    const mutableDocumentMock = {
+      visibilityState: "visible" as DocumentVisibilityState,
+      hidden: false,
+      addEventListener: (type: string, handler: () => void) => lifecycleHandlers.set(type, handler),
+      removeEventListener: (type: string, handler: () => void) => {
+        if (lifecycleHandlers.get(type) === handler) lifecycleHandlers.delete(type);
+      },
+    };
+    const documentMock = mutableDocumentMock as unknown as Document;
+    const api = vi.fn(async () => sessionResponse());
+    let failuresRemaining = 1;
+    const refresh = vi.fn(async () => {
+      if (failuresRemaining > 0) {
+        failuresRemaining -= 1;
+        throw new Error("temporary refresh failure");
+      }
+    });
+    const controller = createSnapshotUpdates({
+      api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
+      refresh,
+      environment: {
+        WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket,
+        document: documentMock,
+        navigator: { onLine: true } as Navigator,
+        random: () => 0.5,
+      },
+    });
+    controller.start();
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+
+    mutableDocumentMock.visibilityState = "hidden";
+    mutableDocumentMock.hidden = true;
+    lifecycleHandlers.get("visibilitychange")?.();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    mutableDocumentMock.visibilityState = "visible";
+    mutableDocumentMock.hidden = false;
+    lifecycleHandlers.get("visibilitychange")?.();
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(2));
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+    for (let index = 0; index < 12; index += 1) await Promise.resolve();
+
+    failuresRemaining = 1;
+    const resumedSocket = mockSockets.sockets[1]!;
+    resumedSocket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(3));
+    await vi.advanceTimersByTimeAsync(0);
+    resumedSocket.serverClose(4401, "Owner authorization expired");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(refresh).toHaveBeenCalledTimes(3);
+    expect(api).toHaveBeenCalledTimes(2);
+  });
 });

@@ -145,6 +145,7 @@ describe("file manager UI flow", () => {
     const sockets = installMockWebSocket();
     let currentManifest = manifest;
     let stateRequests = 0;
+    let failNextStateResponse = false;
     const responseChunks = new Map(chunks);
 
     const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
@@ -174,6 +175,10 @@ describe("file manager UI flow", () => {
       if (String(input) === "/api/state") {
         expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
         stateRequests += 1;
+        if (stateRequests === 1 || failNextStateResponse) {
+          failNextStateResponse = false;
+          return { ok: false, status: 503, json: async () => ({}) } as Response;
+        }
         return { ok: true, status: 200, json: async () => currentManifest } as Response;
       }
       const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
@@ -187,14 +192,20 @@ describe("file manager UI flow", () => {
     vi.stubGlobal("fetch", fetchMock);
     window.fetch = fetchMock as typeof window.fetch;
 
+    const firstReadAt = Date.now();
     // The browser entry has no declarations because it is executed for its side effects.
     // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
     await import("../public/file/app.js");
-    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
     await vi.waitFor(() => expect(stateRequests).toBe(1));
+    expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(true);
+    expect(element<HTMLElement>("#auth-gate").classList.contains("hidden")).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(stateRequests).toBe(2));
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+    expect(Date.now() - firstReadAt).toBeLessThan(5 * 60 * 1_000);
     expect(sockets).toHaveLength(1);
     expect(sockets[0]?.protocols).toEqual([UPDATE_PROTOCOL, syntheticCredentials.localSharedSecret.value]);
-    expect(fetchMock).toHaveBeenCalledTimes(2 + manifest.library.chunks.length + manifest.state.chunks.length);
+    expect(fetchMock).toHaveBeenCalledTimes(3 + manifest.library.chunks.length + manifest.state.chunks.length);
     expect((element<HTMLElement>("#library-select") as unknown as { value: string }).value).toBe(LIBRARY_ID);
     expect(element<HTMLOptionElement>("#library-select option").disabled).toBe(false);
     expect([...document.querySelectorAll<HTMLOptionElement>("#category-folders option")].map((option) => option.value)).toEqual(expect.arrayContaining(["Films", "Series", "Shows"]));
@@ -252,15 +263,18 @@ describe("file manager UI flow", () => {
     const pushedBundle = await makeChunkedSnapshot(pushedSnapshot);
     currentManifest = pushedBundle.manifest;
     for (const [sha256, data] of pushedBundle.chunks) responseChunks.set(sha256, data);
+    const stateRequestsBeforePush = stateRequests;
     await vi.advanceTimersByTimeAsync(1_000);
     sockets[0]?.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
     await vi.advanceTimersByTimeAsync(1_000);
-    await vi.waitFor(() => expect(stateRequests).toBe(2));
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(stateRequestsBeforePush));
     await vi.waitFor(() => expect(element<HTMLElement>("#library-list").textContent).toContain("Beta from pushed update"));
 
+    failNextStateResponse = true;
+    const statesBeforeManualFailure = stateRequests;
     element<HTMLButtonElement>("#refresh-button").click();
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.waitFor(() => expect(stateRequests).toBe(3));
+    await vi.waitFor(() => expect(stateRequests).toBe(statesBeforeManualFailure + 1));
+    await vi.waitFor(() => expect(element<HTMLElement>("#toast").textContent).toContain("Request failed (503)"));
     await vi.waitFor(() => expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected"));
 
     element<HTMLButtonElement>("#clear-selection").click();

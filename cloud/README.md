@@ -49,6 +49,8 @@ The browser subscribes before reconciling its current state, and reads the exist
 are hints, not durable state or permission to act. Refreshes are coalesced without dropping
 changes received during a read. Reconnection, returning to the foreground and low-frequency
 fallback reads recover changes missed during disconnection or failed notification delivery.
+Failed snapshot reads retry after one second, doubling the delay up to one minute until
+a read succeeds. These retries are quiet; explicit refreshes retain user-visible errors.
 Inactive pages pause unnecessary connection retries and refreshes. Connection authorization
 expires with the original Telegram authorization; reconnecting does not extend that deadline.
 

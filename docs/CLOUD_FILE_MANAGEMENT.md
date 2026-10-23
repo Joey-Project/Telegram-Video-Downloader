@@ -216,11 +216,11 @@ Authenticated, validated snapshot canonicalization permits up to 1,000,000 nodes
 
 The Mini App exposes private library data only after the current Telegram identity passes the Worker owner check. An authorization failure hides private content and stops action dispatch until authentication succeeds again. Network errors, rate limits, and server failures retain queued action IDs for retry; permanently rejected actions are surfaced and removed so later valid requests can proceed. Failed previews remain visible in operation history, and missing or unavailable media cannot be selected for a move.
 
-Every successful online state refresh can resume saved actions after owner verification recovers. Quiet polling suppresses transient notices while retaining the same delivery and request-ID deduplication behavior.
+Every successful online state refresh can resume saved actions after owner verification recovers. Background refreshes suppress transient notices while retaining the same delivery and request-ID deduplication behavior. Explicit refreshes show failures to the user.
 
 Selection controls and preview submission share the 100-item request limit. Bulk selection preserves existing selections, adds only the available capacity, and reports when another batch is needed.
 
-State and receipt writes do not call the notification object. A five-minute heartbeat republishes the cached library snapshot and does not scan the filesystem. A scan runs at startup, on an explicit library-scan request, after a newly published download completes, or after a local management operation changes the library. Scan failures preserve the prior snapshot and report a sanitized warning. The UI shows report and scan times; absence of the first scan means waiting for synchronization, not an empty library. The UI considers the local service stale after ten minutes without a report.
+Snapshot commits and inbox changes notify Mini App viewers after the durable D1 write. A five-minute heartbeat republishes the cached library snapshot and does not scan the filesystem. A scan runs at startup, on an explicit library-scan request, after a newly published download completes, or after a local management operation changes the library. Scan failures preserve the prior snapshot and report a sanitized warning. The UI shows report and scan times; absence of the first scan means waiting for synchronization, not an empty library. The UI considers the local service stale after ten minutes without a report.
 
 A failed refresh publishes its warning with the preserved library without waiting for a heartbeat. Its item list, revision, and original scan time remain intact. A subsequent successful scan clears the warning and publishes the recovered state.
 

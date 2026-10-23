@@ -426,6 +426,7 @@ async function performRefreshState({ quiet = false } = {}) {
     }
     if (!transition.authorizationRejected) updateSnapshotUpdateStatus(snapshotUpdateStatus);
     if (!quiet && navigator.onLine && mayUsePrivateSnapshot(state)) showToast(error.message);
+    throw error;
   } finally {
     state.loading = false;
     if (state.refreshAfterDrain) {
@@ -436,7 +437,9 @@ async function performRefreshState({ quiet = false } = {}) {
 }
 
 function refreshState(options = {}) {
-  return snapshotUpdates ? snapshotUpdates.refresh(options) : performRefreshState(options);
+  const refresh = snapshotUpdates ? snapshotUpdates.refresh(options) : performRefreshState(options);
+  // The transport observes callback failures for retry; UI callers rely on the toast above.
+  return refresh.catch(() => {});
 }
 
 function readActionQueue() {

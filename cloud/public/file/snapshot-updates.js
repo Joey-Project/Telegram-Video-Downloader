@@ -103,11 +103,14 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
   let authExpiresAt = null;
   let retryDelay = 1_000;
   let lastRefreshStartedAt = -Infinity;
+  let refreshRetryDelay = 1_000;
   let refreshDirty = false;
   let refreshQuiet = true;
   let refreshTimer = 0;
+  let refreshRetryTimer = 0;
   let refreshPromise = null;
   let refreshWaiters = [];
+  let activeRefreshWaiters = [];
   let connectionTimer = 0;
   let readyTimer = 0;
   let expiryTimer = 0;
@@ -143,13 +146,23 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     readyTimer = 0;
   }
 
-  function settleRefreshWaiters(error) {
-    const waiters = refreshWaiters;
-    refreshWaiters = [];
+  function settleWaiters(waiters, error) {
     for (const waiter of waiters) {
       if (error) waiter.reject(error);
       else waiter.resolve();
     }
+  }
+
+  function settleRefreshWaiters(error) {
+    const waiters = [...activeRefreshWaiters, ...refreshWaiters];
+    activeRefreshWaiters = [];
+    refreshWaiters = [];
+    settleWaiters(waiters, error);
+  }
+
+  function clearRefreshRetryTimer() {
+    clearTimer(refreshRetryTimer);
+    refreshRetryTimer = 0;
   }
 
   function scheduleRefresh(delay = 0) {
@@ -160,9 +173,22 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
 
   function requestRefresh(quiet) {
     if (!started || expired) return;
+    clearRefreshRetryTimer();
     refreshDirty = true;
     refreshQuiet = refreshQuiet && quiet;
     scheduleRefresh();
+  }
+
+  function scheduleRefreshRetry() {
+    if (!started || expired || isPaused() || refreshRetryTimer) return;
+    const delay = refreshRetryDelay;
+    refreshRetryDelay = Math.min(MAX_RETRY_MS, refreshRetryDelay * 2);
+    refreshRetryTimer = setTimer(() => {
+      refreshRetryTimer = 0;
+      if (!started || expired || isPaused()) return;
+      refreshDirty = true;
+      scheduleRefresh();
+    }, delay);
   }
 
   async function runRefresh() {
@@ -172,6 +198,9 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     refreshDirty = false;
     const quiet = refreshQuiet;
     refreshQuiet = true;
+    const attemptWaiters = refreshWaiters;
+    refreshWaiters = [];
+    activeRefreshWaiters = attemptWaiters;
     lastRefreshStartedAt = now();
     refreshPromise = Promise.resolve().then(() => refreshSnapshot({ quiet }));
     let failure = null;
@@ -181,18 +210,31 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
       failure = error;
     } finally {
       refreshPromise = null;
-      if (refreshDirty && started && !expired && !isPaused()) {
-        scheduleRefresh();
-      } else if (!refreshDirty) {
-        settleRefreshWaiters(failure);
+      if (activeRefreshWaiters === attemptWaiters) activeRefreshWaiters = [];
+      if (failure) {
+        settleWaiters(attemptWaiters, failure);
+        if (started && !expired && !isPaused()) {
+          if (!refreshDirty) {
+            refreshDirty = true;
+            refreshQuiet = true;
+          }
+          scheduleRefreshRetry();
+        }
+      } else {
+        settleWaiters(attemptWaiters);
+        refreshRetryDelay = 1_000;
+        clearRefreshRetryTimer();
+        if (refreshDirty && started && !expired && !isPaused()) {
+          scheduleRefresh();
+        }
       }
     }
   }
 
   function refresh(options = {}) {
     if (expired || !started) return Promise.resolve();
-    requestRefresh(options.quiet !== false);
-    if (refreshWaiters.length >= MAX_REFRESH_WAITERS) return Promise.resolve();
+    requestRefresh(options.quiet === true);
+    if (refreshWaiters.length + activeRefreshWaiters.length >= MAX_REFRESH_WAITERS) return Promise.resolve();
     const promise = new Promise((resolve, reject) => refreshWaiters.push({ resolve, reject }));
     return promise;
   }
@@ -263,6 +305,7 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     connecting = false;
     clearTimer(refreshTimer);
     refreshTimer = 0;
+    clearRefreshRetryTimer();
     clearConnectionTimers();
     clearReconnectTimer();
     clearFallbackTimer();
@@ -466,6 +509,9 @@ export function createSnapshotUpdates({ api, refresh: refreshSnapshot, onAuthori
     lifecyclePaused = true;
     needsCatchup = true;
     stopTransport();
+    refreshDirty = false;
+    refreshQuiet = true;
+    settleRefreshWaiters(new Error("Snapshot refresh was paused."));
     emitStatus(!isOnline() ? "offline" : "paused");
   }
 
