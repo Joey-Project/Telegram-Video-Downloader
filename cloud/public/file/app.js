@@ -3,7 +3,9 @@ import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegac
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { HttpResponseError } from "./http-error.js";
 import { createOwnerSnapshotLoader } from "./snapshot-loader.js";
+import { createSnapshotUpdates } from "./snapshot-updates.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
+import { RECENT_SNAPSHOT_MAX_AGE_MS } from "./download-submission-history.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limit.js";
 import { MAX_MANUAL_TARGET_OPTIONS, searchPresentManualTargets } from "./manual-target-picker.js";
 import { MAX_MIGRATION_ITEM_CONFLICTS, buildMigrationPreviewRefreshPayload, migrationConflictChoicesChanged, migrationConflictPolicy, migrationRefreshMatches, normalizeMigrationItemConflicts, setMigrationConflictChoice } from "./migration-conflicts.js";
@@ -27,12 +29,14 @@ const loadOwnerSnapshot = createOwnerSnapshotLoader();
 const CACHE_KEY = "file-manager.snapshot.v1";
 const ACTION_QUEUE_KEY = "file-manager.actions.v1";
 const MAX_LEGACY_BYTES = 256 * 1024;
-const POLL_MS = 12_000;
 
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
 const initialParams = new URLSearchParams(window.location.search);
 const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
+let snapshotUpdates = null;
+let snapshotUpdateStatus = "connecting";
+let privateAccessExpired = false;
 
 const byId = (id) => document.getElementById(id);
 let cachedFolderLibrary = null;
@@ -286,6 +290,49 @@ function setConnection(mode, label) {
   byId("connection-label").textContent = label;
 }
 
+function updateSnapshotUpdateStatus(status) {
+  snapshotUpdateStatus = status;
+  if (status === "expired") return;
+  if (status === "offline") {
+    setConnection("stale", "Offline · showing saved library");
+    return;
+  }
+  if (status === "paused") {
+    setConnection("", "Updates paused");
+    return;
+  }
+  if (status === "fallback") {
+    setConnection("", "Periodic refresh");
+    return;
+  }
+  if (status === "connecting") {
+    setConnection("", state.snapshot ? "Reconnecting for updates" : "Connecting for updates");
+    return;
+  }
+  const synced = state.snapshot?.synced === true;
+  const stale = state.snapshot?.stale === true;
+  setConnection(synced && !stale ? "live" : stale ? "stale" : "", !synced ? "Waiting for computer" : stale ? "Contact is overdue" : "Computer connected");
+}
+
+function refreshLocalSnapshotFreshness({ renderContent = true } = {}) {
+  const snapshot = state.snapshot;
+  if (!snapshot) return;
+  const now = Date.now();
+  const freshnessTime = Number.isSafeInteger(snapshot.last_seen) ? snapshot.last_seen : snapshot.reported_at;
+  const stale = snapshot.synced !== true
+    || !Number.isSafeInteger(freshnessTime)
+    || freshnessTime <= 0
+    || freshnessTime > now
+    || now - freshnessTime > RECENT_SNAPSHOT_MAX_AGE_MS;
+  const changed = snapshot.stale !== stale;
+  if (changed) state.snapshot = { ...snapshot, stale };
+  if (mayUsePrivateSnapshot(state)) {
+    if (changed && renderContent) render();
+    else renderSync();
+  }
+  updateSnapshotUpdateStatus(snapshotUpdateStatus);
+}
+
 function clearCachedSnapshot() {
   try { localStorage.removeItem(CACHE_KEY); } catch { /* Private content remains hidden if storage is unavailable. */ }
 }
@@ -330,6 +377,8 @@ function applySnapshotFailure(status) {
 }
 
 function handleAuthorizationFailure(error) {
+  privateAccessExpired = true;
+  snapshotUpdates?.stop();
   applySnapshotFailure(error?.status);
   showPrivateAccessGate("Owner access could not be verified. Reopen this Mini App from the owner's private chat.");
 }
@@ -345,15 +394,17 @@ async function api(path, options = {}) {
   return data;
 }
 
-async function refreshState({ quiet = false } = {}) {
-  if (!initData || state.loading) return;
+async function performRefreshState({ quiet = false } = {}) {
+  if (!initData || privateAccessExpired || state.loading) return;
   recoverFileActionReceipts();
   state.loading = true;
   try {
     const fresh = await loadOwnerSnapshot((path, headers) => api(path, { headers }));
+    if (privateAccessExpired) return;
     acceptFreshSnapshot(fresh);
-    setConnection(fresh.synced ? (fresh.stale ? "stale" : "live") : "", fresh.synced ? (fresh.stale ? "Contact is overdue" : "Computer connected") : "Waiting for computer");
+    refreshLocalSnapshotFreshness({ renderContent: false });
     render();
+    updateSnapshotUpdateStatus(snapshotUpdateStatus);
     await drainActionsAfterSnapshotRefresh(
       state,
       navigator.onLine,
@@ -361,6 +412,10 @@ async function refreshState({ quiet = false } = {}) {
     );
   } catch (error) {
     const transition = applySnapshotFailure(error?.status);
+    if (transition.authorizationRejected) {
+      privateAccessExpired = true;
+      snapshotUpdates?.stop();
+    }
     if (mayUsePrivateSnapshot(state)) {
       setConnection("stale", "Showing saved library");
       render();
@@ -369,7 +424,9 @@ async function refreshState({ quiet = false } = {}) {
         ? "Owner access could not be verified. Reopen this Mini App from the owner's private chat."
         : "The private library stays hidden until its owner is verified. Check the connection and retry.");
     }
+    if (!transition.authorizationRejected) updateSnapshotUpdateStatus(snapshotUpdateStatus);
     if (!quiet && navigator.onLine && mayUsePrivateSnapshot(state)) showToast(error.message);
+    throw error;
   } finally {
     state.loading = false;
     if (state.refreshAfterDrain) {
@@ -377,6 +434,12 @@ async function refreshState({ quiet = false } = {}) {
       window.setTimeout(() => refreshState({ quiet: true }), 0);
     }
   }
+}
+
+function refreshState(options = {}) {
+  const refresh = snapshotUpdates ? snapshotUpdates.refresh(options) : performRefreshState(options);
+  // The transport observes callback failures for retry; UI callers rely on the toast above.
+  return refresh.catch(() => {});
 }
 
 function readActionQueue() {
@@ -1950,8 +2013,14 @@ function start() {
   byId("auth-message").textContent = "Verifying access to the private library…";
   byId("auth-gate").classList.remove("hidden");
   setConnection("", "Verifying owner access");
-  refreshState();
-  window.setInterval(() => refreshState({ quiet: true }), POLL_MS);
+  snapshotUpdates = createSnapshotUpdates({
+    api,
+    refresh: performRefreshState,
+    onAuthorizationExpired: () => handleAuthorizationFailure({ status: 401 }),
+    onStatus: updateSnapshotUpdateStatus,
+  });
+  window.setInterval(refreshLocalSnapshotFreshness, 60_000);
+  snapshotUpdates.start();
 }
 
 start();

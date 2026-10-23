@@ -1,7 +1,9 @@
 import { ACTION_QUEUE_LIMIT, ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_SETTINGS, appendAction, consumeRejectedActionReceipts, createQueuedAction, dispatchNextOwnedAction, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "/file/action-queue.js";
 import { HttpResponseError } from "/file/http-error.js";
 import { createOwnerSnapshotLoader } from "/file/snapshot-loader.js";
+import { createSnapshotUpdates } from "/file/snapshot-updates.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "/file/snapshot-session.js";
+import { RECENT_SNAPSHOT_MAX_AGE_MS } from "/file/download-submission-history.js";
 import { escapeHtml } from "/file/preview-rendering.js";
 import { validateTargetRelativeDirectory } from "/file/target-directory.js";
 import { mediaLibraryAvailability, mediaLibraryEntries, resolveMediaLibrary } from "/file/library-view.js";
@@ -13,7 +15,6 @@ import { timeAgoMilliseconds, timeAgoSeconds } from "./time-format.js";
 const API = "/api";
 const loadOwnerSnapshot = createOwnerSnapshotLoader();
 const ACTION_QUEUE_KEY = "file-manager.actions.v1";
-const POLL_MS = 12_000;
 const MAX_ACTION_QUEUE = ACTION_QUEUE_LIMIT;
 const SETTINGS_KINDS = new Set([
   "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove", "library_scan",
@@ -37,6 +38,9 @@ const state = {
   libraryDrafts: new Map(),
   toastTimer: 0,
 };
+let snapshotUpdates = null;
+let snapshotUpdateStatus = "connecting";
+let privateAccessExpired = false;
 
 const byId = (id) => document.getElementById(id);
 const formatTime = (value) => {
@@ -59,6 +63,49 @@ function setConnection(mode, label) {
   const dot = byId("connection-dot");
   dot.className = `connection-dot${mode === "live" ? " live" : mode === "stale" ? " stale" : ""}`;
   byId("connection-label").textContent = label;
+}
+
+function updateSnapshotUpdateStatus(status) {
+  snapshotUpdateStatus = status;
+  if (status === "expired") return;
+  if (status === "offline") {
+    setConnection("stale", "Offline · showing saved settings");
+    return;
+  }
+  if (status === "paused") {
+    setConnection("", "Updates paused");
+    return;
+  }
+  if (status === "fallback") {
+    setConnection("", "Periodic refresh");
+    return;
+  }
+  if (status === "connecting") {
+    setConnection("", state.snapshot ? "Reconnecting for updates" : "Connecting for updates");
+    return;
+  }
+  const synced = state.snapshot?.synced === true;
+  const stale = state.snapshot?.stale === true;
+  setConnection(synced && !stale ? "live" : stale ? "stale" : "", !synced ? "Waiting for computer" : stale ? "Contact is overdue" : "Computer connected");
+}
+
+function refreshLocalSnapshotFreshness({ renderContent = true } = {}) {
+  const snapshot = state.snapshot;
+  if (!snapshot) return;
+  const now = Date.now();
+  const freshnessTime = Number.isSafeInteger(snapshot.last_seen) ? snapshot.last_seen : snapshot.reported_at;
+  const stale = snapshot.synced !== true
+    || !Number.isSafeInteger(freshnessTime)
+    || freshnessTime <= 0
+    || freshnessTime > now
+    || now - freshnessTime > RECENT_SNAPSHOT_MAX_AGE_MS;
+  const changed = snapshot.stale !== stale;
+  if (changed) state.snapshot = { ...snapshot, stale };
+  if (mayUsePrivateSnapshot(state)) {
+    if (changed && renderContent) render();
+    else renderSync();
+  }
+  updateSnapshotUpdateStatus(snapshotUpdateStatus);
 }
 
 function showToast(message) {
@@ -299,9 +346,7 @@ async function drainActionQueue({ quiet = false } = {}) {
 
       const { action, error } = outcome;
       if (error?.status === 401 || error?.status === 403) {
-        state.snapshot = null;
-        Object.assign(state, failOwnerSnapshot(state, error.status));
-        showPrivateAccessGate("Owner access could not be verified. Reopen this Mini App from the owner’s private chat.");
+        handleAuthorizationFailure();
         break;
       }
       if (!shouldRetryActionFailure(error)) {
@@ -667,20 +712,33 @@ function applySnapshotFailure(status) {
   return transition;
 }
 
-async function refreshState({ quiet = false } = {}) {
-  if (!initData || state.loading) return;
+function handleAuthorizationFailure() {
+  privateAccessExpired = true;
+  snapshotUpdates?.stop();
+  applySnapshotFailure(401);
+  showPrivateAccessGate("Owner access could not be verified. Reopen this Mini App from the owner’s private chat.");
+}
+
+async function performRefreshState({ quiet = false } = {}) {
+  if (!initData || privateAccessExpired || state.loading) return;
   recoverSettingsActionReceipts();
   state.loading = true;
   try {
     const fresh = await loadOwnerSnapshot((path, headers) => api(path, { headers }));
+    if (privateAccessExpired) return;
     Object.assign(state, acceptOwnerSnapshot(fresh, state));
     byId("auth-gate").classList.add("hidden");
     byId("app-content").classList.remove("hidden");
-    setConnection(fresh.synced ? fresh.stale ? "stale" : "live" : "", fresh.synced ? fresh.stale ? "Contact is overdue" : "Computer connected" : "Waiting for computer");
+    refreshLocalSnapshotFreshness({ renderContent: false });
     render();
+    updateSnapshotUpdateStatus(snapshotUpdateStatus);
     await drainActionsAfterSnapshotRefresh(state, navigator.onLine, () => drainActionQueue({ quiet }));
   } catch (error) {
     const transition = applySnapshotFailure(error?.status);
+    if (transition.authorizationRejected) {
+      privateAccessExpired = true;
+      snapshotUpdates?.stop();
+    }
     if (mayUsePrivateSnapshot(state)) {
       setConnection("stale", "Showing last saved settings");
       render();
@@ -689,7 +747,9 @@ async function refreshState({ quiet = false } = {}) {
         ? "Owner access could not be verified. Reopen this Mini App from the owner’s private chat."
         : "Private settings stay hidden until the owner is verified. Check the connection and retry.");
     }
+    if (!transition.authorizationRejected) updateSnapshotUpdateStatus(snapshotUpdateStatus);
     if (!quiet && navigator.onLine && mayUsePrivateSnapshot(state)) showToast(error.message);
+    throw error;
   } finally {
     state.loading = false;
     if (state.refreshAfterDrain) {
@@ -697,6 +757,12 @@ async function refreshState({ quiet = false } = {}) {
       window.setTimeout(() => refreshState({ quiet: true }), 0);
     }
   }
+}
+
+function refreshState(options = {}) {
+  const refresh = snapshotUpdates ? snapshotUpdates.refresh(options) : performRefreshState(options);
+  // The transport observes callback failures for retry; UI callers rely on the toast above.
+  return refresh.catch(() => {});
 }
 
 function start() {
@@ -711,8 +777,14 @@ function start() {
   byId("auth-message").textContent = "Verifying owner access to local media settings…";
   byId("auth-gate").classList.remove("hidden");
   setConnection("", "Verifying owner access");
-  refreshState();
-  window.setInterval(() => refreshState({ quiet: true }), POLL_MS);
+  snapshotUpdates = createSnapshotUpdates({
+    api,
+    refresh: performRefreshState,
+    onAuthorizationExpired: handleAuthorizationFailure,
+    onStatus: updateSnapshotUpdateStatus,
+  });
+  window.setInterval(refreshLocalSnapshotFreshness, 60_000);
+  snapshotUpdates.start();
 }
 
 start();

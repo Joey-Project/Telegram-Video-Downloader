@@ -1,6 +1,6 @@
 # Cloud file manager
 
-This Cloudflare Worker hosts the private Telegram Mini Apps at `/file/` and `/settings/`, validates Telegram Mini App `initData`, stores owner requests in a durable D1 inbox, and uses a hibernating Durable Object only to notify the connected desktop client. D1 remains the reconnect source of truth. The desktop reports its registered-library snapshots, applied settings, and migration status over the authenticated local API; downloads and file operations continue to run on that desktop.
+This Cloudflare Worker hosts the private Telegram Mini Apps at `/file/` and `/settings/`, validates Telegram Mini App `initData`, stores owner requests in a durable D1 inbox, and uses a hibernating Durable Object for desktop ingress notifications and Mini App state-change notifications. D1 remains the reconnect source of truth. The desktop reports its registered-library snapshots, applied settings, and migration status over the authenticated local API; downloads and file operations continue to run on that desktop.
 
 ## Local checks
 
@@ -24,7 +24,7 @@ The Worker needs these bindings:
 - `OWNER_USER_ID`: the Telegram owner user ID as a string.
 - `LOCAL_SHARED_SECRET`: bearer credential for the desktop's `/api/local/*` endpoints.
 - `WEBHOOK_SECRET`: Telegram webhook secret-token value.
-- `BOT_TOKEN`: used only to verify Telegram Mini App `initData` signatures.
+- `BOT_TOKEN`: used server-side to verify Telegram Mini App `initData` signatures and sign domain-separated, short-lived viewer connection tickets.
 
 The three secrets must be supplied through the runtime's secret store. They are never returned by API responses or embedded in the static app.
 
@@ -32,8 +32,32 @@ The three secrets must be supplied through the runtime's secret store. They are 
 
 - `POST /webhook`: verify Telegram's webhook secret, persist supported owner-private updates, then send a best-effort live notification.
 - `GET /api/state` and `GET /api/library`: owner-only Mini App reads. The state endpoint includes safe summaries of up to 100 unacknowledged cloud inbox requests, without their payloads.
+- `POST /api/updates/session` and `GET /api/updates/ws`: owner-authenticated Mini App subscription setup and hibernating WebSocket notifications. The browser obtains a short-lived connection ticket using Telegram authorization, then supplies it through WebSocket subprotocol headers. The ticket is never placed in the URL or persistent browser storage; no additional manually managed credentials are required.
 - `POST /api/actions`: owner-only validated and idempotent file-management, settings, download-submission, and migration requests. Apply `migrations/0003_media_library_request_kinds.sql` before enabling the new action kinds.
 - `GET /api/local/requests`, `POST /api/local/ack`, `POST /api/local/state`, and `GET /api/local/ws`: shared-secret desktop integration. Inbox acknowledgment means durable local receipt, not completion.
+
+## Live Mini App updates
+
+Both Mini Apps subscribe to lightweight state-change hints instead of polling every twelve
+seconds. A successful snapshot commit or inbox change triggers notification only after its
+D1 write. Uploading an individual staged content chunk does not publish a new snapshot.
+The desktop and browser use separate subscription roles: browsers never receive the
+desktop's inbox envelopes or its shared secret.
+
+The browser subscribes before reconciling its current state, and reads the existing
+`chunked-v1` HTTP manifest and verified content chunks after a notification. Notifications
+are hints, not durable state or permission to act. Refreshes are coalesced without dropping
+changes received during a read. Reconnection, returning to the foreground and low-frequency
+fallback reads recover changes missed during disconnection or failed notification delivery.
+Failed snapshot reads retry after one second, doubling the delay up to one minute until
+a read succeeds. These retries are quiet; explicit refreshes retain user-visible errors.
+Inactive pages pause unnecessary connection retries and refreshes. Connection authorization
+expires with the original Telegram authorization; reconnecting does not extend that deadline.
+
+The Durable Object accepts both client roles through the Hibernation WebSocket API. Idle
+connections do not require a running JavaScript timer or a permanently active object. The
+object uses an alarm for viewer authorization expiry. Mobile page suspension remains a
+separate lifecycle concern and is handled by reconnection and reconciliation.
 
 An action envelope requires `request_id`, `kind`, `payload`, `queued_at_ms` and
 `replay_expires_at_ms`. Create the UUID and Unix-millisecond timestamps once for a new action;

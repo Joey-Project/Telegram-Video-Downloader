@@ -8,6 +8,7 @@ import {
   createDatabaseEpoch,
   emptySnapshot,
   enqueue,
+  getDatabaseEpoch,
   getPendingPage,
   getPendingSummary,
   isDatabaseEpoch,
@@ -35,6 +36,20 @@ import {
   validateSnapshot,
   validateTelegramUpdate,
 } from "./validation";
+import type { MiniAppUpdateEvent } from "./notification_hub";
+import {
+  issueMiniAppUpdatesTicket,
+  MINIAPP_UPDATES_PROTOCOL,
+  MINIAPP_UPDATES_SESSION_PATH,
+  MINIAPP_UPDATES_SOCKET_PATH,
+  NOTIFIER_ROLE_HEADER,
+  NOTIFIER_VIEWER_AUTH_EXPIRY_HEADER,
+  NOTIFIER_VIEWER_EPOCH_HEADER,
+  NOTIFIER_VIEWER_OWNER_HEADER,
+  NOTIFIER_VIEWER_TICKET_EXPIRY_HEADER,
+  readMiniAppUpdatesTicketProtocol,
+  verifyMiniAppUpdatesTicket,
+} from "./updates";
 export { NotificationHub } from "./notification_hub";
 
 const NOTIFIER_ID = "telegram-single-owner";
@@ -121,6 +136,27 @@ async function notifyAfterPersist(env: Env, envelope: InboxEnvelope): Promise<vo
   }
 }
 
+async function notifyViewersAfterPersist(
+  env: Env,
+  reason: MiniAppUpdateEvent["reason"],
+  databaseEpoch?: string,
+  stateVersion?: number,
+): Promise<void> {
+  try {
+    const epoch = databaseEpoch ?? await getDatabaseEpoch(env.DB);
+    const event: MiniAppUpdateEvent = {
+      type: "invalidate",
+      database_epoch: epoch,
+      reason,
+      ...(stateVersion === undefined ? {} : { state_version: stateVersion }),
+    };
+    await env.NOTIFIER.getByName(NOTIFIER_ID).notifyViewers(event);
+  } catch {
+    // D1 is authoritative; viewer updates are hints and cannot undo a durable write.
+    console.warn(JSON.stringify({ event: "miniapp_update_notification_failed", reason }));
+  }
+}
+
 async function handleWebhook(request: Request, env: Env): Promise<Response> {
   requireWebhookAuthorization(request, env);
   const ownerUserId = requireConfiguredOwnerUserId(env.OWNER_USER_ID);
@@ -130,6 +166,7 @@ async function handleWebhook(request: Request, env: Env): Promise<Response> {
   }
   const result = await enqueue(env.DB, `tg:${rawUpdate.update_id}`, "telegram", rawUpdate);
   await notifyAfterPersist(env, result.envelope);
+  await notifyViewersAfterPersist(env, "inbox");
   return persistedResponse(200, result.envelope.seq, result.duplicate);
 }
 
@@ -141,6 +178,7 @@ async function handleAction(request: Request, env: Env): Promise<Response> {
     replay_expires_at_ms: action.replay_expires_at_ms,
   });
   await notifyAfterPersist(env, result.envelope);
+  await notifyViewersAfterPersist(env, "inbox");
   return persistedResponse(202, result.envelope.seq, result.duplicate);
 }
 
@@ -162,7 +200,9 @@ async function handleLocalAck(request: Request, env: Env): Promise<Response> {
   requireLocalAuthorization(request, env);
   const databaseEpoch = await assertDatabaseEpoch(env.DB, request.headers.get("X-Cloud-Database-Epoch"));
   const receipts = parseAckReceipts(await readJsonBody(request, MAX_ACK_BODY_BYTES));
-  return json({ acked: await acknowledge(env.DB, receipts, databaseEpoch) });
+  const acked = await acknowledge(env.DB, receipts, databaseEpoch);
+  if (receipts.length > 0) await notifyViewersAfterPersist(env, "inbox", databaseEpoch);
+  return json({ acked });
 }
 
 async function handleLocalSnapshotChunk(request: Request, env: Env, sha256: string): Promise<Response> {
@@ -185,6 +225,7 @@ async function handleLocalState(request: Request, env: Env): Promise<Response> {
     const now = Date.now();
     if (snapshot.reported_at > now + 60_000) throw new HttpError(400, "reported_at is too far in the future");
     await storeChunkedSnapshot(env.DB, snapshot, databaseEpoch);
+    await notifyViewersAfterPersist(env, "state", databaseEpoch, snapshot.state_version);
     return json({ stored: true, last_seen: now });
   }
   const prepared = isRecord(body) && Object.hasOwn(body, "format") ? validatePreparedSnapshot(body) : undefined;
@@ -192,6 +233,7 @@ async function handleLocalState(request: Request, env: Env): Promise<Response> {
   const now = Date.now();
   if (snapshot.reported_at > now + 60_000) throw new HttpError(400, "reported_at is too far in the future");
   await storeSnapshot(env.DB, snapshot, databaseEpoch, prepared);
+  await notifyViewersAfterPersist(env, "state", databaseEpoch, snapshot.state_version);
   return json({ stored: true, last_seen: now });
 }
 
@@ -227,6 +269,7 @@ async function handleLocalEpochRotation(request: Request, env: Env): Promise<Res
   if (!result.rotated) {
     throw new HttpError(409, "Cloud sequence conflict no longer matches", undefined, result.database_epoch);
   }
+  await notifyViewersAfterPersist(env, "epoch", result.database_epoch);
   return json({ rotated: true, database_epoch: result.database_epoch });
 }
 
@@ -236,7 +279,50 @@ async function handleLocalWebSocket(request: Request, env: Env): Promise<Respons
   if (request.method !== "GET" || request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
     return json({ error: "WebSocket upgrade required" }, 426);
   }
-  return env.NOTIFIER.getByName(NOTIFIER_ID).fetch(request);
+  const headers = new Headers(request.headers);
+  headers.set(NOTIFIER_ROLE_HEADER, "local-client");
+  headers.delete(NOTIFIER_VIEWER_OWNER_HEADER);
+  headers.delete(NOTIFIER_VIEWER_EPOCH_HEADER);
+  headers.delete(NOTIFIER_VIEWER_TICKET_EXPIRY_HEADER);
+  headers.delete(NOTIFIER_VIEWER_AUTH_EXPIRY_HEADER);
+  return env.NOTIFIER.getByName(NOTIFIER_ID).fetch(new Request(request, { headers }));
+}
+
+async function handleMiniAppUpdatesSession(request: Request, env: Env): Promise<Response> {
+  const owner = await requireOwner(request, env);
+  const databaseEpoch = await getDatabaseEpoch(env.DB);
+  const issued = await issueMiniAppUpdatesTicket(env.BOT_TOKEN, owner.userId, databaseEpoch, owner.expiresAt);
+  return json({
+    ticket: issued.ticket,
+    websocket_path: MINIAPP_UPDATES_SOCKET_PATH,
+    protocol: MINIAPP_UPDATES_PROTOCOL,
+    expires_at: owner.expiresAt,
+    database_epoch: databaseEpoch,
+  });
+}
+
+async function handleMiniAppUpdatesWebSocket(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+  if (new URL(request.url).search.length > 0) return json({ error: "WebSocket ticket must not be in the URL" }, 400);
+  if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+    return json({ error: "WebSocket upgrade required" }, 426);
+  }
+  const ticket = readMiniAppUpdatesTicketProtocol(request.headers.get("sec-websocket-protocol"));
+  if (ticket === null) return json({ error: "Unauthorized" }, 401);
+  const claims = await verifyMiniAppUpdatesTicket(ticket, env.BOT_TOKEN, env.OWNER_USER_ID);
+  if (claims === null) return json({ error: "Unauthorized" }, 401);
+  await assertDatabaseEpoch(env.DB, claims.database_epoch);
+
+  const headers = new Headers(request.headers);
+  headers.set("sec-websocket-protocol", MINIAPP_UPDATES_PROTOCOL);
+  headers.set(NOTIFIER_ROLE_HEADER, "viewer");
+  headers.set(NOTIFIER_VIEWER_OWNER_HEADER, claims.owner_user_id);
+  headers.set(NOTIFIER_VIEWER_EPOCH_HEADER, claims.database_epoch);
+  headers.set(NOTIFIER_VIEWER_TICKET_EXPIRY_HEADER, String(claims.ticket_expires_at));
+  headers.set(NOTIFIER_VIEWER_AUTH_EXPIRY_HEADER, String(claims.auth_expires_at));
+  headers.delete("x-telegram-init-data");
+  headers.delete("authorization");
+  return env.NOTIFIER.getByName(NOTIFIER_ID).fetch(new Request(request, { headers }));
 }
 
 function requireChunkedSnapshotCapability(request: Request): void {
@@ -343,6 +429,11 @@ async function dispatch(request: Request, env: Env): Promise<Response> {
     return handleLocalSnapshotChunk(request, env, localChunkMatch[1]!);
   }
   if (path === "/api/local/ws") return handleLocalWebSocket(request, env);
+  if (path === MINIAPP_UPDATES_SESSION_PATH) {
+    if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+    return handleMiniAppUpdatesSession(request, env);
+  }
+  if (path === MINIAPP_UPDATES_SOCKET_PATH) return handleMiniAppUpdatesWebSocket(request, env);
   if (path === "/api/state") {
     if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
     return handleState(request, env);
