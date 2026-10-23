@@ -1311,6 +1311,40 @@ fn queue_index_contents(root: &Path) -> Vec<u8> {
         .expect("queue index should be readable")
 }
 
+fn publish_task_record_as_legacy_media_sidecar(video_root: &Path, task_id: &str) -> PathBuf {
+    let index_path = video_root.join(".telegram-video-downloader-queue/index.json");
+    let mut index: serde_json::Value = serde_json::from_slice(&queue_index_contents(video_root))
+        .expect("queue index should decode for the legacy sidecar fixture");
+    let indexed_path = PathBuf::from(
+        index["tasks"][task_id]["record_path"]
+            .as_str()
+            .expect("task index should store its record path"),
+    );
+    assert!(
+        !indexed_path.is_absolute(),
+        "current queue fixture paths should be root-relative"
+    );
+    let source_path = video_root.join(indexed_path);
+    let sidecar_path = video_root
+        .join(task_id)
+        .join(format!(".telegram-video-downloader-task-{task_id}.json"));
+    fs::rename(&source_path, &sidecar_path)
+        .expect("completed task record should move beside its published media");
+    let relative_sidecar_path = sidecar_path
+        .strip_prefix(video_root)
+        .expect("legacy sidecar should remain beneath the media root")
+        .to_string_lossy()
+        .into_owned();
+    index["tasks"][task_id]["record_path"] = serde_json::json!(relative_sidecar_path);
+    index["tasks"][task_id]["move_target"] = serde_json::Value::Null;
+    fs::write(
+        index_path,
+        serde_json::to_vec(&index).expect("legacy sidecar index should encode"),
+    )
+    .expect("legacy sidecar path should persist in the queue index");
+    sidecar_path
+}
+
 fn open_runtime_test_inbox_with_file_provider(
     root: &Path,
     file_provider: Arc<dyn QueueFileProvider>,
@@ -3557,11 +3591,39 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
             task_id: "pgc-md1376",
             url: "https://www.bilibili.com/bangumi/media/md1376",
             collection_title: Some("家庭教师HITMAN REBORN!"),
-            canonical_season_id: Some(1376),
+            canonical_season_id: None,
             entries: md1376_entries,
             with_verified_attempt: true,
         },
     );
+    let md1376_sidecar_path =
+        publish_task_record_as_legacy_media_sidecar(&config.downloads.video_dir, "pgc-md1376");
+    let md1376_before_backfill = queue
+        .get("pgc-md1376")
+        .expect("legacy md1376 task should load from its sidecar")
+        .expect("legacy md1376 task should remain indexed");
+    let md1376_before_plan = md1376_before_backfill
+        .plan
+        .as_ref()
+        .expect("legacy md1376 plan should persist");
+    assert_eq!(md1376_before_backfill.status, TaskStatus::Completed);
+    assert_eq!(md1376_before_plan.bilibili_pgc_season_id, None);
+    assert!(md1376_before_plan.bilibili_pgc_episode_orders.is_empty());
+    assert_eq!(md1376_before_plan.bilibili_group_entries.len(), 203);
+    let md1376_before_attempt = serde_json::to_value(&md1376_before_backfill.bilibili_attempt)
+        .expect("legacy md1376 receipt should serialize");
+    let md1376_before_hashes = md1376_before_backfill.primary_media_hashes.clone();
+    let md1376_before_saved_location = md1376_before_backfill.saved_location.clone();
+    let md1376_first_bytes = fs::read(config.downloads.video_dir.join(&md1376_paths[0]))
+        .expect("first published episode should be readable before backfill");
+    let md1376_last_bytes = fs::read(
+        config.downloads.video_dir.join(
+            md1376_paths
+                .last()
+                .expect("203-entry fixture should have a final episode"),
+        ),
+    )
+    .expect("last published episode should be readable before backfill");
     let ss_paths = add_completed_bilibili_plan_fixture(
         &queue,
         &config.downloads.video_dir,
@@ -3794,6 +3856,10 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
     let legacy_before_saved_location = legacy_before_backfill.saved_location.clone();
     let resolver_url = "https://www.bilibili.com/bangumi/media/md18102";
     let resolver_episode_id = 95_102_u64;
+    let md1376_resolver_url = "https://www.bilibili.com/bangumi/media/md1376";
+    let md1376_resolver_episode_orders = (1..=203_u32)
+        .map(|index| (10_000 + u64::from(index), index))
+        .collect::<BTreeMap<_, _>>();
     let backfill_cursor =
         crate::pgc_metadata_backfill::backfill_legacy_pgc_metadata_with_resolver_for_test(
             Arc::clone(&queue),
@@ -3802,11 +3868,19 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
             &root_binding,
             None,
             move |_config: Arc<AppConfig>, url: String| {
-                let identity =
-                    (url == resolver_url).then(|| crate::downloader::BilibiliPgcSeasonIdentity {
+                let identity = if url == md1376_resolver_url {
+                    Some(crate::downloader::BilibiliPgcSeasonIdentity {
+                        season_id: 1376,
+                        episode_orders: md1376_resolver_episode_orders.clone(),
+                    })
+                } else if url == resolver_url {
+                    Some(crate::downloader::BilibiliPgcSeasonIdentity {
                         season_id: 18_102,
                         episode_orders: BTreeMap::from([(resolver_episode_id, 10)]),
-                    });
+                    })
+                } else {
+                    None
+                };
                 async move { Ok(identity) }
             },
         )
@@ -3814,6 +3888,113 @@ async fn pgc_collection_hints_reach_scanned_cloud_snapshot_without_guessing() {
     assert!(
         backfill_cursor.is_some(),
         "legacy metadata backfill pass should run against the temporary queue"
+    );
+    let md1376_after_backfill = queue
+        .get("pgc-md1376")
+        .expect("backfilled md1376 task should load")
+        .expect("backfilled md1376 sidecar should remain indexed");
+    assert_eq!(md1376_after_backfill.status, md1376_before_backfill.status);
+    assert!(md1376_after_backfill.revision > md1376_before_backfill.revision);
+    assert_eq!(
+        md1376_after_backfill.updated_at,
+        md1376_before_backfill.updated_at
+    );
+    assert_eq!(
+        md1376_after_backfill.generation,
+        md1376_before_backfill.generation
+    );
+    assert_eq!(
+        md1376_after_backfill.activity_revision,
+        md1376_before_backfill.activity_revision
+    );
+    assert_eq!(
+        md1376_after_backfill.user_actions,
+        md1376_before_backfill.user_actions
+    );
+    assert_eq!(
+        md1376_after_backfill.primary_media_hashes,
+        md1376_before_hashes
+    );
+    assert_eq!(
+        md1376_after_backfill.saved_location,
+        md1376_before_saved_location
+    );
+    assert_eq!(
+        serde_json::to_value(&md1376_after_backfill.bilibili_attempt)
+            .expect("backfilled md1376 receipt should serialize"),
+        md1376_before_attempt,
+        "metadata-only backfill must preserve published episode receipts"
+    );
+    let md1376_after_plan = md1376_after_backfill
+        .plan
+        .as_ref()
+        .expect("backfilled md1376 plan should remain present");
+    assert_eq!(md1376_after_plan.bilibili_pgc_season_id, Some(1376));
+    assert_eq!(md1376_after_plan.bilibili_pgc_episode_orders.len(), 203);
+    assert_eq!(
+        md1376_after_plan.bilibili_group_entries,
+        md1376_before_plan.bilibili_group_entries
+    );
+    for (episode_id, expected_order) in [(10_001_u64, 1_u32), (10_203, 203)] {
+        let stable_media_id = pgc_test_stable_media_id(9_000 + (episode_id - 10_000), episode_id);
+        assert_eq!(
+            md1376_after_plan
+                .bilibili_pgc_episode_orders
+                .iter()
+                .find(|entry| entry.stable_media_id == stable_media_id)
+                .map(|entry| entry.index),
+            Some(expected_order),
+            "resolver order should be retained for episode {expected_order}"
+        );
+    }
+    let md1376_index: serde_json::Value =
+        serde_json::from_slice(&queue_index_contents(&config.downloads.video_dir))
+            .expect("queue index should decode after metadata backfill");
+    assert_eq!(
+        md1376_index["tasks"]["pgc-md1376"]["record_path"],
+        "pgc-md1376/.telegram-video-downloader-task-pgc-md1376.json"
+    );
+    assert!(md1376_sidecar_path.is_file());
+    assert!(
+        !config
+            .downloads
+            .video_dir
+            .join(".telegram-video-downloader-queue/task-pgc-md1376.json")
+            .exists(),
+        "metadata backfill must not move the legacy task sidecar into the active queue"
+    );
+    assert_eq!(
+        md1376_index["tasks"]["pgc-md1376"]["revision"],
+        md1376_after_backfill.revision
+    );
+    assert_eq!(
+        md1376_index["tasks"]["pgc-md1376"]["updated_at"],
+        md1376_before_backfill.updated_at
+    );
+    assert!(
+        queue
+            .list(123_456_789, true, 0)
+            .expect("completed task history should remain readable")
+            .iter()
+            .any(|record| record.id == "pgc-md1376")
+    );
+    assert_eq!(
+        fs::read(config.downloads.video_dir.join(&md1376_paths[0]))
+            .expect("first published episode should remain readable"),
+        md1376_first_bytes,
+        "PGC metadata backfill must not redownload or rewrite episode media"
+    );
+    assert_eq!(
+        fs::read(
+            config.downloads.video_dir.join(
+                md1376_paths
+                    .last()
+                    .expect("203-entry fixture should have a final episode")
+            )
+        )
+        .expect("last published episode should remain readable"),
+        md1376_last_bytes,
+        "PGC metadata backfill must not redownload or rewrite episode media"
     );
     let backfilled_record = queue
         .get("pgc-legacy-md-single-order10")
