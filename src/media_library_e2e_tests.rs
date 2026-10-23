@@ -15,16 +15,16 @@ async fn wait_for_management_dispatch_idle(runtime: &CloudBotRuntime) {
     drop(permit);
 }
 
-struct MigrationFixture {
-    root: PathBuf,
-    video_root: PathBuf,
-    archive_root: PathBuf,
-    config: AppConfig,
-    source_library_id: String,
-    target_library_id: String,
+pub(super) struct MigrationFixture {
+    pub(super) root: PathBuf,
+    pub(super) video_root: PathBuf,
+    pub(super) archive_root: PathBuf,
+    pub(super) config: AppConfig,
+    pub(super) source_library_id: String,
+    pub(super) target_library_id: String,
 }
 
-fn create_migration_fixture(
+pub(super) fn create_migration_fixture(
     label: &str,
     epoch: &str,
 ) -> (MigrationFixture, Arc<QueueManager>, Arc<CloudInbox>) {
@@ -79,7 +79,7 @@ fn library_root_binding(queue: &QueueManager, library_id: &str) -> String {
         .expect("registered library should have a bound root token")
 }
 
-async fn scan_file_item_id(
+pub(super) async fn scan_file_item_id(
     runtime: &CloudBotRuntime,
     seq: u64,
     library_id: &str,
@@ -156,7 +156,7 @@ fn snapshot_library_metadata_tree(
     entries
 }
 
-fn migration_engine_for_test(
+pub(super) fn migration_engine_for_test(
     runtime: &CloudBotRuntime,
     source_library_id: &str,
     target_library_id: &str,

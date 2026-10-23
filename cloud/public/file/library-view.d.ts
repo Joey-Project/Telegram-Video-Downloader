@@ -17,10 +17,29 @@ export type LibraryViewItem = {
   confidence?: unknown;
   metadata_status?: unknown;
   collection?: unknown;
+  moved_to?: unknown;
+};
+export type MovedToTarget = {
+  library_id: string;
+  library_name: string;
+  item_id: string;
+  relative_path: string;
 };
 
 export function itemFolder(item: LibraryViewItem): string;
 export function statusOf(item: LibraryViewItem): string;
+export function movedToTarget(item: LibraryViewItem): MovedToTarget | null;
+export function librarySelectionCounts<T extends LibraryViewItem>(
+  items: readonly T[] | null | undefined,
+  selectedIds: Iterable<string> | null | undefined,
+  canOperate: boolean,
+): {
+  totalCount: number;
+  selectedCount: number;
+  selectableCount: number;
+  skippedUnavailableCount: number;
+  readOnlyCount: number;
+};
 export function needsOrganizing(item: LibraryViewItem): boolean;
 export function mediaLibraryEntries(ownerSnapshot: unknown): MediaLibraryDescriptor[];
 export function defaultMediaLibraryId(ownerSnapshot: unknown): string;

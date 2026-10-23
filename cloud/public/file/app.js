@@ -14,7 +14,7 @@ import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewableP
 import { sourceIdUrl } from "./source-links.js";
 import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
 import { validateTargetRelativeDirectory } from "./target-directory.js";
-import { boundedFolderSuggestions, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnRegisteredMediaLibrary, collectionIdentity, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, itemFolder, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget, statusOf } from "./library-view.js";
+import { boundedFolderSuggestions, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnRegisteredMediaLibrary, collectionIdentity, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, itemFolder, librarySelectionCounts, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, movedToTarget, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget, statusOf } from "./library-view.js";
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
 import { renderMigrationDiscoveryWarnings, renderMigrationHistory } from "./migration-rendering.js";
 import { createMigrationRefreshQueuedCallback, inspectMigrationRefreshHistory, migrationPreviewDraftKey, migrationPreviewEntries as collectMigrationPreviewEntries, migrationPreviewPageWindow, reconcileMigrationRefreshDrafts, releaseMigrationRefreshTracking, renderMigrationPreview as renderMigrationPreviewCard } from "./migration-preview-rendering.js";
@@ -33,7 +33,7 @@ const MAX_LEGACY_BYTES = 256 * 1024;
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
 const initialParams = new URLSearchParams(window.location.search);
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
 let snapshotUpdates = null;
 let snapshotUpdateStatus = "connecting";
 let privateAccessExpired = false;
@@ -75,6 +75,31 @@ const snapshotValue = () => state.snapshot ?? { synced: false, stale: true, libr
 
 function libraryCanOperate(libraryId = activeLibraryId()) {
   return canOperateOnRegisteredMediaLibrary(state.snapshot, libraryId);
+}
+
+function selectionLibraryReadOnlyReason() {
+  const descriptor = activeLibrary().descriptor;
+  const offline = mediaLibraryAvailability(descriptor) === "offline";
+  const savedScan = descriptor?.snapshot_stale === true;
+  if (offline && savedScan) return "Library offline; its saved scan is read-only.";
+  if (savedScan) return "Saved scan is read-only; refresh before selecting.";
+  if (offline) return "Library offline; reconnect before selecting.";
+  return "Library is read-only; refresh its current scan before selecting.";
+}
+
+function mediaSelectionReason(item, selectionEnabled, movedTarget = null) {
+  const presence = statusOf(item);
+  const reasons = [];
+  if (presence === "missing" && movedTarget) reasons.push("This source history item cannot be selected; open its destination item.");
+  else if (presence === "missing") reasons.push("Missing from this library; cannot select. Run a scan to refresh its status.");
+  else if (presence === "unavailable") reasons.push("Unavailable in this library; cannot select.");
+  else if (presence !== "present") reasons.push("File availability is unknown; scan before selecting.");
+  if (!selectionEnabled) reasons.push(selectionLibraryReadOnlyReason());
+  return reasons.join(" ");
+}
+
+function accessibleToken(value) {
+  return Array.from(String(value ?? ""), (character) => character.codePointAt(0).toString(16)).join("-") || "empty";
 }
 
 function filePreviewPayload(fields, expectedIdentity = null) {
@@ -339,7 +364,7 @@ function clearCachedSnapshot() {
 
 function showPrivateAccessGate(message) {
   state.detailId = null;
-  state.selected.clear();
+  clearSelectedItems();
   state.legacyOperation = null;
   state.legacyOperationKey = null;
   state.legacySelection.clear();
@@ -351,7 +376,9 @@ function showPrivateAccessGate(message) {
 }
 
 function acceptFreshSnapshot(snapshot) {
-  clearFileIdentityScopedStateOnSnapshot(state, state.snapshot, snapshot);
+  if (clearFileIdentityScopedStateOnSnapshot(state, state.snapshot, snapshot)) {
+    state.groupSelectionLimitNotice = null;
+  }
   Object.assign(state, acceptOwnerSnapshot(snapshot, state));
   settleMigrationConflictRefreshes();
   normalizeLibraryContext();
@@ -765,7 +792,13 @@ function updateSelectedItems(candidateIds, selected) {
   const result = updateSelectionWithinLimit(state.selected, candidateIds, selected);
   state.selected.clear();
   for (const id of result.ids) state.selected.add(id);
+  state.groupSelectionLimitNotice = null;
   return result.omittedCount;
+}
+
+function clearSelectedItems() {
+  state.selected.clear();
+  state.groupSelectionLimitNotice = null;
 }
 
 function selectionLimitMessage(omittedCount = 0) {
@@ -800,18 +833,27 @@ function renderFilters() {
   byId("known-folders").innerHTML = destinationSuggestions.map((folder) => `<option value="${escapeHtml(folder)}"></option>`).join("");
 }
 
-function itemRow(item, selectionEnabled = true) {
+function itemRow(item, selectionEnabled = true, scope = "library") {
   const id = String(item.id ?? "");
   const selected = state.selected.has(id);
   const presence = statusOf(item);
-  const displayStatus = presence === "present" ? "Available" : presence === "missing" ? "Missing" : presence === "unavailable" ? "Unavailable" : "Status unknown";
+  const movedTarget = movedToTarget(item);
+  const displayStatus = movedTarget ? "Moved" : presence === "present" ? "Available" : presence === "missing" ? "Missing" : presence === "unavailable" ? "Unavailable" : "Status unknown";
+  const rowSelectable = isPresentMedia(item) && selectionEnabled;
+  const selectionReason = rowSelectable ? "" : mediaSelectionReason(item, selectionEnabled, movedTarget);
+  const reasonId = `selection-reason-${scope}-${accessibleToken(id)}`;
+  const movedTargetRegistered = movedTarget
+    && mediaLibraryEntries(state.snapshot).some((entry) => entry.id === movedTarget.library_id);
+  const movedTargetMarkup = movedTarget ? `<div class="moved-target"><span class="moved-target-label">Moved to ${escapeHtml(movedTarget.library_name)}</span><span class="moved-target-note">Source entry stays here as history.</span>${movedTargetRegistered
+    ? `<button class="small-button moved-target-action" type="button" aria-label="Open ${escapeHtml(movedTarget.library_name)} item ${escapeHtml(movedTarget.item_id)}" data-open-moved-target data-source-library-id="${escapeHtml(activeLibraryId())}" data-source-item-id="${escapeHtml(id)}" data-target-library-id="${escapeHtml(movedTarget.library_id)}" data-target-item-id="${escapeHtml(movedTarget.item_id)}" data-target-relative-path="${escapeHtml(movedTarget.relative_path)}">Open target item</button>`
+    : `<span class="moved-target-unavailable">Destination library is no longer registered.</span>`}</div>` : "";
   const dims = item.width && item.height ? `${escapeHtml(item.width)} × ${escapeHtml(item.height)}` : "";
   const codec = item.codec ? escapeHtml(item.codec) : "";
   return `<article class="library-row${selected ? " selected" : ""}" data-item-row="${escapeHtml(id)}">
-    <input class="row-check" type="checkbox" aria-label="Select ${escapeHtml(item.title ?? item.relative_path)}" data-select-item="${escapeHtml(id)}" ${selected ? "checked" : ""} ${isPresentMedia(item) && selectionEnabled ? "" : "disabled"}>
+    <input class="row-check" type="checkbox" aria-label="Select ${escapeHtml(item.title ?? item.relative_path)}" ${selectionReason ? `aria-describedby="${reasonId}"` : ""} data-select-item="${escapeHtml(id)}" ${selected ? "checked" : ""} ${rowSelectable ? "" : "disabled"}>
     <div class="media-icon" aria-hidden="true">▣</div>
-    <div class="media-main"><div class="media-title"><span>${escapeHtml(item.title || item.relative_path || "Untitled video")}</span></div><div class="media-path">${escapeHtml(item.relative_path || "Path unavailable")}</div></div>
-    <div class="media-actions"><div class="media-meta"><span><i class="status-dot ${escapeHtml(presence)}"></i>${displayStatus}</span><span>${formatBytes(item.bytes)}</span>${dims ? `<span>${dims}</span>` : ""}${codec ? `<span>${codec}</span>` : ""}</div><button class="details-button media-details" type="button" data-details="${escapeHtml(id)}">Details</button></div>
+    <div class="media-main"><div class="media-title"><span>${escapeHtml(item.title || item.relative_path || "Untitled video")}</span></div><div class="media-path">${escapeHtml(item.relative_path || "Path unavailable")}</div>${movedTargetMarkup}${selectionReason ? `<p class="media-selection-reason${!selectionEnabled && isPresentMedia(item) ? " readonly" : ""}" id="${reasonId}">${escapeHtml(selectionReason)}</p>` : ""}</div>
+    <div class="media-actions"><div class="media-meta"><span><i class="status-dot ${escapeHtml(movedTarget ? "moved" : presence)}"></i>${displayStatus}</span><span>${formatBytes(item.bytes)}</span>${dims ? `<span>${dims}</span>` : ""}${codec ? `<span>${codec}</span>` : ""}</div><button class="details-button media-details" type="button" data-details="${escapeHtml(id)}">Details</button></div>
   </article>`;
 }
 
@@ -833,11 +875,18 @@ function renderGroupedItems(container, items, page, scope, selectionEnabled = tr
     const selectableEntries = presentMediaItems(entries);
     const groupIds = selectableEntries.map((item) => String(item.id));
     const groupKey = collectionIdentity(entries[0]?.collection);
+    const groupCounts = librarySelectionCounts(entries, state.selected, selectionEnabled);
+    const groupCountId = `group-selection-count-${scope}-${accessibleToken(groupKey)}`;
     const allSelected = groupIds.length > 0 && groupIds.every((id) => state.selected.has(id));
     const someSelected = groupIds.some((id) => state.selected.has(id));
+    const capNotice = state.groupSelectionLimitNotice?.scope === scope
+      && state.groupSelectionLimitNotice?.page === page.page
+      && state.groupSelectionLimitNotice?.groupKey === groupKey
+      ? `<span class="group-selection-cap-note" aria-live="polite">${state.groupSelectionLimitNotice.omittedCount} additional present item${state.groupSelectionLimitNotice.omittedCount === 1 ? "" : "s"} skipped by the ${MAX_SELECTED_ITEMS}-item selection limit. Deselect selected items to add more.</span>`
+      : "";
     return `<details class="collection-group" ${index < 3 ? "open" : ""}>
-      <summary><input class="group-check" type="checkbox" aria-label="Select available ${escapeHtml(title)} items on this page" data-select-group="${escapeHtml(groupKey)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${selectableEntries.length && selectionEnabled ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count">${entries.length} file${entries.length === 1 ? "" : "s"} on this page</span></summary>
-      <div class="collection-items">${entries.map((item) => itemRow(item, selectionEnabled)).join("")}</div>
+      <summary><input class="group-check" type="checkbox" aria-label="Select available ${escapeHtml(title)} items on this page" aria-describedby="${groupCountId}" data-select-group="${escapeHtml(groupKey)}" ${allSelected ? "checked" : ""} ${someSelected && !allSelected ? "data-partial=true" : ""} ${groupCounts.selectableCount ? "" : "disabled"}><span>${escapeHtml(title)}</span><span class="group-count group-selection-count" id="${groupCountId}" aria-live="polite">${groupCounts.selectedCount} selected · ${groupCounts.selectableCount} selectable · ${groupCounts.skippedUnavailableCount} skipped (not present)${groupCounts.readOnlyCount ? ` · ${groupCounts.readOnlyCount} present but read-only` : ""} on this page</span>${capNotice}</summary>
+      <div class="collection-items">${entries.map((item) => itemRow(item, selectionEnabled, scope)).join("")}</div>
     </details>`;
   }).join("");
   container.innerHTML = `${renderedGroups}${libraryPageMarkup(page, scope)}`;
@@ -858,7 +907,13 @@ function renderLibrary() {
   const library = activeLibrarySnapshot();
   const canOperate = libraryCanOperate();
   const availableIds = new Set(presentMediaItems(libraryItems()).map((item) => String(item.id)));
-  for (const id of state.selected) if (!availableIds.has(id)) state.selected.delete(id);
+  let prunedSelection = false;
+  for (const id of state.selected) {
+    if (availableIds.has(id)) continue;
+    state.selected.delete(id);
+    prunedSelection = true;
+  }
+  if (prunedSelection) state.groupSelectionLimitNotice = null;
   renderFilters();
   const items = filteredItems();
   const needsItems = items.filter(needsOrganizing);
@@ -1496,8 +1551,64 @@ function selectVisible() {
   const visible = presentMediaItems(pageItemsForScope(scope));
   const allSelected = visible.length > 0 && visible.every((item) => state.selected.has(String(item.id)));
   const omittedCount = updateSelectedItems(visible.map((item) => String(item.id)), !allSelected);
+  state.groupSelectionLimitNotice = null;
   renderLibrary();
   if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
+}
+
+function openMovedTarget(button) {
+  const sourceLibraryId = button.dataset.sourceLibraryId;
+  const sourceItemId = button.dataset.sourceItemId;
+  if (!sourceLibraryId || sourceLibraryId !== activeLibraryId()) {
+    showToast("This migration link no longer matches the displayed source library. Refresh the view.");
+    return;
+  }
+  const sourceItem = libraryItems().find((item) => String(item.id) === sourceItemId);
+  const target = movedToTarget(sourceItem);
+  if (!target
+      || target.library_id !== button.dataset.targetLibraryId
+      || target.item_id !== button.dataset.targetItemId
+      || target.relative_path !== button.dataset.targetRelativePath) {
+    showToast("This migration destination changed in the latest library snapshot. Refresh the view.");
+    return;
+  }
+  const targetLibrary = mediaLibraryEntries(state.snapshot).find((entry) => entry.id === target.library_id);
+  if (!targetLibrary) {
+    showToast("The destination library is no longer registered, so this item cannot be opened from the current view.");
+    return;
+  }
+
+  state.libraryId = target.library_id;
+  state.view = "library";
+  clearSelectedItems();
+  state.detailId = null;
+  state.query = "";
+  state.libraryPage = 0;
+  state.needsPage = 0;
+  byId("search-input").value = "";
+  byId("category-filter").value = "";
+  byId("status-filter").value = "";
+
+  const targetSnapshot = resolveMediaLibrary(state.snapshot, target.library_id).snapshot;
+  const targetItems = Array.isArray(targetSnapshot?.items) ? targetSnapshot.items : [];
+  const matchingItems = filterLibraryItems(targetItems);
+  const targetIndex = matchingItems.findIndex((item) => String(item.id) === target.item_id);
+  let destinationMessage = "The destination item is not in the retained cloud list yet. The search and filters were cleared; refresh the target library to locate it.";
+  if (targetIndex >= 0) {
+    state.libraryPage = Math.floor(targetIndex / LIBRARY_PAGE_SIZE);
+    const currentTarget = matchingItems[targetIndex];
+    if (isPresentMedia(currentTarget) && String(currentTarget.relative_path ?? "") === target.relative_path) {
+      state.detailId = target.item_id;
+      destinationMessage = `Located the target item in ${targetLibrary.name || target.library_name}.`;
+    } else if (String(currentTarget.relative_path ?? "") !== target.relative_path) {
+      destinationMessage = "The destination ID appears at a different path in this saved view. Refresh the target library before opening it.";
+    } else {
+      destinationMessage = "The destination row is not currently marked present in this saved view. Refresh the target library before opening it.";
+    }
+  }
+  syncLibraryUrl();
+  render();
+  showToast(destinationMessage);
 }
 
 function bindEvents() {
@@ -1506,7 +1617,7 @@ function bindEvents() {
   document.querySelectorAll("[data-scan]").forEach((button) => button.addEventListener("click", () => submitAction("library_scan", { library_id: activeLibraryId() })));
   byId("library-select").addEventListener("change", () => {
     state.libraryId = byId("library-select").value;
-    state.selected.clear();
+    clearSelectedItems();
     state.detailId = null;
     state.legacyOperation = null;
     state.legacyOperationKey = null;
@@ -1609,9 +1720,9 @@ function bindEvents() {
     if (!payload) return showToast("A displayed source or target library identity is unavailable. Refresh the page before requesting a preview.");
     submitAction("library_migration_preview", payload);
   });
-  byId("search-input").addEventListener("input", (event) => { state.query = event.target.value; state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
-  byId("category-filter").addEventListener("input", () => { state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
-  byId("status-filter").addEventListener("change", () => { state.libraryPage = 0; state.needsPage = 0; renderLibrary(); });
+  byId("search-input").addEventListener("input", (event) => { state.query = event.target.value; state.libraryPage = 0; state.needsPage = 0; state.groupSelectionLimitNotice = null; renderLibrary(); });
+  byId("category-filter").addEventListener("input", () => { state.libraryPage = 0; state.needsPage = 0; state.groupSelectionLimitNotice = null; renderLibrary(); });
+  byId("status-filter").addEventListener("change", () => { state.libraryPage = 0; state.needsPage = 0; state.groupSelectionLimitNotice = null; renderLibrary(); });
   byId("select-visible").addEventListener("click", selectVisible);
   byId("organize-selected").addEventListener("click", () => {
     if (!state.selected.size) return;
@@ -1623,7 +1734,7 @@ function bindEvents() {
     moveCard?.focus({ preventScroll: true });
   });
   byId("clear-selection").addEventListener("click", () => {
-    state.selected.clear();
+    clearSelectedItems();
     render();
   });
   byId("target-dir").addEventListener("input", renderFilters);
@@ -1743,10 +1854,12 @@ function bindEvents() {
       const groupIdentity = groupCheckbox.dataset.selectGroup;
       const scope = state.view === "needs" ? "needs" : "library";
       const visibleItems = pageItemsForScope(scope);
+      const groupPage = scope === "needs" ? state.needsPage : state.libraryPage;
       const groupItems = presentMediaItems(visibleItems.filter((item) => collectionIdentity(item?.collection) === groupIdentity));
       const omittedCount = updateSelectedItems(groupItems.map((item) => String(item.id)), groupCheckbox.checked);
+      state.groupSelectionLimitNotice = omittedCount > 0 ? { scope, groupKey: groupIdentity, page: groupPage, omittedCount } : null;
       renderLibrary();
-      if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
+      if (omittedCount > 0) showToast(`${selectionLimitMessage(omittedCount)} Group skipped counts are for files that are not present.`);
       return;
     }
     const checkbox = event.target.closest("[data-select-item]");
@@ -1754,6 +1867,7 @@ function bindEvents() {
     if (!libraryCanOperate()) { renderLibrary(); return; }
     const itemId = checkbox.dataset.selectItem;
     const item = libraryItems().find((entry) => String(entry.id) === String(itemId));
+    state.groupSelectionLimitNotice = null;
     if (!isPresentMedia(item)) {
       state.selected.delete(itemId);
       renderLibrary();
@@ -1871,6 +1985,11 @@ function bindEvents() {
       saveMigrationConflictDraft(previewId, revision, draft);
       renderMigrations();
       showToast(draft.refreshError);
+      return;
+    }
+    const movedTargetButton = event.target.closest("[data-open-moved-target]");
+    if (movedTargetButton) {
+      openMovedTarget(movedTargetButton);
       return;
     }
     const libraryPageButton = event.target.closest("[data-library-page]");
