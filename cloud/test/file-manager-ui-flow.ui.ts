@@ -3,10 +3,74 @@ import { webcrypto } from "node:crypto";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
+import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
 
 const LIBRARY_ID = "test-library";
 const ROOT_BINDING = `v1:${"a".repeat(64)}`;
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "file-manager-ui-flow", auth_date: "0" }).toString();
+const UPDATE_PROTOCOL = "miniapp-updates-v1";
+
+let originalWindowWebSocket: PropertyDescriptor | undefined;
+
+class MockWebSocket extends EventTarget {
+  static CONNECTING = 0;
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+
+  readonly url: string;
+  readonly protocols: string[];
+  readonly protocol: string;
+  readyState = MockWebSocket.CONNECTING;
+
+  constructor(url: string | URL, protocols?: string | string[]) {
+    super();
+    this.url = String(url);
+    this.protocols = Array.isArray(protocols) ? [...protocols] : protocols ? [protocols] : [];
+    this.protocol = this.protocols[0] ?? "";
+  }
+
+  openAndReady() {
+    this.readyState = MockWebSocket.OPEN;
+    this.emit("open");
+    this.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
+  }
+
+  receive(message: Record<string, unknown>) {
+    const event = new Event("message");
+    Object.defineProperty(event, "data", { configurable: true, value: JSON.stringify(message) });
+    this.dispatchEvent(event);
+  }
+
+  private emit(type: string) {
+    this.dispatchEvent(new Event(type));
+  }
+}
+
+function installMockWebSocket() {
+  const sockets: MockWebSocket[] = [];
+  class AutoReadyWebSocket extends MockWebSocket {
+    constructor(url: string | URL, protocols?: string | string[]) {
+      super(url, protocols);
+      sockets.push(this);
+      queueMicrotask(() => this.openAndReady());
+    }
+  }
+  originalWindowWebSocket ??= Object.getOwnPropertyDescriptor(window, "WebSocket");
+  vi.stubGlobal("WebSocket", AutoReadyWebSocket as unknown as typeof WebSocket);
+  Object.defineProperty(window, "WebSocket", { configurable: true, writable: true, value: AutoReadyWebSocket });
+  return sockets;
+}
+
+function updateSession() {
+  return {
+    ticket: syntheticCredentials.localSharedSecret.value,
+    websocket_path: "/api/updates/ws",
+    protocol: UPDATE_PROTOCOL,
+    expires_at: Date.now() + 60 * 60 * 1_000,
+    database_epoch: TEST_DATABASE_EPOCH,
+  };
+}
 
 const ownerSnapshot = {
   synced: true,
@@ -62,6 +126,12 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  if (originalWindowWebSocket) {
+    Object.defineProperty(window, "WebSocket", originalWindowWebSocket);
+    originalWindowWebSocket = undefined;
+  } else {
+    delete (window as Window & { WebSocket?: typeof WebSocket }).WebSocket;
+  }
   const domWindow = window as Window & { happyDOM?: { cancelAsync(): void } };
   domWindow.happyDOM?.cancelAsync();
   document.body.innerHTML = "";
@@ -72,6 +142,10 @@ describe("file manager UI flow", () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);
     const { manifest, chunks } = await makeChunkedSnapshot(ownerSnapshot);
+    const sockets = installMockWebSocket();
+    let currentManifest = manifest;
+    let stateRequests = 0;
+    const responseChunks = new Map(chunks);
 
     const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
     const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
@@ -93,15 +167,20 @@ describe("file manager UI flow", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
       expect(init?.cache).toBe("no-store");
+      if (String(input) === "/api/updates/session") {
+        expect(init?.method).toBe("POST");
+        return { ok: true, status: 200, json: async () => updateSession() } as Response;
+      }
       if (String(input) === "/api/state") {
         expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
-        return { ok: true, status: 200, json: async () => manifest } as Response;
+        stateRequests += 1;
+        return { ok: true, status: 200, json: async () => currentManifest } as Response;
       }
       const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
       if (chunkPath) {
         expect(new Headers(init?.headers).get("X-Cloud-Database-Epoch")).toBe(TEST_DATABASE_EPOCH);
         const sha256 = chunkPath[1]!;
-        return { ok: true, status: 200, json: async () => ({ sha256, data: chunks.get(sha256) }) } as Response;
+        return { ok: true, status: 200, json: async () => ({ sha256, data: responseChunks.get(sha256) }) } as Response;
       }
       throw new Error(`Unexpected request ${String(input)}`);
     });
@@ -112,7 +191,10 @@ describe("file manager UI flow", () => {
     // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
     await import("../public/file/app.js");
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
-    expect(fetchMock).toHaveBeenCalledTimes(1 + manifest.library.chunks.length + manifest.state.chunks.length);
+    await vi.waitFor(() => expect(stateRequests).toBe(1));
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0]?.protocols).toEqual([UPDATE_PROTOCOL, syntheticCredentials.localSharedSecret.value]);
+    expect(fetchMock).toHaveBeenCalledTimes(2 + manifest.library.chunks.length + manifest.state.chunks.length);
     expect((element<HTMLElement>("#library-select") as unknown as { value: string }).value).toBe(LIBRARY_ID);
     expect(element<HTMLOptionElement>("#library-select option").disabled).toBe(false);
     expect([...document.querySelectorAll<HTMLOptionElement>("#category-folders option")].map((option) => option.value)).toEqual(expect.arrayContaining(["Films", "Series", "Shows"]));
@@ -156,9 +238,31 @@ describe("file manager UI flow", () => {
     search.dispatchEvent(new Event("input", { bubbles: true }));
     expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected");
 
+    const pushedSnapshot = {
+      ...ownerSnapshot,
+      state_version: 2,
+      library: {
+        ...ownerSnapshot.library,
+        revision: "pushed-ui-revision",
+        items: ownerSnapshot.library.items.map((item) => item.id === "item-beta"
+          ? { ...item, title: "Beta from pushed update" }
+          : item),
+      },
+    };
+    const pushedBundle = await makeChunkedSnapshot(pushedSnapshot);
+    currentManifest = pushedBundle.manifest;
+    for (const [sha256, data] of pushedBundle.chunks) responseChunks.set(sha256, data);
+    await vi.advanceTimersByTimeAsync(1_000);
+    sockets[0]?.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(stateRequests).toBe(2));
+    await vi.waitFor(() => expect(element<HTMLElement>("#library-list").textContent).toContain("Beta from pushed update"));
+
     element<HTMLButtonElement>("#refresh-button").click();
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2 + manifest.library.chunks.length + manifest.state.chunks.length));
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(stateRequests).toBe(3));
     await vi.waitFor(() => expect(element<HTMLElement>("#selection-count").textContent).toBe("5 items selected"));
+
     element<HTMLButtonElement>("#clear-selection").click();
     expect(tray.classList.contains("hidden")).toBe(true);
     expect(document.querySelectorAll<HTMLInputElement>("[data-select-item]:checked")).toHaveLength(0);
@@ -187,6 +291,7 @@ describe("file manager UI flow", () => {
   it("keeps the verified library visible and stale after a snapshot-format upgrade response", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);
+    installMockWebSocket();
     const { manifest, chunks } = await makeChunkedSnapshot(ownerSnapshot);
 
     const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
@@ -202,6 +307,11 @@ describe("file manager UI flow", () => {
 
     let stateRequests = 0;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/api/updates/session") {
+        expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
+        expect(init?.method).toBe("POST");
+        return { ok: true, status: 200, json: async () => updateSession() } as Response;
+      }
       if (String(input) === "/api/state") {
         expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
         expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");

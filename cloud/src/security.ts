@@ -82,7 +82,7 @@ export function requireConfiguredOwnerUserId(ownerUserId: string): string {
 export async function requireOwner(
   request: Request,
   env: Env,
-): Promise<{ userId: string }> {
+): Promise<{ userId: string; expiresAt: number }> {
   if (!env.BOT_TOKEN) {
     throw new HttpError(503, "Mini App authorization is not configured");
   }
@@ -115,8 +115,13 @@ export async function requireOwner(
   const authDateText = params.get("auth_date");
   if (!authDateText || !/^\d{1,12}$/u.test(authDateText)) throw new HttpError(401, "Unauthorized");
   const authDate = Number(authDateText);
-  const nowSeconds = Math.floor(Date.now() / 1000);
+  const now = Date.now();
+  const nowSeconds = Math.floor(now / 1000);
+  const expiresAt = (authDate + MAX_AUTH_AGE_SECONDS) * 1000;
   if (!Number.isSafeInteger(authDate) || authDate > nowSeconds + MAX_FUTURE_SKEW_SECONDS || nowSeconds - authDate > MAX_AUTH_AGE_SECONDS) {
+    throw new HttpError(401, "Mini App authorization has expired");
+  }
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= now) {
     throw new HttpError(401, "Mini App authorization has expired");
   }
 
@@ -144,5 +149,5 @@ export async function requireOwner(
   if ((chatType !== null && chatType !== "private" && chatType !== "sender") || params.has("chat")) {
     throw new HttpError(403, "Mini App must be opened in the owner's private chat");
   }
-  return { userId };
+  return { userId, expiresAt };
 }

@@ -56,10 +56,32 @@ Local service requests carry the fixed shared secret in their `Authorization: Be
 | `POST /api/local/state` | Publish local state and operation results |
 | `POST /api/local/state/chunks/<sha256>` | Persist a bounded, epoch-bound snapshot chunk |
 | `GET /api/state` | Read the latest local snapshot and safely expose unacknowledged request summaries |
+| `POST /api/updates/session` | Exchange verified Telegram authorization for a short-lived viewer connection ticket |
+| `GET /api/updates/ws` | Receive owner-authorized state-change hints over a hibernating WebSocket |
 | `GET /api/library` | Read the media library snapshot |
 | `GET /api/snapshot/chunks/<sha256>` | Read an owner-authorized snapshot chunk |
 | `POST /api/actions` | Submit a file-management action |
 | `GET /settings/` | Open the separate owner-only library settings Mini App |
+
+### Mini App subscriptions
+
+The two Mini Apps use separate viewer connections to the same hibernating notification
+object as the desktop. A viewer receives only readiness and epoch/version invalidation
+hints. Inbox request envelopes remain restricted to the desktop role. The browser supplies
+its automatic connection ticket in WebSocket subprotocol headers; neither Telegram
+`initData` nor the desktop secret is included in the WebSocket URL. Viewer authorization
+cannot extend beyond the original Telegram authorization deadline.
+
+The Worker explicitly notifies viewers after a successful snapshot commit, request enqueue,
+acknowledgment or epoch rotation. D1 writes do not wake the object on their own. Individual
+staged snapshot chunks do not trigger notifications. Notification failure does not undo
+the durable write.
+
+The browser subscribes before catch-up and fetches the existing owner-authorized HTTP
+snapshot after a hint. It coalesces bursts while retaining hints received during a read.
+Reconnection and foreground recovery reconcile again; low-frequency reads cover failed
+notifications or unavailable WebSockets. Hidden pages pause unnecessary retries and reads.
+The previous twelve-second status polling is removed. See [runtime behavior](../cloud/README.md#live-mini-app-updates).
 
 ### Snapshot preparation and retry
 
