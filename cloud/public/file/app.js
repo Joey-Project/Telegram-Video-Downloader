@@ -412,9 +412,51 @@ function updateMetadataRecoveryPreviewRequest(action, { status, error = "", seq 
   if (action?.kind !== "file_preview" || !request || action.request_id !== request.requestId) return false;
   request.status = status;
   request.error = String(error ?? "");
-  if (seq !== undefined) request.seq = Number.isSafeInteger(seq) ? seq : null;
+  if (seq !== undefined) request.seq = Number.isSafeInteger(seq) && seq > 0 ? seq : null;
   renderPreviews();
   return true;
+}
+
+function metadataRecoveryPreviewSnapshotMatches(entry, request, snapshot) {
+  if (entry?.kind !== "file_preview" || !Number.isSafeInteger(entry.seq) || entry.seq <= 0) return false;
+  const identity = fileOperationLibraryIdentity(entry);
+  if (identity?.library_id !== request.libraryId
+      || identity.root_binding !== request.rootBinding
+      || !fileOperationIdentityMatches(snapshot, entry, request.libraryId)) return false;
+  return typeof entry.request_id === "string"
+    && (entry.request_id === request.requestId || entry.request_id === `action:${request.requestId}`);
+}
+
+function reconcileMetadataRecoveryPreviewRequest(snapshot) {
+  const request = state.metadataRecoveryPreviewRequest;
+  if (!request || !snapshot) return false;
+
+  const operations = Array.isArray(snapshot.operations) ? snapshot.operations : [];
+  const operation = operations.find((entry) => metadataRecoveryPreviewSnapshotMatches(entry, request, snapshot));
+  if (operation) {
+    if (Number.isSafeInteger(operation.seq) && operation.seq > 0) request.seq = operation.seq;
+    const status = String(operation.status ?? "").toLowerCase();
+    request.error = String(operation.error ?? "");
+    if (["failed", "rejected", "stale", "cancelled", "expired"].includes(status)) {
+      request.status = status;
+    } else if (status === "completed") {
+      state.metadataRecoveryPreviewRequest = null;
+      return true;
+    } else {
+      request.status = "submitted";
+    }
+  }
+
+  const previews = Array.isArray(snapshot.previews) ? snapshot.previews : [];
+  const preview = previews.find((entry) => metadataRecoveryPreviewSnapshotMatches(entry, request, snapshot));
+  if (preview) {
+    if (Number.isSafeInteger(preview.seq) && preview.seq > 0) request.seq = preview.seq;
+    request.status = String(preview.status ?? "awaiting_confirmation");
+    request.error = "";
+    state.metadataRecoveryPreviewRequest = null;
+    return true;
+  }
+  return Boolean(operation);
 }
 
 function previewOrganizationStatus(item, organizationStatus) {
@@ -725,6 +767,7 @@ function acceptFreshSnapshot(snapshot) {
     state.groupSelectionLimitNotice = null;
   }
   Object.assign(state, acceptOwnerSnapshot(snapshot, state));
+  reconcileMetadataRecoveryPreviewRequest(state.snapshot);
   settleMigrationConflictRefreshes();
   normalizeLibraryContext();
   byId("auth-gate").classList.add("hidden");
@@ -1717,7 +1760,7 @@ function renderPreviews() {
   const allPreviews = previews();
   const submission = state.metadataRecoveryPreviewRequest;
   if (submission && Number.isSafeInteger(submission.seq)
-      && allPreviews.some((entry) => entry.seq === submission.seq)) {
+      && allPreviews.some((entry) => entry.seq === submission.seq && isReviewablePreviewStatus(entry.status))) {
     state.metadataRecoveryPreviewRequest = null;
   }
   const pending = allPreviews.filter((entry) => isReviewablePreviewStatus(entry.status));

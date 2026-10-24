@@ -174,7 +174,9 @@ async function mountApp(options: {
   const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
   const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
   if (!body) throw new Error("File manager body was not found");
-  document.body.innerHTML = body;
+  const testBody = document.createElement("body");
+  testBody.innerHTML = body;
+  document.body.replaceWith(testBody);
   Object.defineProperty(window, "Telegram", {
     configurable: true,
     value: { WebApp: { initData: MOCK_INIT_DATA, ready: vi.fn(), expand: vi.fn() } },
@@ -193,8 +195,10 @@ async function mountApp(options: {
   let actionSeq = 1;
   let previousRecoveryOperation: Record<string, any> | null = null;
   let stateRequests = 0;
+  let markMetadataSnapshotPrepared: (() => void) | null = null;
   let releaseMetadataResponse: (() => void) | null = null;
   let releaseThirdStateResponse: (() => void) | null = null;
+  const metadataSnapshotPrepared = new Promise<void>((resolveGate) => { markMetadataSnapshotPrepared = resolveGate; });
   const metadataResponseGate = holdMetadataResponse
     ? new Promise<void>((resolveGate) => { releaseMetadataResponse = resolveGate; })
     : Promise.resolve();
@@ -262,6 +266,7 @@ async function mountApp(options: {
           ],
         });
         previousRecoveryOperation = operation;
+        markMetadataSnapshotPrepared?.();
         await metadataResponseGate;
       }
       if (action.kind === "file_preview") {
@@ -312,9 +317,46 @@ async function mountApp(options: {
     sentActions,
     replaceSnapshot,
     get stateRequests() { return stateRequests; },
+    waitForMetadataSnapshotPrepared: () => metadataSnapshotPrepared,
     releaseMetadataActionResponse: () => releaseMetadataResponse?.(),
     releaseThirdStateResponse: () => releaseThirdStateResponse?.(),
   };
+}
+
+async function queueRecoveryPreviewFromOtherFileTab() {
+  const app = await mountApp();
+  element<HTMLButtonElement>('[data-view="needs"]').click();
+  element<HTMLButtonElement>("#recover-library").click();
+  await waitForSubmittedAction(app.sentActions, "metadata_recover");
+  await waitForLocalActionQueueEmpty();
+  await waitForRecoveryResult("Choose a match");
+
+  Object.defineProperty(window.navigator, "onLine", { configurable: true, value: false });
+  element<HTMLInputElement>('[data-recovery-item="item-ready"]').click();
+  element<HTMLButtonElement>("[data-recovery-preview]").click();
+  await vi.waitFor(() => {
+    const queue = JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]");
+    expect(queue).toHaveLength(1);
+    expect(queue[0]?.kind).toBe("file_preview");
+  });
+  const queue = JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]") as Array<Record<string, any>>;
+  const action = queue[0]!;
+  expect(action.request_id).toEqual(expect.any(String));
+  expect(app.sentActions.some((sent) => sent.kind === "file_preview")).toBe(false);
+
+  // Another File tab accepts and removes the shared action; this tab receives no receipt.
+  Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+  localStorage.setItem("file-manager.actions.v1", JSON.stringify(queue.filter((entry) => entry.request_id !== action.request_id)));
+  expect(JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]")).toEqual([]);
+  return { app, requestId: action.request_id as string };
+}
+
+async function applyHelperTabSnapshot(app: Awaited<ReturnType<typeof mountApp>>, snapshot: Record<string, any>) {
+  await app.replaceSnapshot(snapshot);
+  const requestsBefore = app.stateRequests;
+  element<HTMLButtonElement>("#refresh-button").click();
+  await vi.advanceTimersByTimeAsync(1_000);
+  await vi.waitFor(() => expect(app.stateRequests).toBeGreaterThan(requestsBefore));
 }
 
 afterEach(async () => {
@@ -497,9 +539,11 @@ describe("metadata recovery Mini App flow", () => {
   });
 
   it("keeps a failed recovery preview visible after a same-root revision change", async () => {
-    const { sentActions, replaceSnapshot } = await mountApp({ deferRecoveryPreviewSnapshot: true });
+    const app = await mountApp({ deferRecoveryPreviewSnapshot: true });
     element<HTMLButtonElement>('[data-view="needs"]').click();
     element<HTMLButtonElement>("#recover-library").click();
+    await waitForSubmittedAction(app.sentActions, "metadata_recover");
+    await app.waitForMetadataSnapshotPrepared();
     await waitForRecoveryResult("Choose a match");
     element<HTMLInputElement>('[data-recovery-item="item-ready"]').click();
     element<HTMLButtonElement>("[data-recovery-preview]").click();
@@ -509,7 +553,7 @@ describe("metadata recovery Mini App flow", () => {
     expect(sequenceMatch).not.toBeNull();
     const previewSequence = Number(sequenceMatch?.[1]);
     await waitForLocalActionQueueEmpty();
-    await replaceSnapshot({
+    await app.replaceSnapshot({
       ...ownerSnapshot,
       state_version: previewSequence + 1,
       library: { ...ownerSnapshot.library, revision: "recovery-ui-r2" },
@@ -524,7 +568,7 @@ describe("metadata recovery Mini App flow", () => {
     element<HTMLButtonElement>("#refresh-button").click();
     await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview failed · request #${previewSequence}`));
     expect(element<HTMLElement>("#preview-list").textContent).toContain("The library changed while the preview was being prepared.");
-    expect(sentActions.some((action) => action.kind === "file_preview" && action.payload.expected_revision === "recovery-ui-r1")).toBe(true);
+    expect(app.sentActions.some((action) => action.kind === "file_preview" && action.payload.expected_revision === "recovery-ui-r1")).toBe(true);
   });
 
   it("keeps a submitted recovery preview visible when clearing its report", async () => {
@@ -564,6 +608,98 @@ describe("metadata recovery Mini App flow", () => {
     await vi.waitFor(() => expect(app.stateRequests).toBeGreaterThan(requestsBeforeRefresh));
     await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview failed · request #${previewSequence}`));
     expect(element<HTMLElement>("#preview-list").textContent).toContain("The preview could not be prepared.");
+  });
+
+  it("reconciles a helper-tab preview by request ID when its operation receipt is omitted", async () => {
+    const { app, requestId } = await queueRecoveryPreviewFromOtherFileTab();
+    await applyHelperTabSnapshot(app, {
+      ...ownerSnapshot,
+      state_version: 3,
+      operations: [],
+      previews: [{
+        seq: 71,
+        kind: "file_preview",
+        request_id: `action:${requestId}`,
+        preview_id: "helper-tab-preview",
+        revision: "helper-tab-preview-r1",
+        status: "awaiting_confirmation",
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        preview: {
+          metadata_patches: [{
+            item_id: "item-ready",
+            changed: true,
+            changes: [{ field: "title", before: "Original title", after: "Recovered title" }],
+          }],
+        },
+      }],
+    });
+
+    await vi.waitFor(() => expect(document.querySelector('[data-confirm="helper-tab-preview"]')).not.toBeNull());
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("Recovered title");
+    expect(element<HTMLElement>("#preview-list").textContent).not.toContain("Recovery preview is being prepared");
+  });
+
+  it("shows a helper-tab failure by request ID when no origin-tab receipt arrived", async () => {
+    const { app, requestId } = await queueRecoveryPreviewFromOtherFileTab();
+    await applyHelperTabSnapshot(app, {
+      ...ownerSnapshot,
+      state_version: 3,
+      operations: [{
+        seq: 72,
+        kind: "file_preview",
+        request_id: `action:${requestId}`,
+        status: "failed",
+        error: "The helper tab could not prepare this preview.",
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+      }],
+      previews: [],
+    });
+
+    await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain("Recovery preview failed · request #72"));
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("The helper tab could not prepare this preview.");
+    expect(element<HTMLElement>("#preview-list").textContent).not.toContain("Recovery preview is being prepared");
+  });
+
+  it.each([
+    ["another action request ID", { request_id: "action:unrelated-request-id", root_binding: ROOT_BINDING }],
+    ["a different root binding", { request_id: null, root_binding: `v1:${"b".repeat(64)}` }],
+  ])("keeps the originating request pending when a helper snapshot has %s", async (_label, helperIdentity) => {
+    const { app, requestId } = await queueRecoveryPreviewFromOtherFileTab();
+    const requestIdInSnapshot = helperIdentity.request_id ?? `action:${requestId}`;
+    await applyHelperTabSnapshot(app, {
+      ...ownerSnapshot,
+      state_version: 3,
+      operations: [{
+        seq: 73,
+        kind: "file_preview",
+        request_id: requestIdInSnapshot,
+        status: "awaiting_confirmation",
+        library_id: LIBRARY_ID,
+        root_binding: helperIdentity.root_binding,
+      }],
+      previews: [{
+        seq: 73,
+        kind: "file_preview",
+        request_id: requestIdInSnapshot,
+        preview_id: "unrelated-helper-preview",
+        revision: "helper-tab-preview-r1",
+        status: "awaiting_confirmation",
+        library_id: LIBRARY_ID,
+        root_binding: helperIdentity.root_binding,
+        preview: {
+          metadata_patches: [{
+            item_id: "item-ready",
+            changed: true,
+            changes: [{ field: "title", before: "Original title", after: "Unrelated recovered title" }],
+          }],
+        },
+      }],
+    });
+
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("Recovery preview is being prepared");
+    expect(element<HTMLElement>("#preview-list").textContent).toContain(requestId);
   });
 
   it("routes explicit standalone changes through the ordinary metadata preview request", async () => {
@@ -714,6 +850,7 @@ describe("metadata recovery Mini App flow", () => {
     element<HTMLButtonElement>('[data-view="needs"]').click();
     element<HTMLButtonElement>("#recover-library").click();
     await waitForSubmittedAction(sentActions, "metadata_recover");
+    await app.waitForMetadataSnapshotPrepared();
 
     element<HTMLButtonElement>("#refresh-button").click();
     await vi.advanceTimersByTimeAsync(1_000);

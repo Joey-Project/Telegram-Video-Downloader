@@ -12,6 +12,7 @@ const MAX_COMPACT_OPERATION_RESULT_BYTES: usize = 2 * 1024;
 pub(crate) const MAX_METADATA_RECOVERY_RESULT_BYTES: usize = 512 * 1024;
 const MAX_OPERATION_ERROR_JSON_BYTES: usize = 1024;
 const MAX_OPERATION_KIND_JSON_BYTES: usize = 128;
+const MAX_CLOUD_REQUEST_ID_BYTES: usize = 256;
 const MAX_PREVIEW_SNAPSHOT_RECORDS: usize = 100;
 const MAX_PREVIEW_SNAPSHOT_BYTES: usize = 3 * 1024 * 1024;
 const MAX_PREVIEW_ID_JSON_BYTES: usize = 128;
@@ -329,12 +330,16 @@ pub(crate) fn preview_snapshots(
             );
             if let Some(fields) = placeholder.as_object_mut() {
                 fields.insert("kind".to_string(), json!(record.request.kind));
-                if record.request.kind == "file_preview"
-                    && let FilePreviewLibraryId::Valid(library_id) = file_preview_library_id(record)
-                {
-                    fields.insert("library_id".to_string(), json!(library_id));
-                    if let Some(root_binding) = file_preview_root_binding(record) {
-                        fields.insert("root_binding".to_string(), json!(root_binding));
+                if record.request.kind == "file_preview" {
+                    if let Some(request_id) = file_preview_request_id(record) {
+                        fields.insert("request_id".to_string(), json!(request_id));
+                    }
+                    if let FilePreviewLibraryId::Valid(library_id) = file_preview_library_id(record)
+                    {
+                        fields.insert("library_id".to_string(), json!(library_id));
+                        if let Some(root_binding) = file_preview_root_binding(record) {
+                            fields.insert("root_binding".to_string(), json!(root_binding));
+                        }
                     }
                 }
                 if record.request.kind == "library_migration_preview"
@@ -421,13 +426,15 @@ pub(crate) fn preview_snapshots(
                 "preview": details,
             })
         };
-        if !is_migration
-            && let FilePreviewLibraryId::Valid(library_id) = file_preview_library_id(record)
-            && let Some(fields) = candidate.as_object_mut()
-        {
-            fields.insert("library_id".to_string(), json!(library_id));
-            if let Some(root_binding) = file_preview_root_binding(record) {
-                fields.insert("root_binding".to_string(), json!(root_binding));
+        if !is_migration && let Some(fields) = candidate.as_object_mut() {
+            if let Some(request_id) = file_preview_request_id(record) {
+                fields.insert("request_id".to_string(), json!(request_id));
+            }
+            if let FilePreviewLibraryId::Valid(library_id) = file_preview_library_id(record) {
+                fields.insert("library_id".to_string(), json!(library_id));
+                if let Some(root_binding) = file_preview_root_binding(record) {
+                    fields.insert("root_binding".to_string(), json!(root_binding));
+                }
             }
         }
         let Some(candidate_bytes) = json_size_within(&candidate, remaining) else {
@@ -671,6 +678,17 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
         "result": result,
         "error": error,
     });
+    if record.request.kind == "file_preview"
+        && let Some(fields) = operation.as_object_mut()
+    {
+        if let Some(request_id) = file_preview_request_id(record) {
+            fields.insert("request_id".to_string(), json!(request_id));
+        }
+        if let Some((library_id, root_binding)) = file_preview_library_identity(record) {
+            fields.insert("library_id".to_string(), json!(library_id));
+            fields.insert("root_binding".to_string(), json!(root_binding));
+        }
+    }
     if let Some(identity) = metadata_recovery_receipt_identity(record) {
         operation["recovery_identity"] = identity;
     }
@@ -878,6 +896,37 @@ fn file_preview_root_binding(record: &InboxRecord) -> Option<&str> {
         .filter(|binding| valid_root_binding_token(binding))
 }
 
+fn file_preview_library_identity(record: &InboxRecord) -> Option<(&str, &str)> {
+    if record.request.kind != "file_preview" {
+        return None;
+    }
+
+    let payload = &record.request.payload;
+    let has_payload_identity =
+        payload.get("library_id").is_some() || payload.get("root_binding").is_some();
+    let identity = if has_payload_identity {
+        Some((payload.get("library_id")?, payload.get("root_binding")?))
+    } else {
+        let result = record.result.as_ref()?;
+        Some((result.get("library_id")?, result.get("root_binding")?))
+    }?;
+    let (library_id, root_binding) = (identity.0.as_str()?, identity.1.as_str()?);
+    (valid_library_id(library_id) && valid_root_binding_token(root_binding))
+        .then_some((library_id, root_binding))
+}
+
+fn file_preview_request_id(record: &InboxRecord) -> Option<&str> {
+    if record.request.kind != "file_preview" {
+        return None;
+    }
+    let request_id = record.request.extra.get("request_id")?.as_str()?;
+    (!request_id.is_empty()
+        && request_id.trim() == request_id
+        && request_id.len() <= MAX_CLOUD_REQUEST_ID_BYTES
+        && !request_id.chars().any(char::is_control))
+    .then_some(request_id)
+}
+
 fn file_preview_has_valid_root_binding(record: &InboxRecord) -> bool {
     matches!(
         file_preview_library_id(record),
@@ -1016,6 +1065,24 @@ mod tests {
             error,
             result,
         }
+    }
+
+    fn file_preview_with_request(
+        seq: u64,
+        status: InboxStatus,
+        result: Option<Value>,
+        request_id: Value,
+    ) -> InboxRecord {
+        let mut receipt = record(seq, "file_preview", status, result, None);
+        receipt.request.payload = json!({
+            "library_id": "ml-source-root",
+            "root_binding": TEST_ROOT_BINDING,
+        });
+        receipt
+            .request
+            .extra
+            .insert("request_id".to_string(), request_id);
+        receipt
     }
 
     fn legacy_import_result(payload_bytes: Option<usize>, warnings: &[&str]) -> Value {
@@ -1800,6 +1867,166 @@ mod tests {
             2 * 1024 * 1024
         );
         assert!(serde_json::to_vec(&previews).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn file_preview_request_identity_survives_pending_failure_compaction_and_replay() {
+        let request_id = "action:00000000-0000-4000-8000-000000000001";
+        for (seq, status) in [(41, InboxStatus::Pending), (42, InboxStatus::Failed)] {
+            let receipt = file_preview_with_request(seq, status, None, json!(request_id));
+            let operation = operation_snapshot(&receipt, false);
+            assert_eq!(operation["request_id"], request_id);
+            assert_eq!(operation["library_id"], "ml-source-root");
+            assert_eq!(operation["root_binding"], TEST_ROOT_BINDING);
+            assert_eq!(operation["status"], status_name(status));
+        }
+
+        let receipt = file_preview_with_request(
+            43,
+            InboxStatus::AwaitingConfirmation,
+            Some(json!({
+                "preview_id": "preview-source-bound",
+                "revision": "revision-source-bound",
+                "library_id": "ml-result-root",
+                "root_binding": "v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "preview": {"items": "x".repeat(2 * 1024 * 1024)},
+            })),
+            json!(request_id),
+        );
+        let persisted = serde_json::to_vec(&receipt).expect("inbox record should serialize");
+        let reopened: InboxRecord =
+            serde_json::from_slice(&persisted).expect("inbox record should replay");
+
+        let operations = operation_snapshots(&[&reopened]).expect("operations should fit");
+        assert_eq!(operations[0]["request_id"], request_id);
+        assert_eq!(operations[0]["library_id"], "ml-source-root");
+        assert_eq!(operations[0]["root_binding"], TEST_ROOT_BINDING);
+        assert_eq!(operations[0]["details_incomplete"], true);
+        assert_eq!(operations[0]["result_truncated"], true);
+        assert!(serde_json::to_vec(&operations).unwrap().len() <= MAX_OPERATION_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn file_preview_request_identity_is_published_for_full_and_placeholder_previews() {
+        let request_id = "action:00000000-0000-4000-8000-000000000002";
+        let full = file_preview_with_request(
+            44,
+            InboxStatus::AwaitingConfirmation,
+            Some(json!({
+                "preview_id": "preview-full",
+                "revision": "revision-full",
+                "library_id": "ml-source-root",
+                "preview": {"items": [{"path": "clip.mp4"}]},
+            })),
+            json!(request_id),
+        );
+        let full_preview = preview_snapshots(&[&full], 0);
+        assert_eq!(full_preview[0]["request_id"], request_id);
+        assert_eq!(full_preview[0]["library_id"], "ml-source-root");
+        assert_eq!(full_preview[0]["root_binding"], TEST_ROOT_BINDING);
+        assert!(full_preview[0].get("preview").is_some());
+
+        let placeholder = file_preview_with_request(
+            45,
+            InboxStatus::AwaitingConfirmation,
+            Some(json!({
+                "preview_id": "preview-placeholder",
+                "revision": "revision-placeholder",
+                "library_id": "ml-source-root",
+                "preview": {"items": "x".repeat(MAX_PREVIEW_SNAPSHOT_BYTES + 1)},
+            })),
+            json!(request_id),
+        );
+        let placeholder_preview = preview_snapshots(&[&placeholder], 0);
+        assert_eq!(placeholder_preview[0]["request_id"], request_id);
+        assert_eq!(placeholder_preview[0]["library_id"], "ml-source-root");
+        assert_eq!(placeholder_preview[0]["root_binding"], TEST_ROOT_BINDING);
+        assert_eq!(placeholder_preview[0]["preview_incomplete"], true);
+        assert!(placeholder_preview[0].get("preview").is_none());
+    }
+
+    #[test]
+    fn file_preview_request_id_is_omitted_when_invalid_and_respects_snapshot_budgets() {
+        let invalid_request_ids = [
+            json!(""),
+            json!("   "),
+            json!("x".repeat(MAX_CLOUD_REQUEST_ID_BYTES + 1)),
+            json!("bad\nrequest"),
+            json!(17),
+        ];
+        for (index, request_id) in invalid_request_ids.into_iter().enumerate() {
+            let receipt = file_preview_with_request(
+                50 + index as u64,
+                InboxStatus::AwaitingConfirmation,
+                Some(json!({
+                    "preview_id": format!("preview-invalid-{index}"),
+                    "revision": "revision-invalid",
+                    "library_id": "ml-source-root",
+                    "preview": {"items": []},
+                })),
+                request_id,
+            );
+            let operations = operation_snapshots(&[&receipt]).expect("operations should fit");
+            let previews = preview_snapshots(&[&receipt], 0);
+            assert!(operations[0].get("request_id").is_none());
+            assert!(previews[0].get("request_id").is_none());
+        }
+
+        let long_valid_id = "\"".repeat(MAX_CLOUD_REQUEST_ID_BYTES);
+        let receipts = (1..=MAX_OPERATION_SNAPSHOT_RECORDS)
+            .map(|seq| {
+                file_preview_with_request(
+                    seq as u64,
+                    InboxStatus::AwaitingConfirmation,
+                    Some(json!({
+                        "preview_id": format!("preview-budget-{seq}"),
+                        "revision": "revision-budget",
+                        "library_id": "ml-source-root",
+                        "preview": {"items": []},
+                    })),
+                    json!(long_valid_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let refs = receipts.iter().collect::<Vec<_>>();
+        let operations = operation_snapshots(&refs).expect("operations should fit");
+        let previews = preview_snapshots(&refs, 0);
+        assert_eq!(operations.len(), MAX_OPERATION_SNAPSHOT_RECORDS);
+        assert_eq!(previews.len(), MAX_PREVIEW_SNAPSHOT_RECORDS);
+        assert!(serde_json::to_vec(&operations).unwrap().len() <= MAX_OPERATION_SNAPSHOT_BYTES);
+        assert!(serde_json::to_vec(&previews).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn file_preview_can_remain_in_snapshot_after_its_operation_is_compacted_away() {
+        let preview = file_preview_with_request(
+            1,
+            InboxStatus::AwaitingConfirmation,
+            Some(json!({
+                "preview_id": "preview-independent",
+                "revision": "revision-independent",
+                "library_id": "ml-source-root",
+                "preview": {"items": []},
+            })),
+            json!("action:00000000-0000-4000-8000-000000000003"),
+        );
+        let newer = (2..=101)
+            .map(|seq| record(seq, "library_scan", InboxStatus::Completed, None, None))
+            .collect::<Vec<_>>();
+        let mut records = vec![preview];
+        records.extend(newer);
+        let refs = records.iter().collect::<Vec<_>>();
+
+        let operations = operation_snapshots(&refs).expect("operations should fit");
+        let previews = preview_snapshots(&refs, 0);
+        assert_eq!(operations.len(), MAX_OPERATION_SNAPSHOT_RECORDS);
+        assert!(operations.iter().all(|operation| operation["seq"] != 1));
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["seq"], 1);
+        assert_eq!(
+            previews[0]["request_id"],
+            "action:00000000-0000-4000-8000-000000000003"
+        );
     }
 
     #[test]
