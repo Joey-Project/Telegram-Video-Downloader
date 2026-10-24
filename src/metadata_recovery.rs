@@ -179,6 +179,25 @@ where
     F: FnMut(RecoveryQuery) -> Fut + Send,
     Fut: Future<Output = Result<Vec<ResolvedMetadataEntry>>> + Send,
 {
+    analyze_library_batch_with_deadline(
+        snapshot,
+        after_item_id,
+        resolver,
+        tokio::time::Instant::now() + MAX_ANALYSIS_TIME,
+    )
+    .await
+}
+
+async fn analyze_library_batch_with_deadline<F, Fut>(
+    snapshot: &LibrarySnapshot,
+    after_item_id: Option<&str>,
+    resolver: &mut F,
+    deadline: tokio::time::Instant,
+) -> Result<RecoveryReport>
+where
+    F: FnMut(RecoveryQuery) -> Fut + Send,
+    Fut: Future<Output = Result<Vec<ResolvedMetadataEntry>>> + Send,
+{
     let mut candidates = snapshot
         .items
         .iter()
@@ -195,7 +214,6 @@ where
         .take(page_len)
         .copied()
         .collect::<Vec<_>>();
-    let deadline = tokio::time::Instant::now() + MAX_ANALYSIS_TIME;
     let plans = page
         .iter()
         .map(|item| prepare_item(item))
@@ -477,7 +495,7 @@ fn finish_item(
         return result_for(
             item,
             RecoveryStatus::Deferred,
-            "The analysis budget ended before this lookup started; use Analyze deferred items to retry.",
+            "The analysis budget ended before this lookup started; continue with the remaining items to retry it.",
         );
     };
     let resolved = match outcome {
@@ -1607,9 +1625,9 @@ mod tests {
             item.reason.as_deref() == Some("Metadata lookup exceeded its time limit.")
         }));
         assert!(first.items[18..].iter().all(|item| {
-            item.reason.as_deref().is_some_and(|reason| {
-                reason.contains("Analyze deferred items") && reason.len() < 160
-            })
+            item.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("remaining items") && reason.len() < 160)
         }));
         assert_eq!(first.next_cursor.as_deref(), Some("item-017"));
         assert_eq!(first.remaining, 2);
@@ -1693,5 +1711,65 @@ mod tests {
         assert_eq!(second.remaining, 0);
         assert!(second.next_cursor.is_none());
         assert_eq!(second.items[0].item_id, "item-100");
+    }
+
+    #[tokio::test]
+    async fn expired_library_budget_keeps_initial_and_existing_cursors_representable() {
+        let items = (0..5)
+            .map(|index| {
+                let source_id = format!("BV{index:010}");
+                let mut local = item(&format!("item-{index:03}"), &[source_id.as_str()]);
+                local.confidence = Confidence::NeedsConfirmation;
+                local
+            })
+            .collect();
+        let input = snapshot(items);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let mut resolver = move |_| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Vec::new()) }
+        };
+        let expired_deadline = tokio::time::Instant::now() - Duration::from_secs(1);
+
+        let initial =
+            analyze_library_batch_with_deadline(&input, None, &mut resolver, expired_deadline)
+                .await
+                .expect("an expired initial library analysis should still return retryable rows");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(initial.items.len(), 5);
+        assert_eq!(initial.total, 5);
+        assert_eq!(initial.remaining, initial.total);
+        assert!(
+            initial
+                .items
+                .iter()
+                .all(|item| item.status == RecoveryStatus::Deferred)
+        );
+        assert_eq!(initial.items[0].status, RecoveryStatus::Deferred);
+        assert!(initial.next_cursor.is_none());
+
+        let after_existing_cursor = analyze_library_batch_with_deadline(
+            &input,
+            Some("item-001"),
+            &mut resolver,
+            expired_deadline,
+        )
+        .await
+        .expect("an expired continuation should preserve its starting cursor");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(after_existing_cursor.items.len(), 3);
+        assert!(
+            after_existing_cursor
+                .items
+                .iter()
+                .all(|item| item.status == RecoveryStatus::Deferred)
+        );
+        assert_eq!(after_existing_cursor.total, 5);
+        assert_eq!(after_existing_cursor.remaining, 3);
+        assert_eq!(
+            after_existing_cursor.next_cursor.as_deref(),
+            Some("item-001")
+        );
     }
 }

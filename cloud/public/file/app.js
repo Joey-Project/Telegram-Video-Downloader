@@ -123,7 +123,7 @@ function dismissMetadataRecoveryId(id) {
   }
 }
 
-function clearMetadataRecoveryState({ dismiss = true, clearPreviewRequest = true } = {}) {
+function clearMetadataRecoveryState({ dismiss = true, preservePreviewRequest = false } = {}) {
   const current = state.metadataRecovery;
   if (dismiss && current?.requestId) {
     const latestSeq = recoveryOperationsForLibrary(current.libraryId)
@@ -136,7 +136,7 @@ function clearMetadataRecoveryState({ dismiss = true, clearPreviewRequest = true
     if (Number.isSafeInteger(current.seq)) dismissMetadataRecoveryId(String(current.seq));
   }
   state.metadataRecovery = null;
-  if (clearPreviewRequest) state.metadataRecoveryPreviewRequest = null;
+  if (!preservePreviewRequest) state.metadataRecoveryPreviewRequest = null;
 }
 
 function recoveryContext() {
@@ -712,7 +712,7 @@ function invalidateMetadataRecoveryForSnapshot(previousSnapshot, nextSnapshot) {
     return true;
   }
   if (revisionChanged) {
-    clearMetadataRecoveryState({ dismiss: false, clearPreviewRequest: false });
+    clearMetadataRecoveryState({ dismiss: false, preservePreviewRequest: true });
     return true;
   }
   return false;
@@ -2455,7 +2455,7 @@ function bindEvents() {
     if (recoveryNext) { requestMetadataRecovery("library"); return; }
     const recoveryClear = event.target.closest("[data-recovery-clear]");
     if (recoveryClear) {
-      clearMetadataRecoveryState();
+      clearMetadataRecoveryState({ preservePreviewRequest: true });
       renderMetadataRecovery();
       return;
     }

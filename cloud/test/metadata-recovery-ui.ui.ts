@@ -121,6 +121,20 @@ const firstReport = {
   ],
 };
 
+const cursorlessDeferredLibraryReport = {
+  revision: "recovery-ui-r1",
+  total: 2,
+  remaining: 2,
+  next_cursor: null,
+  items: [{
+    item_id: "item-deferred",
+    title: "Deferred video",
+    relative_path: "Deferred.mkv",
+    status: "deferred",
+    reason: "The lookup budget ended before the first item was analyzed.",
+  }],
+};
+
 function element<T>(selector: string): T {
   const found = document.querySelector(selector);
   if (!found) throw new Error(`Expected element ${selector}`);
@@ -408,6 +422,35 @@ describe("metadata recovery Mini App flow", () => {
     expect(element<HTMLElement>("#metadata-recovery-results").textContent).not.toContain("Ready video");
   });
 
+  it("restarts a cursorless deferred library report without an after-item cursor", async () => {
+    const { sentActions } = await mountApp({
+      initialSnapshot: {
+        ...ownerSnapshot,
+        operations: [{
+          seq: 41,
+          kind: "metadata_recover",
+          status: "completed",
+          recovery_identity: { library_id: LIBRARY_ID, root_binding: ROOT_BINDING, scope: "library" },
+          result: {
+            scope: "library",
+            library_id: LIBRARY_ID,
+            root_binding: ROOT_BINDING,
+            recovery: cursorlessDeferredLibraryReport,
+          },
+        }],
+      },
+    });
+    element<HTMLButtonElement>('[data-view="needs"]').click();
+    expect(element<HTMLElement>("#metadata-recovery-results").textContent).toContain("Deferred · analyze again");
+    expect(document.querySelector("[data-recovery-next]")).not.toBeNull();
+
+    element<HTMLButtonElement>("[data-recovery-next]").click();
+    await waitForSubmittedAction(sentActions, "metadata_recover");
+    const retry = sentActions.find((action) => action.kind === "metadata_recover");
+    expect(retry?.payload).toEqual({ library_id: LIBRARY_ID, root_binding: ROOT_BINDING, scope: "library" });
+    await waitForLocalActionQueueEmpty();
+  });
+
   it("retries only deferred rows from a current selected report without library selection state", async () => {
     const deferredReport = {
       revision: "recovery-ui-r1",
@@ -482,6 +525,45 @@ describe("metadata recovery Mini App flow", () => {
     await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview failed · request #${previewSequence}`));
     expect(element<HTMLElement>("#preview-list").textContent).toContain("The library changed while the preview was being prepared.");
     expect(sentActions.some((action) => action.kind === "file_preview" && action.payload.expected_revision === "recovery-ui-r1")).toBe(true);
+  });
+
+  it("keeps a submitted recovery preview visible when clearing its report", async () => {
+    const app = await mountApp({ deferRecoveryPreviewSnapshot: true });
+    element<HTMLButtonElement>('[data-view="needs"]').click();
+    element<HTMLButtonElement>("#recover-library").click();
+    await waitForRecoveryResult("Choose a match");
+    element<HTMLInputElement>('[data-recovery-item="item-ready"]').click();
+    element<HTMLButtonElement>("[data-recovery-preview]").click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain("was submitted. Waiting for your computer to prepare the preview."));
+    const sequenceMatch = element<HTMLElement>("#preview-list").textContent?.match(/recovery preview request #(\d+) was submitted/iu);
+    expect(sequenceMatch).not.toBeNull();
+    const previewSequence = Number(sequenceMatch?.[1]);
+    await waitForLocalActionQueueEmpty();
+
+    element<HTMLButtonElement>('[data-view="needs"]').click();
+    expect(element<HTMLElement>("#metadata-recovery-results").textContent).toContain("Ready video");
+    element<HTMLButtonElement>("[data-recovery-clear]").click();
+    expect(element<HTMLElement>("#metadata-recovery-results").textContent).toBe("");
+    element<HTMLButtonElement>('[data-view="organizing"]').click();
+    expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview request #${previewSequence} was submitted`);
+
+    await app.replaceSnapshot({
+      ...ownerSnapshot,
+      state_version: previewSequence + 1,
+      operations: [{
+        seq: previewSequence,
+        kind: "file_preview",
+        status: "failed",
+        error: "The preview could not be prepared.",
+        result: { library_id: LIBRARY_ID, root_binding: ROOT_BINDING },
+      }],
+    });
+    const requestsBeforeRefresh = app.stateRequests;
+    element<HTMLButtonElement>("#refresh-button").click();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(app.stateRequests).toBeGreaterThan(requestsBeforeRefresh));
+    await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview failed · request #${previewSequence}`));
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("The preview could not be prepared.");
   });
 
   it("routes explicit standalone changes through the ordinary metadata preview request", async () => {

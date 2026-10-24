@@ -50,6 +50,26 @@ describe("metadata recovery reports", () => {
     expect(parseMetadataRecoveryReport({ ...reportFixture, items: [{ ...reportFixture.items[0], status: "guessed" }] })).toBeNull();
   });
 
+  it("accepts a cursorless library report only when its first deferred row represents no progress", () => {
+    const deferredItem = reportFixture.items.find((item) => item.status === "deferred");
+    const cursorless = {
+      revision: "library-r17",
+      total: 3,
+      remaining: 3,
+      next_cursor: null,
+      items: [deferredItem],
+    };
+    expect(parseMetadataRecoveryReport(cursorless)).toMatchObject({
+      total: 3,
+      remaining: 3,
+      next_cursor: null,
+      items: [{ item_id: "item-deferred", status: "deferred" }],
+    });
+    expect(parseMetadataRecoveryReport({ ...cursorless, items: [reportFixture.items[0]] })).toBeNull();
+    expect(parseMetadataRecoveryReport({ ...cursorless, remaining: 2 })).toBeNull();
+    expect(parseMetadataRecoveryReport({ ...cursorless, items: [] })).toBeNull();
+  });
+
   it("builds fill-missing-only patches bound to the analyzed revision and an explicit candidate", () => {
     const report = parseMetadataRecoveryReport(reportFixture);
     expect(report).not.toBeNull();

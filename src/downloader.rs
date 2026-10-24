@@ -6057,31 +6057,29 @@ pub(crate) async fn resolve_bilibili_metadata_recovery_source(
     config: &AppConfig,
     source_id: &str,
 ) -> Result<Vec<crate::metadata_recovery::ResolvedMetadataEntry>> {
-    let url = bilibili_metadata_recovery_source_url(source_id)?;
     let source_query_budget = crate::metadata_recovery::MAX_RESOLVER_QUERY_TIME
         .saturating_sub(METADATA_RECOVERY_SOURCE_QUERY_MARGIN);
     let source_deadline = Instant::now() + source_query_budget;
-    let _permit = tokio_timeout_at(
-        source_deadline,
-        bilibili_missing_validation_semaphore().acquire_owned(),
-    )
-    .await
-    .context("metadata recovery admission timed out")?
-    .context("metadata recovery admission is unavailable")?;
-    let (client, resolved) = tokio_timeout_at(source_deadline, async {
-        sync_bilibili_rust_credentials(config).await?;
-        let client = bilibili_core::client(config)?;
-        let resolved = probe_bilibili_resolved_content(
-            &client,
-            &url,
-            Some(BilibiliSelection::All),
-            BILIBILI_METADATA_PROBE_TIMEOUT,
+    let url = bilibili_metadata_recovery_source_url(source_id)?;
+    let (validation_permit, (client, resolved)) =
+        run_metadata_recovery_query_after_credential_sync(
+            source_deadline,
+            bilibili_missing_validation_semaphore(),
+            || async { sync_bilibili_rust_credentials(config).await },
+            || async {
+                let client = bilibili_core::client(config)?;
+                let resolved = probe_bilibili_resolved_content(
+                    &client,
+                    &url,
+                    Some(BilibiliSelection::All),
+                    BILIBILI_METADATA_PROBE_TIMEOUT,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((client, resolved))
+            },
         )
         .await?;
-        Ok::<_, anyhow::Error>((client, resolved))
-    })
-    .await
-    .context("Bilibili metadata recovery base query timed out")??;
+    let _validation_permit = validation_permit;
 
     let parsed_bvid = bilibili_bvid_from_url(&url);
     let enrichment_deadline = (source_deadline - METADATA_RECOVERY_UGC_RETURN_MARGIN)
@@ -6104,6 +6102,48 @@ pub(crate) async fn resolve_bilibili_metadata_recovery_source(
         },
     )
     .await
+}
+
+async fn run_metadata_recovery_query_after_credential_sync<T, S, SFut, Q, QFut>(
+    deadline: Instant,
+    validation_semaphore: Arc<Semaphore>,
+    credential_sync: S,
+    query: Q,
+) -> Result<(tokio::sync::OwnedSemaphorePermit, T)>
+where
+    T: Send,
+    S: FnOnce() -> SFut + Send,
+    SFut: Future<Output = Result<()>> + Send,
+    Q: FnOnce() -> QFut + Send,
+    QFut: Future<Output = Result<T>> + Send,
+{
+    if Instant::now() >= deadline {
+        bail!("Bilibili metadata recovery timed out before credential sync");
+    }
+    tokio_timeout_at(deadline, credential_sync())
+        .await
+        .context("Bilibili metadata recovery credential sync timed out")??;
+
+    if Instant::now() >= deadline {
+        bail!("metadata recovery admission timed out");
+    }
+    let permit = tokio_timeout_at(deadline, validation_semaphore.acquire_owned())
+        .await
+        .context("metadata recovery admission timed out")?
+        .context("metadata recovery admission is unavailable")?;
+
+    if Instant::now() >= deadline {
+        drop(permit);
+        bail!("Bilibili metadata recovery base query timed out");
+    }
+    let value = tokio_timeout_at(deadline, query())
+        .await
+        .context("Bilibili metadata recovery base query timed out")??;
+    if Instant::now() >= deadline {
+        drop(permit);
+        bail!("Bilibili metadata recovery base query timed out");
+    }
+    Ok((permit, value))
 }
 
 fn bilibili_metadata_recovery_source_url(source_id: &str) -> Result<String> {
@@ -31533,6 +31573,160 @@ mod tests {
                 "accepted {invalid}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_waits_for_serialized_credential_sync_before_validation_admission() {
+        let validation = Arc::new(Semaphore::new(2));
+        let sync_lock = Arc::new(Mutex::new(()));
+        let release_sync = Arc::new(Semaphore::new(0));
+        let sync_waiters = Arc::new(AtomicU64::new(0));
+        let sync_active = Arc::new(AtomicU64::new(0));
+        let sync_finished = Arc::new(AtomicU64::new(0));
+        let query_count = Arc::new(AtomicU64::new(0));
+
+        let make_query = |validation: Arc<Semaphore>| {
+            let sync_lock = Arc::clone(&sync_lock);
+            let release_sync = Arc::clone(&release_sync);
+            let sync_waiters = Arc::clone(&sync_waiters);
+            let sync_active = Arc::clone(&sync_active);
+            let sync_finished = Arc::clone(&sync_finished);
+            let query_count = Arc::clone(&query_count);
+            tokio::spawn(async move {
+                run_metadata_recovery_query_after_credential_sync(
+                    Instant::now() + Duration::from_secs(5),
+                    validation,
+                    move || async move {
+                        sync_waiters.fetch_add(1, Ordering::SeqCst);
+                        let _guard = sync_lock.lock().await;
+                        sync_active.fetch_add(1, Ordering::SeqCst);
+                        release_sync
+                            .acquire()
+                            .await
+                            .map_err(|_| anyhow!("test sync release semaphore closed"))?
+                            .forget();
+                        sync_active.fetch_sub(1, Ordering::SeqCst);
+                        sync_finished.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                    move || async move {
+                        query_count.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                )
+                .await
+            })
+        };
+
+        let first = make_query(Arc::clone(&validation));
+        let second = make_query(Arc::clone(&validation));
+        tokio_timeout(Duration::from_secs(1), async {
+            while sync_waiters.load(Ordering::SeqCst) < 2 || sync_active.load(Ordering::SeqCst) != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both sync futures should queue behind one another");
+
+        assert_eq!(validation.available_permits(), 2);
+        let external_first = tokio_timeout(
+            Duration::from_millis(100),
+            Arc::clone(&validation).acquire_owned(),
+        )
+        .await
+        .expect("external validation should be able to acquire the first permit")
+        .expect("validation semaphore should stay open");
+        let external_second = tokio_timeout(
+            Duration::from_millis(100),
+            Arc::clone(&validation).acquire_owned(),
+        )
+        .await
+        .expect("external validation should be able to acquire the second permit")
+        .expect("validation semaphore should stay open");
+
+        release_sync.add_permits(1);
+        tokio_timeout(Duration::from_secs(1), async {
+            while sync_finished.load(Ordering::SeqCst) < 1
+                || sync_active.load(Ordering::SeqCst) != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second serialized sync should start after the first finishes");
+        assert_eq!(query_count.load(Ordering::SeqCst), 0);
+
+        release_sync.add_permits(1);
+        tokio_timeout(Duration::from_secs(1), async {
+            while sync_finished.load(Ordering::SeqCst) < 2
+                || sync_active.load(Ordering::SeqCst) != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both serialized sync futures should finish");
+        assert_eq!(query_count.load(Ordering::SeqCst), 0);
+
+        drop(external_first);
+        drop(external_second);
+        let _ = first
+            .await
+            .expect("first recovery task should join")
+            .expect("first recovery query should complete");
+        let _ = second
+            .await
+            .expect("second recovery task should join")
+            .expect("second recovery query should complete");
+        assert_eq!(query_count.load(Ordering::SeqCst), 2);
+        assert_eq!(validation.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_expired_credential_sync_wait_does_not_leak_validation_permits() {
+        let validation = Arc::new(Semaphore::new(2));
+        let sync_lock = Arc::new(Mutex::new(()));
+        let held_sync_guard = sync_lock.lock().await;
+        let sync_lock_for_wait = Arc::clone(&sync_lock);
+        let sync_wait_started = Arc::new(AtomicBool::new(false));
+        let sync_wait_started_by_future = Arc::clone(&sync_wait_started);
+        let query_called = Arc::new(AtomicBool::new(false));
+        let query_called_by_future = Arc::clone(&query_called);
+        let validation_for_task = Arc::clone(&validation);
+
+        let task = tokio::spawn(async move {
+            run_metadata_recovery_query_after_credential_sync(
+                Instant::now() + Duration::from_millis(50),
+                validation_for_task,
+                move || async move {
+                    sync_wait_started_by_future.store(true, Ordering::SeqCst);
+                    let _guard = sync_lock_for_wait.lock().await;
+                    Ok(())
+                },
+                move || async move {
+                    query_called_by_future.store(true, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+        });
+        tokio_timeout(Duration::from_secs(1), async {
+            while !sync_wait_started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("credential sync should begin waiting on the serialized lock");
+
+        let result = tokio_timeout(Duration::from_secs(1), task)
+            .await
+            .expect("recovery should respect its shared deadline")
+            .expect("recovery task should join");
+        assert!(result.is_err(), "waiting past the deadline should time out");
+        assert!(!query_called.load(Ordering::SeqCst));
+        assert_eq!(validation.available_permits(), 2);
+        drop(held_sync_guard);
     }
 
     #[test]
