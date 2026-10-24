@@ -60,6 +60,8 @@ pub struct LibraryItem {
     pub codec: Option<String>,
     pub source_ids: Vec<String>,
     pub collection: Option<CollectionMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_status: Option<OrganizationStatus>,
     pub attachments: Vec<LibraryAttachment>,
     /// The NFO selected by the current scan for metadata reads and patches.
     /// This path is rebuilt from the live sidecar index and is not persisted.
@@ -80,6 +82,14 @@ pub struct CollectionMetadata {
     pub kind: String,
     pub order: Option<u32>,
     pub part_id: Option<String>,
+}
+
+/// User-declared organization intent stored in the portable NFO sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrganizationStatus {
+    Standalone,
+    Unreviewed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +193,14 @@ pub struct MetadataPatch {
     #[serde(default)]
     pub source_ids: Vec<String>,
     pub collection: Option<CollectionMetadata>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fill_missing_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_status: Option<OrganizationStatus>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

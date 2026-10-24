@@ -1,6 +1,7 @@
 import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, consumeRejectedActionReceipts, dispatchNextOwnedAction, persistQueuedActionAndDrain, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "./action-queue.js";
 import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
+import { buildMetadataRecoveryPreviewPayload, buildOrganizationStatusPatch, groupMetadataRecoveryItems, metadataRecoveryOperationId, parseMetadataRecoveryReport } from "./metadata-recovery.js";
 import { HttpResponseError } from "./http-error.js";
 import { createOwnerSnapshotLoader } from "./snapshot-loader.js";
 import { createSnapshotUpdates } from "./snapshot-updates.js";
@@ -33,7 +34,7 @@ const MAX_LEGACY_BYTES = 256 * 1024;
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
 const initialParams = new URLSearchParams(window.location.search);
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
 let snapshotUpdates = null;
 let snapshotUpdateStatus = "connecting";
 let privateAccessExpired = false;
@@ -111,6 +112,243 @@ function filePreviewPayload(fields, expectedIdentity = null) {
     expectedIdentity,
     fields,
   });
+}
+
+function dismissMetadataRecoveryId(id) {
+  if (!id) return;
+  state.dismissedRecoveryRequestIds.add(String(id));
+  while (state.dismissedRecoveryRequestIds.size > 128) {
+    state.dismissedRecoveryRequestIds.delete(state.dismissedRecoveryRequestIds.values().next().value);
+  }
+}
+
+function clearMetadataRecoveryState({ dismiss = true } = {}) {
+  const current = state.metadataRecovery;
+  if (dismiss && current?.requestId) {
+    const latestSeq = recoveryOperationsForLibrary(current.libraryId)
+      .reduce((maximum, operation) => Number.isSafeInteger(operation?.seq) ? Math.max(maximum, operation.seq) : maximum, 0);
+    if (latestSeq > 0) {
+      const previous = state.recoveryHiddenThroughSeq.get(current.libraryId) ?? 0;
+      state.recoveryHiddenThroughSeq.set(current.libraryId, Math.max(previous, latestSeq));
+    }
+    dismissMetadataRecoveryId(current.requestId);
+    if (Number.isSafeInteger(current.seq)) dismissMetadataRecoveryId(String(current.seq));
+  }
+  state.metadataRecovery = null;
+}
+
+function recoveryContext() {
+  const option = byId("library-select")?.selectedOptions?.[0];
+  if (option?.value !== activeLibraryId()) return null;
+  const libraryId = activeLibraryId();
+  const rootBinding = option?.dataset?.rootBinding ?? "";
+  const revision = activeLibrarySnapshot()?.revision;
+  if (!libraryId || !isValidLibraryRootBinding(rootBinding) || typeof revision !== "string" || !revision) return null;
+  return { libraryId, rootBinding, revision };
+}
+
+function recoveryOperationsForLibrary(libraryId) {
+  return (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [])
+    .filter((operation) => operation?.kind === "metadata_recover"
+      && operationMatchesLibrary(operation, libraryId)
+      && fileOperationIdentityMatches(state.snapshot, operation, libraryId))
+    .sort((left, right) => Number(right?.seq ?? 0) - Number(left?.seq ?? 0));
+}
+
+function recoveryOperationCompacted(operation) {
+  const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
+  return operation?.details_incomplete === true || operation?.result_truncated === true
+    || result.details_incomplete === true || result.result_truncated === true;
+}
+
+function recoveryOperationReport(operation) {
+  if (!operation || recoveryOperationCompacted(operation)) return null;
+  const result = operation.result && typeof operation.result === "object" ? operation.result : {};
+  return parseMetadataRecoveryReport(result.recovery);
+}
+
+function recoveryOperationMatches(operation, recovery) {
+  return metadataRecoveryOperationId(operation) === recovery.requestId
+    || Number.isSafeInteger(recovery.seq) && Number.isSafeInteger(operation?.seq) && operation.seq === recovery.seq;
+}
+
+function currentMetadataRecovery() {
+  const context = recoveryContext();
+  if (!context) return null;
+  let recovery = state.metadataRecovery;
+  if (!recovery) {
+    const queuedAction = [...readActionQueue()].reverse().find((action) => {
+      const payload = action?.payload && typeof action.payload === "object" ? action.payload : {};
+      return action?.kind === "metadata_recover" && payload.library_id === context.libraryId
+        && payload.root_binding === context.rootBinding;
+    });
+    const requestId = metadataRecoveryOperationId(queuedAction);
+    if (queuedAction && requestId && !state.dismissedRecoveryRequestIds.has(requestId)) {
+      const payload = queuedAction.payload && typeof queuedAction.payload === "object" ? queuedAction.payload : {};
+      recovery = {
+        requestId,
+        libraryId: context.libraryId,
+        rootBinding: context.rootBinding,
+        scope: payload.scope === "selected" ? "selected" : "library",
+        report: null,
+        selectedIds: new Set(),
+        candidateChoices: new Map(),
+        invalidated: false,
+        compacted: false,
+        deliveryUnknown: queuedAction.delivery_outcome === "outcome_unknown",
+        error: null,
+      };
+      state.metadataRecovery = recovery;
+    }
+  }
+  if (recovery && (recovery.libraryId !== context.libraryId || recovery.rootBinding !== context.rootBinding)) {
+    clearMetadataRecoveryState();
+    recovery = null;
+  }
+  if (recovery) {
+    if (recovery.report && recovery.report.revision !== context.revision) {
+      recovery.report = null;
+      recovery.selectedIds.clear();
+      recovery.candidateChoices.clear();
+      recovery.invalidated = true;
+    }
+    const operation = recovery.requestId
+      ? recoveryOperationsForLibrary(context.libraryId).find((entry) => recoveryOperationMatches(entry, recovery))
+      : null;
+    if (operation) {
+      if (recoveryOperationCompacted(operation)) {
+        recovery.compacted = true;
+        recovery.invalidated = true;
+        recovery.report = null;
+        recovery.selectedIds.clear();
+        recovery.candidateChoices.clear();
+      }
+      else {
+        const report = recoveryOperationReport(operation);
+        if (report) {
+          if (report.revision === context.revision && !recovery.invalidated) {
+            recovery.report = report;
+            recovery.error = null;
+          } else {
+            recovery.report = null;
+            recovery.selectedIds.clear();
+            recovery.candidateChoices.clear();
+            recovery.invalidated = true;
+          }
+        } else if (["failed", "stale", "rejected"].includes(String(operation.status))) {
+          recovery.error = String(operation.error ?? operation.message ?? "Metadata analysis failed on your computer.");
+        } else if (operation.result && ["completed", "complete", "succeeded"].includes(String(operation.status))) {
+          recovery.invalidated = true;
+          recovery.report = null;
+          recovery.selectedIds.clear();
+          recovery.candidateChoices.clear();
+        }
+      }
+    }
+    return recovery;
+  }
+
+  for (const operation of recoveryOperationsForLibrary(context.libraryId)) {
+    const requestId = metadataRecoveryOperationId(operation);
+    if (!requestId || state.dismissedRecoveryRequestIds.has(requestId)) continue;
+    const hiddenThroughSeq = state.recoveryHiddenThroughSeq.get(context.libraryId) ?? 0;
+    if (Number.isSafeInteger(operation?.seq) && operation.seq <= hiddenThroughSeq) continue;
+    const recovery = {
+      requestId,
+      libraryId: context.libraryId,
+      rootBinding: context.rootBinding,
+        scope: operation?.result?.scope === "selected" || operation?.scope === "selected" || operation?.payload?.scope === "selected"
+          ? "selected"
+          : operation?.result?.scope === "library" || operation?.scope === "library" || operation?.payload?.scope === "library"
+            ? "library"
+            : "unknown",
+      report: null,
+      selectedIds: new Set(),
+      candidateChoices: new Map(),
+      invalidated: false,
+      compacted: recoveryOperationCompacted(operation),
+      error: null,
+    };
+    const report = recoveryOperationReport(operation);
+    if (report && report.revision === context.revision) recovery.report = report;
+    else if (report || recovery.compacted) recovery.invalidated = true;
+    else if (["failed", "stale", "rejected"].includes(String(operation.status))) {
+      recovery.error = String(operation.error ?? operation.message ?? "Metadata analysis failed on your computer.");
+    } else if (operation.result && ["completed", "complete", "succeeded"].includes(String(operation.status))) {
+      recovery.invalidated = true;
+    }
+    state.metadataRecovery = recovery;
+    return recovery;
+  }
+  return null;
+}
+
+async function requestMetadataRecovery(scope) {
+  if (!libraryCanOperate()) return showToast("This library is offline or showing a saved scan. Reconnect it before analyzing metadata.");
+  const context = recoveryContext();
+  if (!context) return showToast("The displayed library identity or revision is unavailable. Refresh the library before analyzing metadata.");
+  const payload = {
+    library_id: context.libraryId,
+    root_binding: context.rootBinding,
+    scope,
+    ...(scope === "selected" ? { item_ids: [...state.selected] } : {}),
+  };
+  if (scope === "selected" && (state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS)) {
+    return showToast(`Select between 1 and ${MAX_SELECTED_ITEMS} present items to analyze metadata.`);
+  }
+  if (scope === "library") {
+    const current = currentMetadataRecovery();
+    if (current?.scope === "library" && current.report?.remaining > 0 && current.report.next_cursor) payload.after_item_id = current.report.next_cursor;
+  }
+  await submitAction("metadata_recover", payload, {
+    onQueued: (action) => {
+      state.dismissedRecoveryRequestIds.delete(action.request_id);
+      state.metadataRecovery = {
+        requestId: action.request_id,
+        libraryId: context.libraryId,
+        rootBinding: context.rootBinding,
+        scope,
+        report: null,
+        selectedIds: new Set(),
+        candidateChoices: new Map(),
+        invalidated: false,
+        compacted: false,
+        error: null,
+      };
+      renderMetadataRecovery();
+    },
+  });
+}
+
+function previewMetadataRecoverySelection() {
+  const context = recoveryContext();
+  const recovery = currentMetadataRecovery();
+  if (!libraryCanOperate() || !context || !recovery?.report || recovery.report.revision !== context.revision) {
+    return showToast("This analysis is out of date. Analyze the current library before previewing metadata changes.");
+  }
+  const payload = buildMetadataRecoveryPreviewPayload({
+    report: recovery.report,
+    libraryId: context.libraryId,
+    rootBinding: context.rootBinding,
+    itemIds: [...recovery.selectedIds],
+    candidateChoices: recovery.candidateChoices,
+  });
+  if (!payload) return showToast("Select only ready items and choose a candidate for every item that needs confirmation.");
+  submitAction("file_preview", payload);
+}
+
+function previewOrganizationStatus(item, organizationStatus) {
+  if (!libraryCanOperate()) return showToast("This library is offline or showing a saved scan. Reconnect it before changing metadata.");
+  const patch = buildOrganizationStatusPatch(item, organizationStatus);
+  if (!patch) return showToast("An item with an existing collection cannot be marked standalone. Its collection will be preserved.");
+  const payload = filePreviewPayload({
+    item_ids: [String(item.id)],
+    metadata_patches: [patch],
+    rename: false,
+    conflict: "skip",
+  });
+  if (!payload) return showToast("The displayed library identity changed. Refresh the library before previewing this metadata update.");
+  submitAction("file_preview", payload);
 }
 
 function migrationLibraryId(operation, result, field) {
@@ -365,6 +603,7 @@ function clearCachedSnapshot() {
 function showPrivateAccessGate(message) {
   state.detailId = null;
   clearSelectedItems();
+  clearMetadataRecoveryState();
   state.legacyOperation = null;
   state.legacyOperationKey = null;
   state.legacySelection.clear();
@@ -375,8 +614,27 @@ function showPrivateAccessGate(message) {
   setConnection("", "Owner verification required");
 }
 
+function invalidateMetadataRecoveryForSnapshot(previousSnapshot, nextSnapshot) {
+  const recovery = state.metadataRecovery;
+  if (!recovery || !previousSnapshot) return false;
+  const previousEntry = mediaLibraryEntries(previousSnapshot).find((entry) => entry.id === recovery.libraryId);
+  const nextEntry = mediaLibraryEntries(nextSnapshot).find((entry) => entry.id === recovery.libraryId);
+  const previousBinding = previousEntry?.root_binding;
+  const nextBinding = nextEntry?.root_binding;
+  const bindingChanged = previousBinding !== nextBinding;
+  const previousRevision = resolveMediaLibrary(previousSnapshot, recovery.libraryId).snapshot?.revision;
+  const nextRevision = resolveMediaLibrary(nextSnapshot, recovery.libraryId).snapshot?.revision;
+  if (bindingChanged || previousRevision !== nextRevision) {
+    clearMetadataRecoveryState({ dismiss: false });
+    return true;
+  }
+  return false;
+}
+
 function acceptFreshSnapshot(snapshot) {
-  if (clearFileIdentityScopedStateOnSnapshot(state, state.snapshot, snapshot)) {
+  const identityChanged = clearFileIdentityScopedStateOnSnapshot(state, state.snapshot, snapshot);
+  const recoveryChanged = invalidateMetadataRecoveryForSnapshot(state.snapshot, snapshot);
+  if (identityChanged || recoveryChanged) {
     state.groupSelectionLimitNotice = null;
   }
   Object.assign(state, acceptOwnerSnapshot(snapshot, state));
@@ -564,9 +822,15 @@ async function drainActionQueue({ quiet = false } = {}) {
           method: "POST",
         body: JSON.stringify(fileActionRequestBody(action)),
         }),
-        onReceipt: (action, receipt, resolvedSurface) => recordActionReceipt(action, receipt, state, {
-          surface: resolvedSurface,
-        }),
+        onReceipt: (action, receipt, resolvedSurface) => {
+          const recorded = recordActionReceipt(action, receipt, state, { surface: resolvedSurface });
+          if (action?.kind === "metadata_recover" && action.request_id === state.metadataRecovery?.requestId
+              && Number.isSafeInteger(receipt?.seq)) {
+            state.metadataRecovery.seq = receipt.seq;
+            renderMetadataRecovery();
+          }
+          return recorded;
+        },
       });
       const receiptUpdate = outcome.receiptUpdate ?? {};
       if (receiptUpdate.downloadSubmission) renderDownloadStatus();
@@ -616,6 +880,10 @@ async function drainActionQueue({ quiet = false } = {}) {
           ? action
           : { ...action, delivery_outcome: "outcome_unknown", delivery_error_code: code, delivery_error: error };
         const updates = markUnknownFileAction(state, marked);
+        if (action?.kind === "metadata_recover" && state.metadataRecovery?.requestId === action.request_id) {
+          state.metadataRecovery.deliveryUnknown = true;
+          renderMetadataRecovery();
+        }
         if (updates.downloadSubmission) renderDownloadStatus();
         if (updates.migrationConflictDrafts > 0) renderMigrations();
         renderWaiting();
@@ -626,6 +894,10 @@ async function drainActionQueue({ quiet = false } = {}) {
         const { action, rejection, receiptUpdate } = outcome;
         if (receiptUpdate?.rejectedRequestIds?.includes(action.request_id)) {
           settleRejectedFileAction({ request_id: action.request_id, kind: action.kind, ...rejection }, true);
+        }
+        if (action.kind === "metadata_recover" && state.metadataRecovery?.requestId === action.request_id) {
+          state.metadataRecovery.error = rejection.error;
+          renderMetadataRecovery();
         }
         permanentRejections.push(rejection.error);
         continue;
@@ -701,7 +973,7 @@ async function submitAction(kind, payload, { onQueued } = {}) {
     renderDownloadStatus();
     return false;
   }
-  if (["file_preview", "legacy_import"].includes(kind)) {
+  if (["file_preview", "legacy_import", "metadata_recover"].includes(kind)) {
     const libraryId = String(payload?.library_id ?? "");
     if (!fileOperationIdentityMatches(state.snapshot, { result: payload }, libraryId)) {
       showToast("This action does not match a verified library registration. Refresh the library and create a new preview or import.");
@@ -709,7 +981,7 @@ async function submitAction(kind, payload, { onQueued } = {}) {
     }
   }
   const unavailableLibraryAction = (() => {
-    if (["file_preview", "legacy_import"].includes(kind)) {
+    if (["file_preview", "legacy_import", "metadata_recover"].includes(kind)) {
       return !libraryCanOperate(String(payload?.library_id ?? ""));
     }
     if (kind === "download_submit") return !libraryCanOperate(String(payload?.library_id ?? ""));
@@ -983,6 +1255,109 @@ function renderLibrary() {
   selectionActions.classList.toggle("hidden", state.selected.size === 0);
   byId("selection-count").textContent = `${state.selected.size} ${state.selected.size === 1 ? "item" : "items"} selected`;
   byId("organize-selected").disabled = !canOperate || state.selected.size === 0;
+  byId("recover-selected").disabled = !canOperate || state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS;
+  renderMetadataRecovery();
+}
+
+const RECOVERY_GROUP_TITLES = {
+  ready: "Ready to preview",
+  needs_confirmation: "Choose a match",
+  unchanged: "Already complete",
+  unavailable: "Unavailable",
+  unsupported: "Unsupported",
+};
+
+function recoveryPatchSummary(patch) {
+  const parts = [];
+  if (typeof patch?.title === "string") parts.push(`Title: ${patch.title}`);
+  if (patch?.collection && typeof patch.collection === "object") parts.push(`Collection: ${patch.collection.title}`);
+  if (Array.isArray(patch?.source_ids) && patch.source_ids.length) parts.push(`Source IDs: ${patch.source_ids.join(", ")}`);
+  if (patch?.organization_status) parts.push(`Organization status: ${patch.organization_status}`);
+  return parts.join(" · ");
+}
+
+function recoveryItemMarkup(item, recovery) {
+  const selectable = item.status === "ready" || item.status === "needs_confirmation";
+  const checked = recovery.selectedIds.has(item.item_id);
+  const candidateChoice = recovery.candidateChoices.get(item.item_id);
+  const candidates = Array.isArray(item.candidates) ? item.candidates : [];
+  const candidateControl = item.status === "needs_confirmation"
+    ? candidates.length
+      ? `<label class="recovery-candidate-label">Candidate<select class="select-control" data-recovery-candidate="${escapeHtml(item.item_id)}"><option value="">Choose a candidate</option>${candidates.map((candidate, index) => `<option value="${index}" ${candidateChoice === index ? "selected" : ""}>${escapeHtml(candidate.label)}</option>`).join("")}</select></label>`
+      : `<p class="field-hint">No supported candidate is available for this item.</p>`
+    : "";
+  const summary = item.patch ? recoveryPatchSummary(item.patch) : "";
+  return `<article class="recovery-item">
+    <label class="recovery-item-select"><input type="checkbox" data-recovery-item="${escapeHtml(item.item_id)}" ${checked ? "checked" : ""} ${selectable ? "" : "disabled"}><span><strong>${escapeHtml(item.title || "Untitled video")}</strong><code>${escapeHtml(item.relative_path || "Path unavailable")}</code></span></label>
+    <span class="state-pill ${selectable ? "pending" : ""}">${escapeHtml(RECOVERY_GROUP_TITLES[item.status])}</span>
+    ${summary ? `<p class="field-hint">${escapeHtml(summary)}</p>` : ""}
+    ${item.reason ? `<p class="recovery-reason">${escapeHtml(item.reason)}</p>` : ""}
+    ${candidateControl}
+  </article>`;
+}
+
+function renderMetadataRecovery() {
+  const current = recoveryContext();
+  const canOperate = Boolean(current && libraryCanOperate(current.libraryId));
+  const recovery = current ? currentMetadataRecovery() : null;
+  const report = recovery?.report ?? null;
+  const groups = report ? groupMetadataRecoveryItems(report.items) : null;
+  const libraryButton = byId("recover-library");
+  if (libraryButton) {
+    libraryButton.disabled = !canOperate || Boolean(recovery?.requestId && !report && !recovery.error && !recovery.invalidated);
+    libraryButton.textContent = recovery?.scope === "library" && report?.remaining > 0 ? "Analyze next batch" : "Analyze current library";
+  }
+  const selectedButton = byId("recover-selected");
+  if (selectedButton) selectedButton.disabled = !canOperate || state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS;
+  const status = byId("recovery-status");
+  const results = byId("metadata-recovery-results");
+  if (!status || !results) return;
+
+  if (!current) {
+    status.textContent = "Connect and refresh an available library before analyzing metadata.";
+    results.innerHTML = "";
+    return;
+  }
+  if (!recovery) {
+    status.textContent = canOperate
+      ? "Analyze selected items from the selection tray, or start a bounded pass over the current library."
+      : "This library is offline or showing a saved scan. Reconnect it before analyzing metadata.";
+    results.innerHTML = "";
+    return;
+  }
+  if (recovery.invalidated) {
+    status.textContent = recovery.compacted
+      ? "This saved report was compacted and its item details are unavailable. Analyze again to get a fresh report."
+      : "The library changed after this analysis. Its selections and candidates were cleared; analyze again before previewing updates.";
+    results.innerHTML = "";
+    return;
+  }
+  if (!report) {
+    status.textContent = recovery.deliveryUnknown
+      ? "The analysis request delivery outcome is unknown. Check your computer before starting another analysis; this request will not be resent automatically."
+      : recovery.error
+        ? `Analysis failed: ${recovery.error}`
+        : "Metadata analysis is queued or running on your computer. Results arrive through the existing live update connection.";
+    results.innerHTML = "";
+    return;
+  }
+
+  status.textContent = recovery.scope === "selected"
+    ? `Analysis revision ${report.revision} · ${report.items.length} selected result${report.items.length === 1 ? "" : "s"} · ${report.total} needs-organizing candidates in the library`
+    : `Analysis revision ${report.revision} · ${report.items.length} items in this batch · ${report.total} needs-organizing candidates in the library · ${report.remaining} remaining after this batch`;
+  const sections = Object.entries(groups).map(([key, items]) => {
+    const content = items.length ? items.map((item) => recoveryItemMarkup(item, recovery)).join("")
+      : `<p class="field-hint">No items in this group.</p>`;
+    return `<section class="recovery-group" aria-labelledby="recovery-group-${key}"><h4 id="recovery-group-${key}">${escapeHtml(RECOVERY_GROUP_TITLES[key])} <span>${items.length}</span></h4>${content}</section>`;
+  }).join("");
+  const previewPayload = canOperate ? buildMetadataRecoveryPreviewPayload({
+    report,
+    libraryId: current.libraryId,
+    rootBinding: current.rootBinding,
+    itemIds: [...recovery.selectedIds],
+    candidateChoices: recovery.candidateChoices,
+  }) : null;
+  results.innerHTML = `${recovery.scope === "library" && report.remaining > 0 ? `<p class="field-hint">More candidates remain. Analyze the next batch to continue through the library without silently skipping rows.</p>` : ""}<div class="recovery-group-list">${sections}</div><div class="recovery-footer"><button class="primary-button" type="button" data-recovery-preview ${previewPayload ? "" : "disabled"}>Preview selected updates</button>${recovery.scope === "library" && report.remaining > 0 ? `<button class="secondary-button" type="button" data-recovery-next>Analyze next batch</button>` : ""}<button class="quiet-button" type="button" data-recovery-clear>Clear report and choices</button></div>`;
 }
 
 function operationTitle(operation) {
@@ -1456,6 +1831,13 @@ function renderDetail() {
   const pathJoin = (relative) => root ? `${root}${root.includes("\\") && !root.includes("/") ? "\\" : "/"}${relative}` : "";
   const relativePath = String(item.relative_path ?? "");
   const fullPath = pathJoin(relativePath);
+  const organizationStatus = String(item.organization_status ?? "unreviewed").toLowerCase();
+  const hasCollection = Boolean(item.collection && (typeof item.collection === "string" ? item.collection.trim() : item.collection.title));
+  const organizationControls = organizationStatus === "standalone"
+    ? `<button class="small-button detail-organization-action" type="button" data-organization-status="unreviewed" data-organization-item="${escapeHtml(item.id)}" ${libraryCanOperate() ? "" : "disabled"}>Undo standalone declaration</button><p class="field-hint">Undoing the declaration restores the usual collection review check.</p>`
+    : hasCollection
+      ? `<p class="field-hint">This item already has a collection. Existing collections cannot be declared standalone.</p>`
+      : `<button class="small-button detail-organization-action" type="button" data-organization-status="standalone" data-organization-item="${escapeHtml(item.id)}" ${libraryCanOperate() ? "" : "disabled"}>Mark as standalone</button><p class="field-hint">Standalone status only clears the missing-collection check. Missing, unavailable, incomplete, and low-confidence items still need review.</p>`;
   panel.innerHTML = `
     <aside class="detail-sheet" role="dialog" aria-modal="true" aria-label="File details">
       <div class="detail-top"><div><p class="eyebrow">FILE DETAILS</p><h2>${escapeHtml(item.title || "Untitled video")}</h2></div><button class="detail-close" type="button" aria-label="Close details">×</button></div>
@@ -1471,9 +1853,11 @@ function renderDetail() {
         <div class="detail-stat"><span>Codec</span><strong>${escapeHtml(item.codec || "Unknown")}</strong></div>
         <div class="detail-stat"><span>Metadata</span><strong>${escapeHtml(item.metadata_status ?? "Unknown")}</strong></div>
         <div class="detail-stat"><span>Confidence</span><strong>${escapeHtml(item.confidence ?? "Unknown")}</strong></div>
+        <div class="detail-stat"><span>Organization</span><strong>${escapeHtml(organizationStatus)}</strong></div>
         <div class="detail-stat"><span>Integrity</span><strong>${escapeHtml(item.integrity_status ?? "Unknown")}</strong></div>
         <div class="detail-stat"><span>Media + related files</span><strong>${1 + attachments.length} files</strong></div>
       </div>
+      <section class="detail-section"><h3>Organization status</h3>${organizationControls}</section>
       ${collection ? `<section class="detail-section"><h3>Collection</h3><div class="attachment">${escapeHtml(collection)}</div></section>` : ""}
       <section class="detail-section"><h3>Source links (${sourceIds.length})</h3>${sourceIds.length ? sourceIds.map((source) => { const url = sourceIdUrl(source); return `<div class="attachment">${url ? `<a href="${url}" target="_blank" rel="noopener noreferrer">${escapeHtml(source)}</a>` : escapeHtml(source)}</div>`; }).join("") : `<div class="attachment">No source links recorded.</div>`}<p class="field-hint">Remote source availability has not been checked.</p></section>
       <section class="detail-section"><h3>Related files (${attachments.length})</h3>${attachments.length ? attachments.map((attachment) => { const rel = attachment.relative_path ?? attachment.path ?? "Related file"; const absolute = pathJoin(rel); return `<div class="attachment"><div class="copy-row"><code>${escapeHtml(rel)}</code><button class="small-button" type="button" data-copy="${escapeHtml(rel)}">Copy relative</button></div>${absolute ? `<div class="copy-row"><code>${escapeHtml(absolute)}</code><button class="small-button" type="button" data-copy="${escapeHtml(absolute)}">Copy full</button></div>` : ""}<span>${escapeHtml(attachment.kind ?? "attachment")}</span></div>`; }).join("") : `<div class="attachment">No attachments found.</div>`}</section>
@@ -1618,6 +2002,7 @@ function bindEvents() {
   byId("library-select").addEventListener("change", () => {
     state.libraryId = byId("library-select").value;
     clearSelectedItems();
+    clearMetadataRecoveryState();
     state.detailId = null;
     state.legacyOperation = null;
     state.legacyOperationKey = null;
@@ -1629,6 +2014,8 @@ function bindEvents() {
     syncLibraryUrl();
     render();
   });
+  byId("recover-library").addEventListener("click", () => requestMetadataRecovery("library"));
+  byId("recover-selected").addEventListener("click", () => requestMetadataRecovery("selected"));
   byId("download-here").addEventListener("click", () => openDownloadForm());
   byId("download-close").addEventListener("click", closeDownloadForm);
   byId("download-cancel").addEventListener("click", closeDownloadForm);
@@ -1795,6 +2182,36 @@ function bindEvents() {
     if (status) status.textContent = contents.status;
   });
   document.body.addEventListener("change", (event) => {
+    const recoveryCandidate = event.target.closest("[data-recovery-candidate]");
+    if (recoveryCandidate) {
+      const recovery = currentMetadataRecovery();
+      const itemId = recoveryCandidate.dataset.recoveryCandidate;
+      const index = recoveryCandidate.value === "" ? null : Number(recoveryCandidate.value);
+      const item = recovery?.report?.items.find((entry) => entry.item_id === itemId);
+      if (!recovery || !item || item.status !== "needs_confirmation"
+          || index !== null && (!Number.isSafeInteger(index) || index < 0 || index >= (item.candidates?.length ?? 0))) {
+        renderMetadataRecovery();
+        return;
+      }
+      if (index === null) recovery.candidateChoices.delete(itemId);
+      else recovery.candidateChoices.set(itemId, index);
+      renderMetadataRecovery();
+      return;
+    }
+    const recoveryItem = event.target.closest("[data-recovery-item]");
+    if (recoveryItem) {
+      const recovery = currentMetadataRecovery();
+      const itemId = recoveryItem.dataset.recoveryItem;
+      const item = recovery?.report?.items.find((entry) => entry.item_id === itemId);
+      if (!recovery || !item || !["ready", "needs_confirmation"].includes(item.status)) {
+        renderMetadataRecovery();
+        return;
+      }
+      if (recoveryItem.checked) recovery.selectedIds.add(itemId);
+      else recovery.selectedIds.delete(itemId);
+      renderMetadataRecovery();
+      return;
+    }
     const migrationConflict = event.target.closest("[data-migration-conflict-item]");
     if (migrationConflict) {
       const previewId = migrationConflict.dataset.migrationPreviewId;
@@ -1878,6 +2295,22 @@ function bindEvents() {
     if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
   });
   document.body.addEventListener("click", (event) => {
+    const recoveryPreview = event.target.closest("[data-recovery-preview]");
+    if (recoveryPreview) { previewMetadataRecoverySelection(); return; }
+    const recoveryNext = event.target.closest("[data-recovery-next]");
+    if (recoveryNext) { requestMetadataRecovery("library"); return; }
+    const recoveryClear = event.target.closest("[data-recovery-clear]");
+    if (recoveryClear) {
+      clearMetadataRecoveryState();
+      renderMetadataRecovery();
+      return;
+    }
+    const organizationAction = event.target.closest("[data-organization-status]");
+    if (organizationAction) {
+      const item = libraryItems().find((entry) => String(entry.id) === organizationAction.dataset.organizationItem);
+      if (item) previewOrganizationStatus(item, organizationAction.dataset.organizationStatus);
+      return;
+    }
     const dismissUnknown = event.target.closest("[data-dismiss-unknown-action]");
     if (dismissUnknown) {
       const requestId = dismissUnknown.dataset.dismissUnknownAction;

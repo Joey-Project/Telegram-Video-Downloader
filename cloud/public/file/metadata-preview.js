@@ -3,6 +3,7 @@ const FIELD_LABELS = {
   collection: "Collection",
   order: "Order",
   part_id: "Part ID",
+  organization_status: "Organization status",
 };
 
 export function metadataPreviewDetails(patch) {
@@ -24,7 +25,7 @@ export function metadataPreviewDetails(patch) {
   return details;
 }
 
-const METADATA_PATCH_FIELDS = ["title", "source_ids", "collection", "order", "part_id"];
+const METADATA_PATCH_FIELDS = ["title", "source_ids", "collection", "order", "part_id", "organization_status"];
 
 function hasMetadataValue(value) {
   if (typeof value === "string") return value.trim().length > 0;

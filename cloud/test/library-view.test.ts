@@ -572,6 +572,37 @@ describe("bounded library views", () => {
     });
   });
 
+  it("uses standalone organization status only to suppress the missing-collection reason", () => {
+    expect(needsOrganizing({
+      id: "standalone-complete",
+      presence: "present",
+      confidence: "high",
+      metadata_status: "complete",
+      organization_status: "standalone",
+    })).toBe(false);
+    expect(needsOrganizing({
+      id: "standalone-low-confidence",
+      presence: "present",
+      confidence: "low",
+      metadata_status: "complete",
+      organization_status: "standalone",
+    })).toBe(true);
+    expect(needsOrganizing({
+      id: "standalone-incomplete",
+      presence: "present",
+      confidence: "high",
+      metadata_status: "partial",
+      organization_status: "standalone",
+    })).toBe(true);
+    expect(needsOrganizing({
+      id: "standalone-missing",
+      presence: "missing",
+      confidence: "high",
+      metadata_status: "complete",
+      organization_status: "standalone",
+    })).toBe(true);
+  });
+
   it("sorts known episode orders before missing orders with title fallback", () => {
     const items = [
       { id: "missing-2", title: "Episode 2", collection: { id: "series", title: "Series", kind: "series", order: null } },

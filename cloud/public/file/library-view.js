@@ -363,7 +363,8 @@ export function needsOrganizing(item) {
   const confidence = String(item?.confidence ?? "low").toLowerCase();
   const metadata = String(item?.metadata_status ?? "unknown").toLowerCase();
   const hasCollection = Boolean(item?.collection && (typeof item.collection === "string" ? item.collection.trim() : item.collection.title));
-  return confidence !== "high" || metadata !== "complete" || !hasCollection || ["missing", "unavailable"].includes(statusOf(item));
+  const standalone = String(item?.organization_status ?? "").toLowerCase() === "standalone";
+  return confidence !== "high" || metadata !== "complete" || !hasCollection && !standalone || ["missing", "unavailable"].includes(statusOf(item));
 }
 
 export function filterLibraryItems(items, { query = "", category = "", status = "" } = {}) {

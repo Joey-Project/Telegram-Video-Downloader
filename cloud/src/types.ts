@@ -6,6 +6,7 @@ export type RequestKind =
   | "library_set_category"
   | "library_rename"
   | "library_remove"
+  | "metadata_recover"
   | "file_preview"
   | "file_confirm"
   | "legacy_import"
@@ -31,12 +32,47 @@ export interface CollectionMetadata {
   part_id: string | null;
 }
 
+export type OrganizationStatus = "standalone" | "unreviewed";
+
 export interface MetadataPatch {
   item_id: string;
   hint_index?: number;
   title?: string;
   source_ids?: string[];
   collection?: CollectionMetadata;
+  organization_status?: OrganizationStatus;
+  fill_missing_only?: boolean;
+}
+
+export interface MetadataRecoveryPayload extends BoundLibraryMutationIdentity {
+  scope: "selected" | "library";
+  item_ids?: string[];
+  after_item_id?: string;
+}
+
+export type MetadataRecoveryStatus = "ready" | "needs_confirmation" | "unchanged" | "unavailable" | "unsupported";
+
+export interface MetadataRecoveryCandidate {
+  label: string;
+  patch: MetadataPatch;
+}
+
+export interface MetadataRecoveryItem {
+  item_id: string;
+  title: string;
+  relative_path: string;
+  status: MetadataRecoveryStatus;
+  reason?: string;
+  patch?: MetadataPatch;
+  candidates?: MetadataRecoveryCandidate[];
+}
+
+export interface MetadataRecoveryReport {
+  revision: string;
+  items: MetadataRecoveryItem[];
+  total: number;
+  remaining: number;
+  next_cursor: string | null;
 }
 
 export type ConflictPolicy = "skip" | "keep_both";
@@ -59,6 +95,7 @@ export interface LibraryMigrationPreviewPayload {
 
 export interface FilePreviewPayload extends BoundLibraryMutationIdentity {
   item_ids?: string[];
+  expected_revision?: string;
   target_relative_dir?: string;
   rename?: boolean;
   conflict?: ConflictPolicy;

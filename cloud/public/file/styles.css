@@ -112,3 +112,181 @@
     text-align: center;
   }
 }
+
+.recovery-card {
+  margin: 3px 0 18px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: #fff;
+}
+
+.recovery-card-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.recovery-card-heading h3 {
+  margin: 0;
+  font: 700 14px Manrope, sans-serif;
+}
+
+.recovery-card-heading p:not(.eyebrow) {
+  max-width: 660px;
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+#recovery-status {
+  margin: 12px 0 0;
+  line-height: 1.5;
+}
+
+.recovery-group-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.recovery-group {
+  display: grid;
+  gap: 7px;
+}
+
+.recovery-group h4 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  color: #506258;
+  font: 700 11px Manrope, sans-serif;
+}
+
+.recovery-group h4 span {
+  color: var(--muted);
+  font: 500 10px "DM Sans", sans-serif;
+}
+
+.recovery-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 7px 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fbfcfb;
+}
+
+.recovery-item-select {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+}
+
+.recovery-item-select input {
+  flex: none;
+  margin-top: 3px;
+  accent-color: var(--green);
+}
+
+.recovery-item-select span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.recovery-item-select strong {
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.recovery-item-select code {
+  color: var(--muted);
+  font: 10px ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+
+.recovery-item .field-hint,
+.recovery-reason {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.recovery-reason {
+  color: var(--amber);
+}
+
+.recovery-candidate-label {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.recovery-candidate-label select {
+  width: 100%;
+}
+
+.recovery-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.recovery-footer button {
+  font-size: 11px;
+}
+
+.detail-organization-action {
+  margin-top: 9px;
+}
+
+.selection-actions-inner .secondary-button {
+  flex: none;
+  white-space: nowrap;
+}
+
+@media (max-width: 700px) {
+  .recovery-card {
+    padding: 13px;
+  }
+
+  .recovery-card-heading {
+    display: grid;
+  }
+
+  .recovery-card-heading button {
+    width: 100%;
+  }
+
+  .recovery-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .recovery-item > .state-pill {
+    justify-self: start;
+  }
+
+  .recovery-footer button {
+    width: 100%;
+    text-align: center;
+  }
+
+  .selection-actions-inner .secondary-button {
+    width: 100%;
+    padding-right: 8px;
+    padding-left: 8px;
+    text-align: center;
+  }
+}

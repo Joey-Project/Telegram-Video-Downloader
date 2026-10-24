@@ -9,6 +9,7 @@ use crate::cloud::{InboxRecord, InboxStatus};
 const MAX_OPERATION_SNAPSHOT_RECORDS: usize = 100;
 const MAX_OPERATION_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_COMPACT_OPERATION_RESULT_BYTES: usize = 2 * 1024;
+pub(crate) const MAX_METADATA_RECOVERY_RESULT_BYTES: usize = 512 * 1024;
 const MAX_OPERATION_ERROR_JSON_BYTES: usize = 1024;
 const MAX_OPERATION_KIND_JSON_BYTES: usize = 128;
 const MAX_PREVIEW_SNAPSHOT_RECORDS: usize = 100;
@@ -29,7 +30,7 @@ const PREVIEW_DETAILS_UNAVAILABLE_REASON: &str =
     "Preview details are unavailable in this cloud snapshot. Reload the preview before confirming.";
 const MIGRATION_SUMMARY_REASON: &str = "A bounded summary is shown. Start confirms the complete saved migration plan; item and file details are omitted.";
 const PREVIEWS_OMITTED_REASON: &str = "Some pending previews were omitted from this snapshot. Refresh pending previews before confirming.";
-/// Build the bounded operation receipt list, reserving space for the newest usable legacy import.
+/// Reserve bounded actionable recovery and legacy-import results before other receipts.
 pub(crate) fn operation_snapshots(records: &[&InboxRecord]) -> Result<Vec<Value>> {
     let mut selected = records
         .iter()
@@ -48,6 +49,22 @@ pub(crate) fn operation_snapshots(records: &[&InboxRecord]) -> Result<Vec<Value>
     let mut total_bytes = array_json_size(&snapshots, MAX_OPERATION_SNAPSHOT_BYTES)
         .ok_or_else(|| anyhow!("compact cloud operation receipts exceed their size budget"))?;
 
+    // An active recovery report must remain actionable even when newer receipts are large.
+    let mut prioritized_recovery = None;
+    for (index, record) in selected.iter().enumerate().rev() {
+        if record.request.kind == "metadata_recover"
+            && record.status == InboxStatus::Completed
+            && record
+                .result
+                .as_ref()
+                .is_some_and(is_usable_metadata_recovery_result)
+            && restore_full_operation_if_fits(index, record, &mut snapshots, &mut total_bytes)
+        {
+            prioritized_recovery = Some(index);
+            break;
+        }
+    }
+
     // Reserve the newest restorable completed import before large newer receipts can consume the
     // budget. If it cannot fit, try older complete imports before falling back to recency.
     let mut prioritized_legacy_import = None;
@@ -63,7 +80,7 @@ pub(crate) fn operation_snapshots(records: &[&InboxRecord]) -> Result<Vec<Value>
 
     // Allocate the remaining budget to other full results newest first.
     for (index, record) in selected.iter().enumerate().rev() {
-        if Some(index) == prioritized_legacy_import {
+        if Some(index) == prioritized_legacy_import || Some(index) == prioritized_recovery {
             continue;
         }
         restore_full_operation_if_fits(index, record, &mut snapshots, &mut total_bytes);
@@ -124,11 +141,44 @@ fn is_usable_legacy_import_result(result: &Value) -> bool {
     has_library_binding && has_hints && has_candidates && !result_marked_incomplete
 }
 
+fn is_usable_metadata_recovery_result(result: &Value) -> bool {
+    let Some(recovery) = result.get("recovery") else {
+        return false;
+    };
+    result
+        .get("library_id")
+        .and_then(Value::as_str)
+        .is_some_and(valid_library_id)
+        && result
+            .get("root_binding")
+            .and_then(Value::as_str)
+            .is_some_and(valid_root_binding_token)
+        && matches!(
+            result.get("scope").and_then(Value::as_str),
+            Some("selected" | "library")
+        )
+        && recovery
+            .get("revision")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && recovery
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty() && items.len() <= 100)
+        && [result, recovery].iter().all(|value| {
+            !["incomplete", "details_incomplete", "result_truncated"]
+                .iter()
+                .any(|field| value.get(field).and_then(Value::as_bool) == Some(true))
+        })
+        && json_size_within(result, MAX_METADATA_RECOVERY_RESULT_BYTES).is_some()
+}
+
 /// Compact large historical receipts after an upload-size rejection.
 ///
 /// The newest usable completed legacy-import result stays intact because its hints are the manual
 /// mapping entry point in the Mini App. Failed or explicitly incomplete imports do not reserve the
-/// budget. Other details are replaced with a small identity summary.
+/// budget. The latest bounded recovery report is also retained for its candidate/patch choices.
+/// Other details are replaced with a small identity summary.
 pub(crate) fn compact_operation_receipts(operations: &mut [Value]) -> bool {
     let latest_legacy_import = operations
         .iter()
@@ -143,6 +193,22 @@ pub(crate) fn compact_operation_receipts(operations: &mut [Value]) -> bool {
         .max_by_key(|(_, seq)| *seq)
         .map(|(index, _)| index);
 
+    let latest_recovery = operations
+        .iter()
+        .enumerate()
+        .filter(|(_, operation)| {
+            operation.get("kind").and_then(Value::as_str) == Some("metadata_recover")
+                && operation.get("status").and_then(Value::as_str) == Some("completed")
+                && !["details_incomplete", "result_truncated"]
+                    .iter()
+                    .any(|field| operation.get(field).and_then(Value::as_bool) == Some(true))
+                && operation
+                    .get("result")
+                    .is_some_and(is_usable_metadata_recovery_result)
+        })
+        .max_by_key(|(_, operation)| operation.get("seq").and_then(Value::as_u64).unwrap_or(0))
+        .map(|(index, _)| index);
+
     let mut changed = false;
     for (index, operation) in operations.iter_mut().enumerate() {
         let Some(fields) = operation.as_object_mut() else {
@@ -150,7 +216,7 @@ pub(crate) fn compact_operation_receipts(operations: &mut [Value]) -> bool {
         };
 
         changed |= bound_operation_metadata(fields);
-        if Some(index) == latest_legacy_import {
+        if Some(index) == latest_legacy_import || Some(index) == latest_recovery {
             continue;
         }
 
@@ -945,6 +1011,96 @@ mod tests {
             "candidates": candidates,
             "warnings": warnings,
         })
+    }
+
+    fn metadata_recovery_result(reason_bytes: usize) -> Value {
+        json!({
+            "library_id": "ml-test-root",
+            "root_binding": TEST_ROOT_BINDING,
+            "scope": "library",
+            "recovery": {
+                "revision": "recovery-revision",
+                "items": [{
+                    "item_id": "recovery-item",
+                    "title": "Recovered media",
+                    "relative_path": "media.mp4",
+                    "status": "ready",
+                    "reason": "x".repeat(reason_bytes),
+                    "patch": {"item_id": "recovery-item", "title": "Recovered media", "fill_missing_only": true}
+                }],
+                "total": 1,
+                "remaining": 0,
+                "next_cursor": null
+            }
+        })
+    }
+
+    #[test]
+    fn recovery_report_survives_newer_large_receipts_and_upload_compaction() {
+        let latest = metadata_recovery_result(100 * 1024);
+        let records = [
+            record(
+                1,
+                "metadata_recover",
+                InboxStatus::Completed,
+                Some(metadata_recovery_result(90 * 1024)),
+                None,
+            ),
+            record(
+                2,
+                "metadata_recover",
+                InboxStatus::Completed,
+                Some(latest.clone()),
+                None,
+            ),
+            record(
+                3,
+                "legacy_import",
+                InboxStatus::Completed,
+                Some(legacy_import_result(Some(900 * 1024), &[])),
+                None,
+            ),
+            record(
+                4,
+                "file_confirm",
+                InboxStatus::Completed,
+                Some(json!({"payload": "x".repeat(1500 * 1024)})),
+                None,
+            ),
+        ];
+        let mut snapshots = operation_snapshots(&records.iter().collect::<Vec<_>>())
+            .expect("bounded actionable reports should fit");
+        assert_eq!(snapshots[1]["result"], latest);
+        assert_eq!(snapshots[2]["result"]["hints"].as_array().unwrap().len(), 1);
+        assert_ne!(snapshots[1]["details_incomplete"], true);
+        assert!(compact_operation_receipts(&mut snapshots));
+        assert_eq!(snapshots[1]["result"], latest);
+        assert_ne!(snapshots[1]["details_incomplete"], true);
+        assert_eq!(snapshots[0]["details_incomplete"], true);
+        assert!(array_json_size(&snapshots, MAX_OPERATION_SNAPSHOT_BYTES).is_some());
+    }
+
+    #[test]
+    fn recovery_compaction_does_not_reserve_unbound_oversized_or_incomplete_results() {
+        let valid = metadata_recovery_result(4096);
+        let mut unbound = metadata_recovery_result(4096);
+        unbound["root_binding"] = json!("invalid-binding");
+        let oversized = metadata_recovery_result(MAX_METADATA_RECOVERY_RESULT_BYTES);
+        let mut incomplete = metadata_recovery_result(4096);
+        incomplete["recovery"]["incomplete"] = json!(true);
+        let mut snapshots = vec![
+            json!({"seq": 1, "kind": "metadata_recover", "status": "completed", "result": valid.clone()}),
+            json!({"seq": 2, "kind": "metadata_recover", "status": "completed", "result": unbound}),
+            json!({"seq": 3, "kind": "metadata_recover", "status": "completed", "result": oversized}),
+            json!({"seq": 4, "kind": "metadata_recover", "status": "completed", "result": incomplete}),
+        ];
+        assert!(compact_operation_receipts(&mut snapshots));
+        assert_eq!(snapshots[0]["result"], valid);
+        for snapshot in &snapshots[1..] {
+            assert_eq!(snapshot["details_incomplete"], true);
+            assert_eq!(snapshot["result_truncated"], true);
+            assert!(snapshot["result"].get("recovery").is_none());
+        }
     }
 
     fn migration_preview_result(

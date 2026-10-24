@@ -33,14 +33,14 @@ const TEST_TELEGRAM_TOKEN: &str = "codex_synth_v1_api_key_a";
 // Keep completion waits bounded without treating parallel-suite contention as a deadlock.
 const MIGRATION_TEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(60);
 
-struct FakeTelegramRequest {
+pub(super) struct FakeTelegramRequest {
     method: String,
     body: serde_json::Value,
     authorization: Option<String>,
     database_epoch: Option<String>,
 }
 
-fn take_cloud_test_telegram_requests(
+pub(super) fn take_cloud_test_telegram_requests(
     requests: &mut mpsc::UnboundedReceiver<FakeTelegramRequest>,
 ) -> Vec<FakeTelegramRequest> {
     let mut recorded = Vec::new();
@@ -219,7 +219,7 @@ impl QueueFileProvider for PauseOnDirectoryReadProvider {
     }
 }
 
-async fn spawn_fake_telegram_api() -> (
+pub(super) async fn spawn_fake_telegram_api() -> (
     TelegramClient,
     mpsc::UnboundedReceiver<FakeTelegramRequest>,
     oneshot::Sender<()>,
@@ -405,7 +405,7 @@ fn fake_telegram_response(request: &FakeTelegramRequest, next_message_id: &mut i
     )
 }
 
-async fn stop_fake_telegram_api(
+pub(super) async fn stop_fake_telegram_api(
     shutdown: oneshot::Sender<()>,
     server: tokio::task::JoinHandle<Result<()>>,
 ) {
@@ -1226,7 +1226,7 @@ fn empty_cloud_test_library_snapshot(revision: &str) -> LibrarySnapshot {
     }
 }
 
-fn temp_cloud_bot_dir(label: &str) -> PathBuf {
+pub(super) fn temp_cloud_bot_dir(label: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time should be available")
@@ -1236,11 +1236,11 @@ fn temp_cloud_bot_dir(label: &str) -> PathBuf {
     ))
 }
 
-fn open_runtime_test_inbox(root: &Path) -> Result<CloudInbox> {
+pub(super) fn open_runtime_test_inbox(root: &Path) -> Result<CloudInbox> {
     CloudInbox::open_for_epoch(root, crate::cloud::TEST_DATABASE_EPOCH)
 }
 
-fn cloud_test_root_binding(queue: &QueueManager, library_id: &str) -> String {
+pub(super) fn cloud_test_root_binding(queue: &QueueManager, library_id: &str) -> String {
     queue
         .registry_snapshot()
         .expect("library registry should load")
@@ -1398,7 +1398,7 @@ fn runtime_test_request_path(root: &Path, epoch: &str, seq: u64) -> PathBuf {
     runtime_test_inbox_directory(root, epoch).join(format!("request-{seq:020}.json"))
 }
 
-fn persisted_cloud_preview_count(video_root: &Path) -> usize {
+pub(super) fn persisted_cloud_preview_count(video_root: &Path) -> usize {
     fs::read_dir(video_root.join(".telegram-video-downloader-library"))
         .expect("private library directory should list")
         .filter_map(std::result::Result::ok)
@@ -1411,7 +1411,7 @@ fn persisted_cloud_preview_count(video_root: &Path) -> usize {
         .count()
 }
 
-fn make_runtime(
+pub(super) fn make_runtime(
     telegram: TelegramClient,
     config: AppConfig,
     queue: Arc<QueueManager>,
@@ -1450,11 +1450,13 @@ fn make_runtime(
         library_scan_publication_gate: Arc::new(Mutex::new(())),
         telegram_dispatch: Arc::new(Semaphore::new(1)),
         management_dispatch: Arc::new(Semaphore::new(1)),
+        metadata_recovery_dispatch: Arc::new(Semaphore::new(1)),
         backlog_sync_gate: Arc::new(Mutex::new(())),
         reconciliation_complete: Arc::new(AtomicBool::new(true)),
         epoch_fatal: Arc::new(CloudEpochFatal::default()),
         cloud_ready_marker_emitted: Arc::new(AtomicBool::new(false)),
         test_file_provider: None,
+        test_metadata_recovery_resolver: None,
         test_library_refresh_failure: Arc::new(StdMutex::new(None)),
         test_cloud_ready_marker_emissions: Arc::new(AtomicUsize::new(0)),
     }
@@ -1527,7 +1529,7 @@ fn settings_command_recognizes_bot_mentions_without_matching_longer_commands() {
     assert!(!is_settings_command("settings"));
 }
 
-async fn run_library_management_test_request(
+pub(super) async fn run_library_management_test_request(
     runtime: &CloudBotRuntime,
     seq: u64,
     kind: &str,
@@ -3205,6 +3207,27 @@ fn metadata_only_preview_accepts_selected_item_ids_without_move_target() {
         prepared.hint_indices,
         vec![("library-item-1".to_string(), Some(4))]
     );
+}
+
+#[test]
+fn metadata_only_preview_keeps_analysis_revision_and_explicit_standalone_patch() {
+    let payload = serde_json::from_value::<FilePreviewPayload>(serde_json::json!({
+        "expected_revision": "snapshot-r7",
+        "item_ids": ["library-item-1"],
+        "metadata_patches": [{
+            "item_id": "library-item-1",
+            "organization_status": "standalone"
+        }]
+    }))
+    .expect("standalone metadata patch should parse");
+    let prepared = validate_file_preview_payload(payload)
+        .expect("explicit organization-status patches are metadata-only changes");
+    assert_eq!(prepared.expected_revision.as_deref(), Some("snapshot-r7"));
+    assert_eq!(
+        prepared.patches[0].organization_status,
+        Some(crate::library::OrganizationStatus::Standalone)
+    );
+    assert!(!prepared.patches[0].fill_missing_only);
 }
 
 #[test]
@@ -5504,6 +5527,8 @@ async fn completed_file_confirmation_is_preserved_when_library_refresh_fails() {
                 title: Some("Updated title".to_string()),
                 source_ids: Vec::new(),
                 collection: None,
+                organization_status: None,
+                fill_missing_only: false,
             }],
         )
         .expect("move and NFO patch should produce a preview");
