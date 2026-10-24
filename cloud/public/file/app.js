@@ -123,7 +123,7 @@ function dismissMetadataRecoveryId(id) {
   }
 }
 
-function clearMetadataRecoveryState({ dismiss = true, preservePreviewRequest = false } = {}) {
+function clearMetadataRecoveryReport({ dismiss = true } = {}) {
   const current = state.metadataRecovery;
   if (dismiss && current?.requestId) {
     const latestSeq = recoveryOperationsForLibrary(current.libraryId)
@@ -136,6 +136,10 @@ function clearMetadataRecoveryState({ dismiss = true, preservePreviewRequest = f
     if (Number.isSafeInteger(current.seq)) dismissMetadataRecoveryId(String(current.seq));
   }
   state.metadataRecovery = null;
+}
+
+function clearMetadataRecoveryState({ dismiss = true, preservePreviewRequest = false } = {}) {
+  clearMetadataRecoveryReport({ dismiss });
   if (!preservePreviewRequest) state.metadataRecoveryPreviewRequest = null;
 }
 
@@ -255,7 +259,14 @@ function currentMetadataRecovery() {
     }
   }
   if (recovery && (recovery.libraryId !== context.libraryId || recovery.rootBinding !== context.rootBinding)) {
-    clearMetadataRecoveryState();
+    const previewRequest = state.metadataRecoveryPreviewRequest;
+    const recoveryRootChanged = recovery.libraryId === context.libraryId
+      && recovery.rootBinding !== context.rootBinding;
+    clearMetadataRecoveryState({ preservePreviewRequest: true });
+    if (recoveryRootChanged && previewRequest?.libraryId === recovery.libraryId
+        && previewRequest.rootBinding !== context.rootBinding) {
+      state.metadataRecoveryPreviewRequest = null;
+    }
     recovery = null;
   }
   if (recovery) {
@@ -740,24 +751,27 @@ function showPrivateAccessGate(message) {
 function invalidateMetadataRecoveryForSnapshot(previousSnapshot, nextSnapshot) {
   const recovery = state.metadataRecovery;
   const previewRequest = state.metadataRecoveryPreviewRequest;
-  const libraryId = recovery?.libraryId ?? previewRequest?.libraryId;
-  if (!libraryId || !previousSnapshot) return false;
-  const previousEntry = mediaLibraryEntries(previousSnapshot).find((entry) => entry.id === libraryId);
-  const nextEntry = mediaLibraryEntries(nextSnapshot).find((entry) => entry.id === libraryId);
-  const previousBinding = previousEntry?.root_binding;
-  const nextBinding = nextEntry?.root_binding;
-  const bindingChanged = previousBinding !== nextBinding;
-  const revisionChanged = recovery
-    && resolveMediaLibrary(previousSnapshot, libraryId).snapshot?.revision !== resolveMediaLibrary(nextSnapshot, libraryId).snapshot?.revision;
-  if (bindingChanged) {
-    clearMetadataRecoveryState({ dismiss: false });
-    return true;
+  if (!previousSnapshot) return false;
+  const entryFor = (snapshot, libraryId) => mediaLibraryEntries(snapshot).find((entry) => entry.id === libraryId);
+  const bindingChanged = (libraryId) => {
+    const previousEntry = entryFor(previousSnapshot, libraryId);
+    const nextEntry = entryFor(nextSnapshot, libraryId);
+    return previousEntry?.root_binding !== nextEntry?.root_binding;
+  };
+  const recoveryBindingChanged = Boolean(recovery && bindingChanged(recovery.libraryId));
+  const recoveryRevisionChanged = Boolean(recovery
+    && resolveMediaLibrary(previousSnapshot, recovery.libraryId).snapshot?.revision
+      !== resolveMediaLibrary(nextSnapshot, recovery.libraryId).snapshot?.revision);
+  const previewBindingChanged = Boolean(previewRequest
+    && entryFor(nextSnapshot, previewRequest.libraryId)?.root_binding !== previewRequest.rootBinding);
+
+  if (recoveryBindingChanged || recoveryRevisionChanged) {
+    clearMetadataRecoveryReport({ dismiss: false });
   }
-  if (revisionChanged) {
-    clearMetadataRecoveryState({ dismiss: false, preservePreviewRequest: true });
-    return true;
+  if (previewBindingChanged && state.metadataRecoveryPreviewRequest === previewRequest) {
+    state.metadataRecoveryPreviewRequest = null;
   }
-  return false;
+  return recoveryBindingChanged || recoveryRevisionChanged || previewBindingChanged;
 }
 
 function acceptFreshSnapshot(snapshot) {
@@ -1776,8 +1790,11 @@ function renderPreviews() {
       const operation = Number.isSafeInteger(currentSubmission.seq)
         ? (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []).find((entry) => entry?.seq === currentSubmission.seq && entry?.kind === "file_preview")
         : null;
-      if (operation && ["failed", "rejected", "stale", "cancelled", "expired"].includes(String(operation.status).toLowerCase())) {
-        return `<article class="stack-card"><div class="stack-card-head"><div><h3>Recovery preview failed · request #${escapeHtml(currentSubmission.seq ?? currentSubmission.requestId)}</h3><p>${escapeHtml(operation.error ?? "The computer could not create this preview.")}</p></div><span class="state-pill warning">Needs attention</span></div></article>`;
+      const operationStatus = String(operation?.status ?? currentSubmission.status ?? "").toLowerCase();
+      const failureStatuses = ["failed", "rejected", "stale", "cancelled", "expired"];
+      if (failureStatuses.includes(operationStatus)) {
+        const error = operation?.error ?? currentSubmission.error ?? "The computer could not create this preview.";
+        return `<article class="stack-card"><div class="stack-card-head"><div><h3>Recovery preview failed · request #${escapeHtml(currentSubmission.seq ?? currentSubmission.requestId)}</h3><p>${escapeHtml(error)}</p></div><span class="state-pill warning">Needs attention</span></div></article>`;
       }
       const message = currentSubmission.status === "rejected"
         ? `The computer rejected recovery preview request ${Number.isSafeInteger(currentSubmission.seq) ? `#${currentSubmission.seq}` : currentSubmission.requestId}: ${currentSubmission.error || "Request rejected"}`
@@ -2190,7 +2207,7 @@ function bindEvents() {
   byId("library-select").addEventListener("change", () => {
     state.libraryId = byId("library-select").value;
     clearSelectedItems();
-    clearMetadataRecoveryState();
+    clearMetadataRecoveryState({ preservePreviewRequest: true });
     state.detailId = null;
     state.legacyOperation = null;
     state.legacyOperationKey = null;

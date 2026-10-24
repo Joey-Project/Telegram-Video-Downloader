@@ -9,6 +9,10 @@ import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
 
 const LIBRARY_ID = "recovery-library";
 const ROOT_BINDING = `v1:${"a".repeat(64)}`;
+const OTHER_LIBRARY_ID = "secondary-library";
+const OTHER_ROOT_BINDING = `v1:${"b".repeat(64)}`;
+const REPLACEMENT_ROOT_BINDING = `v1:${"c".repeat(64)}`;
+const OTHER_LIBRARY_REVISION = "secondary-ui-r1";
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "metadata-recovery-ui", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
 let originalWindowWebSocket: PropertyDescriptor | undefined;
@@ -121,6 +125,86 @@ const firstReport = {
   ],
 };
 
+function recoveryOperation({ seq, libraryId, rootBinding, revision, itemId, title }: {
+  seq: number;
+  libraryId: string;
+  rootBinding: string;
+  revision: string;
+  itemId: string;
+  title: string;
+}) {
+  const report = {
+    revision,
+    total: 1,
+    remaining: 0,
+    next_cursor: null,
+    items: [{
+      item_id: itemId,
+      title,
+      relative_path: `${itemId}.mkv`,
+      status: "ready",
+      patch: { item_id: itemId, title: `Recovered ${title}` },
+    }],
+  };
+  return {
+    seq,
+    request_id: `metadata-recovery-${libraryId}`,
+    kind: "metadata_recover",
+    status: "completed",
+    recovery_identity: { library_id: libraryId, root_binding: rootBinding, scope: "library" },
+    result: {
+      scope: "library",
+      library_id: libraryId,
+      root_binding: rootBinding,
+      recovery: report,
+    },
+  };
+}
+
+function twoLibrarySnapshot({ primaryRootBinding = ROOT_BINDING, operations = [] }: {
+  primaryRootBinding?: string;
+  operations?: Array<Record<string, any>>;
+} = {}) {
+  const secondarySnapshot = {
+    revision: OTHER_LIBRARY_REVISION,
+    scanned_at: ownerSnapshot.library.scanned_at,
+    root_label: "Secondary library",
+    ready: true,
+    items: [{ id: "secondary-item", title: "Secondary video", relative_path: "Secondary.mkv", presence: "present", bytes: 512, metadata_status: "partial", confidence: "high" }],
+    categories: [],
+    warnings: [],
+  };
+  return {
+    ...ownerSnapshot,
+    settings: {
+      ...ownerSnapshot.settings,
+      applied: {
+        ...ownerSnapshot.settings.applied,
+        libraries: [
+          { ...ownerSnapshot.settings.applied.libraries[0], root_binding: primaryRootBinding },
+          {
+            id: OTHER_LIBRARY_ID,
+            name: "Secondary library",
+            root: "/srv/secondary",
+            root_binding: OTHER_ROOT_BINDING,
+            default_category: "",
+            availability: "available",
+            available: true,
+          },
+        ],
+      },
+    },
+    library: {
+      ...ownerSnapshot.library,
+      libraries: [
+        { id: LIBRARY_ID, root_binding: primaryRootBinding, availability: "available", available: true, is_default: true, snapshot: ownerSnapshot.library },
+        { id: OTHER_LIBRARY_ID, root_binding: OTHER_ROOT_BINDING, availability: "available", available: true, snapshot: secondarySnapshot },
+      ],
+    },
+    operations,
+  };
+}
+
 const cursorlessDeferredLibraryReport = {
   revision: "recovery-ui-r1",
   total: 2,
@@ -147,6 +231,12 @@ async function waitForSubmittedAction(sentActions: Array<Record<string, any>>, k
 
 async function waitForRecoveryResult(text: string) {
   await vi.waitFor(() => expect(element<HTMLElement>("#metadata-recovery-results").textContent).toContain(text));
+}
+
+function selectLibrary(libraryId: string) {
+  const selector = element<HappyDOMSelectElement>("#library-select");
+  selector.value = libraryId;
+  selector.dispatchEvent(new HappyDOMEvent("change", { bubbles: true }));
 }
 
 async function waitForLocalActionQueueEmpty() {
@@ -357,6 +447,20 @@ async function applyHelperTabSnapshot(app: Awaited<ReturnType<typeof mountApp>>,
   element<HTMLButtonElement>("#refresh-button").click();
   await vi.advanceTimersByTimeAsync(1_000);
   await vi.waitFor(() => expect(app.stateRequests).toBeGreaterThan(requestsBefore));
+}
+
+async function submitReadyRecoveryPreview(app: Awaited<ReturnType<typeof mountApp>>) {
+  element<HTMLButtonElement>('[data-view="needs"]').click();
+  await waitForRecoveryResult("Ready video");
+  element<HTMLInputElement>('[data-recovery-item="item-ready"]').click();
+  element<HTMLButtonElement>("[data-recovery-preview]").click();
+  await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain("was submitted. Waiting for your computer to prepare the preview."));
+  const sequenceMatch = element<HTMLElement>("#preview-list").textContent?.match(/recovery preview request #(\d+) was submitted/iu);
+  expect(sequenceMatch).not.toBeNull();
+  await waitForLocalActionQueueEmpty();
+  const action = [...app.sentActions].reverse().find((entry) => entry.kind === "file_preview");
+  expect(action?.request_id).toEqual(expect.any(String));
+  return { seq: Number(sequenceMatch?.[1]), requestId: String(action?.request_id) };
 }
 
 afterEach(async () => {
@@ -608,6 +712,81 @@ describe("metadata recovery Mini App flow", () => {
     await vi.waitFor(() => expect(app.stateRequests).toBeGreaterThan(requestsBeforeRefresh));
     await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview failed · request #${previewSequence}`));
     expect(element<HTMLElement>("#preview-list").textContent).toContain("The preview could not be prepared.");
+  });
+
+  it("keeps a recovery preview failure across library navigation", async () => {
+    const recovery = recoveryOperation({
+      seq: 40,
+      libraryId: LIBRARY_ID,
+      rootBinding: ROOT_BINDING,
+      revision: "recovery-ui-r1",
+      itemId: "item-ready",
+      title: "Ready video",
+    });
+    const app = await mountApp({
+      initialSnapshot: twoLibrarySnapshot({ operations: [recovery] }),
+      deferRecoveryPreviewSnapshot: true,
+    });
+    const { seq, requestId } = await submitReadyRecoveryPreview(app);
+
+    selectLibrary(OTHER_LIBRARY_ID);
+    expect(element<HTMLSelectElement>("#library-select").value).toBe(OTHER_LIBRARY_ID);
+    await applyHelperTabSnapshot(app, twoLibrarySnapshot({
+      operations: [recovery, {
+        seq,
+        kind: "file_preview",
+        request_id: `action:${requestId}`,
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        status: "failed",
+        error: "The preview failed while the other library was open.",
+      }],
+    }));
+    expect(element<HTMLElement>("#preview-list").textContent).not.toContain("Recovery preview failed");
+    await applyHelperTabSnapshot(app, twoLibrarySnapshot({ operations: [recovery] }));
+
+    selectLibrary(LIBRARY_ID);
+    await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview failed · request #${seq}`));
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("The preview failed while the other library was open.");
+  });
+
+  it("invalidates a preview's own root binding while preserving another library's recovery report", async () => {
+    const recovery = recoveryOperation({
+      seq: 40,
+      libraryId: LIBRARY_ID,
+      rootBinding: ROOT_BINDING,
+      revision: "recovery-ui-r1",
+      itemId: "item-ready",
+      title: "Ready video",
+    });
+    const otherRecovery = recoveryOperation({
+      seq: 41,
+      libraryId: OTHER_LIBRARY_ID,
+      rootBinding: OTHER_ROOT_BINDING,
+      revision: OTHER_LIBRARY_REVISION,
+      itemId: "secondary-item",
+      title: "Secondary video",
+    });
+    const app = await mountApp({
+      initialSnapshot: twoLibrarySnapshot({ operations: [recovery, otherRecovery] }),
+      deferRecoveryPreviewSnapshot: true,
+    });
+    await submitReadyRecoveryPreview(app);
+
+    selectLibrary(OTHER_LIBRARY_ID);
+    element<HTMLButtonElement>('[data-view="needs"]').click();
+    await waitForRecoveryResult("Secondary video");
+    await applyHelperTabSnapshot(app, twoLibrarySnapshot({
+      primaryRootBinding: REPLACEMENT_ROOT_BINDING,
+      operations: [otherRecovery],
+    }));
+    expect(element<HTMLElement>("#metadata-recovery-results").textContent).toContain("Secondary video");
+
+    // Returning the old registration must not resurrect a tracker invalidated while away.
+    await applyHelperTabSnapshot(app, twoLibrarySnapshot({ operations: [recovery, otherRecovery] }));
+    selectLibrary(LIBRARY_ID);
+    expect(element<HTMLElement>("#preview-list").textContent).not.toContain("Recovery preview is being prepared");
+    expect(element<HTMLElement>("#preview-list").textContent).not.toContain("Recovery preview failed");
   });
 
   it("reconciles a helper-tab preview by request ID when its operation receipt is omitted", async () => {
