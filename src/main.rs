@@ -19,6 +19,10 @@ mod library_migration;
 mod library_migration_bot;
 mod media_libraries;
 mod media_library_bot;
+mod metadata_recovery;
+mod metadata_recovery_bot;
+#[cfg(test)]
+mod metadata_recovery_e2e_tests;
 mod pgc_metadata_backfill;
 mod queue;
 mod redaction;
@@ -458,12 +462,15 @@ struct CloudBotRuntime {
     library_scan_publication_gate: Arc<Mutex<()>>,
     telegram_dispatch: Arc<Semaphore>,
     management_dispatch: Arc<Semaphore>,
+    metadata_recovery_dispatch: Arc<Semaphore>,
     backlog_sync_gate: Arc<Mutex<()>>,
     reconciliation_complete: Arc<AtomicBool>,
     epoch_fatal: Arc<CloudEpochFatal>,
     cloud_ready_marker_emitted: Arc<AtomicBool>,
     #[cfg(test)]
     test_file_provider: Option<Arc<dyn crate::file_provider::QueueFileProvider>>,
+    #[cfg(test)]
+    test_metadata_recovery_resolver: Option<metadata_recovery_bot::TestMetadataRecoveryResolver>,
     #[cfg(test)]
     test_library_refresh_failure: Arc<std::sync::Mutex<Option<String>>>,
     #[cfg(test)]
@@ -1793,12 +1800,15 @@ async fn run_cloud_bot(
         library_scan_publication_gate: Arc::new(Mutex::new(())),
         telegram_dispatch: Arc::new(Semaphore::new(1)),
         management_dispatch: Arc::new(Semaphore::new(1)),
+        metadata_recovery_dispatch: Arc::new(Semaphore::new(1)),
         backlog_sync_gate: Arc::new(Mutex::new(())),
         reconciliation_complete: Arc::new(AtomicBool::new(false)),
         epoch_fatal: Arc::new(CloudEpochFatal::default()),
         cloud_ready_marker_emitted: Arc::new(AtomicBool::new(false)),
         #[cfg(test)]
         test_file_provider: None,
+        #[cfg(test)]
+        test_metadata_recovery_resolver: None,
         #[cfg(test)]
         test_library_refresh_failure: Arc::new(std::sync::Mutex::new(None)),
         #[cfg(test)]
@@ -2900,10 +2910,10 @@ async fn cloud_request_dispatcher(runtime: CloudBotRuntime) {
                 return;
             }
             let seq = record.request.seq;
-            let semaphore = if record.request.kind == "telegram" {
-                Arc::clone(&runtime.telegram_dispatch)
-            } else {
-                Arc::clone(&runtime.management_dispatch)
+            let semaphore = match record.request.kind.as_str() {
+                "telegram" => Arc::clone(&runtime.telegram_dispatch),
+                "metadata_recover" => Arc::clone(&runtime.metadata_recovery_dispatch),
+                _ => Arc::clone(&runtime.management_dispatch),
             };
             let permit = match semaphore.try_acquire_owned() {
                 Ok(permit) => permit,
@@ -2956,6 +2966,8 @@ struct CloudDispatchOutcome {
 #[serde(deny_unknown_fields)]
 struct FilePreviewPayload {
     #[serde(default)]
+    expected_revision: Option<String>,
+    #[serde(default)]
     item_ids: Option<Vec<String>>,
     #[serde(default)]
     target_relative_dir: Option<String>,
@@ -2977,6 +2989,10 @@ struct MetadataPatchInput {
     source_ids: Vec<String>,
     #[serde(default)]
     collection: Option<crate::library::CollectionMetadata>,
+    #[serde(default)]
+    organization_status: Option<crate::library::OrganizationStatus>,
+    #[serde(default)]
+    fill_missing_only: bool,
     #[serde(default)]
     hint_index: Option<usize>,
 }
@@ -3297,7 +3313,10 @@ async fn dispatch_cloud_management(
         return result;
     }
     let mut owned_request = request.clone();
-    let binding_scoped_action = matches!(request.kind.as_str(), "file_preview" | "legacy_import");
+    let binding_scoped_action = matches!(
+        request.kind.as_str(),
+        "file_preview" | "legacy_import" | "metadata_recover"
+    );
     let requested_library_id_value = if binding_scoped_action {
         owned_request
             .payload
@@ -3344,7 +3363,7 @@ async fn dispatch_cloud_management(
     };
     let selected = if matches!(
         request.kind.as_str(),
-        "library_scan" | "file_preview" | "legacy_import"
+        "library_scan" | "file_preview" | "legacy_import" | "metadata_recover"
     ) {
         match media_library_bot::scoped_runtime(runtime, requested_library_id.as_deref()) {
             Ok(selected) => Some(selected),
@@ -3358,6 +3377,19 @@ async fn dispatch_cloud_management(
         .map(|(runtime, _)| runtime)
         .unwrap_or(runtime);
     let request = &owned_request;
+    if request.kind == "metadata_recover" {
+        return metadata_recovery_bot::dispatch(
+            runtime,
+            request,
+            requested_library_id
+                .as_deref()
+                .expect("metadata recovery requires library_id"),
+            requested_root_binding
+                .as_deref()
+                .expect("metadata recovery requires root_binding"),
+        )
+        .await;
+    }
     match request.kind.as_str() {
         "library_scan" => {
             if !request
@@ -3836,6 +3868,8 @@ fn validate_file_preview_payload(
             title: patch.title.clone(),
             source_ids: patch.source_ids.clone(),
             collection: patch.collection.clone(),
+            organization_status: patch.organization_status,
+            fill_missing_only: patch.fill_missing_only,
         })
         .collect::<Vec<_>>();
     let mut item_ids = payload.item_ids.unwrap_or_default();
@@ -3854,6 +3888,13 @@ fn validate_file_preview_payload(
     {
         return Err("The target folder is too long.".to_string());
     }
+    if payload
+        .expected_revision
+        .as_ref()
+        .is_some_and(|revision| revision.is_empty() || revision.len() > 256)
+    {
+        return Err("The expected library revision is invalid.".to_string());
+    }
     for patch in &patches {
         if patch.item_id.trim().is_empty()
             || patch.item_id.len() > 256
@@ -3862,7 +3903,8 @@ fn validate_file_preview_payload(
                 .as_ref()
                 .is_none_or(|title| title.trim().is_empty())
                 && patch.source_ids.is_empty()
-                && patch.collection.is_none())
+                && patch.collection.is_none()
+                && patch.organization_status.is_none())
             || patch
                 .title
                 .as_ref()
@@ -3933,6 +3975,7 @@ fn validate_file_preview_payload(
         );
     }
     Ok(PreparedFilePreview {
+        expected_revision: payload.expected_revision,
         item_ids,
         target_relative_dir: payload.target_relative_dir,
         rename: payload.rename,
@@ -3946,6 +3989,7 @@ fn validate_file_preview_payload(
 }
 
 struct PreparedFilePreview {
+    expected_revision: Option<String>,
     item_ids: Vec<String>,
     target_relative_dir: Option<String>,
     rename: bool,
@@ -3995,6 +4039,15 @@ fn create_cloud_file_preview(
         },
         &hints,
         |snapshot| {
+            if prepared
+                .expected_revision
+                .as_deref()
+                .is_some_and(|expected| expected != snapshot.revision.as_str())
+            {
+                bail!(
+                    "the library changed after metadata analysis; run analysis again before previewing"
+                );
+            }
             validate_legacy_metadata_patches(
                 snapshot,
                 &context.legacy_imports,

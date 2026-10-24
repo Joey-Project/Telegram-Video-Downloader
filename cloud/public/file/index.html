@@ -74,6 +74,11 @@
           <section id="view-needs" class="view-panel hidden">
             <div class="panel-heading"><div><p class="eyebrow">NEEDS A LOOK</p><h2>Needs organizing</h2><p>Items with incomplete details, uncertain matches, or no collection.</p></div></div>
             <div id="needs-summary" class="section-summary"></div>
+            <section class="recovery-card" aria-labelledby="recovery-title">
+              <div class="recovery-card-heading"><div><p class="eyebrow">METADATA RECOVERY</p><h3 id="recovery-title">Review suggested metadata</h3><p>Analyze selected items or review the next bounded batch from this library. Suggestions never change a file until you preview and confirm them.</p></div><button id="recover-library" class="secondary-button" type="button">Analyze current library</button></div>
+              <p id="recovery-status" class="field-hint" aria-live="polite"></p>
+              <div id="metadata-recovery-results" class="recovery-results"></div>
+            </section>
             <div id="needs-list" class="library-list" aria-live="polite"></div>
             <div id="needs-empty" class="empty-state hidden"><div class="empty-art" aria-hidden="true">✓</div><h2>Everything looks organized</h2><p>Items needing metadata review or a collection will appear here.</p></div>
           </section>
@@ -129,6 +134,7 @@
             <div class="selection-actions-inner">
               <span id="selection-count" class="selection-count"></span>
               <button id="organize-selected" class="primary-button" type="button">Organize selected</button>
+              <button id="recover-selected" class="secondary-button" type="button">Analyze selected metadata</button>
               <button id="clear-selection" class="quiet-button" type="button">Clear selection</button>
             </div>
           </aside>

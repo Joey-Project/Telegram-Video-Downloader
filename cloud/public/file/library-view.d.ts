@@ -16,6 +16,7 @@ export type LibraryViewItem = {
   presence?: unknown;
   confidence?: unknown;
   metadata_status?: unknown;
+  organization_status?: unknown;
   collection?: unknown;
   moved_to?: unknown;
 };

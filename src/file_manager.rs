@@ -33,7 +33,7 @@ use crate::library::{
     HintOrigin, IntegrityStatus, LegacyCandidate, LegacyImportReport, LibraryAttachment,
     LibraryItem, LibrarySnapshot, MAX_LEGACY_HINTS, MetadataFieldChange, MetadataPatch,
     MetadataPatchPreview, MetadataStatus, MoveOutcome, MovePreview, MovePreviewItem,
-    MoveResultItem, PhysicalItemIdentity, Presence, SourceHint,
+    MoveResultItem, OrganizationStatus, PhysicalItemIdentity, Presence, SourceHint,
 };
 use crate::media_libraries::{TaskTransferControl, TaskTransferEntryKind, TaskTransferFile};
 use crate::safe_fs::{
@@ -845,6 +845,7 @@ struct QueueMetadataProvenance {
 struct BuiltLibraryItem {
     item: LibraryItem,
     sidecar_title_present: bool,
+    authoritative_nfo_unreadable: bool,
     fingerprint: Option<FileFingerprint>,
 }
 
@@ -3248,6 +3249,15 @@ impl LibraryManager {
                 );
             }
             validate_metadata_patch(patch)?;
+            if patch.fill_missing_only
+                && item.collection.as_ref().is_some_and(|stored| {
+                    patch.collection.as_ref().is_some_and(|requested| {
+                        !fill_only_collection_patch_preserves_existing(stored, requested)
+                    })
+                })
+            {
+                bail!("fill-only metadata patch cannot replace a stored collection");
+            }
             let source_media = self.absolute_path(&item.relative_path)?;
             let BoundFileRead {
                 token: media_identity,
@@ -3347,9 +3357,21 @@ impl LibraryManager {
                 Some(original) => {
                     let source = std::str::from_utf8(original)
                         .context("selected NFO is not UTF-8; no metadata patch was prepared")?;
+                    if patch.organization_status == Some(OrganizationStatus::Standalone)
+                        && (item.collection.is_some() || nfo_has_collection_metadata(source))
+                    {
+                        bail!("a media item with collection metadata cannot be marked standalone");
+                    }
                     append_metadata_patch(source, patch)?.into_bytes()
                 }
-                None => new_nfo(patch.title.as_deref().unwrap_or(&item.title), patch).into_bytes(),
+                None => {
+                    if patch.organization_status == Some(OrganizationStatus::Standalone)
+                        && item.collection.is_some()
+                    {
+                        bail!("a media item with collection metadata cannot be marked standalone");
+                    }
+                    new_nfo(patch.title.as_deref().unwrap_or(&item.title), patch).into_bytes()
+                }
             };
             let after_sha256 = sha256_bytes(&new_contents);
             let after_text =
@@ -4980,6 +5002,7 @@ impl LibraryManager {
 
         let mut videos = Vec::new();
         let mut sidecar_title_paths = HashSet::new();
+        let mut unreadable_nfo_paths = HashSet::new();
         let mut unreadable_media = HashMap::new();
         let mut fingerprints = BTreeMap::new();
         let mut incomplete_attachment_media = 0usize;
@@ -5044,6 +5067,9 @@ impl LibraryManager {
                     }
                     if built.sidecar_title_present {
                         sidecar_title_paths.insert(built.item.relative_path.clone());
+                    }
+                    if built.authoritative_nfo_unreadable {
+                        unreadable_nfo_paths.insert(built.item.relative_path.clone());
                     }
                     if let Some(fingerprint) = &built.fingerprint {
                         fingerprints.insert(built.item.relative_path.clone(), fingerprint.clone());
@@ -5337,6 +5363,11 @@ impl LibraryManager {
             if let Some((_, record)) = prior {
                 // Queue metadata follows a physical item only after the index's object identity
                 // signals match. The current path alone never carries an old association.
+                if item.organization_status.is_none()
+                    && unreadable_nfo_paths.contains(&item.relative_path)
+                {
+                    item.organization_status = record.item.organization_status;
+                }
                 merge_queue_metadata(&mut item_queue_metadata, &record.queue_metadata);
                 preserve_queue_metadata(
                     item,
@@ -5802,6 +5833,7 @@ impl LibraryManager {
                         codec: None,
                         source_ids: Vec::new(),
                         collection: None,
+                        organization_status: None,
                         attachments: Vec::new(),
                         authoritative_nfo_path: None,
                         confidence: Confidence::Low,
@@ -5811,6 +5843,7 @@ impl LibraryManager {
                         presence: Presence::Unavailable,
                     },
                     sidecar_title_present: false,
+                    authoritative_nfo_unreadable: false,
                     fingerprint: None,
                 }));
             }
@@ -5836,6 +5869,8 @@ impl LibraryManager {
         let mut title = title_from_name;
         let mut source_ids = ids_from_path(&media.relative_path);
         let mut collection = None;
+        let mut organization_status = None;
+        let mut nfo_collection_metadata_present = false;
         let authoritative_nfo_path = sidecars
             .authoritative_nfo(&media.relative_path)
             .map(str::to_owned);
@@ -5848,6 +5883,7 @@ impl LibraryManager {
             MetadataStatus::Unknown
         };
         let mut sidecar_unreadable = false;
+        let mut authoritative_nfo_unreadable = false;
         let attachments = sidecars.attached_files(media);
         for attachment in &attachments {
             if scan.started_at.elapsed() >= SCAN_TIMEOUT {
@@ -5865,6 +5901,9 @@ impl LibraryManager {
                                 let nfo_title = xml_tag_text(&text, "title")
                                     .filter(|value| !value.trim().is_empty());
                                 let nfo_ids = nfo_source_ids(&text);
+                                organization_status = nfo_organization_status(&text);
+                                nfo_collection_metadata_present |=
+                                    nfo_has_collection_metadata(&text);
                                 if let Some(value) = &nfo_title {
                                     title = value.trim().to_string();
                                 }
@@ -5891,18 +5930,21 @@ impl LibraryManager {
                             }
                             Err(_) => {
                                 sidecar_unreadable = true;
+                                authoritative_nfo_unreadable = true;
                                 scan.warnings
                                     .push(format!("NFO is not UTF-8: {attachment}"));
                             }
                         },
                         Ok(None) => {
                             sidecar_unreadable = true;
+                            authoritative_nfo_unreadable = true;
                             scan.warnings.push(format!(
                                 "authoritative NFO disappeared during scan: {attachment}"
                             ));
                         }
                         Err(error) => {
                             sidecar_unreadable = true;
+                            authoritative_nfo_unreadable = true;
                             if is_file_provider_access_error(&error) {
                                 scan.migration_incomplete_paths
                                     .insert(attachment.to_string());
@@ -5966,6 +6008,15 @@ impl LibraryManager {
             return Ok(None);
         }
         source_ids = normalize_source_ids(source_ids);
+        if organization_status == Some(OrganizationStatus::Standalone)
+            && (collection.is_some() || nfo_collection_metadata_present)
+        {
+            organization_status = None;
+            scan.warnings.push(format!(
+                "standalone marker ignored because the NFO also declares a collection: {media_relative_path}",
+                media_relative_path = media.relative_path
+            ));
+        }
         let confidence = if !source_ids.is_empty() && metadata_status == MetadataStatus::Partial {
             Confidence::High
         } else if !source_ids.is_empty() {
@@ -6020,6 +6071,7 @@ impl LibraryManager {
                 codec: media_specs.codec,
                 source_ids,
                 collection,
+                organization_status,
                 attachments: library_attachments,
                 authoritative_nfo_path,
                 confidence,
@@ -6029,6 +6081,7 @@ impl LibraryManager {
                 presence,
             },
             sidecar_title_present,
+            authoritative_nfo_unreadable,
             fingerprint,
         }))
     }
@@ -7605,7 +7658,9 @@ fn preserve_queue_metadata(
         .extend(provenance.source_ids.iter().cloned());
     item.source_ids = normalize_source_ids(std::mem::take(&mut item.source_ids));
 
-    if let Some(collection) = provenance.collection.as_ref() {
+    if item.organization_status != Some(OrganizationStatus::Standalone)
+        && let Some(collection) = provenance.collection.as_ref()
+    {
         if let Some(current) = item.collection.as_mut() {
             merge_collection_metadata(Some(current), collection);
         } else {
@@ -8572,6 +8627,142 @@ fn nfo_source_ids(content: &str) -> Vec<String> {
     deduplicate(ids)
 }
 
+fn nfo_organization_status(content: &str) -> Option<OrganizationStatus> {
+    let element = xml_element_span(content, "tvd_organization", 0)?;
+    if xml_element_span(content, "tvd_organization", element.close_end).is_some() {
+        return None;
+    }
+    match xml_text_content(&content[element.open_end..element.close_start])
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "standalone" => Some(OrganizationStatus::Standalone),
+        "unreviewed" => Some(OrganizationStatus::Unreviewed),
+        _ => None,
+    }
+}
+
+fn nfo_has_collection_metadata(content: &str) -> bool {
+    ["set", "setid", "settype", "episode", "partid"]
+        .iter()
+        .any(|tag| xml_tag_text(content, tag).is_some_and(|value| !value.trim().is_empty()))
+}
+
+fn metadata_subfield_is_missing(content: &str, tag: &str, fill_missing_only: bool) -> bool {
+    !fill_missing_only || xml_tag_text(content, tag).is_none_or(|value| value.trim().is_empty())
+}
+
+fn fill_only_collection_patch_preserves_existing(
+    current: &CollectionMetadata,
+    requested: &CollectionMetadata,
+) -> bool {
+    if !collection_identity_matches(current, requested) {
+        return false;
+    }
+    let string_preserved = |current: Option<&str>, requested: Option<&str>| {
+        current
+            .is_none_or(|value| requested.is_some_and(|candidate| value.trim() == candidate.trim()))
+    };
+    string_preserved(
+        current
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()),
+        requested
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()),
+    ) && (current.title.trim().is_empty() || current.title.trim() == requested.title.trim())
+        && ((current.kind.trim().is_empty() || current.kind.eq_ignore_ascii_case("nfo_set"))
+            || current.kind.eq_ignore_ascii_case(&requested.kind))
+        && current
+            .order
+            .is_none_or(|order| requested.order == Some(order))
+        && string_preserved(
+            current
+                .part_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
+            requested
+                .part_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
+        )
+}
+
+fn collection_identity_matches(
+    current: &CollectionMetadata,
+    requested: &CollectionMetadata,
+) -> bool {
+    let current_id = current
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let requested_id = requested
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    if let (Some(current_id), Some(requested_id)) = (current_id, requested_id) {
+        return current_id.trim() == requested_id.trim();
+    }
+    canonical_collection_title(&current.title) == canonical_collection_title(&requested.title)
+        && collection_kind_compatible(&current.kind, &requested.kind)
+}
+
+fn canonical_collection_title(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn collection_kind_compatible(current: &str, requested: &str) -> bool {
+    fn specific(kind: &str) -> Option<&str> {
+        let kind = kind.trim();
+        (!kind.is_empty() && !kind.eq_ignore_ascii_case("nfo_set")).then_some(kind)
+    }
+    match (specific(current), specific(requested)) {
+        (Some(current), Some(requested)) => current.eq_ignore_ascii_case(requested),
+        _ => true,
+    }
+}
+
+fn nfo_collection_matches_patch(content: &str, collection: &CollectionMetadata) -> bool {
+    let existing_id = xml_tag_text(content, "setid").filter(|value| !value.trim().is_empty());
+    let requested_id = collection
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    if let (Some(existing_id), Some(requested_id)) = (existing_id.as_deref(), requested_id) {
+        if existing_id.trim() == requested_id.trim() {
+            return true;
+        }
+        return false;
+    }
+
+    let existing_title = nfo_collection_title(content).filter(|value| !value.trim().is_empty());
+    let requested_title =
+        (!collection.title.trim().is_empty()).then_some(collection.title.as_str());
+    let titles_match = matches!(
+        (existing_title.as_deref(), requested_title),
+        (Some(existing), Some(requested)) if existing.trim() == requested.trim()
+    );
+    if !titles_match {
+        return false;
+    }
+
+    let existing_kind = xml_tag_text(content, "settype").filter(|value| !value.trim().is_empty());
+    let requested_kind = (!collection.kind.trim().is_empty()
+        && !collection.kind.eq_ignore_ascii_case("nfo_set"))
+    .then_some(collection.kind.as_str());
+    match (existing_kind.as_deref(), requested_kind) {
+        (Some(existing), Some(requested)) => existing.eq_ignore_ascii_case(requested),
+        _ => true,
+    }
+}
+
 fn xml_tag_text(content: &str, name: &str) -> Option<String> {
     let element = xml_element_span(content, name, 0)?;
     Some(
@@ -9144,6 +9335,7 @@ fn metadata_field_changes(before: Option<&str>, after: &str) -> Vec<MetadataFiel
         ("collection_kind", "settype"),
         ("order", "episode"),
         ("part_id", "partid"),
+        ("organization_status", "tvd_organization"),
     ]
     .into_iter()
     .filter_map(|(field, tag)| {
@@ -9173,7 +9365,14 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
         .as_deref()
         .filter(|title| !title.trim().is_empty())
     {
-        if xml_tag_text(&output, "title").is_some() {
+        let existing_title = xml_tag_text(&output, "title");
+        if patch.fill_missing_only
+            && existing_title
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            // Keep a saved NFO title, including a user-edited title, byte-for-byte intact.
+        } else if existing_title.is_some() {
             output = replace_xml_element(&output, "title", title.trim())?;
         } else {
             nodes.push(format!("  <title>{}</title>", xml_escape(title.trim())));
@@ -9191,10 +9390,19 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
             ));
         }
     }
-    if let Some(collection) = &patch.collection {
-        if !collection.title.trim().is_empty() {
+    if let Some(collection) = patch.collection.as_ref()
+        && (!patch.fill_missing_only
+            || !nfo_has_collection_metadata(&output)
+            || nfo_collection_matches_patch(&output, collection))
+    {
+        if !collection.title.trim().is_empty()
+            && (!patch.fill_missing_only
+                || nfo_collection_title(&output).is_none_or(|value| value.trim().is_empty()))
+        {
             if xml_element_span(&output, "set", 0).is_some() {
-                output = replace_nfo_collection_title(&output, collection.title.trim())?;
+                if !patch.fill_missing_only || can_fill_nfo_collection_title(&output)? {
+                    output = replace_nfo_collection_title(&output, collection.title.trim())?;
+                }
             } else {
                 nodes.push(format!(
                     "  <set>{}</set>",
@@ -9202,7 +9410,9 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
                 ));
             }
         }
-        if let Some(order) = collection.order {
+        if let Some(order) = collection.order
+            && metadata_subfield_is_missing(&output, "episode", patch.fill_missing_only)
+        {
             if xml_tag_text(&output, "episode").is_some() {
                 output = replace_xml_element(&output, "episode", &order.to_string())?;
             } else {
@@ -9213,7 +9423,9 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
             ("setid", collection.id.as_deref()),
             ("settype", Some(collection.kind.as_str())),
         ] {
-            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty())
+                && metadata_subfield_is_missing(&output, tag, patch.fill_missing_only)
+            {
                 if xml_tag_text(&output, tag).is_some() {
                     output = replace_xml_element(&output, tag, value.trim())?;
                 } else {
@@ -9225,12 +9437,31 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
             .part_id
             .as_deref()
             .filter(|value| !value.trim().is_empty())
+            && metadata_subfield_is_missing(&output, "partid", patch.fill_missing_only)
         {
             if xml_tag_text(&output, "partid").is_some() {
                 output = replace_xml_element(&output, "partid", part_id.trim())?;
             } else {
                 nodes.push(format!("  <partid>{}</partid>", xml_escape(part_id.trim())));
             }
+        }
+    }
+    if let Some(status) = patch.organization_status {
+        let existing = xml_element_span(&output, "tvd_organization", 0);
+        if let Some(element) = existing {
+            if xml_element_span(&output, "tvd_organization", element.close_end).is_some() {
+                bail!("NFO has multiple organization status fields; refusing an ambiguous patch");
+            }
+            let existing_text = xml_text_content(&output[element.open_end..element.close_start]);
+            if !patch.fill_missing_only || existing_text.trim().is_empty() {
+                let value = organization_status_nfo_value(status);
+                output = replace_xml_element(&output, "tvd_organization", value)?;
+            }
+        } else {
+            nodes.push(format!(
+                "  <tvd_organization>{}</tvd_organization>",
+                organization_status_nfo_value(status)
+            ));
         }
     }
     if nodes.is_empty() {
@@ -9277,6 +9508,24 @@ fn replace_nfo_collection_title(content: &str, value: &str) -> Result<String> {
     bail!("NFO collection has complex children but no unique <name>; refusing to discard them")
 }
 
+fn can_fill_nfo_collection_title(content: &str) -> Result<bool> {
+    let Some(set) = xml_element_span(content, "set", 0) else {
+        return Ok(true);
+    };
+    if set.self_closing {
+        return Ok(true);
+    }
+    let children = direct_xml_child_summary(content, set)?;
+    if children.duplicate_matching {
+        bail!("NFO collection has multiple direct <name> elements; refusing ambiguous patch");
+    }
+    if let Some(name) = children.matching {
+        return Ok(direct_xml_child_summary(content, name)?.count == 0
+            && !xml_has_inner_markup(content, name));
+    }
+    Ok(children.count == 0 && !xml_has_inner_markup(content, set))
+}
+
 fn replace_xml_element(content: &str, name: &str, value: &str) -> Result<String> {
     let element = xml_element_span(content, name, 0)
         .ok_or_else(|| anyhow!("NFO element disappeared or has no matching close"))?;
@@ -9312,9 +9561,14 @@ fn replace_xml_element_span(content: &str, element: XmlElementSpan, value: &str)
     Ok(output)
 }
 
-fn new_nfo(title: &str, patch: &MetadataPatch) -> String {
+fn new_nfo(fallback_title: &str, patch: &MetadataPatch) -> String {
     let mut content =
         String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<movie>\n");
+    let title = patch
+        .title
+        .as_deref()
+        .or_else(|| (!patch.fill_missing_only).then_some(fallback_title))
+        .unwrap_or_default();
     if !title.trim().is_empty() {
         content.push_str(&format!("  <title>{}</title>\n", xml_escape(title.trim())));
     }
@@ -9325,6 +9579,12 @@ fn new_nfo(title: &str, patch: &MetadataPatch) -> String {
                 xml_escape(&value)
             ));
         }
+    }
+    if let Some(status) = patch.organization_status {
+        content.push_str(&format!(
+            "  <tvd_organization>{}</tvd_organization>\n",
+            organization_status_nfo_value(status)
+        ));
     }
     if let Some(collection) = &patch.collection {
         if !collection.title.trim().is_empty() {
@@ -9432,6 +9692,13 @@ fn source_id_nfo_value(id: &str) -> Option<(&'static str, String)> {
     None
 }
 
+fn organization_status_nfo_value(status: OrganizationStatus) -> &'static str {
+    match status {
+        OrganizationStatus::Standalone => "standalone",
+        OrganizationStatus::Unreviewed => "unreviewed",
+    }
+}
+
 fn missing_patch_source_ids(existing: Vec<String>, requested: &[String]) -> Vec<String> {
     let existing = existing.into_iter().collect::<HashSet<_>>();
     normalize_source_ids(requested.to_vec())
@@ -9441,6 +9708,11 @@ fn missing_patch_source_ids(existing: Vec<String>, requested: &[String]) -> Vec<
 }
 
 fn validate_metadata_patch(patch: &MetadataPatch) -> Result<()> {
+    if patch.organization_status == Some(OrganizationStatus::Standalone)
+        && patch.collection.is_some()
+    {
+        bail!("a standalone organization patch cannot include collection metadata");
+    }
     if patch
         .title
         .as_deref()
@@ -9472,6 +9744,7 @@ fn validate_metadata_patch(patch: &MetadataPatch) -> Result<()> {
         .is_none_or(|title| title.trim().is_empty())
         && patch.source_ids.is_empty()
         && patch.collection.is_none()
+        && patch.organization_status.is_none()
     {
         bail!("metadata patch has no fields to apply");
     }
@@ -9969,7 +10242,9 @@ fn attach_matching_hints(
                 }
                 provenance.requires_confirmation |= hint.requires_confirmation;
             }
-            item.collection = item.collection.clone().or_else(|| hint.collection.clone());
+            if item.organization_status != Some(OrganizationStatus::Standalone) {
+                item.collection = item.collection.clone().or_else(|| hint.collection.clone());
+            }
             if hint.requires_confirmation {
                 item.confidence = Confidence::NeedsConfirmation;
             } else if item.confidence == Confidence::Low {
@@ -10951,6 +11226,7 @@ mod tests {
             codec: None,
             source_ids: Vec::new(),
             collection: None,
+            organization_status: None,
             attachments: Vec::new(),
             authoritative_nfo_path: None,
             confidence: Confidence::Low,
@@ -11348,6 +11624,8 @@ mod tests {
                 title: Some("Patched title".to_string()),
                 source_ids: vec!["cid456".to_string()],
                 collection: None,
+                fill_missing_only: false,
+                organization_status: None,
             },
         )
         .expect("metadata patch should target real XML elements");
@@ -11429,6 +11707,8 @@ mod tests {
                     order: None,
                     part_id: None,
                 }),
+                fill_missing_only: false,
+                organization_status: None,
             };
 
             let patched = append_metadata_patch(&original, &patch)
@@ -14254,6 +14534,8 @@ mod tests {
                 title: Some(accepted_title),
                 source_ids: Vec::new(),
                 collection: None,
+                fill_missing_only: false,
+                organization_status: None,
             };
             assert!(validate_metadata_patch(&patch).is_ok());
 
@@ -14263,6 +14545,8 @@ mod tests {
                 title: Some(rejected_title),
                 source_ids: Vec::new(),
                 collection: None,
+                fill_missing_only: false,
+                organization_status: None,
             };
             assert!(validate_metadata_patch(&patch).is_err());
 
@@ -14277,6 +14561,8 @@ mod tests {
                     order: None,
                     part_id: None,
                 }),
+                fill_missing_only: false,
+                organization_status: None,
             };
             assert!(validate_metadata_patch(&accepted_collection).is_ok());
 
@@ -14291,6 +14577,8 @@ mod tests {
                     order: None,
                     part_id: None,
                 }),
+                fill_missing_only: false,
+                organization_status: None,
             };
             assert!(validate_metadata_patch(&rejected_collection).is_err());
         }
@@ -14300,6 +14588,8 @@ mod tests {
             title: Some("Star\tWars".to_string()),
             source_ids: Vec::new(),
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         assert!(validate_metadata_patch(&control_character_title).is_err());
     }
@@ -14864,6 +15154,8 @@ mod tests {
                 order: Some(2),
                 part_id: Some("Part-A".to_string()),
             }),
+            fill_missing_only: false,
+            organization_status: None,
         };
         let preview = manager
             .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
@@ -14955,6 +15247,100 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn recovery_batch_enriches_missing_collection_fields_from_a_scanned_nfo() {
+        let root = TemporaryRoot::new("metadata-recovery-incomplete-collection");
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let bvid = "BV1abcdefgh1";
+        let original_nfo = format!(
+            "<movie><title>Episode</title><uniqueid type=\"bilibili\">{bvid}</uniqueid><uniqueid type=\"bilibili-cid\">20</uniqueid><set>My collection</set><setid>shared-set</setid></movie>"
+        );
+        let nfo_path = root.path().join("clip.nfo");
+        fs::write(&nfo_path, &original_nfo).expect("NFO fixture should write");
+        fs::set_permissions(&nfo_path, fs::Permissions::from_mode(0o600))
+            .expect("NFO fixture should become private");
+
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let local = item_at(&snapshot, "clip.mp4");
+        assert_eq!(local.metadata_status, MetadataStatus::Complete);
+        assert_eq!(local.collection.as_ref().unwrap().order, None);
+        assert_eq!(local.collection.as_ref().unwrap().part_id, None);
+
+        let report = crate::metadata_recovery::analyze_metadata_recovery(
+            &snapshot,
+            None,
+            None,
+            move |query| {
+                assert_eq!(query.source_id, bvid);
+                let entry = crate::metadata_recovery::ResolvedMetadataEntry {
+                    bvid: Some(bvid.to_string()),
+                    aid: None,
+                    cid: Some(20),
+                    epid: None,
+                    title: "Remote episode title".to_string(),
+                    collection: Some(CollectionMetadata {
+                        id: Some("shared-set".to_string()),
+                        title: "Remote collection title".to_string(),
+                        kind: "bilibili_collection".to_string(),
+                        order: Some(2),
+                        part_id: Some("20".to_string()),
+                    }),
+                };
+                async move { Ok(vec![entry]) }
+            },
+        )
+        .await
+        .expect("incomplete scanned collection should be analyzed");
+
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(
+            report.items[0].status,
+            crate::metadata_recovery::RecoveryStatus::Ready
+        );
+        let patch = report.items[0].patch.as_ref().unwrap();
+        let preview = manager
+            .preview_with_patches(
+                &[],
+                None,
+                false,
+                ConflictPolicy::Skip,
+                std::slice::from_ref(patch),
+            )
+            .expect("fill-only collection preview should include missing subfields");
+        assert!(preview.metadata_patches[0].changed);
+        assert!(
+            preview.metadata_patches[0]
+                .changes
+                .iter()
+                .any(|change| change.field == "order" && change.after == "2")
+        );
+        assert!(
+            preview.metadata_patches[0]
+                .changes
+                .iter()
+                .any(|change| change.field == "part_id" && change.after == "20")
+        );
+        assert_eq!(fs::read_to_string(&nfo_path).unwrap(), original_nfo);
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed recovery patch should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+        let rescanned = manager.scan(&[]).expect("patched NFO should rescan");
+        assert_eq!(
+            item_at(&rescanned, "clip.mp4").collection,
+            Some(CollectionMetadata {
+                id: Some("shared-set".to_string()),
+                title: "My collection".to_string(),
+                kind: "bilibili_collection".to_string(),
+                order: Some(2),
+                part_id: Some("20".to_string()),
+            })
+        );
+    }
+
     #[test]
     fn confirmed_collection_patch_preserves_kodi_set_children_and_rescans_name() {
         let root = TemporaryRoot::new("kodi-structured-set-patch");
@@ -14987,6 +15373,8 @@ mod tests {
                 order: None,
                 part_id: None,
             }),
+            fill_missing_only: false,
+            organization_status: None,
         };
 
         let preview = manager
@@ -15042,6 +15430,8 @@ mod tests {
                 order: None,
                 part_id: None,
             }),
+            fill_missing_only: false,
+            organization_status: None,
         };
         for original in [
             "<movie><set><name>First</name><name>Second</name></set></movie>",
@@ -15089,6 +15479,8 @@ mod tests {
             title: Some("Updated title".to_string()),
             source_ids: Vec::new(),
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         let preview = manager
             .preview_with_hints_and_patches(
@@ -15165,6 +15557,8 @@ mod tests {
             title: Some("Updated exact title".to_string()),
             source_ids: Vec::new(),
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         let preview = manager
             .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
@@ -15211,6 +15605,8 @@ mod tests {
             title: Some("Moved title".to_string()),
             source_ids: Vec::new(),
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         let preview = manager
             .preview_with_hints_and_patches(
@@ -15279,6 +15675,8 @@ mod tests {
             title: Some("Replacement title".to_string()),
             source_ids: Vec::new(),
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
 
         let mut no_target_device = |_target_path: &str| Ok(0_u64);
@@ -15311,6 +15709,8 @@ mod tests {
             title: Some("First title".to_string()),
             source_ids: Vec::new(),
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         let once = append_metadata_patch(original, &first_patch)
             .expect("first patch should expand the self-closing title");
@@ -15329,6 +15729,279 @@ mod tests {
         assert!(twice.contains("<title>Second title</title>"));
         assert!(twice.contains("<futureField key=\"x\">keep &amp; opaque</futureField>"));
         assert!(twice.contains("<actor>keep actor</actor>"));
+    }
+
+    #[test]
+    fn fill_only_metadata_patch_preserves_custom_fields_and_fills_only_missing_values() {
+        let existing = "<movie><title>My title</title><set>My collection</set><setid>custom-id</setid><futureField key=\"x\">keep &amp; opaque</futureField></movie>";
+        let patch = MetadataPatch {
+            item_id: "fixture-item".to_string(),
+            title: Some("Remote title".to_string()),
+            source_ids: vec!["BV1abcdefgh".to_string(), "cid12345".to_string()],
+            collection: Some(CollectionMetadata {
+                id: Some("remote-id".to_string()),
+                title: "Remote collection".to_string(),
+                kind: "bilibili_collection".to_string(),
+                order: Some(4),
+                part_id: Some("part-4".to_string()),
+            }),
+            fill_missing_only: true,
+            organization_status: None,
+        };
+
+        let patched = append_metadata_patch(existing, &patch)
+            .expect("fill-only metadata patch should preserve an existing NFO");
+
+        assert!(patched.contains("<title>My title</title>"));
+        assert!(patched.contains("<set>My collection</set>"));
+        assert!(patched.contains("<setid>custom-id</setid>"));
+        assert!(!patched.contains("Remote title"));
+        assert!(!patched.contains("Remote collection"));
+        assert!(!patched.contains("<episode>4</episode>"));
+        assert!(!patched.contains("<partid>part-4</partid>"));
+        assert!(patched.contains("<uniqueid type=\"bilibili\">BV1abcdefgh</uniqueid>"));
+        assert!(patched.contains("<uniqueid type=\"bilibili-cid\">cid12345</uniqueid>"));
+        assert!(patched.contains("<futureField key=\"x\">keep &amp; opaque</futureField>"));
+
+        let missing = "<movie><title/><set></set><futureField>untouched</futureField></movie>";
+        let filled = append_metadata_patch(missing, &patch)
+            .expect("fill-only patch should populate missing fields");
+        assert!(filled.contains("<title>Remote title</title>"));
+        assert!(filled.contains("<set>Remote collection</set>"));
+        assert_eq!(filled.matches("<set>").count(), 1);
+        assert!(filled.contains("<setid>remote-id</setid>"));
+        assert!(filled.contains("<episode>4</episode>"));
+        assert!(filled.contains("<partid>part-4</partid>"));
+        assert!(filled.contains("<futureField>untouched</futureField>"));
+
+        let no_collection = "<movie><title>Local title</title></movie>";
+        let inserted = append_metadata_patch(no_collection, &patch)
+            .expect("fill-only patch should append a missing collection");
+        assert_eq!(inserted.matches("<set>").count(), 1);
+    }
+
+    #[test]
+    fn fill_only_collection_patch_adds_missing_subfields_only_for_the_same_collection() {
+        let patch = MetadataPatch {
+            item_id: "fixture-item".to_string(),
+            title: None,
+            source_ids: Vec::new(),
+            collection: Some(CollectionMetadata {
+                id: Some("shared-id".to_string()),
+                title: "Remote title".to_string(),
+                kind: "bilibili_collection".to_string(),
+                order: Some(8),
+                part_id: Some("20".to_string()),
+            }),
+            fill_missing_only: true,
+            organization_status: None,
+        };
+        let existing = "<movie><set source=\"library\"><name lang=\"en\">My edited collection</name><overview>Keep this overview.</overview><future key=\"opaque\">Keep this node.</future></set><setid>shared-id</setid><episode>3</episode><futureField>keep</futureField></movie>";
+        let patched = append_metadata_patch(existing, &patch)
+            .expect("matching collection should receive missing metadata");
+        assert!(patched.contains("<name lang=\"en\">My edited collection</name>"));
+        assert!(patched.contains("<overview>Keep this overview.</overview>"));
+        assert!(patched.contains("<future key=\"opaque\">Keep this node.</future>"));
+        assert!(patched.contains("<setid>shared-id</setid>"));
+        assert!(patched.contains("<episode>3</episode>"));
+        assert!(patched.contains("<settype>bilibili_collection</settype>"));
+        assert!(patched.contains("<partid>20</partid>"));
+        assert!(patched.contains("<futureField>keep</futureField>"));
+        assert!(!patched.contains("<episode>8</episode>"));
+
+        let complex_without_name = "<movie><set><overview>Preserve this child.</overview></set><setid>shared-id</setid></movie>";
+        let filled_complex = append_metadata_patch(complex_without_name, &patch)
+            .expect("missing subfields should fill without discarding structured children");
+        assert!(filled_complex.contains("<set><overview>Preserve this child.</overview></set>"));
+        assert!(filled_complex.contains("<episode>8</episode>"));
+        assert!(filled_complex.contains("<partid>20</partid>"));
+
+        let unrelated = "<movie><set>My private collection</set><setid>private-id</setid></movie>";
+        let preserved = append_metadata_patch(unrelated, &patch)
+            .expect("a different collection should remain untouched");
+        assert_eq!(preserved, unrelated);
+    }
+
+    #[test]
+    fn fill_only_new_nfo_does_not_promote_the_filename_fallback_to_title() {
+        let patch = MetadataPatch {
+            item_id: "fixture-item".to_string(),
+            title: None,
+            source_ids: vec!["BV1abcdefgh1".to_string()],
+            collection: None,
+            fill_missing_only: true,
+            organization_status: Some(OrganizationStatus::Unreviewed),
+        };
+        let created = new_nfo("legacy filename", &patch);
+        assert!(!created.contains("<title>"));
+        assert!(created.contains("<uniqueid type=\"bilibili\">BV1abcdefgh1</uniqueid>"));
+        assert_eq!(nfo_source_ids(&created), vec!["BV1abcdefgh1"]);
+
+        let legacy_patch = MetadataPatch {
+            fill_missing_only: false,
+            organization_status: None,
+            ..patch
+        };
+        let legacy = new_nfo("legacy filename", &legacy_patch);
+        assert!(legacy.contains("<title>legacy filename</title>"));
+    }
+
+    #[test]
+    fn fill_only_preview_does_not_write_filename_title_for_source_id_only_patch() {
+        let root = TemporaryRoot::new("fill-only-no-filename-title");
+        fs::write(root.path().join("legacy.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let item = item_at(&snapshot, "legacy.mp4");
+        assert_eq!(item.title, "legacy");
+
+        let patch = MetadataPatch {
+            item_id: item.id.clone(),
+            title: None,
+            source_ids: vec!["BV1abcdefgh1".to_string()],
+            collection: None,
+            fill_missing_only: true,
+            organization_status: Some(OrganizationStatus::Unreviewed),
+        };
+        let preview = manager
+            .preview_with_patches(
+                &[],
+                None,
+                false,
+                ConflictPolicy::Skip,
+                std::slice::from_ref(&patch),
+            )
+            .expect("fill-only NFO preview should succeed");
+        assert!(preview.metadata_patches[0].changed);
+        assert!(
+            !preview.metadata_patches[0]
+                .changes
+                .iter()
+                .any(|change| change.field == "title")
+        );
+
+        manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed fill-only patch should write its explicit fields");
+        let created =
+            fs::read_to_string(root.path().join("legacy.nfo")).expect("new NFO should exist");
+        assert!(!created.contains("<title>"));
+        assert!(created.contains("<uniqueid type=\"bilibili\">BV1abcdefgh1</uniqueid>"));
+        assert!(created.contains("<tvd_organization>unreviewed</tvd_organization>"));
+    }
+
+    #[test]
+    fn organization_status_round_trips_and_duplicate_fields_are_ambiguous() {
+        let patch = MetadataPatch {
+            item_id: "fixture-item".to_string(),
+            title: None,
+            source_ids: Vec::new(),
+            collection: None,
+            fill_missing_only: false,
+            organization_status: Some(OrganizationStatus::Standalone),
+        };
+        let created = new_nfo("Local title", &patch);
+        assert_eq!(
+            nfo_organization_status(&created),
+            Some(OrganizationStatus::Standalone)
+        );
+
+        let existing = "<movie><title>Local title</title><tvd_organization>standalone</tvd_organization><futureField>keep</futureField></movie>";
+        let unreviewed = append_metadata_patch(
+            existing,
+            &MetadataPatch {
+                organization_status: Some(OrganizationStatus::Unreviewed),
+                ..patch.clone()
+            },
+        )
+        .expect("explicit unreview action should replace the portable marker");
+        assert_eq!(
+            nfo_organization_status(&unreviewed),
+            Some(OrganizationStatus::Unreviewed)
+        );
+        assert!(unreviewed.contains("<futureField>keep</futureField>"));
+
+        let duplicate = "<movie><tvd_organization>standalone</tvd_organization><tvd_organization>unreviewed</tvd_organization></movie>";
+        assert_eq!(nfo_organization_status(duplicate), None);
+        assert!(append_metadata_patch(duplicate, &patch).is_err());
+    }
+
+    #[test]
+    fn standalone_nfo_status_is_not_overridden_by_later_queue_collection_hints() {
+        let root = TemporaryRoot::new("standalone-preserves-queue-hint");
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        fs::write(
+            root.path().join("clip.nfo"),
+            "<movie><title>Clip title</title><tvd_organization>standalone</tvd_organization></movie>",
+        )
+        .expect("standalone NFO should write");
+        let manager = manager(&root);
+        let collection = CollectionMetadata {
+            id: Some("queue-collection".to_string()),
+            title: "Queue collection".to_string(),
+            kind: "bilibili_collection".to_string(),
+            order: Some(2),
+            part_id: None,
+        };
+        let hint = SourceHint {
+            source_ids: vec!["BV1abcdefgh".to_string()],
+            title: Some("Queue title".to_string()),
+            relative_path: Some("clip.mp4".to_string()),
+            collection: Some(collection),
+            origin: HintOrigin::Queue,
+            requires_confirmation: false,
+        };
+
+        let first = manager
+            .scan(std::slice::from_ref(&hint))
+            .expect("queue metadata should scan");
+        let first_item = item_at(&first, "clip.mp4");
+        assert_eq!(
+            first_item.organization_status,
+            Some(OrganizationStatus::Standalone)
+        );
+        assert_eq!(first_item.collection, None);
+        assert_eq!(first_item.title, "Clip title");
+
+        let rescanned = manager
+            .scan(&[])
+            .expect("persisted queue metadata should remain suppressed by standalone intent");
+        let rescanned_item = item_at(&rescanned, "clip.mp4");
+        assert_eq!(
+            rescanned_item.organization_status,
+            Some(OrganizationStatus::Standalone)
+        );
+        assert_eq!(rescanned_item.collection, None);
+    }
+
+    #[test]
+    fn standalone_declaration_is_rejected_when_nfo_contains_collection_metadata() {
+        let root = TemporaryRoot::new("standalone-rejects-collection");
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        fs::write(
+            root.path().join("clip.nfo"),
+            "<movie><title>Clip title</title><set>Custom collection</set></movie>",
+        )
+        .expect("collection NFO should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let patch = MetadataPatch {
+            item_id: item_at(&snapshot, "clip.mp4").id.clone(),
+            title: None,
+            source_ids: Vec::new(),
+            collection: None,
+            fill_missing_only: false,
+            organization_status: Some(OrganizationStatus::Standalone),
+        };
+
+        let error = manager
+            .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
+            .expect_err("an item with a stored collection cannot be marked standalone");
+        assert!(error.to_string().contains("cannot be marked standalone"));
+        assert_eq!(persisted_preview_count(&manager), 0);
     }
 
     #[test]
@@ -15390,6 +16063,8 @@ mod tests {
             title: Some("Created title".to_string()),
             source_ids: vec!["youtube:abcdefghijk".to_string()],
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         let preview = manager
             .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
@@ -15495,6 +16170,8 @@ mod tests {
             title: Some("After".to_string()),
             source_ids: vec!["youtube:abcdefghijk".to_string()],
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         let preview = manager
             .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
@@ -15689,6 +16366,8 @@ mod tests {
             title: Some(title.to_string()),
             source_ids: Vec::new(),
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
 
         assert!(
@@ -15777,6 +16456,8 @@ mod tests {
                 title: Some("Alias title".to_string()),
                 source_ids: Vec::new(),
                 collection: None,
+                fill_missing_only: false,
+                organization_status: None,
             };
             let result =
                 manager.preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch]);
@@ -15810,6 +16491,8 @@ mod tests {
             title: Some(title.to_string()),
             source_ids: Vec::new(),
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
 
         let distinct = manager
@@ -15861,6 +16544,8 @@ mod tests {
             title: Some("Second updated".to_string()),
             source_ids: Vec::new(),
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         assert!(
             manager
@@ -15907,6 +16592,8 @@ mod tests {
             title: hint.title.clone(),
             source_ids: hint.source_ids.clone(),
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         let preview = manager
             .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
@@ -15938,6 +16625,8 @@ mod tests {
             title: Some("Confirmed".to_string()),
             source_ids: vec!["BV1abcdefgh".to_string()],
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         let preview = manager
             .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[patch])
@@ -15984,6 +16673,8 @@ mod tests {
             title: Some("Must not attach to replacement".to_string()),
             source_ids: vec!["BV1abcdefgh".to_string()],
             collection: None,
+            fill_missing_only: false,
+            organization_status: None,
         };
         let replacement_preview = replaced_manager
             .preview_with_patches(&[], None, false, ConflictPolicy::Skip, &[replacement_patch])
@@ -17782,6 +18473,7 @@ mod tests {
                 order: None,
                 part_id: Some("P03".to_string()),
             }),
+            organization_status: None,
             attachments: Vec::new(),
             authoritative_nfo_path: None,
             confidence: Confidence::High,

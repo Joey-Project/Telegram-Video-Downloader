@@ -241,9 +241,13 @@ export function mediaSnapshotOmissionNotice(descriptor, snapshot) {
 
 function operationLibraryBinding(operation) {
   const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
+  const recoveryIdentity = operation?.recovery_identity && typeof operation.recovery_identity === "object"
+    ? operation.recovery_identity
+    : {};
   const nested = result.operation && typeof result.operation === "object" ? result.operation : {};
   const preview = result.preview && typeof result.preview === "object" ? result.preview : {};
   const candidates = [
+    [recoveryIdentity, "library_id"],
     [result, "library_id"], [result, "source_library_id"],
     [nested, "library_id"], [nested, "source_library_id"],
     [preview, "library_id"], [preview, "source_library_id"],
@@ -363,7 +367,8 @@ export function needsOrganizing(item) {
   const confidence = String(item?.confidence ?? "low").toLowerCase();
   const metadata = String(item?.metadata_status ?? "unknown").toLowerCase();
   const hasCollection = Boolean(item?.collection && (typeof item.collection === "string" ? item.collection.trim() : item.collection.title));
-  return confidence !== "high" || metadata !== "complete" || !hasCollection || ["missing", "unavailable"].includes(statusOf(item));
+  const standalone = String(item?.organization_status ?? "").toLowerCase() === "standalone";
+  return confidence !== "high" || metadata !== "complete" || !hasCollection && !standalone || ["missing", "unavailable"].includes(statusOf(item));
 }
 
 export function filterLibraryItems(items, { query = "", category = "", status = "" } = {}) {

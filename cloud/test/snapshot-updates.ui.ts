@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { webcrypto } from "node:crypto";
 import { resolve } from "node:path";
+import { setImmediate as waitForEventLoopTurn } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSnapshotUpdates } from "../public/file/snapshot-updates.js";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
@@ -540,6 +541,9 @@ describe("snapshot updates browser flows", () => {
     socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
     await vi.advanceTimersByTimeAsync(0);
     await vi.waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    // The mock callback is called before createSnapshotUpdates finishes its async refresh cleanup.
+    // Let that promise chain settle before the invalidation under test arrives.
+    await waitForEventLoopTurn();
 
     const staleResume = handlers.get("activated");
     expect(staleResume).toBeDefined();

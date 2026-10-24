@@ -20,7 +20,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use bbdown_core::{
     DownloadFileKind, DownloadMode, DownloadProgressEvent, DownloadProgressSink, DownloadReport,
     IndexSelection, IndexSelector, Input, MediaStream, ResolvedContent, Selection,
-    VideoCollectionKind, VideoCollectionMetadata, VideoCollectionResolution,
+    UgcCollectionKind, UgcCollectionReference, VideoCollectionKind, VideoCollectionMetadata,
+    VideoCollectionResolution,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -49,7 +50,9 @@ use crate::queue::{
     PlanValidationSnapshot, sanitize_job_for_storage,
 };
 use crate::redaction::redact_sensitive_text;
-use crate::router::{BilibiliSelection, JobRequest, is_bilibili_ugc_collection_url};
+use crate::router::{
+    BilibiliSelection, JobRequest, bilibili_bvid_from_url, is_bilibili_ugc_collection_url,
+};
 use crate::safe_fs::{
     BoundDirectory, BoundEntry, BoundFile, EntryIdentity, RootedFs, identity_for_open_file,
 };
@@ -6042,6 +6045,343 @@ pub async fn inspect_job_display_metadata(
     )
     .await?;
     Ok(Some(bilibili_metadata_display_snapshot(&metadata.plan)))
+}
+
+/// Resolve source metadata without stream planning, media requests, or output-directory work.
+pub(crate) async fn resolve_bilibili_metadata_recovery_source(
+    config: &AppConfig,
+    source_id: &str,
+) -> Result<Vec<crate::metadata_recovery::ResolvedMetadataEntry>> {
+    let url = bilibili_metadata_recovery_source_url(source_id)?;
+    tokio_timeout(BILIBILI_METADATA_PROBE_TIMEOUT, async {
+        let _permit = bilibili_missing_validation_semaphore()
+            .acquire_owned()
+            .await
+            .context("metadata recovery admission is unavailable")?;
+        sync_bilibili_rust_credentials(config).await?;
+        let client = bilibili_core::client(config)?;
+        let resolved = probe_bilibili_resolved_content(
+            &client,
+            &url,
+            Some(BilibiliSelection::All),
+            BILIBILI_METADATA_PROBE_TIMEOUT,
+        )
+        .await?;
+        let parsed_bvid = bilibili_bvid_from_url(&url);
+        let membership_client = &client;
+        let collection_client = &client;
+        let ugc_collections = match &resolved {
+            ResolvedContent::Video(video) => {
+                resolve_bilibili_metadata_recovery_ugc_collections(
+                    video,
+                    parsed_bvid.as_deref(),
+                    |bvid| async move {
+                        Ok(membership_client
+                            .resolve_video_collection_membership(&bvid)
+                            .await?)
+                    },
+                    |reference| async move {
+                        Ok(collection_client
+                            .resolve_video_collection(&reference, None)
+                            .await?)
+                    },
+                )
+                .await?
+            }
+            _ => None,
+        };
+        bilibili_metadata_recovery_entries_with_ugc_collections(
+            resolved,
+            ugc_collections.as_deref(),
+        )
+    })
+    .await
+    .context("Bilibili metadata recovery timed out")?
+}
+
+fn bilibili_metadata_recovery_source_url(source_id: &str) -> Result<String> {
+    if source_id.len() == 12
+        && source_id.starts_with("BV")
+        && source_id.bytes().all(|value| value.is_ascii_alphanumeric())
+    {
+        return Ok(format!("https://www.bilibili.com/video/{source_id}"));
+    }
+    for (prefix, path) in [("av", "video/av"), ("ep", "bangumi/play/ep")] {
+        if let Some(number) = source_id.strip_prefix(prefix)
+            && !number.is_empty()
+            && number.bytes().all(|value| value.is_ascii_digit())
+            && let Ok(number) = number.parse::<u64>()
+            && number > 0
+        {
+            return Ok(format!("https://www.bilibili.com/{path}{number}"));
+        }
+    }
+    bail!("metadata recovery needs a valid Bilibili BV, av, or ep identifier")
+}
+
+async fn resolve_bilibili_metadata_recovery_ugc_collections<M, MFut, C, CFut>(
+    video: &bbdown_core::VideoMetadata,
+    fallback_bvid: Option<&str>,
+    membership_lookup: M,
+    collection_lookup: C,
+) -> Result<Option<Vec<crate::library::CollectionMetadata>>>
+where
+    M: FnOnce(String) -> MFut + Send,
+    MFut: Future<Output = Result<Option<UgcCollectionReference>>> + Send,
+    C: FnOnce(UgcCollectionReference) -> CFut + Send,
+    CFut: Future<Output = Result<VideoCollectionResolution>> + Send,
+{
+    use crate::library::CollectionMetadata;
+
+    if video.pages.is_empty()
+        || video.pages.len() > crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES
+    {
+        bail!("metadata source exceeds the recovery entry limit");
+    }
+    let bvid = match (video.bvid.as_deref(), fallback_bvid) {
+        (Some(metadata_bvid), Some(input_bvid)) if metadata_bvid != input_bvid => {
+            bail!("resolved video BV identity disagrees with the requested source")
+        }
+        (Some(metadata_bvid), _) => metadata_bvid,
+        (None, Some(input_bvid)) => input_bvid,
+        (None, None) => {
+            bail!("resolved video has no BV identity for collection membership")
+        }
+    };
+    if bvid.len() != 12
+        || !bvid.starts_with("BV")
+        || !bvid.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        bail!("resolved video has no valid BV identity for collection membership");
+    }
+    if video.aid == 0
+        || video
+            .pages
+            .iter()
+            .any(|page| page.aid != video.aid || page.cid == 0)
+    {
+        bail!("resolved video pages do not have exact AID/CID identities");
+    }
+
+    let Some(reference) = membership_lookup(bvid.to_string()).await? else {
+        return Ok(None);
+    };
+    if reference.id == 0
+        || reference.owner_mid == 0
+        || reference.item_count == 0
+        || reference.item_count > crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES
+    {
+        bail!("UGC collection membership exceeds the recovery bounds");
+    }
+
+    let collection = collection_lookup(reference.clone()).await?;
+    let (id_prefix, expected_kind) = match reference.kind {
+        UgcCollectionKind::Collection => ("collection", VideoCollectionKind::Collection),
+        UgcCollectionKind::Series => ("series", VideoCollectionKind::Series),
+    };
+    let items = &collection.collection.items;
+    if collection.collection.id != Some(reference.id)
+        || collection.collection.kind != expected_kind
+        || collection.collection.owner.as_ref().map(|owner| owner.mid) != Some(reference.owner_mid)
+        || collection.collection.title.trim().is_empty()
+        || items.is_empty()
+        || items.len() > crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES
+        || collection.selected_items.as_slice() != items.as_slice()
+        || items
+            .iter()
+            .enumerate()
+            .any(|(position, item)| item.index != position as u32 + 1)
+    {
+        bail!("resolved UGC collection did not provide a complete bounded order");
+    }
+
+    let mut mapped = Vec::with_capacity(video.pages.len());
+    for page in &video.pages {
+        let mut matches = items.iter().filter(|item| {
+            item.bvid.as_deref() == Some(bvid) && item.aid == page.aid && item.cid == page.cid
+        });
+        let Some(item) = matches.next() else {
+            bail!("UGC collection did not contain the exact video page identity");
+        };
+        if matches.next().is_some() {
+            bail!("UGC collection contained duplicate video page identities");
+        }
+        mapped.push(CollectionMetadata {
+            id: Some(format!("bilibili:{id_prefix}:{}", reference.id)),
+            title: collection.collection.title.clone(),
+            kind: "bilibili_collection".to_string(),
+            order: Some(item.index),
+            part_id: Some(page.cid.to_string()),
+        });
+    }
+    Ok(Some(mapped))
+}
+
+fn bilibili_metadata_recovery_entries(
+    resolved: ResolvedContent,
+) -> Result<Vec<crate::metadata_recovery::ResolvedMetadataEntry>> {
+    bilibili_metadata_recovery_entries_with_ugc_collections(resolved, None)
+}
+
+fn bilibili_metadata_recovery_entries_with_ugc_collections(
+    resolved: ResolvedContent,
+    ugc_collections: Option<&[crate::library::CollectionMetadata]>,
+) -> Result<Vec<crate::metadata_recovery::ResolvedMetadataEntry>> {
+    use crate::library::CollectionMetadata;
+    use crate::metadata_recovery::ResolvedMetadataEntry;
+
+    let count = match &resolved {
+        ResolvedContent::Video(video) => video.pages.len(),
+        ResolvedContent::Season(season) => season.selected_episodes.len(),
+        ResolvedContent::Collection(collection) => collection.selected_items.len(),
+    };
+    if count > crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES {
+        bail!("metadata source exceeds the recovery entry limit");
+    }
+    let entries = match resolved {
+        ResolvedContent::Video(video) => {
+            let multi_part = video.pages.len() > 1;
+            if ugc_collections.is_some_and(|collections| collections.len() != video.pages.len()) {
+                bail!("UGC collection metadata did not match the resolved page count");
+            }
+            let title = video.title.clone();
+            let bvid = video.bvid.clone();
+            let aid = video.aid;
+            video
+                .pages
+                .into_iter()
+                .enumerate()
+                .map(|(page_index, page)| {
+                    let collection = ugc_collections
+                        .and_then(|collections| collections.get(page_index).cloned())
+                        .or_else(|| {
+                            multi_part.then(|| CollectionMetadata {
+                                id: bvid
+                                    .clone()
+                                    .or_else(|| (aid > 0).then(|| format!("av{aid}"))),
+                                title: title.clone(),
+                                kind: "multi_part".to_string(),
+                                order: Some(page.index),
+                                part_id: (page.cid > 0).then(|| page.cid.to_string()),
+                            })
+                        });
+                    ResolvedMetadataEntry {
+                        bvid: bvid.clone(),
+                        aid: (page.aid > 0).then_some(page.aid),
+                        cid: (page.cid > 0).then_some(page.cid),
+                        epid: page.epid.filter(|id| *id > 0),
+                        title: if multi_part && !page.title.trim().is_empty() {
+                            page.title
+                        } else {
+                            title.clone()
+                        },
+                        collection,
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+        ResolvedContent::Season(resolution) => {
+            let mut orders = BTreeMap::new();
+            for episode in &resolution.season.episodes {
+                if episode.epid > 0
+                    && episode.index > 0
+                    && orders.insert(episode.epid, episode.index).is_some()
+                {
+                    bail!("season metadata contains duplicate episode identities");
+                }
+            }
+            resolution
+                .selected_episodes
+                .into_iter()
+                .map(|episode| {
+                    let collection = resolution
+                        .season
+                        .season_id
+                        .filter(|id| *id > 0)
+                        .zip(orders.get(&episode.epid).copied())
+                        .map(|(season_id, order)| CollectionMetadata {
+                            id: Some(format!("ss{season_id}")),
+                            title: resolution.season.title.clone(),
+                            kind: "bilibili_season".to_string(),
+                            order: Some(order),
+                            part_id: Some(episode.epid.to_string()),
+                        });
+                    let title = episode
+                        .long_title
+                        .as_deref()
+                        .filter(|title| !title.trim().is_empty())
+                        .map(|long_title| {
+                            format!("{} {long_title}", episode.title).trim().to_string()
+                        })
+                        .unwrap_or(episode.title);
+                    ResolvedMetadataEntry {
+                        bvid: episode.bvid,
+                        aid: (episode.aid > 0).then_some(episode.aid),
+                        cid: (episode.cid > 0).then_some(episode.cid),
+                        epid: (episode.epid > 0).then_some(episode.epid),
+                        title,
+                        collection,
+                    }
+                })
+                .collect::<Vec<_>>()
+        }
+        ResolvedContent::Collection(resolution) => {
+            let kind = if resolution.collection.kind == VideoCollectionKind::Collection {
+                "collection"
+            } else if resolution.collection.kind == VideoCollectionKind::Series {
+                "series"
+            } else {
+                bail!("source is not a persistent Bilibili collection or series");
+            };
+            resolution
+                .selected_items
+                .into_iter()
+                .map(|item| ResolvedMetadataEntry {
+                    bvid: item.bvid,
+                    aid: (item.aid > 0).then_some(item.aid),
+                    cid: (item.cid > 0).then_some(item.cid),
+                    epid: None,
+                    title: item.title,
+                    collection: Some(CollectionMetadata {
+                        id: resolution
+                            .collection
+                            .id
+                            .filter(|id| *id > 0)
+                            .map(|id| format!("bilibili:{kind}:{id}")),
+                        title: resolution.collection.title.clone(),
+                        kind: "bilibili_collection".to_string(),
+                        order: Some(item.index),
+                        part_id: (item.cid > 0).then(|| item.cid.to_string()),
+                    }),
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    // Bound returned text as well as entry count; never silently truncate identity or metadata.
+    let text_bytes = entries
+        .iter()
+        .try_fold(0usize, |total, entry| {
+            let collection = entry.collection.as_ref();
+            [
+                entry.title.len(),
+                entry.bvid.as_ref().map_or(0, String::len),
+                collection.map_or(0, |value| value.title.len()),
+                collection.map_or(0, |value| value.kind.len()),
+                collection
+                    .and_then(|value| value.id.as_ref())
+                    .map_or(0, String::len),
+                collection
+                    .and_then(|value| value.part_id.as_ref())
+                    .map_or(0, String::len),
+            ]
+            .into_iter()
+            .try_fold(total, usize::checked_add)
+        })
+        .context("metadata source text size overflowed")?;
+    if text_bytes > 4 * 1024 * 1024 {
+        bail!("metadata source exceeds the recovery text limit");
+    }
+    Ok(entries)
 }
 
 fn bilibili_metadata_display_snapshot(plan: &BilibiliDownloadPlan) -> PlanValidationSnapshot {
@@ -30804,6 +31144,421 @@ mod tests {
         assert!(!nfo.contains("<premiered>"));
         assert!(!nfo.contains("<year>"));
         let _ = fs::remove_dir_all(video_dir);
+    }
+
+    fn metadata_recovery_video(page_count: usize) -> bbdown_core::VideoMetadata {
+        bbdown_core::VideoMetadata {
+            aid: 123,
+            bvid: Some("BV1ab411C7x1".to_string()),
+            title: "Original upload title".to_string(),
+            description: String::new(),
+            cover_url: None,
+            pub_time: None,
+            owner: None,
+            tags: Vec::new(),
+            pages: (1..=page_count)
+                .map(|index| bbdown_core::PageMetadata {
+                    index: index as u32,
+                    aid: 123,
+                    cid: index as u64 * 10,
+                    epid: None,
+                    title: format!("Part {index}"),
+                    duration_seconds: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn metadata_recovery_ugc_reference(
+        kind: UgcCollectionKind,
+        item_count: usize,
+    ) -> UgcCollectionReference {
+        let id = match kind {
+            UgcCollectionKind::Collection => 167_822,
+            UgcCollectionKind::Series => 167_823,
+        };
+        UgcCollectionReference {
+            id,
+            kind,
+            owner_mid: 210_798,
+            title: "Saved group".to_string(),
+            description: String::new(),
+            cover_url: None,
+            item_count,
+        }
+    }
+
+    fn metadata_recovery_ugc_resolution(
+        kind: VideoCollectionKind,
+        id: u64,
+        items: Vec<bbdown_core::VideoCollectionItem>,
+    ) -> VideoCollectionResolution {
+        VideoCollectionResolution {
+            collection: VideoCollectionMetadata {
+                id: Some(id),
+                kind,
+                title: "Saved group title".to_string(),
+                description: String::new(),
+                cover_url: None,
+                pub_time: None,
+                owner: Some(bbdown_core::Owner {
+                    mid: 210_798,
+                    name: "Owner".to_string(),
+                }),
+                items: items.clone(),
+            },
+            selected_items: items,
+        }
+    }
+
+    #[test]
+    fn metadata_recovery_source_ids_never_accept_arbitrary_urls_or_invalid_numbers() {
+        assert_eq!(
+            bilibili_metadata_recovery_source_url("BV1ab411C7x1").unwrap(),
+            "https://www.bilibili.com/video/BV1ab411C7x1"
+        );
+        assert_eq!(
+            bilibili_metadata_recovery_source_url("av00123").unwrap(),
+            "https://www.bilibili.com/video/av123"
+        );
+        assert_eq!(
+            bilibili_metadata_recovery_source_url("ep77").unwrap(),
+            "https://www.bilibili.com/bangumi/play/ep77"
+        );
+        for invalid in [
+            "https://example.invalid/video",
+            "https://www.bilibili.com/video/BV1ab411C7x1",
+            "BV1ab411C7x1?x=1",
+            "BV123",
+            "cid123",
+            "ep0",
+            "av-1",
+            "ep18446744073709551616",
+        ] {
+            assert!(
+                bilibili_metadata_recovery_source_url(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_recovery_mapping_preserves_upload_title_and_exact_multi_part_identity() {
+        let single =
+            bilibili_metadata_recovery_entries(ResolvedContent::Video(metadata_recovery_video(1)))
+                .unwrap();
+        assert_eq!(single[0].title, "Original upload title");
+        assert!(single[0].collection.is_none());
+        let parts =
+            bilibili_metadata_recovery_entries(ResolvedContent::Video(metadata_recovery_video(2)))
+                .unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1].title, "Part 2");
+        assert_eq!(parts[1].cid, Some(20));
+        assert_eq!(parts[1].bvid.as_deref(), Some("BV1ab411C7x1"));
+        let collection = parts[1].collection.as_ref().unwrap();
+        assert_eq!(collection.id.as_deref(), Some("BV1ab411C7x1"));
+        assert_eq!(collection.kind, "multi_part");
+        assert_eq!(collection.order, Some(2));
+        assert_eq!(collection.part_id.as_deref(), Some("20"));
+        assert!(
+            bilibili_metadata_recovery_entries(ResolvedContent::Video(metadata_recovery_video(
+                crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES + 1
+            )))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_ugc_membership_maps_single_video_to_saved_order() {
+        let video = metadata_recovery_video(1);
+        let reference = metadata_recovery_ugc_reference(UgcCollectionKind::Collection, 2);
+        let resolution = metadata_recovery_ugc_resolution(
+            VideoCollectionKind::Collection,
+            reference.id,
+            vec![
+                test_bilibili_collection_item(1, 999, "BVother00001", 99),
+                test_bilibili_collection_item(2, 123, "BV1ab411C7x1", 10),
+            ],
+        );
+
+        let ugc = resolve_bilibili_metadata_recovery_ugc_collections(
+            &video,
+            None,
+            |bvid| async move {
+                assert_eq!(bvid, "BV1ab411C7x1");
+                Ok(Some(reference))
+            },
+            |membership| async move {
+                assert_eq!(membership.id, 167_822);
+                assert_eq!(membership.kind, UgcCollectionKind::Collection);
+                Ok(resolution)
+            },
+        )
+        .await
+        .expect("membership lookup should succeed")
+        .expect("the BV should have saved collection membership");
+        let entries = bilibili_metadata_recovery_entries_with_ugc_collections(
+            ResolvedContent::Video(video),
+            Some(&ugc),
+        )
+        .expect("exact single-page membership should map");
+
+        assert_eq!(
+            bilibili_metadata_recovery_source_url("av123").unwrap(),
+            "https://www.bilibili.com/video/av123"
+        );
+        assert_eq!(entries[0].title, "Original upload title");
+        assert_eq!(entries[0].aid, Some(123));
+        assert_eq!(entries[0].cid, Some(10));
+        let collection = entries[0].collection.as_ref().unwrap();
+        assert_eq!(collection.id.as_deref(), Some("bilibili:collection:167822"));
+        assert_eq!(collection.title, "Saved group title");
+        assert_eq!(collection.kind, "bilibili_collection");
+        assert_eq!(collection.order, Some(2));
+        assert_eq!(collection.part_id.as_deref(), Some("10"));
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_ugc_series_uses_exact_flattened_page_orders() {
+        let video = metadata_recovery_video(2);
+        let reference = metadata_recovery_ugc_reference(UgcCollectionKind::Series, 4);
+        let resolution = metadata_recovery_ugc_resolution(
+            VideoCollectionKind::Series,
+            reference.id,
+            vec![
+                test_bilibili_collection_item(1, 999, "BVother00001", 91),
+                test_bilibili_collection_item(2, 123, "BV1ab411C7x1", 10),
+                test_bilibili_collection_item(3, 888, "BVother00002", 92),
+                test_bilibili_collection_item(4, 123, "BV1ab411C7x1", 20),
+                test_bilibili_collection_item(5, 777, "BVother00003", 93),
+            ],
+        );
+
+        let ugc = resolve_bilibili_metadata_recovery_ugc_collections(
+            &video,
+            None,
+            |bvid| async move {
+                assert_eq!(bvid, "BV1ab411C7x1");
+                Ok(Some(reference))
+            },
+            |membership| async move {
+                assert_eq!(membership.id, 167_823);
+                assert_eq!(membership.kind, UgcCollectionKind::Series);
+                Ok(resolution)
+            },
+        )
+        .await
+        .expect("series membership lookup should succeed")
+        .expect("the BV should have saved series membership");
+        let entries = bilibili_metadata_recovery_entries_with_ugc_collections(
+            ResolvedContent::Video(video),
+            Some(&ugc),
+        )
+        .expect("exact multi-page membership should map");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].title, "Part 1");
+        assert_eq!(entries[1].title, "Part 2");
+        assert_eq!(entries[0].cid, Some(10));
+        assert_eq!(entries[1].cid, Some(20));
+        assert_eq!(entries[0].collection.as_ref().unwrap().order, Some(2));
+        assert_eq!(entries[1].collection.as_ref().unwrap().order, Some(4));
+        assert_eq!(
+            entries[0].collection.as_ref().unwrap().id.as_deref(),
+            Some("bilibili:series:167823")
+        );
+        assert_eq!(
+            entries[0].collection.as_ref().unwrap().part_id.as_deref(),
+            Some("10")
+        );
+        assert_eq!(
+            entries[1].collection.as_ref().unwrap().part_id.as_deref(),
+            Some("20")
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_without_ugc_membership_does_not_fabricate_a_collection() {
+        let video = metadata_recovery_video(1);
+        let collection_lookup_called =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let collection_lookup_seen = std::sync::Arc::clone(&collection_lookup_called);
+        let resolution =
+            metadata_recovery_ugc_resolution(VideoCollectionKind::Collection, 167_822, Vec::new());
+
+        let ugc = resolve_bilibili_metadata_recovery_ugc_collections(
+            &video,
+            None,
+            |bvid| async move {
+                assert_eq!(bvid, "BV1ab411C7x1");
+                Ok(None)
+            },
+            move |_| async move {
+                collection_lookup_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(resolution)
+            },
+        )
+        .await
+        .expect("empty membership should resolve successfully");
+        assert!(ugc.is_none());
+        assert!(!collection_lookup_called.load(std::sync::atomic::Ordering::SeqCst));
+
+        let entries = bilibili_metadata_recovery_entries_with_ugc_collections(
+            ResolvedContent::Video(video),
+            None,
+        )
+        .expect("single video without membership should remain valid");
+        assert!(entries[0].collection.is_none());
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_ugc_membership_rejects_mismatches_and_oversized_groups() {
+        let video = metadata_recovery_video(1);
+        let mismatch_reference = metadata_recovery_ugc_reference(UgcCollectionKind::Collection, 1);
+        let mismatch = metadata_recovery_ugc_resolution(
+            VideoCollectionKind::Collection,
+            mismatch_reference.id,
+            vec![test_bilibili_collection_item(1, 123, "BV1ab411C7x1", 999)],
+        );
+        assert!(
+            resolve_bilibili_metadata_recovery_ugc_collections(
+                &video,
+                None,
+                |_| async move { Ok(Some(mismatch_reference)) },
+                |_| async move { Ok(mismatch) },
+            )
+            .await
+            .is_err()
+        );
+
+        let oversized_reference = metadata_recovery_ugc_reference(
+            UgcCollectionKind::Collection,
+            crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES + 1,
+        );
+        let collection_lookup_called =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let collection_lookup_seen = std::sync::Arc::clone(&collection_lookup_called);
+        let resolution = metadata_recovery_ugc_resolution(
+            VideoCollectionKind::Collection,
+            oversized_reference.id,
+            Vec::new(),
+        );
+        assert!(
+            resolve_bilibili_metadata_recovery_ugc_collections(
+                &video,
+                None,
+                |_| async move { Ok(Some(oversized_reference)) },
+                move |_| async move {
+                    collection_lookup_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(resolution)
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(!collection_lookup_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn metadata_recovery_season_order_requires_exact_episode_membership() {
+        let episode = bbdown_core::EpisodeMetadata {
+            index: 57,
+            aid: 123,
+            bvid: Some("BV1ab411C7x1".to_string()),
+            cid: 456,
+            epid: 77,
+            title: "57".to_string(),
+            long_title: Some("Episode title".to_string()),
+            pub_time: None,
+        };
+        let season = bbdown_core::SeasonMetadata {
+            season_id: Some(10),
+            media_id: Some(20),
+            title: "Season".to_string(),
+            description: String::new(),
+            cover_url: None,
+            main_episode_count: 57,
+            areas: Vec::new(),
+            tags: Vec::new(),
+            episodes: vec![episode.clone()],
+        };
+        let mut selected = episode.clone();
+        selected.index = 1;
+        let entries = bilibili_metadata_recovery_entries(ResolvedContent::Season(
+            bbdown_core::SeasonResolution {
+                season: season.clone(),
+                selected_episodes: vec![selected.clone()],
+            },
+        ))
+        .unwrap();
+        assert_eq!(entries[0].title, "57 Episode title");
+        let collection = entries[0].collection.as_ref().unwrap();
+        assert_eq!(collection.id.as_deref(), Some("ss10"));
+        assert_eq!(collection.order, Some(57));
+        assert_eq!(collection.part_id.as_deref(), Some("77"));
+        let mut unrelated = season.clone();
+        unrelated.episodes.clear();
+        let unproven = bilibili_metadata_recovery_entries(ResolvedContent::Season(
+            bbdown_core::SeasonResolution {
+                season: unrelated,
+                selected_episodes: vec![selected.clone()],
+            },
+        ))
+        .unwrap();
+        assert!(unproven[0].collection.is_none());
+        let mut duplicate = season;
+        duplicate.episodes.push(episode);
+        assert!(
+            bilibili_metadata_recovery_entries(ResolvedContent::Season(
+                bbdown_core::SeasonResolution {
+                    season: duplicate,
+                    selected_episodes: vec![selected],
+                }
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_recovery_mapping_accepts_persistent_collections_and_bounds_text() {
+        let item = test_bilibili_collection_item(3, 123, "BV1ab411C7x1", 456);
+        let collection = VideoCollectionMetadata {
+            id: Some(167822),
+            kind: VideoCollectionKind::Collection,
+            title: "Collection".to_string(),
+            description: String::new(),
+            cover_url: None,
+            pub_time: None,
+            owner: None,
+            items: vec![item.clone()],
+        };
+        let entries = bilibili_metadata_recovery_entries(ResolvedContent::Collection(
+            VideoCollectionResolution {
+                collection: collection.clone(),
+                selected_items: vec![item.clone()],
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            entries[0].collection.as_ref().unwrap().id.as_deref(),
+            Some("bilibili:collection:167822")
+        );
+        assert_eq!(entries[0].collection.as_ref().unwrap().order, Some(3));
+        let mut transient = collection;
+        transient.kind = VideoCollectionKind::History;
+        assert!(
+            bilibili_metadata_recovery_entries(ResolvedContent::Collection(
+                VideoCollectionResolution {
+                    collection: transient,
+                    selected_items: vec![item],
+                }
+            ))
+            .is_err()
+        );
+        let mut oversized = metadata_recovery_video(1);
+        oversized.title = "x".repeat(4 * 1024 * 1024);
+        assert!(bilibili_metadata_recovery_entries(ResolvedContent::Video(oversized)).is_err());
     }
 
     #[test]

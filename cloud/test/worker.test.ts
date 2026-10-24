@@ -37,6 +37,7 @@ import {
   MAX_ACTION_BODY_BYTES,
   MAX_LEGACY_TEXT_BYTES,
   MAX_MIGRATION_ITEM_CONFLICTS as WORKER_MAX_MIGRATION_ITEM_CONFLICTS,
+  MAX_RECOVERY_BATCH_ITEMS as WORKER_MAX_RECOVERY_BATCH_ITEMS,
   MAX_SELECTED_ITEMS as WORKER_MAX_SELECTED_ITEMS,
   MAX_STATE_BODY_BYTES,
   MAX_TARGET_RELATIVE_DIR_BYTES as WORKER_MAX_TARGET_RELATIVE_DIR_BYTES,
@@ -2632,6 +2633,54 @@ describe("Mini App identity and actions", () => {
     expect(maxPatches.status).toBe(202);
     expect(tooManyItems.status).toBe(400);
     expect(tooManyPatches.status).toBe(400);
+  });
+
+  it("validates bounded metadata recovery scopes and revision-bound metadata previews", async () => {
+    const initData = await signInitData();
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    const request = (requestId: string, payload: Record<string, unknown>, kind = "metadata_recover") => ownerRequest("/api/actions", initData, {
+      method: "POST",
+      body: JSON.stringify({ request_id: requestId, kind, payload }),
+    });
+    const selected = await request("00000000-0000-4000-8000-000000009314", {
+      library_id: "library-test", root_binding: TEST_ROOT_BINDING, scope: "selected", item_ids: ["item-a", "item-b"],
+    });
+    const nextBatch = await request("00000000-0000-4000-8000-000000009315", {
+      library_id: "library-test", root_binding: TEST_ROOT_BINDING, scope: "library", after_item_id: "item-z",
+    });
+    const missingSelection = await request("00000000-0000-4000-8000-000000009316", {
+      library_id: "library-test", root_binding: TEST_ROOT_BINDING, scope: "selected",
+    });
+    const mixedScope = await request("00000000-0000-4000-8000-000000009317", {
+      library_id: "library-test", root_binding: TEST_ROOT_BINDING, scope: "library", item_ids: ["item-a"],
+    });
+    const tooMany = await request("00000000-0000-4000-8000-000000009318", {
+      library_id: "library-test", root_binding: TEST_ROOT_BINDING, scope: "selected",
+      item_ids: Array.from({ length: WORKER_MAX_RECOVERY_BATCH_ITEMS + 1 }, (_, index) => `item-${index}`),
+    });
+    const preview = await request("00000000-0000-4000-8000-000000009319", {
+      library_id: "library-test", root_binding: TEST_ROOT_BINDING, expected_revision: "library-r5",
+      item_ids: ["item-a"], metadata_patches: [{ item_id: "item-a", organization_status: "standalone" }],
+    }, "file_preview");
+    const fillOnlyPreview = await request("00000000-0000-4000-8000-000000009321", {
+      library_id: "library-test", root_binding: TEST_ROOT_BINDING, expected_revision: "library-r5",
+      item_ids: ["item-a"], metadata_patches: [{ item_id: "item-a", title: "Recovered title", fill_missing_only: true }],
+    }, "file_preview");
+    const invalidOrganizationStatus = await request("00000000-0000-4000-8000-000000009320", {
+      library_id: "library-test", root_binding: TEST_ROOT_BINDING, expected_revision: "library-r5",
+      item_ids: ["item-a"], metadata_patches: [{ item_id: "item-a", organization_status: "guess" }],
+    }, "file_preview");
+
+    expect(selected.status).toBe(202);
+    expect(nextBatch.status).toBe(202);
+    expect(missingSelection.status).toBe(400);
+    expect(mixedScope.status).toBe(400);
+    expect(tooMany.status).toBe(400);
+    expect(preview.status).toBe(202);
+    expect(fillOnlyPreview.status).toBe(202);
+    expect(invalidOrganizationStatus.status).toBe(400);
+    const after = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(after?.count).toBe((before?.count ?? 0) + 4);
   });
 
   it("accepts only target folders within both UTF-8 path limits before enqueueing", async () => {

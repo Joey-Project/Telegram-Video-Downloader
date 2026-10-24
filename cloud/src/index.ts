@@ -66,6 +66,7 @@ const REQUEST_KINDS = new Set<RequestKind>([
   "library_set_category",
   "library_rename",
   "library_remove",
+  "metadata_recover",
   "file_preview",
   "file_confirm",
   "legacy_import",

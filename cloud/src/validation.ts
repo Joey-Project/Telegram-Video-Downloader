@@ -5,6 +5,7 @@ import type {
   CollectionMetadata,
   DownloadSubmitPayload,
   FilePreviewPayload,
+  MetadataRecoveryPayload,
   LocalSnapshot,
   MetadataPatch,
   ChunkedSnapshotContent,
@@ -31,6 +32,7 @@ export const MAX_JSON_COMPLEXITY_DEPTH = 48;
 export const MAX_TARGET_RELATIVE_DIR_BYTES = 1_024;
 export const MAX_TARGET_RELATIVE_DIR_COMPONENT_BYTES = 255;
 export const MAX_SELECTED_ITEMS = 100;
+export const MAX_RECOVERY_BATCH_ITEMS = MAX_SELECTED_ITEMS;
 export const MAX_MEDIA_LIBRARIES = 16;
 export const MAX_MIGRATION_ITEM_CONFLICTS = 10_000;
 export const MAX_MIGRATION_DISCOVERY_WARNINGS = 16;
@@ -325,7 +327,7 @@ function parseMetadataPatches(value: unknown): MetadataPatch[] {
     throw new HttpError(400, `metadata_patches must contain between 1 and ${MAX_SELECTED_ITEMS} entries`);
   }
   const patches = value.map((entry, index) => {
-    if (!isRecord(entry) || !onlyKeys(entry, ["item_id", "hint_index", "title", "source_ids", "collection"])) {
+    if (!isRecord(entry) || !onlyKeys(entry, ["item_id", "hint_index", "title", "source_ids", "collection", "organization_status", "fill_missing_only"])) {
       throw new HttpError(400, `metadata_patches[${index}] has an invalid shape`);
     }
     const itemId = boundedString(entry.item_id, `metadata_patches[${index}].item_id`, 128);
@@ -340,7 +342,19 @@ function parseMetadataPatches(value: unknown): MetadataPatch[] {
     if (entry.title !== undefined) patch.title = boundedTitle(entry.title, `metadata_patches[${index}].title`);
     if (entry.source_ids !== undefined) patch.source_ids = stringList(entry.source_ids, `metadata_patches[${index}].source_ids`, 64, 128);
     if (entry.collection !== undefined) patch.collection = parseCollection(entry.collection);
-    if (patch.title === undefined && patch.source_ids === undefined && patch.collection === undefined) {
+    if (entry.organization_status !== undefined) {
+      if (entry.organization_status !== "standalone" && entry.organization_status !== "unreviewed") {
+        throw new HttpError(400, `metadata_patches[${index}].organization_status must be standalone or unreviewed`);
+      }
+      patch.organization_status = entry.organization_status;
+    }
+    if (entry.fill_missing_only !== undefined) {
+      if (typeof entry.fill_missing_only !== "boolean") {
+        throw new HttpError(400, `metadata_patches[${index}].fill_missing_only must be a boolean`);
+      }
+      patch.fill_missing_only = entry.fill_missing_only;
+    }
+    if (patch.title === undefined && patch.source_ids === undefined && patch.collection === undefined && patch.organization_status === undefined) {
       throw new HttpError(400, `metadata_patches[${index}] contains no changes`);
     }
     return patch;
@@ -431,7 +445,7 @@ function parseLibraryName(value: unknown, field = "name"): string {
 }
 
 function parsePreviewPayload(value: unknown): FilePreviewPayload {
-  if (!isRecord(value) || !onlyKeys(value, ["library_id", "root_binding", "item_ids", "target_relative_dir", "rename", "conflict", "metadata_patches"])) {
+  if (!isRecord(value) || !onlyKeys(value, ["library_id", "root_binding", "item_ids", "target_relative_dir", "rename", "conflict", "metadata_patches", "expected_revision"])) {
     throw new HttpError(400, "file_preview payload has an invalid shape");
   }
 
@@ -480,9 +494,38 @@ function parsePreviewPayload(value: unknown): FilePreviewPayload {
     ...parseBoundLibraryMutationIdentity(value),
     ...(itemIds === undefined ? {} : { item_ids: itemIds }),
     ...(targetRelativeDir === undefined ? {} : { target_relative_dir: targetRelativeDir }),
+    ...(value.expected_revision === undefined ? {} : { expected_revision: boundedString(value.expected_revision, "expected_revision", 256) }),
     rename,
     conflict,
     ...(metadataPatches === undefined ? {} : { metadata_patches: metadataPatches }),
+  };
+}
+
+function parseMetadataRecover(value: unknown): MetadataRecoveryPayload {
+  if (!isRecord(value) || !onlyKeys(value, ["library_id", "root_binding", "scope", "item_ids", "after_item_id"])) {
+    throw new HttpError(400, "metadata_recover payload has an invalid shape");
+  }
+  const scope = value.scope;
+  if (scope !== "selected" && scope !== "library") {
+    throw new HttpError(400, "scope must be selected or library");
+  }
+  const itemIds = value.item_ids === undefined
+    ? undefined
+    : stringList(value.item_ids, "item_ids", MAX_RECOVERY_BATCH_ITEMS, 128);
+  if (scope === "selected" && itemIds === undefined) {
+    throw new HttpError(400, "item_ids are required when scope is selected");
+  }
+  if (scope === "library" && itemIds !== undefined) {
+    throw new HttpError(400, "item_ids must be omitted when scope is library");
+  }
+  if (scope === "selected" && value.after_item_id !== undefined) {
+    throw new HttpError(400, "after_item_id is only supported when scope is library");
+  }
+  return {
+    ...parseBoundLibraryMutationIdentity(value),
+    scope,
+    ...(itemIds === undefined ? {} : { item_ids: itemIds }),
+    ...(value.after_item_id === undefined ? {} : { after_item_id: boundedString(value.after_item_id, "after_item_id", 128) }),
   };
 }
 
@@ -792,7 +835,7 @@ export function validateActionRequest(value: unknown): ActionRequest {
   }
   const supportedKinds = [
     "library_scan", "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove",
-    "file_preview", "file_confirm", "legacy_import", "download_submit", "library_migration_preview",
+    "metadata_recover", "file_preview", "file_confirm", "legacy_import", "download_submit", "library_migration_preview",
     "library_migration_confirm", "library_migration_control",
   ];
   if (typeof value.kind !== "string" || !supportedKinds.includes(value.kind)) {
@@ -809,6 +852,9 @@ export function validateActionRequest(value: unknown): ActionRequest {
       break;
     case "file_preview":
       payload = parsePreviewPayload(value.payload) as unknown as Record<string, unknown>;
+      break;
+    case "metadata_recover":
+      payload = parseMetadataRecover(value.payload) as unknown as Record<string, unknown>;
       break;
     case "file_confirm":
       if (!onlyKeys(value.payload, ["preview_id", "revision", "library_id"])) {

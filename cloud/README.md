@@ -33,8 +33,17 @@ The three secrets must be supplied through the runtime's secret store. They are 
 - `POST /webhook`: verify Telegram's webhook secret, persist supported owner-private updates, then send a best-effort live notification.
 - `GET /api/state` and `GET /api/library`: owner-only Mini App reads. The state endpoint includes safe summaries of up to 100 unacknowledged cloud inbox requests, without their payloads.
 - `POST /api/updates/session` and `GET /api/updates/ws`: owner-authenticated Mini App subscription setup and hibernating WebSocket notifications. The browser obtains a short-lived connection ticket using Telegram authorization, then supplies it through WebSocket subprotocol headers. The ticket is never placed in the URL or persistent browser storage; no additional manually managed credentials are required.
-- `POST /api/actions`: owner-only validated and idempotent file-management, settings, download-submission, and migration requests. Apply `migrations/0003_media_library_request_kinds.sql` before enabling the new action kinds.
+- `POST /api/actions`: owner-only validated and idempotent file-management, settings, download-submission, metadata-recovery, and migration requests. Apply all pending D1 migrations before enabling their action kinds.
 - `GET /api/local/requests`, `POST /api/local/ack`, `POST /api/local/state`, and `GET /api/local/ws`: shared-secret desktop integration. Inbox acknowledgment means durable local receipt, not completion.
+
+## Metadata recovery upgrades
+
+For metadata-recovery upgrades, export a private D1 backup, then apply migration
+`0005_metadata_recovery_kind.sql` through `wrangler d1 migrations apply` against the
+intended database. It expands the inbox kind constraint while preserving requests,
+acknowledgments, and sequence history. Install and verify the matching desktop Rust
+service before deploying the new Worker and Mini App assets. Existing action kinds
+remain supported throughout this order; rolling back code does not roll back D1 data.
 
 ## Live Mini App updates
 
