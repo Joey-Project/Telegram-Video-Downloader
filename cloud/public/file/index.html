@@ -53,6 +53,7 @@
             <button class="view-tab" data-view="needs" type="button">Needs organizing <span id="needs-count" class="tab-count">0</span></button>
             <button class="view-tab" data-view="waiting" type="button">Requests <span id="waiting-count" class="tab-count">0</span></button>
             <button class="view-tab" data-view="organizing" type="button">Organizing <span id="organizing-count" class="tab-count">0</span></button>
+            <button class="view-tab" data-view="history" type="button">History <span id="history-count" class="tab-count">0</span></button>
           </nav>
 
           <section id="view-library" class="view-panel">
@@ -84,12 +85,15 @@
           </section>
 
           <section id="view-waiting" class="view-panel hidden">
-            <div class="panel-heading"><div><p class="eyebrow">INBOX</p><h2>Waiting for your computer</h2><p>Requests stay here until the desktop app has saved them locally.</p></div></div>
+            <div class="panel-heading"><div><p class="eyebrow">REQUESTS</p><h2>Review and follow up</h2><p>Review file and library migration previews, then confirm or cancel them. Other requests stay here until your computer handles them.</p></div></div>
+            <div id="review-navigation-list" class="stack-list"></div>
+            <div id="migration-preview-list" class="stack-list"></div>
+            <div id="preview-list" class="stack-list"></div>
             <div id="waiting-list" class="stack-list"></div>
           </section>
 
           <section id="view-organizing" class="view-panel hidden">
-            <div class="panel-heading"><div><p class="eyebrow">SAFE CHANGES</p><h2>Review before applying</h2><p>Every move and metadata update needs a preview and a separate confirmation.</p></div></div>
+            <div class="panel-heading"><div><p class="eyebrow">SAFE CHANGES</p><h2>Prepare changes</h2><p>Choose what to change here. Previews appear under Requests for review before you confirm.</p></div></div>
             <section id="move-files-card" class="organize-card" tabindex="-1">
               <div class="organize-card-heading"><span class="step-number">1</span><div><h3>Move selected files</h3><p>Choose a destination and review the complete plan before moving anything.</p></div></div>
               <div class="organize-controls">
@@ -124,10 +128,16 @@
                   <label class="inline-select">If a file already exists <select id="migration-conflict" class="select-control"><option value="skip">Skip it</option><option value="keep_both">Keep both</option></select></label></div>
                 <button id="migration-preview" class="primary-button" type="button">Preview migration <span aria-hidden="true">→</span></button>
               </div>
-              <div id="migration-preview-list" class="stack-list"></div>
               <div id="migration-progress-list" class="stack-list"></div>
             </section>
-            <div id="preview-list" class="stack-list"></div>
+            <div id="active-operation-list" class="stack-list"></div>
+          </section>
+
+          <section id="view-history" class="view-panel hidden">
+            <div class="panel-heading"><div><p class="eyebrow">RECENT ACTIVITY</p><h2>History</h2><p>Search the operation and migration records retained in the latest snapshot.</p></div></div>
+            <label class="search-box history-search"><span aria-hidden="true">⌕</span><input id="history-search" type="search" placeholder="Search recent activity" autocomplete="off" aria-label="Search recent activity"></label>
+            <div id="history-summary" class="section-summary" aria-live="polite"></div>
+            <div id="history-migration-list" class="stack-list"></div>
             <div id="operation-list" class="stack-list"></div>
           </section>
           <aside id="selection-actions" class="selection-actions hidden" role="region" aria-label="Selection actions" aria-live="polite">

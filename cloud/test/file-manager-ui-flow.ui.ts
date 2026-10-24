@@ -1,6 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { webcrypto } from "node:crypto";
 import { resolve } from "node:path";
+import { Event as HappyDOMEvent } from "happy-dom";
+import type { HTMLSelectElement as HappyDOMSelectElement } from "happy-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
@@ -115,10 +117,20 @@ const ownerSnapshot = {
   previews: [],
 };
 
-function element<T extends Element>(selector: string): T {
-  const found = document.querySelector<T>(selector);
+function element<T>(selector: string): T {
+  const found = document.querySelector(selector);
   if (!found) throw new Error(`Expected element ${selector}`);
-  return found;
+  return found as unknown as T;
+}
+
+function makeMemoryStorage() {
+  const values = new Map<string, string>();
+  return {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => values.set(key, String(value)),
+    removeItem: (key: string) => values.delete(key),
+    clear: () => values.clear(),
+  };
 }
 
 afterEach(async () => {
@@ -372,5 +384,447 @@ describe("file manager UI flow", () => {
     expect(fetchMock.mock.calls.filter(([input]) => String(input).startsWith("/api/snapshot/chunks/"))).toHaveLength(
       new Set([...manifest.library.chunks, ...manifest.state.chunks].map((chunk: { sha256: string }) => chunk.sha256)).size,
     );
+  });
+
+  it("keeps review previews in Requests until terminal snapshots move them into searchable History", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const sockets = installMockWebSocket();
+    const storage = makeMemoryStorage();
+
+    const secondaryLibraryId = "secondary-library";
+    const secondaryRootBinding = `v1:${"b".repeat(64)}`;
+    const primaryDescriptor = {
+      id: LIBRARY_ID,
+      name: "Primary library",
+      root: "/srv/media",
+      root_binding: ROOT_BINDING,
+      default_category: "Films",
+      availability: "available",
+      available: true,
+      is_default: true,
+    };
+    const secondaryDescriptor = {
+      id: secondaryLibraryId,
+      name: "Secondary library",
+      root: "/srv/secondary",
+      root_binding: secondaryRootBinding,
+      default_category: "Series",
+      availability: "available",
+      available: true,
+    };
+    const primaryScan = { ...ownerSnapshot.library, libraries: [], migrations: [] };
+    const secondaryScan = {
+      revision: "secondary-review-r1",
+      scanned_at: ownerSnapshot.library.scanned_at,
+      root_label: "Secondary library",
+      ready: true,
+      default_library_id: LIBRARY_ID,
+      items: [{ id: "secondary-item", title: "Secondary video", relative_path: "Series/Secondary.mkv", presence: "present", bytes: 512 }],
+      categories: ["Series"],
+      warnings: [],
+      libraries: [{ id: secondaryLibraryId, availability: "available", available: true }],
+    };
+
+    function filePreview(seq: number, libraryId: string, rootBinding: string, id: string, revision: string) {
+      return {
+        seq,
+        request_id: `file-preview-${id}`,
+        kind: "file_preview",
+        status: "awaiting_confirmation",
+        library_id: libraryId,
+        root_binding: rootBinding,
+        recovery_identity: { library_id: libraryId, root_binding: rootBinding },
+        result: {
+          library_id: libraryId,
+          root_binding: rootBinding,
+          preview_id: id,
+          revision,
+          preview: {
+            target_relative_dir: "Reviewed",
+            conflict: "skip",
+            items: [{ item_id: libraryId === LIBRARY_ID ? "item-alpha" : "secondary-item", source_path: "Source.mkv", target_path: "Reviewed/Source.mkv" }],
+          },
+        },
+      };
+    }
+
+    function migrationPreview(seq: number, id: string, revision: string) {
+      return {
+        seq,
+        request_id: `migration-preview-${id}`,
+        kind: "library_migration_preview",
+        status: "awaiting_confirmation",
+        result: {
+          id,
+          revision,
+          source_library_id: LIBRARY_ID,
+          target_library_id: secondaryLibraryId,
+          source_root_binding: ROOT_BINDING,
+          target_root_binding: secondaryRootBinding,
+          scope: "library",
+          conflict: "skip",
+          include_incomplete_tasks: false,
+          set_target_default_on_success: false,
+          items: [{ item_id: "item-alpha", source_path: "Films/Alpha.mkv", target_path: "Films/Alpha.mkv", outcome: "move" }],
+          item_count: 1,
+          file_count: 1,
+          total_bytes: 1024,
+          required_space_bytes: 0,
+          available_space_bytes: 4096,
+          conflict_count: 0,
+          incomplete_task_count: 0,
+        },
+      };
+    }
+
+    function libraryMigrations() {
+      return [
+        {
+          id: "migration-history",
+          source_library_id: LIBRARY_ID,
+          target_library_id: secondaryLibraryId,
+          status: "completed",
+          total_items: 1,
+          completed_items: 1,
+          total_files: 1,
+          completed_files: 1,
+          copied_bytes: 1024,
+          total_bytes: 1024,
+          success_count: 1,
+          skipped_count: 0,
+          failed_count: 0,
+        },
+        {
+          id: "migration-finalization",
+          source_library_id: LIBRARY_ID,
+          target_library_id: secondaryLibraryId,
+          status: "completed",
+          terminal_finalization_pending: true,
+          warnings: ["Migration needs attention: terminal finalization is pending."],
+          total_items: 1,
+          completed_items: 1,
+          total_files: 1,
+          completed_files: 1,
+          copied_bytes: 1024,
+          total_bytes: 1024,
+          success_count: 1,
+          skipped_count: 0,
+          failed_count: 0,
+        },
+        {
+          id: "migration-handoff",
+          source_library_id: LIBRARY_ID,
+          target_library_id: secondaryLibraryId,
+          status: "running",
+          total_items: 1,
+          completed_items: 0,
+          total_files: 1,
+          completed_files: 0,
+          copied_bytes: 0,
+          total_bytes: 1024,
+          success_count: 0,
+          skipped_count: 0,
+          failed_count: 0,
+          incomplete_task_count: 1,
+          task_transfer_count: 1,
+          task_transfers: [{ copy_complete: true, commit_acked: false, source_cleanup_complete: false, completed_files: 1, total_files: 1 }],
+        },
+      ];
+    }
+
+    function snapshot(operations: Record<string, unknown>[], pendingRequests: Record<string, unknown>[], stateVersion: number) {
+      return {
+        ...ownerSnapshot,
+        state_version: stateVersion,
+        settings: {
+          ...ownerSnapshot.settings,
+          applied: {
+            ...ownerSnapshot.settings.applied,
+            default_library_id: LIBRARY_ID,
+            libraries: [primaryDescriptor, secondaryDescriptor],
+          },
+        },
+        library: {
+          ...ownerSnapshot.library,
+          libraries: [
+            { id: LIBRARY_ID, root_binding: ROOT_BINDING, availability: "available", available: true, is_default: true, snapshot: primaryScan },
+            { id: secondaryLibraryId, root_binding: secondaryRootBinding, availability: "available", available: true, snapshot: secondaryScan },
+          ],
+          migrations: libraryMigrations(),
+        },
+        operations,
+        pending_requests: pendingRequests,
+        previews: [],
+      };
+    }
+
+    const initialOperations = [
+      filePreview(101, LIBRARY_ID, ROOT_BINDING, "file-confirm-primary", "file-confirm-r1"),
+      filePreview(102, LIBRARY_ID, ROOT_BINDING, "file-cancel-primary", "file-cancel-r1"),
+      migrationPreview(103, "migration-confirm-primary", "migration-confirm-r1"),
+      migrationPreview(104, "migration-cancel-primary", "migration-cancel-r1"),
+      filePreview(105, secondaryLibraryId, secondaryRootBinding, "file-cancel-secondary", "file-cancel-secondary-r1"),
+      filePreview(106, LIBRARY_ID, ROOT_BINDING, "file-cancel-failure", "file-cancel-failure-r1"),
+    ];
+    let currentSnapshot = snapshot(initialOperations, [], 1);
+    const initialBundle = await makeChunkedSnapshot(currentSnapshot);
+    let currentManifest = initialBundle.manifest;
+    const responseChunks = new Map(initialBundle.chunks);
+    const actions: Array<Record<string, any>> = [];
+    const acceptedActions: Array<{ action: Record<string, any>; seq: number }> = [];
+    let nextActionSeq = 901;
+    let stateRequests = 0;
+
+    async function publishSnapshot(nextSnapshot: ReturnType<typeof snapshot>) {
+      currentSnapshot = nextSnapshot;
+      const nextBundle = await makeChunkedSnapshot(nextSnapshot);
+      currentManifest = nextBundle.manifest;
+      for (const [sha256, data] of nextBundle.chunks) responseChunks.set(sha256, data);
+    }
+
+    const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
+    const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
+    expect(body).toBeDefined();
+    document.body.innerHTML = body!;
+    expect(document.querySelector("script[src], link[rel='stylesheet']")).toBeNull();
+    Object.defineProperty(window, "Telegram", {
+      configurable: true,
+      value: { WebApp: { initData: MOCK_INIT_DATA, ready: vi.fn(), expand: vi.fn() } },
+    });
+    Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+    vi.stubGlobal("localStorage", storage);
+    Object.defineProperty(window, "matchMedia", { configurable: true, value: vi.fn(() => ({ matches: true })) });
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
+      expect(init?.cache).toBe("no-store");
+      if (String(input) === "/api/updates/session") {
+        expect(init?.method).toBe("POST");
+        return { ok: true, status: 200, json: async () => updateSession() } as Response;
+      }
+      if (String(input) === "/api/state") {
+        expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
+        stateRequests += 1;
+        return { ok: true, status: 200, json: async () => currentManifest } as Response;
+      }
+      const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
+      if (chunkPath) {
+        expect(new Headers(init?.headers).get("X-Cloud-Database-Epoch")).toBe(TEST_DATABASE_EPOCH);
+        const sha256 = chunkPath[1]!;
+        return { ok: true, status: 200, json: async () => ({ sha256, data: responseChunks.get(sha256) }) } as Response;
+      }
+      if (String(input) === "/api/actions") {
+        const action = JSON.parse(String(init?.body)) as Record<string, any>;
+        actions.push(action);
+        const seq = nextActionSeq++;
+        acceptedActions.push({ action, seq });
+        const pending = {
+          seq,
+          request_id: action.request_id,
+          kind: action.kind,
+          status: "pending",
+          created_at: Math.floor(Date.now() / 1000),
+          payload: action.payload,
+        };
+        await publishSnapshot(snapshot(currentSnapshot.operations, [...currentSnapshot.pending_requests, pending], currentSnapshot.state_version + 1));
+        return { ok: true, status: 202, json: async () => ({ seq, request_id: action.request_id }) } as Response;
+      }
+      throw new Error(`Unexpected request ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.fetch = fetchMock as typeof window.fetch;
+
+    vi.resetModules();
+    // The browser entry has no declarations because it is executed for its side effects.
+    // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
+    await import("../public/file/app.js");
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(0));
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    expect(element<HTMLButtonElement>('[data-view="waiting"]').classList.contains("active")).toBe(true);
+    expect(document.querySelector('[data-preview-cancel-id="file-cancel-primary"]')).not.toBeNull();
+    expect(document.querySelector('[data-preview-cancel-id="migration-cancel-primary"]')).not.toBeNull();
+    const fileConfirm = element<HTMLButtonElement>('[data-confirm="file-confirm-primary"]');
+    const migrationConfirm = element<HTMLButtonElement>('[data-migration-confirm="migration-confirm-primary"]');
+    expect(fileConfirm.disabled).toBe(false);
+    expect(migrationConfirm.disabled).toBe(false);
+
+    const fileConfirmRefreshBefore = stateRequests;
+    fileConfirm.click();
+    await vi.waitFor(() => expect(actions.some((action) => action.kind === "file_confirm"
+      && action.payload?.preview_id === "file-confirm-primary")).toBe(true));
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(fileConfirmRefreshBefore));
+    const migrationConfirmRefreshBefore = stateRequests;
+    element<HTMLButtonElement>('[data-migration-confirm="migration-confirm-primary"]').click();
+    await vi.waitFor(() => expect(actions.some((action) => action.kind === "library_migration_confirm"
+      && action.payload?.preview_id === "migration-confirm-primary")).toBe(true));
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(migrationConfirmRefreshBefore));
+
+    const primaryPreviewCounts = () => ({
+      files: document.querySelectorAll("#preview-list article.stack-card").length,
+      migrations: document.querySelectorAll("#migration-preview-list article.stack-card").length,
+    });
+    const firstPrimaryCounts = primaryPreviewCounts();
+    expect(firstPrimaryCounts.files).toBe(3);
+    expect(firstPrimaryCounts.migrations).toBe(2);
+
+    const failedCancelButton = element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="file-cancel-failure"]');
+    const failedCancelRefreshBefore = stateRequests;
+    failedCancelButton.click();
+    await vi.waitFor(() => expect(actions.some((action) => action.kind === "preview_cancel"
+      && action.payload?.preview_id === "file-cancel-failure")).toBe(true));
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(failedCancelRefreshBefore));
+    expect(document.querySelector('[data-preview-cancel-id="file-cancel-failure"]')).not.toBeNull();
+    expect(element<HTMLButtonElement>('[data-preview-cancel-id="file-cancel-failure"]').disabled).toBe(true);
+    expect(element<HTMLButtonElement>('[data-confirm="file-cancel-failure"]').disabled).toBe(true);
+
+    const failedCancelAction = actions.find((action) => action.kind === "preview_cancel" && action.payload?.preview_id === "file-cancel-failure");
+    expect(failedCancelAction?.payload).toEqual({
+      preview_kind: "file_preview",
+      preview_seq: 106,
+      preview_id: "file-cancel-failure",
+      revision: "file-cancel-failure-r1",
+    });
+    const failedCancelAccepted = acceptedActions.find(({ action }) => action.request_id === failedCancelAction?.request_id);
+    if (!failedCancelAccepted) throw new Error("Expected the failed cancellation to have an accepted HTTP receipt");
+    const failedCancelOperation = {
+      seq: failedCancelAccepted.seq,
+      request_id: failedCancelAction?.request_id,
+      kind: "preview_cancel",
+      status: "failed",
+      error: "The computer could not cancel this preview.",
+      result: {},
+    };
+    const failedSnapshot = snapshot(
+      [...currentSnapshot.operations, failedCancelOperation],
+      currentSnapshot.pending_requests.filter((request) => request.seq !== failedCancelAccepted.seq),
+      currentSnapshot.state_version + 1,
+    );
+    await publishSnapshot(failedSnapshot);
+    const requestsBeforeFailedSnapshot = stateRequests;
+    sockets[0]?.receive({
+      type: "invalidate",
+      database_epoch: TEST_DATABASE_EPOCH,
+      state_version: failedSnapshot.state_version,
+      reason: "state",
+    });
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(requestsBeforeFailedSnapshot));
+    expect(document.querySelector('[data-preview-cancel-id="file-cancel-failure"]')).not.toBeNull();
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("The computer could not cancel this preview.");
+    expect(element<HTMLButtonElement>('[data-preview-cancel-id="file-cancel-failure"]').disabled).toBe(false);
+    expect(element<HTMLButtonElement>('[data-preview-cancel-id="file-cancel-failure"]').textContent).toContain("Retry cancellation");
+    expect(element<HTMLButtonElement>('[data-confirm="file-cancel-failure"]').disabled).toBe(false);
+
+    const cancelPrimaryFile = element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="file-cancel-primary"]');
+    const fileRequestsBeforeCancel = stateRequests;
+    cancelPrimaryFile.click();
+    await vi.waitFor(() => expect(actions.some((action) => action.kind === "preview_cancel"
+      && action.payload?.preview_id === "file-cancel-primary")).toBe(true));
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(fileRequestsBeforeCancel));
+    expect(primaryPreviewCounts().files).toBe(firstPrimaryCounts.files);
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("Review needed");
+    const primaryFileCancelAction = actions.find((action) => action.kind === "preview_cancel" && action.payload?.preview_id === "file-cancel-primary");
+    expect(primaryFileCancelAction?.payload).toEqual({
+      preview_kind: "file_preview",
+      preview_seq: 102,
+      preview_id: "file-cancel-primary",
+      revision: "file-cancel-r1",
+    });
+
+    const cancelPrimaryMigration = element<HTMLButtonElement>('[data-preview-cancel-kind="library_migration_preview"][data-preview-cancel-id="migration-cancel-primary"]');
+    const migrationRequestsBeforeCancel = stateRequests;
+    cancelPrimaryMigration.click();
+    await vi.waitFor(() => expect(actions.some((action) => action.kind === "preview_cancel"
+      && action.payload?.preview_id === "migration-cancel-primary")).toBe(true));
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(migrationRequestsBeforeCancel));
+    expect(primaryPreviewCounts().migrations).toBe(firstPrimaryCounts.migrations);
+    const primaryMigrationCancelAction = actions.find((action) => action.kind === "preview_cancel" && action.payload?.preview_id === "migration-cancel-primary");
+    expect(primaryMigrationCancelAction?.payload).toEqual({
+      preview_kind: "library_migration_preview",
+      preview_seq: 104,
+      preview_id: "migration-cancel-primary",
+      revision: "migration-cancel-r1",
+    });
+
+    element<HTMLButtonElement>('[data-review-library="secondary-library"]').click();
+    await vi.waitFor(() => expect(element<HappyDOMSelectElement>("#library-select").value).toBe(secondaryLibraryId));
+    expect(document.querySelector('[data-preview-cancel-id="file-cancel-secondary"]')).not.toBeNull();
+    const secondaryFileCancel = element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="file-cancel-secondary"]');
+    const secondaryRequestsBeforeCancel = stateRequests;
+    secondaryFileCancel.click();
+    await vi.waitFor(() => expect(actions.some((action) => action.kind === "preview_cancel"
+      && action.payload?.preview_id === "file-cancel-secondary")).toBe(true));
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(secondaryRequestsBeforeCancel));
+    expect(document.querySelector('[data-preview-cancel-id="file-cancel-secondary"]')).not.toBeNull();
+    const secondaryFileCancelAction = actions.find((action) => action.kind === "preview_cancel" && action.payload?.preview_id === "file-cancel-secondary");
+    expect(secondaryFileCancelAction?.payload).toEqual({
+      preview_kind: "file_preview",
+      preview_seq: 105,
+      preview_id: "file-cancel-secondary",
+      revision: "file-cancel-secondary-r1",
+    });
+
+    const librarySelect = element<HappyDOMSelectElement>("#library-select");
+    librarySelect.value = LIBRARY_ID;
+    librarySelect.dispatchEvent(new HappyDOMEvent("change", { bubbles: true }));
+    await vi.waitFor(() => expect(librarySelect.value).toBe(LIBRARY_ID));
+
+    const settledOperations: Record<string, unknown>[] = [
+      filePreview(101, LIBRARY_ID, ROOT_BINDING, "file-confirm-primary", "file-confirm-r1"),
+      { ...filePreview(102, LIBRARY_ID, ROOT_BINDING, "file-cancel-primary", "file-cancel-r1"), status: "cancelled" },
+      migrationPreview(103, "migration-confirm-primary", "migration-confirm-r1"),
+      { ...migrationPreview(104, "migration-cancel-primary", "migration-cancel-r1"), status: "cancelled" },
+      { ...filePreview(105, secondaryLibraryId, secondaryRootBinding, "file-cancel-secondary", "file-cancel-secondary-r1"), status: "cancelled" },
+      { ...filePreview(106, LIBRARY_ID, ROOT_BINDING, "file-cancel-failure", "file-cancel-failure-r1"), status: "cancelled" },
+      ...acceptedActions.map(({ action, seq }) => ({
+        seq,
+        request_id: action.request_id,
+        kind: action.kind,
+        status: action.request_id === failedCancelAction?.request_id ? "failed" : "completed",
+        ...(action.request_id === failedCancelAction?.request_id ? { error: "The computer could not cancel this preview." } : {}),
+        result: action.kind === "preview_cancel" && action.request_id !== failedCancelAction?.request_id
+          ? { cancelled: true, ...action.payload }
+          : { accepted: true, preview_id: action.payload?.preview_id, revision: action.payload?.revision },
+      })),
+    ];
+    settledOperations[0] = { ...settledOperations[0]!, status: "confirmed" };
+    settledOperations[2] = { ...settledOperations[2]!, status: "confirmed" };
+    const terminalSnapshot = snapshot(settledOperations, [], currentSnapshot.state_version + 1);
+    await publishSnapshot(terminalSnapshot);
+    const requestsBeforeTerminalUpdate = stateRequests;
+    sockets[0]?.receive({
+      type: "invalidate",
+      database_epoch: TEST_DATABASE_EPOCH,
+      state_version: terminalSnapshot.state_version,
+      reason: "state",
+    });
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(requestsBeforeTerminalUpdate));
+    await vi.waitFor(() => expect(primaryPreviewCounts()).toEqual({ files: 0, migrations: 0 }));
+    expect(element<HTMLElement>("#waiting-count").textContent).toBe("0");
+
+    element<HTMLButtonElement>('[data-view="organizing"]').click();
+    expect(document.querySelector('[data-migration-control="finalize_terminal"][data-migration-id="migration-finalization"]')).not.toBeNull();
+    expect(document.querySelector('[data-migration-control="pause"][data-migration-id="migration-handoff"]')).not.toBeNull();
+    expect(document.querySelector("#migration-progress-list article.stack-card")).not.toBeNull();
+    expect(document.querySelectorAll("#migration-progress-list article.stack-card")).toHaveLength(2);
+    expect(document.querySelectorAll("#history-migration-list article.stack-card")).toHaveLength(1);
+
+    element<HTMLButtonElement>('[data-view="history"]').click();
+    const historySearch = element<HTMLInputElement>("#history-search");
+    historySearch.value = "cancelled";
+    historySearch.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("File preview");
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Library migration preview");
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Cancelled");
+
+    historySearch.value = "completed";
+    historySearch.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Preview cancellation");
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Completed");
+    expect(element<HTMLElement>("#history-migration-list").textContent).toContain("Primary library → Secondary library");
+    expect(element<HTMLElement>("#history-migration-list").textContent).not.toContain("Finish pending finalization");
+    expect(element<HTMLElement>("#history-migration-list").textContent).not.toContain("Unfinished task handoff");
   });
 });

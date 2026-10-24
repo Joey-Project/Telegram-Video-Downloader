@@ -9418,3 +9418,455 @@ async fn explicit_blank_download_category_targets_library_root_mock_e2e() {
     drop(queue);
     let _ = fs::remove_dir_all(root);
 }
+
+fn preview_cancel_test_payload(
+    preview_kind: &str,
+    preview_seq: u64,
+    preview_id: &str,
+    revision: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "preview_kind": preview_kind,
+        "preview_seq": preview_seq,
+        "preview_id": preview_id,
+        "revision": revision,
+    })
+}
+
+#[tokio::test]
+async fn preview_cancel_is_durable_binding_independent_and_preserves_completed_files_mock_telegram_e2e()
+ {
+    const CONFIRM_PREVIEW_SEQ: u64 = 9_501;
+    const CANCEL_FILE_PREVIEW_SEQ: u64 = 9_508;
+    const CANCEL_MIGRATION_PREVIEW_SEQ: u64 = 9_509;
+
+    let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = media_library_e2e_tests::create_migration_fixture(
+        "preview-cancel-management-e2e",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let confirm_bytes = b"confirmed file stays complete";
+    let cancel_bytes = b"cancelled preview leaves this file in place";
+    let migration_bytes = b"cancelled migration leaves its source in place";
+    fs::write(fixture.archive_root.join("confirm-me.mp4"), confirm_bytes)
+        .expect("confirm fixture should write");
+    fs::write(fixture.archive_root.join("cancel-me.mp4"), cancel_bytes)
+        .expect("cancel fixture should write");
+    fs::write(
+        fixture.video_root.join("migration-source.mp4"),
+        migration_bytes,
+    )
+    .expect("migration fixture should write");
+
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let archive_binding = cloud_test_root_binding(&queue, &fixture.target_library_id);
+
+    let confirm_item_id = media_library_e2e_tests::scan_file_item_id(
+        &runtime,
+        9_500,
+        &fixture.target_library_id,
+        "confirm-me.mp4",
+    )
+    .await;
+    let confirm_preview = run_library_management_test_request(
+        &runtime,
+        CONFIRM_PREVIEW_SEQ,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": archive_binding,
+            "item_ids": [confirm_item_id],
+            "target_relative_dir": "confirmed",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(
+        confirm_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        confirm_preview.error
+    );
+    let confirm_preview_result = confirm_preview
+        .result
+        .clone()
+        .expect("file preview should retain its durable result");
+    let confirm_preview_id = confirm_preview_result["preview_id"]
+        .as_str()
+        .expect("file preview should have an ID")
+        .to_string();
+    let confirm_revision = confirm_preview_result["revision"]
+        .as_str()
+        .expect("file preview should have a revision")
+        .to_string();
+
+    for (seq, payload) in [
+        (
+            9_502,
+            preview_cancel_test_payload(
+                "file_preview",
+                CONFIRM_PREVIEW_SEQ,
+                &confirm_preview_id,
+                "wrong-revision",
+            ),
+        ),
+        (
+            9_503,
+            preview_cancel_test_payload(
+                "file_preview",
+                99_999,
+                &confirm_preview_id,
+                &confirm_revision,
+            ),
+        ),
+        (
+            9_504,
+            preview_cancel_test_payload(
+                "library_migration_preview",
+                CONFIRM_PREVIEW_SEQ,
+                &confirm_preview_id,
+                &confirm_revision,
+            ),
+        ),
+    ] {
+        let rejected =
+            run_library_management_test_request(&runtime, seq, "preview_cancel", payload).await;
+        assert_eq!(
+            rejected.status,
+            InboxStatus::Failed,
+            "a mismatched preview identity must not be cancelled"
+        );
+    }
+    let still_confirmable = inbox
+        .record(CONFIRM_PREVIEW_SEQ)
+        .expect("file preview receipt should reload after rejected cancellations")
+        .expect("file preview receipt should remain present");
+    assert_eq!(still_confirmable.status, InboxStatus::AwaitingConfirmation);
+    assert_eq!(still_confirmable.result, Some(confirm_preview_result));
+
+    let confirmed = run_library_management_test_request(
+        &runtime,
+        9_505,
+        "file_confirm",
+        serde_json::json!({
+            "preview_id": confirm_preview_id,
+            "revision": confirm_revision,
+        }),
+    )
+    .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    let confirmed_path = fixture.archive_root.join("confirmed/confirm-me.mp4");
+    assert_eq!(fs::read(&confirmed_path).unwrap(), confirm_bytes);
+
+    let cancel_after_confirm = run_library_management_test_request(
+        &runtime,
+        9_506,
+        "preview_cancel",
+        preview_cancel_test_payload(
+            "file_preview",
+            CONFIRM_PREVIEW_SEQ,
+            &confirm_preview_id,
+            &confirm_revision,
+        ),
+    )
+    .await;
+    assert_eq!(
+        cancel_after_confirm.status,
+        InboxStatus::Failed,
+        "a completed confirmation must not be cancelled"
+    );
+    assert_eq!(fs::read(&confirmed_path).unwrap(), confirm_bytes);
+
+    let cancel_item_id = media_library_e2e_tests::scan_file_item_id(
+        &runtime,
+        9_507,
+        &fixture.target_library_id,
+        "cancel-me.mp4",
+    )
+    .await;
+    let cancel_file_preview = run_library_management_test_request(
+        &runtime,
+        CANCEL_FILE_PREVIEW_SEQ,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": archive_binding,
+            "item_ids": [cancel_item_id],
+            "target_relative_dir": "should-not-be-created",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(
+        cancel_file_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        cancel_file_preview.error
+    );
+    let cancel_file_result = cancel_file_preview
+        .result
+        .clone()
+        .expect("cancellable file preview should retain its result");
+    let cancel_file_id = cancel_file_result["preview_id"]
+        .as_str()
+        .expect("cancellable file preview should have an ID")
+        .to_string();
+    let cancel_file_revision = cancel_file_result["revision"]
+        .as_str()
+        .expect("cancellable file preview should have a revision")
+        .to_string();
+
+    let migration_preview = run_library_management_test_request(
+        &runtime,
+        CANCEL_MIGRATION_PREVIEW_SEQ,
+        "library_migration_preview",
+        bound_migration_preview_payload(
+            &queue,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+            serde_json::json!({
+                "scope": "library",
+                "conflict": "skip",
+                "include_incomplete_tasks": false,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        migration_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        migration_preview.error
+    );
+    let migration_result = migration_preview
+        .result
+        .clone()
+        .expect("migration preview should retain its durable result");
+    let migration_id = migration_result["id"]
+        .as_str()
+        .expect("migration preview should have an ID")
+        .to_string();
+    let migration_revision = migration_result["revision"]
+        .as_str()
+        .expect("migration preview should have a revision")
+        .to_string();
+
+    let offline_archive = fixture.root.join("archive-offline");
+    fs::rename(&fixture.archive_root, &offline_archive)
+        .expect("registered archive root should become unavailable for cancellation");
+    let cancelled_file = run_library_management_test_request(
+        &runtime,
+        9_510,
+        "preview_cancel",
+        preview_cancel_test_payload(
+            "file_preview",
+            CANCEL_FILE_PREVIEW_SEQ,
+            &cancel_file_id,
+            &cancel_file_revision,
+        ),
+    )
+    .await;
+    assert_eq!(
+        cancelled_file.status,
+        InboxStatus::Completed,
+        "{:?}",
+        cancelled_file.error
+    );
+    assert_eq!(cancelled_file.result.as_ref().unwrap()["cancelled"], true);
+    assert_eq!(
+        cancelled_file.result.as_ref().unwrap()["preview_kind"],
+        "file_preview"
+    );
+    assert_eq!(
+        cancelled_file.result.as_ref().unwrap()["preview_seq"],
+        CANCEL_FILE_PREVIEW_SEQ
+    );
+    assert_eq!(
+        cancelled_file.result.as_ref().unwrap()["preview_id"],
+        cancel_file_id
+    );
+    assert_eq!(
+        cancelled_file.result.as_ref().unwrap()["revision"],
+        cancel_file_revision
+    );
+
+    let repeated_cancel = run_library_management_test_request(
+        &runtime,
+        9_511,
+        "preview_cancel",
+        preview_cancel_test_payload(
+            "file_preview",
+            CANCEL_FILE_PREVIEW_SEQ,
+            &cancel_file_id,
+            &cancel_file_revision,
+        ),
+    )
+    .await;
+    assert_eq!(repeated_cancel.status, InboxStatus::Completed);
+
+    let cancelled_migration = run_library_management_test_request(
+        &runtime,
+        9_512,
+        "preview_cancel",
+        preview_cancel_test_payload(
+            "library_migration_preview",
+            CANCEL_MIGRATION_PREVIEW_SEQ,
+            &migration_id,
+            &migration_revision,
+        ),
+    )
+    .await;
+    assert_eq!(
+        cancelled_migration.status,
+        InboxStatus::Completed,
+        "cancellation must remain available when a target library root is missing: {:?}",
+        cancelled_migration.error
+    );
+    assert_eq!(
+        cancelled_migration.result.as_ref().unwrap()["cancelled"],
+        true
+    );
+
+    let file_cancelled_record = inbox
+        .record(CANCEL_FILE_PREVIEW_SEQ)
+        .expect("cancelled file preview receipt should reload")
+        .expect("cancelled file preview receipt should remain present");
+    assert_eq!(file_cancelled_record.status, InboxStatus::Cancelled);
+    assert_eq!(
+        file_cancelled_record.result,
+        Some(cancel_file_result.clone())
+    );
+    let migration_cancelled_record = inbox
+        .record(CANCEL_MIGRATION_PREVIEW_SEQ)
+        .expect("cancelled migration preview receipt should reload")
+        .expect("cancelled migration preview receipt should remain present");
+    assert_eq!(migration_cancelled_record.status, InboxStatus::Cancelled);
+    assert_eq!(
+        migration_cancelled_record.result,
+        Some(migration_result.clone())
+    );
+
+    let permit = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.management_dispatch.clone().acquire_owned(),
+    )
+    .await
+    .expect("management dispatch should finish before reopening the inbox")
+    .expect("management semaphore should remain open");
+    drop(permit);
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+
+    let reopened_inbox = Arc::new(
+        open_runtime_test_inbox(&fixture.video_root).expect("cancelled inbox should reopen"),
+    );
+    for (seq, expected_result) in [
+        (CANCEL_FILE_PREVIEW_SEQ, cancel_file_result),
+        (CANCEL_MIGRATION_PREVIEW_SEQ, migration_result),
+    ] {
+        let record = reopened_inbox
+            .record(seq)
+            .expect("reopened preview receipt should load")
+            .expect("reopened preview receipt should remain present");
+        assert_eq!(record.status, InboxStatus::Cancelled);
+        assert_eq!(record.result, Some(expected_result));
+    }
+
+    fs::rename(&offline_archive, &fixture.archive_root)
+        .expect("archive root should restore after the offline cancellation check");
+    let reopened_runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&reopened_inbox),
+    );
+    let reopened_snapshot = build_cloud_state_snapshot(&reopened_runtime)
+        .await
+        .expect("cloud state should project the reopened cancellation history")
+        .expect("runtime should publish a cloud state snapshot");
+    for (seq, preview_id) in [
+        (CANCEL_FILE_PREVIEW_SEQ, cancel_file_id.as_str()),
+        (CANCEL_MIGRATION_PREVIEW_SEQ, migration_id.as_str()),
+    ] {
+        let operation = reopened_snapshot
+            .operations
+            .iter()
+            .find(|entry| entry["seq"].as_u64() == Some(seq))
+            .expect("cancelled preview should remain in operation history");
+        assert_eq!(operation["status"], "cancelled");
+        assert!(
+            reopened_snapshot
+                .previews
+                .iter()
+                .all(|entry| entry["preview_id"] != preview_id)
+        );
+    }
+
+    let reopened_dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
+    let later_file_confirm = run_library_management_test_request(
+        &reopened_runtime,
+        9_513,
+        "file_confirm",
+        serde_json::json!({
+            "preview_id": cancel_file_id,
+            "revision": cancel_file_revision,
+        }),
+    )
+    .await;
+    assert_eq!(later_file_confirm.status, InboxStatus::Failed);
+    let later_migration_confirm = run_library_management_test_request(
+        &reopened_runtime,
+        9_514,
+        "library_migration_confirm",
+        serde_json::json!({
+            "preview_id": migration_id,
+            "revision": migration_revision,
+        }),
+    )
+    .await;
+    assert_eq!(later_migration_confirm.status, InboxStatus::Failed);
+
+    let restored_cancel_path = fixture.archive_root.join("cancel-me.mp4");
+    assert_eq!(fs::read(&restored_cancel_path).unwrap(), cancel_bytes);
+    assert!(
+        !fixture
+            .archive_root
+            .join("should-not-be-created/cancel-me.mp4")
+            .exists()
+    );
+    assert_eq!(fs::read(&confirmed_path).unwrap(), confirm_bytes);
+    assert_eq!(
+        fs::read(fixture.video_root.join("migration-source.mp4")).unwrap(),
+        migration_bytes
+    );
+    assert!(!fixture.archive_root.join("migration-source.mp4").exists());
+
+    let permit = tokio::time::timeout(
+        Duration::from_secs(5),
+        reopened_runtime.management_dispatch.clone().acquire_owned(),
+    )
+    .await
+    .expect("reopened management dispatch should finish before cleanup")
+    .expect("reopened management semaphore should remain open");
+    drop(permit);
+    reopened_dispatcher.abort();
+    let _ = reopened_dispatcher.await;
+    drop(reopened_runtime);
+    drop(reopened_inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(fixture.root);
+}

@@ -560,7 +560,7 @@ describe("metadata recovery Mini App flow", () => {
       { item_id: "item-ready", title: "Recovered title", fill_missing_only: true },
       { item_id: "item-choice", collection: { id: "series", title: "Series", kind: "series", order: 2, part_id: null }, fill_missing_only: true },
     ]);
-    expect(element<HTMLButtonElement>('[data-view="organizing"]').classList.contains("active")).toBe(true);
+    expect(element<HTMLButtonElement>('[data-view="waiting"]').classList.contains("active")).toBe(true);
     expect(element<HTMLElement>("#preview-list").textContent).toContain("Recovery preview is being prepared");
     await vi.waitFor(() => expect(document.querySelector('[data-confirm="recovery-preview-2"]')).not.toBeNull());
     expect(element<HTMLElement>("#preview-list").textContent).toContain("Recovered title");
@@ -711,7 +711,7 @@ describe("metadata recovery Mini App flow", () => {
     await waitForRecoveryResult("Choose a match");
     element<HTMLInputElement>('[data-recovery-item="item-ready"]').click();
     element<HTMLButtonElement>("[data-recovery-preview]").click();
-    expect(element<HTMLButtonElement>('[data-view="organizing"]').classList.contains("active")).toBe(true);
+    expect(element<HTMLButtonElement>('[data-view="waiting"]').classList.contains("active")).toBe(true);
     await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain("was submitted. Waiting for your computer to prepare the preview."));
     const sequenceMatch = element<HTMLElement>("#preview-list").textContent?.match(/recovery preview request #(\d+) was submitted/iu);
     expect(sequenceMatch).not.toBeNull();
@@ -752,7 +752,7 @@ describe("metadata recovery Mini App flow", () => {
     expect(element<HTMLElement>("#metadata-recovery-results").textContent).toContain("Ready video");
     element<HTMLButtonElement>("[data-recovery-clear]").click();
     expect(element<HTMLElement>("#metadata-recovery-results").textContent).toBe("");
-    element<HTMLButtonElement>('[data-view="organizing"]').click();
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
     expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview request #${previewSequence} was submitted`);
 
     await app.replaceSnapshot({
@@ -905,9 +905,9 @@ describe("metadata recovery Mini App flow", () => {
       storage,
       deferRecoveryPreviewSnapshot: true,
     });
-    element<HTMLButtonElement>('[data-view="organizing"]').click();
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
     await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview request #${submitted.seq} was submitted`));
-    expect(element<HTMLElement>("#organizing-count").textContent).toBe("1");
+    expect(element<HTMLElement>("#waiting-count").textContent).toBe("1");
     expect(reloaded.sentActions.filter((action) => action.kind === "file_preview" || action.kind === "file_confirm")).toEqual([]);
 
     const failedOperation = {
@@ -936,7 +936,7 @@ describe("metadata recovery Mini App flow", () => {
     expect(element<HTMLElement>("#preview-list").textContent).toContain("The submitted preview failed after reload.");
     element<HTMLButtonElement>("[data-recovery-preview-dismiss]").click();
     expect(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY)).toBeNull();
-    expect(element<HTMLElement>("#organizing-count").textContent).toBe("0");
+    expect(element<HTMLElement>("#waiting-count").textContent).toBe("0");
 
     await applyHelperTabSnapshot(reloaded, readyRecoverySnapshot());
     expect(element<HTMLElement>("#preview-list").textContent).not.toContain("Recovery preview failed");
@@ -1028,7 +1028,7 @@ describe("metadata recovery Mini App flow", () => {
     await vi.advanceTimersByTimeAsync(1_000);
     await vi.waitFor(() => expect(retryingPage.stateRequests).toBeGreaterThan(requestsBeforeRetry));
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
-    element<HTMLButtonElement>('[data-view="organizing"]').click();
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
     await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview request #${submitted.seq} was submitted`));
     expect(retryingPage.sentActions.filter((action) => action.kind === "file_preview" || action.kind === "file_confirm")).toEqual([]);
   });

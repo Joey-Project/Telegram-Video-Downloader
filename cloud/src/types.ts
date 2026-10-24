@@ -9,6 +9,7 @@ export type RequestKind =
   | "metadata_recover"
   | "file_preview"
   | "file_confirm"
+  | "preview_cancel"
   | "legacy_import"
   | "download_submit"
   | "library_migration_preview"
@@ -100,6 +101,13 @@ export interface FilePreviewPayload extends BoundLibraryMutationIdentity {
   rename?: boolean;
   conflict?: ConflictPolicy;
   metadata_patches?: MetadataPatch[];
+}
+
+export interface PreviewCancelPayload {
+  preview_kind: "file_preview" | "library_migration_preview";
+  preview_seq: number;
+  preview_id: string;
+  revision: string;
 }
 
 export interface LegacyImportPayload extends BoundLibraryMutationIdentity {

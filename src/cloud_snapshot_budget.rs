@@ -977,6 +977,7 @@ fn status_name(status: InboxStatus) -> &'static str {
         InboxStatus::Failed => "failed",
         InboxStatus::Uncertain => "uncertain",
         InboxStatus::Stale => "stale",
+        InboxStatus::Cancelled => "cancelled",
     }
 }
 
@@ -1833,6 +1834,32 @@ mod tests {
         );
         assert!(previews.iter().map(object_size).sum::<usize>() <= MAX_PREVIEW_SNAPSHOT_BYTES);
         assert!(serde_json::to_vec(&previews).unwrap().len() <= MAX_PREVIEW_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn cancelled_file_previews_remain_in_operation_history_not_active_previews() {
+        let cancelled = record(
+            46,
+            "file_preview",
+            InboxStatus::Cancelled,
+            Some(json!({
+                "preview_id": "preview-cancelled-history",
+                "revision": "revision-cancelled-history",
+                "library_id": "ml-test-root",
+                "preview": {"items": [{"path": "clip.mp4"}]},
+            })),
+            Some("This preview was cancelled before confirmation.".to_string()),
+        );
+
+        let operations = operation_snapshots(&[&cancelled]).expect("history should fit");
+        let previews = preview_snapshots(&[&cancelled], 0);
+
+        assert_eq!(operations[0]["status"], "cancelled");
+        assert_eq!(
+            operations[0]["result"]["preview_id"],
+            "preview-cancelled-history"
+        );
+        assert!(previews.is_empty());
     }
 
     #[test]

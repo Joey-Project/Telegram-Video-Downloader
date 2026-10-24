@@ -835,7 +835,7 @@ export function validateActionRequest(value: unknown): ActionRequest {
   }
   const supportedKinds = [
     "library_scan", "library_register", "library_set_default", "library_set_category", "library_rename", "library_remove",
-    "metadata_recover", "file_preview", "file_confirm", "legacy_import", "download_submit", "library_migration_preview",
+    "metadata_recover", "file_preview", "file_confirm", "preview_cancel", "legacy_import", "download_submit", "library_migration_preview",
     "library_migration_confirm", "library_migration_control",
   ];
   if (typeof value.kind !== "string" || !supportedKinds.includes(value.kind)) {
@@ -866,6 +866,33 @@ export function validateActionRequest(value: unknown): ActionRequest {
         ...parseOptionalLibraryId(value.payload.library_id),
       };
       break;
+    case "preview_cancel": {
+      if (!onlyKeys(value.payload, ["preview_kind", "preview_seq", "preview_id", "revision"])) {
+        throw new HttpError(400, "preview_cancel payload has an invalid shape");
+      }
+      const previewKind = value.payload.preview_kind;
+      if (previewKind !== "file_preview" && previewKind !== "library_migration_preview") {
+        throw new HttpError(400, "preview_kind must identify a file or library migration preview");
+      }
+      if (!Number.isSafeInteger(value.payload.preview_seq) || (value.payload.preview_seq as number) <= 0) {
+        throw new HttpError(400, "preview_seq must be a positive safe integer");
+      }
+      const previewId = boundedUtf8String(value.payload.preview_id, "preview_id", 128);
+      const revision = boundedUtf8String(value.payload.revision, "revision", 256);
+      if (previewId !== value.payload.preview_id || revision !== value.payload.revision) {
+        throw new HttpError(400, "Preview cancellation identity must not contain surrounding whitespace");
+      }
+      if (/[\u0080-\u009f]/u.test(previewId) || /[\u0080-\u009f]/u.test(revision)) {
+        throw new HttpError(400, "Preview cancellation identity contains control characters");
+      }
+      payload = {
+        preview_kind: previewKind,
+        preview_seq: value.payload.preview_seq,
+        preview_id: previewId,
+        revision,
+      };
+      break;
+    }
     case "legacy_import": {
       if (!onlyKeys(value.payload, ["text", "library_id", "root_binding"])) throw new HttpError(400, "legacy_import payload has an invalid shape");
       const text = boundedLegacyText(value.payload.text);
