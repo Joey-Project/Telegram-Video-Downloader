@@ -123,13 +123,129 @@ function element<T>(selector: string): T {
   return found as unknown as T;
 }
 
-function makeMemoryStorage() {
+type MemoryStorageFixture = {
+  getItem: (key: string) => string | null;
+  setItem: (key: string, value: string) => void;
+  removeItem: (key: string) => void;
+  clear: () => void;
+};
+
+function makeMemoryStorage(): MemoryStorageFixture {
   const values = new Map<string, string>();
   return {
     getItem: (key: string) => values.get(key) ?? null,
-    setItem: (key: string, value: string) => values.set(key, String(value)),
-    removeItem: (key: string) => values.delete(key),
-    clear: () => values.clear(),
+    setItem: (key: string, value: string) => { values.set(key, String(value)); },
+    removeItem: (key: string) => { values.delete(key); },
+    clear: () => { values.clear(); },
+  };
+}
+
+function filePreviewFixture(seq: number, libraryId: string, rootBinding: string, id: string, revision: string) {
+  return {
+    seq,
+    request_id: `file-preview-${id}`,
+    kind: "file_preview",
+    status: "awaiting_confirmation",
+    library_id: libraryId,
+    root_binding: rootBinding,
+    recovery_identity: { library_id: libraryId, root_binding: rootBinding },
+    result: {
+      library_id: libraryId,
+      root_binding: rootBinding,
+      preview_id: id,
+      revision,
+      preview: {
+        target_relative_dir: "Reviewed",
+        conflict: "skip",
+        items: [{ item_id: "item-alpha", source_path: "Source.mkv", target_path: "Reviewed/Source.mkv" }],
+      },
+    },
+  };
+}
+
+async function mountFileManagerFixture(
+  initialSnapshot: Record<string, any>,
+  storage: MemoryStorageFixture,
+  onAction?: (
+    action: Record<string, any>,
+    seq: number,
+    publishSnapshot: (snapshot: Record<string, any>) => Promise<void>,
+  ) => Promise<void> | void,
+) {
+  const sockets = installMockWebSocket();
+  let currentManifest: Record<string, any>;
+  let stateRequests = 0;
+  let nextActionSeq = 901;
+  const actions: Array<Record<string, any>> = [];
+  let currentSnapshot = initialSnapshot;
+  const initialBundle = await makeChunkedSnapshot(initialSnapshot);
+  currentManifest = initialBundle.manifest;
+  const responseChunks = new Map(initialBundle.chunks);
+
+  async function publishSnapshot(snapshot: Record<string, any>) {
+    currentSnapshot = snapshot;
+    const bundle = await makeChunkedSnapshot(snapshot);
+    currentManifest = bundle.manifest;
+    for (const [sha256, data] of bundle.chunks) responseChunks.set(sha256, data);
+  }
+
+  const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
+  const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
+  expect(body).toBeDefined();
+  document.body.replaceWith(document.createElement("body"));
+  document.body.innerHTML = body!;
+  expect(document.querySelector("script[src], link[rel='stylesheet']")).toBeNull();
+  Object.defineProperty(window, "Telegram", {
+    configurable: true,
+    value: { WebApp: { initData: MOCK_INIT_DATA, ready: vi.fn(), expand: vi.fn() } },
+  });
+  Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+  vi.stubGlobal("localStorage", storage);
+  Object.defineProperty(window, "matchMedia", { configurable: true, value: vi.fn(() => ({ matches: true })) });
+
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    expect(new Headers(init?.headers).get("X-Telegram-Init-Data")).toBe(MOCK_INIT_DATA);
+    expect(init?.cache).toBe("no-store");
+    if (String(input) === "/api/updates/session") {
+      expect(init?.method).toBe("POST");
+      return { ok: true, status: 200, json: async () => updateSession() } as Response;
+    }
+    if (String(input) === "/api/state") {
+      expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
+      stateRequests += 1;
+      return { ok: true, status: 200, json: async () => currentManifest } as Response;
+    }
+    const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
+    if (chunkPath) {
+      expect(new Headers(init?.headers).get("X-Cloud-Database-Epoch")).toBe(TEST_DATABASE_EPOCH);
+      const sha256 = chunkPath[1]!;
+      return { ok: true, status: 200, json: async () => ({ sha256, data: responseChunks.get(sha256) }) } as Response;
+    }
+    if (String(input) === "/api/actions") {
+      const action = JSON.parse(String(init?.body)) as Record<string, any>;
+      actions.push(action);
+      const seq = nextActionSeq++;
+      await onAction?.(action, seq, publishSnapshot);
+      return { ok: true, status: 202, json: async () => ({ seq, request_id: action.request_id }) } as Response;
+    }
+    throw new Error(`Unexpected request ${String(input)}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  window.fetch = fetchMock as typeof window.fetch;
+
+  vi.resetModules();
+  // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
+  await import("../public/file/app.js");
+  await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(0));
+  await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+
+  return {
+    actions,
+    sockets,
+    fetchMock,
+    publishSnapshot,
+    get stateRequests() { return stateRequests; },
+    get currentSnapshot() { return currentSnapshot; },
   };
 }
 
@@ -146,7 +262,7 @@ afterEach(async () => {
   }
   const domWindow = window as Window & { happyDOM?: { cancelAsync(): void } };
   domWindow.happyDOM?.cancelAsync();
-  document.body.innerHTML = "";
+    document.body.replaceWith(document.createElement("body"));
 });
 
 describe("file manager UI flow", () => {
@@ -163,6 +279,7 @@ describe("file manager UI flow", () => {
     const html = await readFile(resolve(process.cwd(), "public/file/index.html"), "utf8");
     const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
     expect(body).toBeDefined();
+    document.body.replaceWith(document.createElement("body"));
     document.body.innerHTML = body!;
     expect(document.querySelector("script[src], link[rel='stylesheet']")).toBeNull();
 
@@ -566,6 +683,7 @@ describe("file manager UI flow", () => {
       migrationPreview(104, "migration-cancel-primary", "migration-cancel-r1"),
       filePreview(105, secondaryLibraryId, secondaryRootBinding, "file-cancel-secondary", "file-cancel-secondary-r1"),
       filePreview(106, LIBRARY_ID, ROOT_BINDING, "file-cancel-failure", "file-cancel-failure-r1"),
+      filePreview(107, LIBRARY_ID, ROOT_BINDING, "file-cancel-confirmed", "file-cancel-confirmed-r1"),
     ];
     let currentSnapshot = snapshot(initialOperations, [], 1);
     const initialBundle = await makeChunkedSnapshot(currentSnapshot);
@@ -667,10 +785,11 @@ describe("file manager UI flow", () => {
       migrations: document.querySelectorAll("#migration-preview-list article.stack-card").length,
     });
     const firstPrimaryCounts = primaryPreviewCounts();
-    expect(firstPrimaryCounts.files).toBe(3);
+    expect(firstPrimaryCounts.files).toBe(4);
     expect(firstPrimaryCounts.migrations).toBe(2);
 
     const failedCancelButton = element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="file-cancel-failure"]');
+    const activeCountBeforeFailedCancel = element<HTMLElement>("#waiting-count").textContent;
     const failedCancelRefreshBefore = stateRequests;
     failedCancelButton.click();
     await vi.waitFor(() => expect(actions.some((action) => action.kind === "preview_cancel"
@@ -716,6 +835,50 @@ describe("file manager UI flow", () => {
     expect(element<HTMLButtonElement>('[data-preview-cancel-id="file-cancel-failure"]').disabled).toBe(false);
     expect(element<HTMLButtonElement>('[data-preview-cancel-id="file-cancel-failure"]').textContent).toContain("Retry cancellation");
     expect(element<HTMLButtonElement>('[data-confirm="file-cancel-failure"]').disabled).toBe(false);
+    expect(element<HTMLElement>("#waiting-count").textContent).toBe(activeCountBeforeFailedCancel);
+
+    const activeCountBeforeRetiredCancel = Number(element<HTMLElement>("#waiting-count").textContent);
+    expect(Number.isSafeInteger(activeCountBeforeRetiredCancel)).toBe(true);
+    const retiredCancelRefreshBefore = stateRequests;
+    element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="file-cancel-confirmed"]').click();
+    await vi.waitFor(() => expect(actions.some((action) => action.kind === "preview_cancel"
+      && action.payload?.preview_id === "file-cancel-confirmed")).toBe(true));
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(retiredCancelRefreshBefore));
+    const retiredCancelAction = actions.find((action) => action.kind === "preview_cancel" && action.payload?.preview_id === "file-cancel-confirmed");
+    expect(retiredCancelAction?.payload).toEqual({
+      preview_kind: "file_preview",
+      preview_seq: 107,
+      preview_id: "file-cancel-confirmed",
+      revision: "file-cancel-confirmed-r1",
+    });
+    const retiredCancelAccepted = acceptedActions.find(({ action }) => action.request_id === retiredCancelAction?.request_id);
+    if (!retiredCancelAccepted) throw new Error("Expected the confirmed-preview cancellation to have an accepted HTTP receipt");
+    const retiredCancelFailure = {
+      seq: retiredCancelAccepted.seq,
+      request_id: retiredCancelAction?.request_id,
+      kind: "preview_cancel",
+      status: "failed",
+      error: "This preview was already confirmed before cancellation.",
+      result: {},
+    };
+    const retiredSnapshot = snapshot(
+      [...currentSnapshot.operations.map((operation) => operation.seq === 107 ? { ...operation, status: "completed" } : operation), retiredCancelFailure],
+      currentSnapshot.pending_requests.filter((request) => request.seq !== retiredCancelAccepted.seq),
+      currentSnapshot.state_version + 1,
+    );
+    await publishSnapshot(retiredSnapshot);
+    const requestsBeforeRetiredSnapshot = stateRequests;
+    sockets[0]?.receive({
+      type: "invalidate",
+      database_epoch: TEST_DATABASE_EPOCH,
+      state_version: retiredSnapshot.state_version,
+      reason: "state",
+    });
+    await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(requestsBeforeRetiredSnapshot));
+    expect(document.querySelector('[data-preview-cancel-id="file-cancel-confirmed"]')).toBeNull();
+    expect(element<HTMLElement>("#waiting-count").textContent).toBe(String(activeCountBeforeRetiredCancel - 1));
+    const primaryPreviewCountsAfterRetirement = primaryPreviewCounts();
+    expect(primaryPreviewCountsAfterRetirement.files).toBe(firstPrimaryCounts.files - 1);
 
     const cancelPrimaryFile = element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="file-cancel-primary"]');
     const fileRequestsBeforeCancel = stateRequests;
@@ -723,7 +886,7 @@ describe("file manager UI flow", () => {
     await vi.waitFor(() => expect(actions.some((action) => action.kind === "preview_cancel"
       && action.payload?.preview_id === "file-cancel-primary")).toBe(true));
     await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(fileRequestsBeforeCancel));
-    expect(primaryPreviewCounts().files).toBe(firstPrimaryCounts.files);
+    expect(primaryPreviewCounts().files).toBe(primaryPreviewCountsAfterRetirement.files);
     expect(element<HTMLElement>("#preview-list").textContent).toContain("Review needed");
     const primaryFileCancelAction = actions.find((action) => action.kind === "preview_cancel" && action.payload?.preview_id === "file-cancel-primary");
     expect(primaryFileCancelAction?.payload).toEqual({
@@ -778,16 +941,24 @@ describe("file manager UI flow", () => {
       { ...migrationPreview(104, "migration-cancel-primary", "migration-cancel-r1"), status: "cancelled" },
       { ...filePreview(105, secondaryLibraryId, secondaryRootBinding, "file-cancel-secondary", "file-cancel-secondary-r1"), status: "cancelled" },
       { ...filePreview(106, LIBRARY_ID, ROOT_BINDING, "file-cancel-failure", "file-cancel-failure-r1"), status: "cancelled" },
-      ...acceptedActions.map(({ action, seq }) => ({
+      { ...filePreview(107, LIBRARY_ID, ROOT_BINDING, "file-cancel-confirmed", "file-cancel-confirmed-r1"), status: "completed" },
+      ...acceptedActions.map(({ action, seq }) => {
+        const cancellationError = action.request_id === failedCancelAction?.request_id
+          ? "The computer could not cancel this preview."
+          : action.request_id === retiredCancelAction?.request_id
+            ? "This preview was already confirmed before cancellation."
+            : null;
+        return {
         seq,
         request_id: action.request_id,
         kind: action.kind,
-        status: action.request_id === failedCancelAction?.request_id ? "failed" : "completed",
-        ...(action.request_id === failedCancelAction?.request_id ? { error: "The computer could not cancel this preview." } : {}),
-        result: action.kind === "preview_cancel" && action.request_id !== failedCancelAction?.request_id
+        status: cancellationError ? "failed" : "completed",
+        ...(cancellationError ? { error: cancellationError } : {}),
+        result: action.kind === "preview_cancel" && !cancellationError
           ? { cancelled: true, ...action.payload }
           : { accepted: true, preview_id: action.payload?.preview_id, revision: action.payload?.revision },
-      })),
+        };
+      }),
     ];
     settledOperations[0] = { ...settledOperations[0]!, status: "confirmed" };
     settledOperations[2] = { ...settledOperations[2]!, status: "confirmed" };
@@ -823,8 +994,268 @@ describe("file manager UI flow", () => {
     historySearch.dispatchEvent(new Event("input", { bubbles: true }));
     expect(element<HTMLElement>("#operation-list").textContent).toContain("Preview cancellation");
     expect(element<HTMLElement>("#operation-list").textContent).toContain("Completed");
+
+    historySearch.value = "already confirmed before cancellation";
+    historySearch.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Preview cancellation");
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("This preview was already confirmed before cancellation.");
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Failed");
+
+    historySearch.value = "";
+    historySearch.dispatchEvent(new Event("input", { bubbles: true }));
     expect(element<HTMLElement>("#history-migration-list").textContent).toContain("Primary library → Secondary library");
     expect(element<HTMLElement>("#history-migration-list").textContent).not.toContain("Finish pending finalization");
     expect(element<HTMLElement>("#history-migration-list").textContent).not.toContain("Unfinished task handoff");
+  });
+
+  it("keeps unknown cancellations paused and preserves incomplete offline review identity", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const secondaryLibraryId = "offline-review-library";
+    const secondaryRootBinding = `v1:${"c".repeat(64)}`;
+    const unknownRequestId = "00000000-0000-4000-8000-000000000601";
+    const unknownPayload = {
+      preview_kind: "file_preview",
+      preview_seq: 601,
+      preview_id: "unknown-cancel-preview",
+      revision: "unknown-cancel-r1",
+    };
+    const memoryStorage = makeMemoryStorage();
+    let failCancellationStorageWrite = false;
+    const storage = {
+      getItem: memoryStorage.getItem,
+      setItem(key: string, value: string) {
+        if (failCancellationStorageWrite && key === "file-manager.preview-cancellations.v1") {
+          throw new Error("Simulated cancellation-state storage failure");
+        }
+        memoryStorage.setItem(key, value);
+      },
+      removeItem: memoryStorage.removeItem,
+      clear: memoryStorage.clear,
+    };
+    memoryStorage.setItem("file-manager.actions.v1", JSON.stringify([{
+      request_id: unknownRequestId,
+      kind: "preview_cancel",
+      surface: "file",
+      payload: unknownPayload,
+      queued_at_ms: Date.now(),
+      replay_expires_at_ms: Date.now() + 60 * 60 * 1_000,
+      delivery_outcome: "outcome_unknown",
+      delivery_error_code: "action_replay_window_unverifiable",
+      delivery_error: "Check the computer before trying this cancellation again.",
+    }]));
+
+    const primaryDescriptor = {
+      id: LIBRARY_ID,
+      name: "Primary library",
+      root: "/srv/media",
+      root_binding: ROOT_BINDING,
+      default_category: "Films",
+      availability: "available",
+      available: true,
+      is_default: true,
+    };
+    const secondaryDescriptor = {
+      id: secondaryLibraryId,
+      name: "Offline library",
+      root: "/srv/offline",
+      root_binding: secondaryRootBinding,
+      default_category: "Series",
+      availability: "offline",
+      available: false,
+    };
+    const primaryScan = { ...ownerSnapshot.library, libraries: [], migrations: [], migration_omitted_count: 2 };
+    const migrationPreview = {
+      seq: 602,
+      request_id: "migration-preview-incomplete-offline",
+      kind: "library_migration_preview",
+      status: "awaiting_confirmation",
+      details_incomplete: true,
+      preview_id: "migration-incomplete-offline",
+      revision: "migration-incomplete-r1",
+      reason: "The offline library preview omitted its path details.",
+      result: {
+        id: "migration-incomplete-offline",
+        revision: "migration-incomplete-r1",
+        source_library_id: secondaryLibraryId,
+        target_library_id: LIBRARY_ID,
+        source_root_binding: secondaryRootBinding,
+        target_root_binding: ROOT_BINDING,
+      },
+    };
+    const initialSnapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      settings: {
+        ...ownerSnapshot.settings,
+        applied: {
+          ...ownerSnapshot.settings.applied,
+          default_library_id: LIBRARY_ID,
+          libraries: [primaryDescriptor, secondaryDescriptor],
+        },
+      },
+      library: {
+        ...ownerSnapshot.library,
+        migration_omitted_count: 3,
+        migrations: [],
+        libraries: [
+          { id: LIBRARY_ID, root_binding: ROOT_BINDING, availability: "available", available: true, is_default: true, snapshot: primaryScan },
+          { id: secondaryLibraryId, root_binding: secondaryRootBinding, availability: "offline", available: false },
+        ],
+      },
+      operations: [filePreviewFixture(601, LIBRARY_ID, ROOT_BINDING, "unknown-cancel-preview", "unknown-cancel-r1"), migrationPreview],
+      pending_requests: [],
+      previews: [{ preview_incomplete: true, omitted_count: 2, reason: "Two active preview identities were omitted from this fixture." }],
+    };
+    const fixture = await mountFileManagerFixture(initialSnapshot, storage);
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    expect(element<HTMLElement>("#waiting-count").textContent).toBe("3+");
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("2 active previews were omitted");
+    const aggregateCard = [...document.querySelectorAll<HTMLElement>("#preview-list article.stack-card")]
+      .find((card) => card.textContent?.includes("Two active preview identities were omitted"));
+    expect(aggregateCard).toBeDefined();
+    expect(aggregateCard?.querySelector("[data-preview-cancel], [data-confirm], [data-migration-confirm]")).toBeNull();
+    expect(element<HTMLButtonElement>('[data-confirm="unknown-cancel-preview"]').disabled).toBe(true);
+    expect(document.querySelector('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="unknown-cancel-preview"]')).toBeNull();
+    expect(element<HTMLButtonElement>('[data-preview-cancel-dismiss-kind="file_preview"][data-preview-cancel-dismiss-id="unknown-cancel-preview"]')).toBeDefined();
+    expect(fixture.actions).toHaveLength(0);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+
+    element<HTMLButtonElement>('[data-preview-cancel-dismiss-kind="file_preview"][data-preview-cancel-dismiss-id="unknown-cancel-preview"]').click();
+    expect(JSON.parse(memoryStorage.getItem("file-manager.actions.v1") ?? "null")).toEqual([]);
+    expect(element<HTMLElement>("#preview-list").innerHTML).toContain('data-preview-cancel-kind="file_preview"');
+    expect(element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="unknown-cancel-preview"]').disabled).toBe(false);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+
+    const offlineReview = element<HTMLButtonElement>('[data-review-library="offline-review-library"][data-review-preview-kind="library_migration_preview"][data-review-preview-id="migration-incomplete-offline"]');
+    offlineReview.click();
+    await vi.waitFor(() => expect(element<HappyDOMSelectElement>("#library-select").value).toBe(secondaryLibraryId));
+    expect(element<HTMLElement>("#migration-preview-list").textContent).toContain("The offline library preview omitted its path details.");
+    expect(document.querySelector('[data-migration-confirm="migration-incomplete-offline"]')).toBeNull();
+    const offlineCancel = element<HTMLButtonElement>('[data-preview-cancel-kind="library_migration_preview"][data-preview-cancel-id="migration-incomplete-offline"]');
+    expect(offlineCancel.disabled).toBe(false);
+
+    failCancellationStorageWrite = true;
+    offlineCancel.click();
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+    expect(element<HTMLElement>("#toast").textContent).toContain("could not safely save the cancellation request");
+
+    failCancellationStorageWrite = false;
+    element<HTMLButtonElement>('[data-preview-cancel-kind="library_migration_preview"][data-preview-cancel-id="migration-incomplete-offline"]').click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+    expect(fixture.actions[0]?.payload).toEqual({
+      preview_kind: "library_migration_preview",
+      preview_seq: 602,
+      preview_id: "migration-incomplete-offline",
+      revision: "migration-incomplete-r1",
+    });
+
+    element<HTMLButtonElement>('[data-view="history"]').click();
+    expect(element<HTMLElement>("#history-migration-list").textContent).toContain("5 additional migrations are not included in this view");
+  });
+
+  it("restores an accepted cancellation after reload and settles it only from a terminal snapshot", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const preview = filePreviewFixture(701, LIBRARY_ID, ROOT_BINDING, "reload-cancel-preview", "reload-cancel-r1");
+    const initialSnapshot = { ...ownerSnapshot, state_version: 1, operations: [preview], pending_requests: [], previews: [] };
+    const storage = makeMemoryStorage();
+    const acceptedActions: Array<Record<string, any>> = [];
+    let acceptedPendingSnapshot: Record<string, any> | null = null;
+    const onAction = async (
+      action: Record<string, any>,
+      seq: number,
+      publishSnapshot: (snapshot: Record<string, any>) => Promise<void>,
+    ) => {
+      acceptedActions.push(action);
+      acceptedPendingSnapshot = {
+        ...initialSnapshot,
+        state_version: 2,
+        pending_requests: [{
+          seq,
+          request_id: action.request_id,
+          kind: action.kind,
+          status: "pending",
+          created_at: Math.floor(Date.now() / 1000),
+          payload: action.payload,
+        }],
+      };
+      await publishSnapshot(acceptedPendingSnapshot);
+    };
+    const firstPage = await mountFileManagerFixture(initialSnapshot, storage, onAction);
+    await vi.waitFor(() => expect(firstPage.sockets).toHaveLength(1));
+    await vi.waitFor(() => expect(firstPage.sockets[0]?.readyState).toBe(MockWebSocket.OPEN));
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    const stateRequestsBeforeCancel = firstPage.stateRequests;
+    element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="reload-cancel-preview"]').click();
+    await vi.waitFor(() => expect(acceptedActions).toHaveLength(1));
+    await vi.waitFor(() => expect(firstPage.stateRequests).toBeGreaterThan(stateRequestsBeforeCancel));
+    await vi.waitFor(() => {
+      expect(element<HTMLElement>("#waiting-list").textContent).toContain("Waiting for computer · #901");
+      expect(element<HTMLElement>("#waiting-list").textContent).toContain("Saved in the cloud inbox");
+    });
+    const acceptedCancel = acceptedActions[0]!;
+    expect(acceptedCancel.payload).toEqual({
+      preview_kind: "file_preview",
+      preview_seq: 701,
+      preview_id: "reload-cancel-preview",
+      revision: "reload-cancel-r1",
+    });
+    await vi.waitFor(() => expect(JSON.parse(storage.getItem("file-manager.actions.v1") ?? "null")).toEqual([]));
+    const persisted = JSON.parse(storage.getItem("file-manager.preview-cancellations.v1") ?? "null") as { entries?: Array<{ key: string; tracker: Record<string, unknown> }> } | null;
+    expect(persisted?.entries).toContainEqual({
+      key: JSON.stringify(["file_preview", 701, "reload-cancel-preview", "reload-cancel-r1"]),
+      tracker: { requestId: acceptedCancel.request_id, seq: 901, status: "submitted", error: null },
+    });
+    expect(acceptedPendingSnapshot).not.toBeNull();
+
+    const reloadedPage = await mountFileManagerFixture(acceptedPendingSnapshot!, storage, onAction);
+    await vi.waitFor(() => expect(reloadedPage.sockets).toHaveLength(1));
+    await vi.waitFor(() => expect(reloadedPage.sockets[0]?.readyState).toBe(MockWebSocket.OPEN));
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    await vi.waitFor(() => expect(element<HTMLButtonElement>('[data-confirm="reload-cancel-preview"]').disabled).toBe(true));
+    const restoredCancelButton = element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="reload-cancel-preview"]');
+    expect(restoredCancelButton.disabled).toBe(true);
+    expect(restoredCancelButton.textContent).toContain("Cancel request submitted");
+    expect(acceptedActions).toHaveLength(1);
+    expect(reloadedPage.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+
+    const terminalSnapshot = {
+      ...acceptedPendingSnapshot!,
+      state_version: 3,
+      operations: [
+        { ...preview, status: "cancelled" },
+        {
+          seq: 901,
+          request_id: acceptedCancel.request_id,
+          kind: "preview_cancel",
+          status: "completed",
+          result: { cancelled: true, ...acceptedCancel.payload },
+        },
+      ],
+      pending_requests: [],
+    };
+    await reloadedPage.publishSnapshot(terminalSnapshot);
+    const stateRequestsBeforeTerminal = reloadedPage.stateRequests;
+    reloadedPage.sockets[0]?.receive({
+      type: "invalidate",
+      database_epoch: TEST_DATABASE_EPOCH,
+      state_version: 3,
+      reason: "state",
+    });
+    await vi.waitFor(() => expect(reloadedPage.stateRequests).toBeGreaterThan(stateRequestsBeforeTerminal));
+    await vi.waitFor(() => expect(document.querySelector('[data-preview-cancel-id="reload-cancel-preview"]')).toBeNull());
+    await vi.waitFor(() => expect(element<HTMLElement>("#history-count").textContent).toBe("2"));
+    expect(element<HTMLElement>("#waiting-count").textContent).toBe("0");
+
+    element<HTMLButtonElement>('[data-view="history"]').click();
+    expect(element<HTMLInputElement>("#history-search").value).toBe("");
+    expect(element<HTMLElement>("#history-summary").textContent).toContain("2 recent records retained");
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Preview cancellation");
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Completed");
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("File preview");
+    expect(element<HTMLElement>("#operation-list").textContent).toContain("Cancelled");
   });
 });

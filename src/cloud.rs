@@ -998,6 +998,8 @@ struct InboxStateIndex {
     awaiting_preview_expiry_seconds_by_sequence: BTreeMap<u64, u64>,
     active_confirmations: BTreeMap<String, BTreeSet<(Option<u64>, u64)>>,
     active_confirmation_by_sequence: BTreeMap<u64, (String, Option<u64>)>,
+    terminal_confirmations: BTreeMap<String, BTreeMap<u64, InboxStatus>>,
+    terminal_confirmation_by_sequence: BTreeMap<u64, String>,
 }
 
 impl InboxStateIndex {
@@ -1070,6 +1072,14 @@ impl InboxStateIndex {
             self.active_confirmation_by_sequence
                 .insert(record.request.seq, (preview_key, received_at_seconds));
         }
+        if let Some(confirmation_key) = terminal_confirmation_index_key(record) {
+            self.terminal_confirmations
+                .entry(confirmation_key.clone())
+                .or_default()
+                .insert(record.request.seq, record.status);
+            self.terminal_confirmation_by_sequence
+                .insert(record.request.seq, confirmation_key);
+        }
     }
 
     fn forget(&mut self, seq: u64) {
@@ -1108,6 +1118,18 @@ impl InboxStateIndex {
                 self.active_confirmations.remove(&preview_id);
             }
         }
+        if let Some(confirmation_key) = self.terminal_confirmation_by_sequence.remove(&seq) {
+            let remove_confirmation = self
+                .terminal_confirmations
+                .get_mut(&confirmation_key)
+                .is_some_and(|confirmations| {
+                    let _ = confirmations.remove(&seq);
+                    confirmations.is_empty()
+                });
+            if remove_confirmation {
+                self.terminal_confirmations.remove(&confirmation_key);
+            }
+        }
     }
 
     fn awaiting_preview_sequence_for_kind(
@@ -1136,6 +1158,36 @@ impl InboxStateIndex {
                     .next()
                     .is_some()
             })
+    }
+
+    fn terminal_confirmation_disposition_after(
+        &self,
+        preview_kind: &str,
+        preview_id: &str,
+        revision: &str,
+        preview_seq: u64,
+    ) -> Option<InboxStatus> {
+        let confirmations =
+            self.terminal_confirmations
+                .get(&terminal_confirmation_index_key_for_identity(
+                    preview_kind,
+                    preview_id,
+                    revision,
+                ))?;
+        let confirmations = confirmations.range((
+            std::ops::Bound::Excluded(preview_seq),
+            std::ops::Bound::Unbounded,
+        ));
+        let mut failed_or_uncertain = false;
+        for (_, status) in confirmations {
+            if *status == InboxStatus::Completed {
+                return Some(InboxStatus::Completed);
+            }
+            if matches!(status, InboxStatus::Failed | InboxStatus::Uncertain) {
+                failed_or_uncertain = true;
+            }
+        }
+        failed_or_uncertain.then_some(InboxStatus::Stale)
     }
 
     fn has_preexpiry_confirmation_for_preview(&self, preview_id: &str) -> Option<bool> {
@@ -1266,6 +1318,51 @@ fn inbox_preview_revision(record: &InboxRecord) -> Option<&str> {
                 .and_then(Value::as_str)
         })
     })
+}
+
+fn terminal_confirmation_index_key(record: &InboxRecord) -> Option<String> {
+    let preview_kind = match record.request.kind.as_str() {
+        "file_confirm" => "file_preview",
+        "library_migration_confirm" => "library_migration_preview",
+        _ => return None,
+    };
+    if !matches!(
+        record.status,
+        InboxStatus::Completed | InboxStatus::Failed | InboxStatus::Uncertain
+    ) {
+        return None;
+    }
+    let preview_id = record
+        .request
+        .payload
+        .get("preview_id")
+        .and_then(Value::as_str)
+        .filter(|id| preview_identifier_is_indexable(id))?;
+    let revision = record
+        .request
+        .payload
+        .get("revision")
+        .and_then(Value::as_str)
+        .filter(|revision| {
+            valid_preview_cancel_scalar(revision, MAX_PREVIEW_CANCEL_REVISION_BYTES)
+        })?;
+
+    Some(terminal_confirmation_index_key_for_identity(
+        preview_kind,
+        preview_id,
+        revision,
+    ))
+}
+
+fn terminal_confirmation_index_key_for_identity(
+    preview_kind: &str,
+    preview_id: &str,
+    revision: &str,
+) -> String {
+    format!(
+        "{}\0{revision}",
+        preview_index_key(preview_kind, preview_id)
+    )
 }
 
 fn valid_preview_cancel_scalar(value: &str, max_bytes: usize) -> bool {
@@ -1859,14 +1956,48 @@ impl CloudInbox {
         }
 
         let preview_key = preview_index_key(preview_kind, preview_id);
-        if self
-            .state_index
-            .lock()
-            .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?
-            .active_confirmations
-            .get(&preview_key)
-            .is_some_and(|confirmations| !confirmations.is_empty())
-        {
+        let terminal_disposition = {
+            let state_index = self
+                .state_index
+                .lock()
+                .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
+            if state_index
+                .active_confirmations
+                .get(&preview_key)
+                .is_some_and(|confirmations| !confirmations.is_empty())
+            {
+                return Ok(None);
+            }
+            state_index.terminal_confirmation_disposition_after(
+                preview_kind,
+                preview_id,
+                revision,
+                preview_seq,
+            )
+        };
+        if let Some(disposition) = terminal_disposition {
+            self.update_checked_locked(preview_seq, |record| {
+                if record.request.seq != preview_seq
+                    || record.request.kind != preview_kind
+                    || record.status != InboxStatus::AwaitingConfirmation
+                    || inbox_abandoned_preview_expired(record, now_seconds())
+                    || inbox_preview_id(record) != Some(preview_id)
+                    || inbox_preview_revision(record) != Some(revision)
+                {
+                    bail!("preview changed before terminal confirmation recovery");
+                }
+                record.status = disposition;
+                record.next_attempt_at = 0;
+                record.error = match disposition {
+                    InboxStatus::Completed => None,
+                    InboxStatus::Stale => Some(
+                        "A confirmation attempt for this preview failed or became uncertain. Run a fresh preview before making changes."
+                            .to_string(),
+                    ),
+                    _ => bail!("invalid terminal confirmation disposition"),
+                };
+                Ok(())
+            })?;
             return Ok(None);
         }
 
@@ -4904,6 +5035,351 @@ mod tests {
         assert_eq!(replayed.status, InboxStatus::Cancelled);
         assert_eq!(replayed.result, Some(original_result));
         drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn completed_confirmation_proof_survives_history_eviction_and_reopen() {
+        let root = temp_root("preview-cancel-completed-proof");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        finish_initial_recovery(&inbox);
+
+        let preview_id = "preview-cancel-completed-proof";
+        persist_awaiting_preview(&inbox, preview_inbox_record(1, preview_id, now_seconds()));
+        let original_preview_result = inbox
+            .record(1)
+            .expect("preview should be readable")
+            .expect("preview should be stored")
+            .result;
+        inbox
+            .persist(
+                confirmation_inbox_record(
+                    2,
+                    preview_id,
+                    InboxStatus::Pending,
+                    now_millis(),
+                    Some(now_seconds()),
+                )
+                .request,
+            )
+            .expect("confirmation should persist");
+        inbox
+            .update(2, |record| {
+                record.status = InboxStatus::Completed;
+                // The original payload identity remains available even if compaction or a
+                // legacy receipt omitted the generated result.
+                record.result = None;
+            })
+            .expect("completed confirmation receipt should persist");
+
+        // Model a crash after the primary confirmation receipt is durable but before the
+        // related-preview status write: the target remains AwaitingConfirmation.
+        for seq in 3..=130 {
+            let mut management = request(seq, "history");
+            management.kind = "library_scan".to_string();
+            inbox
+                .persist(management)
+                .expect("history request should persist");
+            inbox
+                .update(seq, |record| record.status = InboxStatus::Completed)
+                .expect("history request should become terminal");
+        }
+        let target_bytes = fs::read(inbox.record_path(1)).expect("target bytes should be readable");
+        let (history, _) = inbox
+            .state_records_bounded(10)
+            .expect("bounded history should be readable");
+        assert!(
+            !history.iter().any(|record| record.request.seq == 2),
+            "the confirmation receipt should have fallen outside recent management history"
+        );
+        assert_eq!(
+            inbox
+                .record(1)
+                .expect("target should be readable")
+                .expect("target should remain stored")
+                .status,
+            InboxStatus::AwaitingConfirmation
+        );
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        finish_initial_recovery(&reopened);
+        let (history, _) = reopened
+            .state_records_bounded(10)
+            .expect("rebuilt bounded history should be readable");
+        assert!(
+            !history.iter().any(|record| record.request.seq == 2),
+            "reopen should not republish the old confirmation in recent history"
+        );
+        assert!(
+            reopened
+                .cancel_awaiting_preview("file_preview", 1, preview_id, "revision-1")
+                .expect("completed confirmation should block cancellation")
+                .is_none(),
+            "a completed confirmation must repair its target even after the related-preview write was lost"
+        );
+        let target = reopened
+            .record(1)
+            .expect("target should remain readable")
+            .expect("target should remain stored");
+        assert_eq!(target.status, InboxStatus::Completed);
+        assert_eq!(inbox_preview_id(&target), Some(preview_id));
+        assert_eq!(inbox_preview_revision(&target), Some("revision-1"));
+        assert_eq!(target.result, original_preview_result);
+        assert_ne!(
+            fs::read(reopened.record_path(1)).expect("repaired target bytes should be readable"),
+            target_bytes,
+            "the terminal preview repair should be durable"
+        );
+
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_confirmation_index_prefers_completed_and_prunes_forgotten_receipts() {
+        let preview_id = "preview-cancel-index-pruning";
+        let mut index = InboxStateIndex::default();
+        let mut failed = confirmation_inbox_record(
+            2,
+            preview_id,
+            InboxStatus::Failed,
+            now_millis(),
+            Some(now_seconds()),
+        );
+        failed.result = None;
+        index.record(&failed);
+        let mut completed = confirmation_inbox_record(
+            3,
+            preview_id,
+            InboxStatus::Completed,
+            now_millis(),
+            Some(now_seconds()),
+        );
+        completed.result = None;
+        index.record(&completed);
+
+        assert_eq!(
+            index.terminal_confirmation_disposition_after(
+                "file_preview",
+                preview_id,
+                "revision-1",
+                1,
+            ),
+            Some(InboxStatus::Completed),
+            "any matching completed receipt must win over failed attempts"
+        );
+        index.forget(3);
+        assert_eq!(
+            index.terminal_confirmation_disposition_after(
+                "file_preview",
+                preview_id,
+                "revision-1",
+                1,
+            ),
+            Some(InboxStatus::Stale),
+            "failed receipts alone should retire a preview as stale"
+        );
+        index.forget(2);
+        assert_eq!(
+            index.terminal_confirmation_disposition_after(
+                "file_preview",
+                preview_id,
+                "revision-1",
+                1,
+            ),
+            None,
+            "forgetting the retained receipts should prune the reverse index"
+        );
+    }
+
+    #[test]
+    fn failed_confirmation_retires_preview_and_mismatched_failure_allows_cancel() {
+        let root = temp_root("preview-cancel-failed-confirm-proof");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        finish_initial_recovery(&inbox);
+
+        let partial_id = "preview-cancel-partial-failure";
+        persist_awaiting_preview(&inbox, preview_inbox_record(1, partial_id, now_seconds()));
+        inbox
+            .persist(
+                confirmation_inbox_record(
+                    2,
+                    partial_id,
+                    InboxStatus::Pending,
+                    now_millis(),
+                    Some(now_seconds()),
+                )
+                .request,
+            )
+            .expect("partial-failure confirmation should persist");
+        inbox
+            .update(2, |record| {
+                record.status = InboxStatus::Failed;
+                record.result = Some(json!({
+                    "preview_id": partial_id,
+                    "revision": "revision-1",
+                    "operation": {"status": "partial", "moved": 1}
+                }));
+            })
+            .expect("partial execution failure should persist");
+        assert!(
+            inbox
+                .cancel_awaiting_preview("file_preview", 1, partial_id, "revision-1")
+                .expect("saved execution failure should retire the stale preview")
+                .is_none(),
+            "a failure receipt with matching identity may represent partial effects"
+        );
+        let partial_preview = inbox
+            .record(1)
+            .expect("partial preview should be readable")
+            .expect("partial preview should remain stored");
+        assert_eq!(partial_preview.status, InboxStatus::Stale);
+        assert_eq!(inbox_preview_id(&partial_preview), Some(partial_id));
+
+        let validation_id = "preview-cancel-validation-failure";
+        persist_awaiting_preview(
+            &inbox,
+            preview_inbox_record(3, validation_id, now_seconds()),
+        );
+        let mut wrong_revision_confirmation = confirmation_inbox_record(
+            4,
+            validation_id,
+            InboxStatus::Pending,
+            now_millis(),
+            Some(now_seconds()),
+        )
+        .request;
+        wrong_revision_confirmation.payload =
+            json!({"preview_id": validation_id, "revision": "wrong-revision"});
+        inbox
+            .persist(wrong_revision_confirmation)
+            .expect("preexecution confirmation should persist");
+        inbox
+            .update(4, |record| record.status = InboxStatus::Failed)
+            .expect("mismatched preexecution failure should persist");
+        assert!(
+            inbox
+                .cancel_awaiting_preview("file_preview", 3, validation_id, "revision-1")
+                .expect("mismatched failed confirmation should allow cancellation")
+                .is_some(),
+            "a failed receipt for another revision must not strand this preview"
+        );
+
+        let failed_id = "preview-cancel-failed-without-result";
+        persist_awaiting_preview(&inbox, preview_inbox_record(5, failed_id, now_seconds()));
+        inbox
+            .persist(
+                confirmation_inbox_record(
+                    6,
+                    failed_id,
+                    InboxStatus::Pending,
+                    now_millis(),
+                    Some(now_seconds()),
+                )
+                .request,
+            )
+            .expect("failed confirmation without a result should persist");
+        inbox
+            .update(6, |record| record.status = InboxStatus::Failed)
+            .expect("preexecution failure without a result should persist");
+        assert!(
+            inbox
+                .cancel_awaiting_preview("file_preview", 5, failed_id, "revision-1")
+                .expect("matching failed attempt should retire the preview")
+                .is_none()
+        );
+        assert_eq!(
+            inbox
+                .record(5)
+                .expect("failed preview should be readable")
+                .expect("failed preview should remain stored")
+                .status,
+            InboxStatus::Stale,
+            "a failed attempt without an execution result should be retired only when cancellation is requested"
+        );
+
+        let uncertain_id = "preview-cancel-uncertain-without-result";
+        persist_awaiting_preview(&inbox, preview_inbox_record(7, uncertain_id, now_seconds()));
+        inbox
+            .persist(
+                confirmation_inbox_record(
+                    8,
+                    uncertain_id,
+                    InboxStatus::Pending,
+                    now_millis(),
+                    Some(now_seconds()),
+                )
+                .request,
+            )
+            .expect("uncertain confirmation should persist");
+        inbox
+            .update(8, |record| record.status = InboxStatus::Uncertain)
+            .expect("uncertain confirmation should persist its terminal state");
+        assert!(
+            inbox
+                .cancel_awaiting_preview("file_preview", 7, uncertain_id, "revision-1")
+                .expect("uncertain attempt should retire the preview")
+                .is_none()
+        );
+        assert_eq!(
+            inbox
+                .record(7)
+                .expect("uncertain preview should be readable")
+                .expect("uncertain preview should remain stored")
+                .status,
+            InboxStatus::Stale
+        );
+
+        drop(inbox);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn older_terminal_confirmation_does_not_block_a_later_preview_with_reused_identity() {
+        let root = temp_root("preview-cancel-reused-identity");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        finish_initial_recovery(&inbox);
+
+        let preview_id = "preview-cancel-reused-id";
+        persist_awaiting_preview(&inbox, preview_inbox_record(1, preview_id, now_seconds()));
+        inbox
+            .persist(
+                confirmation_inbox_record(
+                    2,
+                    preview_id,
+                    InboxStatus::Pending,
+                    now_millis(),
+                    Some(now_seconds()),
+                )
+                .request,
+            )
+            .expect("old confirmation should persist");
+        inbox
+            .update(2, |record| {
+                record.status = InboxStatus::Completed;
+                record.result = Some(json!({
+                    "preview_id": preview_id,
+                    "revision": "revision-1",
+                    "operation": {"status": "complete"}
+                }));
+            })
+            .expect("old confirmation should complete");
+
+        // Request sequences are allocated monotonically, so a terminal receipt before this
+        // proposal cannot prove that the later proposal was executed.
+        persist_awaiting_preview(&inbox, preview_inbox_record(3, preview_id, now_seconds()));
+        assert!(
+            inbox
+                .cancel_awaiting_preview("file_preview", 3, preview_id, "revision-1")
+                .expect("an earlier confirmation should not block a later proposal")
+                .is_some()
+        );
+
+        drop(inbox);
         let _ = fs::remove_dir_all(root);
     }
 

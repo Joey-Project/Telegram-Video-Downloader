@@ -9434,6 +9434,276 @@ fn preview_cancel_test_payload(
 }
 
 #[tokio::test]
+async fn preview_cancel_rejects_completed_confirmation_after_history_eviction_and_reopen_mock_telegram_e2e()
+ {
+    const PREVIEW_SEQ: u64 = 19_101;
+    const CONFIRM_SEQ: u64 = 19_102;
+    const CANCEL_SEQ: u64 = 19_103;
+    const HISTORY_START_SEQ: u64 = 30_000;
+    const HISTORY_RECORDS: u64 = 120;
+
+    let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = media_library_e2e_tests::create_migration_fixture(
+        "preview-cancel-confirmation-gap-e2e",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let source_bytes = b"confirmed source moves exactly once";
+    let source_path = fixture.archive_root.join("crash-confirm.mp4");
+    fs::write(&source_path, source_bytes).expect("confirmation fixture should be written");
+
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let root_binding = cloud_test_root_binding(&queue, &fixture.target_library_id);
+    let item_id = media_library_e2e_tests::scan_file_item_id(
+        &runtime,
+        19_100,
+        &fixture.target_library_id,
+        "crash-confirm.mp4",
+    )
+    .await;
+    let preview = run_library_management_test_request(
+        &runtime,
+        PREVIEW_SEQ,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": root_binding,
+            "item_ids": [item_id],
+            "target_relative_dir": "confirmed-after-restart",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(
+        preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "file preview should be ready before confirmation: {:?}",
+        preview.error
+    );
+    let preview_result = preview.result.expect("preview result should be retained");
+    let preview_id = preview_result["preview_id"]
+        .as_str()
+        .expect("preview ID should be present")
+        .to_string();
+    let revision = preview_result["revision"]
+        .as_str()
+        .expect("preview revision should be present")
+        .to_string();
+
+    let confirmation = run_library_management_test_request(
+        &runtime,
+        CONFIRM_SEQ,
+        "file_confirm",
+        serde_json::json!({
+            "preview_id": preview_id,
+            "revision": revision,
+        }),
+    )
+    .await;
+    assert_eq!(
+        confirmation.status,
+        InboxStatus::Completed,
+        "the real confirmation should complete before the simulated crash gap: {:?}",
+        confirmation.error
+    );
+    let confirmation_result = confirmation
+        .result
+        .clone()
+        .expect("completed confirmation should preserve its result");
+    assert_eq!(confirmation_result["preview_id"], preview_id);
+    assert_eq!(confirmation_result["revision"], revision);
+    let confirmed_path = fixture
+        .archive_root
+        .join("confirmed-after-restart/crash-confirm.mp4");
+    assert_eq!(fs::read(&confirmed_path).unwrap(), source_bytes);
+    assert!(
+        !source_path.exists(),
+        "confirmation should move the source file"
+    );
+
+    // Leave the completed confirmation receipt intact, as if restart happened after its durable
+    // write but before the related preview update was persisted.
+    let management_permit = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.management_dispatch.clone().acquire_owned(),
+    )
+    .await
+    .expect("confirmation dispatch should finish before simulating the crash gap")
+    .expect("management semaphore should remain open");
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(management_permit);
+    let stored_confirmation = inbox
+        .record(CONFIRM_SEQ)
+        .expect("completed confirmation should reload")
+        .expect("completed confirmation receipt should remain present");
+    assert_eq!(stored_confirmation.status, InboxStatus::Completed);
+    assert_eq!(
+        stored_confirmation.result,
+        Some(confirmation_result.clone())
+    );
+    let stored_preview = inbox
+        .record(PREVIEW_SEQ)
+        .expect("preview should reload before simulating the gap")
+        .expect("preview receipt should remain present");
+    let original_preview_result = stored_preview
+        .result
+        .clone()
+        .expect("original preview result should remain durable");
+    inbox
+        .update(PREVIEW_SEQ, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+        })
+        .expect("the simulated crash gap should preserve an awaiting preview record");
+    assert_eq!(
+        inbox.record(PREVIEW_SEQ).unwrap().unwrap().result,
+        Some(original_preview_result.clone())
+    );
+
+    for offset in 0..HISTORY_RECORDS {
+        let seq = HISTORY_START_SEQ + offset;
+        inbox
+            .persist(CloudRequest {
+                seq,
+                kind: "library_scan".to_string(),
+                payload: serde_json::json!({ "history_fixture": true, "ordinal": offset }),
+                created_at: now_millis(),
+                extra: serde_json::Map::new(),
+            })
+            .expect("unrelated management receipt should persist");
+        inbox
+            .update(seq, |record| {
+                record.status = InboxStatus::Completed;
+                record.result = Some(serde_json::json!({ "history_fixture": true }));
+            })
+            .expect("unrelated management receipt should become terminal");
+    }
+
+    let (bounded_history, _) = inbox
+        .state_records_bounded(20)
+        .expect("bounded UI history should remain readable");
+    assert!(
+        bounded_history
+            .iter()
+            .all(|record| record.request.seq != CONFIRM_SEQ),
+        "completed confirmation should be evicted from bounded recent management history"
+    );
+    assert_eq!(
+        inbox.record(CONFIRM_SEQ).unwrap().unwrap().result,
+        Some(confirmation_result.clone()),
+        "history eviction must not delete the durable confirmation proof"
+    );
+
+    drop(inbox);
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&fixture.video_root).expect("crash-gap inbox should reopen"),
+    );
+    // Startup indexing is intentionally paged; continue it before submitting the next request.
+    for _ in 0..16 {
+        let _ = inbox
+            .pending()
+            .expect("bounded inbox recovery should make progress");
+    }
+    let (reopened_history, _) = inbox
+        .state_records_bounded(20)
+        .expect("reopened inbox should finish its bounded index recovery");
+    assert!(
+        reopened_history
+            .iter()
+            .all(|record| record.request.seq != CONFIRM_SEQ),
+        "reopened UI history should still omit the evicted confirmation"
+    );
+    assert_eq!(
+        inbox
+            .record(CONFIRM_SEQ)
+            .expect("confirmation proof should reload after restart")
+            .expect("confirmation proof should remain stored after UI eviction")
+            .result,
+        Some(confirmation_result.clone())
+    );
+
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let cancellation = run_library_management_test_request(
+        &runtime,
+        CANCEL_SEQ,
+        "preview_cancel",
+        preview_cancel_test_payload("file_preview", PREVIEW_SEQ, &preview_id, &revision),
+    )
+    .await;
+    assert!(
+        matches!(
+            cancellation.status,
+            InboxStatus::Failed | InboxStatus::Uncertain
+        ),
+        "a durable completed confirmation must block cancellation: {:?} {:?}",
+        cancellation.status,
+        cancellation.error
+    );
+    assert_ne!(cancellation.status, InboxStatus::Cancelled);
+    assert!(
+        !cancellation
+            .result
+            .as_ref()
+            .is_some_and(|result| result["cancelled"].as_bool() == Some(true))
+    );
+    let preview_after_cancel_attempt = inbox
+        .record(PREVIEW_SEQ)
+        .expect("preview should reload after the rejected cancellation")
+        .expect("preview receipt should remain stored");
+    assert_eq!(
+        preview_after_cancel_attempt.status,
+        InboxStatus::Completed,
+        "terminal confirmation proof should retire the stale awaiting preview"
+    );
+    assert_eq!(
+        preview_after_cancel_attempt.result,
+        Some(original_preview_result)
+    );
+    let confirmation_after_cancel_attempt = inbox
+        .record(CONFIRM_SEQ)
+        .expect("confirmation should reload after the rejected cancellation")
+        .expect("confirmation receipt should remain stored");
+    assert_eq!(
+        confirmation_after_cancel_attempt.status,
+        InboxStatus::Completed
+    );
+    assert_eq!(
+        confirmation_after_cancel_attempt.result,
+        Some(confirmation_result)
+    );
+    assert_eq!(fs::read(&confirmed_path).unwrap(), source_bytes);
+    assert!(!source_path.exists());
+
+    let permit = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.management_dispatch.clone().acquire_owned(),
+    )
+    .await
+    .expect("management dispatch should finish before cleanup")
+    .expect("management semaphore should remain open");
+    drop(permit);
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test]
 async fn preview_cancel_is_durable_binding_independent_and_preserves_completed_files_mock_telegram_e2e()
  {
     const CONFIRM_PREVIEW_SEQ: u64 = 9_501;

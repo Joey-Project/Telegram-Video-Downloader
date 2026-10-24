@@ -3045,7 +3045,7 @@ async fn dispatch_cloud_preview_cancel(
 
     if cancelled.is_none() {
         return Ok(cloud_dispatch_failure(
-            "This preview is no longer cancellable or its identity does not match. Refresh pending previews.",
+            "This preview is no longer cancellable or its identity does not match. Refresh Requests and check History or Organizing for any prior confirmation.",
         ));
     }
 

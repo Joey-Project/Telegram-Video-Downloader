@@ -346,10 +346,10 @@ function fullPreview(operation, result, options) {
     && typeof result.target_root_binding === "string" && ROOT_BINDING_PATTERN.test(result.target_root_binding);
   const rootBindingsMatch = rootBindingsValid && options.rootBindingsMatch === true;
   if (operation?.incomplete || !Array.isArray(result.items)) {
-    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>${escapeHtml(operation?.reason ?? "Preview details are unavailable in this cloud snapshot. Request a fresh preview before confirming.")}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>${escapeHtml(operation?.reason ?? "Preview details are unavailable in this cloud snapshot. Request a fresh preview before confirming.")}</p></div><span class="state-pill pending">Refresh required</span></div><div class="stack-actions">${options.cancelMarkup ?? ""}</div></article>`;
   }
   if ((resultId !== undefined && resultId !== id) || (resultRevision !== undefined && resultRevision !== revision)) {
-    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>The preview identity changed while its details were being loaded. Request a fresh preview before continuing.</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>The preview identity changed while its details were being loaded. Request a fresh preview before continuing.</p></div><span class="state-pill pending">Refresh required</span></div><div class="stack-actions">${options.cancelMarkup ?? ""}</div></article>`;
   }
   const files = result.items;
   const candidateDraft = options.draft && typeof options.draft === "object" ? options.draft : null;

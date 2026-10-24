@@ -59,7 +59,7 @@ export function markUnknownFileAction(state, action) {
   if (action.kind === "preview_cancel" && state.previewCancellations instanceof Map) {
     for (const tracker of state.previewCancellations.values()) {
       if (tracker?.requestId !== requestId) continue;
-      tracker.status = UNKNOWN_OUTCOME;
+      tracker.status = "unknown";
       tracker.error = boundedMessage(action);
     }
   }
