@@ -382,7 +382,9 @@ describe("snapshot updates browser flows", () => {
     const readGate = server.holdNextState();
     const beforeCoalescedRead = server.counts.states;
     socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 3, reason: "state" });
-    await vi.advanceTimersByTimeAsync(0);
+    // Invalidation refreshes are throttled to one per second; advance that scheduled window
+    // so the held-state gate, rather than an immediate-request assumption, signals the read.
+    await vi.advanceTimersByTimeAsync(1_000);
     await vi.waitFor(() => expect(server.counts.states).toBe(beforeCoalescedRead + 1));
     socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 4, reason: "inbox" });
     socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 5, reason: "state" });
@@ -400,7 +402,7 @@ describe("snapshot updates browser flows", () => {
     const lateReadGate = server.holdNextState();
     const beforeLateRead = server.counts.states;
     socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 6, reason: "state" });
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(1_000);
     await vi.waitFor(() => expect(server.counts.states).toBe(beforeLateRead + 1));
     socket.serverClose(4401, "Owner authorization expired");
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(true));

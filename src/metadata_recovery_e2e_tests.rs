@@ -491,6 +491,108 @@ async fn metadata_recovery_mock_telegram_cloud_e2e_preview_confirm_rescan_and_st
 }
 
 #[tokio::test]
+async fn metadata_recovery_verified_membership_without_order_confirms_without_guessing() {
+    let bvid = "BV1ab411C7x1";
+    let resolver: TestMetadataRecoveryResolver = Arc::new(move |query: RecoveryQuery| {
+        Box::pin(async move {
+            let mut entry =
+                resolved_entry(&query.source_id, "Provider title", "bilibili:collection:42");
+            let collection = entry.collection.as_mut().unwrap();
+            collection.kind = "bilibili_collection".to_string();
+            collection.order = None;
+            Ok(vec![entry])
+        })
+    });
+    let nfo = source_metadata(bvid, "Manually curated title");
+    let harness = recovery_harness(
+        "metadata-recovery-partial-membership",
+        &[("episode.mp4", &nfo)],
+        resolver,
+    )
+    .await;
+    let original_video = fs::read(harness.video_root.join("episode.mp4")).unwrap();
+    let scan = harness.rescan(71).await;
+    let item_id = snapshot_item_id(&scan, "episode.mp4");
+    let analysis = harness
+        .request(
+            72,
+            "metadata_recover",
+            json!({
+                "scope": "selected", "item_ids": [item_id],
+            }),
+        )
+        .await;
+    assert_eq!(
+        analysis.status,
+        InboxStatus::Completed,
+        "{:?}",
+        analysis.error
+    );
+    let report = recovery_report(&analysis);
+    let recovered = find_recovery_item(report, &item_id);
+    assert_eq!(recovered["status"], "ready");
+    assert_eq!(
+        recovered["patch"]["collection"]["id"],
+        "bilibili:collection:42"
+    );
+    assert!(recovered["patch"]["collection"]["order"].is_null());
+    let preview = harness
+        .request(
+            73,
+            "file_preview",
+            json!({
+                "expected_revision": report["revision"], "item_ids": [item_id],
+                "metadata_patches": [recovered["patch"]],
+            }),
+        )
+        .await;
+    assert_eq!(
+        preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        preview.error
+    );
+    let receipt = result_from(&preview);
+    let confirmation = harness
+        .request(
+            74,
+            "file_confirm",
+            json!({
+                "preview_id": receipt["preview_id"], "revision": receipt["revision"],
+            }),
+        )
+        .await;
+    assert_eq!(
+        confirmation.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmation.error
+    );
+    let scan = harness.rescan(75).await;
+    let item = scan.result.as_ref().unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == item_id)
+        .unwrap();
+    assert_eq!(item["title"], "Manually curated title");
+    assert_eq!(item["collection"]["id"], "bilibili:collection:42");
+    assert_eq!(item["collection"]["title"], "Recovered series");
+    assert!(item["collection"]["order"].is_null());
+    assert_eq!(item["collection"]["part_id"], "123456789");
+    assert_eq!(
+        fs::read(harness.video_root.join("episode.mp4")).unwrap(),
+        original_video
+    );
+    assert!(
+        fs::read_to_string(harness.video_root.join("episode.nfo"))
+            .unwrap()
+            .contains("<future>preserve</future>")
+    );
+    harness.close().await;
+}
+
+#[tokio::test]
 async fn metadata_recovery_ambiguity_and_provider_failure_report_without_writes() {
     let ambiguous_id = "BV1ab411C7x1";
     let offline_id = "BV1xx411c7mD";
@@ -515,7 +617,11 @@ async fn metadata_recovery_ambiguity_and_provider_failure_report_without_writes(
                     },
                 ])
             } else {
-                Err(anyhow!("metadata provider unavailable"))
+                Err(anyhow!(bbdown_core::Error::Api {
+                    code: -412,
+                    message: "private-provider-detail-must-not-be-published".to_string(),
+                })
+                .context("private transport context must not reach the cloud report"))
             }
         })
     });
@@ -555,7 +661,30 @@ async fn metadata_recovery_ambiguity_and_provider_failure_report_without_writes(
     assert!(ambiguous["candidates"].as_array().unwrap().len() >= 2);
     let offline = find_recovery_item(report, &offline_item_id);
     assert_eq!(offline["status"], "unavailable");
-    assert!(!offline["reason"].as_str().unwrap_or_default().is_empty());
+    assert!(
+        offline["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("412")
+    );
+    let published_report = serde_json::to_string(report).unwrap();
+    assert!(!published_report.contains("private-provider-detail"));
+    assert!(!published_report.contains("private transport context"));
+    let published_state = build_cloud_state_snapshot(harness.runtime.as_ref().unwrap())
+        .await
+        .expect("completed recovery snapshot should build")
+        .expect("completed recovery snapshot should be available");
+    let receipt = published_state
+        .operations
+        .iter()
+        .find(|operation| operation["seq"] == 21)
+        .expect("recovery receipt should reach the cloud snapshot");
+    assert_eq!(receipt["status"], "completed");
+    let projected_offline = find_recovery_item(&receipt["result"]["recovery"], &offline_item_id);
+    assert_eq!(projected_offline["reason"], offline["reason"]);
+    let published_state = serde_json::to_string(&published_state.operations).unwrap();
+    assert!(!published_state.contains("private-provider-detail"));
+    assert!(!published_state.contains("private transport context"));
     assert_eq!(
         fs::read(harness.video_root.join("ambiguous.nfo")).unwrap(),
         ambiguous_nfo
