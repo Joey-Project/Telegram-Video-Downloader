@@ -22,7 +22,22 @@ type RejectionTrackerState = {
   localActions?: ReadonlyMap<string, LocalActionReceiptTracker>;
   downloadSubmission?: DownloadSubmissionReceiptTracker | null;
   migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
+  previewCancellations?: ReadonlyMap<string, PreviewCancellationReceiptTracker>;
 };
+
+type PreviewCancellationReceiptTracker = {
+  requestId: string | null;
+  seq: number | null;
+  status: "queued" | "submitted" | "failed" | "unknown";
+  error: string | null;
+};
+
+const PREVIEW_CANCEL_REQUEST_ID = "00000000-0000-4000-8000-000000000001";
+const PREVIEW_CANCEL_TRACKER_KEY = JSON.stringify(["file_preview", 71, "preview-file-71", "revision-1"]);
+
+function previewCancellationState(tracker: PreviewCancellationReceiptTracker): RejectionTrackerState {
+  return { previewCancellations: new Map([[PREVIEW_CANCEL_TRACKER_KEY, tracker]]) };
+}
 
 function sharedQueue(initial: QueuedAction[], { stampMissing = true }: { stampMissing?: boolean } = {}) {
   if (stampMissing) {
@@ -340,6 +355,193 @@ describe("shared Mini App action queue ownership", () => {
     if ("downloadSubmission" in originState) expect(originState.downloadSubmission.seq).toBe(93);
     else expect(originState.migrationConflictDrafts.get("old-preview")?.refreshSeq).toBe(93);
     expect(receiptStorage.getItem(`${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(action.request_id)}`)).toBeNull();
+  });
+
+  it("recovers an accepted preview cancellation receipt from the helper tab", async () => {
+    const action: QueuedAction = {
+      request_id: PREVIEW_CANCEL_REQUEST_ID,
+      kind: "preview_cancel",
+      payload: {
+        preview_kind: "file_preview",
+        preview_seq: 71,
+        preview_id: "preview-file-71",
+        revision: "revision-1",
+      },
+      surface: ACTION_SURFACE_FILE,
+    };
+    const queue = sharedQueue([action]);
+    const receiptStorage = new MemoryStorage();
+    const originState = previewCancellationState({
+      requestId: action.request_id,
+      seq: null,
+      status: "queued",
+      error: "",
+    });
+    const helperState = { previewCancellations: new Map<string, PreviewCancellationReceiptTracker>() };
+
+    const lostOriginResponse = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+      dispatch: async () => { throw new TypeError("response lost after accepting preview cancellation"); },
+      onReceipt: (entry, receipt, surface) => recordActionReceipt(entry, receipt, originState, { surface, storage: receiptStorage }),
+    });
+    expect(lostOriginResponse.status).toBe("error");
+    expect(queue.contents()).toEqual([action]);
+
+    const helperDelivery = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+      dispatch: async (entry) => {
+        expect(entry.request_id).toBe(action.request_id);
+        return { seq: 97 };
+      },
+      onReceipt: (entry, receipt, surface) => recordActionReceipt(entry, receipt, helperState, { surface, storage: receiptStorage }),
+    });
+
+    if (helperDelivery.status !== "sent") throw new Error("Expected helper-tab preview cancellation delivery to be sent");
+    expect(helperDelivery.receiptUpdate).toMatchObject({ persisted: true, matched: false });
+    expect(queue.contents()).toEqual([]);
+    const receiptKey = `${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(action.request_id)}`;
+    expect(receiptStorage.getItem(receiptKey)).not.toBeNull();
+    expect(originState.previewCancellations?.get(PREVIEW_CANCEL_TRACKER_KEY)).toMatchObject({ status: "queued", seq: null });
+
+    const recovered = recoverActionReceipts(originState, { surface: ACTION_SURFACE_FILE, storage: receiptStorage });
+
+    expect(recovered).toMatchObject({ matched: 1, requestIds: [action.request_id] });
+    expect(originState.previewCancellations?.get(PREVIEW_CANCEL_TRACKER_KEY)).toEqual({
+      requestId: action.request_id,
+      seq: 97,
+      status: "submitted",
+      error: null,
+    });
+    expect(receiptStorage.getItem(receiptKey)).toBeNull();
+  });
+
+  it("delivers a rejected preview cancellation receipt to its origin and consumes it after surfacing the error", () => {
+    const action: QueuedAction = {
+      request_id: PREVIEW_CANCEL_REQUEST_ID,
+      kind: "preview_cancel",
+      payload: {
+        preview_kind: "file_preview",
+        preview_seq: 71,
+        preview_id: "preview-file-71",
+        revision: "revision-1",
+      },
+      surface: ACTION_SURFACE_FILE,
+    };
+    const receiptStorage = new MemoryStorage();
+    const helperState = { previewCancellations: new Map<string, PreviewCancellationReceiptTracker>() };
+    const originState = previewCancellationState({
+      requestId: action.request_id,
+      seq: null,
+      status: "queued",
+      error: "",
+    });
+    const error = "This preview can no longer be cancelled.";
+
+    const recorded = recordActionReceipt(action, { outcome: "rejected", status: 422, error }, helperState, {
+      surface: ACTION_SURFACE_FILE,
+      storage: receiptStorage,
+    });
+    expect(recorded).toMatchObject({ persisted: true, matched: false });
+
+    const recovered = recoverActionReceipts(originState, { surface: ACTION_SURFACE_FILE, storage: receiptStorage });
+    expect(recovered).toMatchObject({
+      matched: 1,
+      rejectedRequestIds: [action.request_id],
+      rejections: [{ request_id: action.request_id, kind: "preview_cancel", status: 422, error }],
+    });
+    expect(originState.previewCancellations?.get(PREVIEW_CANCEL_TRACKER_KEY)).toEqual({
+      requestId: action.request_id,
+      seq: null,
+      status: "failed",
+      error,
+    });
+
+    const receiptKey = `${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(action.request_id)}`;
+    expect(receiptStorage.getItem(receiptKey)).not.toBeNull();
+    expect(consumeRejectedActionReceipts(originState, {
+      surface: ACTION_SURFACE_FILE,
+      requestIds: recovered.rejectedRequestIds,
+      storage: receiptStorage,
+    })).toEqual({ consumed: 1 });
+    expect(receiptStorage.getItem(receiptKey)).toBeNull();
+  });
+
+  it.each([
+    {
+      mismatch: "request ID differs",
+      actionRequestId: "00000000-0000-4000-8000-000000000002",
+      trackerRequestId: PREVIEW_CANCEL_REQUEST_ID,
+      kind: "preview_cancel",
+      recordSurface: ACTION_SURFACE_FILE,
+      recoverySurface: ACTION_SURFACE_FILE,
+      trackerSeq: null,
+      receiptSeq: 98,
+      payload: { preview_kind: "file_preview", preview_seq: 71, preview_id: "preview-file-71", revision: "revision-1" },
+    },
+    {
+      mismatch: "surface differs",
+      actionRequestId: PREVIEW_CANCEL_REQUEST_ID,
+      trackerRequestId: PREVIEW_CANCEL_REQUEST_ID,
+      kind: "preview_cancel",
+      recordSurface: ACTION_SURFACE_FILE,
+      recoverySurface: ACTION_SURFACE_SETTINGS,
+      trackerSeq: null,
+      receiptSeq: 98,
+      payload: { preview_kind: "file_preview", preview_seq: 71, preview_id: "preview-file-71", revision: "revision-1" },
+    },
+    {
+      mismatch: "action kind differs",
+      actionRequestId: PREVIEW_CANCEL_REQUEST_ID,
+      trackerRequestId: PREVIEW_CANCEL_REQUEST_ID,
+      kind: "library_migration_preview",
+      recordSurface: ACTION_SURFACE_FILE,
+      recoverySurface: ACTION_SURFACE_FILE,
+      trackerSeq: null,
+      receiptSeq: 98,
+      payload: { supersedes_preview_seq: 70, supersedes_preview_id: "preview-file-70", supersedes_revision: "revision-0" },
+    },
+    {
+      mismatch: "sequence differs",
+      actionRequestId: PREVIEW_CANCEL_REQUEST_ID,
+      trackerRequestId: PREVIEW_CANCEL_REQUEST_ID,
+      kind: "preview_cancel",
+      recordSurface: ACTION_SURFACE_FILE,
+      recoverySurface: ACTION_SURFACE_FILE,
+      trackerSeq: 99,
+      receiptSeq: 98,
+      payload: { preview_kind: "file_preview", preview_seq: 71, preview_id: "preview-file-71", revision: "revision-1" },
+    },
+  ] as const)("does not bind a preview cancellation receipt when $mismatch", (scenario) => {
+    const action: QueuedAction = {
+      request_id: scenario.actionRequestId,
+      kind: scenario.kind,
+      payload: scenario.payload,
+      surface: scenario.recordSurface,
+    };
+    const receiptStorage = new MemoryStorage();
+    const tracker: PreviewCancellationReceiptTracker = {
+      requestId: scenario.trackerRequestId,
+      seq: scenario.trackerSeq,
+      status: "queued",
+      error: "",
+    };
+    const originState = previewCancellationState(tracker);
+    const beforeRecovery = { ...tracker };
+    const recorded = recordActionReceipt(action, { seq: scenario.receiptSeq }, {}, {
+      surface: scenario.recordSurface,
+      storage: receiptStorage,
+    });
+    expect(recorded.persisted).toBe(true);
+
+    const recovered = recoverActionReceipts(originState, { surface: scenario.recoverySurface, storage: receiptStorage });
+
+    expect(recovered.matched).toBe(0);
+    expect(originState.previewCancellations?.get(PREVIEW_CANCEL_TRACKER_KEY)).toEqual(beforeRecovery);
+    expect(receiptStorage.getItem(`${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(action.request_id)}`)).not.toBeNull();
   });
 
   it("does not dequeue a delivered action when durable receipt storage fails", async () => {

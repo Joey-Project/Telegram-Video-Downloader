@@ -259,7 +259,7 @@ function persistOutcomeUnknown(action, code, error, readQueue, writeQueue) {
 function needsDurableReceipt(action, surface) {
   if (!action || !actionBelongsToSurface(action, surface)) return false;
   if (surface === ACTION_SURFACE_SETTINGS) return SETTINGS_ACTION_KINDS.has(action.kind);
-  return action.kind === "download_submit"
+  return action.kind === "download_submit" || action.kind === "preview_cancel"
     || action.kind === "library_migration_preview" && hasSupersessionPayload(action.payload);
 }
 
@@ -324,6 +324,7 @@ function validReceiptRecord(value, expectedRequestId) {
 
 function applyReceiptToTrackers(action, receipt, state, surface) {
   const result = { matched: false, localAction: false, downloadSubmission: false, migrationConflictDrafts: 0, rejected: false };
+  let previewCancellationMatched = false;
   if (!validRequestId(action?.request_id)) return result;
   const rejected = receipt?.outcome === "rejected";
   if (rejected ? !validReceiptRecord({ ...receipt, version: 1, request_id: action.request_id, surface, kind: action.kind, stored_at: 1 }, action.request_id)
@@ -373,8 +374,24 @@ function applyReceiptToTrackers(action, receipt, state, surface) {
     }
   }
 
-  result.rejected = rejected && (result.localAction || result.downloadSubmission || result.migrationConflictDrafts > 0);
-  result.matched = result.localAction || result.downloadSubmission || result.migrationConflictDrafts > 0;
+  if (surface === ACTION_SURFACE_FILE && action.kind === "preview_cancel"
+      && state?.previewCancellations instanceof Map) {
+    for (const tracker of state.previewCancellations.values()) {
+      if (tracker?.requestId !== action.request_id || tracker.seq != null && tracker.seq !== receipt.seq) continue;
+      if (rejected) {
+        tracker.status = "failed";
+        tracker.error = receipt.error;
+      } else {
+        tracker.status = "submitted";
+        tracker.seq = receipt.seq;
+        tracker.error = null;
+      }
+      previewCancellationMatched = true;
+    }
+  }
+
+  result.rejected = rejected && (result.localAction || result.downloadSubmission || result.migrationConflictDrafts > 0 || previewCancellationMatched);
+  result.matched = result.localAction || result.downloadSubmission || result.migrationConflictDrafts > 0 || previewCancellationMatched;
   return result;
 }
 
@@ -393,6 +410,11 @@ function trackerKinds(state, requestId, surface) {
         && [...state.migrationConflictDrafts.values()].some((draft) => (draft.refreshRequestId === requestId || draft.rejectedRefreshRequestId === requestId)
           && (draft.refreshSeq == null || Number.isSafeInteger(draft.refreshSeq)))) {
       kinds.add("library_migration_preview");
+    }
+    if (state?.previewCancellations instanceof Map
+        && [...state.previewCancellations.values()].some((tracker) => tracker?.requestId === requestId
+          && (tracker.seq == null || Number.isSafeInteger(tracker.seq)))) {
+      kinds.add("preview_cancel");
     }
   }
   return kinds;
@@ -415,6 +437,13 @@ function trackerIds(state, surface) {
       for (const draft of state.migrationConflictDrafts.values()) {
         for (const requestId of [draft?.refreshRequestId, draft?.rejectedRefreshRequestId]) {
           if ((draft?.refreshSeq == null || Number.isSafeInteger(draft?.refreshSeq)) && validRequestId(requestId)) ids.add(requestId);
+        }
+      }
+    }
+    if (state?.previewCancellations instanceof Map) {
+      for (const tracker of state.previewCancellations.values()) {
+        if ((tracker?.seq == null || Number.isSafeInteger(tracker.seq)) && validRequestId(tracker?.requestId)) {
+          ids.add(tracker.requestId);
         }
       }
     }
@@ -528,7 +557,9 @@ function hasRejectedTracker(state, requestId, surface) {
   if (surface === ACTION_SURFACE_FILE) {
     return state?.downloadSubmission?.request_id === requestId && state.downloadSubmission.rejected === true
       || state?.migrationConflictDrafts instanceof Map
-        && [...state.migrationConflictDrafts.values()].some((draft) => draft.rejectedRefreshRequestId === requestId);
+        && [...state.migrationConflictDrafts.values()].some((draft) => draft.rejectedRefreshRequestId === requestId)
+      || state?.previewCancellations instanceof Map
+        && [...state.previewCancellations.values()].some((tracker) => tracker.requestId === requestId && tracker.status === "failed");
   }
   return false;
 }

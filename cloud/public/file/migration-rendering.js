@@ -103,7 +103,7 @@ function renderMigrationProgress(migration, libraries) {
 export function renderMigrationHistory({ migrations, libraries = [], libraryId, omittedCount }) {
   const rows = Array.isArray(migrations) ? migrations : [];
   const relevant = rows.filter((migration) => migration && typeof migration === "object"
-    && (migration.source_library_id === libraryId || migration.target_library_id === libraryId));
+    && (!libraryId || migration.source_library_id === libraryId || migration.target_library_id === libraryId));
   const notice = migrationHistoryNotice(omittedCount);
   const noticeMarkup = notice ? `<p class="field-hint">${escapeHtml(notice)}</p>` : "";
   // The backend has already ordered the bounded snapshot by recovery priority.

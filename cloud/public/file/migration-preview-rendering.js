@@ -23,8 +23,10 @@ export function migrationPreviewEntries(snapshot, selectedLibraryId) {
     if (preview?.kind !== "library_migration_preview" || preview?.status !== "awaiting_confirmation") continue;
     active.push({
       ...preview,
+      kind: "library_migration_preview",
       result: preview.result && typeof preview.result === "object" ? preview.result : null,
       id: preview.preview_id ?? preview.id,
+      seq: preview.seq,
       incomplete: preview.preview_incomplete === true || preview.incomplete === true || preview.reload_required === true,
     });
   }
@@ -33,7 +35,9 @@ export function migrationPreviewEntries(snapshot, selectedLibraryId) {
     const result = operation.result && typeof operation.result === "object" ? operation.result : {};
     active.push({
       ...operation,
+      kind: "library_migration_preview",
       id: operation.preview_id ?? result.id ?? result.preview_id ?? operation.id,
+      seq: operation.seq,
       result,
       incomplete: operation.details_incomplete === true || operation.result_truncated === true || result.incomplete === true,
     });
@@ -42,11 +46,13 @@ export function migrationPreviewEntries(snapshot, selectedLibraryId) {
   for (const operation of active) {
     const result = operation.result ?? {};
     const sourceLibraryId = result.source_library_id ?? operation.source_library_id;
-    if (sourceLibraryId !== selectedLibraryId) continue;
+    if (typeof selectedLibraryId === "string" && selectedLibraryId && sourceLibraryId !== selectedLibraryId) continue;
     const id = operation.id ?? result.id ?? result.preview_id;
     const revision = operation.revision ?? result.revision;
     if (!id || !revision) continue;
-    const key = migrationPreviewDraftKey(id, revision);
+    const key = Number.isSafeInteger(operation.seq) && operation.seq > 0
+      ? `seq:${operation.seq}`
+      : migrationPreviewDraftKey(id, revision);
     if (!key) continue;
     const existing = unique.get(key);
     if (!existing || existing.incomplete && !operation.incomplete) {
@@ -282,7 +288,7 @@ function compactPreview(operation, result, options) {
   const awaitingConfirmation = status === "awaiting_confirmation";
   const librariesAvailable = options.sourceAvailable === true && options.targetAvailable === true;
   const rootBindingsMatch = options.rootBindingsMatch === true;
-  const canConfirm = summaryValid && awaitingConfirmation && librariesAvailable && rootBindingsMatch && !invalidated;
+  const canConfirm = summaryValid && awaitingConfirmation && librariesAvailable && rootBindingsMatch && !invalidated && options.cancelPending !== true;
 
   const summary = `${itemCount?.toLocaleString() ?? "Unknown"} media items · ${fileCount?.toLocaleString() ?? "Unknown"} files · ${formatBytes(result.total_bytes)} total`;
   const space = `Required space ${formatBytes(result.required_space_bytes)} · Available ${formatBytes(result.available_space_bytes)} · ${conflictCount?.toLocaleString() ?? "Unknown"} conflict${conflictCount === 1 ? "" : "s"}`;
@@ -326,7 +332,7 @@ function compactPreview(operation, result, options) {
     ? `<p class="field-hint" role="alert">The compact preview summary is incomplete or inconsistent. Request a fresh preview before starting.</p>`
     : "";
 
-  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Source: ${escapeHtml(sourceLibraryId)} · Target: ${escapeHtml(targetLibraryId)}</p>${selectionNotice}<p>Default conflict choice: ${conflictLabel}.</p>${unavailable}${identityChanged}${stale}${invalidatedMessage}${invalidSummary}</div><span class="state-pill pending">Compact review</span></div><div class="preview-table">${sampleRows || `<div class="preview-line"><span>No sample media paths are available.</span></div>`}${omittedItems}${omittedFiles}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button></div></article>`;
+  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Source: ${escapeHtml(sourceLibraryId)} · Target: ${escapeHtml(targetLibraryId)}</p>${selectionNotice}<p>Default conflict choice: ${conflictLabel}.</p>${unavailable}${identityChanged}${stale}${invalidatedMessage}${invalidSummary}</div><span class="state-pill pending">Compact review</span></div><div class="preview-table">${sampleRows || `<div class="preview-line"><span>No sample media paths are available.</span></div>`}${omittedItems}${omittedFiles}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button>${options.cancelMarkup ?? ""}</div></article>`;
 }
 
 function fullPreview(operation, result, options) {
@@ -340,10 +346,10 @@ function fullPreview(operation, result, options) {
     && typeof result.target_root_binding === "string" && ROOT_BINDING_PATTERN.test(result.target_root_binding);
   const rootBindingsMatch = rootBindingsValid && options.rootBindingsMatch === true;
   if (operation?.incomplete || !Array.isArray(result.items)) {
-    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>${escapeHtml(operation?.reason ?? "Preview details are unavailable in this cloud snapshot. Request a fresh preview before confirming.")}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>${escapeHtml(operation?.reason ?? "Preview details are unavailable in this cloud snapshot. Request a fresh preview before confirming.")}</p></div><span class="state-pill pending">Refresh required</span></div><div class="stack-actions">${options.cancelMarkup ?? ""}</div></article>`;
   }
   if ((resultId !== undefined && resultId !== id) || (resultRevision !== undefined && resultRevision !== revision)) {
-    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>The preview identity changed while its details were being loaded. Request a fresh preview before continuing.</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview needs to be regenerated</h3><p>The preview identity changed while its details were being loaded. Request a fresh preview before continuing.</p></div><span class="state-pill pending">Refresh required</span></div><div class="stack-actions">${options.cancelMarkup ?? ""}</div></article>`;
   }
   const files = result.items;
   const candidateDraft = options.draft && typeof options.draft === "object" ? options.draft : null;
@@ -402,7 +408,7 @@ function fullPreview(operation, result, options) {
   const supersededMessage = options.invalidated === true && !draft
     ? `<p class="field-hint" role="status">This preview was superseded by a refreshed preview and cannot be confirmed.</p>`
     : "";
-  const canConfirm = Boolean(id && revision) && !invalidated && sourceAvailable && targetAvailable && rootBindingsMatch;
+  const canConfirm = Boolean(id && revision) && !invalidated && sourceAvailable && targetAvailable && rootBindingsMatch && options.cancelPending !== true;
   const canRefresh = Boolean(id && revision && draft && (choicesChanged || draft.refreshError) && !refreshPending && !refreshOutcomeUnknown && rootBindingsMatch);
   const refreshButton = canRefresh
     ? `<button class="small-button" type="button" data-migration-refresh-conflicts="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}" ${sourceAvailable && targetAvailable ? "" : "disabled"}>Refresh preview</button>`
@@ -412,7 +418,7 @@ function fullPreview(operation, result, options) {
     : "";
   const offlineMessage = sourceAvailable && targetAvailable ? "" : `<p class="field-hint">The source or target library is offline or showing a saved scan. Reconnect it and refresh before starting the migration.</p>`;
   const identityMessage = rootBindingsMatch ? "" : `<p class="field-hint" role="alert">The registered source or target identity is unavailable or has changed. Request a fresh preview before continuing.</p>`;
-  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Category and collection structure will be preserved. Default conflict choice: ${escapeHtml(result.conflict ?? "skip")}.</p>${offlineMessage}${identityMessage}${refreshMessage}${staleMessage}${supersededMessage}${conflictLimit}</div><span class="state-pill pending">Review needed</span></div>${pageControls}<div class="preview-table">${paths || `<div class="preview-line"><span>No media items were found in this selection.</span></div>`}</div>${pageControls}<div class="stack-actions">${clearRefreshButton}${refreshButton}<button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button></div></article>`;
+  return `<article class="stack-card"><div class="stack-card-head"><div><h3>Migration preview</h3><p>${escapeHtml(summary)}</p><p>${escapeHtml(space)}</p>${tasks}<p>Category and collection structure will be preserved. Default conflict choice: ${escapeHtml(result.conflict ?? "skip")}.</p>${offlineMessage}${identityMessage}${refreshMessage}${staleMessage}${supersededMessage}${conflictLimit}</div><span class="state-pill pending">Review needed</span></div>${pageControls}<div class="preview-table">${paths || `<div class="preview-line"><span>No media items were found in this selection.</span></div>`}</div>${pageControls}<div class="stack-actions">${clearRefreshButton}${refreshButton}<button class="small-button confirm" type="button" data-migration-confirm="${escapeHtml(id)}" data-revision="${escapeHtml(revision)}" ${canConfirm ? "" : "disabled"}>Start migration</button>${options.cancelMarkup ?? ""}</div></article>`;
 }
 
 export function renderMigrationPreview(operation, options = {}) {

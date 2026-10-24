@@ -45,6 +45,12 @@ export interface MigrationConflictReceiptTracker {
   refreshExpiresAtMs?: number | null;
   refreshDeliveryOutcome?: "outcome_unknown" | null;
 }
+export interface PreviewCancellationReceiptTracker {
+  requestId?: string | null;
+  seq?: number | null;
+  status?: "queued" | "submitted" | "failed" | "unknown";
+  error?: string | null;
+}
 
 export const ACTION_QUEUE_LIMIT: number;
 export const ACTION_REPLAY_WINDOW_MS: number;
@@ -99,6 +105,7 @@ export function recordActionReceipt(
     localActions?: ReadonlyMap<string, LocalActionReceiptTracker>;
     downloadSubmission?: DownloadSubmissionReceiptTracker | null;
     migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
+    previewCancellations?: ReadonlyMap<string, PreviewCancellationReceiptTracker>;
   },
   options?: { surface?: "settings" | "file"; storage?: Storage; now?: number },
 ): { persisted: boolean; matched: boolean; localAction: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; rejected?: boolean; rejectedRequestIds?: string[]; consume?: () => void };
@@ -107,6 +114,7 @@ export function recoverActionReceipts(
     localActions?: ReadonlyMap<string, LocalActionReceiptTracker>;
     downloadSubmission?: DownloadSubmissionReceiptTracker | null;
     migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
+    previewCancellations?: ReadonlyMap<string, PreviewCancellationReceiptTracker>;
   },
   options: { surface: "settings" | "file"; storage?: Storage },
 ): { matched: number; localActions: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; requestIds: string[]; rejectedRequestIds: string[]; rejections: Array<{ request_id: string; kind: string; status: number; error: string }> };
@@ -115,6 +123,7 @@ export function consumeRejectedActionReceipts(
     localActions?: ReadonlyMap<string, LocalActionReceiptTracker>;
     downloadSubmission?: DownloadSubmissionReceiptTracker | null;
     migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
+    previewCancellations?: ReadonlyMap<string, PreviewCancellationReceiptTracker>;
   },
   options: { surface: "settings" | "file"; requestIds: readonly string[]; storage?: Storage },
 ): { consumed: number };

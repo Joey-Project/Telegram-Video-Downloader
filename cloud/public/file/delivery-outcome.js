@@ -56,6 +56,13 @@ export function markUnknownFileAction(state, action) {
       migrationConflictDrafts += 1;
     }
   }
+  if (action.kind === "preview_cancel" && state.previewCancellations instanceof Map) {
+    for (const tracker of state.previewCancellations.values()) {
+      if (tracker?.requestId !== requestId) continue;
+      tracker.status = "unknown";
+      tracker.error = boundedMessage(action);
+    }
+  }
   return { downloadSubmission, migrationConflictDrafts };
 }
 
@@ -93,6 +100,16 @@ export function dismissUnknownFileAction(state, requestId, queue, writeQueue) {
       draft.refreshError = remembered?.error
         ?? "The delivery outcome is unknown. The browser notice was dismissed; check your computer before requesting another preview.";
       migrationConflictDrafts += 1;
+    }
+  }
+  if (action.kind === "preview_cancel" && state?.previewCancellations instanceof Map) {
+    for (const tracker of state.previewCancellations.values()) {
+      if (tracker?.requestId !== requestId) continue;
+      tracker.requestId = null;
+      tracker.seq = null;
+      tracker.status = "failed";
+      tracker.error = remembered?.error
+        ?? "The delivery outcome is unknown. The notice was dismissed after checking the computer.";
     }
   }
   return { status: "dismissed", action, downloadSubmission, migrationConflictDrafts };

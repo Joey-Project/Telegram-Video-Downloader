@@ -1,6 +1,6 @@
 export const MIGRATION_PREVIEW_PAGE_SIZE: 30;
 export function migrationPreviewDraftKey(id: string, revision: string): string | null;
-export function migrationPreviewEntries(snapshot: unknown, selectedLibraryId: string): Array<Record<string, unknown>>;
+export function migrationPreviewEntries(snapshot: unknown, selectedLibraryId?: string): Array<Record<string, unknown>>;
 export type MigrationRefreshHistoryKind = "unaccepted" | "recorded" | "pending" | "outside_recent_history" | "unknown";
 export function inspectMigrationRefreshHistory(
   refresh: { seq?: unknown } | null | undefined,
@@ -42,6 +42,8 @@ export function renderMigrationPreview(
     invalidated?: boolean;
     draftChanged?: boolean;
     refreshPending?: boolean;
+    cancelPending?: boolean;
+    cancelMarkup?: string;
     draft?: unknown;
     page?: number;
   },

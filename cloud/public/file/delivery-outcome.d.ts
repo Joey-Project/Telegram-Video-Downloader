@@ -30,6 +30,7 @@ export function markUnknownFileAction(
     } | null;
     migrationConflictDrafts?: Map<string, Record<string, unknown>>;
     migrationConflictInvalidated?: Set<string>;
+    previewCancellations?: Map<string, { requestId?: string | null; seq?: number | null; status?: string; error?: string | null }>;
     unknownActionOutcomes?: Map<string, { kind?: string; code?: string; error?: string }>;
     quarantinedActionIds?: Set<string>;
   },
@@ -41,6 +42,7 @@ export function dismissUnknownFileAction(
     downloadMessage?: string | null;
     migrationConflictDrafts?: Map<string, Record<string, unknown>>;
     migrationConflictInvalidated?: Set<string>;
+    previewCancellations?: Map<string, { requestId?: string | null; seq?: number | null; status?: string; error?: string | null }>;
     unknownActionOutcomes?: Map<string, unknown>;
     quarantinedActionIds?: Set<string>;
   },
