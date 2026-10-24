@@ -723,6 +723,7 @@ async function performRefreshState({ quiet = false } = {}) {
   if (!initData || privateAccessExpired || state.loading) return;
   recoverSettingsActionReceipts();
   state.loading = true;
+  byId("app-content").setAttribute("aria-busy", "true");
   try {
     const fresh = await loadOwnerSnapshot((path, headers) => api(path, { headers }));
     if (privateAccessExpired) return;
@@ -752,6 +753,7 @@ async function performRefreshState({ quiet = false } = {}) {
     throw error;
   } finally {
     state.loading = false;
+    byId("app-content").setAttribute("aria-busy", "false");
     if (state.refreshAfterDrain) {
       state.refreshAfterDrain = false;
       window.setTimeout(() => refreshState({ quiet: true }), 0);

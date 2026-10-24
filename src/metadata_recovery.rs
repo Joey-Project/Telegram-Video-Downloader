@@ -1,9 +1,11 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 
 use crate::library::{
@@ -16,8 +18,9 @@ pub const MAX_LIBRARY_METADATA_RECOVERY_ITEMS: usize = 100;
 
 pub(crate) const MAX_RESOLVED_METADATA_ENTRIES: usize = 512;
 const MAX_CHOICES_PER_ITEM: usize = 24;
-const MAX_RESOLVER_QUERY_TIME: Duration = Duration::from_secs(12);
+pub(crate) const MAX_RESOLVER_QUERY_TIME: Duration = Duration::from_secs(12);
 const MAX_ANALYSIS_TIME: Duration = Duration::from_secs(100);
+const MAX_CONCURRENT_RESOLVER_QUERIES: usize = 2;
 
 /// One canonical Bilibili source identifier passed to the injected metadata resolver.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -72,6 +75,7 @@ pub enum RecoveryStatus {
     NeedsConfirmation,
     Unchanged,
     Unavailable,
+    Deferred,
     Unsupported,
 }
 
@@ -123,7 +127,7 @@ where
         .collect::<HashMap<_, _>>();
     let requested_count = selected.len();
     let mut reports = Vec::with_capacity(requested_count);
-    let mut resolved_by_source = HashMap::new();
+    let mut planned = Vec::new();
     let deadline = tokio::time::Instant::now() + MAX_ANALYSIS_TIME;
 
     for item_id in std::mem::take(&mut selected) {
@@ -139,7 +143,22 @@ where
             });
             continue;
         };
-        reports.push(analyze_item(item, resolver, &mut resolved_by_source, deadline).await);
+        reports.push(RecoveryItem {
+            item_id: String::new(),
+            title: String::new(),
+            relative_path: String::new(),
+            status: RecoveryStatus::Deferred,
+            reason: None,
+            patch: None,
+            candidates: None,
+        });
+        planned.push((reports.len() - 1, item, prepare_item(item)));
+    }
+
+    let queries = unique_queries(planned.iter().map(|(_, _, plan)| plan));
+    let resolved_by_source = resolve_unique_queries(&queries, resolver, deadline).await;
+    for (report_index, item, plan) in planned {
+        reports[report_index] = finish_item(item, plan, &resolved_by_source);
     }
 
     Ok(RecoveryReport {
@@ -160,6 +179,25 @@ where
     F: FnMut(RecoveryQuery) -> Fut + Send,
     Fut: Future<Output = Result<Vec<ResolvedMetadataEntry>>> + Send,
 {
+    analyze_library_batch_with_deadline(
+        snapshot,
+        after_item_id,
+        resolver,
+        tokio::time::Instant::now() + MAX_ANALYSIS_TIME,
+    )
+    .await
+}
+
+async fn analyze_library_batch_with_deadline<F, Fut>(
+    snapshot: &LibrarySnapshot,
+    after_item_id: Option<&str>,
+    resolver: &mut F,
+    deadline: tokio::time::Instant,
+) -> Result<RecoveryReport>
+where
+    F: FnMut(RecoveryQuery) -> Fut + Send,
+    Fut: Future<Output = Result<Vec<ResolvedMetadataEntry>>> + Send,
+{
     let mut candidates = snapshot
         .items
         .iter()
@@ -171,20 +209,50 @@ where
         candidates.retain(|item| item.id.as_str() > cursor);
     }
     let page_len = candidates.len().min(MAX_LIBRARY_METADATA_RECOVERY_ITEMS);
-    let remaining = candidates.len().saturating_sub(page_len);
-    let page = candidates.into_iter().take(page_len).collect::<Vec<_>>();
-    let next_cursor = if remaining > 0 {
-        page.last().map(|item| item.id.clone())
-    } else {
-        None
-    };
+    let page = candidates
+        .iter()
+        .take(page_len)
+        .copied()
+        .collect::<Vec<_>>();
+    let plans = page
+        .iter()
+        .map(|item| prepare_item(item))
+        .collect::<Vec<_>>();
+    let queries = unique_queries(plans.iter());
+    let resolved_by_source = resolve_unique_queries(&queries, resolver, deadline).await;
+    let reports = page
+        .iter()
+        .zip(plans)
+        .map(|(item, plan)| finish_item(item, plan, &resolved_by_source))
+        .collect::<Vec<_>>();
 
-    let mut reports = Vec::with_capacity(page.len());
-    let mut resolved_by_source = HashMap::new();
-    let deadline = tokio::time::Instant::now() + MAX_ANALYSIS_TIME;
-    for item in page {
-        reports.push(analyze_item(item, resolver, &mut resolved_by_source, deadline).await);
-    }
+    let first_deferred = reports
+        .iter()
+        .position(|item| item.status == RecoveryStatus::Deferred);
+    let (next_cursor, remaining) = if let Some(index) = first_deferred {
+        let cursor = if index > 0 {
+            page.get(index - 1).map(|item| item.id.clone())
+        } else {
+            after_item_id.map(str::to_string)
+        };
+        let remaining = candidates
+            .iter()
+            .filter(|item| {
+                cursor
+                    .as_deref()
+                    .is_none_or(|cursor| item.id.as_str() > cursor)
+            })
+            .count();
+        (cursor, remaining)
+    } else {
+        let remaining = candidates.len().saturating_sub(page_len);
+        let next_cursor = if remaining > 0 {
+            page.last().map(|item| item.id.clone())
+        } else {
+            None
+        };
+        (next_cursor, remaining)
+    };
 
     Ok(RecoveryReport {
         revision: snapshot.revision.clone(),
@@ -210,32 +278,38 @@ fn is_library_candidate(item: &LibraryItem) -> bool {
                 && item.organization_status != Some(OrganizationStatus::Standalone)))
 }
 
-async fn analyze_item<F, Fut>(
-    item: &LibraryItem,
-    resolver: &mut F,
-    resolved_by_source: &mut HashMap<String, std::result::Result<Vec<ResolvedMetadataEntry>, ()>>,
-    deadline: tokio::time::Instant,
-) -> RecoveryItem
-where
-    F: FnMut(RecoveryQuery) -> Fut + Send,
-    Fut: Future<Output = Result<Vec<ResolvedMetadataEntry>>> + Send,
-{
+enum ItemPlan {
+    Complete(RecoveryItem),
+    Lookup {
+        identity: SourceIdentity,
+        local_patch: Option<MetadataPatch>,
+    },
+}
+
+enum ResolverOutcome {
+    Resolved(Vec<ResolvedMetadataEntry>),
+    TimedOut,
+    ProviderFailure(String),
+    ResultLimit,
+}
+
+fn prepare_item(item: &LibraryItem) -> ItemPlan {
     if item.presence != Presence::Present {
-        return result_for(
+        return ItemPlan::Complete(result_for(
             item,
             RecoveryStatus::Unavailable,
             "Media is missing or unavailable; metadata was not queried.",
-        );
+        ));
     }
     if matches!(
         item.metadata_status,
         MetadataStatus::Unreadable | MetadataStatus::ProviderUnavailable
     ) {
-        return result_for(
+        return ItemPlan::Complete(result_for(
             item,
             RecoveryStatus::Unavailable,
             "Local metadata is unreadable or unavailable.",
-        );
+        ));
     }
 
     let local_patch = trusted_local_patch(item);
@@ -245,58 +319,225 @@ where
             if !has_bilibili_identity_marker(item)
                 && let Some(patch) = local_patch.as_ref().filter(|_| local_patch_can_fill(item))
             {
-                return local_metadata_result(
+                return ItemPlan::Complete(local_metadata_result(
                     item,
                     patch.clone(),
                     "Using reliable local metadata; no supported online source lookup is available.",
-                );
+                ));
             }
-            return result_for(item, RecoveryStatus::Unsupported, reason);
+            return ItemPlan::Complete(result_for(item, RecoveryStatus::Unsupported, reason));
         }
     };
     if let Some(patch) = local_patch
         .as_ref()
         .filter(|_| local_metadata_is_sufficient_without_lookup(item))
     {
-        return local_metadata_result(
+        return ItemPlan::Complete(local_metadata_result(
             item,
             patch.clone(),
             "Using reliable local title, source identity, and organization metadata.",
-        );
+        ));
     }
-    let resolved = if let Some(cached) = resolved_by_source.get(&identity.query.source_id) {
-        cached.as_ref().map_err(|_| ())
-    } else if tokio::time::Instant::now() >= deadline {
-        Err(())
-    } else {
-        let timeout = MAX_RESOLVER_QUERY_TIME
-            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-        let outcome = tokio::time::timeout(timeout, resolver(identity.query.clone()))
-            .await
-            .ok()
-            .and_then(std::result::Result::ok)
-            .filter(|entries| entries.len() <= MAX_RESOLVED_METADATA_ENTRIES)
-            .ok_or(());
-        resolved_by_source.insert(identity.query.source_id.clone(), outcome);
-        resolved_by_source
-            .get(&identity.query.source_id)
-            .expect("source resolution was just cached")
-            .as_ref()
-            .map_err(|_| ())
+    ItemPlan::Lookup {
+        identity,
+        local_patch,
+    }
+}
+
+fn unique_queries<'a>(plans: impl IntoIterator<Item = &'a ItemPlan>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    plans
+        .into_iter()
+        .filter_map(|plan| match plan {
+            ItemPlan::Lookup { identity, .. } if seen.insert(identity.query.source_id.clone()) => {
+                Some(identity.query.source_id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+async fn resolve_unique_queries<'a, F, Fut>(
+    queries: &[String],
+    resolver: &'a mut F,
+    deadline: tokio::time::Instant,
+) -> HashMap<String, ResolverOutcome>
+where
+    F: FnMut(RecoveryQuery) -> Fut + Send + 'a,
+    Fut: Future<Output = Result<Vec<ResolvedMetadataEntry>>> + Send + 'a,
+{
+    type PendingQuery<'a> = Pin<Box<dyn Future<Output = (String, ResolverOutcome)> + Send + 'a>>;
+
+    let mut outcomes = HashMap::with_capacity(queries.len());
+    let mut in_flight = HashSet::new();
+    let mut next_query = 0;
+    let mut pending = FuturesUnordered::<PendingQuery<'a>>::new();
+
+    loop {
+        while next_query < queries.len()
+            && pending.len() < MAX_CONCURRENT_RESOLVER_QUERIES
+            && tokio::time::Instant::now() < deadline
+        {
+            let source_id = queries[next_query].clone();
+            next_query += 1;
+            let timeout = MAX_RESOLVER_QUERY_TIME
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            if timeout.is_zero() {
+                next_query -= 1;
+                break;
+            }
+            let future = resolver(RecoveryQuery {
+                source_id: source_id.clone(),
+            });
+            in_flight.insert(source_id.clone());
+            pending.push(Box::pin(async move {
+                let outcome = match tokio::time::timeout(timeout, future).await {
+                    Err(_) => ResolverOutcome::TimedOut,
+                    Ok(Err(error)) => {
+                        ResolverOutcome::ProviderFailure(safe_provider_failure_reason(&error))
+                    }
+                    Ok(Ok(entries)) if entries.len() > MAX_RESOLVED_METADATA_ENTRIES => {
+                        ResolverOutcome::ResultLimit
+                    }
+                    Ok(Ok(entries)) => ResolverOutcome::Resolved(entries),
+                };
+                (source_id, outcome)
+            }));
+        }
+
+        if pending.is_empty() {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            completed = pending.next() => {
+                let Some((source_id, outcome)) = completed else {
+                    break;
+                };
+                in_flight.remove(&source_id);
+                outcomes.insert(source_id, outcome);
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                for source_id in in_flight.drain() {
+                    outcomes.insert(source_id, ResolverOutcome::TimedOut);
+                }
+                break;
+            }
+        }
+    }
+
+    outcomes
+}
+
+fn safe_provider_failure_reason(error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+    {
+        return "Metadata lookup exceeded its time limit.".to_string();
+    }
+
+    let Some(core_error) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<bbdown_core::Error>())
+    else {
+        return "Metadata provider request failed.".to_string();
     };
-    let Ok(resolved) = resolved else {
+
+    match core_error {
+        bbdown_core::Error::Http(error) if error.is_timeout() => {
+            "Metadata lookup exceeded its time limit.".to_string()
+        }
+        bbdown_core::Error::Http(error) => error.status().map_or_else(
+            || "Metadata provider request failed.".to_string(),
+            |status| {
+                let status = status.as_u16();
+                if status == 412 {
+                    format!(
+                        "Metadata provider refused this lookup with HTTP status {status}; retry later."
+                    )
+                } else {
+                    format!("Metadata provider returned HTTP status {status}.")
+                }
+            },
+        ),
+        bbdown_core::Error::Api { code, .. } => {
+            format!("Metadata provider returned API error code {code}.")
+        }
+        bbdown_core::Error::AccessRestricted(_) => {
+            "Metadata provider reported an access restriction for this source.".to_string()
+        }
+        _ => "Metadata provider request failed.".to_string(),
+    }
+}
+
+fn finish_item(
+    item: &LibraryItem,
+    plan: ItemPlan,
+    resolved_by_source: &HashMap<String, ResolverOutcome>,
+) -> RecoveryItem {
+    let (identity, local_patch) = match plan {
+        ItemPlan::Complete(report) => return report,
+        ItemPlan::Lookup {
+            identity,
+            local_patch,
+        } => (identity, local_patch),
+    };
+    let Some(outcome) = resolved_by_source.get(&identity.query.source_id) else {
         if let Some(patch) = local_patch.as_ref().filter(|_| local_patch_can_fill(item)) {
             return local_metadata_result(
                 item,
                 patch.clone(),
-                "Online metadata is unavailable; only reliable local metadata is offered.",
+                "Metadata lookup was not attempted; only reliable local metadata is offered.",
             );
         }
         return result_for(
             item,
-            RecoveryStatus::Unavailable,
-            "Metadata lookup is unavailable or exceeded its time/result limit.",
+            RecoveryStatus::Deferred,
+            "The analysis budget ended before this lookup started; continue with the remaining items to retry it.",
         );
+    };
+    let resolved = match outcome {
+        ResolverOutcome::Resolved(entries) => entries,
+        ResolverOutcome::TimedOut => {
+            if let Some(patch) = local_patch.as_ref().filter(|_| local_patch_can_fill(item)) {
+                return local_metadata_result(
+                    item,
+                    patch.clone(),
+                    "Online metadata is unavailable; only reliable local metadata is offered.",
+                );
+            }
+            return result_for(
+                item,
+                RecoveryStatus::Unavailable,
+                "Metadata lookup exceeded its time limit.",
+            );
+        }
+        ResolverOutcome::ProviderFailure(reason) => {
+            if let Some(patch) = local_patch.as_ref().filter(|_| local_patch_can_fill(item)) {
+                return local_metadata_result(
+                    item,
+                    patch.clone(),
+                    "Online metadata is unavailable; only reliable local metadata is offered.",
+                );
+            }
+            return result_for(item, RecoveryStatus::Unavailable, reason);
+        }
+        ResolverOutcome::ResultLimit => {
+            if let Some(patch) = local_patch.as_ref().filter(|_| local_patch_can_fill(item)) {
+                return local_metadata_result(
+                    item,
+                    patch.clone(),
+                    "Online metadata exceeded the recovery entry limit; only reliable local metadata is offered.",
+                );
+            }
+            return result_for(
+                item,
+                RecoveryStatus::Unavailable,
+                "Metadata result exceeded the recovery entry limit.",
+            );
+        }
     };
 
     let matches = matching_remote_entries(&identity, resolved);
@@ -892,6 +1133,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn distinct_source_lookups_run_two_at_a_time_and_keep_report_order() {
+        let source_ids = (0..6)
+            .map(|index| format!("BV{index:010}"))
+            .collect::<Vec<_>>();
+        let items = source_ids
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, source_id)| item(&format!("item-{index:02}"), &[source_id.as_str()]))
+            .collect::<Vec<_>>();
+        let input = snapshot(items);
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let active_queries = Arc::new(AtomicUsize::new(0));
+        let max_active_queries = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&resolver_calls);
+        let active = Arc::clone(&active_queries);
+        let max_active = Arc::clone(&max_active_queries);
+
+        let report = analyze_metadata_recovery(&input, None, None, move |query| {
+            let calls = Arc::clone(&calls);
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(active_now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(vec![ResolvedMetadataEntry {
+                    bvid: Some(query.source_id.clone()),
+                    aid: None,
+                    cid: None,
+                    epid: None,
+                    title: "Remote title".to_string(),
+                    collection: None,
+                }])
+            }
+        })
+        .await
+        .expect("the library batch should complete");
+
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), source_ids.len());
+        assert_eq!(max_active_queries.load(Ordering::SeqCst), 2);
+        assert!(active_queries.load(Ordering::SeqCst) == 0);
+        assert_eq!(
+            report
+                .items
+                .iter()
+                .map(|result| result.item_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "item-00", "item-01", "item-02", "item-03", "item-04", "item-05"
+            ]
+        );
+        assert!(
+            report
+                .items
+                .iter()
+                .all(|result| result.status == RecoveryStatus::Ready)
+        );
+    }
+
+    #[tokio::test]
     async fn bvid_only_multiple_parts_require_explicit_choice_and_keep_local_title() {
         let bvid = "BV1abcdefgh1";
         let input = snapshot(vec![item("only", &[bvid])]);
@@ -1237,6 +1541,148 @@ mod tests {
                 .as_deref()
                 .is_some_and(|reason| !reason.contains("private-cookie") && reason.len() < 160)
         }));
+        assert!(
+            report.items.iter().all(|item| {
+                item.reason.as_deref() == Some("Metadata provider request failed.")
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_provider_api_and_timeout_errors_have_bounded_safe_reasons() {
+        let api_error = anyhow::Error::new(bbdown_core::Error::Api {
+            code: -412,
+            message: "private API message with signed-url.example/token".to_string(),
+        })
+        .context("provider lookup failed for https://signed-url.example/private");
+        assert_eq!(
+            safe_provider_failure_reason(&api_error),
+            "Metadata provider returned API error code -412."
+        );
+
+        let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
+            .await
+            .expect_err("a pending future must hit the zero timeout");
+        let timeout_error = anyhow::Error::new(elapsed)
+            .context("metadata adapter timed out for https://signed-url.example/private");
+        assert_eq!(
+            safe_provider_failure_reason(&timeout_error),
+            "Metadata lookup exceeded its time limit."
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn analysis_budget_defers_unstarted_queries_and_library_cursor_reaches_them() {
+        let items = (0..20)
+            .map(|index| {
+                let source_id = format!("BV{index:010}");
+                let mut local = item(&format!("item-{index:03}"), &[source_id.as_str()]);
+                local.confidence = Confidence::NeedsConfirmation;
+                local
+            })
+            .collect::<Vec<_>>();
+        let input = snapshot(items);
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&resolver_calls);
+
+        let first = analyze_metadata_recovery(&input, None, None, move |query| {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(vec![ResolvedMetadataEntry {
+                    bvid: Some(query.source_id),
+                    aid: None,
+                    cid: None,
+                    epid: None,
+                    title: "Remote title".to_string(),
+                    collection: None,
+                }])
+            }
+        })
+        .await
+        .expect("the bounded report should complete at its analysis deadline");
+
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 18);
+        assert_eq!(first.items.len(), 20);
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .filter(|item| item.status == RecoveryStatus::Unavailable)
+                .count(),
+            18
+        );
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .filter(|item| item.status == RecoveryStatus::Deferred)
+                .count(),
+            2
+        );
+        assert!(first.items[..18].iter().all(|item| {
+            item.reason.as_deref() == Some("Metadata lookup exceeded its time limit.")
+        }));
+        assert!(first.items[18..].iter().all(|item| {
+            item.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("remaining items") && reason.len() < 160)
+        }));
+        assert_eq!(first.next_cursor.as_deref(), Some("item-017"));
+        assert_eq!(first.remaining, 2);
+
+        let deferred_ids = first.items[18..]
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect::<Vec<_>>();
+        let retried_selected =
+            analyze_metadata_recovery(&input, Some(&deferred_ids), None, |query| async move {
+                Ok(vec![ResolvedMetadataEntry {
+                    bvid: Some(query.source_id),
+                    aid: None,
+                    cid: None,
+                    epid: None,
+                    title: "Remote title".to_string(),
+                    collection: None,
+                }])
+            })
+            .await
+            .expect("selected deferred items should be eligible for retry");
+        assert_eq!(retried_selected.items.len(), 2);
+        assert!(
+            retried_selected
+                .items
+                .iter()
+                .all(|item| { item.status == RecoveryStatus::Ready })
+        );
+
+        let retried_cursor = analyze_metadata_recovery(
+            &input,
+            None,
+            first.next_cursor.as_deref(),
+            |query| async move {
+                Ok(vec![ResolvedMetadataEntry {
+                    bvid: Some(query.source_id),
+                    aid: None,
+                    cid: None,
+                    epid: None,
+                    title: "Remote title".to_string(),
+                    collection: None,
+                }])
+            },
+        )
+        .await
+        .expect("the continuation cursor should replay the deferred tail");
+        assert_eq!(retried_cursor.items.len(), 2);
+        assert!(
+            retried_cursor
+                .items
+                .iter()
+                .all(|item| { item.status == RecoveryStatus::Ready })
+        );
+        assert_eq!(retried_cursor.remaining, 0);
+        assert!(retried_cursor.next_cursor.is_none());
     }
 
     #[tokio::test]
@@ -1265,5 +1711,65 @@ mod tests {
         assert_eq!(second.remaining, 0);
         assert!(second.next_cursor.is_none());
         assert_eq!(second.items[0].item_id, "item-100");
+    }
+
+    #[tokio::test]
+    async fn expired_library_budget_keeps_initial_and_existing_cursors_representable() {
+        let items = (0..5)
+            .map(|index| {
+                let source_id = format!("BV{index:010}");
+                let mut local = item(&format!("item-{index:03}"), &[source_id.as_str()]);
+                local.confidence = Confidence::NeedsConfirmation;
+                local
+            })
+            .collect();
+        let input = snapshot(items);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = Arc::clone(&calls);
+        let mut resolver = move |_| {
+            resolver_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(Vec::new()) }
+        };
+        let expired_deadline = tokio::time::Instant::now() - Duration::from_secs(1);
+
+        let initial =
+            analyze_library_batch_with_deadline(&input, None, &mut resolver, expired_deadline)
+                .await
+                .expect("an expired initial library analysis should still return retryable rows");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(initial.items.len(), 5);
+        assert_eq!(initial.total, 5);
+        assert_eq!(initial.remaining, initial.total);
+        assert!(
+            initial
+                .items
+                .iter()
+                .all(|item| item.status == RecoveryStatus::Deferred)
+        );
+        assert_eq!(initial.items[0].status, RecoveryStatus::Deferred);
+        assert!(initial.next_cursor.is_none());
+
+        let after_existing_cursor = analyze_library_batch_with_deadline(
+            &input,
+            Some("item-001"),
+            &mut resolver,
+            expired_deadline,
+        )
+        .await
+        .expect("an expired continuation should preserve its starting cursor");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(after_existing_cursor.items.len(), 3);
+        assert!(
+            after_existing_cursor
+                .items
+                .iter()
+                .all(|item| item.status == RecoveryStatus::Deferred)
+        );
+        assert_eq!(after_existing_cursor.total, 5);
+        assert_eq!(after_existing_cursor.remaining, 3);
+        assert_eq!(
+            after_existing_cursor.next_cursor.as_deref(),
+            Some("item-001")
+        );
     }
 }

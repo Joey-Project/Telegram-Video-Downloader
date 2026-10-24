@@ -1,4 +1,4 @@
-const RECOVERY_STATUSES = new Set(["ready", "needs_confirmation", "unchanged", "unavailable", "unsupported"]);
+const RECOVERY_STATUSES = new Set(["ready", "needs_confirmation", "unchanged", "unavailable", "unsupported", "deferred"]);
 const ORGANIZATION_STATUSES = new Set(["standalone", "unreviewed"]);
 const MAX_RECOVERY_ITEMS = 100;
 const MAX_RECOVERY_CANDIDATES = 24;
@@ -97,7 +97,8 @@ export function parseMetadataRecoveryReport(value) {
       || !Number.isSafeInteger(value.total) || value.total < 0
       || !Number.isSafeInteger(value.remaining) || value.remaining < 0
       || !(value.next_cursor === null || boundedText(value.next_cursor, 128))) return null;
-  if (value.remaining > 0 && value.next_cursor === null) return null;
+  if (value.remaining > 0 && value.next_cursor === null
+      && !(value.remaining === value.total && value.total > 0 && value.items[0]?.status === "deferred")) return null;
   if (value.remaining === 0 && value.next_cursor !== null) return null;
   const items = value.items.map(parseItem);
   if (items.some((item) => !item) || new Set(items.map((item) => item.item_id)).size !== items.length) return null;
@@ -114,6 +115,7 @@ export function groupMetadataRecoveryItems(items) {
   const groups = {
     ready: [],
     needs_confirmation: [],
+    deferred: [],
     unchanged: [],
     unavailable: [],
     unsupported: [],

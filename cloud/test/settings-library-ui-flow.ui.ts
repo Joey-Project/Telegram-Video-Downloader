@@ -7,6 +7,7 @@ import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
 
 const LIBRARY_ID = "main-library";
 const ROOT_BINDING = `v1:${"a".repeat(64)}`;
+const ACTION_QUEUE_STORAGE_KEY = "file-manager.actions.v1";
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "settings-library-ui-flow", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
 
@@ -233,6 +234,7 @@ describe("settings library UI flow", () => {
     expect(actionRequest).toBeDefined();
     const action = JSON.parse(String(actionRequest?.[1]?.body));
     expect(action).toMatchObject({ kind: "library_scan", payload: { library_id: LIBRARY_ID } });
+    await vi.waitFor(() => expect(JSON.parse(stored.get(ACTION_QUEUE_STORAGE_KEY) ?? "[]")).toEqual([]));
     const snapshotRequestCount = 1 + manifest.library.chunks.length + manifest.state.chunks.length;
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(snapshotRequestCount + 5));
 
@@ -256,10 +258,13 @@ describe("settings library UI flow", () => {
     await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(statesBeforePush));
     await vi.waitFor(() => expect(element<HTMLInputElement>('[data-category-form="main-library"] input[name="default_category"]').value).toBe("Shows"));
 
-    failNextStateResponse = true;
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false"));
     const statesBeforeManualFailure = stateRequests;
+    failNextStateResponse = true;
     element<HTMLButtonElement>("#refresh-button").click();
     await vi.waitFor(() => expect(stateRequests).toBe(statesBeforeManualFailure + 1));
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false"));
     await vi.waitFor(() => expect(element<HTMLElement>("#toast").textContent).toContain("Request failed (503)"));
     expect(element<HTMLInputElement>('[data-category-form="main-library"] input[name="default_category"]').value).toBe("Shows");
   });

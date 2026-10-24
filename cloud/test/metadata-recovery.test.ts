@@ -9,7 +9,7 @@ import {
 const collection = { id: "series-1", title: "Series", kind: "series", order: 1, part_id: null };
 const reportFixture = {
   revision: "library-r17",
-  total: 5,
+  total: 6,
   remaining: 2,
   next_cursor: "item-unavailable",
   items: [
@@ -22,6 +22,7 @@ const reportFixture = {
       { label: "Series · episode 1", patch: { item_id: "item-choice", collection } },
       { label: "Series · episode 2", patch: { item_id: "item-choice", collection: { ...collection, order: 2 } } },
     ] },
+    { item_id: "item-deferred", title: "Deferred", relative_path: "Deferred.mkv", status: "deferred", reason: "The lookup budget ended before this item was analyzed." },
     { item_id: "item-unchanged", title: "Unchanged", relative_path: "Unchanged.mkv", status: "unchanged", reason: "Metadata is already complete." },
     { item_id: "item-unavailable", title: "Unavailable", relative_path: "Unavailable.mkv", status: "unavailable", reason: "The source could not be checked." },
     { item_id: "item-unsupported", title: "Unsupported", relative_path: "Unsupported.mkv", status: "unsupported", reason: "No supported source ID was found." },
@@ -39,6 +40,7 @@ describe("metadata recovery reports", () => {
     expect(groupMetadataRecoveryItems(report!.items)).toMatchObject({
       ready: [{ item_id: "item-ready" }],
       needs_confirmation: [{ item_id: "item-choice" }],
+      deferred: [{ item_id: "item-deferred", reason: "The lookup budget ended before this item was analyzed." }],
       unchanged: [{ item_id: "item-unchanged", reason: "Metadata is already complete." }],
       unavailable: [{ item_id: "item-unavailable", reason: "The source could not be checked." }],
       unsupported: [{ item_id: "item-unsupported", reason: "No supported source ID was found." }],
@@ -46,6 +48,26 @@ describe("metadata recovery reports", () => {
     expect(parseMetadataRecoveryReport({ ...reportFixture, remaining: 2, next_cursor: null })).toBeNull();
     expect(parseMetadataRecoveryReport({ ...reportFixture, items: [...reportFixture.items, reportFixture.items[0]] })).toBeNull();
     expect(parseMetadataRecoveryReport({ ...reportFixture, items: [{ ...reportFixture.items[0], status: "guessed" }] })).toBeNull();
+  });
+
+  it("accepts a cursorless library report only when its first deferred row represents no progress", () => {
+    const deferredItem = reportFixture.items.find((item) => item.status === "deferred");
+    const cursorless = {
+      revision: "library-r17",
+      total: 3,
+      remaining: 3,
+      next_cursor: null,
+      items: [deferredItem],
+    };
+    expect(parseMetadataRecoveryReport(cursorless)).toMatchObject({
+      total: 3,
+      remaining: 3,
+      next_cursor: null,
+      items: [{ item_id: "item-deferred", status: "deferred" }],
+    });
+    expect(parseMetadataRecoveryReport({ ...cursorless, items: [reportFixture.items[0]] })).toBeNull();
+    expect(parseMetadataRecoveryReport({ ...cursorless, remaining: 2 })).toBeNull();
+    expect(parseMetadataRecoveryReport({ ...cursorless, items: [] })).toBeNull();
   });
 
   it("builds fill-missing-only patches bound to the analyzed revision and an explicit candidate", () => {
