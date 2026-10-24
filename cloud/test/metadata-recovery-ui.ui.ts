@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { Event as HappyDOMEvent } from "happy-dom";
 import type { HTMLSelectElement as HappyDOMSelectElement } from "happy-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { RECOVERY_PREVIEW_STORAGE_KEY } from "../public/file/metadata-recovery-preview-state.js";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
 
@@ -251,12 +252,20 @@ async function mountApp(options: {
   holdMetadataResponse?: boolean;
   blockThirdStateResponse?: boolean;
   deferRecoveryPreviewSnapshot?: boolean;
+  storage?: ReturnType<typeof makeMemoryStorage>;
+  online?: boolean;
+  snapshotStatus?: number;
+  firstSnapshotStatus?: number;
 } = {}) {
   const {
     initialSnapshot = ownerSnapshot,
     holdMetadataResponse = false,
     blockThirdStateResponse = false,
     deferRecoveryPreviewSnapshot = false,
+    storage = makeMemoryStorage(),
+    online = true,
+    snapshotStatus = 0,
+    firstSnapshotStatus = 0,
   } = options;
   vi.useFakeTimers();
   vi.stubGlobal("crypto", webcrypto);
@@ -271,12 +280,13 @@ async function mountApp(options: {
     configurable: true,
     value: { WebApp: { initData: MOCK_INIT_DATA, ready: vi.fn(), expand: vi.fn() } },
   });
-  Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+  Object.defineProperty(window.navigator, "onLine", { configurable: true, value: online });
   vi.stubGlobal("navigator", window.navigator);
   Object.defineProperty(window, "matchMedia", { configurable: true, value: vi.fn(() => ({ matches: true })) });
-  vi.stubGlobal("localStorage", makeMemoryStorage());
+  vi.stubGlobal("localStorage", storage);
 
   let currentManifest: Record<string, any>;
+  let currentSnapshotStatus = snapshotStatus;
   const responseChunks = new Map<string, string>();
   const initial = await makeChunkedSnapshot(initialSnapshot);
   currentManifest = initial.manifest;
@@ -317,6 +327,8 @@ async function mountApp(options: {
       expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
       stateRequests += 1;
       if (blockThirdStateResponse && stateRequests === 3) await thirdStateResponseGate;
+      if (stateRequests === 1 && firstSnapshotStatus > 0) return { ok: false, status: firstSnapshotStatus, json: async () => ({ error: "The owner snapshot could not be loaded." }) } as Response;
+      if (currentSnapshotStatus > 0) return { ok: false, status: currentSnapshotStatus, json: async () => ({ error: "The owner snapshot could not be loaded." }) } as Response;
       return { ok: true, status: 200, json: async () => currentManifest } as Response;
     }
     const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
@@ -399,14 +411,24 @@ async function mountApp(options: {
   // The browser entry has no declarations because it is executed for its side effects.
   // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
   await import("../public/file/app.js");
-  await vi.waitFor(() => {
-    expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false);
-    expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
-  });
+  if (firstSnapshotStatus > 0 || snapshotStatus > 0) {
+    await vi.waitFor(() => {
+      expect(stateRequests).toBeGreaterThan(0);
+      expect(element<HTMLElement>("#auth-gate").classList.contains("hidden")).toBe(false);
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+  } else {
+    await vi.waitFor(() => {
+      expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false);
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+  }
   return {
     sentActions,
     replaceSnapshot,
+    storage,
     get stateRequests() { return stateRequests; },
+    setSnapshotStatus: (status: number) => { currentSnapshotStatus = status; },
     waitForMetadataSnapshotPrepared: () => metadataSnapshotPrepared,
     releaseMetadataActionResponse: () => releaseMetadataResponse?.(),
     releaseThirdStateResponse: () => releaseThirdStateResponse?.(),
@@ -461,6 +483,44 @@ async function submitReadyRecoveryPreview(app: Awaited<ReturnType<typeof mountAp
   const action = [...app.sentActions].reverse().find((entry) => entry.kind === "file_preview");
   expect(action?.request_id).toEqual(expect.any(String));
   return { seq: Number(sequenceMatch?.[1]), requestId: String(action?.request_id) };
+}
+
+async function queueReadyRecoveryPreview(app: Awaited<ReturnType<typeof mountApp>>) {
+  element<HTMLButtonElement>('[data-view="needs"]').click();
+  await waitForRecoveryResult("Ready video");
+  element<HTMLInputElement>('[data-recovery-item="item-ready"]').click();
+  element<HTMLButtonElement>("[data-recovery-preview]").click();
+  let queuedAction: Record<string, any> | undefined;
+  await vi.waitFor(() => {
+    const queue = JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]") as Array<Record<string, any>>;
+    expect(queue).toHaveLength(1);
+    queuedAction = queue[0];
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("queued in this browser");
+  });
+  expect(queuedAction?.kind).toBe("file_preview");
+  return { action: queuedAction!, requestId: String(queuedAction?.request_id) };
+}
+
+function makeFailingRecoveryPreviewStorage() {
+  const storage = makeMemoryStorage();
+  const setItem = storage.setItem;
+  storage.setItem = (key, value) => {
+    if (key === RECOVERY_PREVIEW_STORAGE_KEY) throw new Error("Preview tracking storage is unavailable.");
+    return setItem(key, value);
+  };
+  return storage;
+}
+
+function readyRecoverySnapshot(primaryRootBinding = ROOT_BINDING) {
+  const recovery = recoveryOperation({
+    seq: 40,
+    libraryId: LIBRARY_ID,
+    rootBinding: primaryRootBinding,
+    revision: "recovery-ui-r1",
+    itemId: "item-ready",
+    title: "Ready video",
+  });
+  return twoLibrarySnapshot({ primaryRootBinding, operations: [recovery] });
 }
 
 afterEach(async () => {
@@ -787,6 +847,232 @@ describe("metadata recovery Mini App flow", () => {
     selectLibrary(LIBRARY_ID);
     expect(element<HTMLElement>("#preview-list").textContent).not.toContain("Recovery preview is being prepared");
     expect(element<HTMLElement>("#preview-list").textContent).not.toContain("Recovery preview failed");
+  });
+
+  it("restores a queued recovery preview on reload and drains only its existing request", async () => {
+    const storage = makeMemoryStorage();
+    const firstTab = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    Object.defineProperty(window.navigator, "onLine", { configurable: true, value: false });
+    const queued = await queueReadyRecoveryPreview(firstTab);
+    expect(firstTab.sentActions.some((action) => action.kind === "file_preview")).toBe(false);
+    expect(JSON.parse(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY) ?? "null")).toMatchObject({
+      requestId: queued.requestId,
+      status: "queued",
+      libraryId: LIBRARY_ID,
+      rootBinding: ROOT_BINDING,
+    });
+
+    vi.clearAllTimers();
+    const reloaded = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      online: true,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    await waitForSubmittedAction(reloaded.sentActions, "file_preview");
+    await waitForLocalActionQueueEmpty();
+    const retriedPreviewActions = reloaded.sentActions.filter((action) => action.kind === "file_preview");
+    expect(retriedPreviewActions).toHaveLength(1);
+    expect(retriedPreviewActions[0]?.request_id).toBe(queued.requestId);
+    expect(reloaded.sentActions.some((action) => action.kind === "file_confirm")).toBe(false);
+    expect(JSON.parse(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY) ?? "null")).toMatchObject({
+      requestId: queued.requestId,
+      status: "submitted",
+    });
+  });
+
+  it("restores a submitted recovery preview, retains later failure, and dismisses it without resubmitting", async () => {
+    const storage = makeMemoryStorage();
+    const firstTab = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    const submitted = await submitReadyRecoveryPreview(firstTab);
+    expect(JSON.parse(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY) ?? "null")).toMatchObject({
+      requestId: submitted.requestId,
+      seq: submitted.seq,
+      status: "submitted",
+    });
+
+    vi.clearAllTimers();
+    const reloaded = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    element<HTMLButtonElement>('[data-view="organizing"]').click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview request #${submitted.seq} was submitted`));
+    expect(element<HTMLElement>("#organizing-count").textContent).toBe("1");
+    expect(reloaded.sentActions.filter((action) => action.kind === "file_preview" || action.kind === "file_confirm")).toEqual([]);
+
+    const failedOperation = {
+      seq: submitted.seq,
+      kind: "file_preview",
+      request_id: `action:${submitted.requestId}`,
+      library_id: LIBRARY_ID,
+      root_binding: ROOT_BINDING,
+      status: "failed",
+      error: "The submitted preview failed after reload.",
+    };
+    await applyHelperTabSnapshot(reloaded, readyRecoverySnapshot());
+    await reloaded.replaceSnapshot(twoLibrarySnapshot({ operations: [failedOperation] }));
+    const requestsBeforeFailure = reloaded.stateRequests;
+    element<HTMLButtonElement>("#refresh-button").click();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(reloaded.stateRequests).toBeGreaterThan(requestsBeforeFailure));
+    await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview failed · request #${submitted.seq}`));
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("The submitted preview failed after reload.");
+    expect(JSON.parse(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY) ?? "null")).toMatchObject({
+      requestId: submitted.requestId,
+      status: "failed",
+    });
+
+    await applyHelperTabSnapshot(reloaded, readyRecoverySnapshot());
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("The submitted preview failed after reload.");
+    element<HTMLButtonElement>("[data-recovery-preview-dismiss]").click();
+    expect(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY)).toBeNull();
+    expect(element<HTMLElement>("#organizing-count").textContent).toBe("0");
+
+    await applyHelperTabSnapshot(reloaded, readyRecoverySnapshot());
+    expect(element<HTMLElement>("#preview-list").textContent).not.toContain("Recovery preview failed");
+    expect(reloaded.sentActions.filter((action) => action.kind === "file_preview" || action.kind === "file_confirm")).toEqual([]);
+  });
+
+  it("clears a restored tracker when a matching preview arrives after reload", async () => {
+    const storage = makeMemoryStorage();
+    const firstTab = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    const submitted = await submitReadyRecoveryPreview(firstTab);
+    vi.clearAllTimers();
+
+    const reloaded = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    expect(reloaded.sentActions.filter((action) => action.kind === "file_preview" || action.kind === "file_confirm")).toEqual([]);
+    await applyHelperTabSnapshot(reloaded, {
+      ...readyRecoverySnapshot(),
+      previews: [{
+        seq: submitted.seq,
+        kind: "file_preview",
+        request_id: `action:${submitted.requestId}`,
+        library_id: LIBRARY_ID,
+        root_binding: ROOT_BINDING,
+        preview_id: "reload-success-preview",
+        revision: "reload-success-r1",
+        status: "awaiting_confirmation",
+        preview: {
+          metadata_patches: [{
+            item_id: "item-ready",
+            changed: true,
+            changes: [{ field: "title", before: "Original title", after: "Reloaded recovered title" }],
+          }],
+        },
+      }],
+    });
+    await vi.waitFor(() => expect(document.querySelector('[data-confirm="reload-success-preview"]')).not.toBeNull());
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("Reloaded recovered title");
+    expect(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY)).toBeNull();
+    expect(reloaded.sentActions.filter((action) => action.kind === "file_preview" || action.kind === "file_confirm")).toEqual([]);
+  });
+
+  it("does not restore across a replaced root binding on the first fresh snapshot", async () => {
+    const storage = makeMemoryStorage();
+    const firstTab = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    const submitted = await submitReadyRecoveryPreview(firstTab);
+    expect(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY)).not.toBeNull();
+    vi.clearAllTimers();
+
+    const reloaded = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(REPLACEMENT_ROOT_BINDING),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    expect(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY)).toBeNull();
+    expect(element<HTMLElement>("#preview-list").textContent).not.toContain(`request #${submitted.seq}`);
+    expect(reloaded.sentActions.filter((action) => action.kind === "file_preview" || action.kind === "file_confirm")).toEqual([]);
+  });
+
+  it("keeps the tracker through an unverified transient snapshot failure, then restores without posting", async () => {
+    const storage = makeMemoryStorage();
+    const firstTab = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    const submitted = await submitReadyRecoveryPreview(firstTab);
+    vi.clearAllTimers();
+
+    const retryingPage = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      firstSnapshotStatus: 503,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    expect(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY)).not.toBeNull();
+    const requestsBeforeRetry = retryingPage.stateRequests;
+    element<HTMLButtonElement>("#refresh-button").click();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(retryingPage.stateRequests).toBeGreaterThan(requestsBeforeRetry));
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+    element<HTMLButtonElement>('[data-view="organizing"]').click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview request #${submitted.seq} was submitted`));
+    expect(retryingPage.sentActions.filter((action) => action.kind === "file_preview" || action.kind === "file_confirm")).toEqual([]);
+  });
+
+  it("clears a restored tracker when private access expires", async () => {
+    const storage = makeMemoryStorage();
+    const firstTab = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    const submitted = await submitReadyRecoveryPreview(firstTab);
+    expect(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY)).not.toBeNull();
+    vi.clearAllTimers();
+
+    const expiredPage = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview request #${submitted.seq} was submitted`));
+    expiredPage.setSnapshotStatus(401);
+    const requestsBeforeExpiry = expiredPage.stateRequests;
+    element<HTMLButtonElement>("#refresh-button").click();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(expiredPage.stateRequests).toBeGreaterThan(requestsBeforeExpiry));
+    await vi.waitFor(() => expect(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY)).toBeNull());
+    expect(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY)).toBeNull();
+    expect(element<HTMLElement>("#auth-gate").classList.contains("hidden")).toBe(false);
+    expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(true);
+    expect(expiredPage.sentActions.filter((action) => action.kind === "file_preview" || action.kind === "file_confirm")).toEqual([]);
+  });
+
+  it("keeps the in-page preview usable when tracker storage writes fail", async () => {
+    const storage = makeFailingRecoveryPreviewStorage();
+    const app = await mountApp({
+      initialSnapshot: readyRecoverySnapshot(),
+      storage,
+      deferRecoveryPreviewSnapshot: true,
+    });
+    const submitted = await submitReadyRecoveryPreview(app);
+    expect(storage.getItem(RECOVERY_PREVIEW_STORAGE_KEY)).toBeNull();
+    expect(element<HTMLElement>("#preview-list").textContent).toContain(`Recovery preview request #${submitted.seq} was submitted`);
+    expect(app.sentActions.some((action) => action.kind === "file_preview" && action.request_id === submitted.requestId)).toBe(true);
   });
 
   it("reconciles a helper-tab preview by request ID when its operation receipt is omitted", async () => {

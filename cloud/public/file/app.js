@@ -2,6 +2,7 @@ import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, consumeRejectedActi
 import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { buildMetadataRecoveryPreviewPayload, buildOrganizationStatusPatch, groupMetadataRecoveryItems, metadataRecoveryOperationId, parseMetadataRecoveryReport } from "./metadata-recovery.js";
+import { readRecoveryPreviewRequest, writeRecoveryPreviewRequest } from "./metadata-recovery-preview-state.js";
 import { HttpResponseError } from "./http-error.js";
 import { createOwnerSnapshotLoader } from "./snapshot-loader.js";
 import { createSnapshotUpdates } from "./snapshot-updates.js";
@@ -39,6 +40,7 @@ const state = { ownerVerified: false, privateUiVisible: false, canDispatchAction
 let snapshotUpdates = null;
 let snapshotUpdateStatus = "connecting";
 let privateAccessExpired = false;
+let metadataRecoveryPreviewRestoreAttempted = false;
 
 const byId = (id) => document.getElementById(id);
 let cachedFolderLibrary = null;
@@ -138,9 +140,32 @@ function clearMetadataRecoveryReport({ dismiss = true } = {}) {
   state.metadataRecovery = null;
 }
 
+function setMetadataRecoveryPreviewRequest(request) {
+  const next = request ? { ...request } : null;
+  state.metadataRecoveryPreviewRequest = next;
+  metadataRecoveryPreviewRestoreAttempted = true;
+  try { writeRecoveryPreviewRequest(localStorage, next); } catch { /* The in-memory request remains available for this page. */ }
+}
+
+function restoreMetadataRecoveryPreviewRequest(snapshot) {
+  if (metadataRecoveryPreviewRestoreAttempted || !state.ownerVerified || !state.privateUiVisible) return false;
+  metadataRecoveryPreviewRestoreAttempted = true;
+  if (state.metadataRecoveryPreviewRequest) return false;
+
+  let request = null;
+  try { request = readRecoveryPreviewRequest(localStorage); } catch { return false; }
+  if (!request) return false;
+  if (registeredMediaLibrary(snapshot, request.libraryId)?.root_binding !== request.rootBinding) {
+    setMetadataRecoveryPreviewRequest(null);
+    return true;
+  }
+  setMetadataRecoveryPreviewRequest(request);
+  return true;
+}
+
 function clearMetadataRecoveryState({ dismiss = true, preservePreviewRequest = false } = {}) {
   clearMetadataRecoveryReport({ dismiss });
-  if (!preservePreviewRequest) state.metadataRecoveryPreviewRequest = null;
+  if (!preservePreviewRequest) setMetadataRecoveryPreviewRequest(null);
 }
 
 function recoveryContext() {
@@ -265,7 +290,7 @@ function currentMetadataRecovery() {
     clearMetadataRecoveryState({ preservePreviewRequest: true });
     if (recoveryRootChanged && previewRequest?.libraryId === recovery.libraryId
         && previewRequest.rootBinding !== context.rootBinding) {
-      state.metadataRecoveryPreviewRequest = null;
+      setMetadataRecoveryPreviewRequest(null);
     }
     recovery = null;
   }
@@ -405,14 +430,14 @@ function previewMetadataRecoverySelection() {
   submitAction("file_preview", payload, {
     onQueued: (action) => {
       state.view = "organizing";
-      state.metadataRecoveryPreviewRequest = {
+      setMetadataRecoveryPreviewRequest({
         requestId: action.request_id,
         seq: null,
         libraryId: context.libraryId,
         rootBinding: context.rootBinding,
         status: "queued",
         error: "",
-      };
+      });
       render();
     },
   });
@@ -424,6 +449,7 @@ function updateMetadataRecoveryPreviewRequest(action, { status, error = "", seq 
   request.status = status;
   request.error = String(error ?? "");
   if (seq !== undefined) request.seq = Number.isSafeInteger(seq) && seq > 0 ? seq : null;
+  setMetadataRecoveryPreviewRequest(request);
   renderPreviews();
   return true;
 }
@@ -441,30 +467,29 @@ function metadataRecoveryPreviewSnapshotMatches(entry, request, snapshot) {
 function reconcileMetadataRecoveryPreviewRequest(snapshot) {
   const request = state.metadataRecoveryPreviewRequest;
   if (!request || !snapshot) return false;
+  let updated = { ...request };
 
   const operations = Array.isArray(snapshot.operations) ? snapshot.operations : [];
   const operation = operations.find((entry) => metadataRecoveryPreviewSnapshotMatches(entry, request, snapshot));
   if (operation) {
-    if (Number.isSafeInteger(operation.seq) && operation.seq > 0) request.seq = operation.seq;
+    if (Number.isSafeInteger(operation.seq) && operation.seq > 0) updated.seq = operation.seq;
     const status = String(operation.status ?? "").toLowerCase();
-    request.error = String(operation.error ?? "");
+    updated.error = String(operation.error ?? "");
     if (["failed", "rejected", "stale", "cancelled", "expired"].includes(status)) {
-      request.status = status;
+      updated.status = status;
     } else if (status === "completed") {
-      state.metadataRecoveryPreviewRequest = null;
+      setMetadataRecoveryPreviewRequest(null);
       return true;
     } else {
-      request.status = "submitted";
+      updated.status = "submitted";
     }
+    setMetadataRecoveryPreviewRequest(updated);
   }
 
   const previews = Array.isArray(snapshot.previews) ? snapshot.previews : [];
   const preview = previews.find((entry) => metadataRecoveryPreviewSnapshotMatches(entry, request, snapshot));
   if (preview) {
-    if (Number.isSafeInteger(preview.seq) && preview.seq > 0) request.seq = preview.seq;
-    request.status = String(preview.status ?? "awaiting_confirmation");
-    request.error = "";
-    state.metadataRecoveryPreviewRequest = null;
+    setMetadataRecoveryPreviewRequest(null);
     return true;
   }
   return Boolean(operation);
@@ -733,10 +758,10 @@ function clearCachedSnapshot() {
   try { localStorage.removeItem(CACHE_KEY); } catch { /* Private content remains hidden if storage is unavailable. */ }
 }
 
-function showPrivateAccessGate(message) {
+function showPrivateAccessGate(message, { preserveRecoveryPreviewRequest = false } = {}) {
   state.detailId = null;
   clearSelectedItems();
-  clearMetadataRecoveryState();
+  clearMetadataRecoveryState({ preservePreviewRequest: preserveRecoveryPreviewRequest });
   state.legacyOperation = null;
   state.legacyOperationKey = null;
   state.legacySelection.clear();
@@ -769,7 +794,7 @@ function invalidateMetadataRecoveryForSnapshot(previousSnapshot, nextSnapshot) {
     clearMetadataRecoveryReport({ dismiss: false });
   }
   if (previewBindingChanged && state.metadataRecoveryPreviewRequest === previewRequest) {
-    state.metadataRecoveryPreviewRequest = null;
+    setMetadataRecoveryPreviewRequest(null);
   }
   return recoveryBindingChanged || recoveryRevisionChanged || previewBindingChanged;
 }
@@ -781,6 +806,7 @@ function acceptFreshSnapshot(snapshot) {
     state.groupSelectionLimitNotice = null;
   }
   Object.assign(state, acceptOwnerSnapshot(snapshot, state));
+  restoreMetadataRecoveryPreviewRequest(state.snapshot);
   reconcileMetadataRecoveryPreviewRequest(state.snapshot);
   settleMigrationConflictRefreshes();
   normalizeLibraryContext();
@@ -852,7 +878,9 @@ async function performRefreshState({ quiet = false } = {}) {
     } else {
       showPrivateAccessGate(transition.authorizationRejected
         ? "Owner access could not be verified. Reopen this Mini App from the owner's private chat."
-        : "The private library stays hidden until its owner is verified. Check the connection and retry.");
+        : "The private library stays hidden until its owner is verified. Check the connection and retry.", {
+        preserveRecoveryPreviewRequest: !transition.authorizationRejected,
+      });
     }
     if (!transition.authorizationRejected) updateSnapshotUpdateStatus(snapshotUpdateStatus);
     if (!quiet && navigator.onLine && mayUsePrivateSnapshot(state)) showToast(error.message);
@@ -1775,16 +1803,17 @@ function renderPreviews() {
   const submission = state.metadataRecoveryPreviewRequest;
   if (submission && Number.isSafeInteger(submission.seq)
       && allPreviews.some((entry) => entry.seq === submission.seq && isReviewablePreviewStatus(entry.status))) {
-    state.metadataRecoveryPreviewRequest = null;
+    setMetadataRecoveryPreviewRequest(null);
   }
   const pending = allPreviews.filter((entry) => isReviewablePreviewStatus(entry.status));
-  byId("organizing-count").textContent = String(pending.length);
   const currentSubmission = state.metadataRecoveryPreviewRequest;
   const submissionLibrary = currentSubmission
     ? registeredMediaLibrary(state.snapshot, currentSubmission.libraryId)
     : null;
-  const requestCard = currentSubmission && currentSubmission.libraryId === activeLibraryId()
-    && submissionLibrary?.root_binding === currentSubmission.rootBinding
+  const showRequestCard = Boolean(currentSubmission && currentSubmission.libraryId === activeLibraryId()
+    && submissionLibrary?.root_binding === currentSubmission.rootBinding);
+  byId("organizing-count").textContent = String(pending.length + (showRequestCard ? 1 : 0));
+  const requestCard = showRequestCard
     ? (() => {
       const queued = readActionQueue().some((action) => action.request_id === currentSubmission.requestId);
       const operation = Number.isSafeInteger(currentSubmission.seq)
@@ -1794,7 +1823,7 @@ function renderPreviews() {
       const failureStatuses = ["failed", "rejected", "stale", "cancelled", "expired"];
       if (failureStatuses.includes(operationStatus)) {
         const error = operation?.error ?? currentSubmission.error ?? "The computer could not create this preview.";
-        return `<article class="stack-card"><div class="stack-card-head"><div><h3>Recovery preview failed · request #${escapeHtml(currentSubmission.seq ?? currentSubmission.requestId)}</h3><p>${escapeHtml(error)}</p></div><span class="state-pill warning">Needs attention</span></div></article>`;
+        return `<article class="stack-card"><div class="stack-card-head"><div><h3>Recovery preview failed · request #${escapeHtml(currentSubmission.seq ?? currentSubmission.requestId)}</h3><p>${escapeHtml(error)}</p></div><span class="state-pill warning">Needs attention</span></div><button type="button" class="secondary-button" data-recovery-preview-dismiss="${escapeHtml(currentSubmission.requestId)}">Dismiss notice</button></article>`;
       }
       const message = currentSubmission.status === "rejected"
         ? `The computer rejected recovery preview request ${Number.isSafeInteger(currentSubmission.seq) ? `#${currentSubmission.seq}` : currentSubmission.requestId}: ${currentSubmission.error || "Request rejected"}`
@@ -2513,6 +2542,14 @@ function bindEvents() {
     }
     const recoveryNext = event.target.closest("[data-recovery-next]");
     if (recoveryNext) { requestMetadataRecovery("library"); return; }
+    const previewNoticeDismiss = event.target.closest("[data-recovery-preview-dismiss]");
+    if (previewNoticeDismiss) {
+      if (state.metadataRecoveryPreviewRequest?.requestId === previewNoticeDismiss.dataset.recoveryPreviewDismiss) {
+        setMetadataRecoveryPreviewRequest(null);
+        renderPreviews();
+      }
+      return;
+    }
     const recoveryClear = event.target.closest("[data-recovery-clear]");
     if (recoveryClear) {
       clearMetadataRecoveryState({ preservePreviewRequest: true });
@@ -2533,7 +2570,7 @@ function bindEvents() {
         showToast("The delivery notice could not be removed from browser storage. It remains paused here.");
         return;
       }
-      if (state.metadataRecoveryPreviewRequest?.requestId === requestId) state.metadataRecoveryPreviewRequest = null;
+      if (state.metadataRecoveryPreviewRequest?.requestId === requestId) setMetadataRecoveryPreviewRequest(null);
       if (dismissed.downloadSubmission) renderDownloadStatus();
       if (dismissed.migrationConflictDrafts > 0) renderMigrations();
       renderWaiting();

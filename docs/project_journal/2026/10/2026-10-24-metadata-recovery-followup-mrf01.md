@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-24
 updated: 2026-10-24
 branch: "codex/metadata-recovery-regressions"
-pr: ""
+pr: "https://github.com/Joey-Project/Telegram-Video-Downloader/pull/57"
 supersedes: []
 superseded_by: ""
 ---
@@ -30,6 +30,8 @@ superseded_by: ""
 - Clearing analysis choices and navigating between libraries retain an already submitted preview's preparation/failure tracking. Validate its original library/root independently of any newer analysis in another library; original root-binding changes and private-access expiry still clear it.
 - Retain a received failure even if later bounded operation history omits its receipt. File and Settings loading regions expose their real refresh lifecycle with `aria-busy`; tests wait for completed refreshes before simulating a later manual failure.
 - Recover a preview submission from its original request ID in owner snapshots when another browser tab drains the shared queue. Publish the bounded ID and original library/root identity on file-preview receipts and active previews, including compact placeholders, so an omitted operation receipt cannot strand the submitting tab.
+- Persist only bounded preview identity, sequence, status, and error in browser storage. Restore display tracking after a fresh owner snapshot verifies the original library/root, without synthesizing, replaying, or confirming any action. Existing durable queued actions keep their normal startup drain and stable request ID.
+- Include a visible tracked request in Organizing's count. Allow terminal failure tracking to be dismissed locally while keeping backend history, and retain the existing check-computer flow for unknown delivery outcomes.
 - Complete serialized credential synchronization before acquiring shared validation capacity, within the same source deadline, so waiting recovery queries do not reserve download-validation slots.
 
 ## Validation
@@ -38,6 +40,7 @@ superseded_by: ""
 - After preserving explicit membership, the same two real samples returned one valid collection-bearing entry each at the 3s enrichment deadline, with zero invented order values. These probes load the existing profile without legacy synchronization, credential refresh, or writes; they do not submit production commands.
 - Recovery-focused tests passed 95 cases, including mock Telegram analysis-to-confirmation-to-rescan for verified membership without order, unchanged video bytes, and preservation of custom NFO content.
 - Full Rust suite: 1288 passed, zero failed, 16 existing ignored; recovery-focused suite: 95 passed. All-target Clippy with warnings denied, formatting, and isolated optimized release build passed. Snapshot regressions cover exact persisted request IDs, pending/failure identity, compaction/replay, placeholders, and independent preview/history retention.
-- Cloud suite: 318 ordinary tests and 34 UI tests passed; generated binding types, TypeScript, JavaScript syntax, and deployment packaging passed. Tests wait for mock snapshot publication and completed refreshes, isolate delegated listeners between page mounts, and honor the one-second invalidation throttle instead of assuming immediate reads.
+- Cloud suite: 324 ordinary tests and 41 UI tests passed; generated binding types, TypeScript, JavaScript syntax, and deployment packaging passed. Tests wait for mock snapshot publication and completed refreshes, isolate delegated listeners between page mounts, and honor the one-second invalidation throttle instead of assuming immediate reads.
 - UI regressions exercise automatic Organizing navigation, pending-to-confirmation handoff, same-root revision failure visibility, deferred-only retry after reload without browser selection, cross-tab success/failure with foreign-request and root-binding rejection, and library navigation with independently invalidated roots and omitted failure history. Loading regions expose their refresh lifecycle through aria-busy.
+- Six persistence-helper tests cover bounded exact records, malformed/oversized input, identity and sequence validation, control-free UTF-8 errors, and unavailable storage. Reload UI tests cover the existing queued UUID draining once, submitted requests generating no new action, later success/failure, terminal dismissal without resurrection, first-snapshot root replacement, transient startup failure, authorization expiry, and failed storage writes.
 - Read-only provider diagnostics do not constitute production metadata confirmation. Private runtime snapshots, logs, and deployment bookkeeping remain outside Git.
