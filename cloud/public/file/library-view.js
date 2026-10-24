@@ -241,9 +241,13 @@ export function mediaSnapshotOmissionNotice(descriptor, snapshot) {
 
 function operationLibraryBinding(operation) {
   const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
+  const recoveryIdentity = operation?.recovery_identity && typeof operation.recovery_identity === "object"
+    ? operation.recovery_identity
+    : {};
   const nested = result.operation && typeof result.operation === "object" ? result.operation : {};
   const preview = result.preview && typeof result.preview === "object" ? result.preview : {};
   const candidates = [
+    [recoveryIdentity, "library_id"],
     [result, "library_id"], [result, "source_library_id"],
     [nested, "library_id"], [nested, "source_library_id"],
     [preview, "library_id"], [preview, "source_library_id"],

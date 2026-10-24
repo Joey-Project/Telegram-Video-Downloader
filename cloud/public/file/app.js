@@ -147,11 +147,53 @@ function recoveryContext() {
   return { libraryId, rootBinding, revision };
 }
 
+function metadataRecoveryReceiptIdentity(operation) {
+  if (!operation || typeof operation !== "object" || Array.isArray(operation)
+      || !Object.hasOwn(operation, "recovery_identity")) return { present: false, identity: null };
+  const value = operation.recovery_identity;
+  const fields = ["library_id", "root_binding", "scope"];
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== fields.length
+      || !fields.every((field) => Object.hasOwn(value, field))
+      || Object.keys(value).some((field) => !fields.includes(field))
+      || !["selected", "library"].includes(value.scope)) {
+    return { present: true, identity: null };
+  }
+  const parsed = fileOperationLibraryIdentity({ recovery_identity: value });
+  if (!parsed || parsed.library_id !== value.library_id || parsed.root_binding !== value.root_binding
+      || !isValidLibraryRootBinding(value.root_binding)) {
+    return { present: true, identity: null };
+  }
+  return {
+    present: true,
+    identity: Object.freeze({ library_id: parsed.library_id, root_binding: parsed.root_binding, scope: value.scope }),
+  };
+}
+
+function recoveryOperationScope(operation) {
+  const receipt = metadataRecoveryReceiptIdentity(operation);
+  if (receipt.present) return receipt.identity?.scope ?? "unknown";
+  const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
+  const candidates = [result.scope, operation?.scope, operation?.payload?.scope];
+  return candidates.find((scope) => scope === "selected" || scope === "library") ?? "unknown";
+}
+
+function recoveryOperationMatchesLibrary(operation, libraryId) {
+  const receipt = metadataRecoveryReceiptIdentity(operation);
+  if (receipt.present) {
+    if (!receipt.identity || receipt.identity.library_id !== libraryId) return false;
+    // Check the receipt's identity independently so a malformed or mismatched
+    // completed result cannot make a valid newer intent look foreign.
+    return fileOperationIdentityMatches(state.snapshot, { recovery_identity: receipt.identity }, libraryId);
+  }
+  return operationMatchesLibrary(operation, libraryId)
+    && fileOperationIdentityMatches(state.snapshot, operation, libraryId);
+}
+
 function recoveryOperationsForLibrary(libraryId) {
   return (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [])
     .filter((operation) => operation?.kind === "metadata_recover"
-      && operationMatchesLibrary(operation, libraryId)
-      && fileOperationIdentityMatches(state.snapshot, operation, libraryId))
+      && recoveryOperationMatchesLibrary(operation, libraryId))
     .sort((left, right) => Number(right?.seq ?? 0) - Number(left?.seq ?? 0));
 }
 
@@ -164,10 +206,19 @@ function recoveryOperationCompacted(operation) {
 function recoveryOperationReport(operation) {
   if (!operation || recoveryOperationCompacted(operation)) return null;
   const result = operation.result && typeof operation.result === "object" ? operation.result : {};
+  const receipt = metadataRecoveryReceiptIdentity(operation);
+  const boundIdentity = receipt.present
+    ? receipt.identity
+    : fileOperationLibraryIdentity(operation);
+  if (!boundIdentity || result.library_id !== boundIdentity.library_id
+      || result.root_binding !== boundIdentity.root_binding
+      || !["selected", "library"].includes(result.scope)
+      || receipt.present && result.scope !== boundIdentity.scope) return null;
   return parseMetadataRecoveryReport(result.recovery);
 }
 
 function recoveryOperationMatches(operation, recovery) {
+  if (recoveryOperationScope(operation) !== recovery.scope) return false;
   return metadataRecoveryOperationId(operation) === recovery.requestId
     || Number.isSafeInteger(recovery.seq) && Number.isSafeInteger(operation?.seq) && operation.seq === recovery.seq;
 }
@@ -237,7 +288,7 @@ function currentMetadataRecovery() {
           }
         } else if (["failed", "stale", "rejected"].includes(String(operation.status))) {
           recovery.error = String(operation.error ?? operation.message ?? "Metadata analysis failed on your computer.");
-        } else if (operation.result && ["completed", "complete", "succeeded"].includes(String(operation.status))) {
+        } else if (["completed", "complete", "succeeded"].includes(String(operation.status))) {
           recovery.invalidated = true;
           recovery.report = null;
           recovery.selectedIds.clear();
@@ -257,11 +308,7 @@ function currentMetadataRecovery() {
       requestId,
       libraryId: context.libraryId,
       rootBinding: context.rootBinding,
-        scope: operation?.result?.scope === "selected" || operation?.scope === "selected" || operation?.payload?.scope === "selected"
-          ? "selected"
-          : operation?.result?.scope === "library" || operation?.scope === "library" || operation?.payload?.scope === "library"
-            ? "library"
-            : "unknown",
+      scope: recoveryOperationScope(operation),
       report: null,
       selectedIds: new Set(),
       candidateChoices: new Map(),
@@ -274,7 +321,7 @@ function currentMetadataRecovery() {
     else if (report || recovery.compacted) recovery.invalidated = true;
     else if (["failed", "stale", "rejected"].includes(String(operation.status))) {
       recovery.error = String(operation.error ?? operation.message ?? "Metadata analysis failed on your computer.");
-    } else if (operation.result && ["completed", "complete", "succeeded"].includes(String(operation.status))) {
+    } else if (["completed", "complete", "succeeded"].includes(String(operation.status))) {
       recovery.invalidated = true;
     }
     state.metadataRecovery = recovery;

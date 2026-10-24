@@ -618,6 +618,31 @@ async fn metadata_recovery_resolver_wait_does_not_block_library_or_telegram_disp
         .await
         .expect("mock resolver should enter its blocked state");
 
+    let pending_snapshot = tokio::time::timeout(
+        Duration::from_secs(3),
+        build_cloud_state_snapshot(harness.runtime.as_ref().unwrap()),
+    )
+    .await
+    .expect("snapshot reporting must not wait for the held resolver")
+    .expect("processing snapshot should build")
+    .expect("processing snapshot should be available");
+    let pending_receipt = pending_snapshot
+        .operations
+        .iter()
+        .find(|operation| operation["seq"] == 41)
+        .expect("processing recovery receipt should be published before completion");
+    assert_eq!(pending_receipt["status"], "processing");
+    assert!(pending_receipt["result"].is_null());
+    assert!(pending_receipt.get("payload").is_none());
+    assert_eq!(
+        pending_receipt["recovery_identity"],
+        json!({
+            "library_id": harness.library_id,
+            "root_binding": harness.root_binding,
+            "scope": "selected",
+        })
+    );
+
     let concurrent_scan = tokio::time::timeout(Duration::from_secs(3), harness.rescan(42)).await;
     let concurrent_telegram = tokio::time::timeout(
         Duration::from_secs(3),

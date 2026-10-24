@@ -623,6 +623,27 @@ fn exact_bounded_scalar_field(result: &Value, field: &str, max_json_bytes: usize
     (compacted == *candidate).then_some(compacted)
 }
 
+fn metadata_recovery_receipt_identity(record: &InboxRecord) -> Option<Value> {
+    if record.request.kind != "metadata_recover" {
+        return None;
+    }
+    let payload = &record.request.payload;
+    let library_id = payload.get("library_id")?.as_str()?;
+    let root_binding = payload.get("root_binding")?.as_str()?;
+    let scope = payload.get("scope")?.as_str()?;
+    if !valid_library_id(library_id)
+        || !valid_root_binding_token(root_binding)
+        || !matches!(scope, "selected" | "library")
+    {
+        return None;
+    }
+    Some(json!({
+        "library_id": library_id,
+        "root_binding": root_binding,
+        "scope": scope,
+    }))
+}
+
 fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value {
     let result = record.result.as_ref().map(|result| {
         if record.request.kind == "library_scan" {
@@ -650,6 +671,9 @@ fn operation_snapshot(record: &InboxRecord, include_full_result: bool) -> Value 
         "result": result,
         "error": error,
     });
+    if let Some(identity) = metadata_recovery_receipt_identity(record) {
+        operation["recovery_identity"] = identity;
+    }
     if result_was_compacted || kind_truncated || error_truncated {
         let fields = operation
             .as_object_mut()
@@ -1033,6 +1057,77 @@ mod tests {
                 "next_cursor": null
             }
         })
+    }
+
+    #[test]
+    fn recovery_receipts_publish_bounded_binding_before_completion_without_payload() {
+        for (index, status) in [
+            InboxStatus::Pending,
+            InboxStatus::Processing,
+            InboxStatus::AwaitingConfirmation,
+            InboxStatus::Retryable,
+            InboxStatus::Uncertain,
+            InboxStatus::Failed,
+            InboxStatus::Stale,
+            InboxStatus::Completed,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut receipt = record(index as u64 + 1, "metadata_recover", status, None, None);
+            receipt.request.payload = json!({
+                "library_id": "ml-test-root",
+                "root_binding": TEST_ROOT_BINDING,
+                "scope": "selected",
+                "item_ids": ["private-item-marker"],
+                "private": "private-payload-marker".repeat(4096),
+            });
+            let mut snapshots = operation_snapshots(&[&receipt]).unwrap();
+            let expected = json!({
+                "library_id": "ml-test-root",
+                "root_binding": TEST_ROOT_BINDING,
+                "scope": "selected",
+            });
+            assert_eq!(snapshots[0]["recovery_identity"], expected);
+            assert!(snapshots[0]["result"].is_null());
+            let encoded = serde_json::to_string(&snapshots).unwrap();
+            assert!(!encoded.contains("private-item-marker"));
+            assert!(!encoded.contains("private-payload-marker"));
+            assert!(encoded.len() < 2048);
+            compact_operation_receipts(&mut snapshots);
+            assert_eq!(snapshots[0]["recovery_identity"], expected);
+        }
+    }
+
+    #[test]
+    fn recovery_receipt_identity_rejects_invalid_bindings_and_unrelated_kinds() {
+        let valid = json!({
+            "library_id": "ml-test-root", "root_binding": TEST_ROOT_BINDING, "scope": "library",
+        });
+        for (field, invalid) in [
+            ("library_id", json!(" ")),
+            ("library_id", json!("x".repeat(MAX_LIBRARY_ID_BYTES + 1))),
+            ("library_id", json!("control\ncharacter")),
+            ("root_binding", json!("unverified-root")),
+            ("root_binding", Value::Null),
+            ("scope", json!("unknown")),
+        ] {
+            let mut receipt = record(1, "metadata_recover", InboxStatus::Failed, None, None);
+            receipt.request.payload = valid.clone();
+            receipt.request.payload[field] = invalid;
+            assert!(
+                operation_snapshot(&receipt, false)
+                    .get("recovery_identity")
+                    .is_none()
+            );
+        }
+        let mut unrelated = record(2, "library_scan", InboxStatus::Processing, None, None);
+        unrelated.request.payload = valid;
+        assert!(
+            operation_snapshot(&unrelated, false)
+                .get("recovery_identity")
+                .is_none()
+        );
     }
 
     #[test]

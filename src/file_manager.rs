@@ -3251,10 +3251,9 @@ impl LibraryManager {
             validate_metadata_patch(patch)?;
             if patch.fill_missing_only
                 && item.collection.as_ref().is_some_and(|stored| {
-                    patch
-                        .collection
-                        .as_ref()
-                        .is_some_and(|requested| requested != stored)
+                    patch.collection.as_ref().is_some_and(|requested| {
+                        !fill_only_collection_patch_preserves_existing(stored, requested)
+                    })
                 })
             {
                 bail!("fill-only metadata patch cannot replace a stored collection");
@@ -8650,6 +8649,120 @@ fn nfo_has_collection_metadata(content: &str) -> bool {
         .any(|tag| xml_tag_text(content, tag).is_some_and(|value| !value.trim().is_empty()))
 }
 
+fn metadata_subfield_is_missing(content: &str, tag: &str, fill_missing_only: bool) -> bool {
+    !fill_missing_only || xml_tag_text(content, tag).is_none_or(|value| value.trim().is_empty())
+}
+
+fn fill_only_collection_patch_preserves_existing(
+    current: &CollectionMetadata,
+    requested: &CollectionMetadata,
+) -> bool {
+    if !collection_identity_matches(current, requested) {
+        return false;
+    }
+    let string_preserved = |current: Option<&str>, requested: Option<&str>| {
+        current
+            .is_none_or(|value| requested.is_some_and(|candidate| value.trim() == candidate.trim()))
+    };
+    string_preserved(
+        current
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()),
+        requested
+            .id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()),
+    ) && (current.title.trim().is_empty() || current.title.trim() == requested.title.trim())
+        && ((current.kind.trim().is_empty() || current.kind.eq_ignore_ascii_case("nfo_set"))
+            || current.kind.eq_ignore_ascii_case(&requested.kind))
+        && current
+            .order
+            .is_none_or(|order| requested.order == Some(order))
+        && string_preserved(
+            current
+                .part_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
+            requested
+                .part_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
+        )
+}
+
+fn collection_identity_matches(
+    current: &CollectionMetadata,
+    requested: &CollectionMetadata,
+) -> bool {
+    let current_id = current
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let requested_id = requested
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    if let (Some(current_id), Some(requested_id)) = (current_id, requested_id) {
+        return current_id.trim() == requested_id.trim();
+    }
+    canonical_collection_title(&current.title) == canonical_collection_title(&requested.title)
+        && collection_kind_compatible(&current.kind, &requested.kind)
+}
+
+fn canonical_collection_title(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn collection_kind_compatible(current: &str, requested: &str) -> bool {
+    fn specific(kind: &str) -> Option<&str> {
+        let kind = kind.trim();
+        (!kind.is_empty() && !kind.eq_ignore_ascii_case("nfo_set")).then_some(kind)
+    }
+    match (specific(current), specific(requested)) {
+        (Some(current), Some(requested)) => current.eq_ignore_ascii_case(requested),
+        _ => true,
+    }
+}
+
+fn nfo_collection_matches_patch(content: &str, collection: &CollectionMetadata) -> bool {
+    let existing_id = xml_tag_text(content, "setid").filter(|value| !value.trim().is_empty());
+    let requested_id = collection
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    if let (Some(existing_id), Some(requested_id)) = (existing_id.as_deref(), requested_id) {
+        if existing_id.trim() == requested_id.trim() {
+            return true;
+        }
+        return false;
+    }
+
+    let existing_title = nfo_collection_title(content).filter(|value| !value.trim().is_empty());
+    let requested_title =
+        (!collection.title.trim().is_empty()).then_some(collection.title.as_str());
+    let titles_match = matches!(
+        (existing_title.as_deref(), requested_title),
+        (Some(existing), Some(requested)) if existing.trim() == requested.trim()
+    );
+    if !titles_match {
+        return false;
+    }
+
+    let existing_kind = xml_tag_text(content, "settype").filter(|value| !value.trim().is_empty());
+    let requested_kind = (!collection.kind.trim().is_empty()
+        && !collection.kind.eq_ignore_ascii_case("nfo_set"))
+    .then_some(collection.kind.as_str());
+    match (existing_kind.as_deref(), requested_kind) {
+        (Some(existing), Some(requested)) => existing.eq_ignore_ascii_case(requested),
+        _ => true,
+    }
+}
+
 fn xml_tag_text(content: &str, name: &str) -> Option<String> {
     let element = xml_element_span(content, name, 0)?;
     Some(
@@ -9277,14 +9390,19 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
             ));
         }
     }
-    if let Some(collection) = patch
-        .collection
-        .as_ref()
-        .filter(|_| !patch.fill_missing_only || !nfo_has_collection_metadata(&output))
+    if let Some(collection) = patch.collection.as_ref()
+        && (!patch.fill_missing_only
+            || !nfo_has_collection_metadata(&output)
+            || nfo_collection_matches_patch(&output, collection))
     {
-        if !collection.title.trim().is_empty() {
+        if !collection.title.trim().is_empty()
+            && (!patch.fill_missing_only
+                || nfo_collection_title(&output).is_none_or(|value| value.trim().is_empty()))
+        {
             if xml_element_span(&output, "set", 0).is_some() {
-                output = replace_nfo_collection_title(&output, collection.title.trim())?;
+                if !patch.fill_missing_only || can_fill_nfo_collection_title(&output)? {
+                    output = replace_nfo_collection_title(&output, collection.title.trim())?;
+                }
             } else {
                 nodes.push(format!(
                     "  <set>{}</set>",
@@ -9292,7 +9410,9 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
                 ));
             }
         }
-        if let Some(order) = collection.order {
+        if let Some(order) = collection.order
+            && metadata_subfield_is_missing(&output, "episode", patch.fill_missing_only)
+        {
             if xml_tag_text(&output, "episode").is_some() {
                 output = replace_xml_element(&output, "episode", &order.to_string())?;
             } else {
@@ -9303,7 +9423,9 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
             ("setid", collection.id.as_deref()),
             ("settype", Some(collection.kind.as_str())),
         ] {
-            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty())
+                && metadata_subfield_is_missing(&output, tag, patch.fill_missing_only)
+            {
                 if xml_tag_text(&output, tag).is_some() {
                     output = replace_xml_element(&output, tag, value.trim())?;
                 } else {
@@ -9315,6 +9437,7 @@ fn append_metadata_patch(content: &str, patch: &MetadataPatch) -> Result<String>
             .part_id
             .as_deref()
             .filter(|value| !value.trim().is_empty())
+            && metadata_subfield_is_missing(&output, "partid", patch.fill_missing_only)
         {
             if xml_tag_text(&output, "partid").is_some() {
                 output = replace_xml_element(&output, "partid", part_id.trim())?;
@@ -9385,6 +9508,24 @@ fn replace_nfo_collection_title(content: &str, value: &str) -> Result<String> {
     bail!("NFO collection has complex children but no unique <name>; refusing to discard them")
 }
 
+fn can_fill_nfo_collection_title(content: &str) -> Result<bool> {
+    let Some(set) = xml_element_span(content, "set", 0) else {
+        return Ok(true);
+    };
+    if set.self_closing {
+        return Ok(true);
+    }
+    let children = direct_xml_child_summary(content, set)?;
+    if children.duplicate_matching {
+        bail!("NFO collection has multiple direct <name> elements; refusing ambiguous patch");
+    }
+    if let Some(name) = children.matching {
+        return Ok(direct_xml_child_summary(content, name)?.count == 0
+            && !xml_has_inner_markup(content, name));
+    }
+    Ok(children.count == 0 && !xml_has_inner_markup(content, set))
+}
+
 fn replace_xml_element(content: &str, name: &str, value: &str) -> Result<String> {
     let element = xml_element_span(content, name, 0)
         .ok_or_else(|| anyhow!("NFO element disappeared or has no matching close"))?;
@@ -9420,9 +9561,14 @@ fn replace_xml_element_span(content: &str, element: XmlElementSpan, value: &str)
     Ok(output)
 }
 
-fn new_nfo(title: &str, patch: &MetadataPatch) -> String {
+fn new_nfo(fallback_title: &str, patch: &MetadataPatch) -> String {
     let mut content =
         String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<movie>\n");
+    let title = patch
+        .title
+        .as_deref()
+        .or_else(|| (!patch.fill_missing_only).then_some(fallback_title))
+        .unwrap_or_default();
     if !title.trim().is_empty() {
         content.push_str(&format!("  <title>{}</title>\n", xml_escape(title.trim())));
     }
@@ -15101,6 +15247,100 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn recovery_batch_enriches_missing_collection_fields_from_a_scanned_nfo() {
+        let root = TemporaryRoot::new("metadata-recovery-incomplete-collection");
+        fs::write(root.path().join("clip.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let bvid = "BV1abcdefgh1";
+        let original_nfo = format!(
+            "<movie><title>Episode</title><uniqueid type=\"bilibili\">{bvid}</uniqueid><uniqueid type=\"bilibili-cid\">20</uniqueid><set>My collection</set><setid>shared-set</setid></movie>"
+        );
+        let nfo_path = root.path().join("clip.nfo");
+        fs::write(&nfo_path, &original_nfo).expect("NFO fixture should write");
+        fs::set_permissions(&nfo_path, fs::Permissions::from_mode(0o600))
+            .expect("NFO fixture should become private");
+
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("initial scan should complete");
+        let local = item_at(&snapshot, "clip.mp4");
+        assert_eq!(local.metadata_status, MetadataStatus::Complete);
+        assert_eq!(local.collection.as_ref().unwrap().order, None);
+        assert_eq!(local.collection.as_ref().unwrap().part_id, None);
+
+        let report = crate::metadata_recovery::analyze_metadata_recovery(
+            &snapshot,
+            None,
+            None,
+            move |query| {
+                assert_eq!(query.source_id, bvid);
+                let entry = crate::metadata_recovery::ResolvedMetadataEntry {
+                    bvid: Some(bvid.to_string()),
+                    aid: None,
+                    cid: Some(20),
+                    epid: None,
+                    title: "Remote episode title".to_string(),
+                    collection: Some(CollectionMetadata {
+                        id: Some("shared-set".to_string()),
+                        title: "Remote collection title".to_string(),
+                        kind: "bilibili_collection".to_string(),
+                        order: Some(2),
+                        part_id: Some("20".to_string()),
+                    }),
+                };
+                async move { Ok(vec![entry]) }
+            },
+        )
+        .await
+        .expect("incomplete scanned collection should be analyzed");
+
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(
+            report.items[0].status,
+            crate::metadata_recovery::RecoveryStatus::Ready
+        );
+        let patch = report.items[0].patch.as_ref().unwrap();
+        let preview = manager
+            .preview_with_patches(
+                &[],
+                None,
+                false,
+                ConflictPolicy::Skip,
+                std::slice::from_ref(patch),
+            )
+            .expect("fill-only collection preview should include missing subfields");
+        assert!(preview.metadata_patches[0].changed);
+        assert!(
+            preview.metadata_patches[0]
+                .changes
+                .iter()
+                .any(|change| change.field == "order" && change.after == "2")
+        );
+        assert!(
+            preview.metadata_patches[0]
+                .changes
+                .iter()
+                .any(|change| change.field == "part_id" && change.after == "20")
+        );
+        assert_eq!(fs::read_to_string(&nfo_path).unwrap(), original_nfo);
+
+        let result = manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed recovery patch should complete");
+        assert_eq!(result.status, BatchStatus::Complete);
+        let rescanned = manager.scan(&[]).expect("patched NFO should rescan");
+        assert_eq!(
+            item_at(&rescanned, "clip.mp4").collection,
+            Some(CollectionMetadata {
+                id: Some("shared-set".to_string()),
+                title: "My collection".to_string(),
+                kind: "bilibili_collection".to_string(),
+                order: Some(2),
+                part_id: Some("20".to_string()),
+            })
+        );
+    }
+
     #[test]
     fn confirmed_collection_patch_preserves_kodi_set_children_and_rescans_name() {
         let root = TemporaryRoot::new("kodi-structured-set-patch");
@@ -15538,6 +15778,117 @@ mod tests {
         let inserted = append_metadata_patch(no_collection, &patch)
             .expect("fill-only patch should append a missing collection");
         assert_eq!(inserted.matches("<set>").count(), 1);
+    }
+
+    #[test]
+    fn fill_only_collection_patch_adds_missing_subfields_only_for_the_same_collection() {
+        let patch = MetadataPatch {
+            item_id: "fixture-item".to_string(),
+            title: None,
+            source_ids: Vec::new(),
+            collection: Some(CollectionMetadata {
+                id: Some("shared-id".to_string()),
+                title: "Remote title".to_string(),
+                kind: "bilibili_collection".to_string(),
+                order: Some(8),
+                part_id: Some("20".to_string()),
+            }),
+            fill_missing_only: true,
+            organization_status: None,
+        };
+        let existing = "<movie><set source=\"library\"><name lang=\"en\">My edited collection</name><overview>Keep this overview.</overview><future key=\"opaque\">Keep this node.</future></set><setid>shared-id</setid><episode>3</episode><futureField>keep</futureField></movie>";
+        let patched = append_metadata_patch(existing, &patch)
+            .expect("matching collection should receive missing metadata");
+        assert!(patched.contains("<name lang=\"en\">My edited collection</name>"));
+        assert!(patched.contains("<overview>Keep this overview.</overview>"));
+        assert!(patched.contains("<future key=\"opaque\">Keep this node.</future>"));
+        assert!(patched.contains("<setid>shared-id</setid>"));
+        assert!(patched.contains("<episode>3</episode>"));
+        assert!(patched.contains("<settype>bilibili_collection</settype>"));
+        assert!(patched.contains("<partid>20</partid>"));
+        assert!(patched.contains("<futureField>keep</futureField>"));
+        assert!(!patched.contains("<episode>8</episode>"));
+
+        let complex_without_name = "<movie><set><overview>Preserve this child.</overview></set><setid>shared-id</setid></movie>";
+        let filled_complex = append_metadata_patch(complex_without_name, &patch)
+            .expect("missing subfields should fill without discarding structured children");
+        assert!(filled_complex.contains("<set><overview>Preserve this child.</overview></set>"));
+        assert!(filled_complex.contains("<episode>8</episode>"));
+        assert!(filled_complex.contains("<partid>20</partid>"));
+
+        let unrelated = "<movie><set>My private collection</set><setid>private-id</setid></movie>";
+        let preserved = append_metadata_patch(unrelated, &patch)
+            .expect("a different collection should remain untouched");
+        assert_eq!(preserved, unrelated);
+    }
+
+    #[test]
+    fn fill_only_new_nfo_does_not_promote_the_filename_fallback_to_title() {
+        let patch = MetadataPatch {
+            item_id: "fixture-item".to_string(),
+            title: None,
+            source_ids: vec!["BV1abcdefgh1".to_string()],
+            collection: None,
+            fill_missing_only: true,
+            organization_status: Some(OrganizationStatus::Unreviewed),
+        };
+        let created = new_nfo("legacy filename", &patch);
+        assert!(!created.contains("<title>"));
+        assert!(created.contains("<uniqueid type=\"bilibili\">BV1abcdefgh1</uniqueid>"));
+        assert_eq!(nfo_source_ids(&created), vec!["BV1abcdefgh1"]);
+
+        let legacy_patch = MetadataPatch {
+            fill_missing_only: false,
+            organization_status: None,
+            ..patch
+        };
+        let legacy = new_nfo("legacy filename", &legacy_patch);
+        assert!(legacy.contains("<title>legacy filename</title>"));
+    }
+
+    #[test]
+    fn fill_only_preview_does_not_write_filename_title_for_source_id_only_patch() {
+        let root = TemporaryRoot::new("fill-only-no-filename-title");
+        fs::write(root.path().join("legacy.mp4"), b"fixture-video")
+            .expect("media fixture should write");
+        let manager = manager(&root);
+        let snapshot = manager.scan(&[]).expect("scan should complete");
+        let item = item_at(&snapshot, "legacy.mp4");
+        assert_eq!(item.title, "legacy");
+
+        let patch = MetadataPatch {
+            item_id: item.id.clone(),
+            title: None,
+            source_ids: vec!["BV1abcdefgh1".to_string()],
+            collection: None,
+            fill_missing_only: true,
+            organization_status: Some(OrganizationStatus::Unreviewed),
+        };
+        let preview = manager
+            .preview_with_patches(
+                &[],
+                None,
+                false,
+                ConflictPolicy::Skip,
+                std::slice::from_ref(&patch),
+            )
+            .expect("fill-only NFO preview should succeed");
+        assert!(preview.metadata_patches[0].changed);
+        assert!(
+            !preview.metadata_patches[0]
+                .changes
+                .iter()
+                .any(|change| change.field == "title")
+        );
+
+        manager
+            .execute_preview(&preview.id, &preview.revision)
+            .expect("confirmed fill-only patch should write its explicit fields");
+        let created =
+            fs::read_to_string(root.path().join("legacy.nfo")).expect("new NFO should exist");
+        assert!(!created.contains("<title>"));
+        assert!(created.contains("<uniqueid type=\"bilibili\">BV1abcdefgh1</uniqueid>"));
+        assert!(created.contains("<tvd_organization>unreviewed</tvd_organization>"));
     }
 
     #[test]

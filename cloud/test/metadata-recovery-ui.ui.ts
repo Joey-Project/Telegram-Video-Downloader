@@ -146,13 +146,11 @@ async function mountApp(options: {
   initialSnapshot?: Record<string, any>;
   holdMetadataResponse?: boolean;
   blockThirdStateResponse?: boolean;
-  omitRecoveryRequestId?: boolean;
 } = {}) {
   const {
     initialSnapshot = ownerSnapshot,
     holdMetadataResponse = false,
     blockThirdStateResponse = false,
-    omitRecoveryRequestId = false,
   } = options;
   vi.useFakeTimers();
   vi.stubGlobal("crypto", webcrypto);
@@ -228,9 +226,14 @@ async function mountApp(options: {
           : firstReport;
         const operation = {
           seq: actionSeq,
-          ...(omitRecoveryRequestId ? {} : { request_id: action.request_id }),
           kind: "metadata_recover",
           status: "completed",
+          error: null,
+          recovery_identity: {
+            library_id: LIBRARY_ID,
+            root_binding: ROOT_BINDING,
+            scope: action.payload.scope,
+          },
           result: { scope: action.payload.scope, library_id: LIBRARY_ID, root_binding: ROOT_BINDING, recovery },
         };
         await replaceSnapshot({
@@ -411,7 +414,21 @@ describe("metadata recovery Mini App flow", () => {
   it.each([
     ["processing", "Metadata analysis is queued or running on your computer."],
     ["failed", "Analysis failed: Latest analysis failed."],
-  ])("keeps the newest %s analysis intent ahead of an older completed report", async (latestStatus, expectedStatus) => {
+  ])("restores the newest %s intent after reload with an empty browser queue", async (latestStatus, expectedStatus) => {
+    const latestOperation = {
+      seq: 2,
+      kind: "metadata_recover",
+      status: latestStatus,
+      created_at: 2,
+      updated_at: 2,
+      attempts: 0,
+      next_attempt_at: null,
+      error: latestStatus === "failed" ? "Latest analysis failed." : null,
+      result: null,
+      recovery_identity: { library_id: LIBRARY_ID, root_binding: ROOT_BINDING, scope: "library" },
+    };
+    expect(latestOperation.result).toBeNull();
+    expect(latestOperation).not.toHaveProperty("payload");
     const initialSnapshot = {
       ...ownerSnapshot,
       operations: [
@@ -419,20 +436,95 @@ describe("metadata recovery Mini App flow", () => {
           seq: 1,
           kind: "metadata_recover",
           status: "completed",
+          recovery_identity: { library_id: LIBRARY_ID, root_binding: ROOT_BINDING, scope: "library" },
+          result: { scope: "library", library_id: LIBRARY_ID, root_binding: ROOT_BINDING, recovery: firstReport },
+        },
+        latestOperation,
+      ],
+    };
+    await mountApp({ initialSnapshot });
+    expect(JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]")).toEqual([]);
+    element<HTMLButtonElement>('[data-view="needs"]').click();
+    expect(element<HTMLElement>("#recovery-status").textContent).toContain(expectedStatus);
+    expect(element<HTMLElement>("#metadata-recovery-results").textContent).not.toContain("Ready video");
+  });
+
+  it.each([
+    ["a different library", { library_id: "other-library", root_binding: ROOT_BINDING, scope: "library" }],
+    ["a different root binding", { library_id: LIBRARY_ID, root_binding: `v1:${"b".repeat(64)}`, scope: "library" }],
+  ])("does not let a newer intent for %s block this library's completed report", async (_label, recoveryIdentity) => {
+    const initialSnapshot = {
+      ...ownerSnapshot,
+      operations: [
+        {
+          seq: 1,
+          kind: "metadata_recover",
+          status: "completed",
+          recovery_identity: { library_id: LIBRARY_ID, root_binding: ROOT_BINDING, scope: "library" },
           result: { scope: "library", library_id: LIBRARY_ID, root_binding: ROOT_BINDING, recovery: firstReport },
         },
         {
           seq: 2,
           kind: "metadata_recover",
-          status: latestStatus,
-          error: latestStatus === "failed" ? "Latest analysis failed." : undefined,
-          result: { scope: "library", library_id: LIBRARY_ID, root_binding: ROOT_BINDING },
+          status: "processing",
+          created_at: 3,
+          updated_at: 3,
+          attempts: 0,
+          next_attempt_at: null,
+          error: null,
+          result: null,
+          recovery_identity: recoveryIdentity,
         },
       ],
     };
     await mountApp({ initialSnapshot });
+    expect(JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]")).toEqual([]);
     element<HTMLButtonElement>('[data-view="needs"]').click();
-    expect(element<HTMLElement>("#recovery-status").textContent).toContain(expectedStatus);
+    expect(element<HTMLElement>("#recovery-status").textContent).toContain("Analysis revision recovery-ui-r1");
+    expect(element<HTMLElement>("#metadata-recovery-results").textContent).toContain("Ready video");
+  });
+
+  it("does not use a completed report whose identity conflicts with its recovery receipt", async () => {
+    const initialSnapshot = {
+      ...ownerSnapshot,
+      operations: [{
+        seq: 1,
+        kind: "metadata_recover",
+        status: "completed",
+        recovery_identity: { library_id: LIBRARY_ID, root_binding: ROOT_BINDING, scope: "library" },
+        result: {
+          scope: "library",
+          library_id: LIBRARY_ID,
+          root_binding: `v1:${"b".repeat(64)}`,
+          recovery: firstReport,
+        },
+      }],
+    };
+    await mountApp({ initialSnapshot });
+    expect(JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]")).toEqual([]);
+    element<HTMLButtonElement>('[data-view="needs"]').click();
+    expect(element<HTMLElement>("#metadata-recovery-results").textContent).not.toContain("Ready video");
+    expect(element<HTMLElement>("#recovery-status").textContent).toContain("library changed");
+  });
+
+  it.each([
+    ["foreign library", { library_id: "other-library", root_binding: ROOT_BINDING, scope: "library" }],
+    ["foreign root", { library_id: LIBRARY_ID, root_binding: `v1:${"b".repeat(64)}`, scope: "library" }],
+    ["invalid scope", { library_id: LIBRARY_ID, root_binding: ROOT_BINDING, scope: "other" }],
+  ])("fails closed on a %s receipt identity even when its result looks local", async (_label, recoveryIdentity) => {
+    const initialSnapshot = {
+      ...ownerSnapshot,
+      operations: [{
+        seq: 1,
+        kind: "metadata_recover",
+        status: "completed",
+        recovery_identity: recoveryIdentity,
+        result: { scope: "library", library_id: LIBRARY_ID, root_binding: ROOT_BINDING, recovery: firstReport },
+      }],
+    };
+    await mountApp({ initialSnapshot });
+    expect(JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]")).toEqual([]);
+    element<HTMLButtonElement>('[data-view="needs"]').click();
     expect(element<HTMLElement>("#metadata-recovery-results").textContent).not.toContain("Ready video");
   });
 
@@ -440,7 +532,6 @@ describe("metadata recovery Mini App flow", () => {
     const app = await mountApp({
       holdMetadataResponse: true,
       blockThirdStateResponse: true,
-      omitRecoveryRequestId: true,
     });
     const { sentActions, releaseMetadataActionResponse, releaseThirdStateResponse } = app;
     element<HTMLButtonElement>('[data-view="needs"]').click();

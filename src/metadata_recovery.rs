@@ -201,6 +201,11 @@ fn is_library_candidate(item: &LibraryItem) -> bool {
             || item.confidence == Confidence::Low
             || item.confidence == Confidence::NeedsConfirmation
             || item.source_ids.is_empty()
+            || item
+                .collection
+                .as_ref()
+                .is_some_and(collection_has_missing_fields)
+                && has_bilibili_identity_marker(item)
             || (item.collection.is_none()
                 && item.organization_status != Some(OrganizationStatus::Standalone)))
 }
@@ -469,7 +474,9 @@ fn matching_remote_entries<'a>(
                 return entry.bvid.as_deref() == Some(bvid.as_str())
                     && !optional_identity_conflicts(identity.aid, entry.aid);
             }
-            identity.aid.is_some_and(|aid| entry.aid == Some(aid))
+            identity.aid.is_some_and(|aid| {
+                entry.aid == Some(aid) && identity.cid.is_none_or(|cid| entry.cid == Some(cid))
+            })
         })
         .collect()
 }
@@ -502,7 +509,7 @@ fn recovery_patch(item: &LibraryItem, entry: &ResolvedMetadataEntry) -> Metadata
     let collection = if item.organization_status == Some(OrganizationStatus::Standalone) {
         None
     } else {
-        item.collection.clone().or_else(|| entry.collection.clone())
+        merge_recovery_collection(item.collection.as_ref(), entry.collection.as_ref())
     };
     MetadataPatch {
         item_id: item.id.clone(),
@@ -514,6 +521,92 @@ fn recovery_patch(item: &LibraryItem, entry: &ResolvedMetadataEntry) -> Metadata
         collection,
         fill_missing_only: true,
         organization_status: None,
+    }
+}
+
+fn merge_recovery_collection(
+    local: Option<&CollectionMetadata>,
+    remote: Option<&CollectionMetadata>,
+) -> Option<CollectionMetadata> {
+    let Some(local) = local else {
+        return remote.cloned();
+    };
+    let Some(remote) = remote else {
+        return Some(local.clone());
+    };
+    if !same_collection_identity(local, remote) {
+        return Some(local.clone());
+    }
+
+    let mut merged = local.clone();
+    fill_missing_optional_string(&mut merged.id, remote.id.as_deref());
+    fill_missing_string(&mut merged.title, Some(remote.title.as_str()));
+    if merged.order.is_none() {
+        merged.order = remote.order;
+    }
+    fill_missing_optional_string(&mut merged.part_id, remote.part_id.as_deref());
+    if (merged.kind.trim().is_empty() || merged.kind.eq_ignore_ascii_case("nfo_set"))
+        && !remote.kind.trim().is_empty()
+    {
+        merged.kind = remote.kind.trim().to_string();
+    }
+    Some(merged)
+}
+
+fn same_collection_identity(local: &CollectionMetadata, remote: &CollectionMetadata) -> bool {
+    let local_id = local.id.as_deref().filter(|value| !value.trim().is_empty());
+    let remote_id = remote
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    if let (Some(local_id), Some(remote_id)) = (local_id, remote_id) {
+        return local_id.trim() == remote_id.trim();
+    }
+
+    let local_title = canonical_collection_title(&local.title);
+    let remote_title = canonical_collection_title(&remote.title);
+    if local_title.is_empty() || local_title != remote_title {
+        return false;
+    }
+    collection_kinds_compatible(&local.kind, &remote.kind)
+}
+
+fn canonical_collection_title(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn collection_kinds_compatible(left: &str, right: &str) -> bool {
+    fn specific_kind(kind: &str) -> Option<&str> {
+        let kind = kind.trim();
+        (!kind.is_empty() && !kind.eq_ignore_ascii_case("nfo_set")).then_some(kind)
+    }
+    match (specific_kind(left), specific_kind(right)) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => true,
+    }
+}
+
+fn fill_missing_string(target: &mut String, remote: Option<&str>) {
+    if target.trim().is_empty()
+        && let Some(remote) = remote.map(str::trim).filter(|value| !value.is_empty())
+    {
+        *target = remote.to_string();
+    }
+}
+
+fn fill_missing_optional_string(target: &mut Option<String>, remote: Option<&str>) {
+    if target
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        *target = remote
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
     }
 }
 
@@ -578,9 +671,14 @@ fn trusted_local_patch(item: &LibraryItem) -> Option<MetadataPatch> {
 
 fn local_metadata_is_sufficient_without_lookup(item: &LibraryItem) -> bool {
     let has_trusted_title = trusted_local_title(item).is_some();
+    let local_collection_complete = item
+        .collection
+        .as_ref()
+        .is_some_and(|collection| !collection_has_missing_fields(collection));
     item.metadata_status != MetadataStatus::Complete
         && has_trusted_title
-        && (item.collection.is_some()
+        && (item.authoritative_nfo_path.is_none() && item.collection.is_some()
+            || item.authoritative_nfo_path.is_some() && local_collection_complete
             || item.organization_status == Some(OrganizationStatus::Standalone))
 }
 
@@ -610,6 +708,54 @@ fn patch_has_changes(patch: &MetadataPatch, item: &LibraryItem) -> bool {
         || (item.collection.is_none()
             && item.organization_status != Some(OrganizationStatus::Standalone)
             && patch.collection.is_some())
+        || item.collection.as_ref().is_some_and(|current| {
+            patch
+                .collection
+                .as_ref()
+                .is_some_and(|proposed| collection_fills_missing_fields(current, proposed))
+        })
+}
+
+fn collection_has_missing_fields(collection: &CollectionMetadata) -> bool {
+    collection
+        .id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        || collection.title.trim().is_empty()
+        || collection.kind.trim().is_empty()
+        || collection.kind.eq_ignore_ascii_case("nfo_set")
+        || collection.order.is_none()
+        || collection
+            .part_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+}
+
+fn collection_fills_missing_fields(
+    current: &CollectionMetadata,
+    proposed: &CollectionMetadata,
+) -> bool {
+    let current_kind_missing =
+        current.kind.trim().is_empty() || current.kind.eq_ignore_ascii_case("nfo_set");
+    current
+        .id
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        && proposed
+            .id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || current.title.trim().is_empty() && !proposed.title.trim().is_empty()
+        || current_kind_missing && !proposed.kind.trim().is_empty()
+        || current.order.is_none() && proposed.order.is_some()
+        || current
+            .part_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+            && proposed
+                .part_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn candidate_label(entry: &ResolvedMetadataEntry) -> String {
@@ -780,7 +926,7 @@ mod tests {
     #[tokio::test]
     async fn exact_epid_match_preserves_a_custom_local_collection() {
         let mut local = item("episode", &["ep7", "BV1abcdefgh1"]);
-        let custom = collection("personal-id", "My edited collection", Some(99));
+        let custom = collection("personal-id", "My edited collection", None);
         local.collection = Some(custom.clone());
         // The NFO has IDs and a custom set but no title; the filename fallback
         // must not be promoted into the NFO or suppress metadata lookup.
@@ -805,6 +951,7 @@ mod tests {
         assert_eq!(report.items[0].status, RecoveryStatus::Ready);
         assert_eq!(patch.title.as_deref(), Some("Remote episode"));
         assert_eq!(patch.collection.as_ref(), Some(&custom));
+        assert_eq!(patch.collection.as_ref().unwrap().order, None);
         assert!(patch.source_ids.contains(&"ep7".to_string()));
         assert!(!patch.source_ids.contains(&"ep8".to_string()));
     }
@@ -866,6 +1013,151 @@ mod tests {
         assert_eq!(patch.collection.as_ref(), Some(&custom));
         assert!(patch.source_ids.contains(&"cid10".to_string()));
         assert!(!patch.source_ids.contains(&"cid20".to_string()));
+    }
+
+    #[tokio::test]
+    async fn av_and_cid_match_the_exact_remote_part_and_fill_only_missing_group_fields() {
+        let mut local = item("legacy", &["av123", "cid20"]);
+        let custom = CollectionMetadata {
+            id: Some("shared-set".to_string()),
+            title: "My edited collection".to_string(),
+            kind: "user-kind".to_string(),
+            order: Some(99),
+            part_id: None,
+        };
+        local.title = "legacy".to_string();
+        local.collection = Some(custom.clone());
+        local.authoritative_nfo_path = Some("legacy.nfo".to_string());
+        let mut wrong = entry("BV1abcdefgh1", 10, "Wrong part", 1);
+        wrong.collection = Some(CollectionMetadata {
+            id: Some("shared-set".to_string()),
+            title: "Remote collection".to_string(),
+            kind: "bilibili_collection".to_string(),
+            order: Some(1),
+            part_id: Some("10".to_string()),
+        });
+        let mut exact = entry("BV1abcdefgh1", 20, "Exact part", 2);
+        exact.collection = Some(CollectionMetadata {
+            id: Some("shared-set".to_string()),
+            title: "Remote collection".to_string(),
+            kind: "bilibili_collection".to_string(),
+            order: Some(2),
+            part_id: Some("20".to_string()),
+        });
+        let input = snapshot(vec![local]);
+        let ids = vec!["legacy".to_string()];
+
+        let report = analyze_metadata_recovery(&input, Some(&ids), None, move |query| {
+            assert_eq!(query.source_id, "av123");
+            let entries = vec![wrong.clone(), exact.clone()];
+            async move { Ok(entries) }
+        })
+        .await
+        .expect("exact AID and CID should resolve");
+
+        let result = &report.items[0];
+        let patch = result.patch.as_ref().unwrap();
+        assert_eq!(result.status, RecoveryStatus::Ready);
+        assert!(patch.source_ids.contains(&"cid20".to_string()));
+        assert!(!patch.source_ids.contains(&"cid10".to_string()));
+        let merged = patch.collection.as_ref().unwrap();
+        assert_eq!(merged.id.as_deref(), Some("shared-set"));
+        assert_eq!(merged.title, custom.title);
+        assert_eq!(merged.kind, custom.kind);
+        assert_eq!(merged.order, Some(99));
+        assert_eq!(merged.part_id.as_deref(), Some("20"));
+    }
+
+    #[tokio::test]
+    async fn av_and_cid_do_not_fall_back_to_a_different_aid_part() {
+        let mut local = item("legacy", &["av123", "cid20"]);
+        local.title = "legacy".to_string();
+        local.authoritative_nfo_path = Some("legacy.nfo".to_string());
+        let mut wrong = entry("BV1abcdefgh1", 10, "Wrong part", 1);
+        wrong.collection = Some(CollectionMetadata {
+            id: Some("remote-set".to_string()),
+            title: "Remote collection".to_string(),
+            kind: "bilibili_collection".to_string(),
+            order: Some(1),
+            part_id: Some("10".to_string()),
+        });
+        let input = snapshot(vec![local]);
+        let ids = vec!["legacy".to_string()];
+
+        let report = analyze_metadata_recovery(&input, Some(&ids), None, move |_| {
+            let wrong = wrong.clone();
+            async move { Ok(vec![wrong]) }
+        })
+        .await
+        .expect("CID mismatches should produce a safe unavailable choice");
+
+        assert_eq!(report.items[0].status, RecoveryStatus::Unsupported);
+        assert!(
+            report.items[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("exact source identity"))
+        );
+        assert!(report.items[0].patch.is_none());
+    }
+
+    #[test]
+    fn collection_without_id_merges_only_when_canonical_title_and_kind_match() {
+        let local = CollectionMetadata {
+            id: None,
+            title: "My   collection".to_string(),
+            kind: "nfo_set".to_string(),
+            order: None,
+            part_id: None,
+        };
+        let remote = CollectionMetadata {
+            id: Some("remote-id".to_string()),
+            title: "my collection".to_string(),
+            kind: "bilibili_collection".to_string(),
+            order: Some(4),
+            part_id: Some("cid20".to_string()),
+        };
+
+        let merged = merge_recovery_collection(Some(&local), Some(&remote)).unwrap();
+        assert_eq!(merged.id.as_deref(), Some("remote-id"));
+        assert_eq!(merged.title, local.title);
+        assert_eq!(merged.kind, "bilibili_collection");
+        assert_eq!(merged.order, Some(4));
+        assert_eq!(merged.part_id.as_deref(), Some("cid20"));
+
+        let same_id_without_order = CollectionMetadata {
+            id: Some("shared-set".to_string()),
+            title: "Edited set name".to_string(),
+            kind: "custom-kind".to_string(),
+            order: None,
+            part_id: None,
+        };
+        let matching_remote = CollectionMetadata {
+            id: Some("shared-set".to_string()),
+            title: "Remote title".to_string(),
+            kind: "bilibili_collection".to_string(),
+            order: Some(7),
+            part_id: Some("cid7".to_string()),
+        };
+        let completed =
+            merge_recovery_collection(Some(&same_id_without_order), Some(&matching_remote))
+                .unwrap();
+        assert_eq!(completed.title, same_id_without_order.title);
+        assert_eq!(completed.kind, same_id_without_order.kind);
+        assert_eq!(completed.order, Some(7));
+        assert_eq!(completed.part_id.as_deref(), Some("cid7"));
+
+        let different = CollectionMetadata {
+            id: Some("different-id".to_string()),
+            title: "An unrelated collection".to_string(),
+            kind: "bilibili_collection".to_string(),
+            order: Some(9),
+            part_id: Some("cid99".to_string()),
+        };
+        assert_eq!(
+            merge_recovery_collection(Some(&local), Some(&different)),
+            Some(local)
+        );
     }
 
     #[tokio::test]

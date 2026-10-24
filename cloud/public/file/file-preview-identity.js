@@ -63,7 +63,8 @@ export function fileOperationLibraryIdentity(operation) {
   const nestedPreview = result?.preview && typeof result.preview === "object"
     ? result.preview
     : operation.preview && typeof operation.preview === "object" ? operation.preview : null;
-  const sources = [operation, result, nestedPreview].filter((source) => source && typeof source === "object");
+  const sources = [operation, operation.recovery_identity, result, nestedPreview]
+    .filter((source) => source && typeof source === "object");
   const values = { library_id: [], root_binding: [] };
   for (const source of sources) {
     for (const field of Object.keys(values)) {
