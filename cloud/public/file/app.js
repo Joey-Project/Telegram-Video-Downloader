@@ -2109,7 +2109,12 @@ function allMigrationPreviewEntries() {
 function retainedMigrationState() {
   const descriptors = mediaLibraryEntries(state.snapshot);
   const migrations = new Map();
-  const omittedByLibrary = new Map();
+  // The Rust snapshot publishes one global migration history and omitted count. Nested
+  // library snapshots may carry a mirrored count, so combine reports by maximum, not sum.
+  let omittedCount = Number.isSafeInteger(state.snapshot?.library?.migration_omitted_count)
+    && state.snapshot.library.migration_omitted_count > 0
+    ? state.snapshot.library.migration_omitted_count
+    : 0;
   for (const descriptor of descriptors) {
     const snapshot = descriptor.snapshot && typeof descriptor.snapshot === "object"
       ? descriptor.snapshot
@@ -2118,7 +2123,7 @@ function retainedMigrationState() {
     const omitted = Number.isSafeInteger(snapshot.migration_omitted_count) && snapshot.migration_omitted_count > 0
       ? snapshot.migration_omitted_count
       : 0;
-    omittedByLibrary.set(descriptor.id, Math.max(omittedByLibrary.get(descriptor.id) ?? 0, omitted));
+    omittedCount = Math.max(omittedCount, omitted);
     for (const migration of Array.isArray(snapshot.migrations) ? snapshot.migrations : []) {
       if (!migration || typeof migration !== "object") continue;
       const key = typeof migration.id === "string" && migration.id
@@ -2129,16 +2134,10 @@ function retainedMigrationState() {
   }
   const active = mediaLibraryEntries(state.snapshot).some((entry) => entry.id === activeLibraryId());
   if (!migrations.size && active && Array.isArray(state.snapshot?.library?.migrations)) {
-    const fallbackOmitted = Number.isSafeInteger(state.snapshot.library.migration_omitted_count)
-      && state.snapshot.library.migration_omitted_count > 0
-      ? state.snapshot.library.migration_omitted_count
-      : 0;
-    omittedByLibrary.set(activeLibraryId(), Math.max(omittedByLibrary.get(activeLibraryId()) ?? 0, fallbackOmitted));
     for (const migration of state.snapshot.library.migrations) {
       if (migration && typeof migration === "object") migrations.set(String(migration.id ?? JSON.stringify(migration)), migration);
     }
   }
-  const omittedCount = [...omittedByLibrary.values()].reduce((total, count) => total + count, 0);
   return { migrations: [...migrations.values()], omittedCount };
 }
 

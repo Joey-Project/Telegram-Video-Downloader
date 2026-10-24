@@ -928,6 +928,13 @@ describe("file manager UI flow", () => {
       preview_id: "file-cancel-secondary",
       revision: "file-cancel-secondary-r1",
     });
+    const secondaryFileCancelAccepted = acceptedActions.find(({ action }) => action.request_id === secondaryFileCancelAction?.request_id);
+    if (!secondaryFileCancelAccepted) throw new Error("Expected the final cancellation to have an accepted HTTP receipt");
+    await vi.waitFor(() => {
+      expect(element<HTMLElement>("#waiting-list").textContent).toContain(`Waiting for computer · #${secondaryFileCancelAccepted.seq}`);
+      expect(element<HTMLElement>("#waiting-list").textContent).toContain("Saved in the cloud inbox");
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
 
     const librarySelect = element<HappyDOMSelectElement>("#library-select");
     librarySelect.value = LIBRARY_ID;
@@ -1064,6 +1071,8 @@ describe("file manager UI flow", () => {
       availability: "offline",
       available: false,
     };
+    // Model an older nested library projection repeating a stale global count.
+    // The top-level migration_omitted_count below is the current global value.
     const primaryScan = { ...ownerSnapshot.library, libraries: [], migrations: [], migration_omitted_count: 2 };
     const migrationPreview = {
       seq: 602,
@@ -1152,7 +1161,7 @@ describe("file manager UI flow", () => {
     });
 
     element<HTMLButtonElement>('[data-view="history"]').click();
-    expect(element<HTMLElement>("#history-migration-list").textContent).toContain("5 additional migrations are not included in this view");
+    expect(element<HTMLElement>("#history-migration-list").textContent).toContain("3 additional migrations are not included in this view");
   });
 
   it("restores an accepted cancellation after reload and settles it only from a terminal snapshot", async () => {
