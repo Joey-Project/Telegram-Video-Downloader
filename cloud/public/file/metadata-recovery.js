@@ -1,4 +1,4 @@
-const RECOVERY_STATUSES = new Set(["ready", "needs_confirmation", "unchanged", "unavailable", "unsupported"]);
+const RECOVERY_STATUSES = new Set(["ready", "needs_confirmation", "unchanged", "unavailable", "unsupported", "deferred"]);
 const ORGANIZATION_STATUSES = new Set(["standalone", "unreviewed"]);
 const MAX_RECOVERY_ITEMS = 100;
 const MAX_RECOVERY_CANDIDATES = 24;
@@ -114,6 +114,7 @@ export function groupMetadataRecoveryItems(items) {
   const groups = {
     ready: [],
     needs_confirmation: [],
+    deferred: [],
     unchanged: [],
     unavailable: [],
     unsupported: [],

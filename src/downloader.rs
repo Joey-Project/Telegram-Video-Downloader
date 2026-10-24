@@ -30,8 +30,10 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex, MutexGuard, OnceCell, Semaphore, watch};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, sleep, sleep_until, timeout as tokio_timeout};
-use tracing::info;
+use tokio::time::{
+    Instant, sleep, sleep_until, timeout as tokio_timeout, timeout_at as tokio_timeout_at,
+};
+use tracing::{info, warn};
 
 use crate::bilibili_attempt::{
     BilibiliAttemptEntryState, BilibiliAttemptOutcome, BilibiliAttemptSnapshot,
@@ -163,6 +165,9 @@ const OUTPUT_ABORT_GRACE: Duration = Duration::from_secs(3);
 const MAX_FFPROBE_CAPTURE_BYTES: usize = 64 * 1024;
 const BILIBILI_METADATA_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const BILIBILI_METADATA_PROBE_AFTER_DUPLICATE_TIMEOUT: Duration = Duration::from_secs(5);
+const METADATA_RECOVERY_SOURCE_QUERY_MARGIN: Duration = Duration::from_secs(1);
+const METADATA_RECOVERY_UGC_ENRICHMENT_CAP: Duration = Duration::from_secs(3);
+const METADATA_RECOVERY_UGC_RETURN_MARGIN: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandProcessGroup {
@@ -6053,11 +6058,17 @@ pub(crate) async fn resolve_bilibili_metadata_recovery_source(
     source_id: &str,
 ) -> Result<Vec<crate::metadata_recovery::ResolvedMetadataEntry>> {
     let url = bilibili_metadata_recovery_source_url(source_id)?;
-    tokio_timeout(BILIBILI_METADATA_PROBE_TIMEOUT, async {
-        let _permit = bilibili_missing_validation_semaphore()
-            .acquire_owned()
-            .await
-            .context("metadata recovery admission is unavailable")?;
+    let source_query_budget = crate::metadata_recovery::MAX_RESOLVER_QUERY_TIME
+        .saturating_sub(METADATA_RECOVERY_SOURCE_QUERY_MARGIN);
+    let source_deadline = Instant::now() + source_query_budget;
+    let _permit = tokio_timeout_at(
+        source_deadline,
+        bilibili_missing_validation_semaphore().acquire_owned(),
+    )
+    .await
+    .context("metadata recovery admission timed out")?
+    .context("metadata recovery admission is unavailable")?;
+    let (client, resolved) = tokio_timeout_at(source_deadline, async {
         sync_bilibili_rust_credentials(config).await?;
         let client = bilibili_core::client(config)?;
         let resolved = probe_bilibili_resolved_content(
@@ -6067,36 +6078,32 @@ pub(crate) async fn resolve_bilibili_metadata_recovery_source(
             BILIBILI_METADATA_PROBE_TIMEOUT,
         )
         .await?;
-        let parsed_bvid = bilibili_bvid_from_url(&url);
-        let membership_client = &client;
-        let collection_client = &client;
-        let ugc_collections = match &resolved {
-            ResolvedContent::Video(video) => {
-                resolve_bilibili_metadata_recovery_ugc_collections(
-                    video,
-                    parsed_bvid.as_deref(),
-                    |bvid| async move {
-                        Ok(membership_client
-                            .resolve_video_collection_membership(&bvid)
-                            .await?)
-                    },
-                    |reference| async move {
-                        Ok(collection_client
-                            .resolve_video_collection(&reference, None)
-                            .await?)
-                    },
-                )
-                .await?
-            }
-            _ => None,
-        };
-        bilibili_metadata_recovery_entries_with_ugc_collections(
-            resolved,
-            ugc_collections.as_deref(),
-        )
+        Ok::<_, anyhow::Error>((client, resolved))
     })
     .await
-    .context("Bilibili metadata recovery timed out")?
+    .context("Bilibili metadata recovery base query timed out")??;
+
+    let parsed_bvid = bilibili_bvid_from_url(&url);
+    let enrichment_deadline = (source_deadline - METADATA_RECOVERY_UGC_RETURN_MARGIN)
+        .min(Instant::now() + METADATA_RECOVERY_UGC_ENRICHMENT_CAP);
+    let membership_client = &client;
+    let collection_client = &client;
+    bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+        resolved,
+        parsed_bvid.as_deref(),
+        enrichment_deadline,
+        |bvid| async move {
+            Ok(membership_client
+                .resolve_video_collection_membership(&bvid)
+                .await?)
+        },
+        |reference| async move {
+            Ok(collection_client
+                .resolve_video_collection(&reference, None)
+                .await?)
+        },
+    )
+    .await
 }
 
 fn bilibili_metadata_recovery_source_url(source_id: &str) -> Result<String> {
@@ -6119,6 +6126,193 @@ fn bilibili_metadata_recovery_source_url(source_id: &str) -> Result<String> {
     bail!("metadata recovery needs a valid Bilibili BV, av, or ep identifier")
 }
 
+async fn bilibili_metadata_recovery_entries_with_optional_ugc_collections<M, MFut, C, CFut>(
+    resolved: ResolvedContent,
+    fallback_bvid: Option<&str>,
+    enrichment_deadline: Instant,
+    membership_lookup: M,
+    collection_lookup: C,
+) -> Result<Vec<crate::metadata_recovery::ResolvedMetadataEntry>>
+where
+    M: FnOnce(String) -> MFut + Send,
+    MFut: Future<Output = Result<Option<UgcCollectionReference>>> + Send,
+    C: FnOnce(UgcCollectionReference) -> CFut + Send,
+    CFut: Future<Output = Result<VideoCollectionResolution>> + Send,
+{
+    // Validate and preserve the exact resolved metadata before optional enrichment starts. The
+    // analyzer applies its normal source-identity checks to these entries when enrichment fails.
+    if let ResolvedContent::Video(video) = &resolved {
+        validate_bilibili_metadata_recovery_video_base(video, fallback_bvid)?;
+    }
+    let base_entries = bilibili_metadata_recovery_entries(resolved.clone())?;
+    let ResolvedContent::Video(video) = &resolved else {
+        return Ok(base_entries);
+    };
+    if Instant::now() >= enrichment_deadline {
+        warn!(
+            reason = "optional_lookup_window_exhausted",
+            "metadata recovery UGC enrichment was skipped; retaining base video metadata"
+        );
+        return Ok(base_entries);
+    }
+
+    let reference = match tokio_timeout_at(
+        enrichment_deadline,
+        resolve_bilibili_metadata_recovery_ugc_membership(video, fallback_bvid, membership_lookup),
+    )
+    .await
+    {
+        Ok(Ok(Some(reference))) => reference,
+        Ok(Ok(None)) => return Ok(base_entries),
+        Ok(Err(_)) => {
+            warn!(
+                reason = "optional_membership_lookup_or_validation_failed",
+                "metadata recovery UGC membership was unavailable; retaining base video metadata"
+            );
+            return Ok(base_entries);
+        }
+        Err(_) => {
+            warn!(
+                reason = "optional_membership_lookup_timed_out",
+                "metadata recovery UGC membership timed out; retaining base video metadata"
+            );
+            return Ok(base_entries);
+        }
+    };
+
+    let partial_collections = match partial_bilibili_metadata_recovery_ugc_collections(
+        video,
+        fallback_bvid,
+        &reference,
+    ) {
+        Ok(collections) => collections,
+        Err(_) => {
+            warn!(
+                reason = "optional_membership_result_validation_failed",
+                "metadata recovery UGC membership was invalid; retaining base video metadata"
+            );
+            return Ok(base_entries);
+        }
+    };
+    let partial_entries = match bilibili_metadata_recovery_entries_with_ugc_collections(
+        resolved.clone(),
+        Some(&partial_collections),
+    ) {
+        Ok(entries) => entries,
+        Err(_) => {
+            warn!(
+                reason = "optional_membership_mapping_failed",
+                "metadata recovery UGC membership could not be mapped; retaining base video metadata"
+            );
+            return Ok(base_entries);
+        }
+    };
+
+    if reference.item_count > crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES {
+        warn!(
+            reason = "optional_collection_exceeds_recovery_bound",
+            "metadata recovery retained verified UGC membership without collection order"
+        );
+        return Ok(partial_entries);
+    }
+    if Instant::now() >= enrichment_deadline {
+        warn!(
+            reason = "optional_collection_window_exhausted",
+            "metadata recovery retained verified UGC membership without collection order"
+        );
+        return Ok(partial_entries);
+    }
+
+    let full_collections = match tokio_timeout_at(
+        enrichment_deadline,
+        resolve_bilibili_metadata_recovery_ugc_collections_for_reference(
+            video,
+            fallback_bvid,
+            &reference,
+            collection_lookup,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(collections)) => collections,
+        Ok(Err(_)) => {
+            warn!(
+                reason = "optional_collection_lookup_or_validation_failed",
+                "metadata recovery retained verified UGC membership without collection order"
+            );
+            return Ok(partial_entries);
+        }
+        Err(_) => {
+            warn!(
+                reason = "optional_collection_lookup_timed_out",
+                "metadata recovery retained verified UGC membership without collection order"
+            );
+            return Ok(partial_entries);
+        }
+    };
+
+    match bilibili_metadata_recovery_entries_with_ugc_collections(resolved, Some(&full_collections))
+    {
+        Ok(entries) => Ok(entries),
+        Err(_) => {
+            warn!(
+                reason = "optional_collection_mapping_failed",
+                "metadata recovery retained verified UGC membership without collection order"
+            );
+            Ok(partial_entries)
+        }
+    }
+}
+
+fn validate_bilibili_metadata_recovery_video_base(
+    video: &bbdown_core::VideoMetadata,
+    fallback_bvid: Option<&str>,
+) -> Result<()> {
+    if video.pages.is_empty()
+        || video.pages.len() > crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES
+    {
+        bail!("metadata source exceeds the recovery entry limit");
+    }
+    if video.aid == 0
+        || video
+            .pages
+            .iter()
+            .any(|page| page.aid != video.aid || page.cid == 0)
+    {
+        bail!("resolved video pages do not have exact AID/CID identities");
+    }
+    if let Some(fallback_bvid) = fallback_bvid
+        && (fallback_bvid.len() != 12
+            || !fallback_bvid.starts_with("BV")
+            || !fallback_bvid
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric()))
+    {
+        bail!("metadata recovery source has no valid BV identity");
+    }
+    match (video.bvid.as_deref(), fallback_bvid) {
+        (Some(metadata_bvid), Some(input_bvid)) if metadata_bvid != input_bvid => {
+            bail!("resolved video BV identity disagrees with the requested source")
+        }
+        (Some(metadata_bvid), _) => {
+            if metadata_bvid.len() != 12
+                || !metadata_bvid.starts_with("BV")
+                || !metadata_bvid
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric())
+            {
+                bail!("resolved video has no valid BV identity");
+            }
+        }
+        (None, Some(_)) => {
+            bail!("resolved video has no BV identity for the requested source")
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 async fn resolve_bilibili_metadata_recovery_ugc_collections<M, MFut, C, CFut>(
     video: &bbdown_core::VideoMetadata,
     fallback_bvid: Option<&str>,
@@ -6131,13 +6325,48 @@ where
     C: FnOnce(UgcCollectionReference) -> CFut + Send,
     CFut: Future<Output = Result<VideoCollectionResolution>> + Send,
 {
-    use crate::library::CollectionMetadata;
-
-    if video.pages.is_empty()
-        || video.pages.len() > crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES
-    {
-        bail!("metadata source exceeds the recovery entry limit");
+    let Some(reference) =
+        resolve_bilibili_metadata_recovery_ugc_membership(video, fallback_bvid, membership_lookup)
+            .await?
+    else {
+        return Ok(None);
+    };
+    if reference.item_count > crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES {
+        bail!("UGC collection exceeds the recovery entry limit");
     }
+
+    resolve_bilibili_metadata_recovery_ugc_collections_for_reference(
+        video,
+        fallback_bvid,
+        &reference,
+        collection_lookup,
+    )
+    .await
+    .map(Some)
+}
+
+async fn resolve_bilibili_metadata_recovery_ugc_membership<M, MFut>(
+    video: &bbdown_core::VideoMetadata,
+    fallback_bvid: Option<&str>,
+    membership_lookup: M,
+) -> Result<Option<UgcCollectionReference>>
+where
+    M: FnOnce(String) -> MFut + Send,
+    MFut: Future<Output = Result<Option<UgcCollectionReference>>> + Send,
+{
+    validate_bilibili_metadata_recovery_video_base(video, fallback_bvid)?;
+    let bvid = bilibili_metadata_recovery_video_bvid(video, fallback_bvid)?;
+    let Some(reference) = membership_lookup(bvid.to_string()).await? else {
+        return Ok(None);
+    };
+    validate_bilibili_metadata_recovery_ugc_reference(&reference)?;
+    Ok(Some(reference))
+}
+
+fn bilibili_metadata_recovery_video_bvid<'a>(
+    video: &'a bbdown_core::VideoMetadata,
+    fallback_bvid: Option<&'a str>,
+) -> Result<&'a str> {
     let bvid = match (video.bvid.as_deref(), fallback_bvid) {
         (Some(metadata_bvid), Some(input_bvid)) if metadata_bvid != input_bvid => {
             bail!("resolved video BV identity disagrees with the requested source")
@@ -6154,26 +6383,68 @@ where
     {
         bail!("resolved video has no valid BV identity for collection membership");
     }
-    if video.aid == 0
-        || video
-            .pages
-            .iter()
-            .any(|page| page.aid != video.aid || page.cid == 0)
-    {
-        bail!("resolved video pages do not have exact AID/CID identities");
-    }
+    Ok(bvid)
+}
 
-    let Some(reference) = membership_lookup(bvid.to_string()).await? else {
-        return Ok(None);
-    };
+fn validate_bilibili_metadata_recovery_ugc_reference(
+    reference: &UgcCollectionReference,
+) -> Result<()> {
     if reference.id == 0
         || reference.owner_mid == 0
         || reference.item_count == 0
-        || reference.item_count > crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES
+        || reference.title.trim().is_empty()
+        || reference.title.len() > crate::file_manager::MAX_METADATA_TITLE_CHARS * 4
+        || reference.title.chars().count() > crate::file_manager::MAX_METADATA_TITLE_CHARS
     {
-        bail!("UGC collection membership exceeds the recovery bounds");
+        bail!("UGC collection membership is missing bounded identity or title metadata");
     }
+    Ok(())
+}
 
+fn partial_bilibili_metadata_recovery_ugc_collections(
+    video: &bbdown_core::VideoMetadata,
+    fallback_bvid: Option<&str>,
+    reference: &UgcCollectionReference,
+) -> Result<Vec<crate::library::CollectionMetadata>> {
+    use crate::library::CollectionMetadata;
+
+    validate_bilibili_metadata_recovery_video_base(video, fallback_bvid)?;
+    validate_bilibili_metadata_recovery_ugc_reference(reference)?;
+    let id_prefix = match reference.kind {
+        UgcCollectionKind::Collection => "collection",
+        UgcCollectionKind::Series => "series",
+    };
+    Ok(video
+        .pages
+        .iter()
+        .map(|page| CollectionMetadata {
+            id: Some(format!("bilibili:{id_prefix}:{}", reference.id)),
+            title: reference.title.clone(),
+            kind: "bilibili_collection".to_string(),
+            order: None,
+            part_id: Some(page.cid.to_string()),
+        })
+        .collect())
+}
+
+async fn resolve_bilibili_metadata_recovery_ugc_collections_for_reference<C, CFut>(
+    video: &bbdown_core::VideoMetadata,
+    fallback_bvid: Option<&str>,
+    reference: &UgcCollectionReference,
+    collection_lookup: C,
+) -> Result<Vec<crate::library::CollectionMetadata>>
+where
+    C: FnOnce(UgcCollectionReference) -> CFut + Send,
+    CFut: Future<Output = Result<VideoCollectionResolution>> + Send,
+{
+    use crate::library::CollectionMetadata;
+
+    validate_bilibili_metadata_recovery_video_base(video, fallback_bvid)?;
+    validate_bilibili_metadata_recovery_ugc_reference(reference)?;
+    let bvid = bilibili_metadata_recovery_video_bvid(video, fallback_bvid)?;
+    if reference.item_count > crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES {
+        bail!("UGC collection exceeds the recovery entry limit");
+    }
     let collection = collection_lookup(reference.clone()).await?;
     let (id_prefix, expected_kind) = match reference.kind {
         UgcCollectionKind::Collection => ("collection", VideoCollectionKind::Collection),
@@ -6214,7 +6485,7 @@ where
             part_id: Some(page.cid.to_string()),
         });
     }
-    Ok(Some(mapped))
+    Ok(mapped)
 }
 
 fn bilibili_metadata_recovery_entries(
@@ -31211,6 +31482,28 @@ mod tests {
         }
     }
 
+    fn assert_partial_metadata_recovery_collection(
+        entry: &crate::metadata_recovery::ResolvedMetadataEntry,
+        expected_id: &str,
+        expected_title: &str,
+        expected_cid: u64,
+    ) {
+        assert_eq!(entry.cid, Some(expected_cid));
+        let collection = entry
+            .collection
+            .as_ref()
+            .expect("verified membership should retain partial collection metadata");
+        assert_eq!(collection.id.as_deref(), Some(expected_id));
+        assert_eq!(collection.title, expected_title);
+        assert_eq!(collection.kind, "bilibili_collection");
+        assert_eq!(collection.order, None);
+        let expected_part_id = expected_cid.to_string();
+        assert_eq!(
+            collection.part_id.as_deref(),
+            Some(expected_part_id.as_str())
+        );
+    }
+
     #[test]
     fn metadata_recovery_source_ids_never_accept_arbitrary_urls_or_invalid_numbers() {
         assert_eq!(
@@ -31317,6 +31610,279 @@ mod tests {
         assert_eq!(collection.kind, "bilibili_collection");
         assert_eq!(collection.order, Some(2));
         assert_eq!(collection.part_id.as_deref(), Some("10"));
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_optional_ugc_lookup_failure_keeps_base_video_entries() {
+        let video = metadata_recovery_video(1);
+        let expected = bilibili_metadata_recovery_entries(ResolvedContent::Video(video.clone()))
+            .expect("base Video metadata should map before optional enrichment");
+        let entries = bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+            ResolvedContent::Video(video),
+            None,
+            Instant::now() + Duration::from_secs(1),
+            |_| async { Err(anyhow!("provider error contains a signed URL and cookie")) },
+            |_| async { unreachable!("collection lookup requires a membership result") },
+        )
+        .await
+        .expect("optional membership failure should preserve the exact base result");
+
+        assert_eq!(entries, expected);
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_invalid_ugc_membership_keeps_base_video_entries() {
+        let video = metadata_recovery_video(1);
+        let expected = bilibili_metadata_recovery_entries(ResolvedContent::Video(video.clone()))
+            .expect("base Video metadata should map before optional enrichment");
+        let mut reference = metadata_recovery_ugc_reference(UgcCollectionKind::Collection, 2);
+        reference.title = "x".repeat(crate::file_manager::MAX_METADATA_TITLE_CHARS + 1);
+        let collection_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let collection_called_by_lookup = std::sync::Arc::clone(&collection_called);
+        let entries = bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+            ResolvedContent::Video(video),
+            None,
+            Instant::now() + Duration::from_secs(1),
+            |_| async move { Ok(Some(reference)) },
+            move |_| async move {
+                collection_called_by_lookup.store(true, std::sync::atomic::Ordering::SeqCst);
+                unreachable!("invalid membership title should stop before collection lookup")
+            },
+        )
+        .await
+        .expect("invalid membership title should preserve base metadata");
+
+        assert_eq!(entries, expected);
+        assert!(!collection_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_optional_ugc_collection_failure_keeps_verified_membership_without_order()
+     {
+        let video = metadata_recovery_video(1);
+        let reference = metadata_recovery_ugc_reference(UgcCollectionKind::Collection, 2);
+        let entries = bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+            ResolvedContent::Video(video),
+            None,
+            Instant::now() + Duration::from_secs(1),
+            |_| async move { Ok(Some(reference)) },
+            |_| async { Err(anyhow!("provider collection lookup failed")) },
+        )
+        .await
+        .expect("optional collection failure should preserve verified membership");
+
+        assert_eq!(entries.len(), 1);
+        assert_partial_metadata_recovery_collection(
+            &entries[0],
+            "bilibili:collection:167822",
+            "Saved group",
+            10,
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_optional_ugc_timeout_keeps_verified_membership_without_order() {
+        let video = metadata_recovery_video(1);
+        let reference = metadata_recovery_ugc_reference(UgcCollectionKind::Series, 2);
+        let collection_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let collection_called_by_lookup = std::sync::Arc::clone(&collection_called);
+        let entries = bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+            ResolvedContent::Video(video),
+            None,
+            Instant::now() + Duration::from_millis(200),
+            |_| async move { Ok(Some(reference)) },
+            move |_| async move {
+                collection_called_by_lookup.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<Result<VideoCollectionResolution>>().await
+            },
+        )
+        .await
+        .expect("optional collection timeout should preserve verified membership");
+
+        assert_eq!(entries.len(), 1);
+        assert_partial_metadata_recovery_collection(
+            &entries[0],
+            "bilibili:series:167823",
+            "Saved group",
+            10,
+        );
+        assert!(collection_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_skips_optional_ugc_when_its_deadline_has_expired() {
+        let video = metadata_recovery_video(1);
+        let expected = bilibili_metadata_recovery_entries(ResolvedContent::Video(video.clone()))
+            .expect("base Video metadata should map before optional enrichment");
+        let membership_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let membership_called_by_lookup = std::sync::Arc::clone(&membership_called);
+        let entries = bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+            ResolvedContent::Video(video),
+            None,
+            Instant::now() - Duration::from_millis(1),
+            move |_| async move {
+                membership_called_by_lookup.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            },
+            |_| async { unreachable!("expired enrichment deadline should skip the lookup") },
+        )
+        .await
+        .expect("an expired optional deadline should preserve the exact base result");
+
+        assert_eq!(entries, expected);
+        assert!(!membership_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_oversized_collection_membership_keeps_exact_pages_without_order() {
+        let video = metadata_recovery_video(2);
+        let reference = metadata_recovery_ugc_reference(
+            UgcCollectionKind::Collection,
+            crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES + 1,
+        );
+        let entries = bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+            ResolvedContent::Video(video),
+            None,
+            Instant::now() + Duration::from_secs(1),
+            |_| async move { Ok(Some(reference)) },
+            |_| async { unreachable!("oversized membership must stop before collection lookup") },
+        )
+        .await
+        .expect("oversized collection should preserve verified membership");
+
+        assert_eq!(entries.len(), 2);
+        assert_partial_metadata_recovery_collection(
+            &entries[0],
+            "bilibili:collection:167822",
+            "Saved group",
+            10,
+        );
+        assert_partial_metadata_recovery_collection(
+            &entries[1],
+            "bilibili:collection:167822",
+            "Saved group",
+            20,
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_optional_ugc_success_keeps_exact_collection_mapping() {
+        let video = metadata_recovery_video(1);
+        let reference = metadata_recovery_ugc_reference(UgcCollectionKind::Collection, 2);
+        let resolution = metadata_recovery_ugc_resolution(
+            VideoCollectionKind::Collection,
+            reference.id,
+            vec![
+                test_bilibili_collection_item(1, 999, "BVother00001", 99),
+                test_bilibili_collection_item(2, 123, "BV1ab411C7x1", 10),
+            ],
+        );
+        let expected_collection = crate::library::CollectionMetadata {
+            id: Some(format!("bilibili:collection:{}", reference.id)),
+            title: "Saved group title".to_string(),
+            kind: "bilibili_collection".to_string(),
+            order: Some(2),
+            part_id: Some("10".to_string()),
+        };
+        let expected = bilibili_metadata_recovery_entries_with_ugc_collections(
+            ResolvedContent::Video(video.clone()),
+            Some(std::slice::from_ref(&expected_collection)),
+        )
+        .expect("exact optional collection metadata should map");
+        let entries = bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+            ResolvedContent::Video(video),
+            None,
+            Instant::now() + Duration::from_secs(1),
+            |_| async move { Ok(Some(reference)) },
+            |_| async move { Ok(resolution) },
+        )
+        .await
+        .expect("valid optional UGC enrichment should preserve existing behavior");
+
+        assert_eq!(entries, expected);
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_oversized_ugc_collection_keeps_verified_membership_without_order() {
+        let video = metadata_recovery_video(1);
+        let reference = metadata_recovery_ugc_reference(UgcCollectionKind::Collection, 1);
+        let oversized_items = (1..=crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES + 1)
+            .map(|index| {
+                test_bilibili_collection_item(index as u32, 123, "BVother00001", index as u64)
+            })
+            .collect::<Vec<_>>();
+        let resolution = metadata_recovery_ugc_resolution(
+            VideoCollectionKind::Collection,
+            reference.id,
+            oversized_items,
+        );
+        let entries = bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+            ResolvedContent::Video(video),
+            None,
+            Instant::now() + Duration::from_secs(1),
+            |_| async move { Ok(Some(reference)) },
+            |_| async move { Ok(resolution) },
+        )
+        .await
+        .expect("oversized optional collection should preserve verified membership");
+
+        assert_eq!(entries.len(), 1);
+        assert_partial_metadata_recovery_collection(
+            &entries[0],
+            "bilibili:collection:167822",
+            "Saved group",
+            10,
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_base_video_failure_is_not_hidden_by_optional_fallback() {
+        let video =
+            metadata_recovery_video(crate::metadata_recovery::MAX_RESOLVED_METADATA_ENTRIES + 1);
+        let membership_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let membership_called_by_lookup = std::sync::Arc::clone(&membership_called);
+        let result = bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+            ResolvedContent::Video(video),
+            None,
+            Instant::now() + Duration::from_secs(1),
+            move |_| async move {
+                membership_called_by_lookup.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            },
+            |_| async { unreachable!("no membership result should skip collection lookup") },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "the strict base entry limit must remain enforced"
+        );
+        assert!(!membership_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn metadata_recovery_rejects_mismatched_requested_bvid_before_membership_lookup() {
+        let membership_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let membership_called_by_lookup = std::sync::Arc::clone(&membership_called);
+        let result = bilibili_metadata_recovery_entries_with_optional_ugc_collections(
+            ResolvedContent::Video(metadata_recovery_video(1)),
+            Some("BVother00001"),
+            Instant::now() + Duration::from_secs(1),
+            move |_| async move {
+                membership_called_by_lookup.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(None)
+            },
+            |_| async {
+                unreachable!("mismatched source identity must stop before collection lookup")
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "mismatched requested BVID must remain an error"
+        );
+        assert!(!membership_called.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

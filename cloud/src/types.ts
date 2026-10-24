@@ -50,7 +50,7 @@ export interface MetadataRecoveryPayload extends BoundLibraryMutationIdentity {
   after_item_id?: string;
 }
 
-export type MetadataRecoveryStatus = "ready" | "needs_confirmation" | "unchanged" | "unavailable" | "unsupported";
+export type MetadataRecoveryStatus = "ready" | "needs_confirmation" | "deferred" | "unchanged" | "unavailable" | "unsupported";
 
 export interface MetadataRecoveryCandidate {
   label: string;

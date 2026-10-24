@@ -14,6 +14,7 @@ import { submitLegacyFileImport } from "./legacy-file-import.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
 import { sourceIdUrl } from "./source-links.js";
 import { escapeHtml, renderMovePreviewItems } from "./preview-rendering.js";
+import { registeredMediaLibrary } from "./library-view.js";
 import { validateTargetRelativeDirectory } from "./target-directory.js";
 import { boundedFolderSuggestions, buildMigrationPreviewPayloadFromRenderedOptions, canOperateOnRegisteredMediaLibrary, collectionIdentity, defaultMediaLibraryId, filterLibraryItems, groupLibraryItems, isValidLibraryRootBinding, itemFolder, librarySelectionCounts, LIBRARY_PAGE_SIZE, mediaLibraryAvailability, mediaLibraryEntries, mediaSnapshotInfo, mediaSnapshotOmissionNotice, migrationEndpointAvailability, migrationPreviewBindingsMatch, movedToTarget, needsOrganizing, operationLibraryId, operationMatchesLibrary, paginateLibraryItems, renderMigrationTargetOptions, resolveMediaLibrary, selectMigrationTarget, statusOf } from "./library-view.js";
 import { incompleteMigrationTaskSummary } from "./migration-task-summary.js";
@@ -34,7 +35,7 @@ const MAX_LEGACY_BYTES = 256 * 1024;
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
 const initialParams = new URLSearchParams(window.location.search);
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoveryPreviewRequest: null, dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
 let snapshotUpdates = null;
 let snapshotUpdateStatus = "connecting";
 let privateAccessExpired = false;
@@ -122,7 +123,7 @@ function dismissMetadataRecoveryId(id) {
   }
 }
 
-function clearMetadataRecoveryState({ dismiss = true } = {}) {
+function clearMetadataRecoveryState({ dismiss = true, clearPreviewRequest = true } = {}) {
   const current = state.metadataRecovery;
   if (dismiss && current?.requestId) {
     const latestSeq = recoveryOperationsForLibrary(current.libraryId)
@@ -135,6 +136,7 @@ function clearMetadataRecoveryState({ dismiss = true } = {}) {
     if (Number.isSafeInteger(current.seq)) dismissMetadataRecoveryId(String(current.seq));
   }
   state.metadataRecovery = null;
+  if (clearPreviewRequest) state.metadataRecoveryPreviewRequest = null;
 }
 
 function recoveryContext() {
@@ -330,17 +332,25 @@ function currentMetadataRecovery() {
   return null;
 }
 
-async function requestMetadataRecovery(scope) {
+async function requestMetadataRecovery(scope, { deferredItemIds = null } = {}) {
   if (!libraryCanOperate()) return showToast("This library is offline or showing a saved scan. Reconnect it before analyzing metadata.");
   const context = recoveryContext();
   if (!context) return showToast("The displayed library identity or revision is unavailable. Refresh the library before analyzing metadata.");
+  const current = deferredItemIds === null ? null : currentMetadataRecovery();
+  if (deferredItemIds !== null && (scope !== "selected" || !Array.isArray(deferredItemIds)
+      || deferredItemIds.length === 0 || deferredItemIds.length > MAX_SELECTED_ITEMS
+      || !current || current.scope !== "selected" || !current.report
+      || current.report.revision !== context.revision
+      || deferredItemIds.some((id) => !current.report.items.some((item) => item.item_id === id && item.status === "deferred")))) {
+    return showToast("The deferred results no longer match this library revision. Analyze the current selection again before retrying.");
+  }
   const payload = {
     library_id: context.libraryId,
     root_binding: context.rootBinding,
     scope,
-    ...(scope === "selected" ? { item_ids: [...state.selected] } : {}),
+    ...(scope === "selected" ? { item_ids: deferredItemIds === null ? [...state.selected] : [...deferredItemIds] } : {}),
   };
-  if (scope === "selected" && (state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS)) {
+  if (scope === "selected" && (payload.item_ids.length === 0 || payload.item_ids.length > MAX_SELECTED_ITEMS)) {
     return showToast(`Select between 1 and ${MAX_SELECTED_ITEMS} present items to analyze metadata.`);
   }
   if (scope === "library") {
@@ -381,7 +391,30 @@ function previewMetadataRecoverySelection() {
     candidateChoices: recovery.candidateChoices,
   });
   if (!payload) return showToast("Select only ready items and choose a candidate for every item that needs confirmation.");
-  submitAction("file_preview", payload);
+  submitAction("file_preview", payload, {
+    onQueued: (action) => {
+      state.view = "organizing";
+      state.metadataRecoveryPreviewRequest = {
+        requestId: action.request_id,
+        seq: null,
+        libraryId: context.libraryId,
+        rootBinding: context.rootBinding,
+        status: "queued",
+        error: "",
+      };
+      render();
+    },
+  });
+}
+
+function updateMetadataRecoveryPreviewRequest(action, { status, error = "", seq = undefined } = {}) {
+  const request = state.metadataRecoveryPreviewRequest;
+  if (action?.kind !== "file_preview" || !request || action.request_id !== request.requestId) return false;
+  request.status = status;
+  request.error = String(error ?? "");
+  if (seq !== undefined) request.seq = Number.isSafeInteger(seq) ? seq : null;
+  renderPreviews();
+  return true;
 }
 
 function previewOrganizationStatus(item, organizationStatus) {
@@ -656,6 +689,7 @@ function showPrivateAccessGate(message) {
   state.legacySelection.clear();
   document.querySelector(".detail-panel")?.remove();
   byId("app-content").classList.add("hidden");
+  byId("app-content").setAttribute("aria-busy", "false");
   byId("auth-gate").classList.remove("hidden");
   byId("auth-message").textContent = message;
   setConnection("", "Owner verification required");
@@ -663,16 +697,22 @@ function showPrivateAccessGate(message) {
 
 function invalidateMetadataRecoveryForSnapshot(previousSnapshot, nextSnapshot) {
   const recovery = state.metadataRecovery;
-  if (!recovery || !previousSnapshot) return false;
-  const previousEntry = mediaLibraryEntries(previousSnapshot).find((entry) => entry.id === recovery.libraryId);
-  const nextEntry = mediaLibraryEntries(nextSnapshot).find((entry) => entry.id === recovery.libraryId);
+  const previewRequest = state.metadataRecoveryPreviewRequest;
+  const libraryId = recovery?.libraryId ?? previewRequest?.libraryId;
+  if (!libraryId || !previousSnapshot) return false;
+  const previousEntry = mediaLibraryEntries(previousSnapshot).find((entry) => entry.id === libraryId);
+  const nextEntry = mediaLibraryEntries(nextSnapshot).find((entry) => entry.id === libraryId);
   const previousBinding = previousEntry?.root_binding;
   const nextBinding = nextEntry?.root_binding;
   const bindingChanged = previousBinding !== nextBinding;
-  const previousRevision = resolveMediaLibrary(previousSnapshot, recovery.libraryId).snapshot?.revision;
-  const nextRevision = resolveMediaLibrary(nextSnapshot, recovery.libraryId).snapshot?.revision;
-  if (bindingChanged || previousRevision !== nextRevision) {
+  const revisionChanged = recovery
+    && resolveMediaLibrary(previousSnapshot, libraryId).snapshot?.revision !== resolveMediaLibrary(nextSnapshot, libraryId).snapshot?.revision;
+  if (bindingChanged) {
     clearMetadataRecoveryState({ dismiss: false });
+    return true;
+  }
+  if (revisionChanged) {
+    clearMetadataRecoveryState({ dismiss: false, clearPreviewRequest: false });
     return true;
   }
   return false;
@@ -730,6 +770,7 @@ async function performRefreshState({ quiet = false } = {}) {
   if (!initData || privateAccessExpired || state.loading) return;
   recoverFileActionReceipts();
   state.loading = true;
+  byId("app-content").setAttribute("aria-busy", "true");
   try {
     const fresh = await loadOwnerSnapshot((path, headers) => api(path, { headers }));
     if (privateAccessExpired) return;
@@ -761,6 +802,7 @@ async function performRefreshState({ quiet = false } = {}) {
     throw error;
   } finally {
     state.loading = false;
+    byId("app-content").setAttribute("aria-busy", "false");
     if (state.refreshAfterDrain) {
       state.refreshAfterDrain = false;
       window.setTimeout(() => refreshState({ quiet: true }), 0);
@@ -871,6 +913,13 @@ async function drainActionQueue({ quiet = false } = {}) {
         }),
         onReceipt: (action, receipt, resolvedSurface) => {
           const recorded = recordActionReceipt(action, receipt, state, { surface: resolvedSurface });
+          if (action?.kind === "file_preview" && action.request_id === state.metadataRecoveryPreviewRequest?.requestId) {
+            updateMetadataRecoveryPreviewRequest(action, {
+              status: receipt?.outcome === "rejected" ? "rejected" : "submitted",
+              error: receipt?.error,
+              seq: receipt?.seq,
+            });
+          }
           if (action?.kind === "metadata_recover" && action.request_id === state.metadataRecovery?.requestId
               && Number.isSafeInteger(receipt?.seq)) {
             state.metadataRecovery.seq = receipt.seq;
@@ -931,6 +980,7 @@ async function drainActionQueue({ quiet = false } = {}) {
           state.metadataRecovery.deliveryUnknown = true;
           renderMetadataRecovery();
         }
+        updateMetadataRecoveryPreviewRequest(action, { status: "unknown", error });
         if (updates.downloadSubmission) renderDownloadStatus();
         if (updates.migrationConflictDrafts > 0) renderMigrations();
         renderWaiting();
@@ -946,6 +996,7 @@ async function drainActionQueue({ quiet = false } = {}) {
           state.metadataRecovery.error = rejection.error;
           renderMetadataRecovery();
         }
+        updateMetadataRecoveryPreviewRequest(action, { status: "rejected", error: rejection.error });
         permanentRejections.push(rejection.error);
         continue;
       }
@@ -968,6 +1019,10 @@ async function drainActionQueue({ quiet = false } = {}) {
           state.downloadMessage = typeof error?.message === "string" ? error.message : "The request was rejected before it reached your computer.";
           renderDownloadStatus();
         }
+        updateMetadataRecoveryPreviewRequest(action, {
+          status: "rejected",
+          error: typeof error?.message === "string" ? error.message : "The preview request was rejected.",
+        });
         for (const [previewId, draft] of state.migrationConflictDrafts) {
           if (draft.refreshRequestId === action.request_id) {
             draft.refreshRequestId = null;
@@ -1309,6 +1364,7 @@ function renderLibrary() {
 const RECOVERY_GROUP_TITLES = {
   ready: "Ready to preview",
   needs_confirmation: "Choose a match",
+  deferred: "Deferred · analyze again",
   unchanged: "Already complete",
   unavailable: "Unavailable",
   unsupported: "Unsupported",
@@ -1338,7 +1394,7 @@ function recoveryItemMarkup(item, recovery) {
     <label class="recovery-item-select"><input type="checkbox" data-recovery-item="${escapeHtml(item.item_id)}" ${checked ? "checked" : ""} ${selectable ? "" : "disabled"}><span><strong>${escapeHtml(item.title || "Untitled video")}</strong><code>${escapeHtml(item.relative_path || "Path unavailable")}</code></span></label>
     <span class="state-pill ${selectable ? "pending" : ""}">${escapeHtml(RECOVERY_GROUP_TITLES[item.status])}</span>
     ${summary ? `<p class="field-hint">${escapeHtml(summary)}</p>` : ""}
-    ${item.reason ? `<p class="recovery-reason">${escapeHtml(item.reason)}</p>` : ""}
+    ${item.reason ? `<p class="recovery-reason">${escapeHtml(item.reason)}</p>` : item.status === "deferred" ? `<p class="recovery-reason">This item was not analyzed within the current work budget.</p>` : ""}
     ${candidateControl}
   </article>`;
 }
@@ -1392,11 +1448,20 @@ function renderMetadataRecovery() {
   status.textContent = recovery.scope === "selected"
     ? `Analysis revision ${report.revision} · ${report.items.length} selected result${report.items.length === 1 ? "" : "s"} · ${report.total} needs-organizing candidates in the library`
     : `Analysis revision ${report.revision} · ${report.items.length} items in this batch · ${report.total} needs-organizing candidates in the library · ${report.remaining} remaining after this batch`;
-  const sections = Object.entries(groups).map(([key, items]) => {
+  const sections = Object.entries(groups).filter(([key, items]) => key !== "deferred" || items.length > 0).map(([key, items]) => {
     const content = items.length ? items.map((item) => recoveryItemMarkup(item, recovery)).join("")
       : `<p class="field-hint">No items in this group.</p>`;
     return `<section class="recovery-group" aria-labelledby="recovery-group-${key}"><h4 id="recovery-group-${key}">${escapeHtml(RECOVERY_GROUP_TITLES[key])} <span>${items.length}</span></h4>${content}</section>`;
   }).join("");
+  const deferredItems = report.items.filter((item) => item.status === "deferred");
+  const continuationHint = recovery.scope === "library" && report.remaining > 0
+    ? deferredItems.length > 0
+      ? "This batch reached its work budget. Analyze the next batch to retry deferred rows from the last completed item."
+      : "More candidates remain. Analyze the next batch to continue through the library without silently skipping rows."
+    : "";
+  const deferredRetry = recovery.scope === "selected" && deferredItems.length > 0
+    ? `<button class="secondary-button" type="button" data-recovery-retry-deferred>Analyze deferred items</button>`
+    : "";
   const previewPayload = canOperate ? buildMetadataRecoveryPreviewPayload({
     report,
     libraryId: current.libraryId,
@@ -1404,7 +1469,7 @@ function renderMetadataRecovery() {
     itemIds: [...recovery.selectedIds],
     candidateChoices: recovery.candidateChoices,
   }) : null;
-  results.innerHTML = `${recovery.scope === "library" && report.remaining > 0 ? `<p class="field-hint">More candidates remain. Analyze the next batch to continue through the library without silently skipping rows.</p>` : ""}<div class="recovery-group-list">${sections}</div><div class="recovery-footer"><button class="primary-button" type="button" data-recovery-preview ${previewPayload ? "" : "disabled"}>Preview selected updates</button>${recovery.scope === "library" && report.remaining > 0 ? `<button class="secondary-button" type="button" data-recovery-next>Analyze next batch</button>` : ""}<button class="quiet-button" type="button" data-recovery-clear>Clear report and choices</button></div>`;
+  results.innerHTML = `${continuationHint ? `<p class="field-hint">${escapeHtml(continuationHint)}</p>` : ""}<div class="recovery-group-list">${sections}</div><div class="recovery-footer"><button class="primary-button" type="button" data-recovery-preview ${previewPayload ? "" : "disabled"}>Preview selected updates</button>${deferredRetry}${recovery.scope === "library" && report.remaining > 0 ? `<button class="secondary-button" type="button" data-recovery-next>Analyze next batch</button>` : ""}<button class="quiet-button" type="button" data-recovery-clear>Clear report and choices</button></div>`;
 }
 
 function operationTitle(operation) {
@@ -1457,8 +1522,8 @@ function renderWaiting() {
 
 function operationPreview(operation) {
   const identity = fileOperationLibraryIdentity(operation);
-  if (operation?.preview && typeof operation.preview === "object") return { id: operation.preview_id ?? operation.preview.id, revision: operation.revision ?? operation.preview.revision, preview: operation.preview, status: operation.status, ...(identity ?? {}) };
-  if (operation?.result?.preview && typeof operation.result.preview === "object") return { id: operation.preview_id ?? operation.result.preview_id ?? operation.result.preview.id, revision: operation.revision ?? operation.result.revision ?? operation.result.preview.revision, preview: operation.result.preview, status: operation.status, ...(identity ?? {}) };
+  if (operation?.preview && typeof operation.preview === "object") return { seq: operation.seq, id: operation.preview_id ?? operation.preview.id, revision: operation.revision ?? operation.preview.revision, preview: operation.preview, status: operation.status, ...(identity ?? {}) };
+  if (operation?.result?.preview && typeof operation.result.preview === "object") return { seq: operation.seq, id: operation.preview_id ?? operation.result.preview_id ?? operation.result.preview.id, revision: operation.revision ?? operation.result.revision ?? operation.result.preview.revision, preview: operation.result.preview, status: operation.status, ...(identity ?? {}) };
   return null;
 }
 
@@ -1468,6 +1533,7 @@ function previews() {
     if (preview?.kind === "library_migration_preview") continue;
     const incomplete = preview.preview_incomplete === true || preview.incomplete === true || preview.reload_required === true;
     collected.push({
+      seq: preview.seq,
       id: preview.preview_id ?? preview.id ?? (incomplete ? "omitted-preview-details" : undefined),
       revision: preview.revision ?? preview.preview?.revision ?? (incomplete ? String(preview.omitted_count ?? "unknown") : undefined),
       preview: incomplete ? null : preview.preview ?? preview,
@@ -1648,9 +1714,41 @@ function renderMigrations() {
 }
 
 function renderPreviews() {
-  const pending = previews().filter((entry) => isReviewablePreviewStatus(entry.status));
+  const allPreviews = previews();
+  const submission = state.metadataRecoveryPreviewRequest;
+  if (submission && Number.isSafeInteger(submission.seq)
+      && allPreviews.some((entry) => entry.seq === submission.seq)) {
+    state.metadataRecoveryPreviewRequest = null;
+  }
+  const pending = allPreviews.filter((entry) => isReviewablePreviewStatus(entry.status));
   byId("organizing-count").textContent = String(pending.length);
-  byId("preview-list").innerHTML = pending.map((entry) => {
+  const currentSubmission = state.metadataRecoveryPreviewRequest;
+  const submissionLibrary = currentSubmission
+    ? registeredMediaLibrary(state.snapshot, currentSubmission.libraryId)
+    : null;
+  const requestCard = currentSubmission && currentSubmission.libraryId === activeLibraryId()
+    && submissionLibrary?.root_binding === currentSubmission.rootBinding
+    ? (() => {
+      const queued = readActionQueue().some((action) => action.request_id === currentSubmission.requestId);
+      const operation = Number.isSafeInteger(currentSubmission.seq)
+        ? (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []).find((entry) => entry?.seq === currentSubmission.seq && entry?.kind === "file_preview")
+        : null;
+      if (operation && ["failed", "rejected", "stale", "cancelled", "expired"].includes(String(operation.status).toLowerCase())) {
+        return `<article class="stack-card"><div class="stack-card-head"><div><h3>Recovery preview failed · request #${escapeHtml(currentSubmission.seq ?? currentSubmission.requestId)}</h3><p>${escapeHtml(operation.error ?? "The computer could not create this preview.")}</p></div><span class="state-pill warning">Needs attention</span></div></article>`;
+      }
+      const message = currentSubmission.status === "rejected"
+        ? `The computer rejected recovery preview request ${Number.isSafeInteger(currentSubmission.seq) ? `#${currentSubmission.seq}` : currentSubmission.requestId}: ${currentSubmission.error || "Request rejected"}`
+        : currentSubmission.status === "unknown"
+          ? `Delivery outcome for recovery preview request ${currentSubmission.requestId} is unknown. Check your computer before retrying.`
+          : queued
+            ? `Recovery preview request ${currentSubmission.requestId} is queued in this browser and will be sent when the connection is available.`
+            : Number.isSafeInteger(currentSubmission.seq)
+              ? `Recovery preview request #${currentSubmission.seq} was submitted. Waiting for your computer to prepare the preview.`
+              : `Submitting recovery preview request ${currentSubmission.requestId}…`;
+      return `<article class="stack-card"><div class="stack-card-head"><div><h3>Recovery preview is being prepared</h3><p>${escapeHtml(message)}</p></div><span class="state-pill pending">Waiting</span></div></article>`;
+    })()
+    : "";
+  byId("preview-list").innerHTML = requestCard + pending.map((entry) => {
     if (isIncompletePreview(entry)) {
       const reason = entry.reason || "Preview details were omitted from the saved snapshot. Request a fresh preview before confirming.";
       return `<article class="stack-card"><div class="stack-card-head"><div><h3>Preview needs to be regenerated</h3><p>${escapeHtml(reason)}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
@@ -1667,7 +1765,7 @@ function renderPreviews() {
     const offlineMessage = canConfirm ? "" : `<p class="field-hint">This library is offline or showing a saved scan. Reconnect it and refresh before confirming.</p>`;
     return `<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(preview.target_relative_dir ?? "Metadata only · file locations stay the same")} · Conflict: ${escapeHtml(preview.conflict ?? "skip")}</p>${offlineMessage}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${describePreview(preview)}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}" data-library-id="${escapeHtml(libraryId)}" ${canConfirm ? "" : "disabled"}>Confirm changes</button></div></article>`;
   }).join("");
-  if (!pending.length) byId("preview-list").innerHTML = "";
+  if (!requestCard && !pending.length) byId("preview-list").innerHTML = "";
 }
 
 function renderLegacyMappings() {
@@ -2344,6 +2442,15 @@ function bindEvents() {
   document.body.addEventListener("click", (event) => {
     const recoveryPreview = event.target.closest("[data-recovery-preview]");
     if (recoveryPreview) { previewMetadataRecoverySelection(); return; }
+    const recoveryRetryDeferred = event.target.closest("[data-recovery-retry-deferred]");
+    if (recoveryRetryDeferred) {
+      const recovery = currentMetadataRecovery();
+      const deferredItemIds = recovery?.report?.items
+        .filter((item) => item.status === "deferred")
+        .map((item) => item.item_id) ?? [];
+      requestMetadataRecovery("selected", { deferredItemIds });
+      return;
+    }
     const recoveryNext = event.target.closest("[data-recovery-next]");
     if (recoveryNext) { requestMetadataRecovery("library"); return; }
     const recoveryClear = event.target.closest("[data-recovery-clear]");
@@ -2366,9 +2473,11 @@ function bindEvents() {
         showToast("The delivery notice could not be removed from browser storage. It remains paused here.");
         return;
       }
+      if (state.metadataRecoveryPreviewRequest?.requestId === requestId) state.metadataRecoveryPreviewRequest = null;
       if (dismissed.downloadSubmission) renderDownloadStatus();
       if (dismissed.migrationConflictDrafts > 0) renderMigrations();
       renderWaiting();
+      renderPreviews();
       showToast("The delivery outcome is still unknown. The browser notice was dismissed; check your computer before resubmitting.");
       return;
     }
@@ -2603,9 +2712,11 @@ function start() {
   telegram?.ready?.();
   telegram?.expand?.();
   bindEvents();
+  byId("app-content").setAttribute("aria-busy", "true");
   Object.assign(state, beginOwnerVerification());
   clearCachedSnapshot();
   if (!initData) {
+    byId("app-content").setAttribute("aria-busy", "false");
     byId("auth-gate").classList.remove("hidden");
     return;
   }
