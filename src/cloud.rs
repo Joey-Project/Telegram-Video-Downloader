@@ -997,7 +997,7 @@ struct InboxStateIndex {
     awaiting_preview_id_by_sequence: BTreeMap<u64, String>,
     awaiting_preview_expiry_seconds_by_sequence: BTreeMap<u64, u64>,
     active_confirmations: BTreeMap<String, BTreeSet<(Option<u64>, u64)>>,
-    active_confirmation_by_sequence: BTreeMap<u64, (String, Option<u64>)>,
+    active_confirmation_by_sequence: BTreeMap<u64, (String, Option<u64>, Option<String>)>,
     terminal_confirmations: BTreeMap<String, BTreeMap<u64, InboxStatus>>,
     terminal_confirmation_by_sequence: BTreeMap<u64, String>,
 }
@@ -1065,12 +1065,23 @@ impl InboxStateIndex {
                 _ => unreachable!("confirmation kind was checked above"),
             };
             let preview_key = preview_index_key(preview_kind, preview_id);
+            let revision = record
+                .request
+                .payload
+                .get("revision")
+                .and_then(Value::as_str)
+                .filter(|revision| {
+                    valid_preview_cancel_scalar(revision, MAX_PREVIEW_CANCEL_REVISION_BYTES)
+                })
+                .map(str::to_owned);
             self.active_confirmations
                 .entry(preview_key.clone())
                 .or_default()
                 .insert((received_at_seconds, record.request.seq));
-            self.active_confirmation_by_sequence
-                .insert(record.request.seq, (preview_key, received_at_seconds));
+            self.active_confirmation_by_sequence.insert(
+                record.request.seq,
+                (preview_key, received_at_seconds, revision),
+            );
         }
         if let Some(confirmation_key) = terminal_confirmation_index_key(record) {
             self.terminal_confirmations
@@ -1104,7 +1115,7 @@ impl InboxStateIndex {
                 self.awaiting_preview_sequences.remove(&preview_id);
             }
         }
-        if let Some((preview_id, received_at_seconds)) =
+        if let Some((preview_id, received_at_seconds, _revision)) =
             self.active_confirmation_by_sequence.remove(&seq)
         {
             let remove_preview =
@@ -1157,6 +1168,42 @@ impl InboxStateIndex {
                     .range(..(Some(expires_at_seconds), 0))
                     .next()
                     .is_some()
+            })
+    }
+
+    fn has_active_confirmation_for_revision(
+        &self,
+        preview_id: &str,
+        preview_kind: &str,
+        revision: &str,
+        preview_seq: u64,
+    ) -> bool {
+        let preview_key = preview_index_key(preview_kind, preview_id);
+        self.active_confirmations
+            .get(&preview_key)
+            .is_some_and(|confirmations| {
+                confirmations.iter().any(|(_, seq)| {
+                    // A confirmation allocated before this preview cannot be causal evidence
+                    // about this proposal, even if the caller reused its ID and revision.
+                    if *seq <= preview_seq {
+                        return false;
+                    }
+                    let Some((indexed_preview_key, _, indexed_revision)) =
+                        self.active_confirmation_by_sequence.get(seq)
+                    else {
+                        // An inconsistent reverse index must not make a cancellation unsafe.
+                        return true;
+                    };
+                    if indexed_preview_key != &preview_key {
+                        return true;
+                    }
+                    match indexed_revision.as_deref() {
+                        Some(active_revision) => active_revision == revision,
+                        // Legacy or malformed confirmation identities remain conservative:
+                        // without a valid revision, they may refer to this exact target.
+                        None => true,
+                    }
+                })
             })
     }
 
@@ -1955,17 +2002,17 @@ impl CloudInbox {
             return Ok(None);
         }
 
-        let preview_key = preview_index_key(preview_kind, preview_id);
         let terminal_disposition = {
             let state_index = self
                 .state_index
                 .lock()
                 .map_err(|_| anyhow!("cloud inbox state index lock was poisoned"))?;
-            if state_index
-                .active_confirmations
-                .get(&preview_key)
-                .is_some_and(|confirmations| !confirmations.is_empty())
-            {
+            if state_index.has_active_confirmation_for_revision(
+                preview_id,
+                preview_kind,
+                revision,
+                preview_seq,
+            ) {
                 return Ok(None);
             }
             state_index.terminal_confirmation_disposition_after(
@@ -3354,6 +3401,19 @@ mod tests {
                 "preview": {"id": preview_id, "revision": "revision-1"}
             })),
         }
+    }
+
+    fn preview_inbox_record_with_revision(
+        seq: u64,
+        preview_id: &str,
+        updated_at: u64,
+        revision: &str,
+    ) -> InboxRecord {
+        let mut record = preview_inbox_record(seq, preview_id, updated_at);
+        let result = record.result.as_mut().expect("preview result should exist");
+        result["revision"] = json!(revision);
+        result["preview"]["revision"] = json!(revision);
+        record
     }
 
     fn confirmation_inbox_record(
@@ -5471,6 +5531,237 @@ mod tests {
 
         drop(inbox);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_cancel_ignores_active_confirmation_for_another_revision_of_reused_id() {
+        let root = temp_root("preview-cancel-active-revision");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        finish_initial_recovery(&inbox);
+
+        for (case, status) in [
+            InboxStatus::Pending,
+            InboxStatus::Processing,
+            InboxStatus::Retryable,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let old_preview_seq = case as u64 * 4 + 1;
+            let new_preview_seq = old_preview_seq + 1;
+            let confirmation_seq = old_preview_seq + 2;
+            let preview_id = format!("preview-cancel-reused-{case}");
+
+            persist_awaiting_preview(
+                &inbox,
+                preview_inbox_record(old_preview_seq, &preview_id, now_seconds()),
+            );
+            persist_awaiting_preview(
+                &inbox,
+                preview_inbox_record_with_revision(
+                    new_preview_seq,
+                    &preview_id,
+                    now_seconds(),
+                    "revision-2",
+                ),
+            );
+            inbox
+                .persist(
+                    confirmation_inbox_record(
+                        confirmation_seq,
+                        &preview_id,
+                        InboxStatus::Pending,
+                        now_millis(),
+                        Some(now_seconds()),
+                    )
+                    .request,
+                )
+                .expect("older revision confirmation should persist");
+            if status != InboxStatus::Pending {
+                inbox
+                    .update(confirmation_seq, |record| record.status = status)
+                    .expect("confirmation lifecycle status should persist");
+            }
+
+            assert!(
+                inbox
+                    .cancel_awaiting_preview(
+                        "file_preview",
+                        new_preview_seq,
+                        &preview_id,
+                        "revision-2",
+                    )
+                    .expect("a different revision should not block cancellation")
+                    .is_some(),
+                "active {status:?} confirmation for the reused ID's older revision must not block the new target"
+            );
+            assert!(
+                inbox
+                    .cancel_awaiting_preview(
+                        "file_preview",
+                        old_preview_seq,
+                        &preview_id,
+                        "revision-1",
+                    )
+                    .expect("same-revision active confirmation should safely block cancellation")
+                    .is_none(),
+                "active {status:?} confirmation should still block its exact target"
+            );
+        }
+
+        drop(inbox);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_cancel_does_not_treat_prior_sequence_as_confirmation_for_reused_target() {
+        let root = temp_root("preview-cancel-active-sequence");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        finish_initial_recovery(&inbox);
+
+        let preview_id = "preview-cancel-same-revision-reused";
+        persist_awaiting_preview(&inbox, preview_inbox_record(1, preview_id, now_seconds()));
+        inbox
+            .persist(
+                confirmation_inbox_record(
+                    2,
+                    preview_id,
+                    InboxStatus::Pending,
+                    now_millis(),
+                    Some(now_seconds()),
+                )
+                .request,
+            )
+            .expect("prior active confirmation should persist");
+        persist_awaiting_preview(&inbox, preview_inbox_record(3, preview_id, now_seconds()));
+
+        assert!(
+            inbox
+                .cancel_awaiting_preview("file_preview", 3, preview_id, "revision-1")
+                .expect("a prior-sequence confirmation should not block a later proposal")
+                .is_some()
+        );
+        assert!(
+            inbox
+                .cancel_awaiting_preview("file_preview", 1, preview_id, "revision-1")
+                .expect("later same-revision confirmation should block its original target")
+                .is_none()
+        );
+
+        drop(inbox);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_cancel_revision_filter_is_rebuilt_after_reopen() {
+        let root = temp_root("preview-cancel-active-revision-reopen");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        finish_initial_recovery(&inbox);
+
+        let preview_id = "preview-cancel-revision-reopen";
+        persist_awaiting_preview(
+            &inbox,
+            preview_inbox_record_with_revision(1, preview_id, now_seconds(), "revision-2"),
+        );
+        inbox
+            .persist(
+                confirmation_inbox_record(
+                    2,
+                    preview_id,
+                    InboxStatus::Pending,
+                    now_millis(),
+                    Some(now_seconds()),
+                )
+                .request,
+            )
+            .expect("older revision confirmation should persist");
+        inbox
+            .update(2, |record| record.status = InboxStatus::Retryable)
+            .expect("retryable lifecycle status should persist");
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        finish_initial_recovery(&reopened);
+        assert!(
+            reopened
+                .cancel_awaiting_preview("file_preview", 1, preview_id, "revision-2")
+                .expect("rebuilt index should distinguish the active old revision")
+                .is_some()
+        );
+
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn active_confirmation_revision_filter_is_conservative_for_incomplete_metadata() {
+        let preview_id = "preview-cancel-incomplete-revision";
+        let mut missing_revision = confirmation_inbox_record(
+            2,
+            preview_id,
+            InboxStatus::Pending,
+            now_millis(),
+            Some(now_seconds()),
+        );
+        missing_revision
+            .request
+            .payload
+            .as_object_mut()
+            .expect("confirmation payload should be an object")
+            .remove("revision");
+
+        let mut index = InboxStateIndex::default();
+        index.record(&missing_revision);
+        assert!(index.has_active_confirmation_for_revision(
+            preview_id,
+            "file_preview",
+            "revision-2",
+            1,
+        ));
+        assert!(index.has_active_confirmation_before_kind(
+            preview_id,
+            "file_preview",
+            now_seconds() + 1,
+        ));
+
+        let mut invalid_revision = confirmation_inbox_record(
+            3,
+            preview_id,
+            InboxStatus::Processing,
+            now_millis(),
+            Some(now_seconds()),
+        );
+        invalid_revision.request.payload["revision"] = json!("");
+        let mut invalid_revision_index = InboxStateIndex::default();
+        invalid_revision_index.record(&invalid_revision);
+        assert!(invalid_revision_index.has_active_confirmation_for_revision(
+            preview_id,
+            "file_preview",
+            "revision-2",
+            1,
+        ));
+
+        let valid_confirmation = confirmation_inbox_record(
+            4,
+            preview_id,
+            InboxStatus::Retryable,
+            now_millis(),
+            Some(now_seconds()),
+        );
+        let mut inconsistent_index = InboxStateIndex::default();
+        inconsistent_index.record(&valid_confirmation);
+        inconsistent_index
+            .active_confirmation_by_sequence
+            .remove(&4);
+        assert!(inconsistent_index.has_active_confirmation_for_revision(
+            preview_id,
+            "file_preview",
+            "revision-2",
+            1,
+        ));
     }
 
     #[test]

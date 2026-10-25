@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
 import {
+  ACTION_REPLAY_WINDOW_MS,
   ACTION_RECEIPT_STORAGE_PREFIX,
   ACTION_SURFACE_FILE,
   createQueuedAction,
@@ -28,6 +29,13 @@ const FILE_CANCEL_REQUEST_ID = "00000000-0000-4000-8000-000000000711";
 const MIGRATION_CANCEL_REQUEST_ID = "00000000-0000-4000-8000-000000000712";
 const FILE_CANCEL_REQUEST_SEQ = 903;
 const MIGRATION_CANCEL_REQUEST_SEQ = 902;
+const FILE_BUSY_PREVIEW_ID = "file-busy-cancel-preview";
+const FILE_BUSY_PREVIEW_REVISION = "file-busy-cancel-r1";
+const FILE_BUSY_PREVIEW_SEQ = 803;
+const FILE_BUSY_CANCEL_REQUEST_ID = "00000000-0000-4000-8000-000000000713";
+const RECEIPT_FAILURE_PREVIEW_ID = "file-receipt-failure-preview";
+const RECEIPT_FAILURE_PREVIEW_REVISION = "file-receipt-failure-r1";
+const RECEIPT_FAILURE_PREVIEW_SEQ = 804;
 const SNAPSHOT_REFRESH_START_BUDGET_MS = 1_000;
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "file-manager-ui-flow", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
@@ -2078,9 +2086,335 @@ describe("file manager UI flow", () => {
     expect(element<HTMLElement>("#history-migration-list").textContent).toContain("3 additional migrations are not included in this view");
   });
 
-  it("restores an accepted cancellation after reload and settles it only from a terminal snapshot", async () => {
+  it.each([
+    { status: "queued" as const, seq: null, error: null },
+    { status: "submitted" as const, seq: FILE_CANCEL_REQUEST_SEQ, error: null },
+    { status: "unknown" as const, seq: FILE_CANCEL_REQUEST_SEQ, error: "Check the computer before trying this cancellation again." },
+  ])("keeps an online file preview's confirm disabled during a $status cancellation without showing the offline hint", async ({ status, seq, error }) => {
+    const storage = makeMemoryStorage();
+    const key = previewCancellationStorageKey("file_preview", FILE_BUSY_PREVIEW_SEQ, FILE_BUSY_PREVIEW_ID, FILE_BUSY_PREVIEW_REVISION);
+    storage.setItem(PREVIEW_CANCELLATION_STORAGE_KEY, cancellationTrackerEnvelope([{
+      key,
+      requestId: FILE_BUSY_CANCEL_REQUEST_ID,
+      seq,
+      status,
+      error,
+    }]));
+    const snapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      operations: [filePreviewFixture(FILE_BUSY_PREVIEW_SEQ, LIBRARY_ID, ROOT_BINDING, FILE_BUSY_PREVIEW_ID, FILE_BUSY_PREVIEW_REVISION)],
+      pending_requests: [],
+      previews: [],
+    };
+    const fixture = await mountFileManagerFixture(snapshot, storage);
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    const confirm = element<HTMLButtonElement>(`[data-confirm="${FILE_BUSY_PREVIEW_ID}"]`);
+    expect(window.navigator.onLine).toBe(true);
+    expect(confirm.disabled).toBe(true);
+    expect(element<HTMLElement>("#preview-list").textContent).not.toContain("This library is offline or showing a saved scan.");
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+  });
+
+  it("shows the offline review hint for a genuinely offline file library", async () => {
+    const offlineLibraryId = "offline-file-preview-library";
+    const offlineBinding = `v1:${"d".repeat(64)}`;
+    const offlineLibrary = {
+      id: offlineLibraryId,
+      name: "Offline file library",
+      root: "/srv/offline",
+      root_binding: offlineBinding,
+      default_category: "Films",
+      availability: "offline",
+      available: false,
+    };
+    const snapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      settings: {
+        ...ownerSnapshot.settings,
+        applied: {
+          ...ownerSnapshot.settings.applied,
+          libraries: [...ownerSnapshot.settings.applied.libraries, offlineLibrary],
+        },
+      },
+      library: {
+        ...ownerSnapshot.library,
+        libraries: [...ownerSnapshot.library.libraries, offlineLibrary],
+      },
+      operations: [filePreviewFixture(805, offlineLibraryId, offlineBinding, "offline-file-preview", "offline-file-r1")],
+      pending_requests: [],
+      previews: [],
+    };
+    await mountFileManagerFixture(snapshot, makeMemoryStorage());
+
+    const librarySelect = element<HappyDOMSelectElement>("#library-select");
+    librarySelect.value = offlineLibraryId;
+    librarySelect.dispatchEvent(new HappyDOMEvent("change", { bubbles: true }));
+    await vi.waitFor(() => expect(librarySelect.value).toBe(offlineLibraryId));
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    expect(element<HTMLButtonElement>('[data-confirm="offline-file-preview"]').disabled).toBe(true);
+    expect(element<HTMLElement>("#preview-list").textContent).toContain("This library is offline or showing a saved scan.");
+  });
+
+  it("keeps an accepted cancellation receipt and same request queued until tracker storage recovers", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);
+    const memoryStorage = makeMemoryStorage();
+    let failCancellationTrackerWrite = false;
+    const storage = {
+      getItem: memoryStorage.getItem,
+      setItem(key: string, value: string) {
+        if (failCancellationTrackerWrite && key === PREVIEW_CANCELLATION_STORAGE_KEY) {
+          throw new Error("Simulated cancellation tracker storage failure");
+        }
+        memoryStorage.setItem(key, value);
+      },
+      removeItem: memoryStorage.removeItem,
+      clear: memoryStorage.clear,
+    };
+    const preview = filePreviewFixture(
+      RECEIPT_FAILURE_PREVIEW_SEQ,
+      LIBRARY_ID,
+      ROOT_BINDING,
+      RECEIPT_FAILURE_PREVIEW_ID,
+      RECEIPT_FAILURE_PREVIEW_REVISION,
+    );
+    const snapshot = { ...ownerSnapshot, state_version: 1, operations: [preview], pending_requests: [], previews: [] };
+    let acceptedServerActions = 0;
+    let acceptedSeq = 0;
+    const firstPage = await mountFileManagerFixture(snapshot, storage, (action, seq) => {
+      if (action.kind !== "preview_cancel") throw new Error(`Unexpected action ${action.kind}`);
+      acceptedServerActions += 1;
+      acceptedSeq = seq;
+      const key = previewCancellationStorageKey("file_preview", RECEIPT_FAILURE_PREVIEW_SEQ, RECEIPT_FAILURE_PREVIEW_ID, RECEIPT_FAILURE_PREVIEW_REVISION);
+      const intent = JSON.parse(memoryStorage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null") as { entries?: Array<{ key: string; tracker: Record<string, unknown> }> } | null;
+      expect(intent?.entries).toContainEqual({
+        key,
+        tracker: { requestId: action.request_id, seq: null, status: "queued", error: "" },
+      });
+      // The intent and action are already durable. Fail only the tracker update after receipt processing starts.
+      failCancellationTrackerWrite = true;
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    });
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    element<HTMLButtonElement>(`[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="${RECEIPT_FAILURE_PREVIEW_ID}"]`).click();
+    await vi.waitFor(() => {
+      expect(firstPage.actions).toHaveLength(1);
+      const action = firstPage.actions[0]!;
+      const queued = JSON.parse(memoryStorage.getItem("file-manager.actions.v1") ?? "null") as Array<Record<string, any>>;
+      expect(queued).toHaveLength(1);
+      expect(queued[0]).toMatchObject({ request_id: action.request_id, kind: "preview_cancel", payload: action.payload });
+      const receipt = JSON.parse(memoryStorage.getItem(`${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(action.request_id)}`) ?? "null");
+      expect(receipt).toMatchObject({
+        version: 1,
+        request_id: action.request_id,
+        surface: ACTION_SURFACE_FILE,
+        kind: "preview_cancel",
+        outcome: "accepted",
+        seq: acceptedSeq,
+      });
+    });
+    const acceptedAction = firstPage.actions[0]!;
+    const receiptKey = `${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(acceptedAction.request_id)}`;
+    expect(acceptedServerActions).toBe(1);
+    expect(firstPage.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(1);
+
+    // Model an aged queue record: its six-day replay window has expired, while the accepted receipt remains durable.
+    const now = Date.now();
+    const queued = JSON.parse(memoryStorage.getItem("file-manager.actions.v1") ?? "null") as Array<Record<string, any>>;
+    const agedAction = {
+      ...queued[0],
+      queued_at_ms: now - ACTION_REPLAY_WINDOW_MS - 1,
+      replay_expires_at_ms: now - 1,
+    };
+    memoryStorage.setItem("file-manager.actions.v1", JSON.stringify([agedAction]));
+    expect(agedAction.replay_expires_at_ms).toBeLessThanOrEqual(now);
+
+    const reloadedPage = await mountFileManagerFixture(snapshot, storage, () => {
+      throw new Error("An accepted cancellation must not be posted again during receipt recovery");
+    });
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false"));
+    expect(JSON.parse(memoryStorage.getItem("file-manager.actions.v1") ?? "null")).toEqual([agedAction]);
+    expect(JSON.parse(memoryStorage.getItem(receiptKey) ?? "null")).toMatchObject({ outcome: "accepted", seq: acceptedSeq });
+    expect(reloadedPage.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+    expect(reloadedPage.actions).toHaveLength(0);
+
+    // A cross-tab-style receipt recovery can now persist the tracker, consume the receipt, and remove the same UUID.
+    failCancellationTrackerWrite = false;
+    Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+    const storageEvent = new Event("storage");
+    Object.defineProperty(storageEvent, "key", { configurable: true, value: receiptKey });
+    window.dispatchEvent(storageEvent);
+    await vi.waitFor(() => {
+      expect(JSON.parse(memoryStorage.getItem("file-manager.actions.v1") ?? "null")).toEqual([]);
+      expect(memoryStorage.getItem(receiptKey)).toBeNull();
+      const persisted = JSON.parse(memoryStorage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null") as { entries?: Array<{ key: string; tracker: Record<string, unknown> }> } | null;
+      expect(persisted?.entries).toContainEqual({
+        key: previewCancellationStorageKey("file_preview", RECEIPT_FAILURE_PREVIEW_SEQ, RECEIPT_FAILURE_PREVIEW_ID, RECEIPT_FAILURE_PREVIEW_REVISION),
+        tracker: { requestId: acceptedAction.request_id, seq: acceptedSeq, status: "submitted", error: null },
+      });
+    });
+    expect(acceptedServerActions).toBe(1);
+    expect(reloadedPage.actions).toHaveLength(0);
+    expect(reloadedPage.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+  });
+
+  it("retains receipt evidence when queue removal fails through terminal snapshot and reload", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const memoryStorage = makeMemoryStorage();
+    let failActionQueueWrite = false;
+    let actionQueueWriteAttempts = 0;
+    const storage = {
+      getItem: memoryStorage.getItem,
+      setItem(key: string, value: string) {
+        if (key === "file-manager.actions.v1") {
+          actionQueueWriteAttempts += 1;
+          if (failActionQueueWrite) throw new Error("Simulated action queue storage failure");
+        }
+        memoryStorage.setItem(key, value);
+      },
+      removeItem: memoryStorage.removeItem,
+      clear: memoryStorage.clear,
+    };
+    const preview = filePreviewFixture(
+      RECEIPT_FAILURE_PREVIEW_SEQ,
+      LIBRARY_ID,
+      ROOT_BINDING,
+      RECEIPT_FAILURE_PREVIEW_ID,
+      RECEIPT_FAILURE_PREVIEW_REVISION,
+    );
+    const initialSnapshot = { ...ownerSnapshot, state_version: 1, operations: [preview], pending_requests: [], previews: [] };
+    let acceptedServerActions = 0;
+    let acceptedSeq = 0;
+    const firstPage = await mountFileManagerFixture(initialSnapshot, storage, (action, seq) => {
+      if (action.kind !== "preview_cancel") throw new Error(`Unexpected action ${action.kind}`);
+      acceptedServerActions += 1;
+      acceptedSeq = seq;
+      failActionQueueWrite = true;
+      return { status: 202, body: { seq, request_id: action.request_id } };
+    });
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    element<HTMLButtonElement>(`[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="${RECEIPT_FAILURE_PREVIEW_ID}"]`).click();
+    await vi.waitFor(() => {
+      expect(firstPage.actions).toHaveLength(1);
+      const action = firstPage.actions[0]!;
+      const queued = JSON.parse(memoryStorage.getItem("file-manager.actions.v1") ?? "null") as Array<Record<string, any>>;
+      expect(queued).toHaveLength(1);
+      expect(queued[0]).toMatchObject({ request_id: action.request_id, kind: "preview_cancel", payload: action.payload });
+      const receiptKey = `${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(action.request_id)}`;
+      expect(JSON.parse(memoryStorage.getItem(receiptKey) ?? "null")).toMatchObject({ outcome: "accepted", seq: acceptedSeq });
+      const cancellationState = JSON.parse(memoryStorage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null") as { entries?: Array<{ key: string; tracker: Record<string, unknown> }> } | null;
+      expect(cancellationState?.entries).toContainEqual({
+        key: previewCancellationStorageKey("file_preview", RECEIPT_FAILURE_PREVIEW_SEQ, RECEIPT_FAILURE_PREVIEW_ID, RECEIPT_FAILURE_PREVIEW_REVISION),
+        tracker: { requestId: action.request_id, seq: acceptedSeq, status: "submitted", error: null },
+      });
+      expect(actionQueueWriteAttempts).toBeGreaterThan(1);
+    });
+    await vi.waitFor(() => {
+      expect(element<HTMLElement>("#toast").textContent).toContain("paused until the receipt can be recovered");
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+    const acceptedAction = firstPage.actions[0]!;
+    const receiptKey = `${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(acceptedAction.request_id)}`;
+    expect(acceptedServerActions).toBe(1);
+
+    const terminalSnapshot = {
+      ...initialSnapshot,
+      state_version: 2,
+      operations: [
+        { ...preview, status: "cancelled" },
+        {
+          seq: acceptedSeq,
+          request_id: acceptedAction.request_id,
+          kind: "preview_cancel",
+          status: "completed",
+          result: { cancelled: true, ...acceptedAction.payload },
+        },
+      ],
+      pending_requests: [],
+      previews: [],
+    };
+    await firstPage.publishSnapshot(terminalSnapshot);
+    // Advance only the client refresh budget; the WebSocket invalidation still arrives as its own timer task.
+    vi.setSystemTime(new Date(Date.now() + SNAPSHOT_REFRESH_START_BUDGET_MS));
+    const stateRequestsBeforeTerminal = firstPage.stateRequests;
+    const versionsBeforeTerminal = firstPage.stateRequestVersions.length;
+    const invalidationTask = new Promise<void>((resolve, reject) => window.setTimeout(() => {
+      try {
+        const liveSocket = latestOpenSocket(firstPage.sockets);
+        if (!liveSocket) throw new Error("Expected a live updates connection before terminal cancellation snapshot invalidation.");
+        liveSocket.receive({
+          type: "invalidate",
+          database_epoch: TEST_DATABASE_EPOCH,
+          state_version: terminalSnapshot.state_version,
+          reason: "state",
+        });
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    }, 0));
+    await vi.advanceTimersByTimeAsync(0);
+    await invalidationTask;
+    await vi.waitFor(() => {
+      expect(firstPage.stateRequests).toBe(stateRequestsBeforeTerminal + 1);
+      expect(firstPage.stateRequestVersions.slice(versionsBeforeTerminal)).toContain(terminalSnapshot.state_version);
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+    const terminalQueue = JSON.parse(memoryStorage.getItem("file-manager.actions.v1") ?? "null") as Array<Record<string, any>>;
+    expect(terminalQueue).toHaveLength(1);
+    expect(terminalQueue[0]?.request_id).toBe(acceptedAction.request_id);
+    expect(JSON.parse(memoryStorage.getItem(receiptKey) ?? "null")).toMatchObject({ outcome: "accepted", seq: acceptedSeq });
+    const cancellationKey = previewCancellationStorageKey("file_preview", RECEIPT_FAILURE_PREVIEW_SEQ, RECEIPT_FAILURE_PREVIEW_ID, RECEIPT_FAILURE_PREVIEW_REVISION);
+    const terminalTrackers = JSON.parse(memoryStorage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null") as { entries?: Array<{ key: string; tracker: Record<string, unknown> }> } | null;
+    expect(terminalTrackers?.entries).toContainEqual({
+      key: cancellationKey,
+      tracker: { requestId: acceptedAction.request_id, seq: acceptedSeq, status: "submitted", error: null },
+    });
+
+    // Also exercise recovery if another tab had already retired its copy of this terminal tracker.
+    memoryStorage.removeItem(PREVIEW_CANCELLATION_STORAGE_KEY);
+
+    // The action is now older than its safe replay window; the accepted receipt remains the only durable proof.
+    const now = Date.now();
+    const agedAction = {
+      ...terminalQueue[0],
+      queued_at_ms: now - ACTION_REPLAY_WINDOW_MS - 1,
+      replay_expires_at_ms: now - 1,
+    };
+    memoryStorage.setItem("file-manager.actions.v1", JSON.stringify([agedAction]));
+    const reloadedPage = await mountFileManagerFixture(terminalSnapshot, storage, () => {
+      throw new Error("A terminal cancellation receipt must never be posted again");
+    });
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false"));
+    expect(JSON.parse(memoryStorage.getItem("file-manager.actions.v1") ?? "null")).toHaveLength(1);
+    expect(JSON.parse(memoryStorage.getItem(receiptKey) ?? "null")).toMatchObject({ outcome: "accepted", seq: acceptedSeq });
+    expect(reloadedPage.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+    expect(reloadedPage.actions).toHaveLength(0);
+
+    failActionQueueWrite = false;
+    const attemptsBeforeRecovery = actionQueueWriteAttempts;
+    const onlineEvent = new Event("online");
+    window.dispatchEvent(onlineEvent);
+    await vi.waitFor(() => {
+      expect(actionQueueWriteAttempts).toBeGreaterThan(attemptsBeforeRecovery);
+      expect(JSON.parse(memoryStorage.getItem("file-manager.actions.v1") ?? "null")).toEqual([]);
+      expect(memoryStorage.getItem(receiptKey)).toBeNull();
+    });
+    expect(acceptedServerActions).toBe(1);
+    expect(reloadedPage.actions).toHaveLength(0);
+    expect(reloadedPage.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+  });
+
+  it("restores an accepted cancellation after reload and settles it only from a terminal snapshot", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const clock = controlledSnapshotClock();
     const preview = filePreviewFixture(701, LIBRARY_ID, ROOT_BINDING, "reload-cancel-preview", "reload-cancel-r1");
     const initialSnapshot = { ...ownerSnapshot, state_version: 1, operations: [preview], pending_requests: [], previews: [] };
     const storage = makeMemoryStorage();
@@ -2111,11 +2445,15 @@ describe("file manager UI flow", () => {
     await vi.waitFor(() => expect(firstPage.sockets[0]?.readyState).toBe(MockWebSocket.OPEN));
 
     element<HTMLButtonElement>('[data-view="waiting"]').click();
+    clock.advanceRefreshBudget();
     const stateRequestsBeforeCancel = firstPage.stateRequests;
+    const versionsBeforeCancel = firstPage.stateRequestVersions.length;
     element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="reload-cancel-preview"]').click();
     await vi.waitFor(() => expect(acceptedActions).toHaveLength(1));
-    await vi.waitFor(() => expect(firstPage.stateRequests).toBeGreaterThan(stateRequestsBeforeCancel));
     await vi.waitFor(() => {
+      expect(firstPage.stateRequests).toBeGreaterThan(stateRequestsBeforeCancel);
+      expect(firstPage.stateRequestVersions.slice(versionsBeforeCancel)).toContain(2);
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
       expect(element<HTMLElement>("#waiting-list").textContent).toContain("Waiting for computer · #901");
       expect(element<HTMLElement>("#waiting-list").textContent).toContain("Saved in the cloud inbox");
     });
@@ -2137,6 +2475,8 @@ describe("file manager UI flow", () => {
     const reloadedPage = await mountFileManagerFixture(acceptedPendingSnapshot!, storage, onAction);
     await vi.waitFor(() => expect(reloadedPage.sockets).toHaveLength(1));
     await vi.waitFor(() => expect(reloadedPage.sockets[0]?.readyState).toBe(MockWebSocket.OPEN));
+    expect(reloadedPage.stateRequestVersions).toContain(2);
+    expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
     element<HTMLButtonElement>('[data-view="waiting"]').click();
     await vi.waitFor(() => expect(element<HTMLButtonElement>('[data-confirm="reload-cancel-preview"]').disabled).toBe(true));
     const restoredCancelButton = element<HTMLButtonElement>('[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="reload-cancel-preview"]');
@@ -2161,17 +2501,30 @@ describe("file manager UI flow", () => {
       pending_requests: [],
     };
     await reloadedPage.publishSnapshot(terminalSnapshot);
+    clock.advanceRefreshBudget();
     const stateRequestsBeforeTerminal = reloadedPage.stateRequests;
-    reloadedPage.sockets[0]?.receive({
-      type: "invalidate",
-      database_epoch: TEST_DATABASE_EPOCH,
-      state_version: 3,
-      reason: "state",
-    });
+    const versionsBeforeTerminal = reloadedPage.stateRequestVersions.length;
+    await new Promise<void>((resolve, reject) => window.setTimeout(() => {
+      try {
+        const liveSocket = latestOpenSocket(reloadedPage.sockets);
+        if (!liveSocket) throw new Error("Expected a live updates connection before terminal cancellation snapshot invalidation.");
+        liveSocket.receive({
+          type: "invalidate",
+          database_epoch: TEST_DATABASE_EPOCH,
+          state_version: 3,
+          reason: "state",
+        });
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    }, 0));
     await vi.waitFor(() => {
-      expect(reloadedPage.stateRequests).toBeGreaterThan(stateRequestsBeforeTerminal);
+      expect(reloadedPage.stateRequests).toBe(stateRequestsBeforeTerminal + 1);
+      expect(reloadedPage.stateRequestVersions.slice(versionsBeforeTerminal)).toContain(3);
       expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
       expect(element<HTMLElement>("#history-count").textContent).toBe("2");
+      expect(element<HTMLElement>("#history-summary").textContent).toContain("2 recent records retained");
       expect(element<HTMLElement>("#waiting-count").textContent).toBe("0");
       expect(document.querySelector('[data-preview-cancel-id="reload-cancel-preview"]')).toBeNull();
     });

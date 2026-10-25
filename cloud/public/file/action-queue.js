@@ -118,6 +118,11 @@ export function nextQueuedActionForSurface(queue, surface, excludedIds = new Set
   ) ?? null;
 }
 
+function beforeReceiptAcknowledged(callback, action, receipt, applied, surface) {
+  if (typeof callback !== "function") return true;
+  try { return callback(action, receipt, applied, surface) !== false; } catch { return false; }
+}
+
 export async function dispatchNextOwnedAction({
   surface,
   readQueue,
@@ -176,7 +181,9 @@ export async function dispatchNextOwnedAction({
       if (receiptUpdate?.persisted !== true) {
         return { status: "rejection_receipt_failed", action, error, receiptUpdate };
       }
-      const removed = writeQueue(removeQueuedAction(readQueue(), action.request_id));
+      const queue = readQueue();
+      const removed = !queue.some((entry) => entry?.request_id === action.request_id)
+        || writeQueue(removeQueuedAction(queue, action.request_id));
       if (removed) receiptUpdate?.consume?.();
       return removed
         ? { status: "rejected", action, rejection, receiptUpdate }
@@ -198,7 +205,9 @@ export async function dispatchNextOwnedAction({
     return { status: "receipt_failed", action, receipt, receiptUpdate };
   }
 
-  const removed = writeQueue(removeQueuedAction(readQueue(), action.request_id));
+  const queue = readQueue();
+  const removed = !queue.some((entry) => entry?.request_id === action.request_id)
+    || writeQueue(removeQueuedAction(queue, action.request_id));
   return { status: removed ? "sent" : "remove_failed", action, receipt, receiptUpdate };
 }
 
@@ -451,7 +460,12 @@ function trackerIds(state, surface) {
   return ids;
 }
 
-export function recordActionReceipt(action, receipt, state = {}, { surface = action?.surface, storage, now = Date.now() } = {}) {
+export function recordActionReceipt(action, receipt, state = {}, {
+  surface = action?.surface,
+  storage,
+  now = Date.now(),
+  beforeAcknowledge,
+} = {}) {
   const resolvedSurface = surface ?? (SETTINGS_ACTION_KINDS.has(action?.kind) ? ACTION_SURFACE_SETTINGS : ACTION_SURFACE_FILE);
   const result = { persisted: false, matched: false, localAction: false, downloadSubmission: false, migrationConflictDrafts: 0, rejected: false, rejectedRequestIds: [] };
   if (!needsDurableReceipt(action, resolvedSurface)) {
@@ -487,6 +501,11 @@ export function recordActionReceipt(action, receipt, state = {}, { surface = act
   result.persisted = true;
   const applied = applyReceiptToTrackers(action, receipt, state, resolvedSurface);
   Object.assign(result, applied);
+  if (!beforeReceiptAcknowledged(beforeAcknowledge, action, receipt, applied, resolvedSurface)) {
+    result.persisted = false;
+    result.acknowledgementBlocked = true;
+    return result;
+  }
   if (applied.rejected) result.rejectedRequestIds.push(action.request_id);
   if (applied.matched && !rejected) {
     try { targetStorage.removeItem(receiptStorageKey(action.request_id)); } catch { /* Re-reading this receipt is idempotent. */ }
@@ -499,8 +518,8 @@ export function recordActionReceipt(action, receipt, state = {}, { surface = act
   return result;
 }
 
-export function recoverActionReceipts(state, { surface, storage } = {}) {
-  const result = { matched: 0, localActions: false, downloadSubmission: false, migrationConflictDrafts: 0, requestIds: [], rejectedRequestIds: [], rejections: [] };
+export function recoverActionReceipts(state, { surface, storage, beforeAcknowledge } = {}) {
+  const result = { matched: 0, localActions: false, downloadSubmission: false, migrationConflictDrafts: 0, requestIds: [], blockedRequestIds: [], rejectedRequestIds: [], rejections: [] };
   if (surface !== ACTION_SURFACE_SETTINGS && surface !== ACTION_SURFACE_FILE) return result;
   const targetStorage = getStorage(storage);
   if (!targetStorage || typeof targetStorage.getItem !== "function") return result;
@@ -512,6 +531,10 @@ export function recoverActionReceipts(state, { surface, storage } = {}) {
     try { record = JSON.parse(targetStorage.getItem(receiptStorageKey(requestId)) ?? "null"); } catch { continue; }
     if (!validReceiptRecord(record, requestId) || record.surface !== surface || !kinds.has(record.kind)) continue;
     const applied = applyReceiptToTrackers({ request_id: requestId, kind: record.kind }, record, state, surface);
+    if (!beforeReceiptAcknowledged(beforeAcknowledge, { request_id: requestId, kind: record.kind }, record, applied, surface)) {
+      result.blockedRequestIds.push(requestId);
+      continue;
+    }
     if (!applied.matched) continue;
     result.matched += 1;
     result.localActions ||= applied.localAction;
@@ -528,7 +551,8 @@ export function recoverActionReceipts(state, { surface, storage } = {}) {
   }
 
   // Unmatched keys may belong to a sleeping origin tab. Accepted receipts are
-  // consumed here; rejected receipts stay until the origin removes its queue row.
+  // consumed here after any supplied acknowledgement gate succeeds; rejected
+  // receipts stay until the origin removes its queue row.
   return result;
 }
 

@@ -52,6 +52,21 @@ export interface PreviewCancellationReceiptTracker {
   error?: string | null;
 }
 
+export interface ActionReceiptApplication {
+  matched: boolean;
+  localAction: boolean;
+  downloadSubmission: boolean;
+  migrationConflictDrafts: number;
+  rejected: boolean;
+}
+
+export type BeforeActionReceiptAcknowledge = (
+  action: Pick<QueuedAction, "request_id" | "kind">,
+  receipt: unknown,
+  applied: ActionReceiptApplication,
+  surface: "settings" | "file",
+) => boolean;
+
 export const ACTION_QUEUE_LIMIT: number;
 export const ACTION_REPLAY_WINDOW_MS: number;
 export const ACTION_SURFACE_SETTINGS: "settings";
@@ -107,8 +122,8 @@ export function recordActionReceipt(
     migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
     previewCancellations?: ReadonlyMap<string, PreviewCancellationReceiptTracker>;
   },
-  options?: { surface?: "settings" | "file"; storage?: Storage; now?: number },
-): { persisted: boolean; matched: boolean; localAction: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; rejected?: boolean; rejectedRequestIds?: string[]; consume?: () => void };
+  options?: { surface?: "settings" | "file"; storage?: Storage; now?: number; beforeAcknowledge?: BeforeActionReceiptAcknowledge },
+): { persisted: boolean; matched: boolean; localAction: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; rejected?: boolean; rejectedRequestIds?: string[]; acknowledgementBlocked?: boolean; consume?: () => void };
 export function recoverActionReceipts(
   state: {
     localActions?: ReadonlyMap<string, LocalActionReceiptTracker>;
@@ -116,8 +131,8 @@ export function recoverActionReceipts(
     migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
     previewCancellations?: ReadonlyMap<string, PreviewCancellationReceiptTracker>;
   },
-  options: { surface: "settings" | "file"; storage?: Storage },
-): { matched: number; localActions: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; requestIds: string[]; rejectedRequestIds: string[]; rejections: Array<{ request_id: string; kind: string; status: number; error: string }> };
+  options: { surface: "settings" | "file"; storage?: Storage; beforeAcknowledge?: BeforeActionReceiptAcknowledge },
+): { matched: number; localActions: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; requestIds: string[]; blockedRequestIds: string[]; rejectedRequestIds: string[]; rejections: Array<{ request_id: string; kind: string; status: number; error: string }> };
 export function consumeRejectedActionReceipts(
   state: {
     localActions?: ReadonlyMap<string, LocalActionReceiptTracker>;

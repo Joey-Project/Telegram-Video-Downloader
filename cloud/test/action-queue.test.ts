@@ -561,6 +561,70 @@ describe("shared Mini App action queue ownership", () => {
     expect(queue.contents()).toEqual([action]);
   });
 
+  it("keeps an accepted cancellation receipt and its queue row until tracker persistence acknowledges it", async () => {
+    const requestId = "accepted-cancellation-tracker-write-failure";
+    const action = createQueuedAction({
+      request_id: requestId,
+      kind: "preview_cancel",
+      payload: { preview_kind: "file_preview", preview_seq: 71, preview_id: "preview-file-71", revision: "revision-1" },
+      surface: ACTION_SURFACE_FILE,
+    });
+    const queue = sharedQueue([action]);
+    const receiptStorage = new MemoryStorage();
+    const state = previewCancellationState({ requestId, seq: null, status: "queued", error: "" });
+    let trackerWriteAvailable = false;
+    let dispatchCount = 0;
+    const onReceipt = (entry: QueuedAction, receipt: unknown, surface: "settings" | "file") => recordActionReceipt(entry, receipt, state, {
+      surface,
+      storage: receiptStorage,
+      beforeAcknowledge: (_acceptedAction, _acceptedReceipt, applied) => applied.matched && trackerWriteAvailable,
+    });
+
+    const delivered = await dispatchNextOwnedAction({
+      surface: ACTION_SURFACE_FILE,
+      readQueue: queue.read,
+      writeQueue: queue.write,
+      dispatch: async () => {
+        dispatchCount += 1;
+        return { seq: 97 };
+      },
+      onReceipt,
+    });
+
+    const receiptKey = `${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(requestId)}`;
+    expect(delivered.status).toBe("receipt_failed");
+    expect(queue.contents()).toEqual([action]);
+    expect(JSON.parse(receiptStorage.getItem(receiptKey) ?? "null")).toMatchObject({
+      request_id: requestId,
+      surface: ACTION_SURFACE_FILE,
+      kind: "preview_cancel",
+      outcome: "accepted",
+      seq: 97,
+    });
+    expect(dispatchCount).toBe(1);
+
+    const blockedRecovery = recoverActionReceipts(state, {
+      surface: ACTION_SURFACE_FILE,
+      storage: receiptStorage,
+      beforeAcknowledge: (_acceptedAction, _acceptedReceipt, applied) => applied.matched && trackerWriteAvailable,
+    });
+    expect(blockedRecovery).toMatchObject({ matched: 0, blockedRequestIds: [requestId] });
+    expect(receiptStorage.getItem(receiptKey)).not.toBeNull();
+    expect(queue.contents()).toEqual([action]);
+
+    trackerWriteAvailable = true;
+    const recovered = recoverActionReceipts(state, {
+      surface: ACTION_SURFACE_FILE,
+      storage: receiptStorage,
+      beforeAcknowledge: (_acceptedAction, _acceptedReceipt, applied) => applied.matched && trackerWriteAvailable,
+    });
+    expect(recovered).toMatchObject({ matched: 1, blockedRequestIds: [] });
+    expect(receiptStorage.getItem(receiptKey)).toBeNull();
+    expect(state.previewCancellations?.get(PREVIEW_CANCEL_TRACKER_KEY)).toMatchObject({ requestId, seq: 97, status: "submitted" });
+    expect(queue.contents()).toEqual([action]);
+    expect(dispatchCount).toBe(1);
+  });
+
   it("leaves an unmatched receipt for its sleeping origin tab to consume", () => {
     const action: QueuedAction = { request_id: "sleeping-origin", kind: "download_submit", payload: { url: "https://example.test/v" }, surface: ACTION_SURFACE_FILE };
     const receiptStorage = new MemoryStorage();
