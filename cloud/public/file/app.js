@@ -7,10 +7,10 @@ import { HttpResponseError } from "./http-error.js";
 import { createOwnerSnapshotLoader } from "./snapshot-loader.js";
 import { createSnapshotUpdates } from "./snapshot-updates.js";
 import { acceptOwnerSnapshot, beginOwnerVerification, drainActionsAfterSnapshotRefresh, failOwnerSnapshot, mayDispatchActions, mayUsePrivateSnapshot } from "./snapshot-session.js";
-import { RECENT_SNAPSHOT_MAX_AGE_MS } from "./download-submission-history.js";
+import { RECENT_OPERATION_SNAPSHOT_LIMIT, RECENT_SNAPSHOT_MAX_AGE_MS } from "./download-submission-history.js";
 import { MAX_SELECTED_ITEMS, updateSelectionWithinLimit } from "./selection-limit.js";
 import { MAX_MANUAL_TARGET_OPTIONS, searchPresentManualTargets } from "./manual-target-picker.js";
-import { MAX_MIGRATION_ITEM_CONFLICTS, buildMigrationPreviewRefreshPayload, migrationConflictChoicesChanged, migrationConflictPolicy, migrationRefreshMatches, normalizeMigrationItemConflicts, setMigrationConflictChoice } from "./migration-conflicts.js";
+import { MAX_MIGRATION_ITEM_CONFLICTS, buildMigrationPreviewRefreshPayload, migrationConflictChoicesChanged, migrationConflictPolicy, migrationControlActions, migrationRefreshMatches, normalizeMigrationItemConflicts, setMigrationConflictChoice } from "./migration-conflicts.js";
 import { submitLegacyFileImport } from "./legacy-file-import.js";
 import { buildWaitingEntries, isIncompletePreview, isPresentMedia, isReviewablePreviewStatus, isWaitingEntryPending, operationDetailsWarning, operationHistoryEntries, presentMediaItems } from "./state-view.js";
 import { sourceIdUrl } from "./source-links.js";
@@ -26,6 +26,7 @@ import { dismissUnknownFileAction, isUnknownDeliveryAction, markUnknownFileActio
 import { buildDownloadSubmitPayload, isBoundDownloadLibraryOption } from "./download-submit.js";
 import { createFileQueuedAction, fileActionRequestBody } from "./file-action-dispatch.js";
 import { buildFilePreviewPayloadFromRenderedOption, buildLegacyMetadataPreviewPayloadFromRenderedOption, buildSelectedFilePreviewPayloadFromRenderedOption, clearFileIdentityScopedStateOnSnapshot, fileOperationIdentityMatches, fileOperationLibraryIdentity } from "./file-preview-identity.js";
+import { PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY, PREVIEW_CANCELLATION_STORAGE_KEY, readPreviewCancellationDismissals, readPreviewCancellations, writePreviewCancellationDismissals, writePreviewCancellations } from "./preview-cancellation-state.js";
 
 const API = "/api";
 const loadOwnerSnapshot = createOwnerSnapshotLoader();
@@ -36,11 +37,12 @@ const MAX_LEGACY_BYTES = 256 * 1024;
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
 const initialParams = new URLSearchParams(window.location.search);
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoveryPreviewRequest: null, dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, refreshAfterDrain: false, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
 let snapshotUpdates = null;
 let snapshotUpdateStatus = "connecting";
 let privateAccessExpired = false;
 let metadataRecoveryPreviewRestoreAttempted = false;
+let previewCancellationRestoreAttempted = false;
 
 const byId = (id) => document.getElementById(id);
 let cachedFolderLibrary = null;
@@ -145,6 +147,194 @@ function setMetadataRecoveryPreviewRequest(request) {
   state.metadataRecoveryPreviewRequest = next;
   metadataRecoveryPreviewRestoreAttempted = true;
   try { writeRecoveryPreviewRequest(localStorage, next); } catch { /* The in-memory request remains available for this page. */ }
+}
+
+const PERSISTED_PREVIEW_CANCELLATION_STATUSES = new Set(["queued", "submitted", "unknown"]);
+
+function safelyGetFileStorage() {
+  try { return window.localStorage; } catch { return null; }
+}
+
+function readStoredPreviewCancellations(storage) {
+  if (!storage || typeof storage.getItem !== "function") return null;
+  let raw;
+  try { raw = storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY); } catch { return null; }
+  let stored;
+  try { stored = readPreviewCancellations(storage); } catch { return null; }
+  if (!(stored instanceof Map) || raw !== null && stored.size === 0) return null;
+  return stored;
+}
+
+function readStoredPreviewCancellationDismissals(storage = safelyGetFileStorage()) {
+  if (!storage || typeof storage.getItem !== "function") return null;
+  try { return readPreviewCancellationDismissals(storage); } catch { return null; }
+}
+
+function clonePreviewCancellationDismissals(dismissals) {
+  return new Map([...dismissals].map(([key, requestIds]) => [key, new Set(requestIds)]));
+}
+
+function previewCancellationDismissed(dismissals, key, requestId) {
+  return typeof key === "string" && typeof requestId === "string"
+    && dismissals.get(key)?.has(requestId) === true;
+}
+
+function setPreviewCancellationDismissed(key, requestId, dismissed) {
+  const storage = safelyGetFileStorage();
+  const current = readStoredPreviewCancellationDismissals(storage);
+  if (!current || typeof key !== "string" || typeof requestId !== "string") return false;
+  const next = clonePreviewCancellationDismissals(current);
+  let requestIds = next.get(key);
+  if (dismissed) {
+    if (!requestIds) {
+      requestIds = new Set();
+      next.set(key, requestIds);
+    }
+    requestIds.add(requestId);
+  } else if (requestIds) {
+    requestIds.delete(requestId);
+    if (requestIds.size === 0) next.delete(key);
+  }
+  try { return writePreviewCancellationDismissals(storage, next); } catch { return false; }
+}
+
+function readCancellationReceiptPresence(requestId) {
+  const storage = safelyGetFileStorage();
+  if (!storage || typeof storage.getItem !== "function" || typeof requestId !== "string") return null;
+  try { return storage.getItem(`${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(requestId)}`) !== null; } catch { return null; }
+}
+
+function mergePreviewCancellationTrackers(current, incoming) {
+  if (current?.status === "failed" && current.requestId === incoming?.requestId) return current;
+  if (current?.requestId !== incoming?.requestId) return incoming;
+  const currentStatus = String(current?.status ?? "").toLowerCase();
+  const incomingStatus = String(incoming?.status ?? "").toLowerCase();
+  if (incomingStatus === "failed") {
+    return { ...incoming, requestId: current.requestId, seq: current.seq ?? incoming.seq };
+  }
+  const currentHasAcceptedSeq = Number.isSafeInteger(current?.seq) && current.seq > 0;
+  const incomingHasAcceptedSeq = Number.isSafeInteger(incoming?.seq) && incoming.seq > 0;
+  if ((currentStatus === "unknown") !== (incomingStatus === "unknown")) {
+    const unknown = currentStatus === "unknown" ? current : incoming;
+    const other = currentStatus === "unknown" ? incoming : current;
+    const unknownHasAcceptedSeq = currentStatus === "unknown" ? currentHasAcceptedSeq : incomingHasAcceptedSeq;
+    const otherHasAcceptedSeq = currentStatus === "unknown" ? incomingHasAcceptedSeq : currentHasAcceptedSeq;
+    if (!unknownHasAcceptedSeq && otherHasAcceptedSeq) {
+      return { ...other, requestId: current.requestId, seq: other.seq };
+    }
+    return { ...unknown, requestId: current.requestId, seq: current.seq ?? incoming.seq, status: "unknown" };
+  }
+  const rank = { queued: 0, submitted: 1, unknown: 2, failed: 3 };
+  const status = rank[String(current?.status ?? "").toLowerCase()] >= rank[String(incoming?.status ?? "").toLowerCase()]
+    ? current.status
+    : incoming.status;
+  const preferred = status === current?.status ? current : incoming;
+  return { ...preferred, requestId: current.requestId, seq: current.seq ?? incoming.seq, status };
+}
+
+function persistPreviewCancellations({ removeKeys = [], removeRequestIds = [] } = {}) {
+  const storage = safelyGetFileStorage();
+  if (!storage) return false;
+  const dismissals = readStoredPreviewCancellationDismissals(storage);
+  if (!dismissals) return false;
+  const removed = new Set(removeKeys);
+  const removedRequestIds = new Map();
+  for (const removal of removeRequestIds) {
+    if (typeof removal?.key !== "string" || typeof removal?.requestId !== "string") continue;
+    let requestIds = removedRequestIds.get(removal.key);
+    if (!requestIds) {
+      requestIds = new Set();
+      removedRequestIds.set(removal.key, requestIds);
+    }
+    requestIds.add(removal.requestId);
+  }
+  const isRemoved = (key, tracker) => removed.has(key) || removedRequestIds.get(key)?.has(tracker?.requestId) === true;
+  const stored = readStoredPreviewCancellations(storage);
+  if (!stored) return false;
+  for (const [key, tracker] of stored) {
+    if (isRemoved(key, tracker) || previewCancellationDismissed(dismissals, key, tracker.requestId)) continue;
+    const current = state.previewCancellations.get(key);
+    if (!current) state.previewCancellations.set(key, { ...tracker });
+    else if (current.status !== "failed") {
+      state.previewCancellations.set(key, mergePreviewCancellationTrackers(current, tracker));
+    }
+  }
+  const pending = new Map([...state.previewCancellations].filter(([key, tracker]) =>
+    !isRemoved(key, tracker)
+    && !previewCancellationDismissed(dismissals, key, tracker?.requestId)
+    && PERSISTED_PREVIEW_CANCELLATION_STATUSES.has(String(tracker?.status ?? "").toLowerCase())));
+  try { return writePreviewCancellations(storage, pending); } catch { return false; }
+}
+
+function previewCancellationsMatchStoredSerialization(storage, cancellations) {
+  let serialized = null;
+  const serializationSink = {
+    setItem(_key, value) { serialized = value; },
+    removeItem() { serialized = null; },
+  };
+  if (!writePreviewCancellations(serializationSink, cancellations)) return null;
+  try { return storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) === serialized; } catch { return null; }
+}
+
+function mergePreviewCancellationsFromStorage() {
+  if (!state.ownerVerified || !state.privateUiVisible) return false;
+  const storage = safelyGetFileStorage();
+  const dismissals = readStoredPreviewCancellationDismissals(storage);
+  if (!dismissals) return false;
+  const stored = readStoredPreviewCancellations(storage);
+  if (!stored) return false;
+  let changed = false;
+  for (const [key, current] of state.previewCancellations) {
+    if (previewCancellationDismissed(dismissals, key, current?.requestId)) {
+      state.previewCancellations.delete(key);
+      state.previewCancellationAttempts.delete(key);
+      changed = true;
+      continue;
+    }
+    if (current?.status === "failed" || stored.has(key)) continue;
+    state.previewCancellations.delete(key);
+    state.previewCancellationAttempts.delete(key);
+    changed = true;
+  }
+  for (const [key, incoming] of stored) {
+    if (previewCancellationDismissed(dismissals, key, incoming.requestId)) continue;
+    const current = state.previewCancellations.get(key);
+    const merged = current
+      ? current.status === "failed" && current.requestId !== incoming.requestId
+        ? { ...incoming }
+        : mergePreviewCancellationTrackers(current, incoming)
+      : { ...incoming };
+    if (!current || current.requestId !== merged.requestId || current.seq !== merged.seq
+        || current.status !== merged.status || current.error !== merged.error) {
+      state.previewCancellations.set(key, merged);
+      changed = true;
+    }
+  }
+  const pending = new Map([...state.previewCancellations].filter(([key, tracker]) =>
+    !previewCancellationDismissed(dismissals, key, tracker?.requestId)
+    && PERSISTED_PREVIEW_CANCELLATION_STATUSES.has(String(tracker?.status ?? "").toLowerCase())));
+  if (previewCancellationsMatchStoredSerialization(storage, pending) === false) {
+    persistPreviewCancellations();
+  }
+  return changed;
+}
+
+function restorePreviewCancellations() {
+  if (previewCancellationRestoreAttempted || !state.ownerVerified || !state.privateUiVisible) return false;
+  const storage = safelyGetFileStorage();
+  if (!storage) return false;
+  const dismissals = readStoredPreviewCancellationDismissals(storage);
+  if (!dismissals) return false;
+  const restored = readStoredPreviewCancellations(storage);
+  if (!(restored instanceof Map)) return false;
+  previewCancellationRestoreAttempted = true;
+  for (const [key, tracker] of restored) {
+    if (!PERSISTED_PREVIEW_CANCELLATION_STATUSES.has(String(tracker?.status ?? "").toLowerCase())
+        || previewCancellationDismissed(dismissals, key, tracker.requestId)) continue;
+    state.previewCancellations.set(key, { ...tracker });
+  }
+  persistPreviewCancellations();
+  return true;
 }
 
 function restoreMetadataRecoveryPreviewRequest(snapshot) {
@@ -429,7 +619,7 @@ function previewMetadataRecoverySelection() {
   if (!payload) return showToast("Select only ready items and choose a candidate for every item that needs confirmation.");
   submitAction("file_preview", payload, {
     onQueued: (action) => {
-      state.view = "organizing";
+      state.view = "waiting";
       setMetadataRecoveryPreviewRequest({
         requestId: action.request_id,
         seq: null,
@@ -762,10 +952,22 @@ function showPrivateAccessGate(message, { preserveRecoveryPreviewRequest = false
   state.detailId = null;
   clearSelectedItems();
   clearMetadataRecoveryState({ preservePreviewRequest: preserveRecoveryPreviewRequest });
+  state.historyQuery = "";
+  if (!preserveRecoveryPreviewRequest) {
+    state.previewCancellations.clear();
+    state.previewCancellationAttempts.clear();
+  }
   state.legacyOperation = null;
   state.legacyOperationKey = null;
   state.legacySelection.clear();
   document.querySelector(".detail-panel")?.remove();
+  document.querySelectorAll("#app-content .stack-list, #app-content .library-list, #metadata-recovery-results")
+    .forEach((list) => { list.innerHTML = ""; });
+  byId("history-summary").textContent = "";
+  byId("history-search").value = "";
+  for (const id of ["waiting-count", "organizing-count", "history-count", "library-count", "needs-count"]) {
+    byId(id).textContent = "0";
+  }
   byId("app-content").classList.add("hidden");
   byId("app-content").setAttribute("aria-busy", "false");
   byId("auth-gate").classList.remove("hidden");
@@ -812,6 +1014,10 @@ function acceptFreshSnapshot(snapshot) {
   normalizeLibraryContext();
   byId("auth-gate").classList.add("hidden");
   byId("app-content").classList.remove("hidden");
+  restorePreviewCancellations();
+  reconcilePreviewCancellations(state.snapshot);
+  recoverFileActionReceipts();
+  promoteMissingPreviewCancellationIntents(state.snapshot);
   const params = new URLSearchParams(window.location.search);
   if (params.get("download") === "1" && !state.downloadFormOpened) {
     state.downloadFormOpened = true;
@@ -908,13 +1114,174 @@ function readActionQueue() {
   } catch { return []; }
 }
 
+function readActionQueueForReceiptAcknowledgement() {
+  const storage = safelyGetFileStorage();
+  if (!storage || typeof storage.getItem !== "function") return null;
+  try {
+    const value = JSON.parse(storage.getItem(ACTION_QUEUE_KEY) ?? "[]");
+    return Array.isArray(value) ? value : null;
+  } catch { return null; }
+}
+
+function readActionQueueForCancellationDismissal() {
+  const storage = safelyGetFileStorage();
+  if (!storage || typeof storage.getItem !== "function") return null;
+  try {
+    const value = JSON.parse(storage.getItem(ACTION_QUEUE_KEY) ?? "[]");
+    if (!Array.isArray(value) || value.length > 20
+        || value.some((entry) => !entry || typeof entry !== "object" || Array.isArray(entry)
+          || typeof entry.request_id !== "string" || !entry.request_id
+          || typeof entry.kind !== "string" || !entry.kind
+          || !entry.payload || typeof entry.payload !== "object" || Array.isArray(entry.payload))) return null;
+    return value;
+  } catch { return null; }
+}
+
+function isFreshCompleteCancellationHistory(snapshot) {
+  if (!state.ownerVerified || !state.privateUiVisible || !snapshot
+      || snapshot.synced !== true || snapshot.stale !== false
+      || !Number.isSafeInteger(snapshot.last_seen) || snapshot.last_seen > Date.now()
+      || Date.now() - snapshot.last_seen > RECENT_SNAPSHOT_MAX_AGE_MS
+      || !Array.isArray(snapshot.operations) || !Array.isArray(snapshot.pending_requests)
+      || snapshot.operations.length >= RECENT_OPERATION_SNAPSHOT_LIMIT
+      || snapshot.pending_requests.length >= RECENT_OPERATION_SNAPSHOT_LIMIT) return false;
+  let previousSequence = 0;
+  for (const operation of snapshot.operations) {
+    if (!Number.isSafeInteger(operation?.seq) || operation.seq <= previousSequence
+        || typeof operation.kind !== "string" || typeof operation.status !== "string") return false;
+    previousSequence = operation.seq;
+  }
+  previousSequence = 0;
+  for (const request of snapshot.pending_requests) {
+    if (!Number.isSafeInteger(request?.seq) || request.seq <= previousSequence
+        || typeof request.kind !== "string") return false;
+    previousSequence = request.seq;
+  }
+  return true;
+}
+
+function isFreshCompleteCancellationSnapshot(snapshot) {
+  return isFreshCompleteCancellationHistory(snapshot)
+    && Array.isArray(snapshot.previews)
+    && snapshot.previews.length <= RECENT_OPERATION_SNAPSHOT_LIMIT + 1
+    && snapshot.previews.every((preview) => preview && typeof preview === "object" && !Array.isArray(preview))
+    && !omittedPreviewAggregate(snapshot);
+}
+
+function previewCancellationOperationAmbiguousForPayload(operation, payload) {
+  if (operation?.kind !== "preview_cancel") return false;
+  const result = operation.result && typeof operation.result === "object" ? operation.result : {};
+  const kind = result.preview_kind ?? operation.preview_kind;
+  const sequence = result.preview_seq ?? operation.preview_seq;
+  const id = result.preview_id ?? operation.preview_id;
+  const revision = result.revision ?? operation.revision;
+  if (typeof kind !== "string" || !Number.isSafeInteger(sequence)
+      || typeof id !== "string" || typeof revision !== "string") return true;
+  return kind === payload.preview_kind && sequence === payload.preview_seq
+    && id === payload.preview_id && revision === payload.revision;
+}
+
+function previewCancellationHasAmbiguousServerEvidence(payload, snapshot) {
+  if (!isFreshCompleteCancellationSnapshot(snapshot)) return true;
+  if (snapshot.pending_requests.some((request) => request.kind === "preview_cancel")) return true;
+  return snapshot.operations.some((operation) => previewCancellationOperationAmbiguousForPayload(operation, payload));
+}
+
+function previewCancellationHasAmbiguousDismissalEvidence(payload, snapshot) {
+  if (!isFreshCompleteCancellationHistory(snapshot)) return true;
+  if (snapshot.pending_requests.some((request) => request.kind === "preview_cancel")) return true;
+  return snapshot.operations.some((operation) => previewCancellationOperationAmbiguousForPayload(operation, payload));
+}
+
+function promoteMissingPreviewCancellationIntents(snapshot) {
+  if (!isFreshCompleteCancellationSnapshot(snapshot)) return false;
+  const storage = safelyGetFileStorage();
+  const queue = readActionQueueForCancellationDismissal();
+  const dismissals = readStoredPreviewCancellationDismissals(storage);
+  if (!storage || !queue || !dismissals) return false;
+  let changed = false;
+  const previous = new Map();
+  for (const [key, tracker] of state.previewCancellations) {
+    if (tracker?.status !== "queued" || tracker.seq !== null
+        || typeof tracker.requestId !== "string" || state.previewCancellationAttempts.has(key)
+        || previewCancellationDismissed(dismissals, key, tracker.requestId)) continue;
+    if (queue.some((action) => action.request_id === tracker.requestId)) continue;
+    const receipt = readCancellationReceiptPresence(tracker.requestId);
+    if (receipt !== false) continue;
+    const payload = previewCancellationPayloadFromKey(key);
+    if (!payload || previewCancellationHasAmbiguousServerEvidence(payload, snapshot)) continue;
+    previous.set(key, { ...tracker });
+    tracker.status = "unknown";
+    tracker.error = "No saved cancellation action or receipt is available. This browser will not resend it. Check your computer before dismissing this notice.";
+    changed = true;
+  }
+  if (!changed) return false;
+  if (persistPreviewCancellations()) return true;
+  for (const [key, tracker] of previous) state.previewCancellations.set(key, tracker);
+  return false;
+}
+
+function dismissPreviewCancellationNotice(key, tracker, queue, expectedRequestId = tracker?.requestId) {
+  if (!key || typeof expectedRequestId !== "string"
+      || state.previewCancellationAttempts.has(key) || !Array.isArray(queue)) return false;
+  const current = state.previewCancellations.get(key);
+  const ownsTracker = current?.requestId === expectedRequestId;
+  const targetTracker = ownsTracker
+    ? current
+    : tracker?.requestId === expectedRequestId ? tracker : { requestId: expectedRequestId, seq: null, status: "unknown", error: "" };
+  if (targetTracker.status !== "unknown") return false;
+  const payload = previewCancellationPayloadFromKey(key);
+  if (!payload || previewCancellationIsKnownPending(targetTracker, payload, state.snapshot)) return false;
+  const queueRows = queue.filter((action) => action.request_id === expectedRequestId);
+  if (queueRows.length > 1 || queueRows.some((action) => action.kind !== "preview_cancel"
+      || queuedPreviewCancellationKey(action) !== key
+      || !isUnknownDeliveryAction(action, state.unknownActionOutcomes))) return false;
+  if (readCancellationReceiptPresence(expectedRequestId) !== false) return false;
+  if (targetTracker.seq === null && previewCancellationHasAmbiguousDismissalEvidence(payload, state.snapshot)) return false;
+  if (targetTracker.seq !== null && (!Number.isSafeInteger(targetTracker.seq) || targetTracker.seq <= 0)) return false;
+
+  const storage = safelyGetFileStorage();
+  const dismissals = readStoredPreviewCancellationDismissals(storage);
+  if (!storage || !dismissals) return false;
+  const alreadyDismissed = previewCancellationDismissed(dismissals, key, expectedRequestId);
+  if (!alreadyDismissed && !setPreviewCancellationDismissed(key, expectedRequestId, true)) return false;
+
+  const previous = ownsTracker ? { ...current } : null;
+  if (ownsTracker) state.previewCancellations.delete(key);
+  const removal = [{ key, requestId: expectedRequestId }];
+  if (!persistPreviewCancellations({ removeRequestIds: removal })) {
+    if (previous) state.previewCancellations.set(key, previous);
+    if (!alreadyDismissed) setPreviewCancellationDismissed(key, expectedRequestId, false);
+    return false;
+  }
+
+  if (queueRows.length > 0) {
+    const remaining = queue.filter((action) => action.request_id !== expectedRequestId);
+    if (!writeActionQueue(remaining)) {
+      const markerRemoved = alreadyDismissed || setPreviewCancellationDismissed(key, expectedRequestId, false);
+      if (previous) state.previewCancellations.set(key, previous);
+      if (markerRemoved && previous) persistPreviewCancellations();
+      return false;
+    }
+  }
+  state.quarantinedActionIds.delete(expectedRequestId);
+  state.unknownActionOutcomes.delete(expectedRequestId);
+  return true;
+}
+
 function recoverFileActionReceipts() {
-  const recovered = recoverActionReceipts(state, { surface: ACTION_SURFACE_FILE });
+  restoreQueuedPreviewCancellationTrackers();
+  const recovered = recoverActionReceipts(state, {
+    surface: ACTION_SURFACE_FILE,
+    beforeAcknowledge: acknowledgeFileActionReceipt,
+  });
+  for (const requestId of recovered.blockedRequestIds) state.quarantinedActionIds.add(requestId);
   if (recovered.matched > 0) {
     const matchedIds = new Set(recovered.requestIds);
     const queue = readActionQueue();
     const remaining = queue.filter((action) => !matchedIds.has(action.request_id));
     const queueUpdated = remaining.length === queue.length || writeActionQueue(remaining);
+    for (const requestId of recovered.requestIds) state.quarantinedActionIds.delete(requestId);
     if (recovered.rejectedRequestIds.length > 0) {
       if (queueUpdated) {
         consumeRejectedActionReceipts(state, { surface: ACTION_SURFACE_FILE, requestIds: recovered.rejectedRequestIds });
@@ -926,7 +1293,24 @@ function recoverFileActionReceipts() {
     if (recovered.downloadSubmission) renderDownloadStatus();
     if (recovered.migrationConflictDrafts > 0) renderMigrations();
   }
+  if (recovered.matched > 0 || recovered.blockedRequestIds.length > 0) renderPreviewReviewCards();
+  if (recovered.blockedRequestIds.length > 0 || recovered.requestIds.length > 0) renderQueueCount();
   return recovered;
+}
+
+function acknowledgeFileActionReceipt(action, _receipt, applied) {
+  if (action.kind !== "preview_cancel") return true;
+  const key = queuedPreviewCancellationKey(action)
+    ?? [...state.previewCancellations].find(([, tracker]) => tracker?.requestId === action.request_id)?.[0];
+  const tracker = key ? state.previewCancellations.get(key) : null;
+  if (!applied?.matched || tracker?.requestId !== action.request_id || !persistPreviewCancellations()) return false;
+
+  const queue = readActionQueueForReceiptAcknowledgement();
+  if (!queue) return false;
+  const sameId = queue.filter((entry) => entry?.request_id === action.request_id);
+  if (sameId.some((entry) => entry?.kind !== "preview_cancel" || queuedPreviewCancellationKey(entry) !== key)) return false;
+  const remaining = queue.filter((entry) => entry?.request_id !== action.request_id);
+  return remaining.length === queue.length || writeActionQueue(remaining);
 }
 
 function settleRejectedFileAction(rejection, queueRemoved) {
@@ -951,6 +1335,15 @@ function settleRejectedFileAction(rejection, queueRemoved) {
     }
     renderMigrations();
   }
+  if (rejection.kind === "preview_cancel") {
+    for (const tracker of state.previewCancellations.values()) {
+      if (tracker.requestId !== rejection.request_id) continue;
+      tracker.status = "failed";
+      tracker.error = message;
+    }
+    persistPreviewCancellations();
+    renderPreviewReviewCards();
+  }
 }
 
 function writeActionQueue(actions) {
@@ -971,7 +1364,10 @@ async function drainActionQueue({ quiet = false } = {}) {
   if (state.draining) return state.draining;
   recoverFileActionReceipts();
   for (const action of readActionQueue()) {
-    if (action.delivery_outcome === "outcome_unknown") markUnknownFileAction(state, action);
+    if (action.delivery_outcome === "outcome_unknown") {
+      markUnknownFileAction(state, action);
+      if (action.kind === "preview_cancel") persistPreviewCancellations();
+    }
   }
   const restored = restorePendingActions(state, {
     surface: ACTION_SURFACE_FILE,
@@ -985,6 +1381,7 @@ async function drainActionQueue({ quiet = false } = {}) {
     let sentAny = false;
     let connectionInterrupted = false;
     let removalFailed = false;
+    let receiptRecoveryMessage = "";
     const permanentRejections = [];
     while (navigator.onLine) {
       const outcome = await dispatchNextOwnedAction({
@@ -997,7 +1394,14 @@ async function drainActionQueue({ quiet = false } = {}) {
         body: JSON.stringify(fileActionRequestBody(action)),
         }),
         onReceipt: (action, receipt, resolvedSurface) => {
-          const recorded = recordActionReceipt(action, receipt, state, { surface: resolvedSurface });
+          const recorded = recordActionReceipt(action, receipt, state, {
+            surface: resolvedSurface,
+            beforeAcknowledge: acknowledgeFileActionReceipt,
+          });
+          if (action?.kind === "preview_cancel" && recorded.acknowledgementBlocked) {
+            state.quarantinedActionIds.add(action.request_id);
+            renderQueueCount();
+          }
           if (action?.kind === "file_preview" && action.request_id === state.metadataRecoveryPreviewRequest?.requestId) {
             updateMetadataRecoveryPreviewRequest(action, {
               status: receipt?.outcome === "rejected" ? "rejected" : "submitted",
@@ -1010,12 +1414,14 @@ async function drainActionQueue({ quiet = false } = {}) {
             state.metadataRecovery.seq = receipt.seq;
             renderMetadataRecovery();
           }
+          if (action?.kind === "preview_cancel") renderPreviewReviewCards();
           return recorded;
         },
       });
       const receiptUpdate = outcome.receiptUpdate ?? {};
       if (receiptUpdate.downloadSubmission) renderDownloadStatus();
       if (receiptUpdate.migrationConflictDrafts > 0) renderMigrations();
+      if (outcome.action?.kind === "preview_cancel") renderPreviewReviewCards();
       if (outcome.status === "empty") break;
       if (outcome.status === "remove_failed") {
         if (!quiet) showToast("Request reached the computer, but this browser could not update its retry queue.");
@@ -1023,7 +1429,13 @@ async function drainActionQueue({ quiet = false } = {}) {
       }
       if (outcome.status === "receipt_failed") {
         connectionInterrupted = true;
-        if (!quiet) showToast("The computer accepted the request, but this browser could not save its receipt. The same request ID will retry.");
+        if (outcome.receiptUpdate?.acknowledgementBlocked) {
+          state.quarantinedActionIds.add(outcome.action.request_id);
+          receiptRecoveryMessage = "The computer's cancellation receipt is saved, but this browser could not finish updating its local state. The same request remains queued and paused until the receipt can be recovered.";
+          renderQueueCount();
+        } else if (!quiet) {
+          showToast("The computer accepted the request, but this browser could not save its receipt. The same request ID will retry.");
+        }
         if (!state.retryTimer) {
           const delay = state.retryDelay;
           state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
@@ -1036,7 +1448,14 @@ async function drainActionQueue({ quiet = false } = {}) {
       }
       if (outcome.status === "rejection_receipt_failed") {
         connectionInterrupted = true;
-        if (!quiet) showToast("The rejection could not be saved in this browser. The same request remains queued and will retry.");
+        if (outcome.receiptUpdate?.acknowledgementBlocked) {
+          state.quarantinedActionIds.add(outcome.action.request_id);
+          receiptRecoveryMessage = "The computer's cancellation receipt is saved, but this browser could not finish updating its local state. The same request remains queued and paused until the receipt can be recovered.";
+          renderQueueCount();
+        }
+        if (!quiet && !outcome.receiptUpdate?.acknowledgementBlocked) {
+          showToast("The rejection could not be saved in this browser. The same request remains queued and will retry.");
+        }
         if (!state.retryTimer) {
           const delay = state.retryDelay;
           state.retryDelay = Math.min(state.retryDelay * 2, 30_000);
@@ -1061,11 +1480,13 @@ async function drainActionQueue({ quiet = false } = {}) {
           ? action
           : { ...action, delivery_outcome: "outcome_unknown", delivery_error_code: code, delivery_error: error };
         const updates = markUnknownFileAction(state, marked);
+        if (action?.kind === "preview_cancel") persistPreviewCancellations();
         if (action?.kind === "metadata_recover" && state.metadataRecovery?.requestId === action.request_id) {
           state.metadataRecovery.deliveryUnknown = true;
           renderMetadataRecovery();
         }
         updateMetadataRecoveryPreviewRequest(action, { status: "unknown", error });
+        if (action?.kind === "preview_cancel") renderPreviewReviewCards();
         if (updates.downloadSubmission) renderDownloadStatus();
         if (updates.migrationConflictDrafts > 0) renderMigrations();
         renderWaiting();
@@ -1082,6 +1503,7 @@ async function drainActionQueue({ quiet = false } = {}) {
           renderMetadataRecovery();
         }
         updateMetadataRecoveryPreviewRequest(action, { status: "rejected", error: rejection.error });
+        if (action?.kind === "preview_cancel") renderPreviewReviewCards();
         permanentRejections.push(rejection.error);
         continue;
       }
@@ -1108,6 +1530,15 @@ async function drainActionQueue({ quiet = false } = {}) {
           status: "rejected",
           error: typeof error?.message === "string" ? error.message : "The preview request was rejected.",
         });
+        if (action?.kind === "preview_cancel") {
+          for (const tracker of state.previewCancellations.values()) {
+            if (tracker.requestId !== action.request_id) continue;
+            tracker.status = "failed";
+            tracker.error = typeof error?.message === "string" ? error.message : "The computer rejected the cancellation request.";
+          }
+          persistPreviewCancellations();
+          renderPreviewReviewCards();
+        }
         for (const [previewId, draft] of state.migrationConflictDrafts) {
           if (draft.refreshRequestId === action.request_id) {
             draft.refreshRequestId = null;
@@ -1138,6 +1569,8 @@ async function drainActionQueue({ quiet = false } = {}) {
       const remainder = connectionInterrupted ? " Other saved requests remain queued while the connection recovers." : "";
       const storageNote = removalFailed ? " One rejected request could not be removed from browser storage and will stay quarantined for this session." : "";
       showToast(`${count} rejected request${count === 1 ? " was" : "s were"} removed from the retry queue: ${details}.${remainder}${storageNote}`);
+    } else if (!quiet && receiptRecoveryMessage) {
+      showToast(receiptRecoveryMessage);
     } else if (!quiet && connectionInterrupted) {
       showToast("Connection interrupted. The request remains queued with the same ID.");
     }
@@ -1153,7 +1586,7 @@ async function drainActionQueue({ quiet = false } = {}) {
   return sentAny;
 }
 
-async function submitAction(kind, payload, { onQueued } = {}) {
+async function submitAction(kind, payload, { onQueued, requestId: suppliedRequestId } = {}) {
   if (!mayDispatchActions(state)) return false;
   if (kind === "download_submit" && unknownFileActionForKind(readActionQueue(), kind, state.unknownActionOutcomes)) {
     state.downloadMessage = "A previous download has an unknown delivery outcome. Check your computer and dismiss its notice before adding another request.";
@@ -1166,6 +1599,10 @@ async function submitAction(kind, payload, { onQueued } = {}) {
       showToast("This action does not match a verified library registration. Refresh the library and create a new preview or import.");
       return false;
     }
+  }
+  if (kind === "preview_cancel" && !reviewTargetForCancellation(payload)) {
+    showToast("This preview is no longer awaiting review. Refresh the Requests view before cancelling it.");
+    return false;
   }
   const unavailableLibraryAction = (() => {
     if (["file_preview", "legacy_import", "metadata_recover"].includes(kind)) {
@@ -1211,12 +1648,18 @@ async function submitAction(kind, payload, { onQueued } = {}) {
       }
     }
   }
-  const action = createFileQueuedAction(kind, payload, crypto.randomUUID());
+  const action = createFileQueuedAction(kind, payload, suppliedRequestId ?? crypto.randomUUID());
   const queued = await persistQueuedActionAndDrain({
     action,
     readQueue: readActionQueue,
     writeQueue: writeActionQueue,
-    onQueued,
+    onQueued: (queuedAction) => {
+      onQueued?.(queuedAction);
+      if (["file_preview", "library_migration_preview"].includes(kind) && state.view !== "waiting") {
+        state.view = "waiting";
+        render();
+      }
+    },
     afterPersist: () => {
       if (kind !== "download_submit") return;
       state.downloadSubmission = {
@@ -1439,7 +1882,7 @@ function renderLibrary() {
   byId("preview-move").disabled = !canOperate || state.selected.size === 0;
   byId("import-legacy").disabled = !canOperate;
   const selectionActions = byId("selection-actions");
-  selectionActions.classList.toggle("hidden", state.selected.size === 0);
+  selectionActions.classList.toggle("hidden", state.selected.size === 0 || ["waiting", "history"].includes(state.view));
   byId("selection-count").textContent = `${state.selected.size} ${state.selected.size === 1 ? "item" : "items"} selected`;
   byId("organize-selected").disabled = !canOperate || state.selected.size === 0;
   byId("recover-selected").disabled = !canOperate || state.selected.size === 0 || state.selected.size > MAX_SELECTED_ITEMS;
@@ -1567,9 +2010,42 @@ function statusText(value) {
   return text.replace(/^\w/u, (letter) => letter.toLocaleUpperCase());
 }
 
+const SETTLED_OPERATION_STATUSES = new Set([
+  "completed", "failed", "cancelled", "confirmed", "expired", "stale", "rejected",
+  "uncertain", "partial_failure", "partial", "stopped", "superseded",
+]);
+
+function historySearchMatches(value) {
+  const query = String(state.historyQuery ?? "").trim().toLocaleLowerCase();
+  if (!query) return true;
+  try { return JSON.stringify(value).toLocaleLowerCase().includes(query); } catch { return false; }
+}
+
 function legacyOperations() {
   return (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : []).filter((operation) =>
     operation?.kind === "legacy_import" && operationMatchesLibrary(operation, activeLibraryId()));
+}
+
+function allReviewEntries() {
+  return [
+    ...allFilePreviews().filter((entry) => isReviewablePreviewStatus(entry.status)
+      && !snapshotConfirmsPreviewCancellation("file_preview", entry))
+      .map((entry) => ({ kind: "file_preview", entry, libraryId: entry.library_id ?? "" })),
+    ...allMigrationPreviewEntries().map((entry) => ({
+      kind: "library_migration_preview",
+      entry,
+      libraryId: String(entry.result?.source_library_id ?? entry.source_library_id ?? ""),
+    })),
+  ];
+}
+
+function queuedCancellationMatches(action, review) {
+  const payload = previewCancellationPayload(review.kind, review.entry);
+  return action?.kind === "preview_cancel" && payload
+    && action.payload?.preview_kind === payload.preview_kind
+    && action.payload?.preview_seq === payload.preview_seq
+    && action.payload?.preview_id === payload.preview_id
+    && action.payload?.revision === payload.revision;
 }
 
 function renderWaiting() {
@@ -1577,22 +2053,31 @@ function renderWaiting() {
   const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
   const cloudQueue = Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : [];
   const { cloud: pendingRequests, local } = buildWaitingEntries(cloudQueue, tasks, operations);
-  const pendingCloud = pendingRequests.filter(isWaitingEntryPending);
-  const pending = local.filter(isWaitingEntryPending);
+  const reviewEntries = allReviewEntries();
+  const reviewSequences = new Set(reviewEntries.map(({ entry }) => entry.seq).filter((seq) => Number.isSafeInteger(seq) && seq > 0));
+  const pendingCloud = pendingRequests.filter((entry) => isWaitingEntryPending(entry)
+    && !(Number.isSafeInteger(entry.seq) && reviewSequences.has(entry.seq)));
+  const pending = local.filter((entry) => isWaitingEntryPending(entry)
+    && !(Number.isSafeInteger(entry.seq) && reviewSequences.has(entry.seq)));
   const localQueue = readActionQueue();
   for (const action of localQueue) {
-    if (action.delivery_outcome === "outcome_unknown") markUnknownFileAction(state, action);
+    if (action.delivery_outcome === "outcome_unknown") {
+      markUnknownFileAction(state, action);
+      if (action.kind === "preview_cancel") persistPreviewCancellations();
+    }
   }
-  byId("waiting-count").textContent = String(pendingCloud.length + pending.length + localQueue.length);
   const cards = [];
   for (const request of pendingCloud) cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(operationTitle(request))}</h3><p>Saved in the cloud inbox. Your desktop app has not acknowledged local receipt yet.</p></div><span class="state-pill pending">Waiting for computer · #${escapeHtml(request.seq)}</span></div><p>Received ${escapeHtml(timeAgo(request.created_at))}</p></article>`);
   for (const action of localQueue) {
+    if (action.kind === "preview_cancel" && reviewEntries.some((review) => queuedCancellationMatches(action, review))) continue;
     const remembered = state.unknownActionOutcomes.get(action.request_id);
     const displayAction = remembered && !isUnknownDeliveryAction(action)
       ? { ...action, delivery_outcome: "outcome_unknown", delivery_error: remembered.error }
       : action;
     if (isUnknownDeliveryAction(displayAction, state.unknownActionOutcomes)) {
-      const title = action.kind === "download_submit" ? "Download delivery outcome unknown" : "Preview delivery outcome unknown";
+      const title = action.kind === "download_submit" ? "Download delivery outcome unknown"
+        : action.kind === "preview_cancel" ? "Cancellation delivery outcome unknown"
+          : "Preview delivery outcome unknown";
       const detail = typeof displayAction.delivery_error === "string"
         ? displayAction.delivery_error
         : remembered?.error ?? "The request may or may not have reached your computer.";
@@ -1602,27 +2087,51 @@ function renderWaiting() {
     }
   }
   for (const entry of pending) cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(operationTitle(entry))}</h3><p>${escapeHtml(entry.message ?? entry.error ?? "Your computer has received this request and is working on it.")}</p></div><span class="state-pill pending">${escapeHtml(statusText(entry.status))}</span></div>${entry.updated_at ? `<p>Updated ${escapeHtml(timeAgo(entry.updated_at, "seconds"))}</p>` : ""}</article>`);
-  byId("waiting-list").innerHTML = cards.length ? cards.join("") : `<div class="empty-state"><div class="empty-art" aria-hidden="true">✓</div><h2>Nothing is waiting</h2><p>New requests and scans will appear here while your computer processes them.</p></div>`;
+  byId("waiting-list").innerHTML = cards.length ? cards.join("") : `<div class="empty-state"><div class="empty-art" aria-hidden="true">✓</div><h2>No other requests are waiting</h2><p>New requests and scans will appear here while your computer processes them.</p></div>`;
 }
 
 function operationPreview(operation) {
+  if (operation?.kind !== "file_preview") return null;
+  const result = operation.result && typeof operation.result === "object" ? operation.result : {};
+  const preview = operation.preview && typeof operation.preview === "object"
+    ? operation.preview
+    : result.preview && typeof result.preview === "object" ? result.preview : null;
   const identity = fileOperationLibraryIdentity(operation);
-  if (operation?.preview && typeof operation.preview === "object") return { seq: operation.seq, id: operation.preview_id ?? operation.preview.id, revision: operation.revision ?? operation.preview.revision, preview: operation.preview, status: operation.status, ...(identity ?? {}) };
-  if (operation?.result?.preview && typeof operation.result.preview === "object") return { seq: operation.seq, id: operation.preview_id ?? operation.result.preview_id ?? operation.result.preview.id, revision: operation.revision ?? operation.result.revision ?? operation.result.preview.revision, preview: operation.result.preview, status: operation.status, ...(identity ?? {}) };
-  return null;
+  const id = operation.preview_id ?? result.preview_id ?? preview?.preview_id ?? preview?.id;
+  const revision = operation.revision ?? result.revision ?? preview?.revision;
+  if (typeof id !== "string" || typeof revision !== "string") return null;
+  return {
+    ...operation,
+    kind: "file_preview",
+    seq: operation.seq,
+    id,
+    revision,
+    preview,
+    status: operation.status,
+    incomplete: operation.details_incomplete === true || operation.result_truncated === true || !preview,
+    preview_incomplete: operation.preview_incomplete === true,
+    reload_required: operation.reload_required === true,
+    reason: operation.reason,
+    ...(identity ?? {}),
+  };
 }
 
-function previews() {
+function allFilePreviews() {
   const collected = [];
   for (const preview of Array.isArray(state.snapshot?.previews) ? state.snapshot.previews : []) {
-    if (preview?.kind === "library_migration_preview") continue;
+    if (preview?.kind !== "file_preview") continue;
     const incomplete = preview.preview_incomplete === true || preview.incomplete === true || preview.reload_required === true;
+    const id = preview.preview_id ?? preview.id;
+    const revision = preview.revision ?? preview.preview?.revision;
+    if (typeof id !== "string" || typeof revision !== "string") continue;
     collected.push({
+      ...preview,
+      kind: "file_preview",
       seq: preview.seq,
-      id: preview.preview_id ?? preview.id ?? (incomplete ? "omitted-preview-details" : undefined),
-      revision: preview.revision ?? preview.preview?.revision ?? (incomplete ? String(preview.omitted_count ?? "unknown") : undefined),
-      preview: incomplete ? null : preview.preview ?? preview,
-      incomplete: preview.incomplete === true,
+      id,
+      revision,
+      preview: incomplete ? null : preview.preview && typeof preview.preview === "object" ? preview.preview : preview,
+      incomplete: incomplete || !preview.preview,
       preview_incomplete: preview.preview_incomplete === true,
       reload_required: preview.reload_required === true,
       reason: preview.reason,
@@ -1636,9 +2145,314 @@ function previews() {
   }
   const unique = new Map();
   for (const value of collected) {
-    if (value.id && value.revision) unique.set(`${value.id}:${value.revision}`, value);
+    if (Number.isSafeInteger(value.seq) && value.seq > 0) {
+      const key = `seq:${value.seq}`;
+      const existing = unique.get(key);
+      if (!existing || existing.incomplete && !value.incomplete) unique.set(key, value);
+    } else {
+      unique.set(JSON.stringify([value.kind, value.id, value.revision]), value);
+    }
   }
-  return [...unique.values()].reverse().filter((entry) => !entry.library_id || entry.library_id === activeLibraryId());
+  return [...unique.values()].reverse();
+}
+
+function omittedPreviewAggregate(snapshot = state.snapshot) {
+  const aggregates = (Array.isArray(snapshot?.previews) ? snapshot.previews : [])
+    .filter((entry) => entry && typeof entry === "object" && typeof entry.kind !== "string"
+      && entry.preview_incomplete === true && Number.isSafeInteger(entry.omitted_count) && entry.omitted_count > 0);
+  if (!aggregates.length) return null;
+  const aggregate = aggregates[0];
+  const omittedCount = Math.max(...aggregates.map((entry) => entry.omitted_count));
+  return { omittedCount, reason: typeof aggregate.reason === "string" ? aggregate.reason : "Some active previews were omitted from the saved snapshot." };
+}
+
+function previews() {
+  return allFilePreviews().filter((entry) => !entry.library_id || entry.library_id === activeLibraryId());
+}
+
+function previewCancellationPayload(kind, entry) {
+  if (!entry || !["file_preview", "library_migration_preview"].includes(kind)
+      || !Number.isSafeInteger(entry.seq) || entry.seq <= 0) return null;
+  const id = entry.preview_id ?? entry.id;
+  const revision = entry.revision;
+  const encoder = new TextEncoder();
+  if (typeof id !== "string" || !id || id.trim() !== id || encoder.encode(id).byteLength > 128
+      || /[\u0000-\u001f\u007f\u0080-\u009f]/u.test(id)
+      || typeof revision !== "string" || !revision || revision.trim() !== revision || encoder.encode(revision).byteLength > 256
+      || /[\u0000-\u001f\u007f\u0080-\u009f]/u.test(revision)) return null;
+  return { preview_kind: kind, preview_seq: entry.seq, preview_id: id, revision };
+}
+
+function previewCancellationKey(payload) {
+  return payload ? JSON.stringify([payload.preview_kind, payload.preview_seq, payload.preview_id, payload.revision]) : null;
+}
+
+function queuedPreviewCancellationKey(action) {
+  if (action?.kind !== "preview_cancel" || !action.payload || typeof action.payload !== "object") return null;
+  return previewCancellationKey(previewCancellationPayload(action.payload.preview_kind, {
+    seq: action.payload.preview_seq,
+    preview_id: action.payload.preview_id,
+    revision: action.payload.revision,
+  }));
+}
+
+function restoreQueuedPreviewCancellationTrackers() {
+  const queue = readActionQueueForReceiptAcknowledgement();
+  const dismissals = readStoredPreviewCancellationDismissals();
+  if (!queue || !dismissals) return false;
+  let changed = false;
+  for (const action of queue) {
+    const key = queuedPreviewCancellationKey(action);
+    if (!key || typeof action.request_id !== "string"
+        || previewCancellationDismissed(dismissals, key, action.request_id)
+        || state.previewCancellations.has(key)) continue;
+    state.previewCancellations.set(key, {
+      requestId: action.request_id,
+      seq: null,
+      status: action.delivery_outcome === "outcome_unknown" ? "unknown" : "queued",
+      error: action.delivery_error ?? "",
+    });
+    changed = true;
+  }
+  return changed;
+}
+
+function hasQueuedPreviewCancellation(key, tracker) {
+  if (!key || typeof tracker?.requestId !== "string") return false;
+  const queue = readActionQueueForReceiptAcknowledgement();
+  if (!queue) return true;
+  return queue.some((action) => action?.request_id === tracker.requestId
+    && queuedPreviewCancellationKey(action) === key);
+}
+
+function previewCancellationPayloadFromKey(key) {
+  let identity;
+  try { identity = JSON.parse(key); } catch { return null; }
+  if (!Array.isArray(identity) || identity.length !== 4) return null;
+  const [kind, seq, id, revision] = identity;
+  const payload = previewCancellationPayload(kind, { seq, id, revision });
+  return payload && previewCancellationKey(payload) === key ? payload : null;
+}
+
+function previewCancellationTracker(kind, entry) {
+  const payload = previewCancellationPayload(kind, entry);
+  const key = previewCancellationKey(payload);
+  if (!payload || !key) return null;
+  let tracker = state.previewCancellations.get(key);
+  if (!tracker) {
+    const queuedAction = readActionQueue().find((action) => action.kind === "preview_cancel"
+      && action.payload?.preview_kind === payload.preview_kind
+      && action.payload?.preview_seq === payload.preview_seq
+      && action.payload?.preview_id === payload.preview_id
+      && action.payload?.revision === payload.revision);
+    if (queuedAction) {
+      tracker = {
+        requestId: queuedAction.request_id,
+        seq: null,
+        status: queuedAction.delivery_outcome === "outcome_unknown" ? "unknown" : "queued",
+        error: queuedAction.delivery_error ?? "",
+      };
+      state.previewCancellations.set(key, tracker);
+      persistPreviewCancellations();
+    }
+  }
+  return { payload, key, tracker: tracker ?? null };
+}
+
+const ACTIVE_PREVIEW_CANCELLATION_STATUSES = new Set([
+  "queued", "submitted", "unknown", "pending", "processing", "inflight", "in_flight",
+]);
+
+function isActivePreviewCancellation(tracker, key) {
+  return Boolean(key && state.previewCancellationAttempts.has(key))
+    || ACTIVE_PREVIEW_CANCELLATION_STATUSES.has(String(tracker?.status ?? "").toLowerCase())
+    || String(tracker?.status ?? "").toLowerCase() === "failed" && hasQueuedPreviewCancellation(key, tracker);
+}
+
+function previewCancellationBusy(kind, entry) {
+  const cancellation = previewCancellationTracker(kind, entry);
+  if (!cancellation) return false;
+  return isActivePreviewCancellation(cancellation.tracker, cancellation.key);
+}
+
+function migrationCancellationBusyForDraft(previewId, revision) {
+  const operation = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === revision);
+  if (operation && previewCancellationBusy("library_migration_preview", operation)) return true;
+  const hasMatchingCancellation = (key) => {
+    let identity;
+    try { identity = JSON.parse(key); } catch { return false; }
+    return Array.isArray(identity) && identity[0] === "library_migration_preview"
+      && identity[2] === previewId && identity[3] === revision;
+  };
+  for (const [key, tracker] of state.previewCancellations) {
+    if (hasMatchingCancellation(key) && isActivePreviewCancellation(tracker, key)) return true;
+  }
+  for (const key of state.previewCancellationAttempts) {
+    if (hasMatchingCancellation(key)) return true;
+  }
+  return false;
+}
+
+function reviewTargetForCancellation(payload) {
+  return allReviewEntries().find(({ kind, entry }) => {
+    const target = previewCancellationPayload(kind, entry);
+    return target && target.preview_kind === payload?.preview_kind
+      && target.preview_seq === payload?.preview_seq
+      && target.preview_id === payload?.preview_id
+      && target.revision === payload?.revision;
+  }) ?? null;
+}
+
+function cancellationOperationMatches(operation, payload) {
+  const result = operation?.result && typeof operation.result === "object" ? operation.result : {};
+  return operation?.kind === "preview_cancel"
+    && String(operation.status ?? "").toLowerCase() === "completed"
+    && result.cancelled === true
+    && result.preview_kind === payload.preview_kind
+    && result.preview_seq === payload.preview_seq
+    && result.preview_id === payload.preview_id
+    && result.revision === payload.revision;
+}
+
+function previewCancellationTargetEvidence(payload, snapshot) {
+  const previews = Array.isArray(snapshot?.previews) ? snapshot.previews : null;
+  const operations = Array.isArray(snapshot?.operations) ? snapshot.operations : null;
+  if (!previews || !operations) return "unknown";
+  const rows = [...previews, ...operations].filter((entry) => entry?.seq === payload.preview_seq);
+  if (rows.length === 0) return "absent";
+  if (rows.some((entry) => entry?.kind === payload.preview_kind
+      && (entry.preview_id ?? entry.id ?? entry.result?.preview_id ?? entry.result?.id) === payload.preview_id
+      && (entry.revision ?? entry.result?.revision) === payload.revision)) return "present";
+  return "ambiguous";
+}
+
+function previewCancellationHistory(tracker, snapshot, payload) {
+  if (!Number.isSafeInteger(tracker?.seq) || tracker.seq <= 0) return { kind: "unaccepted" };
+  const operations = Array.isArray(snapshot?.operations) ? snapshot.operations : null;
+  const pendingRequests = Array.isArray(snapshot?.pending_requests) ? snapshot.pending_requests : null;
+  const previews = Array.isArray(snapshot?.previews) ? snapshot.previews : null;
+  if (!operations || !pendingRequests || !previews) return { kind: "unknown" };
+  const operation = operations.find((entry) => entry?.seq === tracker.seq);
+  if (operation) return { kind: "recorded", operation };
+  const pending = pendingRequests.find((entry) => entry?.seq === tracker.seq);
+  if (pending) return { kind: "pending", pending };
+  const lastSeen = snapshot.last_seen;
+  const now = Date.now();
+  if (snapshot.synced !== true || snapshot.stale !== false || !Number.isSafeInteger(lastSeen)
+      || lastSeen > now || now - lastSeen > RECENT_SNAPSHOT_MAX_AGE_MS
+      || operations.length > RECENT_OPERATION_SNAPSHOT_LIMIT
+      || pendingRequests.length >= RECENT_OPERATION_SNAPSHOT_LIMIT
+      || previews.length > RECENT_OPERATION_SNAPSHOT_LIMIT + 1) return { kind: "unknown" };
+  let previousSequence = 0;
+  let allOperationsAreNewer = true;
+  for (const entry of operations) {
+    if (!Number.isSafeInteger(entry?.seq) || entry.seq <= previousSequence || typeof entry.kind !== "string" || typeof entry.status !== "string") {
+      return { kind: "unknown" };
+    }
+    if (entry.seq <= tracker.seq) allOperationsAreNewer = false;
+    previousSequence = entry.seq;
+  }
+  let previousPendingSequence = 0;
+  for (const entry of pendingRequests) {
+    if (!Number.isSafeInteger(entry?.seq) || entry.seq <= previousPendingSequence || typeof entry.kind !== "string") {
+      return { kind: "unknown" };
+    }
+    previousPendingSequence = entry.seq;
+  }
+  if (operations.length === RECENT_OPERATION_SNAPSHOT_LIMIT) {
+    return allOperationsAreNewer ? { kind: "outside_recent_history" } : { kind: "unknown" };
+  }
+  const hasPreviewOmission = previews.some((entry) => entry && typeof entry === "object"
+    && typeof entry.kind !== "string" && entry.preview_incomplete === true);
+  if (hasPreviewOmission || previewCancellationTargetEvidence(payload, snapshot) !== "absent") {
+    return { kind: "unknown" };
+  }
+  return { kind: "missing_target_history" };
+}
+
+function previewCancellationIsKnownPending(tracker, payload, snapshot) {
+  if (tracker?.seq === null) return previewCancellationHasAmbiguousDismissalEvidence(payload, snapshot);
+  const history = previewCancellationHistory(tracker, snapshot, payload);
+  if (history.kind === "pending") return true;
+  if (history.kind !== "recorded") return false;
+  return history.operation?.kind !== "preview_cancel"
+    || !SETTLED_OPERATION_STATUSES.has(String(history.operation.status ?? "").toLowerCase());
+}
+
+function reconcilePreviewCancellations(snapshot) {
+  if (!(state.previewCancellations instanceof Map) || !snapshot) return false;
+  let changed = false;
+  const removedKeys = new Set();
+  const operations = Array.isArray(snapshot.operations) ? snapshot.operations : [];
+  const snapshotPreviews = Array.isArray(snapshot.previews) ? snapshot.previews : [];
+  for (const [key, tracker] of state.previewCancellations) {
+    let identity;
+    try { identity = JSON.parse(key); } catch { continue; }
+    const [kind, targetSeq, targetId, targetRevision] = identity;
+    const payload = { preview_kind: kind, preview_seq: targetSeq, preview_id: targetId, revision: targetRevision };
+    if (hasQueuedPreviewCancellation(key, tracker)) continue;
+    const target = [...snapshotPreviews, ...operations].find((entry) => entry?.kind === kind && entry.seq === targetSeq
+      && (entry.preview_id ?? entry.id ?? entry.result?.preview_id ?? entry.result?.id) === targetId
+      && (entry.revision ?? entry.result?.revision) === targetRevision);
+    const targetStatus = String(target?.status ?? "").toLowerCase();
+    if (!Number.isSafeInteger(tracker.seq)) {
+      const cancellation = operations.find((entry) => entry?.kind === "preview_cancel"
+        && entry?.result?.preview_kind === kind
+        && entry.result.preview_seq === targetSeq
+        && entry.result.preview_id === targetId
+        && entry.result.revision === targetRevision);
+      if (cancellation && cancellationOperationMatches(cancellation, payload)) {
+        state.previewCancellations.delete(key);
+        removedKeys.add(key);
+        changed = true;
+        continue;
+      }
+      if (cancellation && ["failed", "rejected", "stale", "expired"].includes(String(cancellation.status).toLowerCase())) {
+        tracker.status = "failed";
+        tracker.error = String(cancellation.error ?? "The computer could not cancel this preview.");
+        changed = true;
+      }
+    }
+    if (target && SETTLED_OPERATION_STATUSES.has(targetStatus)) {
+      state.previewCancellations.delete(key);
+      removedKeys.add(key);
+      changed = true;
+      continue;
+    }
+    if (!Number.isSafeInteger(tracker.seq)) continue;
+    const cancellation = operations.find((entry) => entry?.seq === tracker.seq);
+    if (cancellation) {
+      if (cancellationOperationMatches(cancellation, payload)) {
+        state.previewCancellations.delete(key);
+        removedKeys.add(key);
+        changed = true;
+        continue;
+      }
+      const cancellationStatus = String(cancellation.status).toLowerCase();
+      if (cancellation.kind === "preview_cancel"
+          && ["failed", "rejected", "stale", "expired"].includes(cancellationStatus)) {
+        tracker.status = "failed";
+        tracker.error = String(cancellation.error ?? "The computer could not cancel this preview.");
+        changed = true;
+      } else if (cancellation.kind === "preview_cancel" && SETTLED_OPERATION_STATUSES.has(cancellationStatus)) {
+        tracker.status = "unknown";
+        tracker.error = `Cancellation request #${tracker.seq} is recorded, but its result details are unavailable. Its outcome is unknown; check your computer before dismissing this browser notice.`;
+        changed = true;
+      }
+      continue;
+    }
+    const history = previewCancellationHistory(tracker, snapshot, payload);
+    if (tracker.status === "submitted"
+        && ["outside_recent_history", "missing_target_history"].includes(history.kind)) {
+      tracker.status = "unknown";
+      tracker.error = history.kind === "missing_target_history"
+        ? `Cancellation request #${tracker.seq} and its preview are not present in this complete snapshot. Its outcome is unknown; check your computer before dismissing this browser notice.`
+        : `Cancellation request #${tracker.seq} is outside recent history. Its outcome is unknown; check your computer before dismissing this browser notice.`;
+      changed = true;
+    }
+  }
+  if (changed) persistPreviewCancellations({ removeKeys: removedKeys });
+  return changed;
 }
 
 function describePreview(preview) {
@@ -1697,7 +2511,48 @@ function migrationTargetOptions() {
 }
 
 function migrationPreviewEntries() {
-  return collectMigrationPreviewEntries(state.snapshot, activeLibraryId());
+  return collectMigrationPreviewEntries(state.snapshot, activeLibraryId())
+    .filter((entry) => !snapshotConfirmsPreviewCancellation("library_migration_preview", entry));
+}
+
+function allMigrationPreviewEntries() {
+  return collectMigrationPreviewEntries(state.snapshot)
+    .filter((entry) => !snapshotConfirmsPreviewCancellation("library_migration_preview", entry));
+}
+
+function retainedMigrationState() {
+  const descriptors = mediaLibraryEntries(state.snapshot);
+  const migrations = new Map();
+  // The Rust snapshot publishes one global migration history and omitted count. Nested
+  // library snapshots may carry a mirrored count, so combine reports by maximum, not sum.
+  let omittedCount = Number.isSafeInteger(state.snapshot?.library?.migration_omitted_count)
+    && state.snapshot.library.migration_omitted_count > 0
+    ? state.snapshot.library.migration_omitted_count
+    : 0;
+  for (const descriptor of descriptors) {
+    const snapshot = descriptor.snapshot && typeof descriptor.snapshot === "object"
+      ? descriptor.snapshot
+      : descriptor.id === activeLibraryId() ? state.snapshot?.library : null;
+    if (!snapshot) continue;
+    const omitted = Number.isSafeInteger(snapshot.migration_omitted_count) && snapshot.migration_omitted_count > 0
+      ? snapshot.migration_omitted_count
+      : 0;
+    omittedCount = Math.max(omittedCount, omitted);
+    for (const migration of Array.isArray(snapshot.migrations) ? snapshot.migrations : []) {
+      if (!migration || typeof migration !== "object") continue;
+      const key = typeof migration.id === "string" && migration.id
+        ? migration.id
+        : JSON.stringify([migration.source_library_id, migration.target_library_id, migration.started_at, migration.created_at]);
+      migrations.set(key, migration);
+    }
+  }
+  const active = mediaLibraryEntries(state.snapshot).some((entry) => entry.id === activeLibraryId());
+  if (!migrations.size && active && Array.isArray(state.snapshot?.library?.migrations)) {
+    for (const migration of state.snapshot.library.migrations) {
+      if (migration && typeof migration === "object") migrations.set(String(migration.id ?? JSON.stringify(migration)), migration);
+    }
+  }
+  return { migrations: [...migrations.values()], omittedCount };
 }
 
 function migrationConflictDraft(previewId, revision) {
@@ -1766,7 +2621,9 @@ function renderMigrationPreview(operation) {
   const savedConflicts = normalizeMigrationItemConflicts(result.item_conflicts);
   const draftConflicts = draft ? normalizeMigrationItemConflicts(draft.itemConflicts) : savedConflicts;
   const choicesChanged = Boolean(draft && migrationConflictChoicesChanged(savedConflicts, draftConflicts));
-  return renderMigrationPreviewCard(operation, {
+  const cancellation = previewCancellationMarkup("library_migration_preview", operation);
+  const cardId = previewCardId("library_migration_preview", operation);
+  const card = renderMigrationPreviewCard(operation, {
     activeLibraryId: activeLibraryId(),
     sourceAvailable: endpoints.sourceAvailable,
     targetAvailable: endpoints.targetAvailable,
@@ -1776,7 +2633,11 @@ function renderMigrationPreview(operation) {
     draftChanged: choicesChanged,
     refreshPending: Boolean(draft?.refreshRequestId),
     invalidated: state.migrationConflictInvalidated.has(migrationPreviewDraftKey(id, revision)),
+    cancelMarkup: cancellation,
+    cancelPending: previewCancellationBusy("library_migration_preview", operation),
+    cardId,
   });
+  return card.replace('<article class="stack-card">', `<article class="stack-card" id="${cardId}" tabindex="-1">`);
 }
 
 function renderMigrations() {
@@ -1786,33 +2647,151 @@ function renderMigrations() {
   byId("migration-preview-list").innerHTML = previews.map(renderMigrationPreview).join("");
   const library = state.snapshot?.library;
   const libraries = mediaLibraryEntries(state.snapshot);
+  const retained = retainedMigrationState();
+  const migrations = retained.migrations;
+  const hasActiveControls = (migration) => migrationControlActions(migration).length > 0
+    || ["queued", "running", "paused"].includes(String(migration?.status ?? "").toLowerCase());
   byId("migration-progress-list").innerHTML = renderMigrationDiscoveryWarnings({
     warnings: library?.migration_discovery_warnings,
     omittedCount: library?.migration_discovery_warning_omitted_count,
     libraries,
   }) + renderMigrationHistory({
-    migrations: library?.migrations,
+    migrations: migrations.filter(hasActiveControls),
     libraries,
     libraryId: activeLibraryId(),
-    omittedCount: library?.migration_omitted_count,
+    omittedCount: 0,
   });
+  byId("history-migration-list").innerHTML = renderMigrationHistory({
+    migrations: migrations.filter((migration) => !hasActiveControls(migration) && historySearchMatches(migration)),
+    libraries,
+    omittedCount: retained.omittedCount,
+  });
+}
+
+function previewCardId(kind, entry) {
+  return `review-${accessibleToken(JSON.stringify([kind, entry?.seq, entry?.id, entry?.revision]))}`;
+}
+
+function snapshotConfirmsPreviewCancellation(kind, entry) {
+  const payload = previewCancellationPayload(kind, entry);
+  if (!payload) return false;
+  return (Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [])
+    .some((operation) => cancellationOperationMatches(operation, payload));
+}
+
+function previewCancellationMarkup(kind, entry) {
+  const cancellation = previewCancellationTracker(kind, entry);
+  if (!cancellation) return "";
+  const { payload, key, tracker } = cancellation;
+  const queuedAction = String(tracker?.status ?? "").toLowerCase() === "failed"
+    && hasQueuedPreviewCancellation(key, tracker);
+  const busy = Boolean(state.previewCancellationAttempts.has(key))
+    || ACTIVE_PREVIEW_CANCELLATION_STATUSES.has(String(tracker?.status ?? "").toLowerCase())
+    || queuedAction;
+  const attrs = `data-preview-cancel-kind="${escapeHtml(kind)}" data-preview-cancel-seq="${escapeHtml(payload.preview_seq)}" data-preview-cancel-id="${escapeHtml(payload.preview_id)}" data-preview-cancel-revision="${escapeHtml(payload.revision)}"`;
+  if (tracker?.status === "unknown") {
+    if (previewCancellationIsKnownPending(tracker, payload, state.snapshot)) {
+      const pendingMessage = Number.isSafeInteger(tracker.seq) && tracker.seq > 0
+        ? `Cancellation request #${tracker.seq} is still pending or has ambiguous status on your computer. Waiting for a current result.`
+        : "Cancellation status is pending or ambiguous on your computer. Waiting for a current result.";
+      return `<p class="field-hint" role="status">${escapeHtml(pendingMessage)}</p>`;
+    }
+    return `<p class="field-hint" role="status">${escapeHtml(tracker.error || "The cancellation delivery outcome is unknown.")} Check your computer before trying again.</p><button class="quiet-button" type="button" data-preview-cancel-dismiss-kind="${escapeHtml(kind)}" data-preview-cancel-dismiss-seq="${escapeHtml(payload.preview_seq)}" data-preview-cancel-dismiss-id="${escapeHtml(payload.preview_id)}" data-preview-cancel-dismiss-revision="${escapeHtml(payload.revision)}">Dismiss after checking computer</button>`;
+  }
+  const status = busy
+    ? `<p class="field-hint" role="status">${tracker?.status === "failed" && queuedAction
+      ? "The computer's cancellation result is recorded; this browser is still reconciling its retry row."
+      : tracker?.status === "queued" ? "Cancellation is saved in this browser and will be sent when connected." : Number.isSafeInteger(tracker?.seq) ? `Cancellation request #${tracker.seq} was submitted. Waiting for your computer.` : "Submitting cancellation…"}</p>`
+    : tracker?.status === "failed" ? `<p class="field-hint" role="alert">${escapeHtml(tracker.error || "The computer could not cancel this preview.")}</p>` : "";
+  const label = busy ? "Cancel request submitted" : tracker?.status === "failed" ? "Retry cancellation" : "Cancel preview";
+  return `${status}<button class="quiet-button" type="button" data-preview-cancel ${attrs} ${busy ? "disabled" : ""}>${label}</button>`;
+}
+
+function renderReviewNavigation() {
+  const cards = [];
+  const entries = allReviewEntries();
+  for (const review of entries) {
+    if (!review.libraryId || review.libraryId === activeLibraryId()) continue;
+    const { kind, entry, libraryId } = review;
+    const canReview = Boolean(registeredMediaLibrary(state.snapshot, libraryId)
+      && [...byId("library-select").options].some((option) => option.value === libraryId));
+    const id = previewCancellationPayload(kind, entry)?.preview_id ?? entry.id ?? "";
+    const revision = entry.revision ?? "";
+    const sequence = Number.isSafeInteger(entry.seq) ? entry.seq : "";
+    const cancelState = previewCancellationTracker(kind, entry)?.tracker;
+    const cancelMessage = cancelState?.status === "queued" ? "Cancellation is queued in this browser."
+      : cancelState?.status === "submitted" ? `Cancellation request #${cancelState.seq} is waiting for your computer.`
+        : cancelState?.status === "failed" ? `Cancellation failed: ${cancelState.error || "The computer could not cancel this preview."}`
+          : "";
+    const title = kind === "file_preview" ? "File changes need review" : "Library migration needs review";
+    const reviewButton = canReview
+      ? `<button class="secondary-button" type="button" data-review-library="${escapeHtml(libraryId)}" data-review-preview-kind="${escapeHtml(kind)}" data-review-preview-seq="${escapeHtml(sequence)}" data-review-preview-id="${escapeHtml(id)}" data-review-preview-revision="${escapeHtml(revision)}">Review</button>`
+      : `<p class="field-hint">This library is no longer registered. You can still cancel this saved preview by its exact identity.</p>`;
+    cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>${escapeHtml(libraryLabel(libraryId))} · request ${sequence ? `#${sequence}` : "details unavailable"}</p>${cancelMessage ? `<p class="field-hint">${escapeHtml(cancelMessage)}</p>` : ""}</div><span class="state-pill pending">Review needed</span></div><div class="stack-actions">${reviewButton}${previewCancellationMarkup(kind, entry)}</div></article>`);
+  }
+  for (const [key, tracker] of state.previewCancellations) {
+    const hasAcceptedSequence = Number.isSafeInteger(tracker?.seq) && tracker.seq > 0;
+    const isUnacceptedUnknown = tracker?.status === "unknown" && tracker.seq === null;
+    const isUnacceptedQueued = tracker?.status === "queued" && tracker.seq === null;
+    if (!["submitted", "unknown", "queued"].includes(String(tracker?.status ?? "").toLowerCase())
+        || (!hasAcceptedSequence && !isUnacceptedUnknown && !isUnacceptedQueued)
+        || state.previewCancellationAttempts.has(key)) continue;
+    const payload = previewCancellationPayloadFromKey(key);
+    if (!payload || reviewTargetForCancellation(payload)) continue;
+    const queue = readActionQueueForCancellationDismissal();
+    if (queue?.some((action) => action.request_id === tracker.requestId
+        && queuedPreviewCancellationKey(action) === key)) continue;
+    const knownPending = tracker.status === "unknown"
+      && previewCancellationIsKnownPending(tracker, payload, state.snapshot);
+    const unknown = tracker.status === "unknown" && !knownPending;
+    const message = isUnacceptedQueued
+      ? "Cancellation status could not be verified from the available browser storage or computer snapshot. No outcome is assumed; this notice remains visible while status is reconciled."
+      : knownPending
+      ? `Cancellation${hasAcceptedSequence ? ` request #${tracker.seq}` : ""} is still pending or has ambiguous status on your computer. Waiting for a current result.`
+      : tracker.error || (unknown
+      ? isUnacceptedUnknown
+        ? "No saved cancellation action or receipt is available. This browser will not resend it. Check your computer before dismissing this notice."
+        : "The preview is not present in this Requests snapshot. The cancellation outcome is unknown; check your computer before dismissing this browser notice."
+      : `Cancellation request #${tracker.seq} is not present in this Requests snapshot. Waiting for a current result from your computer.`);
+    const cancelNotice = unknown
+      ? `<button class="quiet-button" type="button" data-preview-cancel-dismiss-kind="${escapeHtml(payload.preview_kind)}" data-preview-cancel-dismiss-seq="${escapeHtml(payload.preview_seq)}" data-preview-cancel-dismiss-id="${escapeHtml(payload.preview_id)}" data-preview-cancel-dismiss-revision="${escapeHtml(payload.revision)}">Dismiss after checking computer</button>`
+      : "";
+    const title = unknown ? "Preview cancellation outcome unknown" : "Preview cancellation is still being tracked";
+    cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>${escapeHtml(message)}</p></div><span class="state-pill ${unknown ? "warning" : "pending"}">${unknown ? "Outcome unknown" : "Waiting"}</span></div>${cancelNotice ? `<div class="stack-actions">${cancelNotice}</div>` : ""}</article>`);
+  }
+  const recovery = state.metadataRecoveryPreviewRequest;
+  if (recovery && recovery.libraryId !== activeLibraryId()
+      && registeredMediaLibrary(state.snapshot, recovery.libraryId)?.root_binding === recovery.rootBinding) {
+    cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>Recovery preview is being prepared</h3><p>${escapeHtml(libraryLabel(recovery.libraryId))} · request ${Number.isSafeInteger(recovery.seq) ? `#${recovery.seq}` : escapeHtml(recovery.requestId)}</p></div><span class="state-pill pending">Waiting</span></div><button class="secondary-button" type="button" data-review-library="${escapeHtml(recovery.libraryId)}">Open library</button></article>`);
+  }
+  byId("review-navigation-list").innerHTML = cards.join("");
+}
+
+function renderPreviewReviewCards() {
+  reconcilePreviewCancellations(state.snapshot);
+  renderMigrations();
+  renderPreviews();
+  renderReviewNavigation();
+  renderTabCounts();
 }
 
 function renderPreviews() {
   const allPreviews = previews();
+  const omittedAggregate = omittedPreviewAggregate();
   const submission = state.metadataRecoveryPreviewRequest;
   if (submission && Number.isSafeInteger(submission.seq)
-      && allPreviews.some((entry) => entry.seq === submission.seq && isReviewablePreviewStatus(entry.status))) {
+      && allPreviews.some((entry) => entry.seq === submission.seq && isReviewablePreviewStatus(entry.status)
+        && !snapshotConfirmsPreviewCancellation("file_preview", entry))) {
     setMetadataRecoveryPreviewRequest(null);
   }
-  const pending = allPreviews.filter((entry) => isReviewablePreviewStatus(entry.status));
+  const pending = allPreviews.filter((entry) => isReviewablePreviewStatus(entry.status)
+    && !snapshotConfirmsPreviewCancellation("file_preview", entry));
   const currentSubmission = state.metadataRecoveryPreviewRequest;
   const submissionLibrary = currentSubmission
     ? registeredMediaLibrary(state.snapshot, currentSubmission.libraryId)
     : null;
   const showRequestCard = Boolean(currentSubmission && currentSubmission.libraryId === activeLibraryId()
     && submissionLibrary?.root_binding === currentSubmission.rootBinding);
-  byId("organizing-count").textContent = String(pending.length + (showRequestCard ? 1 : 0));
   const requestCard = showRequestCard
     ? (() => {
       const queued = readActionQueue().some((action) => action.request_id === currentSubmission.requestId);
@@ -1823,7 +2802,7 @@ function renderPreviews() {
       const failureStatuses = ["failed", "rejected", "stale", "cancelled", "expired"];
       if (failureStatuses.includes(operationStatus)) {
         const error = operation?.error ?? currentSubmission.error ?? "The computer could not create this preview.";
-        return `<article class="stack-card"><div class="stack-card-head"><div><h3>Recovery preview failed · request #${escapeHtml(currentSubmission.seq ?? currentSubmission.requestId)}</h3><p>${escapeHtml(error)}</p></div><span class="state-pill warning">Needs attention</span></div><button type="button" class="secondary-button" data-recovery-preview-dismiss="${escapeHtml(currentSubmission.requestId)}">Dismiss notice</button></article>`;
+        return `<article class="stack-card" id="${previewCardId("file_preview", { seq: currentSubmission.seq, id: currentSubmission.requestId, revision: "recovery" })}"><div class="stack-card-head"><div><h3>Recovery preview failed · request #${escapeHtml(currentSubmission.seq ?? currentSubmission.requestId)}</h3><p>${escapeHtml(error)}</p></div><span class="state-pill warning">Needs attention</span></div><button type="button" class="secondary-button" data-recovery-preview-dismiss="${escapeHtml(currentSubmission.requestId)}">Dismiss notice</button></article>`;
       }
       const message = currentSubmission.status === "rejected"
         ? `The computer rejected recovery preview request ${Number.isSafeInteger(currentSubmission.seq) ? `#${currentSubmission.seq}` : currentSubmission.requestId}: ${currentSubmission.error || "Request rejected"}`
@@ -1834,27 +2813,34 @@ function renderPreviews() {
             : Number.isSafeInteger(currentSubmission.seq)
               ? `Recovery preview request #${currentSubmission.seq} was submitted. Waiting for your computer to prepare the preview.`
               : `Submitting recovery preview request ${currentSubmission.requestId}…`;
-      return `<article class="stack-card"><div class="stack-card-head"><div><h3>Recovery preview is being prepared</h3><p>${escapeHtml(message)}</p></div><span class="state-pill pending">Waiting</span></div></article>`;
+      return `<article class="stack-card" id="${previewCardId("file_preview", { seq: currentSubmission.seq, id: currentSubmission.requestId, revision: "recovery" })}"><div class="stack-card-head"><div><h3>Recovery preview is being prepared</h3><p>${escapeHtml(message)}</p></div><span class="state-pill pending">Waiting</span></div></article>`;
     })()
     : "";
-  byId("preview-list").innerHTML = requestCard + pending.map((entry) => {
+  const omittedNotice = omittedAggregate
+    ? `<article class="stack-card" role="status"><div class="stack-card-head"><div><h3>${omittedAggregate.omittedCount} active preview${omittedAggregate.omittedCount === 1 ? " was" : "s were"} omitted</h3><p>${escapeHtml(omittedAggregate.reason)} This saved snapshot does not include the preview identities, so these entries cannot be reviewed, confirmed, or cancelled here. Refresh Requests for an updated view.</p></div><span class="state-pill warning">Details unavailable</span></div></article>`
+    : "";
+  byId("preview-list").innerHTML = requestCard + omittedNotice + pending.map((entry) => {
+    const cancel = previewCancellationMarkup("file_preview", entry);
+    const cardId = previewCardId("file_preview", entry);
     if (isIncompletePreview(entry)) {
       const reason = entry.reason || "Preview details were omitted from the saved snapshot. Request a fresh preview before confirming.";
-      return `<article class="stack-card"><div class="stack-card-head"><div><h3>Preview needs to be regenerated</h3><p>${escapeHtml(reason)}</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+      return `<article class="stack-card" id="${cardId}" tabindex="-1"><div class="stack-card-head"><div><h3>Preview needs to be regenerated</h3><p>${escapeHtml(reason)}</p></div><span class="state-pill pending">Refresh required</span></div><div class="stack-actions">${cancel}</div></article>`;
     }
     if (!fileOperationIdentityMatches(state.snapshot, entry, entry.library_id ?? "")) {
-      return `<article class="stack-card"><div class="stack-card-head"><div><h3>Preview needs refreshing</h3><p>This saved preview does not have a verified identity for the current library registration. No changes were applied; request a fresh preview before confirming.</p></div><span class="state-pill pending">Refresh required</span></div></article>`;
+      return `<article class="stack-card" id="${cardId}" tabindex="-1"><div class="stack-card-head"><div><h3>Preview needs refreshing</h3><p>This saved preview does not have a verified identity for the current library registration. No changes were applied; request a fresh preview before confirming.</p></div><span class="state-pill pending">Refresh required</span></div><div class="stack-actions">${cancel}</div></article>`;
     }
     const preview = entry.preview;
     const hasMetadataChanges = hasMetadataPreviewChanges(preview);
     const hasMoveItems = Array.isArray(preview.items) && preview.items.length > 0;
     const title = hasMetadataChanges && hasMoveItems ? "Move and update metadata" : hasMetadataChanges ? "Update metadata" : "Move files";
     const libraryId = typeof entry.library_id === "string" ? entry.library_id : "";
-    const canConfirm = libraryCanOperate(libraryId);
-    const offlineMessage = canConfirm ? "" : `<p class="field-hint">This library is offline or showing a saved scan. Reconnect it and refresh before confirming.</p>`;
-    return `<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(preview.target_relative_dir ?? "Metadata only · file locations stay the same")} · Conflict: ${escapeHtml(preview.conflict ?? "skip")}</p>${offlineMessage}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${describePreview(preview)}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}" data-library-id="${escapeHtml(libraryId)}" ${canConfirm ? "" : "disabled"}>Confirm changes</button></div></article>`;
+    const libraryAvailable = libraryCanOperate(libraryId);
+    const cancellationBusy = previewCancellationBusy("file_preview", entry);
+    const canConfirm = libraryAvailable && !cancellationBusy;
+    const offlineMessage = libraryAvailable ? "" : `<p class="field-hint">This library is offline or showing a saved scan. Reconnect it and refresh before confirming.</p>`;
+    return `<article class="stack-card" id="${cardId}" tabindex="-1"><div class="stack-card-head"><div><h3>${title}</h3><p>Destination: ${escapeHtml(preview.target_relative_dir ?? "Metadata only · file locations stay the same")} · Conflict: ${escapeHtml(preview.conflict ?? "skip")}</p>${offlineMessage}</div><span class="state-pill pending">Review needed</span></div><div class="preview-table">${describePreview(preview)}</div><div class="stack-actions"><button class="small-button confirm" type="button" data-confirm="${escapeHtml(entry.id)}" data-revision="${escapeHtml(entry.revision)}" data-library-id="${escapeHtml(libraryId)}" ${canConfirm ? "" : "disabled"}>Confirm changes</button>${cancel}</div></article>`;
   }).join("");
-  if (!requestCard && !pending.length) byId("preview-list").innerHTML = "";
+  if (!requestCard && !omittedNotice && !pending.length) byId("preview-list").innerHTML = "";
 }
 
 function renderLegacyMappings() {
@@ -1980,10 +2966,19 @@ function manualTargetPickerMarkup(key, selection, hintIndex) {
 
 function renderOperations() {
   const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
-  const visible = operationHistoryEntries(operations);
-  byId("operation-list").innerHTML = visible.slice(-12).reverse().map((entry) => {
+  const history = operationHistoryEntries(operations).filter((entry) =>
+    SETTLED_OPERATION_STATUSES.has(String(entry?.status ?? "").toLowerCase()) && historySearchMatches(entry));
+  const active = operations.filter((entry) => !["file_preview", "library_migration_preview", "preview_cancel"].includes(entry?.kind)
+    && !SETTLED_OPERATION_STATUSES.has(String(entry?.status ?? "").toLowerCase()));
+  const renderEntries = (entries) => entries.slice().reverse().map((entry) => {
     const result = entry.result && typeof entry.result === "object" ? entry.result : {};
     const outcome = result.operation && typeof result.operation === "object" ? result.operation : result;
+    const preview = result.preview && typeof result.preview === "object"
+      ? result.preview
+      : entry.preview && typeof entry.preview === "object" ? entry.preview : null;
+    const cancelTarget = entry.kind === "preview_cancel" && result.cancelled === true
+      ? `${statusText(result.preview_kind)} #${Number.isSafeInteger(result.preview_seq) ? result.preview_seq : "?"} · ${String(result.preview_id ?? "preview identity unavailable")} · revision ${String(result.revision ?? "unavailable")}`
+      : "";
     const items = Array.isArray(outcome.items) ? outcome.items : Array.isArray(result.items) ? result.items : [];
     const hintCount = Array.isArray(result.hints) ? result.hints.length : 0;
     const candidateCount = Array.isArray(result.candidates) ? result.candidates.length : 0;
@@ -1991,7 +2986,11 @@ function renderOperations() {
     const movedFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.moved_files) ? item.moved_files : 0), 0);
     const totalFiles = items.reduce((total, item) => total + (Number.isSafeInteger(item.total_files) ? item.total_files : 0), 0);
     const metadataUpdated = items.filter((item) => item.metadata_patched === true).length;
-    const summary = items.length
+    const summary = cancelTarget
+      ? `Cancelled ${cancelTarget}. No changes were applied by this request.`
+      : entry.kind === "file_preview" && String(entry.status).toLowerCase() === "cancelled"
+        ? "This preview was cancelled before confirmation. No changes were applied."
+        : items.length
       ? `${items.length} item${items.length === 1 ? "" : "s"} · ${movedFiles}/${totalFiles} related file${totalFiles === 1 ? "" : "s"} moved · ${metadataUpdated} metadata update${metadataUpdated === 1 ? "" : "s"}`
       : entry.kind === "legacy_import"
         ? detailsWarning
@@ -2019,8 +3018,75 @@ function renderOperations() {
       ? `${libraryLabel(sourceLibraryId)} → ${libraryLabel(targetLibraryId)}`
       : operationLibraryId(entry) ? libraryLabel(operationLibraryId(entry)) : "";
     const contextLabel = libraryContext ? `<p class="field-hint">${escapeHtml(libraryContext)}</p>` : "";
-    return `<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(operationTitle(entry))}</h3><p>${escapeHtml(entry.error ?? summary)}</p>${contextLabel}</div><span class="state-pill">${escapeHtml(statusText(entry.status))}</span></div>${entry.created_at ? `<p>Received ${escapeHtml(timeAgo(entry.created_at))}</p>` : ""}${itemResults ? `<div class="preview-table">${itemResults}</div>` : ""}${warningDetails.length ? `<div class="operation-warnings">${warningDetails.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}</div>` : ""}${entry.kind === "legacy_import" && result.revision ? `<p>Library revision: ${escapeHtml(result.revision)}</p>` : ""}</article>`;
+    const previewDetails = preview ? `<div class="preview-table">${describePreview(preview)}</div>` : "";
+    const title = entry.kind === "preview_cancel" ? "Preview cancellation" : operationTitle(entry);
+    return `<article class="stack-card"><div class="stack-card-head"><div><h3>${escapeHtml(title)}</h3><p>${escapeHtml(entry.error ?? summary)}</p>${contextLabel}</div><span class="state-pill">${escapeHtml(statusText(entry.status))}</span></div>${entry.created_at ? `<p>Received ${escapeHtml(timeAgo(entry.created_at))}</p>` : ""}${previewDetails}${itemResults ? `<div class="preview-table">${itemResults}</div>` : ""}${warningDetails.length ? `<div class="operation-warnings">${warningDetails.map((warning) => `<p>${escapeHtml(warning)}</p>`).join("")}</div>` : ""}${entry.kind === "legacy_import" && result.revision ? `<p>Library revision: ${escapeHtml(result.revision)}</p>` : ""}</article>`;
   }).join("");
+  byId("active-operation-list").innerHTML = renderEntries(active);
+  byId("operation-list").innerHTML = renderEntries(history);
+}
+
+function renderTabCounts() {
+  const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
+  const tasks = Array.isArray(state.snapshot?.tasks) ? state.snapshot.tasks : [];
+  const cloudQueue = Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : [];
+  const reviewEntries = allReviewEntries();
+  const reviewSequences = new Set(reviewEntries.map(({ entry }) => entry.seq).filter((seq) => Number.isSafeInteger(seq) && seq > 0));
+  const { cloud: pendingCloud, local } = buildWaitingEntries(cloudQueue, tasks, operations);
+  const requestKeys = new Set();
+  let rowIndex = 0;
+  for (const entry of [...pendingCloud, ...local]) {
+    if (!isWaitingEntryPending(entry) || Number.isSafeInteger(entry.seq) && reviewSequences.has(entry.seq)) continue;
+    requestKeys.add(Number.isSafeInteger(entry.seq) && entry.seq > 0 ? `seq:${entry.seq}` : `row:${rowIndex++}`);
+  }
+  for (const { kind, entry } of reviewEntries) {
+    const key = previewCancellationKey(previewCancellationPayload(kind, entry));
+    const tracker = key ? state.previewCancellations.get(key) : null;
+    requestKeys.add(Number.isSafeInteger(entry.seq) && entry.seq > 0
+      ? `seq:${entry.seq}`
+      : `preview:${kind}:${entry.id}:${entry.revision}`);
+    if (!isActivePreviewCancellation(tracker, key)) continue;
+    if (Number.isSafeInteger(tracker?.seq) && tracker.seq > 0) requestKeys.add(`seq:${tracker.seq}`);
+    else if (tracker?.requestId) requestKeys.add(`request:${tracker.requestId}`);
+    else requestKeys.add(`cancel:${key}`);
+  }
+  for (const action of readActionQueue()) requestKeys.add(`request:${action.request_id}`);
+  const recovery = state.metadataRecoveryPreviewRequest;
+  if (recovery) {
+    requestKeys.add(Number.isSafeInteger(recovery.seq) && recovery.seq > 0 ? `seq:${recovery.seq}` : `request:${recovery.requestId}`);
+  }
+  for (const [key, tracker] of state.previewCancellations) {
+    if (!isActivePreviewCancellation(tracker, key)) continue;
+    if (Number.isSafeInteger(tracker.seq) && tracker.seq > 0) requestKeys.add(`seq:${tracker.seq}`);
+    else if (tracker.requestId) requestKeys.add(`request:${tracker.requestId}`);
+    else requestKeys.add(`cancel:${key}`);
+  }
+  const omittedPreviews = omittedPreviewAggregate();
+  byId("waiting-count").textContent = omittedPreviews ? `${requestKeys.size}+` : String(requestKeys.size);
+
+  const activeOperations = operations.filter((entry) => !["file_preview", "library_migration_preview", "preview_cancel"].includes(entry?.kind)
+    && !SETTLED_OPERATION_STATUSES.has(String(entry?.status ?? "").toLowerCase()));
+  const retained = retainedMigrationState();
+  const activeMigrations = retained.migrations.filter((migration) =>
+    (migration.source_library_id === activeLibraryId() || migration.target_library_id === activeLibraryId())
+    && (migrationControlActions(migration).length > 0 || ["queued", "running", "paused"].includes(String(migration.status ?? "").toLowerCase())));
+  byId("organizing-count").textContent = String(activeOperations.length + activeMigrations.length);
+
+  const historyOperations = operationHistoryEntries(operations)
+    .filter((entry) => SETTLED_OPERATION_STATUSES.has(String(entry?.status ?? "").toLowerCase()));
+  const historyMigrations = retained.migrations.filter((migration) =>
+    migrationControlActions(migration).length === 0 && !["queued", "running", "paused"].includes(String(migration.status ?? "").toLowerCase()));
+  const visibleHistoryCount = historyOperations.filter(historySearchMatches).length
+    + historyMigrations.filter(historySearchMatches).length;
+  const retainedHistoryCount = historyOperations.length + historyMigrations.length;
+  byId("history-count").textContent = String(retainedHistoryCount);
+  const query = String(state.historyQuery ?? "").trim();
+  const summary = query
+    ? `${visibleHistoryCount} matching recent record${visibleHistoryCount === 1 ? "" : "s"} · ${retainedHistoryCount} retained.`
+    : retainedHistoryCount
+      ? `${retainedHistoryCount} recent record${retainedHistoryCount === 1 ? "" : "s"} retained in this snapshot.`
+      : "No recent activity is available in the current snapshot.";
+  byId("history-summary").textContent = `${summary}${operations.length >= RECENT_OPERATION_SNAPSHOT_LIMIT ? " Older operation records may be omitted from this snapshot." : ""}`;
 }
 
 function renderSync() {
@@ -2102,6 +3168,7 @@ function renderDetail() {
 
 function render() {
   if (!mayUsePrivateSnapshot(state)) return;
+  reconcilePreviewCancellations(state.snapshot);
   renderSync();
   renderLibrary();
   settleDownloadSubmission();
@@ -2109,8 +3176,10 @@ function render() {
   renderWaiting();
   renderMigrations();
   renderPreviews();
+  renderReviewNavigation();
   renderLegacyMappings();
   renderOperations();
+  renderTabCounts();
   renderQueueCount();
   for (const tab of document.querySelectorAll(".view-tab")) {
     const active = tab.dataset.view === state.view;
@@ -2342,6 +3411,7 @@ function bindEvents() {
     submitAction("library_migration_preview", payload);
   });
   byId("search-input").addEventListener("input", (event) => { state.query = event.target.value; state.libraryPage = 0; state.needsPage = 0; state.groupSelectionLimitNotice = null; renderLibrary(); });
+  byId("history-search").addEventListener("input", (event) => { state.historyQuery = event.target.value; render(); });
   byId("category-filter").addEventListener("input", () => { state.libraryPage = 0; state.needsPage = 0; state.groupSelectionLimitNotice = null; renderLibrary(); });
   byId("status-filter").addEventListener("change", () => { state.libraryPage = 0; state.needsPage = 0; state.groupSelectionLimitNotice = null; renderLibrary(); });
   byId("select-visible").addEventListener("click", selectVisible);
@@ -2453,6 +3523,10 @@ function bindEvents() {
       const itemId = migrationConflict.dataset.migrationConflictItem;
       const operation = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === revision);
       if (!operation) return;
+      if (previewCancellationBusy("library_migration_preview", operation)) {
+        renderMigrations();
+        return;
+      }
       const result = operation?.result ?? {};
       const existing = migrationConflictDraft(previewId, revision);
       const defaultPolicy = result.conflict === "keep_both" ? "keep_both" : "skip";
@@ -2529,6 +3603,144 @@ function bindEvents() {
     if (omittedCount > 0) showToast(selectionLimitMessage(omittedCount));
   });
   document.body.addEventListener("click", (event) => {
+    const reviewLibrary = event.target.closest("[data-review-library]");
+    if (reviewLibrary) {
+      const libraryId = reviewLibrary.dataset.reviewLibrary;
+      const library = registeredMediaLibrary(state.snapshot, libraryId);
+      const option = [...byId("library-select").options].find((entry) => entry.value === libraryId);
+      if (!library || !option) {
+        showToast("This preview's registered library is not available in the current snapshot.");
+        return;
+      }
+      state.libraryId = libraryId;
+      byId("library-select").value = libraryId;
+      clearSelectedItems();
+      clearMetadataRecoveryState({ preservePreviewRequest: true });
+      state.detailId = null;
+      state.legacyOperation = null;
+      state.legacyOperationKey = null;
+      state.legacySelection.clear();
+      state.manualPickerKey = null;
+      state.libraryPage = 0;
+      state.needsPage = 0;
+      cachedFolderLibrary = null;
+      state.view = "waiting";
+      syncLibraryUrl();
+      render();
+      const kind = reviewLibrary.dataset.reviewPreviewKind;
+      const sequence = Number(reviewLibrary.dataset.reviewPreviewSeq);
+      const previewId = reviewLibrary.dataset.reviewPreviewId ?? "";
+      const revision = reviewLibrary.dataset.reviewPreviewRevision ?? "";
+      if (kind && previewId && revision && Number.isSafeInteger(sequence) && sequence > 0) {
+        const card = document.getElementById(previewCardId(kind, { seq: sequence, id: previewId, revision }));
+        card?.scrollIntoView?.({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+        card?.focus?.({ preventScroll: true });
+      }
+      return;
+    }
+    const cancelDismiss = event.target.closest("[data-preview-cancel-dismiss-kind]");
+    if (cancelDismiss) {
+      const kind = cancelDismiss.dataset.previewCancelDismissKind;
+      const payload = {
+        preview_kind: kind,
+        preview_seq: Number(cancelDismiss.dataset.previewCancelDismissSeq),
+        preview_id: cancelDismiss.dataset.previewCancelDismissId,
+        revision: cancelDismiss.dataset.previewCancelDismissRevision,
+      };
+      const key = previewCancellationKey(payload);
+      const tracker = key ? state.previewCancellations.get(key) : null;
+      const queue = readActionQueueForCancellationDismissal();
+      if (!key || !tracker || !queue) {
+        showToast("The cancellation notice could not be removed from browser storage. It remains paused here.");
+        return;
+      }
+      if (previewCancellationHasAmbiguousDismissalEvidence(payload, state.snapshot)
+          && tracker.seq === null) {
+        showToast("This cancellation is still pending or has ambiguous status on your computer. It remains paused here.");
+        return;
+      }
+      if (!dismissPreviewCancellationNotice(key, tracker, queue)) {
+        showToast(previewCancellationIsKnownPending(tracker, payload, state.snapshot)
+          ? "This cancellation is still pending or has ambiguous status on your computer. It remains paused here."
+          : "The cancellation notice could not be removed from browser storage. It remains paused here.");
+        return;
+      }
+      render();
+      showToast("The cancellation result is still unknown. Check your computer before trying again.");
+      return;
+    }
+    const cancelPreview = event.target.closest("[data-preview-cancel]");
+    if (cancelPreview) {
+      const kind = cancelPreview.dataset.previewCancelKind;
+      const payload = {
+        preview_kind: kind,
+        preview_seq: Number(cancelPreview.dataset.previewCancelSeq),
+        preview_id: cancelPreview.dataset.previewCancelId,
+        revision: cancelPreview.dataset.previewCancelRevision,
+      };
+      const review = reviewTargetForCancellation(payload);
+      if (!review) {
+        showToast("This preview is no longer awaiting review. Refresh the Requests view before cancelling it.");
+        return;
+      }
+      const cancellation = previewCancellationTracker(kind, review.entry);
+      if (!cancellation || state.previewCancellationAttempts.has(cancellation.key)
+          || ["queued", "submitted", "unknown"].includes(cancellation.tracker?.status)) return;
+      const previousTracker = cancellation.tracker ? { ...cancellation.tracker } : null;
+      const requestId = crypto.randomUUID();
+      state.previewCancellations.set(cancellation.key, {
+        requestId,
+        seq: null,
+        status: "queued",
+        error: "",
+      });
+      if (!persistPreviewCancellations()) {
+        if (previousTracker) state.previewCancellations.set(cancellation.key, previousTracker);
+        else state.previewCancellations.delete(cancellation.key);
+        render();
+        showToast("This browser could not safely save the cancellation request, so it was not sent.");
+        return;
+      }
+      state.previewCancellationAttempts.add(cancellation.key);
+      cancelPreview.disabled = true;
+      render();
+      submitAction("preview_cancel", payload, {
+        requestId,
+        onQueued: (action) => {
+          state.previewCancellations.set(cancellation.key, {
+            requestId: action.request_id,
+            seq: null,
+            status: "queued",
+            error: "",
+          });
+          persistPreviewCancellations();
+          render();
+        },
+      }).then((queued) => {
+        state.previewCancellationAttempts.delete(cancellation.key);
+        if (!queued) {
+          const current = state.previewCancellations.get(cancellation.key);
+          if (current?.requestId === requestId) {
+            if (previousTracker) state.previewCancellations.set(cancellation.key, previousTracker);
+            else state.previewCancellations.delete(cancellation.key);
+          }
+          persistPreviewCancellations({ removeKeys: [cancellation.key] });
+          showToast("The cancellation could not be queued. The preview is still available for review.");
+        }
+        render();
+      }, () => {
+        state.previewCancellationAttempts.delete(cancellation.key);
+        const current = state.previewCancellations.get(cancellation.key);
+        if (current?.requestId === requestId) {
+          if (previousTracker) state.previewCancellations.set(cancellation.key, previousTracker);
+          else state.previewCancellations.delete(cancellation.key);
+        }
+        persistPreviewCancellations({ removeKeys: [cancellation.key] });
+        render();
+        showToast("The cancellation could not be queued. The preview is still available for review.");
+      });
+      return;
+    }
     const recoveryPreview = event.target.closest("[data-recovery-preview]");
     if (recoveryPreview) { previewMetadataRecoverySelection(); return; }
     const recoveryRetryDeferred = event.target.closest("[data-recovery-retry-deferred]");
@@ -2546,7 +3758,7 @@ function bindEvents() {
     if (previewNoticeDismiss) {
       if (state.metadataRecoveryPreviewRequest?.requestId === previewNoticeDismiss.dataset.recoveryPreviewDismiss) {
         setMetadataRecoveryPreviewRequest(null);
-        renderPreviews();
+        render();
       }
       return;
     }
@@ -2565,6 +3777,32 @@ function bindEvents() {
     const dismissUnknown = event.target.closest("[data-dismiss-unknown-action]");
     if (dismissUnknown) {
       const requestId = dismissUnknown.dataset.dismissUnknownAction;
+      const cancellationQueue = readActionQueueForCancellationDismissal();
+      const cancellationAction = cancellationQueue?.find((action) => action.request_id === requestId);
+      if (cancellationAction?.kind === "preview_cancel") {
+        const key = queuedPreviewCancellationKey(cancellationAction);
+        if (!key || !isUnknownDeliveryAction(cancellationAction, state.unknownActionOutcomes)) {
+          showToast("The delivery notice could not be removed from browser storage. It remains paused here.");
+          return;
+        }
+        restoreQueuedPreviewCancellationTrackers();
+        const tracker = state.previewCancellations.get(key) ?? {
+          requestId,
+          seq: null,
+          status: "unknown",
+          error: cancellationAction.delivery_error ?? "The request may or may not have reached your computer.",
+        };
+        if (!dismissPreviewCancellationNotice(key, tracker, cancellationQueue, requestId)) {
+          showToast(previewCancellationIsKnownPending(tracker, previewCancellationPayloadFromKey(key), state.snapshot)
+            ? "This cancellation is still pending or has ambiguous status on your computer. It remains paused here."
+            : "The cancellation notice could not be removed from browser storage. It remains paused here.");
+          return;
+        }
+        renderWaiting();
+        renderPreviewReviewCards();
+        showToast("The cancellation result is still unknown. The browser notice was dismissed; check your computer before resubmitting.");
+        return;
+      }
       const dismissed = dismissUnknownFileAction(state, requestId, readActionQueue(), writeActionQueue);
       if (dismissed.status !== "dismissed") {
         showToast("The delivery notice could not be removed from browser storage. It remains paused here.");
@@ -2574,7 +3812,7 @@ function bindEvents() {
       if (dismissed.downloadSubmission) renderDownloadStatus();
       if (dismissed.migrationConflictDrafts > 0) renderMigrations();
       renderWaiting();
-      renderPreviews();
+      renderPreviewReviewCards();
       showToast("The delivery outcome is still unknown. The browser notice was dismissed; check your computer before resubmitting.");
       return;
     }
@@ -2609,6 +3847,10 @@ function bindEvents() {
       const revision = migrationRefresh.dataset.migrationPreviewRevision;
       const operation = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === revision);
       if (!operation) return;
+      if (previewCancellationBusy("library_migration_preview", operation)) {
+        renderMigrations();
+        return;
+      }
       const sourceLibraryId = migrationLibraryId(operation, operation?.result ?? {}, "source_library_id");
       const targetLibraryId = migrationLibraryId(operation, operation?.result ?? {}, "target_library_id");
       const endpoints = migrationEndpointAvailability(state.snapshot, sourceLibraryId, targetLibraryId);
@@ -2662,6 +3904,10 @@ function bindEvents() {
     if (clearMigrationRefresh) {
       const previewId = clearMigrationRefresh.dataset.migrationRefreshClear;
       const revision = clearMigrationRefresh.dataset.migrationPreviewRevision;
+      if (migrationCancellationBusyForDraft(previewId, revision)) {
+        renderMigrations();
+        return;
+      }
       const draft = migrationConflictDraft(previewId, revision);
       if (!draft || !releaseMigrationRefreshTracking(draft, state.snapshot)) {
         renderMigrations();
@@ -2751,6 +3997,10 @@ function bindEvents() {
     if (migrationConfirm) {
       const previewId = migrationConfirm.dataset.migrationConfirm;
       const matchingPreview = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === migrationConfirm.dataset.revision);
+      if (matchingPreview && previewCancellationBusy("library_migration_preview", matchingPreview)) {
+        renderMigrations();
+        return;
+      }
       const result = matchingPreview?.result ?? {};
       const sourceId = String(result.source_library_id ?? matchingPreview?.source_library_id ?? activeLibraryId());
       const targetId = String(result.target_library_id ?? matchingPreview?.target_library_id ?? "");
@@ -2793,13 +4043,29 @@ function bindEvents() {
     if (event.target.closest("#preview-metadata")) { previewSelectedLegacy(); return; }
   });
   window.addEventListener("storage", (event) => {
+    if (event.key === PREVIEW_CANCELLATION_STORAGE_KEY
+        || event.key === PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY
+        || event.key === ACTION_QUEUE_KEY || event.key === null) {
+      if (state.ownerVerified && state.privateUiVisible) {
+        const changed = mergePreviewCancellationsFromStorage();
+        const recovered = recoverFileActionReceipts();
+        const orphaned = promoteMissingPreviewCancellationIntents(state.snapshot);
+        if (changed || recovered.matched > 0 || recovered.blockedRequestIds.length > 0 || orphaned) render();
+      }
+      return;
+    }
     if (!event.key?.startsWith(ACTION_RECEIPT_STORAGE_PREFIX)) return;
     const recovered = recoverFileActionReceipts();
-    if (recovered.matched === 0) return;
+    const orphaned = promoteMissingPreviewCancellationIntents(state.snapshot);
+    if (recovered.matched === 0) {
+      if (orphaned) render();
+      return;
+    }
     if (state.ownerVerified) {
       if (state.loading) state.refreshAfterDrain = true;
       else refreshState({ quiet: true });
     }
+    if (orphaned) render();
   });
   window.addEventListener("online", () => { showToast("Connection restored. Sending saved actions."); drainActionQueue(); refreshState({ quiet: true }); });
   window.addEventListener("keydown", (event) => { if (event.key === "Escape" && state.detailId) { state.detailId = null; renderDetail(); } });

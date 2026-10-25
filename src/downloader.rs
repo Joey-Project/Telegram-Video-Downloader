@@ -40419,9 +40419,13 @@ mv video.original video.m4s || exit 46
             command_liveness_pair().expect("worker liveness pair should create");
         let additional = prepare_bilibili_worker_inherited_fds(&worker_liveness, &output_lock)
             .expect("worker descriptors should prepare");
-        let PreparedCommandFds { inherited, .. } =
-            prepare_command_inherited_fds(&[], additional, None)
-                .expect("worker descriptors should avoid target collisions");
+        let PreparedCommandFds {
+            inherited,
+            remap,
+            scratch,
+            ..
+        } = prepare_command_inherited_fds(&[], additional, None)
+            .expect("worker descriptors should avoid target collisions");
         drop(worker_liveness);
 
         let ready = root.join("worker.ready");
@@ -40441,10 +40445,9 @@ mv video.original video.m4s || exit 46
             .stderr(Stdio::inherit());
         unsafe {
             command.pre_exec(move || {
-                for (source, target) in &inherited {
-                    if libc::dup2(source.as_raw_fd(), *target) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
+                let _source_holders = (&inherited, &scratch);
+                for operation in &remap {
+                    apply_child_fd_remap_operation(*operation)?;
                 }
                 Ok(())
             });

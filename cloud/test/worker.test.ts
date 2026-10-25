@@ -2277,6 +2277,78 @@ describe("Mini App identity and actions", () => {
     }
   });
 
+  it("persists exact preview cancellation identities and deduplicates transport retries", async () => {
+    const initData = await signInitData();
+    const actions = ["file_preview", "library_migration_preview"].map((previewKind, index) => ({
+      request_id: `00000000-0000-4000-8000-${String(9700 + index).padStart(12, "0")}`,
+      kind: "preview_cancel",
+      payload: { preview_kind: previewKind, preview_seq: 17 + index, preview_id: `preview-${index}`, revision: `revision-${index}` },
+    }));
+    for (const action of actions) {
+      const submit = () => ownerRequest("/api/actions", initData, { method: "POST", body: JSON.stringify(action) });
+      const response = await submit();
+      expect(response.status).toBe(202);
+      const firstReceipt = await responseJson<{ seq: number }>(response);
+      const retried = await submit();
+      expect(retried.status).toBe(202);
+      expect(await responseJson<{ seq: number }>(retried)).toMatchObject({ seq: firstReceipt.seq });
+      const changed = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({ ...action, payload: { ...action.payload, revision: "another-revision" } }),
+      });
+      expect(changed.status).toBe(409);
+    }
+    const backlog = await responseJson<{ requests: Array<{ seq: number; kind: string; payload: Record<string, unknown> }> }>(await localRequests());
+    expect(backlog.requests.map(({ kind, payload }) => ({ kind, payload })))
+      .toEqual(actions.map(({ kind, payload }) => ({ kind, payload })));
+    const acknowledged = await SELF.fetch(new Request(workerUrl + "/api/local/ack", {
+      method: "POST",
+      headers: { ...localHeaders(), "content-type": "application/json" },
+      body: JSON.stringify(await acknowledgmentBody(backlog.requests.map(({ seq }) => seq))),
+    }));
+    expect(acknowledged.status).toBe(200);
+    expect(await responseJson<{ requests: unknown[] }>(await localRequests())).toMatchObject({ requests: [] });
+  });
+
+  it("rejects malformed cancellation identities before any inbox write", async () => {
+    const initData = await signInitData();
+    const valid = { preview_kind: "file_preview", preview_seq: 19, preview_id: "preview-a", revision: "revision-a" };
+    const cases: Record<string, unknown>[] = [
+      {},
+      { ...valid, preview_kind: "file_confirm" },
+      { ...valid, preview_kind: "telegram" },
+      { ...valid, preview_seq: 0 },
+      { ...valid, preview_seq: -1 },
+      { ...valid, preview_seq: 1.5 },
+      { ...valid, preview_seq: "19" },
+      { ...valid, preview_seq: Number.MAX_SAFE_INTEGER + 1 },
+      { ...valid, preview_id: "" },
+      { ...valid, preview_id: " preview-a" },
+      { ...valid, preview_id: "x".repeat(129) },
+      { ...valid, preview_id: "影".repeat(43) },
+      { ...valid, preview_id: "preview\u0000a" },
+      { ...valid, preview_id: "preview\u0085a" },
+      { ...valid, revision: "" },
+      { ...valid, revision: "revision-a " },
+      { ...valid, revision: "x".repeat(257) },
+      { ...valid, revision: "版".repeat(86) },
+      { ...valid, revision: "revision\u0001a" },
+      { ...valid, revision: "revision\u009fa" },
+      { ...valid, library_id: "another-library" },
+      { ...valid, root_binding: TEST_ROOT_BINDING },
+    ];
+    const before = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    for (const [index, payload] of cases.entries()) {
+      const response = await ownerRequest("/api/actions", initData, {
+        method: "POST",
+        body: JSON.stringify({ request_id: `00000000-0000-4000-8000-${String(9800 + index).padStart(12, "0")}`, kind: "preview_cancel", payload }),
+      });
+      expect(response.status, `case ${index}`).toBe(400);
+    }
+    const after = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox").first<{ count: number }>();
+    expect(after?.count).toBe(before?.count);
+  });
+
   it("persists validated multi-library settings, downloads, and migration actions through the inbox", async () => {
     const initData = await signInitData();
     const rootBinding = `v1:${"a".repeat(64)}`;

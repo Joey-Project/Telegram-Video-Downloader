@@ -156,6 +156,7 @@ struct PreviewAnchorStore {
 }
 
 struct PreviewAnchorEntry {
+    revision: String,
     anchors: HashMap<String, BoundFile>,
     expires_at: Instant,
 }
@@ -701,9 +702,38 @@ impl PreviewAnchorStore {
         self.by_preview.get(preview_id).map(|entry| &entry.anchors)
     }
 
+    fn touch_for_revision(
+        &mut self,
+        preview_id: &str,
+        revision: &str,
+        now: Instant,
+    ) -> Option<&HashMap<String, BoundFile>> {
+        if self
+            .by_preview
+            .get(preview_id)
+            .is_none_or(|entry| entry.revision != revision)
+        {
+            return None;
+        }
+        self.touch(preview_id, now)
+    }
+
+    fn remove_if_revision(&mut self, preview_id: &str, revision: &str) -> bool {
+        if self
+            .by_preview
+            .get(preview_id)
+            .is_none_or(|entry| entry.revision != revision)
+        {
+            return false;
+        }
+        self.remove(preview_id);
+        true
+    }
+
     fn matches_required_anchors(
         &self,
         preview_id: &str,
+        revision: &str,
         required: &HashSet<String>,
     ) -> Result<bool> {
         if required.is_empty() {
@@ -712,6 +742,9 @@ impl PreviewAnchorStore {
         let Some(entry) = self.by_preview.get(preview_id) else {
             return Ok(false);
         };
+        if entry.revision != revision {
+            return Ok(false);
+        }
         for token in required {
             let Some(anchor) = entry.anchors.get(token) else {
                 return Ok(false);
@@ -2693,22 +2726,22 @@ impl LibraryManager {
                 unconfirmable.insert(preview_id.clone());
                 continue;
             }
-            required_previews.push((preview_id.clone(), required));
+            required_previews.push((preview_id.clone(), revision.clone(), required));
         }
 
         if required_previews.is_empty() {
             return Ok(unconfirmable);
         }
         let Some(cache) = LIVE_PREVIEW_ANCHORS.get() else {
-            unconfirmable.extend(required_previews.into_iter().map(|(id, _)| id));
+            unconfirmable.extend(required_previews.into_iter().map(|(id, _, _)| id));
             return Ok(unconfirmable);
         };
         let mut cache = cache
             .lock()
             .map_err(|_| anyhow!("preview identity-anchor cache is poisoned"))?;
         cache.prune_expired(Instant::now());
-        for (preview_id, required) in required_previews {
-            if !cache.matches_required_anchors(&preview_id, &required)? {
+        for (preview_id, revision, required) in required_previews {
+            if !cache.matches_required_anchors(&preview_id, &revision, &required)? {
                 unconfirmable.insert(preview_id);
             }
         }
@@ -3441,7 +3474,7 @@ impl LibraryManager {
             bail!("move preview exceeds its private storage limit");
         }
         validate_preview(&preview)?;
-        store_preview_anchors(&id, preview_anchors)?;
+        store_preview_anchors(&id, &preview.revision, preview_anchors)?;
         if let Err(error) = self.write_private_file(&self.preview_path(&id), &contents) {
             release_preview_anchors(&id);
             return Err(error);
@@ -7400,7 +7433,11 @@ fn batch_result(manifest: &BatchManifest) -> BatchMoveResult {
     }
 }
 
-fn store_preview_anchors(preview_id: &str, anchors: HashMap<String, BoundFile>) -> Result<()> {
+fn store_preview_anchors(
+    preview_id: &str,
+    revision: &str,
+    anchors: HashMap<String, BoundFile>,
+) -> Result<()> {
     if anchors.is_empty() {
         return Ok(());
     }
@@ -7422,6 +7459,7 @@ fn store_preview_anchors(preview_id: &str, anchors: HashMap<String, BoundFile>) 
     cache.by_preview.insert(
         preview_id.to_string(),
         PreviewAnchorEntry {
+            revision: revision.to_string(),
             anchors,
             expires_at: now + PREVIEW_ANCHOR_TTL,
         },
@@ -7496,7 +7534,11 @@ fn preview_has_required_anchors(
     let Some(cache) = cache else {
         return Ok(false);
     };
-    cache.matches_required_anchors(&persisted.preview.id, &required)
+    cache.matches_required_anchors(
+        &persisted.preview.id,
+        &persisted.preview.revision,
+        &required,
+    )
 }
 
 fn require_preview_anchors(persisted: &PersistedPreview, process_nonce: &str) -> Result<()> {
@@ -7515,10 +7557,17 @@ fn require_preview_anchors(persisted: &PersistedPreview, process_nonce: &str) ->
         .map_err(|_| anyhow!("preview identity-anchor cache is poisoned"))?;
     let now = Instant::now();
     cache.prune_expired(now);
-    if cache.touch(&persisted.preview.id, now).is_none() {
+    if cache
+        .touch_for_revision(&persisted.preview.id, &persisted.preview.revision, now)
+        .is_none()
+    {
         bail!("selected object lost its in-process descriptor anchor; create a new preview");
     }
-    if !cache.matches_required_anchors(&persisted.preview.id, &required)? {
+    if !cache.matches_required_anchors(
+        &persisted.preview.id,
+        &persisted.preview.revision,
+        &required,
+    )? {
         bail!(
             "in-process descriptor anchor no longer matches the approved object; create a new preview"
         );
@@ -7534,6 +7583,16 @@ pub(crate) fn release_preview_anchors(preview_id: &str) {
         return;
     };
     cache.remove(preview_id);
+}
+
+pub(crate) fn release_preview_anchors_for_revision(preview_id: &str, revision: &str) -> bool {
+    let Some(cache) = LIVE_PREVIEW_ANCHORS.get() else {
+        return false;
+    };
+    let Ok(mut cache) = cache.lock() else {
+        return false;
+    };
+    cache.remove_if_revision(preview_id, revision)
 }
 
 fn sha256_bound_file(file: &BoundFile) -> Result<String> {
@@ -18891,6 +18950,7 @@ mod tests {
         store.by_preview.insert(
             "preview-anchor-expiration".to_string(),
             PreviewAnchorEntry {
+                revision: "revision-expired".to_string(),
                 anchors,
                 expires_at: now - Duration::from_secs(1),
             },
@@ -18899,6 +18959,7 @@ mod tests {
         store.by_preview.insert(
             "preview-anchor-recent".to_string(),
             PreviewAnchorEntry {
+                revision: "revision-recent".to_string(),
                 anchors: HashMap::new(),
                 expires_at: now + Duration::from_secs(10),
             },
@@ -19106,6 +19167,7 @@ mod tests {
         cache.by_preview.insert(
             preview.id.clone(),
             PreviewAnchorEntry {
+                revision: persisted.preview.revision.clone(),
                 anchors,
                 expires_at: now + PREVIEW_ANCHOR_TTL,
             },
@@ -19129,6 +19191,7 @@ mod tests {
         cache.by_preview.insert(
             preview.id.clone(),
             PreviewAnchorEntry {
+                revision: persisted.preview.revision.clone(),
                 anchors,
                 expires_at: now + PREVIEW_ANCHOR_TTL,
             },
@@ -19142,6 +19205,7 @@ mod tests {
             cache.by_preview.insert(
                 preview_id,
                 PreviewAnchorEntry {
+                    revision: "revision-lru".to_string(),
                     anchors: HashMap::new(),
                     expires_at: now + PREVIEW_ANCHOR_TTL,
                 },
@@ -19168,7 +19232,8 @@ mod tests {
         let preview_id = new_operation_id("test-preview-anchor-release");
         let mut anchors = HashMap::new();
         anchors.insert(read.token.clone(), read.file);
-        store_preview_anchors(&preview_id, anchors).expect("live preview anchors should be stored");
+        store_preview_anchors(&preview_id, "revision-test", anchors)
+            .expect("live preview anchors should be stored");
         {
             let cache = LIVE_PREVIEW_ANCHORS
                 .get()
@@ -19194,6 +19259,96 @@ mod tests {
     }
 
     #[test]
+    fn preview_anchor_revision_release_preserves_reused_id_for_new_revision() {
+        let root = TemporaryRoot::new("preview-anchor-reused-id-revision-release");
+        let media_path = root.path().join("clip.mp4");
+        fs::write(&media_path, b"preview anchor reused-id fixture")
+            .expect("media fixture should write");
+        let manager = manager(&root);
+        manager.make_preview_creation_time_unavailable_for_test();
+        let snapshot = manager
+            .scan(&[])
+            .expect("library scan should find the preview fixture");
+        let item_id = snapshot
+            .items
+            .iter()
+            .find(|item| item.relative_path == "clip.mp4")
+            .expect("preview fixture should appear in the library")
+            .id
+            .clone();
+        let preview = manager
+            .preview(
+                std::slice::from_ref(&item_id),
+                "organized",
+                false,
+                ConflictPolicy::KeepBoth,
+            )
+            .expect("fixture preview should persist with live descriptor anchors");
+        let old_revision = preview.revision.clone();
+        let new_revision = format!("{old_revision}-reused");
+        let initially_confirmable = manager
+            .unconfirmable_preview_ids(&[(preview.id.clone(), old_revision.clone())])
+            .expect("current preview should be confirmable while its anchor is live");
+        assert!(!initially_confirmable.contains(&preview.id));
+
+        let newer_anchors = {
+            let cache = LIVE_PREVIEW_ANCHORS
+                .get()
+                .expect("preview creation should initialize the anchor cache")
+                .lock()
+                .expect("anchor cache should remain healthy");
+            cache
+                .by_preview
+                .get(&preview.id)
+                .expect("preview should retain its registered anchors")
+                .anchors
+                .clone()
+        };
+        store_preview_anchors(&preview.id, &new_revision, newer_anchors)
+            .expect("a reused ID should replace its anchor ownership revision");
+        let mut persisted = manager
+            .read_persisted_preview(&preview.id)
+            .expect("persisted preview should remain readable");
+        persisted.preview.revision = new_revision.clone();
+        let bytes = serde_json::to_vec(&persisted).expect("replacement preview should encode");
+        manager
+            .write_private_file(&manager.preview_path(&preview.id), &bytes)
+            .expect("reused preview ID should persist the new revision");
+
+        let newer_preview = (preview.id.clone(), new_revision.clone());
+        assert!(
+            manager
+                .unconfirmable_preview_ids(std::slice::from_ref(&newer_preview))
+                .expect("new revision should match its replacement anchor entry")
+                .is_empty(),
+            "newer revision should be confirmable before stale cancellation"
+        );
+        assert!(
+            !release_preview_anchors_for_revision(&preview.id, &old_revision),
+            "stale cancellation must not release anchors now owned by the newer revision"
+        );
+        assert!(
+            manager
+                .unconfirmable_preview_ids(std::slice::from_ref(&newer_preview))
+                .expect("newer revision should remain checkable after stale release")
+                .is_empty(),
+            "newer preview should remain confirmable after cancellation of the old revision"
+        );
+
+        assert!(
+            release_preview_anchors_for_revision(&preview.id, &new_revision),
+            "cancellation of the exact current revision should release its anchor entry"
+        );
+        assert!(
+            manager
+                .unconfirmable_preview_ids(std::slice::from_ref(&newer_preview))
+                .expect("released current revision should remain a normal unavailable state")
+                .contains(&preview.id),
+            "the exact current revision should no longer be confirmable after release"
+        );
+    }
+
+    #[test]
     fn preview_anchor_lru_capacity_evicts_oldest_and_keeps_all_limits() {
         let now = Instant::now();
         let mut store = PreviewAnchorStore::default();
@@ -19203,6 +19358,7 @@ mod tests {
             store.by_preview.insert(
                 preview_id,
                 PreviewAnchorEntry {
+                    revision: "revision-capacity".to_string(),
                     anchors: HashMap::new(),
                     expires_at: now + PREVIEW_ANCHOR_TTL,
                 },

@@ -9418,3 +9418,1012 @@ async fn explicit_blank_download_category_targets_library_root_mock_e2e() {
     drop(queue);
     let _ = fs::remove_dir_all(root);
 }
+
+fn preview_cancel_test_payload(
+    preview_kind: &str,
+    preview_seq: u64,
+    preview_id: &str,
+    revision: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "preview_kind": preview_kind,
+        "preview_seq": preview_seq,
+        "preview_id": preview_id,
+        "revision": revision,
+    })
+}
+
+// Frozen copy of the schema-1 reader contract from source 9a70f1f69519c6868dbd355c0eac5891c5fe435c.
+// Keep this independent of the current InboxStatus so a persisted value added after that source
+// cannot silently make the rollback compatibility assertion tautological.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacySchema1InboxStatus {
+    Pending,
+    Processing,
+    AwaitingConfirmation,
+    Completed,
+    Retryable,
+    Failed,
+    Uncertain,
+    Stale,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct LegacySchema1CloudRequest {
+    seq: u64,
+    kind: String,
+    payload: serde_json::Value,
+    created_at: u64,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl LegacySchema1CloudRequest {
+    fn validate(&self) {
+        const LEGACY_MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+        const LEGACY_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+        const LEGACY_MAX_IMPORT_BYTES: usize = 256 * 1024;
+
+        assert!(self.seq > 0 && self.seq <= LEGACY_MAX_JS_SAFE_INTEGER);
+        assert!(self.payload.is_object());
+        if self.kind == "legacy_import" {
+            let text = self
+                .payload
+                .get("text")
+                .and_then(|value| value.as_str())
+                .expect("legacy schema-1 legacy_import payload must contain text");
+            assert!(text.len() <= LEGACY_MAX_IMPORT_BYTES);
+        }
+        let encoded = serde_json::to_vec(self).expect("legacy schema-1 request should encode");
+        assert!(encoded.len() <= LEGACY_MAX_REQUEST_BYTES);
+        // Schema 1 deliberately had no request-kind allowlist; preview_cancel remains readable.
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct LegacySchema1InboxRecord {
+    schema_version: u32,
+    request: LegacySchema1CloudRequest,
+    status: LegacySchema1InboxStatus,
+    attempts: u32,
+    #[serde(default)]
+    received_at: Option<u64>,
+    updated_at: u64,
+    #[serde(default)]
+    next_attempt_at: u64,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+}
+
+fn read_legacy_schema1_inbox_record(path: &Path) -> LegacySchema1InboxRecord {
+    let bytes =
+        fs::read(path).expect("persisted inbox record should be readable from fixture storage");
+    let record: LegacySchema1InboxRecord = serde_json::from_slice(&bytes)
+        .expect("persisted inbox record should decode with the frozen schema-1 reader");
+    assert_eq!(record.schema_version, 1);
+    record.request.validate();
+    let _legacy_fields = (
+        record.attempts,
+        record.received_at,
+        record.updated_at,
+        record.next_attempt_at,
+        record.error.as_deref(),
+        record.result.as_ref(),
+        record.request.created_at,
+        &record.request.extra,
+    );
+    record
+}
+
+#[tokio::test]
+async fn preview_cancel_rejects_completed_confirmation_after_history_eviction_and_reopen_mock_telegram_e2e()
+ {
+    const PREVIEW_SEQ: u64 = 19_101;
+    const CONFIRM_SEQ: u64 = 19_102;
+    const CANCEL_SEQ: u64 = 19_103;
+    const HISTORY_START_SEQ: u64 = 30_000;
+    const HISTORY_RECORDS: u64 = 120;
+
+    let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = media_library_e2e_tests::create_migration_fixture(
+        "preview-cancel-confirmation-gap-e2e",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let source_bytes = b"confirmed source moves exactly once";
+    let source_path = fixture.archive_root.join("crash-confirm.mp4");
+    fs::write(&source_path, source_bytes).expect("confirmation fixture should be written");
+
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let root_binding = cloud_test_root_binding(&queue, &fixture.target_library_id);
+    let item_id = media_library_e2e_tests::scan_file_item_id(
+        &runtime,
+        19_100,
+        &fixture.target_library_id,
+        "crash-confirm.mp4",
+    )
+    .await;
+    let preview = run_library_management_test_request(
+        &runtime,
+        PREVIEW_SEQ,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": root_binding,
+            "item_ids": [item_id],
+            "target_relative_dir": "confirmed-after-restart",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(
+        preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "file preview should be ready before confirmation: {:?}",
+        preview.error
+    );
+    let preview_result = preview.result.expect("preview result should be retained");
+    let preview_id = preview_result["preview_id"]
+        .as_str()
+        .expect("preview ID should be present")
+        .to_string();
+    let revision = preview_result["revision"]
+        .as_str()
+        .expect("preview revision should be present")
+        .to_string();
+
+    let confirmation = run_library_management_test_request(
+        &runtime,
+        CONFIRM_SEQ,
+        "file_confirm",
+        serde_json::json!({
+            "preview_id": preview_id,
+            "revision": revision,
+        }),
+    )
+    .await;
+    assert_eq!(
+        confirmation.status,
+        InboxStatus::Completed,
+        "the real confirmation should complete before the simulated crash gap: {:?}",
+        confirmation.error
+    );
+    let confirmation_result = confirmation
+        .result
+        .clone()
+        .expect("completed confirmation should preserve its result");
+    assert_eq!(confirmation_result["preview_id"], preview_id);
+    assert_eq!(confirmation_result["revision"], revision);
+    let confirmed_path = fixture
+        .archive_root
+        .join("confirmed-after-restart/crash-confirm.mp4");
+    assert_eq!(fs::read(&confirmed_path).unwrap(), source_bytes);
+    assert!(
+        !source_path.exists(),
+        "confirmation should move the source file"
+    );
+
+    // Leave the completed confirmation receipt intact, as if restart happened after its durable
+    // write but before the related preview update was persisted.
+    let management_permit = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.management_dispatch.clone().acquire_owned(),
+    )
+    .await
+    .expect("confirmation dispatch should finish before simulating the crash gap")
+    .expect("management semaphore should remain open");
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(management_permit);
+    let stored_confirmation = inbox
+        .record(CONFIRM_SEQ)
+        .expect("completed confirmation should reload")
+        .expect("completed confirmation receipt should remain present");
+    assert_eq!(stored_confirmation.status, InboxStatus::Completed);
+    assert_eq!(
+        stored_confirmation.result,
+        Some(confirmation_result.clone())
+    );
+    let stored_preview = inbox
+        .record(PREVIEW_SEQ)
+        .expect("preview should reload before simulating the gap")
+        .expect("preview receipt should remain present");
+    let original_preview_result = stored_preview
+        .result
+        .clone()
+        .expect("original preview result should remain durable");
+    inbox
+        .update(PREVIEW_SEQ, |record| {
+            record.status = InboxStatus::AwaitingConfirmation;
+        })
+        .expect("the simulated crash gap should preserve an awaiting preview record");
+    assert_eq!(
+        inbox.record(PREVIEW_SEQ).unwrap().unwrap().result,
+        Some(original_preview_result.clone())
+    );
+
+    for offset in 0..HISTORY_RECORDS {
+        let seq = HISTORY_START_SEQ + offset;
+        inbox
+            .persist(CloudRequest {
+                seq,
+                kind: "library_scan".to_string(),
+                payload: serde_json::json!({ "history_fixture": true, "ordinal": offset }),
+                created_at: now_millis(),
+                extra: serde_json::Map::new(),
+            })
+            .expect("unrelated management receipt should persist");
+        inbox
+            .update(seq, |record| {
+                record.status = InboxStatus::Completed;
+                record.result = Some(serde_json::json!({ "history_fixture": true }));
+            })
+            .expect("unrelated management receipt should become terminal");
+    }
+
+    let (bounded_history, _) = inbox
+        .state_records_bounded(20)
+        .expect("bounded UI history should remain readable");
+    assert!(
+        bounded_history
+            .iter()
+            .all(|record| record.request.seq != CONFIRM_SEQ),
+        "completed confirmation should be evicted from bounded recent management history"
+    );
+    assert_eq!(
+        inbox.record(CONFIRM_SEQ).unwrap().unwrap().result,
+        Some(confirmation_result.clone()),
+        "history eviction must not delete the durable confirmation proof"
+    );
+
+    drop(inbox);
+    let inbox = Arc::new(
+        open_runtime_test_inbox(&fixture.video_root).expect("crash-gap inbox should reopen"),
+    );
+    // Startup indexing is intentionally paged; continue it before submitting the next request.
+    for _ in 0..16 {
+        let _ = inbox
+            .pending()
+            .expect("bounded inbox recovery should make progress");
+    }
+    let (reopened_history, _) = inbox
+        .state_records_bounded(20)
+        .expect("reopened inbox should finish its bounded index recovery");
+    assert!(
+        reopened_history
+            .iter()
+            .all(|record| record.request.seq != CONFIRM_SEQ),
+        "reopened UI history should still omit the evicted confirmation"
+    );
+    assert_eq!(
+        inbox
+            .record(CONFIRM_SEQ)
+            .expect("confirmation proof should reload after restart")
+            .expect("confirmation proof should remain stored after UI eviction")
+            .result,
+        Some(confirmation_result.clone())
+    );
+
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let cancellation = run_library_management_test_request(
+        &runtime,
+        CANCEL_SEQ,
+        "preview_cancel",
+        preview_cancel_test_payload("file_preview", PREVIEW_SEQ, &preview_id, &revision),
+    )
+    .await;
+    assert!(
+        matches!(
+            cancellation.status,
+            InboxStatus::Failed | InboxStatus::Uncertain
+        ),
+        "a durable completed confirmation must block cancellation: {:?} {:?}",
+        cancellation.status,
+        cancellation.error
+    );
+    assert_ne!(cancellation.status, InboxStatus::Cancelled);
+    assert!(
+        !cancellation
+            .result
+            .as_ref()
+            .is_some_and(|result| result["cancelled"].as_bool() == Some(true))
+    );
+    let preview_after_cancel_attempt = inbox
+        .record(PREVIEW_SEQ)
+        .expect("preview should reload after the rejected cancellation")
+        .expect("preview receipt should remain stored");
+    assert_eq!(
+        preview_after_cancel_attempt.status,
+        InboxStatus::Completed,
+        "terminal confirmation proof should retire the stale awaiting preview"
+    );
+    assert_eq!(
+        preview_after_cancel_attempt.result,
+        Some(original_preview_result)
+    );
+    let confirmation_after_cancel_attempt = inbox
+        .record(CONFIRM_SEQ)
+        .expect("confirmation should reload after the rejected cancellation")
+        .expect("confirmation receipt should remain stored");
+    assert_eq!(
+        confirmation_after_cancel_attempt.status,
+        InboxStatus::Completed
+    );
+    assert_eq!(
+        confirmation_after_cancel_attempt.result,
+        Some(confirmation_result)
+    );
+    assert_eq!(fs::read(&confirmed_path).unwrap(), source_bytes);
+    assert!(!source_path.exists());
+
+    let permit = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.management_dispatch.clone().acquire_owned(),
+    )
+    .await
+    .expect("management dispatch should finish before cleanup")
+    .expect("management semaphore should remain open");
+    drop(permit);
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(fixture.root);
+}
+
+#[tokio::test]
+async fn preview_cancel_is_durable_binding_independent_and_preserves_completed_files_mock_telegram_e2e()
+ {
+    const CONFIRM_PREVIEW_SEQ: u64 = 9_501;
+    const CANCEL_FILE_PREVIEW_SEQ: u64 = 9_508;
+    const CANCEL_MIGRATION_PREVIEW_SEQ: u64 = 9_509;
+    const LEGACY_STALE_SCAN_SEQ: u64 = 9_515;
+    const LEGACY_STALE_PREVIEW_SEQ: u64 = 9_516;
+    const LEGACY_PREVIEW_CANCELLED_ERROR: &str = "This preview was cancelled before confirmation.";
+
+    let (telegram, _telegram_requests, shutdown, server) = spawn_fake_telegram_api().await;
+    let (fixture, queue, inbox) = media_library_e2e_tests::create_migration_fixture(
+        "preview-cancel-management-e2e",
+        crate::cloud::TEST_DATABASE_EPOCH,
+    );
+    let confirm_bytes = b"confirmed file stays complete";
+    let cancel_bytes = b"cancelled preview leaves this file in place";
+    let migration_bytes = b"cancelled migration leaves its source in place";
+    let stale_preview_bytes = b"legacy stale preview remains stale";
+    fs::write(fixture.archive_root.join("confirm-me.mp4"), confirm_bytes)
+        .expect("confirm fixture should write");
+    fs::write(fixture.archive_root.join("cancel-me.mp4"), cancel_bytes)
+        .expect("cancel fixture should write");
+    fs::write(
+        fixture.video_root.join("migration-source.mp4"),
+        migration_bytes,
+    )
+    .expect("migration fixture should write");
+    fs::write(
+        fixture.archive_root.join("legacy-stale-preview.mp4"),
+        stale_preview_bytes,
+    )
+    .expect("legacy stale preview fixture should write");
+
+    let runtime = make_runtime(
+        telegram.clone(),
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&inbox),
+    );
+    let dispatcher = tokio::spawn(cloud_request_dispatcher(runtime.clone()));
+    let archive_binding = cloud_test_root_binding(&queue, &fixture.target_library_id);
+
+    let confirm_item_id = media_library_e2e_tests::scan_file_item_id(
+        &runtime,
+        9_500,
+        &fixture.target_library_id,
+        "confirm-me.mp4",
+    )
+    .await;
+    let confirm_preview = run_library_management_test_request(
+        &runtime,
+        CONFIRM_PREVIEW_SEQ,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": archive_binding,
+            "item_ids": [confirm_item_id],
+            "target_relative_dir": "confirmed",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(
+        confirm_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        confirm_preview.error
+    );
+    let confirm_preview_result = confirm_preview
+        .result
+        .clone()
+        .expect("file preview should retain its durable result");
+    let confirm_preview_id = confirm_preview_result["preview_id"]
+        .as_str()
+        .expect("file preview should have an ID")
+        .to_string();
+    let confirm_revision = confirm_preview_result["revision"]
+        .as_str()
+        .expect("file preview should have a revision")
+        .to_string();
+
+    for (seq, payload) in [
+        (
+            9_502,
+            preview_cancel_test_payload(
+                "file_preview",
+                CONFIRM_PREVIEW_SEQ,
+                &confirm_preview_id,
+                "wrong-revision",
+            ),
+        ),
+        (
+            9_503,
+            preview_cancel_test_payload(
+                "file_preview",
+                99_999,
+                &confirm_preview_id,
+                &confirm_revision,
+            ),
+        ),
+        (
+            9_504,
+            preview_cancel_test_payload(
+                "library_migration_preview",
+                CONFIRM_PREVIEW_SEQ,
+                &confirm_preview_id,
+                &confirm_revision,
+            ),
+        ),
+    ] {
+        let rejected =
+            run_library_management_test_request(&runtime, seq, "preview_cancel", payload).await;
+        assert_eq!(
+            rejected.status,
+            InboxStatus::Failed,
+            "a mismatched preview identity must not be cancelled"
+        );
+    }
+    let still_confirmable = inbox
+        .record(CONFIRM_PREVIEW_SEQ)
+        .expect("file preview receipt should reload after rejected cancellations")
+        .expect("file preview receipt should remain present");
+    assert_eq!(still_confirmable.status, InboxStatus::AwaitingConfirmation);
+    assert_eq!(still_confirmable.result, Some(confirm_preview_result));
+
+    let confirmed = run_library_management_test_request(
+        &runtime,
+        9_505,
+        "file_confirm",
+        serde_json::json!({
+            "preview_id": confirm_preview_id,
+            "revision": confirm_revision,
+        }),
+    )
+    .await;
+    assert_eq!(
+        confirmed.status,
+        InboxStatus::Completed,
+        "{:?}",
+        confirmed.error
+    );
+    let confirmed_path = fixture.archive_root.join("confirmed/confirm-me.mp4");
+    assert_eq!(fs::read(&confirmed_path).unwrap(), confirm_bytes);
+
+    let cancel_after_confirm = run_library_management_test_request(
+        &runtime,
+        9_506,
+        "preview_cancel",
+        preview_cancel_test_payload(
+            "file_preview",
+            CONFIRM_PREVIEW_SEQ,
+            &confirm_preview_id,
+            &confirm_revision,
+        ),
+    )
+    .await;
+    assert_eq!(
+        cancel_after_confirm.status,
+        InboxStatus::Failed,
+        "a completed confirmation must not be cancelled"
+    );
+    assert_eq!(fs::read(&confirmed_path).unwrap(), confirm_bytes);
+
+    let cancel_item_id = media_library_e2e_tests::scan_file_item_id(
+        &runtime,
+        9_507,
+        &fixture.target_library_id,
+        "cancel-me.mp4",
+    )
+    .await;
+    let cancel_file_preview = run_library_management_test_request(
+        &runtime,
+        CANCEL_FILE_PREVIEW_SEQ,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": archive_binding,
+            "item_ids": [cancel_item_id],
+            "target_relative_dir": "should-not-be-created",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(
+        cancel_file_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        cancel_file_preview.error
+    );
+    let cancel_file_result = cancel_file_preview
+        .result
+        .clone()
+        .expect("cancellable file preview should retain its result");
+    let cancel_file_id = cancel_file_result["preview_id"]
+        .as_str()
+        .expect("cancellable file preview should have an ID")
+        .to_string();
+    let cancel_file_revision = cancel_file_result["revision"]
+        .as_str()
+        .expect("cancellable file preview should have a revision")
+        .to_string();
+
+    let stale_item_id = media_library_e2e_tests::scan_file_item_id(
+        &runtime,
+        LEGACY_STALE_SCAN_SEQ,
+        &fixture.target_library_id,
+        "legacy-stale-preview.mp4",
+    )
+    .await;
+    let stale_preview = run_library_management_test_request(
+        &runtime,
+        LEGACY_STALE_PREVIEW_SEQ,
+        "file_preview",
+        serde_json::json!({
+            "library_id": fixture.target_library_id,
+            "root_binding": archive_binding,
+            "item_ids": [stale_item_id],
+            "target_relative_dir": "legacy-stale-preview",
+            "conflict": "skip",
+        }),
+    )
+    .await;
+    assert_eq!(stale_preview.status, InboxStatus::AwaitingConfirmation);
+    let stale_preview_result = stale_preview
+        .result
+        .clone()
+        .expect("ordinary stale preview should retain its result");
+    let stale_preview_id = stale_preview_result["preview_id"]
+        .as_str()
+        .expect("ordinary stale preview should have an ID")
+        .to_string();
+    inbox
+        .update(LEGACY_STALE_PREVIEW_SEQ, |record| {
+            record.status = InboxStatus::Stale
+        })
+        .expect("ordinary preview should persist its legacy stale status");
+
+    let migration_preview = run_library_management_test_request(
+        &runtime,
+        CANCEL_MIGRATION_PREVIEW_SEQ,
+        "library_migration_preview",
+        bound_migration_preview_payload(
+            &queue,
+            &fixture.source_library_id,
+            &fixture.target_library_id,
+            serde_json::json!({
+                "scope": "library",
+                "conflict": "skip",
+                "include_incomplete_tasks": false,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        migration_preview.status,
+        InboxStatus::AwaitingConfirmation,
+        "{:?}",
+        migration_preview.error
+    );
+    let migration_result = migration_preview
+        .result
+        .clone()
+        .expect("migration preview should retain its durable result");
+    let migration_id = migration_result["id"]
+        .as_str()
+        .expect("migration preview should have an ID")
+        .to_string();
+    let migration_revision = migration_result["revision"]
+        .as_str()
+        .expect("migration preview should have a revision")
+        .to_string();
+
+    let offline_archive = fixture.root.join("archive-offline");
+    fs::rename(&fixture.archive_root, &offline_archive)
+        .expect("registered archive root should become unavailable for cancellation");
+    let cancelled_file = run_library_management_test_request(
+        &runtime,
+        9_510,
+        "preview_cancel",
+        preview_cancel_test_payload(
+            "file_preview",
+            CANCEL_FILE_PREVIEW_SEQ,
+            &cancel_file_id,
+            &cancel_file_revision,
+        ),
+    )
+    .await;
+    assert_eq!(
+        cancelled_file.status,
+        InboxStatus::Completed,
+        "{:?}",
+        cancelled_file.error
+    );
+    assert_eq!(cancelled_file.result.as_ref().unwrap()["cancelled"], true);
+    assert_eq!(
+        cancelled_file.result.as_ref().unwrap()["preview_kind"],
+        "file_preview"
+    );
+    assert_eq!(
+        cancelled_file.result.as_ref().unwrap()["preview_seq"],
+        CANCEL_FILE_PREVIEW_SEQ
+    );
+    assert_eq!(
+        cancelled_file.result.as_ref().unwrap()["preview_id"],
+        cancel_file_id
+    );
+    assert_eq!(
+        cancelled_file.result.as_ref().unwrap()["revision"],
+        cancel_file_revision
+    );
+
+    let repeated_cancel = run_library_management_test_request(
+        &runtime,
+        9_511,
+        "preview_cancel",
+        preview_cancel_test_payload(
+            "file_preview",
+            CANCEL_FILE_PREVIEW_SEQ,
+            &cancel_file_id,
+            &cancel_file_revision,
+        ),
+    )
+    .await;
+    assert_eq!(repeated_cancel.status, InboxStatus::Completed);
+
+    let cancelled_migration = run_library_management_test_request(
+        &runtime,
+        9_512,
+        "preview_cancel",
+        preview_cancel_test_payload(
+            "library_migration_preview",
+            CANCEL_MIGRATION_PREVIEW_SEQ,
+            &migration_id,
+            &migration_revision,
+        ),
+    )
+    .await;
+    assert_eq!(
+        cancelled_migration.status,
+        InboxStatus::Completed,
+        "cancellation must remain available when a target library root is missing: {:?}",
+        cancelled_migration.error
+    );
+    assert_eq!(
+        cancelled_migration.result.as_ref().unwrap()["cancelled"],
+        true
+    );
+
+    for (seq, preview_kind, preview_id, revision, original_result) in [
+        (
+            CANCEL_FILE_PREVIEW_SEQ,
+            "file_preview",
+            cancel_file_id.as_str(),
+            cancel_file_revision.as_str(),
+            &cancel_file_result,
+        ),
+        (
+            CANCEL_MIGRATION_PREVIEW_SEQ,
+            "library_migration_preview",
+            migration_id.as_str(),
+            migration_revision.as_str(),
+            &migration_result,
+        ),
+    ] {
+        let legacy_target = read_legacy_schema1_inbox_record(&inbox.record_path_for_test(seq));
+        assert_eq!(legacy_target.request.kind, preview_kind);
+        assert_eq!(legacy_target.status, LegacySchema1InboxStatus::Stale);
+        assert_eq!(
+            legacy_target.error.as_deref(),
+            Some(LEGACY_PREVIEW_CANCELLED_ERROR),
+            "legacy readers should retain the human-readable cancellation reason"
+        );
+        let mut expected_disk_result = original_result.clone();
+        expected_disk_result
+            .as_object_mut()
+            .expect("preview result should be an object")
+            .insert(
+                "_tvd_preview_cancelled_v1".to_string(),
+                serde_json::json!({
+                    "preview_seq": seq,
+                    "preview_kind": preview_kind,
+                    "preview_id": preview_id,
+                    "revision": revision,
+                }),
+            );
+        assert_eq!(legacy_target.result, Some(expected_disk_result));
+    }
+
+    for (seq, expected_payload) in [
+        (
+            9_510,
+            preview_cancel_test_payload(
+                "file_preview",
+                CANCEL_FILE_PREVIEW_SEQ,
+                &cancel_file_id,
+                &cancel_file_revision,
+            ),
+        ),
+        (
+            9_512,
+            preview_cancel_test_payload(
+                "library_migration_preview",
+                CANCEL_MIGRATION_PREVIEW_SEQ,
+                &migration_id,
+                &migration_revision,
+            ),
+        ),
+    ] {
+        let legacy_cancel_ack = read_legacy_schema1_inbox_record(&inbox.record_path_for_test(seq));
+        assert_eq!(legacy_cancel_ack.request.kind, "preview_cancel");
+        assert_eq!(legacy_cancel_ack.request.payload, expected_payload);
+        assert_eq!(
+            legacy_cancel_ack.status,
+            LegacySchema1InboxStatus::Completed
+        );
+        assert_eq!(
+            legacy_cancel_ack.result.as_ref().unwrap()["cancelled"],
+            true
+        );
+    }
+
+    let legacy_stale_without_marker =
+        read_legacy_schema1_inbox_record(&inbox.record_path_for_test(LEGACY_STALE_PREVIEW_SEQ));
+    assert_eq!(
+        legacy_stale_without_marker.status,
+        LegacySchema1InboxStatus::Stale
+    );
+    assert_eq!(legacy_stale_without_marker.request.kind, "file_preview");
+    assert_eq!(
+        legacy_stale_without_marker.result,
+        Some(stale_preview_result.clone())
+    );
+    assert!(
+        legacy_stale_without_marker
+            .result
+            .as_ref()
+            .unwrap()
+            .get("_tvd_preview_cancelled_v1")
+            .is_none()
+    );
+
+    let file_cancelled_record = inbox
+        .record(CANCEL_FILE_PREVIEW_SEQ)
+        .expect("cancelled file preview receipt should reload")
+        .expect("cancelled file preview receipt should remain present");
+    assert_eq!(file_cancelled_record.status, InboxStatus::Cancelled);
+    assert_eq!(
+        file_cancelled_record.result,
+        Some(cancel_file_result.clone())
+    );
+    let migration_cancelled_record = inbox
+        .record(CANCEL_MIGRATION_PREVIEW_SEQ)
+        .expect("cancelled migration preview receipt should reload")
+        .expect("cancelled migration preview receipt should remain present");
+    assert_eq!(migration_cancelled_record.status, InboxStatus::Cancelled);
+    assert_eq!(
+        migration_cancelled_record.result,
+        Some(migration_result.clone())
+    );
+    let stale_without_marker = inbox
+        .record(LEGACY_STALE_PREVIEW_SEQ)
+        .expect("ordinary stale preview receipt should reload")
+        .expect("ordinary stale preview receipt should remain present");
+    assert_eq!(stale_without_marker.status, InboxStatus::Stale);
+    assert_eq!(
+        stale_without_marker.result,
+        Some(stale_preview_result.clone())
+    );
+
+    let permit = tokio::time::timeout(
+        Duration::from_secs(5),
+        runtime.management_dispatch.clone().acquire_owned(),
+    )
+    .await
+    .expect("management dispatch should finish before reopening the inbox")
+    .expect("management semaphore should remain open");
+    drop(permit);
+    dispatcher.abort();
+    let _ = dispatcher.await;
+    drop(runtime);
+    drop(inbox);
+
+    let reopened_inbox = Arc::new(
+        open_runtime_test_inbox(&fixture.video_root).expect("cancelled inbox should reopen"),
+    );
+    for (seq, expected_result) in [
+        (CANCEL_FILE_PREVIEW_SEQ, &cancel_file_result),
+        (CANCEL_MIGRATION_PREVIEW_SEQ, &migration_result),
+    ] {
+        let record = reopened_inbox
+            .record(seq)
+            .expect("reopened preview receipt should load")
+            .expect("reopened preview receipt should remain present");
+        assert_eq!(record.status, InboxStatus::Cancelled);
+        assert_eq!(record.result, Some((*expected_result).clone()));
+        assert_eq!(
+            record.error.as_deref(),
+            Some(LEGACY_PREVIEW_CANCELLED_ERROR),
+            "the current reader should retain the human-readable cancellation reason"
+        );
+        let runtime_projection =
+            serde_json::to_value(&record).expect("reopened runtime cancellation should serialize");
+        assert_eq!(runtime_projection["status"], "cancelled");
+        assert_eq!(&runtime_projection["result"], expected_result);
+        assert!(
+            runtime_projection["result"]
+                .get("_tvd_preview_cancelled_v1")
+                .is_none()
+        );
+    }
+    for seq in [9_510, 9_512] {
+        let cancellation_ack = reopened_inbox
+            .record(seq)
+            .expect("reopened preview_cancel acknowledgement should load")
+            .expect("reopened preview_cancel acknowledgement should remain present");
+        assert_eq!(cancellation_ack.request.kind, "preview_cancel");
+        assert_eq!(cancellation_ack.status, InboxStatus::Completed);
+    }
+    let reopened_stale_without_marker = reopened_inbox
+        .record(LEGACY_STALE_PREVIEW_SEQ)
+        .expect("ordinary stale preview should reopen")
+        .expect("ordinary stale preview should remain present");
+    assert_eq!(reopened_stale_without_marker.status, InboxStatus::Stale);
+    assert_eq!(
+        reopened_stale_without_marker.result,
+        Some(stale_preview_result.clone())
+    );
+
+    fs::rename(&offline_archive, &fixture.archive_root)
+        .expect("archive root should restore after the offline cancellation check");
+    let reopened_runtime = make_runtime(
+        telegram,
+        fixture.config.clone(),
+        Arc::clone(&queue),
+        Arc::clone(&reopened_inbox),
+    );
+    let reopened_snapshot = build_cloud_state_snapshot(&reopened_runtime)
+        .await
+        .expect("cloud state should project the reopened cancellation history")
+        .expect("runtime should publish a cloud state snapshot");
+    for (seq, preview_id) in [
+        (CANCEL_FILE_PREVIEW_SEQ, cancel_file_id.as_str()),
+        (CANCEL_MIGRATION_PREVIEW_SEQ, migration_id.as_str()),
+    ] {
+        let operation = reopened_snapshot
+            .operations
+            .iter()
+            .find(|entry| entry["seq"].as_u64() == Some(seq))
+            .expect("cancelled preview should remain in operation history");
+        assert_eq!(operation["status"], "cancelled");
+        assert!(
+            reopened_snapshot
+                .previews
+                .iter()
+                .all(|entry| entry["preview_id"] != preview_id)
+        );
+    }
+    let cancellation_operation = reopened_snapshot
+        .operations
+        .iter()
+        .find(|entry| entry["seq"].as_u64() == Some(9_510))
+        .expect("reopened preview_cancel acknowledgement should be indexed in history");
+    assert_eq!(cancellation_operation["kind"], "preview_cancel");
+    assert_eq!(cancellation_operation["status"], "completed");
+    assert_eq!(cancellation_operation["result"]["cancelled"], true);
+    let stale_operation = reopened_snapshot
+        .operations
+        .iter()
+        .find(|entry| entry["seq"].as_u64() == Some(LEGACY_STALE_PREVIEW_SEQ))
+        .expect("ordinary stale preview should remain in history after index rebuild");
+    assert_eq!(stale_operation["kind"], "file_preview");
+    assert_eq!(stale_operation["status"], "stale");
+    assert!(
+        reopened_snapshot
+            .previews
+            .iter()
+            .all(|entry| entry["preview_id"] != stale_preview_id)
+    );
+
+    let reopened_dispatcher = tokio::spawn(cloud_request_dispatcher(reopened_runtime.clone()));
+    let later_file_confirm = run_library_management_test_request(
+        &reopened_runtime,
+        9_513,
+        "file_confirm",
+        serde_json::json!({
+            "preview_id": cancel_file_id,
+            "revision": cancel_file_revision,
+        }),
+    )
+    .await;
+    assert_eq!(later_file_confirm.status, InboxStatus::Failed);
+    let later_migration_confirm = run_library_management_test_request(
+        &reopened_runtime,
+        9_514,
+        "library_migration_confirm",
+        serde_json::json!({
+            "preview_id": migration_id,
+            "revision": migration_revision,
+        }),
+    )
+    .await;
+    assert_eq!(later_migration_confirm.status, InboxStatus::Failed);
+
+    let restored_cancel_path = fixture.archive_root.join("cancel-me.mp4");
+    assert_eq!(fs::read(&restored_cancel_path).unwrap(), cancel_bytes);
+    assert!(
+        !fixture
+            .archive_root
+            .join("should-not-be-created/cancel-me.mp4")
+            .exists()
+    );
+    assert_eq!(fs::read(&confirmed_path).unwrap(), confirm_bytes);
+    assert_eq!(
+        fs::read(fixture.video_root.join("migration-source.mp4")).unwrap(),
+        migration_bytes
+    );
+    assert_eq!(
+        fs::read(fixture.archive_root.join("legacy-stale-preview.mp4")).unwrap(),
+        stale_preview_bytes
+    );
+    assert!(!fixture.archive_root.join("migration-source.mp4").exists());
+
+    let permit = tokio::time::timeout(
+        Duration::from_secs(5),
+        reopened_runtime.management_dispatch.clone().acquire_owned(),
+    )
+    .await
+    .expect("reopened management dispatch should finish before cleanup")
+    .expect("reopened management semaphore should remain open");
+    drop(permit);
+    reopened_dispatcher.abort();
+    let _ = reopened_dispatcher.await;
+    drop(reopened_runtime);
+    drop(reopened_inbox);
+    drop(queue);
+    stop_fake_telegram_api(shutdown, server).await;
+    let _ = fs::remove_dir_all(fixture.root);
+}

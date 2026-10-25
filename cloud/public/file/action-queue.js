@@ -118,6 +118,11 @@ export function nextQueuedActionForSurface(queue, surface, excludedIds = new Set
   ) ?? null;
 }
 
+function beforeReceiptAcknowledged(callback, action, receipt, applied, surface) {
+  if (typeof callback !== "function") return true;
+  try { return callback(action, receipt, applied, surface) !== false; } catch { return false; }
+}
+
 export async function dispatchNextOwnedAction({
   surface,
   readQueue,
@@ -176,7 +181,9 @@ export async function dispatchNextOwnedAction({
       if (receiptUpdate?.persisted !== true) {
         return { status: "rejection_receipt_failed", action, error, receiptUpdate };
       }
-      const removed = writeQueue(removeQueuedAction(readQueue(), action.request_id));
+      const queue = readQueue();
+      const removed = !queue.some((entry) => entry?.request_id === action.request_id)
+        || writeQueue(removeQueuedAction(queue, action.request_id));
       if (removed) receiptUpdate?.consume?.();
       return removed
         ? { status: "rejected", action, rejection, receiptUpdate }
@@ -198,7 +205,9 @@ export async function dispatchNextOwnedAction({
     return { status: "receipt_failed", action, receipt, receiptUpdate };
   }
 
-  const removed = writeQueue(removeQueuedAction(readQueue(), action.request_id));
+  const queue = readQueue();
+  const removed = !queue.some((entry) => entry?.request_id === action.request_id)
+    || writeQueue(removeQueuedAction(queue, action.request_id));
   return { status: removed ? "sent" : "remove_failed", action, receipt, receiptUpdate };
 }
 
@@ -259,7 +268,7 @@ function persistOutcomeUnknown(action, code, error, readQueue, writeQueue) {
 function needsDurableReceipt(action, surface) {
   if (!action || !actionBelongsToSurface(action, surface)) return false;
   if (surface === ACTION_SURFACE_SETTINGS) return SETTINGS_ACTION_KINDS.has(action.kind);
-  return action.kind === "download_submit"
+  return action.kind === "download_submit" || action.kind === "preview_cancel"
     || action.kind === "library_migration_preview" && hasSupersessionPayload(action.payload);
 }
 
@@ -324,6 +333,7 @@ function validReceiptRecord(value, expectedRequestId) {
 
 function applyReceiptToTrackers(action, receipt, state, surface) {
   const result = { matched: false, localAction: false, downloadSubmission: false, migrationConflictDrafts: 0, rejected: false };
+  let previewCancellationMatched = false;
   if (!validRequestId(action?.request_id)) return result;
   const rejected = receipt?.outcome === "rejected";
   if (rejected ? !validReceiptRecord({ ...receipt, version: 1, request_id: action.request_id, surface, kind: action.kind, stored_at: 1 }, action.request_id)
@@ -373,8 +383,24 @@ function applyReceiptToTrackers(action, receipt, state, surface) {
     }
   }
 
-  result.rejected = rejected && (result.localAction || result.downloadSubmission || result.migrationConflictDrafts > 0);
-  result.matched = result.localAction || result.downloadSubmission || result.migrationConflictDrafts > 0;
+  if (surface === ACTION_SURFACE_FILE && action.kind === "preview_cancel"
+      && state?.previewCancellations instanceof Map) {
+    for (const tracker of state.previewCancellations.values()) {
+      if (tracker?.requestId !== action.request_id || tracker.seq != null && tracker.seq !== receipt.seq) continue;
+      if (rejected) {
+        tracker.status = "failed";
+        tracker.error = receipt.error;
+      } else {
+        tracker.status = "submitted";
+        tracker.seq = receipt.seq;
+        tracker.error = null;
+      }
+      previewCancellationMatched = true;
+    }
+  }
+
+  result.rejected = rejected && (result.localAction || result.downloadSubmission || result.migrationConflictDrafts > 0 || previewCancellationMatched);
+  result.matched = result.localAction || result.downloadSubmission || result.migrationConflictDrafts > 0 || previewCancellationMatched;
   return result;
 }
 
@@ -393,6 +419,11 @@ function trackerKinds(state, requestId, surface) {
         && [...state.migrationConflictDrafts.values()].some((draft) => (draft.refreshRequestId === requestId || draft.rejectedRefreshRequestId === requestId)
           && (draft.refreshSeq == null || Number.isSafeInteger(draft.refreshSeq)))) {
       kinds.add("library_migration_preview");
+    }
+    if (state?.previewCancellations instanceof Map
+        && [...state.previewCancellations.values()].some((tracker) => tracker?.requestId === requestId
+          && (tracker.seq == null || Number.isSafeInteger(tracker.seq)))) {
+      kinds.add("preview_cancel");
     }
   }
   return kinds;
@@ -418,11 +449,23 @@ function trackerIds(state, surface) {
         }
       }
     }
+    if (state?.previewCancellations instanceof Map) {
+      for (const tracker of state.previewCancellations.values()) {
+        if ((tracker?.seq == null || Number.isSafeInteger(tracker.seq)) && validRequestId(tracker?.requestId)) {
+          ids.add(tracker.requestId);
+        }
+      }
+    }
   }
   return ids;
 }
 
-export function recordActionReceipt(action, receipt, state = {}, { surface = action?.surface, storage, now = Date.now() } = {}) {
+export function recordActionReceipt(action, receipt, state = {}, {
+  surface = action?.surface,
+  storage,
+  now = Date.now(),
+  beforeAcknowledge,
+} = {}) {
   const resolvedSurface = surface ?? (SETTINGS_ACTION_KINDS.has(action?.kind) ? ACTION_SURFACE_SETTINGS : ACTION_SURFACE_FILE);
   const result = { persisted: false, matched: false, localAction: false, downloadSubmission: false, migrationConflictDrafts: 0, rejected: false, rejectedRequestIds: [] };
   if (!needsDurableReceipt(action, resolvedSurface)) {
@@ -458,6 +501,11 @@ export function recordActionReceipt(action, receipt, state = {}, { surface = act
   result.persisted = true;
   const applied = applyReceiptToTrackers(action, receipt, state, resolvedSurface);
   Object.assign(result, applied);
+  if (!beforeReceiptAcknowledged(beforeAcknowledge, action, receipt, applied, resolvedSurface)) {
+    result.persisted = false;
+    result.acknowledgementBlocked = true;
+    return result;
+  }
   if (applied.rejected) result.rejectedRequestIds.push(action.request_id);
   if (applied.matched && !rejected) {
     try { targetStorage.removeItem(receiptStorageKey(action.request_id)); } catch { /* Re-reading this receipt is idempotent. */ }
@@ -470,8 +518,8 @@ export function recordActionReceipt(action, receipt, state = {}, { surface = act
   return result;
 }
 
-export function recoverActionReceipts(state, { surface, storage } = {}) {
-  const result = { matched: 0, localActions: false, downloadSubmission: false, migrationConflictDrafts: 0, requestIds: [], rejectedRequestIds: [], rejections: [] };
+export function recoverActionReceipts(state, { surface, storage, beforeAcknowledge } = {}) {
+  const result = { matched: 0, localActions: false, downloadSubmission: false, migrationConflictDrafts: 0, requestIds: [], blockedRequestIds: [], rejectedRequestIds: [], rejections: [] };
   if (surface !== ACTION_SURFACE_SETTINGS && surface !== ACTION_SURFACE_FILE) return result;
   const targetStorage = getStorage(storage);
   if (!targetStorage || typeof targetStorage.getItem !== "function") return result;
@@ -483,6 +531,10 @@ export function recoverActionReceipts(state, { surface, storage } = {}) {
     try { record = JSON.parse(targetStorage.getItem(receiptStorageKey(requestId)) ?? "null"); } catch { continue; }
     if (!validReceiptRecord(record, requestId) || record.surface !== surface || !kinds.has(record.kind)) continue;
     const applied = applyReceiptToTrackers({ request_id: requestId, kind: record.kind }, record, state, surface);
+    if (!beforeReceiptAcknowledged(beforeAcknowledge, { request_id: requestId, kind: record.kind }, record, applied, surface)) {
+      result.blockedRequestIds.push(requestId);
+      continue;
+    }
     if (!applied.matched) continue;
     result.matched += 1;
     result.localActions ||= applied.localAction;
@@ -499,7 +551,8 @@ export function recoverActionReceipts(state, { surface, storage } = {}) {
   }
 
   // Unmatched keys may belong to a sleeping origin tab. Accepted receipts are
-  // consumed here; rejected receipts stay until the origin removes its queue row.
+  // consumed here after any supplied acknowledgement gate succeeds; rejected
+  // receipts stay until the origin removes its queue row.
   return result;
 }
 
@@ -528,7 +581,9 @@ function hasRejectedTracker(state, requestId, surface) {
   if (surface === ACTION_SURFACE_FILE) {
     return state?.downloadSubmission?.request_id === requestId && state.downloadSubmission.rejected === true
       || state?.migrationConflictDrafts instanceof Map
-        && [...state.migrationConflictDrafts.values()].some((draft) => draft.rejectedRefreshRequestId === requestId);
+        && [...state.migrationConflictDrafts.values()].some((draft) => draft.rejectedRefreshRequestId === requestId)
+      || state?.previewCancellations instanceof Map
+        && [...state.previewCancellations.values()].some((tracker) => tracker.requestId === requestId && tracker.status === "failed");
   }
   return false;
 }

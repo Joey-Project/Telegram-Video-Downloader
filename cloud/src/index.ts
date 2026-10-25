@@ -69,6 +69,7 @@ const REQUEST_KINDS = new Set<RequestKind>([
   "metadata_recover",
   "file_preview",
   "file_confirm",
+  "preview_cancel",
   "legacy_import",
   "download_submit",
   "library_migration_preview",

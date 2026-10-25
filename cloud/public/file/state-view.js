@@ -30,8 +30,11 @@ const TERMINAL_PREVIEW_STATUSES = new Set([
   "failed",
   "uncertain",
   "partial_failure",
+  "partial",
   "stale",
   "rejected",
+  "stopped",
+  "superseded",
 ]);
 
 const TERMINAL_WAITING_STATUSES = new Set([
@@ -39,6 +42,14 @@ const TERMINAL_WAITING_STATUSES = new Set([
   "failed",
   "cancelled",
   "confirmed",
+  "expired",
+  "stale",
+  "rejected",
+  "uncertain",
+  "partial_failure",
+  "partial",
+  "stopped",
+  "superseded",
 ]);
 
 export function isPresentMedia(item) {
@@ -64,7 +75,7 @@ export function isIncompletePreview(entry) {
 
 export function isWaitingEntryPending(entry) {
   const status = String(entry?.status ?? "pending").toLowerCase();
-  return entry?.kind === "file_preview"
+  return ["file_preview", "library_migration_preview"].includes(entry?.kind)
     ? isReviewablePreviewStatus(status)
     : !TERMINAL_WAITING_STATUSES.has(status);
 }

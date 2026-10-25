@@ -79,6 +79,7 @@ use crate::downloader::{
 };
 use crate::file_manager::{
     LibraryManager, PreviewBuildRequest, metadata_title_within_limits, release_preview_anchors,
+    release_preview_anchors_for_revision,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 use crate::library::{
@@ -3006,8 +3007,64 @@ struct FileConfirmPayload {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PreviewCancelPayload {
+    preview_kind: String,
+    preview_seq: u64,
+    preview_id: String,
+    revision: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LegacyImportPayload {
     text: String,
+}
+
+async fn dispatch_cloud_preview_cancel(
+    runtime: &CloudBotRuntime,
+    request: &CloudRequest,
+) -> Result<CloudDispatchOutcome> {
+    let payload: PreviewCancelPayload = match serde_json::from_value(request.payload.clone()) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return Ok(cloud_dispatch_failure(format!(
+                "invalid preview_cancel payload: {error}"
+            )));
+        }
+    };
+
+    let inbox = Arc::clone(&runtime.inbox);
+    let preview_kind = payload.preview_kind.clone();
+    let preview_id = payload.preview_id.clone();
+    let revision = payload.revision.clone();
+    let preview_seq = payload.preview_seq;
+    let cancelled = tokio::task::spawn_blocking(move || {
+        inbox.cancel_awaiting_preview(&preview_kind, preview_seq, &preview_id, &revision)
+    })
+    .await
+    .context("cloud preview cancellation worker failed")??;
+
+    if cancelled.is_none() {
+        return Ok(cloud_dispatch_failure(
+            "This preview is no longer cancellable or its identity does not match. Refresh Requests and check History or Organizing for any prior confirmation.",
+        ));
+    }
+
+    if payload.preview_kind == "file_preview" {
+        release_preview_anchors_for_revision(&payload.preview_id, &payload.revision);
+    }
+    Ok(CloudDispatchOutcome {
+        status: InboxStatus::Completed,
+        result: Some(serde_json::json!({
+            "cancelled": true,
+            "preview_kind": payload.preview_kind,
+            "preview_seq": payload.preview_seq,
+            "preview_id": payload.preview_id,
+            "revision": payload.revision,
+        })),
+        error: None,
+        related_preview: None,
+    })
 }
 
 async fn dispatch_cloud_record(runtime: CloudBotRuntime, record: InboxRecord) {
@@ -3300,6 +3357,9 @@ async fn dispatch_cloud_management(
     runtime: &CloudBotRuntime,
     request: &CloudRequest,
 ) -> Result<CloudDispatchOutcome> {
+    if request.kind == "preview_cancel" {
+        return dispatch_cloud_preview_cancel(runtime, request).await;
+    }
     if !matches!(
         request.kind.as_str(),
         "file_preview" | "file_confirm" | "legacy_import"

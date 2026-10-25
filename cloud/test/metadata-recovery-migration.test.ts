@@ -6,14 +6,14 @@ import { describe, expect, it } from "vitest";
 const testEnv = env as typeof env & { TEST_MIGRATIONS: D1Migration[] };
 const probeMigrationsTable = "metadata_recovery_probe_migrations";
 
-function metadataRecoveryProbeMigration(queries: string[]): D1Migration {
-  const source = testEnv.TEST_MIGRATIONS.find(({ name }) => name.includes("0005_metadata_recovery_kind"));
-  if (!source) throw new Error("Migration 0005 metadata_recovery_kind was not loaded for the test");
+function inboxProbeMigration(migrationName: string, temporaryTable: string, queries: string[]): D1Migration {
+  const source = testEnv.TEST_MIGRATIONS.find(({ name }) => name.includes(migrationName));
+  if (!source) throw new Error(`Migration ${migrationName} was not loaded for the test`);
   return {
-    name: "0005_metadata_recovery_probe",
+    name: `${migrationName}_probe`,
     queries: [
       ...source.queries.map((query) => query
-        .replaceAll("inbox_with_metadata_recovery_kind", "inbox_probe_with_metadata_recovery_kind")
+        .replaceAll(temporaryTable, "inbox_probe_with_new_kind")
         .replaceAll("inbox_sequence_backup", "inbox_probe_sequence_backup")
         .replaceAll("inbox_pending_seq", "inbox_probe_pending_seq")
         .replace(/\binbox\b/gu, "inbox_probe")),
@@ -34,7 +34,11 @@ async function createOldInboxProbe() {
   )`).run();
 }
 
-describe("metadata recovery inbox migration", () => {
+describe.each([
+  { migrationName: "0005_metadata_recovery_kind", temporaryTable: "inbox_with_metadata_recovery_kind", newKind: "metadata_recover" },
+  { migrationName: "0006_preview_cancel_kind", temporaryTable: "inbox_with_preview_cancel_kind", newKind: "preview_cancel" },
+])("$migrationName inbox migration", ({ migrationName, temporaryTable, newKind }) => {
+  const migration = (queries: string[]) => inboxProbeMigration(migrationName, temporaryTable, queries);
   it("preserves populated inbox fields and rolls back the failed migration atomically", async () => {
     await createOldInboxProbe();
     const originalRows = [
@@ -66,25 +70,25 @@ describe("metadata recovery inbox migration", () => {
     }
     await testEnv.DB.prepare("UPDATE sqlite_sequence SET seq = 41 WHERE name = 'inbox_probe'").run();
 
-    const failed = metadataRecoveryProbeMigration(["INSERT INTO metadata_recovery_probe_failure (id) VALUES (1)"]);
+    const failed = migration(["INSERT INTO metadata_recovery_probe_failure (id) VALUES (1)"]);
     await expect(applyD1Migrations(testEnv.DB, [failed], probeMigrationsTable)).rejects.toThrow();
 
     const afterRollback = await testEnv.DB.prepare(`SELECT seq, dedup_key, payload_hash, kind, payload_json, created_at, acked_at
       FROM inbox_probe ORDER BY seq`).all<Record<string, unknown>>();
     expect(afterRollback.results).toEqual(originalRows);
-    const probeTable = await testEnv.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'inbox_probe_with_metadata_recovery_kind'").first();
+    const probeTable = await testEnv.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'inbox_probe_with_new_kind'").first();
     expect(probeTable).toBeNull();
 
-    await applyD1Migrations(testEnv.DB, [metadataRecoveryProbeMigration([])], probeMigrationsTable);
+    await applyD1Migrations(testEnv.DB, [migration([])], probeMigrationsTable);
     const preservedRows = await testEnv.DB.prepare(`SELECT seq, dedup_key, payload_hash, kind, payload_json, created_at, acked_at
       FROM inbox_probe ORDER BY seq`).all<Record<string, unknown>>();
     expect(preservedRows.results).toEqual(originalRows);
 
     const next = await testEnv.DB.prepare(`INSERT INTO inbox_probe
       (dedup_key, payload_hash, kind, payload_json, created_at)
-      VALUES ('action:recovery-request', 'recovery-payload-hash', 'metadata_recover',
+      VALUES ('action:recovery-request', 'recovery-payload-hash', ?,
         '{"library_id":"main","scope":"library"}', 1_800_000_005)
-      RETURNING seq`).first<{ seq: number }>();
+      RETURNING seq`).bind(newKind).first<{ seq: number }>();
     expect(next?.seq).toBe(42);
 
     const duplicate = await testEnv.DB.prepare(`INSERT INTO inbox_probe
@@ -103,7 +107,7 @@ describe("metadata recovery inbox migration", () => {
     await testEnv.DB.prepare("DELETE FROM inbox_probe").run();
     await testEnv.DB.prepare("UPDATE sqlite_sequence SET seq = 89 WHERE name = 'inbox_probe'").run();
 
-    await applyD1Migrations(testEnv.DB, [metadataRecoveryProbeMigration([])], probeMigrationsTable);
+    await applyD1Migrations(testEnv.DB, [migration([])], probeMigrationsTable);
 
     const count = await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM inbox_probe").first<{ count: number }>();
     const savedSequence = await testEnv.DB.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'inbox_probe'").first<{ seq: number }>();
@@ -111,9 +115,9 @@ describe("metadata recovery inbox migration", () => {
     expect(savedSequence?.seq).toBe(89);
     const next = await testEnv.DB.prepare(`INSERT INTO inbox_probe
       (dedup_key, payload_hash, kind, payload_json, created_at)
-      VALUES ('action:recovery-request', 'recovery-payload-hash', 'metadata_recover',
+      VALUES ('action:recovery-request', 'recovery-payload-hash', ?,
         '{"library_id":"main","scope":"library"}', 1_800_000_005)
-      RETURNING seq`).first<{ seq: number }>();
+      RETURNING seq`).bind(newKind).first<{ seq: number }>();
     expect(next?.seq).toBe(90);
   });
 });

@@ -45,6 +45,27 @@ export interface MigrationConflictReceiptTracker {
   refreshExpiresAtMs?: number | null;
   refreshDeliveryOutcome?: "outcome_unknown" | null;
 }
+export interface PreviewCancellationReceiptTracker {
+  requestId?: string | null;
+  seq?: number | null;
+  status?: "queued" | "submitted" | "failed" | "unknown";
+  error?: string | null;
+}
+
+export interface ActionReceiptApplication {
+  matched: boolean;
+  localAction: boolean;
+  downloadSubmission: boolean;
+  migrationConflictDrafts: number;
+  rejected: boolean;
+}
+
+export type BeforeActionReceiptAcknowledge = (
+  action: Pick<QueuedAction, "request_id" | "kind">,
+  receipt: unknown,
+  applied: ActionReceiptApplication,
+  surface: "settings" | "file",
+) => boolean;
 
 export const ACTION_QUEUE_LIMIT: number;
 export const ACTION_REPLAY_WINDOW_MS: number;
@@ -99,22 +120,25 @@ export function recordActionReceipt(
     localActions?: ReadonlyMap<string, LocalActionReceiptTracker>;
     downloadSubmission?: DownloadSubmissionReceiptTracker | null;
     migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
+    previewCancellations?: ReadonlyMap<string, PreviewCancellationReceiptTracker>;
   },
-  options?: { surface?: "settings" | "file"; storage?: Storage; now?: number },
-): { persisted: boolean; matched: boolean; localAction: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; rejected?: boolean; rejectedRequestIds?: string[]; consume?: () => void };
+  options?: { surface?: "settings" | "file"; storage?: Storage; now?: number; beforeAcknowledge?: BeforeActionReceiptAcknowledge },
+): { persisted: boolean; matched: boolean; localAction: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; rejected?: boolean; rejectedRequestIds?: string[]; acknowledgementBlocked?: boolean; consume?: () => void };
 export function recoverActionReceipts(
   state: {
     localActions?: ReadonlyMap<string, LocalActionReceiptTracker>;
     downloadSubmission?: DownloadSubmissionReceiptTracker | null;
     migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
+    previewCancellations?: ReadonlyMap<string, PreviewCancellationReceiptTracker>;
   },
-  options: { surface: "settings" | "file"; storage?: Storage },
-): { matched: number; localActions: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; requestIds: string[]; rejectedRequestIds: string[]; rejections: Array<{ request_id: string; kind: string; status: number; error: string }> };
+  options: { surface: "settings" | "file"; storage?: Storage; beforeAcknowledge?: BeforeActionReceiptAcknowledge },
+): { matched: number; localActions: boolean; downloadSubmission: boolean; migrationConflictDrafts: number; requestIds: string[]; blockedRequestIds: string[]; rejectedRequestIds: string[]; rejections: Array<{ request_id: string; kind: string; status: number; error: string }> };
 export function consumeRejectedActionReceipts(
   state: {
     localActions?: ReadonlyMap<string, LocalActionReceiptTracker>;
     downloadSubmission?: DownloadSubmissionReceiptTracker | null;
     migrationConflictDrafts?: ReadonlyMap<string, MigrationConflictReceiptTracker>;
+    previewCancellations?: ReadonlyMap<string, PreviewCancellationReceiptTracker>;
   },
   options: { surface: "settings" | "file"; requestIds: readonly string[]; storage?: Storage },
 ): { consumed: number };
