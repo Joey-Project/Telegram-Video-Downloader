@@ -1,7 +1,9 @@
 export const PREVIEW_CANCELLATION_STORAGE_KEY = "file-manager.preview-cancellations.v1";
+export const PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY = "file-manager.preview-cancellation-dismissals.v1";
 
 const FORMAT_VERSION = 1;
 const MAX_ENTRIES = 100;
+const MAX_DISMISSAL_MARKERS = 128;
 const MAX_RAW_BYTES = 256 * 1024;
 const MAX_KEY_BYTES = 1_024;
 const MAX_ID_BYTES = 128;
@@ -166,6 +168,73 @@ export function writePreviewCancellations(storage, cancellations) {
     const serialized = JSON.stringify({ version: FORMAT_VERSION, entries });
     if (!withinUtf8Limit(serialized, MAX_RAW_BYTES)) return false;
     storage.setItem(PREVIEW_CANCELLATION_STORAGE_KEY, serialized);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function readPreviewCancellationDismissals(storage) {
+  try {
+    if (!storage || typeof storage.getItem !== "function") return null;
+    const raw = storage.getItem(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY);
+    if (raw === null) return new Map();
+    if (!withinUtf8Limit(raw, MAX_RAW_BYTES)) return null;
+    const envelope = JSON.parse(raw);
+    if (!hasExactKeys(envelope, ENVELOPE_KEYS)
+        || envelope.version !== FORMAT_VERSION
+        || !Array.isArray(envelope.entries)
+        || envelope.entries.length > MAX_DISMISSAL_MARKERS) return null;
+
+    const dismissals = new Map();
+    let markerCount = 0;
+    for (const entry of envelope.entries) {
+      if (!hasExactKeys(entry, ["key", "request_ids"])
+          || typeof entry.key !== "string"
+          || !identityFromKey(entry.key)
+          || !Array.isArray(entry.request_ids)
+          || entry.request_ids.length === 0
+          || dismissals.has(entry.key)) return null;
+      const requestIds = new Set();
+      for (const requestId of entry.request_ids) {
+        if (typeof requestId !== "string" || !REQUEST_ID_PATTERN.test(requestId) || requestIds.has(requestId)) return null;
+        requestIds.add(requestId);
+      }
+      markerCount += requestIds.size;
+      if (markerCount > MAX_DISMISSAL_MARKERS) return null;
+      dismissals.set(entry.key, requestIds);
+    }
+    return dismissals;
+  } catch {
+    return null;
+  }
+}
+
+export function writePreviewCancellationDismissals(storage, dismissals) {
+  try {
+    if (!storage || !(dismissals instanceof Map)) return false;
+    const entries = [];
+    let markerCount = 0;
+    for (const [key, requestIds] of dismissals) {
+      if (typeof key !== "string" || !identityFromKey(key)
+          || !(requestIds instanceof Set) || requestIds.size === 0) return false;
+      for (const requestId of requestIds) {
+        if (typeof requestId !== "string" || !REQUEST_ID_PATTERN.test(requestId)) return false;
+      }
+      markerCount += requestIds.size;
+      if (markerCount > MAX_DISMISSAL_MARKERS) return false;
+      entries.push({ key, request_ids: [...requestIds].sort() });
+    }
+    if (entries.length === 0) {
+      if (typeof storage.removeItem !== "function") return false;
+      storage.removeItem(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY);
+      return true;
+    }
+    entries.sort((left, right) => (left.key < right.key ? -1 : left.key > right.key ? 1 : 0));
+    if (typeof storage.setItem !== "function") return false;
+    const serialized = JSON.stringify({ version: FORMAT_VERSION, entries });
+    if (!withinUtf8Limit(serialized, MAX_RAW_BYTES)) return false;
+    storage.setItem(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY, serialized);
     return true;
   } catch {
     return false;

@@ -79,6 +79,7 @@ use crate::downloader::{
 };
 use crate::file_manager::{
     LibraryManager, PreviewBuildRequest, metadata_title_within_limits, release_preview_anchors,
+    release_preview_anchors_for_revision,
 };
 use crate::file_provider::{classify_deadlock_error, is_file_provider_access_error};
 use crate::library::{
@@ -3050,7 +3051,7 @@ async fn dispatch_cloud_preview_cancel(
     }
 
     if payload.preview_kind == "file_preview" {
-        release_preview_anchors(&payload.preview_id);
+        release_preview_anchors_for_revision(&payload.preview_id, &payload.revision);
     }
     Ok(CloudDispatchOutcome {
         status: InboxStatus::Completed,

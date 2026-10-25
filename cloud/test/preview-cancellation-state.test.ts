@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY,
   PREVIEW_CANCELLATION_STORAGE_KEY,
+  readPreviewCancellationDismissals,
   readPreviewCancellations,
+  writePreviewCancellationDismissals,
   writePreviewCancellations,
   type PreviewCancellationStorage,
   type PreviewCancellationTracker,
@@ -243,5 +246,97 @@ describe("durable preview cancellation state", () => {
     const missingRemover = { setItem() {} } as unknown as Pick<PreviewCancellationStorage, "setItem" | "removeItem">;
     expect(readPreviewCancellations(missingGetter).size).toBe(0);
     expect(writePreviewCancellations(missingRemover, new Map())).toBe(false);
+  });
+
+  it("round-trips exact dismissal pairs in stable key and UUID order", () => {
+    const firstKey = cancellationKey("file_preview", 42, "preview-a", "revision-a");
+    const secondKey = cancellationKey("library_migration_preview", 43, "migration-a", "revision-b");
+    const first = new Map<string, Set<string>>([
+      [secondKey, new Set([REQUEST_ID_TWO, REQUEST_ID])],
+      [firstKey, new Set([REQUEST_ID_TWO])],
+    ]);
+    const second = new Map([...first.entries()].reverse().map(([key, requestIds]) => [key, new Set([...requestIds].reverse())]));
+    const firstStorage = memoryStorage();
+    const secondStorage = memoryStorage();
+
+    expect(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY).toBe("file-manager.preview-cancellation-dismissals.v1");
+    expect(writePreviewCancellationDismissals(firstStorage.storage, first)).toBe(true);
+    expect(writePreviewCancellationDismissals(secondStorage.storage, second)).toBe(true);
+    const serialized = firstStorage.values.get(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY);
+    expect(serialized).toBe(secondStorage.values.get(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY));
+    expect(JSON.parse(serialized ?? "null")).toEqual({
+      version: 1,
+      entries: [
+        { key: firstKey, request_ids: [REQUEST_ID_TWO] },
+        { key: secondKey, request_ids: [REQUEST_ID, REQUEST_ID_TWO] },
+      ],
+    });
+    expect(readPreviewCancellationDismissals(firstStorage.storage)).toEqual(new Map([
+      [firstKey, new Set([REQUEST_ID_TWO])],
+      [secondKey, new Set([REQUEST_ID, REQUEST_ID_TWO])],
+    ]));
+  });
+
+  it("keeps dismissal scoped to the exact request UUID so a new request for the same target remains eligible", () => {
+    const key = cancellationKey();
+    const dismissedRequest = REQUEST_ID;
+    const newRequest = "00000000-0000-4000-8000-000000000003";
+    const { storage, values } = memoryStorage();
+    expect(writePreviewCancellationDismissals(storage, new Map([[key, new Set([dismissedRequest])]]))).toBe(true);
+
+    const restored = readPreviewCancellationDismissals(storage);
+    expect(restored?.get(key)?.has(dismissedRequest)).toBe(true);
+    expect(restored?.get(key)?.has(newRequest)).toBe(false);
+
+    restored?.get(key)?.add(newRequest);
+    expect(writePreviewCancellationDismissals(storage, restored!)).toBe(true);
+    expect(JSON.parse(values.get(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY) ?? "null").entries).toEqual([
+      { key, request_ids: [dismissedRequest, newRequest] },
+    ]);
+  });
+
+  it("bounds exact dismissal pairs and fails closed for corrupt or unavailable marker storage", () => {
+    const key = cancellationKey();
+    const initial = new Map<string, Set<string>>([[key, new Set([REQUEST_ID])]]);
+    const { storage, values } = memoryStorage();
+    expect(writePreviewCancellationDismissals(storage, initial)).toBe(true);
+    const before = values.get(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY);
+    const tooMany = new Map<string, Set<string>>();
+    for (let index = 0; index < 129; index += 1) {
+      const requestId = `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`;
+      tooMany.set(cancellationKey("file_preview", index + 1, `preview-${index + 1}`, "revision-a"), new Set([requestId]));
+    }
+    expect(writePreviewCancellationDismissals(storage, tooMany)).toBe(false);
+    expect(values.get(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY)).toBe(before);
+
+    values.set(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY, JSON.stringify({
+      version: 1,
+      entries: [{ key, request_ids: [REQUEST_ID, REQUEST_ID] }],
+    }));
+    expect(readPreviewCancellationDismissals(storage)).toBeNull();
+    values.set(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY, "x".repeat(256 * 1024 + 1));
+    expect(readPreviewCancellationDismissals(storage)).toBeNull();
+
+    const unavailable = {
+      getItem() { throw new Error("unavailable"); },
+      setItem() { throw new Error("unavailable"); },
+      removeItem() { throw new Error("unavailable"); },
+    };
+    expect(readPreviewCancellationDismissals(unavailable)).toBeNull();
+    expect(writePreviewCancellationDismissals(unavailable, initial)).toBe(false);
+    expect(writePreviewCancellationDismissals(unavailable, new Map())).toBe(false);
+  });
+
+  it("keeps dismissal markers separate from legacy cancellation tracker storage", () => {
+    const key = cancellationKey();
+    const { storage, values } = memoryStorage({
+      [PREVIEW_CANCELLATION_STORAGE_KEY]: envelope([{ key, tracker: tracker() }]),
+    });
+
+    expect(readPreviewCancellations(storage).get(key)).toEqual(tracker());
+    expect(readPreviewCancellationDismissals(storage)).toEqual(new Map());
+    values.set(PREVIEW_CANCELLATION_DISMISSALS_STORAGE_KEY, envelope([{ key, tracker: tracker() }]));
+    expect(readPreviewCancellationDismissals(storage)).toBeNull();
+    expect(readPreviewCancellations(storage).get(key)).toEqual(tracker());
   });
 });
