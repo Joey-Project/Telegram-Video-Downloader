@@ -2,15 +2,27 @@ import { readFile } from "node:fs/promises";
 import { webcrypto } from "node:crypto";
 import { resolve } from "node:path";
 import { Event as HappyDOMEvent } from "happy-dom";
-import type { HTMLSelectElement as HappyDOMSelectElement } from "happy-dom";
+import type { HTMLButtonElement as HappyDOMButtonElement, HTMLSelectElement as HappyDOMSelectElement } from "happy-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
 
 const LIBRARY_ID = "test-library";
 const ROOT_BINDING = `v1:${"a".repeat(64)}`;
+const MIGRATION_TARGET_ID = "migration-target-library";
+const MIGRATION_TARGET_BINDING = `v1:${"b".repeat(64)}`;
+const MIGRATION_PREVIEW_ID = "migration-cancel-preview";
+const MIGRATION_PREVIEW_REVISION = "migration-cancel-r1";
+const MIGRATION_PREVIEW_SEQ = 801;
+const MIGRATION_CONFLICT_ITEM_ID = "conflict-bundle";
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "file-manager-ui-flow", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
+
+type MockActionResponse = { status: number; body: Record<string, unknown> };
+type MigrationPendingSnapshot = Record<string, any> & {
+  state_version: number;
+  pending_requests: Record<string, any>[];
+};
 
 let originalWindowWebSocket: PropertyDescriptor | undefined;
 
@@ -117,6 +129,93 @@ const ownerSnapshot = {
   previews: [],
 };
 
+function migrationPreviewSnapshot() {
+  const sourceLibrary = {
+    id: LIBRARY_ID,
+    name: "Test library",
+    root: "/srv/media",
+    root_binding: ROOT_BINDING,
+    default_category: "Films",
+    availability: "available",
+    available: true,
+    is_default: true,
+  };
+  const targetLibrary = {
+    id: MIGRATION_TARGET_ID,
+    name: "Migration target",
+    root: "/srv/target",
+    root_binding: MIGRATION_TARGET_BINDING,
+    default_category: "Films",
+    availability: "available",
+    available: true,
+  };
+  const sourceScan = { ...ownerSnapshot.library, libraries: [], migrations: [] };
+  const targetScan = {
+    ...ownerSnapshot.library,
+    revision: "migration-target-revision",
+    root_label: "Migration target",
+    libraries: [],
+    migrations: [],
+  };
+  const preview = {
+    seq: MIGRATION_PREVIEW_SEQ,
+    request_id: "migration-preview-request",
+    kind: "library_migration_preview",
+    status: "awaiting_confirmation",
+    preview_id: MIGRATION_PREVIEW_ID,
+    revision: MIGRATION_PREVIEW_REVISION,
+    result: {
+      id: MIGRATION_PREVIEW_ID,
+      revision: MIGRATION_PREVIEW_REVISION,
+      source_library_id: LIBRARY_ID,
+      target_library_id: MIGRATION_TARGET_ID,
+      source_root_binding: ROOT_BINDING,
+      target_root_binding: MIGRATION_TARGET_BINDING,
+      scope: "library",
+      conflict: "skip",
+      include_incomplete_tasks: false,
+      set_target_default_on_success: false,
+      item_count: 1,
+      file_count: 1,
+      conflict_count: 1,
+      incomplete_task_count: 0,
+      total_bytes: 100,
+      required_space_bytes: 100,
+      available_space_bytes: 10_000,
+      items: [{
+        item_id: MIGRATION_CONFLICT_ITEM_ID,
+        conflict: true,
+        source_path: "Films/Conflict.mkv",
+        target_path: "Films/Conflict.mkv",
+        files: [],
+      }],
+    },
+  };
+  return {
+    ...ownerSnapshot,
+    state_version: 1,
+    settings: {
+      ...ownerSnapshot.settings,
+      applied: {
+        ...ownerSnapshot.settings.applied,
+        default_library_id: LIBRARY_ID,
+        libraries: [sourceLibrary, targetLibrary],
+      },
+    },
+    library: {
+      ...ownerSnapshot.library,
+      libraries: [
+        { ...sourceLibrary, snapshot: sourceScan },
+        { ...targetLibrary, snapshot: targetScan },
+      ],
+      migrations: [],
+    },
+    operations: [preview],
+    pending_requests: [],
+    previews: [],
+  };
+}
+
 function element<T>(selector: string): T {
   const found = document.querySelector(selector);
   if (!found) throw new Error(`Expected element ${selector}`);
@@ -170,7 +269,7 @@ async function mountFileManagerFixture(
     action: Record<string, any>,
     seq: number,
     publishSnapshot: (snapshot: Record<string, any>) => Promise<void>,
-  ) => Promise<void> | void,
+  ) => Promise<MockActionResponse | void> | MockActionResponse | void,
 ) {
   const sockets = installMockWebSocket();
   let currentManifest: Record<string, any>;
@@ -225,7 +324,14 @@ async function mountFileManagerFixture(
       const action = JSON.parse(String(init?.body)) as Record<string, any>;
       actions.push(action);
       const seq = nextActionSeq++;
-      await onAction?.(action, seq, publishSnapshot);
+      const customResponse = await onAction?.(action, seq, publishSnapshot);
+      if (customResponse) {
+        return {
+          ok: customResponse.status >= 200 && customResponse.status < 300,
+          status: customResponse.status,
+          json: async () => customResponse.body,
+        } as Response;
+      }
       return { ok: true, status: 202, json: async () => ({ seq, request_id: action.request_id }) } as Response;
     }
     throw new Error(`Unexpected request ${String(input)}`);
@@ -1013,6 +1119,187 @@ describe("file manager UI flow", () => {
     expect(element<HTMLElement>("#history-migration-list").textContent).toContain("Primary library → Secondary library");
     expect(element<HTMLElement>("#history-migration-list").textContent).not.toContain("Finish pending finalization");
     expect(element<HTMLElement>("#history-migration-list").textContent).not.toContain("Unfinished task handoff");
+  });
+
+  it("settles a rejected migration cancellation receipt into the retryable preview in the same render", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const snapshot = migrationPreviewSnapshot();
+    const storage = makeMemoryStorage();
+    const error = "The computer could not cancel this migration preview.";
+    const fixture = await mountFileManagerFixture(snapshot, storage, () => ({
+      status: 422,
+      body: { error },
+    }));
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    const stateRequestsBeforeCancel = fixture.stateRequests;
+    element<HTMLButtonElement>('[data-preview-cancel-kind="library_migration_preview"][data-preview-cancel-id="migration-cancel-preview"]').click();
+
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+    await vi.waitFor(() => {
+      expect(element<HTMLElement>("#migration-preview-list").textContent).toContain(error);
+      const retry = element<HTMLButtonElement>('[data-preview-cancel-kind="library_migration_preview"][data-preview-cancel-id="migration-cancel-preview"]');
+      expect(retry.textContent).toContain("Retry cancellation");
+      expect(retry.disabled).toBe(false);
+      expect(element<HTMLButtonElement>('[data-migration-confirm="migration-cancel-preview"]').disabled).toBe(false);
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+
+    expect(fixture.actions[0]?.kind).toBe("preview_cancel");
+    expect(fixture.stateRequests).toBe(stateRequestsBeforeCancel);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(1);
+  });
+
+  it("locks a dirty migration conflict draft during queued and submitted cancellation, then restores it after a fresh failure snapshot", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const initialSnapshot = migrationPreviewSnapshot();
+    const storage = makeMemoryStorage();
+    let acceptedSnapshot: MigrationPendingSnapshot = initialSnapshot;
+    let acceptedSeq = 0;
+    let signalActionStarted!: () => void;
+    const actionStarted = new Promise<void>((resolve) => { signalActionStarted = resolve; });
+    let releaseActionResponse!: (response: MockActionResponse) => void;
+    const actionResponse = new Promise<MockActionResponse>((resolve) => { releaseActionResponse = resolve; });
+    const fixture = await mountFileManagerFixture(initialSnapshot, storage, async (action, seq, publishSnapshot) => {
+      if (action.kind !== "preview_cancel") return { status: 422, body: { error: "Unexpected superseding preview request." } };
+      acceptedSeq = seq;
+      const pendingRequest = {
+        seq,
+        request_id: action.request_id,
+        kind: action.kind,
+        status: "pending",
+        created_at: Math.floor(Date.now() / 1000),
+        payload: action.payload,
+      };
+      acceptedSnapshot = {
+        ...acceptedSnapshot,
+        state_version: acceptedSnapshot.state_version + 1,
+        pending_requests: [...acceptedSnapshot.pending_requests, pendingRequest],
+      };
+      await publishSnapshot(acceptedSnapshot);
+      signalActionStarted();
+      return actionResponse;
+    });
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    const conflictSelector = () => element<HappyDOMSelectElement>(`[data-migration-conflict-item="${MIGRATION_CONFLICT_ITEM_ID}"]`);
+    conflictSelector().value = "keep_both";
+    conflictSelector().dispatchEvent(new HappyDOMEvent("change", { bubbles: true }));
+    expect(conflictSelector().value).toBe("keep_both");
+    expect(element<HTMLButtonElement>('[data-migration-refresh-conflicts="migration-cancel-preview"]').disabled).toBe(false);
+    expect(element<HTMLButtonElement>('[data-migration-confirm="migration-cancel-preview"]').disabled).toBe(true);
+
+    element<HTMLButtonElement>('[data-preview-cancel-kind="library_migration_preview"][data-preview-cancel-id="migration-cancel-preview"]').click();
+    await actionStarted;
+
+    const attemptSupersedingRefresh = () => {
+      const refresh = element<HappyDOMButtonElement>('[data-migration-refresh-conflicts="migration-cancel-preview"]');
+      const selector = conflictSelector();
+      expect(refresh.disabled).toBe(true);
+      expect(selector.disabled).toBe(true);
+      expect(element<HTMLButtonElement>('[data-migration-confirm="migration-cancel-preview"]').disabled).toBe(true);
+      refresh.dispatchEvent(new HappyDOMEvent("click", { bubbles: true }));
+      conflictSelector().value = "skip";
+      conflictSelector().dispatchEvent(new HappyDOMEvent("change", { bubbles: true }));
+    };
+    attemptSupersedingRefresh();
+    expect(element<HTMLElement>("#migration-preview-list").textContent).toContain("Cancellation is saved in this browser and will be sent when connected.");
+    expect(JSON.parse(storage.getItem("file-manager.actions.v1") ?? "[]").map((action: Record<string, unknown>) => action.kind)).toEqual(["preview_cancel"]);
+    expect(fixture.actions).toHaveLength(1);
+
+    const cancellationAction = fixture.actions[0]!;
+    releaseActionResponse({
+      status: 202,
+      body: { seq: acceptedSeq, request_id: cancellationAction.request_id },
+    });
+    await vi.waitFor(() => {
+      expect(element<HTMLElement>("#waiting-list").textContent).toContain(`Waiting for computer · #${acceptedSeq}`);
+      expect(element<HTMLElement>("#waiting-list").textContent).toContain("Saved in the cloud inbox");
+      expect(element<HTMLElement>("#migration-preview-list").textContent).toContain(`Cancellation request #${acceptedSeq} was submitted. Waiting for your computer.`);
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+
+    attemptSupersedingRefresh();
+    expect(fixture.actions).toHaveLength(1);
+    expect(JSON.parse(storage.getItem("file-manager.actions.v1") ?? "[]")).toEqual([]);
+
+    const cancellationError = "The computer could not cancel this migration preview.";
+    const failureSnapshot = {
+      ...fixture.currentSnapshot,
+      state_version: fixture.currentSnapshot.state_version + 1,
+      operations: [...fixture.currentSnapshot.operations, {
+        seq: acceptedSeq,
+        request_id: cancellationAction.request_id,
+        kind: "preview_cancel",
+        status: "failed",
+        error: cancellationError,
+        result: {
+          preview_kind: "library_migration_preview",
+          preview_seq: MIGRATION_PREVIEW_SEQ,
+          preview_id: MIGRATION_PREVIEW_ID,
+          revision: MIGRATION_PREVIEW_REVISION,
+        },
+      }],
+      pending_requests: [],
+    };
+    await fixture.publishSnapshot(failureSnapshot);
+    const stateRequestsBeforeFailure = fixture.stateRequests;
+    fixture.sockets[0]?.receive({
+      type: "invalidate",
+      database_epoch: TEST_DATABASE_EPOCH,
+      state_version: failureSnapshot.state_version,
+      reason: "state",
+    });
+    await vi.waitFor(() => {
+      expect(fixture.stateRequests).toBe(stateRequestsBeforeFailure + 1);
+      expect(element<HTMLElement>("#migration-preview-list").textContent).toContain(cancellationError);
+      expect(conflictSelector().value).toBe("keep_both");
+      expect(conflictSelector().disabled).toBe(false);
+      expect(element<HTMLButtonElement>('[data-migration-refresh-conflicts="migration-cancel-preview"]').disabled).toBe(false);
+      const retry = element<HTMLButtonElement>('[data-preview-cancel-kind="library_migration_preview"][data-preview-cancel-id="migration-cancel-preview"]');
+      expect(retry.textContent).toContain("Retry cancellation");
+      expect(retry.disabled).toBe(false);
+      expect(element<HTMLButtonElement>('[data-migration-confirm="migration-cancel-preview"]').disabled).toBe(true);
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+    expect(fixture.actions).toHaveLength(1);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(1);
+  });
+
+  it("keeps a dirty migration draft locked for an unknown cancellation and rejects synthetic refresh/change events", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const snapshot = migrationPreviewSnapshot();
+    const storage = makeMemoryStorage();
+    const fixture = await mountFileManagerFixture(snapshot, storage, () => ({
+      status: 410,
+      body: { error: "The migration cancellation delivery is unknown." },
+    }));
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    const conflictSelector = () => element<HappyDOMSelectElement>(`[data-migration-conflict-item="${MIGRATION_CONFLICT_ITEM_ID}"]`);
+    conflictSelector().value = "keep_both";
+    conflictSelector().dispatchEvent(new HappyDOMEvent("change", { bubbles: true }));
+    expect(conflictSelector().value).toBe("keep_both");
+    element<HTMLButtonElement>('[data-preview-cancel-kind="library_migration_preview"][data-preview-cancel-id="migration-cancel-preview"]').click();
+    await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+    await vi.waitFor(() => expect(element<HTMLElement>("#migration-preview-list").textContent).toContain("The cloud no longer has a retained receipt for this request."));
+
+    const refresh = element<HappyDOMButtonElement>('[data-migration-refresh-conflicts="migration-cancel-preview"]');
+    expect(refresh.disabled).toBe(true);
+    expect(conflictSelector().disabled).toBe(true);
+    expect(element<HTMLButtonElement>('[data-migration-confirm="migration-cancel-preview"]').disabled).toBe(true);
+    refresh.dispatchEvent(new HappyDOMEvent("click", { bubbles: true }));
+    conflictSelector().value = "skip";
+    conflictSelector().dispatchEvent(new HappyDOMEvent("change", { bubbles: true }));
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+
+    expect(conflictSelector().value).toBe("keep_both");
+    expect(element<HTMLButtonElement>('[data-migration-refresh-conflicts="migration-cancel-preview"]').disabled).toBe(true);
+    expect(element<HTMLButtonElement>('[data-migration-confirm="migration-cancel-preview"]').disabled).toBe(true);
+    expect(fixture.actions).toHaveLength(1);
+    expect(fixture.actions[0]?.kind).toBe("preview_cancel");
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(1);
+    expect(JSON.parse(storage.getItem("file-manager.actions.v1") ?? "[]").map((action: Record<string, unknown>) => action.kind)).toEqual(["preview_cancel"]);
   });
 
   it("keeps unknown cancellations paused and preserves incomplete offline review identity", async () => {

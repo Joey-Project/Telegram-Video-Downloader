@@ -360,6 +360,7 @@ function fullPreview(operation, result, options) {
   const draftConflicts = draft ? normalizeMigrationItemConflicts(draft.itemConflicts) : savedConflicts;
   const choicesChanged = Boolean(draft && migrationConflictChoicesChanged(savedConflicts, draftConflicts));
   const refreshOutcomeUnknown = draft?.refreshOutcomeUnknown === true;
+  const cancellationPending = options.cancelPending === true;
   const invalidated = options.invalidated === true || choicesChanged || refreshOutcomeUnknown;
   const refreshPending = Boolean(draft?.refreshRequestId) && !refreshOutcomeUnknown;
   const paths = displayItems.map((item) => {
@@ -373,7 +374,7 @@ function fullPreview(operation, result, options) {
     const labels = nested.slice(0, 12).map((file) => `${escapeHtml(file.source_path ?? "Source unavailable")} → ${escapeHtml(file.target_path ?? "Target unavailable")}`);
     const path = `${escapeHtml(item.source_path ?? "Source unavailable")} → ${escapeHtml(item.target_path ?? "Target unavailable")}`;
     const choice = conflict
-      ? `<label class="migration-conflict-choice">${escapeHtml(itemId)} conflict<select class="select-control" data-migration-conflict-item="${escapeHtml(itemId)}" data-migration-preview-id="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}" aria-label="Conflict handling for ${escapeHtml(itemId)}" ${refreshPending || refreshOutcomeUnknown || !sourceAvailable || !targetAvailable || !rootBindingsMatch ? "disabled" : ""}><option value="skip" ${policy === "skip" ? "selected" : ""}>Skip</option><option value="keep_both" ${policy === "keep_both" ? "selected" : ""}>Keep both</option></select></label>`
+      ? `<label class="migration-conflict-choice">${escapeHtml(itemId)} conflict<select class="select-control" data-migration-conflict-item="${escapeHtml(itemId)}" data-migration-preview-id="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}" aria-label="Conflict handling for ${escapeHtml(itemId)}" ${cancellationPending || refreshPending || refreshOutcomeUnknown || !sourceAvailable || !targetAvailable || !rootBindingsMatch ? "disabled" : ""}><option value="skip" ${policy === "skip" ? "selected" : ""}>Skip</option><option value="keep_both" ${policy === "keep_both" ? "selected" : ""}>Keep both</option></select></label>`
       : `<strong class="${item.outcome === "skip" || item.status === "skipped" ? "skip" : "move"}">${outcome}</strong>`;
     return `<div class="preview-line${conflict ? " migration-conflict-line" : ""}"><span>${path}${labels.length ? `<br><span class="field-hint">${labels.join("<br>")}</span>` : ""}</span>${choice}</div>`;
   }).join("");
@@ -391,7 +392,7 @@ function fullPreview(operation, result, options) {
     : "";
   const refreshOutsideHistory = draft?.refreshHistory === "outside_recent_history";
   const clearRefreshButton = refreshOutsideHistory
-    ? `<button class="quiet-button" type="button" data-migration-refresh-clear="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}">Clear waiting status</button>`
+    ? `<button class="quiet-button" type="button" data-migration-refresh-clear="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}" ${cancellationPending ? "disabled" : ""}>Clear waiting status</button>`
     : "";
   const refreshMessage = refreshOutcomeUnknown
     ? `<p class="field-hint" role="status">${escapeHtml(draft?.refreshError ?? "The refresh delivery outcome is unknown.")} It will not be sent again automatically. Check your computer before dismissing the notice.</p>`
@@ -408,10 +409,10 @@ function fullPreview(operation, result, options) {
   const supersededMessage = options.invalidated === true && !draft
     ? `<p class="field-hint" role="status">This preview was superseded by a refreshed preview and cannot be confirmed.</p>`
     : "";
-  const canConfirm = Boolean(id && revision) && !invalidated && sourceAvailable && targetAvailable && rootBindingsMatch && options.cancelPending !== true;
+  const canConfirm = Boolean(id && revision) && !invalidated && sourceAvailable && targetAvailable && rootBindingsMatch && !cancellationPending;
   const canRefresh = Boolean(id && revision && draft && (choicesChanged || draft.refreshError) && !refreshPending && !refreshOutcomeUnknown && rootBindingsMatch);
   const refreshButton = canRefresh
-    ? `<button class="small-button" type="button" data-migration-refresh-conflicts="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}" ${sourceAvailable && targetAvailable ? "" : "disabled"}>Refresh preview</button>`
+    ? `<button class="small-button" type="button" data-migration-refresh-conflicts="${escapeHtml(id)}" data-migration-preview-revision="${escapeHtml(revision)}" ${sourceAvailable && targetAvailable && !cancellationPending ? "" : "disabled"}>Refresh preview</button>`
     : "";
   const conflictLimit = Number(result.conflict_count ?? files.filter((item) => item?.conflict === true).length) > MAX_MIGRATION_ITEM_CONFLICTS
     ? `<p class="field-hint">This preview has more than ${MAX_MIGRATION_ITEM_CONFLICTS.toLocaleString()} conflicting bundles. Refresh with the global choice to review a supported subset.</p>`

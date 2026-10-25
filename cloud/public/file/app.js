@@ -916,6 +916,7 @@ function acceptFreshSnapshot(snapshot) {
   byId("auth-gate").classList.add("hidden");
   byId("app-content").classList.remove("hidden");
   restorePreviewCancellations();
+  reconcilePreviewCancellations(state.snapshot);
   recoverFileActionReceipts();
   const params = new URLSearchParams(window.location.search);
   if (params.get("download") === "1" && !state.downloadFormOpened) {
@@ -1032,8 +1033,7 @@ function recoverFileActionReceipts() {
     if (recovered.downloadSubmission) renderDownloadStatus();
     if (recovered.migrationConflictDrafts > 0) renderMigrations();
     if (recovered.matched > 0) {
-      renderPreviews();
-      renderReviewNavigation();
+      renderPreviewReviewCards();
       renderTabCounts();
     }
   }
@@ -1069,7 +1069,7 @@ function settleRejectedFileAction(rejection, queueRemoved) {
       tracker.error = message;
     }
     persistPreviewCancellations();
-    renderPreviews();
+    renderPreviewReviewCards();
   }
 }
 
@@ -1134,14 +1134,14 @@ async function drainActionQueue({ quiet = false } = {}) {
             state.metadataRecovery.seq = receipt.seq;
             renderMetadataRecovery();
           }
-          if (action?.kind === "preview_cancel") renderPreviews();
+          if (action?.kind === "preview_cancel") renderPreviewReviewCards();
           return recorded;
         },
       });
       const receiptUpdate = outcome.receiptUpdate ?? {};
       if (receiptUpdate.downloadSubmission) renderDownloadStatus();
       if (receiptUpdate.migrationConflictDrafts > 0) renderMigrations();
-      if (outcome.action?.kind === "preview_cancel") renderPreviews();
+      if (outcome.action?.kind === "preview_cancel") renderPreviewReviewCards();
       if (outcome.status === "empty") break;
       if (outcome.status === "remove_failed") {
         if (!quiet) showToast("Request reached the computer, but this browser could not update its retry queue.");
@@ -1193,7 +1193,7 @@ async function drainActionQueue({ quiet = false } = {}) {
           renderMetadataRecovery();
         }
         updateMetadataRecoveryPreviewRequest(action, { status: "unknown", error });
-        if (action?.kind === "preview_cancel") renderPreviews();
+        if (action?.kind === "preview_cancel") renderPreviewReviewCards();
         if (updates.downloadSubmission) renderDownloadStatus();
         if (updates.migrationConflictDrafts > 0) renderMigrations();
         renderWaiting();
@@ -1210,7 +1210,7 @@ async function drainActionQueue({ quiet = false } = {}) {
           renderMetadataRecovery();
         }
         updateMetadataRecoveryPreviewRequest(action, { status: "rejected", error: rejection.error });
-        if (action?.kind === "preview_cancel") renderPreviews();
+        if (action?.kind === "preview_cancel") renderPreviewReviewCards();
         permanentRejections.push(rejection.error);
         continue;
       }
@@ -1244,7 +1244,7 @@ async function drainActionQueue({ quiet = false } = {}) {
             tracker.error = typeof error?.message === "string" ? error.message : "The computer rejected the cancellation request.";
           }
           persistPreviewCancellations();
-          renderPreviews();
+          renderPreviewReviewCards();
         }
         for (const [previewId, draft] of state.migrationConflictDrafts) {
           if (draft.refreshRequestId === action.request_id) {
@@ -1932,6 +1932,24 @@ function previewCancellationBusy(kind, entry) {
   return isActivePreviewCancellation(cancellation.tracker, cancellation.key);
 }
 
+function migrationCancellationBusyForDraft(previewId, revision) {
+  const operation = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === revision);
+  if (operation && previewCancellationBusy("library_migration_preview", operation)) return true;
+  const hasMatchingCancellation = (key) => {
+    let identity;
+    try { identity = JSON.parse(key); } catch { return false; }
+    return Array.isArray(identity) && identity[0] === "library_migration_preview"
+      && identity[2] === previewId && identity[3] === revision;
+  };
+  for (const [key, tracker] of state.previewCancellations) {
+    if (hasMatchingCancellation(key) && isActivePreviewCancellation(tracker, key)) return true;
+  }
+  for (const key of state.previewCancellationAttempts) {
+    if (hasMatchingCancellation(key)) return true;
+  }
+  return false;
+}
+
 function reviewTargetForCancellation(payload) {
   return allReviewEntries().find(({ kind, entry }) => {
     const target = previewCancellationPayload(kind, entry);
@@ -2312,8 +2330,14 @@ function renderReviewNavigation() {
   byId("review-navigation-list").innerHTML = cards.join("");
 }
 
-function renderPreviews() {
+function renderPreviewReviewCards() {
   reconcilePreviewCancellations(state.snapshot);
+  renderMigrations();
+  renderPreviews();
+  renderReviewNavigation();
+}
+
+function renderPreviews() {
   const allPreviews = previews();
   const omittedAggregate = omittedPreviewAggregate();
   const submission = state.metadataRecoveryPreviewRequest;
@@ -2703,6 +2727,7 @@ function renderDetail() {
 
 function render() {
   if (!mayUsePrivateSnapshot(state)) return;
+  reconcilePreviewCancellations(state.snapshot);
   renderSync();
   renderLibrary();
   settleDownloadSubmission();
@@ -3057,6 +3082,10 @@ function bindEvents() {
       const itemId = migrationConflict.dataset.migrationConflictItem;
       const operation = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === revision);
       if (!operation) return;
+      if (previewCancellationBusy("library_migration_preview", operation)) {
+        renderMigrations();
+        return;
+      }
       const result = operation?.result ?? {};
       const existing = migrationConflictDraft(previewId, revision);
       const defaultPolicy = result.conflict === "keep_both" ? "keep_both" : "skip";
@@ -3313,7 +3342,7 @@ function bindEvents() {
       if (dismissed.downloadSubmission) renderDownloadStatus();
       if (dismissed.migrationConflictDrafts > 0) renderMigrations();
       renderWaiting();
-      renderPreviews();
+      renderPreviewReviewCards();
       showToast("The delivery outcome is still unknown. The browser notice was dismissed; check your computer before resubmitting.");
       return;
     }
@@ -3348,6 +3377,10 @@ function bindEvents() {
       const revision = migrationRefresh.dataset.migrationPreviewRevision;
       const operation = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === revision);
       if (!operation) return;
+      if (previewCancellationBusy("library_migration_preview", operation)) {
+        renderMigrations();
+        return;
+      }
       const sourceLibraryId = migrationLibraryId(operation, operation?.result ?? {}, "source_library_id");
       const targetLibraryId = migrationLibraryId(operation, operation?.result ?? {}, "target_library_id");
       const endpoints = migrationEndpointAvailability(state.snapshot, sourceLibraryId, targetLibraryId);
@@ -3401,6 +3434,10 @@ function bindEvents() {
     if (clearMigrationRefresh) {
       const previewId = clearMigrationRefresh.dataset.migrationRefreshClear;
       const revision = clearMigrationRefresh.dataset.migrationPreviewRevision;
+      if (migrationCancellationBusyForDraft(previewId, revision)) {
+        renderMigrations();
+        return;
+      }
       const draft = migrationConflictDraft(previewId, revision);
       if (!draft || !releaseMigrationRefreshTracking(draft, state.snapshot)) {
         renderMigrations();
@@ -3490,6 +3527,10 @@ function bindEvents() {
     if (migrationConfirm) {
       const previewId = migrationConfirm.dataset.migrationConfirm;
       const matchingPreview = migrationPreviewEntries().find((entry) => entry.id === previewId && entry.revision === migrationConfirm.dataset.revision);
+      if (matchingPreview && previewCancellationBusy("library_migration_preview", matchingPreview)) {
+        renderMigrations();
+        return;
+      }
       const result = matchingPreview?.result ?? {};
       const sourceId = String(result.source_library_id ?? matchingPreview?.source_library_id ?? activeLibraryId());
       const targetId = String(result.target_library_id ?? matchingPreview?.target_library_id ?? "");
