@@ -28,6 +28,7 @@ const FILE_CANCEL_REQUEST_ID = "00000000-0000-4000-8000-000000000711";
 const MIGRATION_CANCEL_REQUEST_ID = "00000000-0000-4000-8000-000000000712";
 const FILE_CANCEL_REQUEST_SEQ = 903;
 const MIGRATION_CANCEL_REQUEST_SEQ = 902;
+const SNAPSHOT_REFRESH_START_BUDGET_MS = 1_000;
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "file-manager-ui-flow", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
 
@@ -99,20 +100,39 @@ class MockWebSocket extends EventTarget {
   }
 
   openAndReady() {
+    if (this.readyState !== MockWebSocket.CONNECTING) return;
     this.readyState = MockWebSocket.OPEN;
     this.emit("open");
     this.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH });
   }
 
   receive(message: Record<string, unknown>) {
+    if (this.readyState !== MockWebSocket.OPEN) return;
     const event = new Event("message");
     Object.defineProperty(event, "data", { configurable: true, value: JSON.stringify(message) });
+    this.dispatchEvent(event);
+  }
+
+  close(code = 1000, reason = "") {
+    if (this.readyState === MockWebSocket.CLOSING || this.readyState === MockWebSocket.CLOSED) return;
+    this.readyState = MockWebSocket.CLOSING;
+    this.readyState = MockWebSocket.CLOSED;
+    const event = new Event("close");
+    Object.defineProperties(event, {
+      code: { configurable: true, value: code },
+      reason: { configurable: true, value: reason },
+      wasClean: { configurable: true, value: true },
+    });
     this.dispatchEvent(event);
   }
 
   private emit(type: string) {
     this.dispatchEvent(new Event(type));
   }
+}
+
+function latestOpenSocket(sockets: MockWebSocket[]) {
+  return [...sockets].reverse().find((socket) => socket.readyState === MockWebSocket.OPEN && socket.protocol === UPDATE_PROTOCOL);
 }
 
 function installMockWebSocket() {
@@ -137,6 +157,18 @@ function updateSession() {
     protocol: UPDATE_PROTOCOL,
     expires_at: Date.now() + 60 * 60 * 1_000,
     database_epoch: TEST_DATABASE_EPOCH,
+  };
+}
+
+function controlledSnapshotClock() {
+  const realNow = Date.now.bind(Date);
+  let offset = 0;
+  vi.spyOn(Date, "now").mockImplementation(() => realNow() + offset);
+  return {
+    advanceRefreshBudget() {
+      // Match the client's one-second minimum refresh-start interval without waiting on wall time.
+      offset += SNAPSHOT_REFRESH_START_BUDGET_MS;
+    },
   };
 }
 
@@ -465,6 +497,7 @@ async function mountFileManagerFixture(
   const sockets = installMockWebSocket();
   let currentManifest: Record<string, any>;
   let stateRequests = 0;
+  const stateRequestVersions: number[] = [];
   let nextActionSeq = 901;
   const actions: Array<Record<string, any>> = [];
   let currentSnapshot = initialSnapshot;
@@ -503,7 +536,9 @@ async function mountFileManagerFixture(
     if (String(input) === "/api/state") {
       expect(new Headers(init?.headers).get("X-Snapshot-Format")).toBe("chunked-v1");
       stateRequests += 1;
-      return { ok: true, status: 200, json: async () => currentManifest } as Response;
+      const manifest = currentManifest;
+      stateRequestVersions.push(manifest.state_version);
+      return { ok: true, status: 200, json: async () => manifest } as Response;
     }
     const chunkPath = String(input).match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
     if (chunkPath) {
@@ -533,7 +568,7 @@ async function mountFileManagerFixture(
   vi.resetModules();
   // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
   await import("../public/file/app.js");
-  await vi.waitFor(() => expect(sockets[0]?.readyState).toBe(MockWebSocket.OPEN));
+  await vi.waitFor(() => expect(latestOpenSocket(sockets)).toBeDefined());
   await vi.waitFor(() => {
     expect(stateRequests).toBeGreaterThan(0);
     expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false);
@@ -545,6 +580,7 @@ async function mountFileManagerFixture(
     sockets,
     fetchMock,
     publishSnapshot,
+    stateRequestVersions,
     get stateRequests() { return stateRequests; },
     get currentSnapshot() { return currentSnapshot; },
   };
@@ -1352,6 +1388,7 @@ describe("file manager UI flow", () => {
 
   it("locks a dirty migration conflict draft during queued and submitted cancellation, then restores it after a fresh failure snapshot", async () => {
     vi.stubGlobal("crypto", webcrypto);
+    const clock = controlledSnapshotClock();
     const initialSnapshot = migrationPreviewSnapshot();
     const storage = makeMemoryStorage();
     let acceptedSnapshot: MigrationPendingSnapshot = initialSnapshot;
@@ -1423,9 +1460,6 @@ describe("file manager UI flow", () => {
     expect(fixture.actions).toHaveLength(1);
     expect(JSON.parse(storage.getItem("file-manager.actions.v1") ?? "[]")).toEqual([]);
 
-    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
-    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false"));
-
     const cancellationError = "The computer could not cancel this migration preview.";
     const failureSnapshot = {
       ...fixture.currentSnapshot,
@@ -1445,12 +1479,14 @@ describe("file manager UI flow", () => {
       }],
       pending_requests: [],
     };
+    clock.advanceRefreshBudget();
     await fixture.publishSnapshot(failureSnapshot);
     const stateRequestsBeforeFailure = fixture.stateRequests;
+    const stateRequestVersionsBeforeFailure = fixture.stateRequestVersions.length;
     let liveSocket: MockWebSocket | undefined;
     await new Promise<void>((resolve, reject) => window.setTimeout(() => {
       try {
-        liveSocket = fixture.sockets.find((socket) => socket.readyState === MockWebSocket.OPEN && socket.protocol === UPDATE_PROTOCOL);
+        liveSocket = latestOpenSocket(fixture.sockets);
         if (!liveSocket) throw new Error("Expected a live updates connection before failure snapshot invalidation.");
         liveSocket.receive({
           type: "invalidate",
@@ -1464,7 +1500,8 @@ describe("file manager UI flow", () => {
       }
     }, 0));
     await vi.waitFor(() => {
-      expect(fixture.stateRequests).toBe(stateRequestsBeforeFailure + 1);
+      expect(fixture.stateRequests, `failure snapshot v${failureSnapshot.state_version}; fetched manifest versions [${fixture.stateRequestVersions.join(", ")}]`).toBe(stateRequestsBeforeFailure + 1);
+      expect(fixture.stateRequestVersions.slice(stateRequestVersionsBeforeFailure)).toContain(failureSnapshot.state_version);
       expect(element<HTMLElement>("#migration-preview-list").textContent).toContain(cancellationError);
       expect(conflictSelector().value).toBe("keep_both");
       expect(conflictSelector().disabled).toBe(false);
@@ -1687,6 +1724,7 @@ describe("file manager UI flow", () => {
   });
 
   it("keeps exact pending, saturated pending, omission, stale, and incomplete histories blocked", async () => {
+    const clock = controlledSnapshotClock();
     const storage = makeMemoryStorage();
     storage.setItem(PREVIEW_CANCELLATION_STORAGE_KEY, cancellationTrackerEnvelope(acceptedCancellationTrackers()));
     const saturated = saturatedCancellationSnapshot();
@@ -1727,11 +1765,13 @@ describe("file manager UI flow", () => {
       appliedMarker: () => void = () => {},
       pauseAfterRequest = false,
     ) => {
+      clock.advanceRefreshBudget();
       const requestsBefore = fixture.stateRequests;
+      const manifestVersionsBefore = fixture.stateRequestVersions.length;
       await fixture.publishSnapshot(nextSnapshot);
       let liveSocket: MockWebSocket | undefined;
       await vi.waitFor(() => {
-        liveSocket = fixture.sockets.find((socket) => socket.readyState === MockWebSocket.OPEN && socket.protocol === UPDATE_PROTOCOL);
+        liveSocket = latestOpenSocket(fixture.sockets);
         expect(liveSocket).toBeDefined();
       });
       liveSocket!.receive({
@@ -1740,7 +1780,10 @@ describe("file manager UI flow", () => {
         state_version: nextSnapshot.state_version,
         reason: "state",
       });
-      await vi.waitFor(() => expect(fixture.stateRequests, `state_version ${nextSnapshot.state_version} must start a state fetch`).toBe(requestsBefore + 1));
+      await vi.waitFor(() => {
+        expect(fixture.stateRequests, `state_version ${nextSnapshot.state_version}; fetched manifest versions [${fixture.stateRequestVersions.join(", ")}]`).toBe(requestsBefore + 1);
+        expect(fixture.stateRequestVersions.slice(manifestVersionsBefore)).toContain(nextSnapshot.state_version);
+      });
       if (pauseAfterRequest) Object.defineProperty(window.navigator, "onLine", { configurable: true, value: false });
       await vi.waitFor(() => {
         expect(fixture.stateRequests, `state_version ${nextSnapshot.state_version} must request the published snapshot`).toBe(requestsBefore + 1);
@@ -1748,7 +1791,6 @@ describe("file manager UI flow", () => {
         appliedMarker();
         expectNoDismissibleCancellation();
       });
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
     };
     const saturatedPending = {
       ...saturated,
