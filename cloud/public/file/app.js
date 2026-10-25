@@ -168,7 +168,24 @@ function readStoredPreviewCancellations(storage) {
 function mergePreviewCancellationTrackers(current, incoming) {
   if (current?.status === "failed" && current.requestId === incoming?.requestId) return current;
   if (current?.requestId !== incoming?.requestId) return incoming;
-  const rank = { queued: 0, unknown: 1, submitted: 2, failed: 3 };
+  const currentStatus = String(current?.status ?? "").toLowerCase();
+  const incomingStatus = String(incoming?.status ?? "").toLowerCase();
+  if (incomingStatus === "failed") {
+    return { ...incoming, requestId: current.requestId, seq: current.seq ?? incoming.seq };
+  }
+  const currentHasAcceptedSeq = Number.isSafeInteger(current?.seq) && current.seq > 0;
+  const incomingHasAcceptedSeq = Number.isSafeInteger(incoming?.seq) && incoming.seq > 0;
+  if ((currentStatus === "unknown") !== (incomingStatus === "unknown")) {
+    const unknown = currentStatus === "unknown" ? current : incoming;
+    const other = currentStatus === "unknown" ? incoming : current;
+    const unknownHasAcceptedSeq = currentStatus === "unknown" ? currentHasAcceptedSeq : incomingHasAcceptedSeq;
+    const otherHasAcceptedSeq = currentStatus === "unknown" ? incomingHasAcceptedSeq : currentHasAcceptedSeq;
+    if (!unknownHasAcceptedSeq && otherHasAcceptedSeq) {
+      return { ...other, requestId: current.requestId, seq: other.seq };
+    }
+    return { ...unknown, requestId: current.requestId, seq: current.seq ?? incoming.seq, status: "unknown" };
+  }
+  const rank = { queued: 0, submitted: 1, unknown: 2, failed: 3 };
   const status = rank[String(current?.status ?? "").toLowerCase()] >= rank[String(incoming?.status ?? "").toLowerCase()]
     ? current.status
     : incoming.status;
@@ -195,6 +212,16 @@ function persistPreviewCancellations({ removeKeys = [] } = {}) {
   try { return writePreviewCancellations(storage, pending); } catch { return false; }
 }
 
+function previewCancellationsMatchStoredSerialization(storage, cancellations) {
+  let serialized = null;
+  const serializationSink = {
+    setItem(_key, value) { serialized = value; },
+    removeItem() { serialized = null; },
+  };
+  if (!writePreviewCancellations(serializationSink, cancellations)) return null;
+  try { return storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) === serialized; } catch { return null; }
+}
+
 function mergePreviewCancellationsFromStorage() {
   if (!state.ownerVerified || !state.privateUiVisible) return false;
   const storage = safelyGetFileStorage();
@@ -219,6 +246,11 @@ function mergePreviewCancellationsFromStorage() {
       state.previewCancellations.set(key, merged);
       changed = true;
     }
+  }
+  const pending = new Map([...state.previewCancellations].filter(([key, tracker]) =>
+    PERSISTED_PREVIEW_CANCELLATION_STATUSES.has(String(tracker?.status ?? "").toLowerCase())));
+  if (previewCancellationsMatchStoredSerialization(storage, pending) === false) {
+    persistPreviewCancellations();
   }
   return changed;
 }
@@ -1014,6 +1046,26 @@ function readActionQueue() {
   } catch { return []; }
 }
 
+function readActionQueueForCancellationDismissal() {
+  const storage = safelyGetFileStorage();
+  if (!storage || typeof storage.getItem !== "function") return null;
+  try {
+    const value = JSON.parse(storage.getItem(ACTION_QUEUE_KEY) ?? "[]");
+    return Array.isArray(value)
+      ? value.filter((entry) => entry && typeof entry.request_id === "string" && typeof entry.kind === "string"
+        && entry.payload && typeof entry.payload === "object")
+      : null;
+  } catch { return null; }
+}
+
+function isDismissibleAcceptedUnknownCancellation(key, tracker, payload) {
+  return Boolean(key && !state.previewCancellationAttempts.has(key)
+    && typeof tracker?.requestId === "string"
+    && tracker.status === "unknown"
+    && Number.isSafeInteger(tracker.seq) && tracker.seq > 0
+    && !previewCancellationIsKnownPending(tracker, payload, state.snapshot));
+}
+
 function recoverFileActionReceipts() {
   const recovered = recoverActionReceipts(state, { surface: ACTION_SURFACE_FILE });
   if (recovered.matched > 0) {
@@ -1034,7 +1086,6 @@ function recoverFileActionReceipts() {
     if (recovered.migrationConflictDrafts > 0) renderMigrations();
     if (recovered.matched > 0) {
       renderPreviewReviewCards();
-      renderTabCounts();
     }
   }
   return recovered;
@@ -1892,6 +1943,15 @@ function previewCancellationKey(payload) {
   return payload ? JSON.stringify([payload.preview_kind, payload.preview_seq, payload.preview_id, payload.revision]) : null;
 }
 
+function previewCancellationPayloadFromKey(key) {
+  let identity;
+  try { identity = JSON.parse(key); } catch { return null; }
+  if (!Array.isArray(identity) || identity.length !== 4) return null;
+  const [kind, seq, id, revision] = identity;
+  const payload = previewCancellationPayload(kind, { seq, id, revision });
+  return payload && previewCancellationKey(payload) === key ? payload : null;
+}
+
 function previewCancellationTracker(kind, entry) {
   const payload = previewCancellationPayload(kind, entry);
   const key = previewCancellationKey(payload);
@@ -1971,27 +2031,68 @@ function cancellationOperationMatches(operation, payload) {
     && result.revision === payload.revision;
 }
 
-function previewCancellationHistory(tracker, snapshot) {
+function previewCancellationTargetEvidence(payload, snapshot) {
+  const previews = Array.isArray(snapshot?.previews) ? snapshot.previews : null;
+  const operations = Array.isArray(snapshot?.operations) ? snapshot.operations : null;
+  if (!previews || !operations) return "unknown";
+  const rows = [...previews, ...operations].filter((entry) => entry?.seq === payload.preview_seq);
+  if (rows.length === 0) return "absent";
+  if (rows.some((entry) => entry?.kind === payload.preview_kind
+      && (entry.preview_id ?? entry.id ?? entry.result?.preview_id ?? entry.result?.id) === payload.preview_id
+      && (entry.revision ?? entry.result?.revision) === payload.revision)) return "present";
+  return "ambiguous";
+}
+
+function previewCancellationHistory(tracker, snapshot, payload) {
   if (!Number.isSafeInteger(tracker?.seq) || tracker.seq <= 0) return { kind: "unaccepted" };
   const operations = Array.isArray(snapshot?.operations) ? snapshot.operations : null;
   const pendingRequests = Array.isArray(snapshot?.pending_requests) ? snapshot.pending_requests : null;
-  if (!operations || !pendingRequests) return { kind: "unknown" };
-  const operation = operations.find((entry) => entry?.kind === "preview_cancel" && entry.seq === tracker.seq);
+  const previews = Array.isArray(snapshot?.previews) ? snapshot.previews : null;
+  if (!operations || !pendingRequests || !previews) return { kind: "unknown" };
+  const operation = operations.find((entry) => entry?.seq === tracker.seq);
   if (operation) return { kind: "recorded", operation };
   const pending = pendingRequests.find((entry) => entry?.seq === tracker.seq);
   if (pending) return { kind: "pending", pending };
   const lastSeen = snapshot.last_seen;
+  const now = Date.now();
   if (snapshot.synced !== true || snapshot.stale !== false || !Number.isSafeInteger(lastSeen)
-      || lastSeen > Date.now() || Date.now() - lastSeen > RECENT_SNAPSHOT_MAX_AGE_MS
-      || operations.length !== RECENT_OPERATION_SNAPSHOT_LIMIT) return { kind: "unknown" };
-  let previousSequence = tracker.seq;
+      || lastSeen > now || now - lastSeen > RECENT_SNAPSHOT_MAX_AGE_MS
+      || operations.length > RECENT_OPERATION_SNAPSHOT_LIMIT
+      || pendingRequests.length >= RECENT_OPERATION_SNAPSHOT_LIMIT
+      || previews.length > RECENT_OPERATION_SNAPSHOT_LIMIT + 1) return { kind: "unknown" };
+  let previousSequence = 0;
+  let allOperationsAreNewer = true;
   for (const entry of operations) {
     if (!Number.isSafeInteger(entry?.seq) || entry.seq <= previousSequence || typeof entry.kind !== "string" || typeof entry.status !== "string") {
       return { kind: "unknown" };
     }
+    if (entry.seq <= tracker.seq) allOperationsAreNewer = false;
     previousSequence = entry.seq;
   }
-  return { kind: "outside_recent_history" };
+  let previousPendingSequence = 0;
+  for (const entry of pendingRequests) {
+    if (!Number.isSafeInteger(entry?.seq) || entry.seq <= previousPendingSequence || typeof entry.kind !== "string") {
+      return { kind: "unknown" };
+    }
+    previousPendingSequence = entry.seq;
+  }
+  if (operations.length === RECENT_OPERATION_SNAPSHOT_LIMIT) {
+    return allOperationsAreNewer ? { kind: "outside_recent_history" } : { kind: "unknown" };
+  }
+  const hasPreviewOmission = previews.some((entry) => entry && typeof entry === "object"
+    && typeof entry.kind !== "string" && entry.preview_incomplete === true);
+  if (hasPreviewOmission || previewCancellationTargetEvidence(payload, snapshot) !== "absent") {
+    return { kind: "unknown" };
+  }
+  return { kind: "missing_target_history" };
+}
+
+function previewCancellationIsKnownPending(tracker, payload, snapshot) {
+  const history = previewCancellationHistory(tracker, snapshot, payload);
+  if (history.kind === "pending") return true;
+  if (history.kind !== "recorded") return false;
+  return history.operation?.kind !== "preview_cancel"
+    || !SETTLED_OPERATION_STATUSES.has(String(history.operation.status ?? "").toLowerCase());
 }
 
 function reconcilePreviewCancellations(snapshot) {
@@ -2034,7 +2135,7 @@ function reconcilePreviewCancellations(snapshot) {
       continue;
     }
     if (!Number.isSafeInteger(tracker.seq)) continue;
-    const cancellation = operations.find((entry) => entry?.kind === "preview_cancel" && entry.seq === tracker.seq);
+    const cancellation = operations.find((entry) => entry?.seq === tracker.seq);
     if (cancellation) {
       if (cancellationOperationMatches(cancellation, payload)) {
         state.previewCancellations.delete(key);
@@ -2042,16 +2143,26 @@ function reconcilePreviewCancellations(snapshot) {
         changed = true;
         continue;
       }
-      if (["failed", "rejected", "stale", "expired"].includes(String(cancellation.status).toLowerCase())) {
+      const cancellationStatus = String(cancellation.status).toLowerCase();
+      if (cancellation.kind === "preview_cancel"
+          && ["failed", "rejected", "stale", "expired"].includes(cancellationStatus)) {
         tracker.status = "failed";
         tracker.error = String(cancellation.error ?? "The computer could not cancel this preview.");
+        changed = true;
+      } else if (cancellation.kind === "preview_cancel" && SETTLED_OPERATION_STATUSES.has(cancellationStatus)) {
+        tracker.status = "unknown";
+        tracker.error = `Cancellation request #${tracker.seq} is recorded, but its result details are unavailable. Its outcome is unknown; check your computer before dismissing this browser notice.`;
         changed = true;
       }
       continue;
     }
-    if (tracker.status === "submitted" && previewCancellationHistory(tracker, snapshot).kind === "outside_recent_history") {
+    const history = previewCancellationHistory(tracker, snapshot, payload);
+    if (tracker.status === "submitted"
+        && ["outside_recent_history", "missing_target_history"].includes(history.kind)) {
       tracker.status = "unknown";
-      tracker.error = `Cancellation request #${tracker.seq} is outside recent history. Check your computer before trying again.`;
+      tracker.error = history.kind === "missing_target_history"
+        ? `Cancellation request #${tracker.seq} and its preview are not present in this complete snapshot. Its outcome is unknown; check your computer before dismissing this browser notice.`
+        : `Cancellation request #${tracker.seq} is outside recent history. Its outcome is unknown; check your computer before dismissing this browser notice.`;
       changed = true;
     }
   }
@@ -2291,6 +2402,9 @@ function previewCancellationMarkup(kind, entry) {
   const busy = attempt || tracker?.status === "queued" || tracker?.status === "submitted";
   const attrs = `data-preview-cancel-kind="${escapeHtml(kind)}" data-preview-cancel-seq="${escapeHtml(payload.preview_seq)}" data-preview-cancel-id="${escapeHtml(payload.preview_id)}" data-preview-cancel-revision="${escapeHtml(payload.revision)}"`;
   if (tracker?.status === "unknown") {
+    if (previewCancellationIsKnownPending(tracker, payload, state.snapshot)) {
+      return `<p class="field-hint" role="status">Cancellation request #${escapeHtml(tracker.seq)} is still pending or has ambiguous status on your computer. Waiting for a current result.</p>`;
+    }
     return `<p class="field-hint" role="status">${escapeHtml(tracker.error || "The cancellation delivery outcome is unknown.")} Check your computer before trying again.</p><button class="quiet-button" type="button" data-preview-cancel-dismiss-kind="${escapeHtml(kind)}" data-preview-cancel-dismiss-seq="${escapeHtml(payload.preview_seq)}" data-preview-cancel-dismiss-id="${escapeHtml(payload.preview_id)}" data-preview-cancel-dismiss-revision="${escapeHtml(payload.revision)}">Dismiss after checking computer</button>`;
   }
   const status = busy
@@ -2322,6 +2436,25 @@ function renderReviewNavigation() {
       : `<p class="field-hint">This library is no longer registered. You can still cancel this saved preview by its exact identity.</p>`;
     cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${title}</h3><p>${escapeHtml(libraryLabel(libraryId))} · request ${sequence ? `#${sequence}` : "details unavailable"}</p>${cancelMessage ? `<p class="field-hint">${escapeHtml(cancelMessage)}</p>` : ""}</div><span class="state-pill pending">Review needed</span></div><div class="stack-actions">${reviewButton}${previewCancellationMarkup(kind, entry)}</div></article>`);
   }
+  for (const [key, tracker] of state.previewCancellations) {
+    if (!["submitted", "unknown"].includes(String(tracker?.status ?? "").toLowerCase())
+        || !Number.isSafeInteger(tracker.seq) || tracker.seq <= 0
+        || state.previewCancellationAttempts.has(key)) continue;
+    const payload = previewCancellationPayloadFromKey(key);
+    if (!payload || reviewTargetForCancellation(payload)) continue;
+    const knownPending = tracker.status === "unknown"
+      && previewCancellationIsKnownPending(tracker, payload, state.snapshot);
+    const unknown = tracker.status === "unknown" && !knownPending;
+    const message = knownPending
+      ? `Cancellation request #${tracker.seq} is still pending or has ambiguous status on your computer. Waiting for a current result.`
+      : tracker.error || (unknown
+      ? "The preview is not present in this Requests snapshot. The cancellation outcome is unknown; check your computer before dismissing this browser notice."
+      : `Cancellation request #${tracker.seq} is not present in this Requests snapshot. Waiting for a current result from your computer.`);
+    const cancelNotice = unknown
+      ? `<button class="quiet-button" type="button" data-preview-cancel-dismiss-kind="${escapeHtml(payload.preview_kind)}" data-preview-cancel-dismiss-seq="${escapeHtml(payload.preview_seq)}" data-preview-cancel-dismiss-id="${escapeHtml(payload.preview_id)}" data-preview-cancel-dismiss-revision="${escapeHtml(payload.revision)}">Dismiss after checking computer</button>`
+      : "";
+    cards.push(`<article class="stack-card"><div class="stack-card-head"><div><h3>${unknown ? "Preview cancellation outcome unknown" : "Preview cancellation is still being tracked"}</h3><p>${escapeHtml(message)}</p></div><span class="state-pill ${unknown ? "warning" : "pending"}">${unknown ? "Outcome unknown" : "Waiting"}</span></div>${cancelNotice ? `<div class="stack-actions">${cancelNotice}</div>` : ""}</article>`);
+  }
   const recovery = state.metadataRecoveryPreviewRequest;
   if (recovery && recovery.libraryId !== activeLibraryId()
       && registeredMediaLibrary(state.snapshot, recovery.libraryId)?.root_binding === recovery.rootBinding) {
@@ -2335,6 +2468,7 @@ function renderPreviewReviewCards() {
   renderMigrations();
   renderPreviews();
   renderReviewNavigation();
+  renderTabCounts();
 }
 
 function renderPreviews() {
@@ -3208,10 +3342,33 @@ function bindEvents() {
       };
       const key = previewCancellationKey(payload);
       const tracker = key ? state.previewCancellations.get(key) : null;
+      if (tracker?.status === "unknown"
+          && previewCancellationIsKnownPending(tracker, payload, state.snapshot)) {
+        showToast("This cancellation is still pending or has ambiguous status on your computer. It remains paused here.");
+        return;
+      }
       if (tracker?.requestId) {
-        const dismissed = dismissUnknownFileAction(state, tracker.requestId, readActionQueue(), writeActionQueue);
-        if (dismissed.status !== "dismissed") {
+        const queue = readActionQueueForCancellationDismissal();
+        if (!queue) {
           showToast("The cancellation notice could not be removed from browser storage. It remains paused here.");
+          return;
+        }
+        if (queue.some((action) => action.request_id === tracker.requestId)) {
+          const dismissed = dismissUnknownFileAction(state, tracker.requestId, queue, writeActionQueue);
+          if (dismissed.status !== "dismissed") {
+            showToast("The cancellation notice could not be removed from browser storage. It remains paused here.");
+            return;
+          }
+        } else if (isDismissibleAcceptedUnknownCancellation(key, tracker, payload)) {
+          const previous = { ...tracker };
+          state.previewCancellations.delete(key);
+          if (!persistPreviewCancellations({ removeKeys: [key] })) {
+            state.previewCancellations.set(key, previous);
+            showToast("The cancellation notice could not be removed from browser storage. It remains paused here.");
+            return;
+          }
+        } else {
+          showToast("This cancellation is still being reconciled. It remains paused here.");
           return;
         }
       } else if (tracker) {

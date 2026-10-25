@@ -3,9 +3,15 @@ import { webcrypto } from "node:crypto";
 import { resolve } from "node:path";
 import { Event as HappyDOMEvent } from "happy-dom";
 import type { HTMLButtonElement as HappyDOMButtonElement, HTMLSelectElement as HappyDOMSelectElement } from "happy-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { makeChunkedSnapshot, TEST_DATABASE_EPOCH } from "./snapshot-loader-fixtures.js";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials.js";
+import {
+  ACTION_RECEIPT_STORAGE_PREFIX,
+  ACTION_SURFACE_FILE,
+  createQueuedAction,
+} from "../public/file/action-queue.js";
+import { PREVIEW_CANCELLATION_STORAGE_KEY } from "../public/file/preview-cancellation-state.js";
 
 const LIBRARY_ID = "test-library";
 const ROOT_BINDING = `v1:${"a".repeat(64)}`;
@@ -15,6 +21,13 @@ const MIGRATION_PREVIEW_ID = "migration-cancel-preview";
 const MIGRATION_PREVIEW_REVISION = "migration-cancel-r1";
 const MIGRATION_PREVIEW_SEQ = 801;
 const MIGRATION_CONFLICT_ITEM_ID = "conflict-bundle";
+const FILE_CANCEL_PREVIEW_ID = "file-history-cancel-preview";
+const FILE_CANCEL_PREVIEW_REVISION = "file-history-cancel-r1";
+const FILE_CANCEL_PREVIEW_SEQ = 802;
+const FILE_CANCEL_REQUEST_ID = "00000000-0000-4000-8000-000000000711";
+const MIGRATION_CANCEL_REQUEST_ID = "00000000-0000-4000-8000-000000000712";
+const FILE_CANCEL_REQUEST_SEQ = 903;
+const MIGRATION_CANCEL_REQUEST_SEQ = 902;
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "file-manager-ui-flow", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
 
@@ -25,6 +38,47 @@ type MigrationPendingSnapshot = Record<string, any> & {
 };
 
 let originalWindowWebSocket: PropertyDescriptor | undefined;
+const originalWindowAddEventListener = window.addEventListener;
+const originalWindowAddEventListenerDescriptor = Object.getOwnPropertyDescriptor(window, "addEventListener");
+const capturedWindowListeners: Array<{
+  type: string;
+  listener: EventListenerOrEventListenerObject;
+  options: boolean | AddEventListenerOptions | undefined;
+}> = [];
+
+function clearCapturedWindowListeners() {
+  for (const { type, listener, options } of capturedWindowListeners.splice(0)) {
+    (window as EventTarget).removeEventListener(type, listener, options);
+  }
+}
+
+function captureMountedAppWindowListeners() {
+  clearCapturedWindowListeners();
+  Object.defineProperty(window, "addEventListener", {
+    configurable: true,
+    writable: true,
+    value(type: string, listener: EventListenerOrEventListenerObject | null, options?: boolean | AddEventListenerOptions) {
+      if (listener && ["storage", "online", "keydown"].includes(type)) {
+        capturedWindowListeners.push({ type, listener, options });
+      }
+      const add = originalWindowAddEventListener as unknown as (
+        type: string,
+        callback: EventListenerOrEventListenerObject | null,
+        settings?: boolean | AddEventListenerOptions,
+      ) => void;
+      return add.call(window, type, listener, options);
+    },
+  });
+}
+
+function restoreWindowAddEventListener() {
+  clearCapturedWindowListeners();
+  if (originalWindowAddEventListenerDescriptor) {
+    Object.defineProperty(window, "addEventListener", originalWindowAddEventListenerDescriptor);
+  } else {
+    Reflect.deleteProperty(window, "addEventListener");
+  }
+}
 
 class MockWebSocket extends EventTarget {
   static CONNECTING = 0;
@@ -216,6 +270,142 @@ function migrationPreviewSnapshot() {
   };
 }
 
+function fileCancellationPreviewEntry() {
+  const operation = filePreviewFixture(
+    FILE_CANCEL_PREVIEW_SEQ,
+    LIBRARY_ID,
+    ROOT_BINDING,
+    FILE_CANCEL_PREVIEW_ID,
+    FILE_CANCEL_PREVIEW_REVISION,
+  );
+  return {
+    ...operation,
+    id: FILE_CANCEL_PREVIEW_ID,
+    preview_id: FILE_CANCEL_PREVIEW_ID,
+    revision: FILE_CANCEL_PREVIEW_REVISION,
+    preview: operation.result.preview,
+  };
+}
+
+function migrationCancellationPreviewSnapshot() {
+  const snapshot = migrationPreviewSnapshot();
+  return {
+    ...snapshot,
+    synced: true,
+    stale: false,
+    last_seen: Date.now(),
+    previews: [snapshot.operations[0], fileCancellationPreviewEntry()],
+  };
+}
+
+function snapshotWithLibraryLabel(snapshot: Record<string, any>, name: string) {
+  return {
+    ...snapshot,
+    settings: {
+      ...snapshot.settings,
+      applied: {
+        ...snapshot.settings.applied,
+        libraries: snapshot.settings.applied.libraries.map((library: Record<string, any>) => (
+          library.id === LIBRARY_ID ? { ...library, name } : library
+        )),
+      },
+    },
+    library: {
+      ...snapshot.library,
+      libraries: snapshot.library.libraries.map((library: Record<string, any>) => (
+        library.id === LIBRARY_ID ? { ...library, name } : library
+      )),
+    },
+  };
+}
+
+function saturatedCancellationSnapshot() {
+  const snapshot = migrationCancellationPreviewSnapshot();
+  return {
+    ...snapshot,
+    operations: newerHistoryOperations(1_000, 100),
+    pending_requests: [],
+  };
+}
+
+function orphanCancellationSnapshot(stateVersion = 1) {
+  const snapshot = migrationPreviewSnapshot();
+  return {
+    ...snapshot,
+    state_version: stateVersion,
+    synced: true,
+    stale: false,
+    last_seen: Date.now(),
+    operations: [
+      {
+        seq: FILE_CANCEL_REQUEST_SEQ,
+        request_id: FILE_CANCEL_REQUEST_ID,
+        kind: "preview_cancel",
+        status: "completed",
+        result_truncated: true,
+        result: {},
+      },
+      ...newerHistoryOperations(1_000, 2),
+    ],
+    pending_requests: [],
+    previews: [],
+  };
+}
+
+function newerHistoryOperations(startSeq = 1_000, count = 100) {
+  return Array.from({ length: count }, (_, index) => ({
+    seq: startSeq + index,
+    request_id: `retained-history-${startSeq + index}`,
+    kind: "download_submit",
+    status: "completed",
+    result: {},
+  }));
+}
+
+function previewCancellationStorageKey(kind: "file_preview" | "library_migration_preview", seq: number, id: string, revision: string) {
+  return JSON.stringify([kind, seq, id, revision]);
+}
+
+function cancellationTrackerEnvelope(trackers: Array<{
+  key: string;
+  requestId: string;
+  seq: number | null;
+  status: "queued" | "submitted" | "unknown";
+  error: string | null;
+}>) {
+  return JSON.stringify({
+    version: 1,
+    entries: trackers.map(({ key, ...tracker }) => ({
+      key,
+      tracker: {
+        requestId: tracker.requestId,
+        seq: tracker.seq,
+        status: tracker.status,
+        error: tracker.error,
+      },
+    })),
+  });
+}
+
+function acceptedCancellationTrackers(seqOffset = 0) {
+  return [
+    {
+      key: previewCancellationStorageKey("file_preview", FILE_CANCEL_PREVIEW_SEQ, FILE_CANCEL_PREVIEW_ID, FILE_CANCEL_PREVIEW_REVISION),
+      requestId: FILE_CANCEL_REQUEST_ID,
+      seq: FILE_CANCEL_REQUEST_SEQ + seqOffset,
+      status: "submitted" as const,
+      error: null,
+    },
+    {
+      key: previewCancellationStorageKey("library_migration_preview", MIGRATION_PREVIEW_SEQ, MIGRATION_PREVIEW_ID, MIGRATION_PREVIEW_REVISION),
+      requestId: MIGRATION_CANCEL_REQUEST_ID,
+      seq: MIGRATION_CANCEL_REQUEST_SEQ + seqOffset,
+      status: "submitted" as const,
+      error: null,
+    },
+  ];
+}
+
 function element<T>(selector: string): T {
   const found = document.querySelector(selector);
   if (!found) throw new Error(`Expected element ${selector}`);
@@ -271,6 +461,7 @@ async function mountFileManagerFixture(
     publishSnapshot: (snapshot: Record<string, any>) => Promise<void>,
   ) => Promise<MockActionResponse | void> | MockActionResponse | void,
 ) {
+  clearCapturedWindowListeners();
   const sockets = installMockWebSocket();
   let currentManifest: Record<string, any>;
   let stateRequests = 0;
@@ -342,8 +533,12 @@ async function mountFileManagerFixture(
   vi.resetModules();
   // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.
   await import("../public/file/app.js");
-  await vi.waitFor(() => expect(stateRequests).toBeGreaterThan(0));
-  await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+  await vi.waitFor(() => expect(sockets[0]?.readyState).toBe(MockWebSocket.OPEN));
+  await vi.waitFor(() => {
+    expect(stateRequests).toBeGreaterThan(0);
+    expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false);
+    expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+  });
 
   return {
     actions,
@@ -355,11 +550,16 @@ async function mountFileManagerFixture(
   };
 }
 
+beforeEach(() => {
+  captureMountedAppWindowListeners();
+});
+
 afterEach(async () => {
   vi.clearAllTimers();
   vi.useRealTimers();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  restoreWindowAddEventListener();
   if (originalWindowWebSocket) {
     Object.defineProperty(window, "WebSocket", originalWindowWebSocket);
     originalWindowWebSocket = undefined;
@@ -1223,6 +1423,9 @@ describe("file manager UI flow", () => {
     expect(fixture.actions).toHaveLength(1);
     expect(JSON.parse(storage.getItem("file-manager.actions.v1") ?? "[]")).toEqual([]);
 
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false"));
+
     const cancellationError = "The computer could not cancel this migration preview.";
     const failureSnapshot = {
       ...fixture.currentSnapshot,
@@ -1244,12 +1447,22 @@ describe("file manager UI flow", () => {
     };
     await fixture.publishSnapshot(failureSnapshot);
     const stateRequestsBeforeFailure = fixture.stateRequests;
-    fixture.sockets[0]?.receive({
-      type: "invalidate",
-      database_epoch: TEST_DATABASE_EPOCH,
-      state_version: failureSnapshot.state_version,
-      reason: "state",
-    });
+    let liveSocket: MockWebSocket | undefined;
+    await new Promise<void>((resolve, reject) => window.setTimeout(() => {
+      try {
+        liveSocket = fixture.sockets.find((socket) => socket.readyState === MockWebSocket.OPEN && socket.protocol === UPDATE_PROTOCOL);
+        if (!liveSocket) throw new Error("Expected a live updates connection before failure snapshot invalidation.");
+        liveSocket.receive({
+          type: "invalidate",
+          database_epoch: TEST_DATABASE_EPOCH,
+          state_version: failureSnapshot.state_version,
+          reason: "state",
+        });
+        resolve();
+      } catch (error) {
+        reject(error);
+      }
+    }, 0));
     await vi.waitFor(() => {
       expect(fixture.stateRequests).toBe(stateRequestsBeforeFailure + 1);
       expect(element<HTMLElement>("#migration-preview-list").textContent).toContain(cancellationError);
@@ -1300,6 +1513,378 @@ describe("file manager UI flow", () => {
     expect(fixture.actions[0]?.kind).toBe("preview_cancel");
     expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(1);
     expect(JSON.parse(storage.getItem("file-manager.actions.v1") ?? "[]").map((action: Record<string, unknown>) => action.kind)).toEqual(["preview_cancel"]);
+  });
+
+  it("keeps evicted file and migration cancellations dismissible across stale storage events, reload, and counts", async () => {
+    const storage = makeMemoryStorage();
+    const submittedTrackers = acceptedCancellationTrackers();
+    storage.setItem(PREVIEW_CANCELLATION_STORAGE_KEY, cancellationTrackerEnvelope(submittedTrackers));
+    const snapshot = saturatedCancellationSnapshot();
+    const fixture = await mountFileManagerFixture(snapshot, storage);
+    const fileKey = submittedTrackers[0]!.key;
+    const migrationKey = submittedTrackers[1]!.key;
+    const fileDismiss = () => element<HTMLButtonElement>(`[data-preview-cancel-dismiss-kind="file_preview"][data-preview-cancel-dismiss-id="${FILE_CANCEL_PREVIEW_ID}"]`);
+    const migrationDismiss = () => element<HTMLButtonElement>(`[data-preview-cancel-dismiss-kind="library_migration_preview"][data-preview-cancel-dismiss-id="${MIGRATION_PREVIEW_ID}"]`);
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    await vi.waitFor(() => {
+      expect(fileDismiss()).toBeDefined();
+      expect(migrationDismiss()).toBeDefined();
+      expect(element<HTMLElement>("#waiting-count").textContent).toBe("4");
+    });
+    const reconciled = JSON.parse(storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null") as {
+      entries: Array<{ key: string; tracker: { status: string; seq: number | null } }>;
+    };
+    expect(reconciled.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: fileKey, tracker: expect.objectContaining({ status: "unknown", seq: FILE_CANCEL_REQUEST_SEQ }) }),
+      expect.objectContaining({ key: migrationKey, tracker: expect.objectContaining({ status: "unknown", seq: MIGRATION_CANCEL_REQUEST_SEQ }) }),
+    ]));
+
+    const staleSubmittedEnvelope = cancellationTrackerEnvelope(submittedTrackers);
+    storage.setItem(PREVIEW_CANCELLATION_STORAGE_KEY, staleSubmittedEnvelope);
+    window.dispatchEvent(new StorageEvent("storage", {
+      key: PREVIEW_CANCELLATION_STORAGE_KEY,
+      newValue: staleSubmittedEnvelope,
+    }));
+    expect(fileDismiss()).toBeDefined();
+    expect(migrationDismiss()).toBeDefined();
+    expect(element<HTMLElement>("#waiting-count").textContent).toBe("4");
+    const storageAfterStaleSubmittedEvent = JSON.parse(storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null") as {
+      entries: Array<{ key: string; tracker: { status: string; seq: number | null } }>;
+    };
+    expect(storageAfterStaleSubmittedEvent.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: fileKey, tracker: expect.objectContaining({ status: "unknown", seq: FILE_CANCEL_REQUEST_SEQ }) }),
+      expect.objectContaining({ key: migrationKey, tracker: expect.objectContaining({ status: "unknown", seq: MIGRATION_CANCEL_REQUEST_SEQ }) }),
+    ]));
+
+    fileDismiss().click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#waiting-count").textContent).toBe("3"));
+    const afterFileDismissal = JSON.parse(storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null") as { entries: Array<{ key: string }> };
+    expect(afterFileDismissal.entries.map((entry) => entry.key)).toEqual([migrationKey]);
+    migrationDismiss().click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#waiting-count").textContent).toBe("2"));
+    expect(storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY)).toBeNull();
+    expect(fixture.actions).toHaveLength(0);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+
+    const reloaded = await mountFileManagerFixture(snapshot, storage);
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#waiting-count").textContent).toBe("2"));
+    expect(document.querySelector('[data-preview-cancel-dismiss-kind="file_preview"]')).toBeNull();
+    expect(document.querySelector('[data-preview-cancel-dismiss-kind="library_migration_preview"]')).toBeNull();
+    expect(element<HTMLButtonElement>(`[data-preview-cancel-kind="file_preview"][data-preview-cancel-id="${FILE_CANCEL_PREVIEW_ID}"]`).disabled).toBe(false);
+    expect(element<HTMLButtonElement>(`[data-preview-cancel-kind="library_migration_preview"][data-preview-cancel-id="${MIGRATION_PREVIEW_ID}"]`).disabled).toBe(false);
+    expect(reloaded.actions).toHaveLength(0);
+  });
+
+  it("shows and safely dismisses short-history orphan cancellations including a compacted terminal receipt", async () => {
+    const backingStorage = makeMemoryStorage();
+    let failCancellationStorageWrite = false;
+    const storage: MemoryStorageFixture = {
+      getItem: backingStorage.getItem,
+      setItem(key, value) {
+        if (failCancellationStorageWrite && key === PREVIEW_CANCELLATION_STORAGE_KEY) {
+          throw new Error("Simulated cancellation-state storage failure");
+        }
+        backingStorage.setItem(key, value);
+      },
+      removeItem(key) {
+        if (failCancellationStorageWrite && key === PREVIEW_CANCELLATION_STORAGE_KEY) {
+          throw new Error("Simulated cancellation-state storage failure");
+        }
+        backingStorage.removeItem(key);
+      },
+      clear: backingStorage.clear,
+    };
+    const submittedTrackers = acceptedCancellationTrackers();
+    storage.setItem(PREVIEW_CANCELLATION_STORAGE_KEY, cancellationTrackerEnvelope(submittedTrackers));
+    const snapshot = orphanCancellationSnapshot();
+    let fixture = await mountFileManagerFixture(snapshot, storage);
+    const fileKey = submittedTrackers[0]!.key;
+    const migrationKey = submittedTrackers[1]!.key;
+    const fileDismiss = () => element<HTMLButtonElement>(`#review-navigation-list [data-preview-cancel-dismiss-kind="file_preview"][data-preview-cancel-dismiss-id="${FILE_CANCEL_PREVIEW_ID}"]`);
+    const migrationDismiss = () => element<HTMLButtonElement>(`#review-navigation-list [data-preview-cancel-dismiss-kind="library_migration_preview"][data-preview-cancel-dismiss-id="${MIGRATION_PREVIEW_ID}"]`);
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    await vi.waitFor(() => {
+      expect(fileDismiss()).toBeDefined();
+      expect(migrationDismiss()).toBeDefined();
+      expect(element<HTMLElement>("#review-navigation-list").textContent).toContain(`Cancellation request #${FILE_CANCEL_REQUEST_SEQ} is recorded, but its result details are unavailable.`);
+      expect(element<HTMLElement>("#review-navigation-list").textContent).toContain("Its outcome is unknown; check your computer before dismissing this browser notice.");
+      expect(element<HTMLElement>("#review-navigation-list").textContent).not.toContain("Cancelled");
+      expect(element<HTMLElement>("#waiting-count").textContent).toBe("2");
+    });
+    const persistedUnknown = JSON.parse(storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null") as {
+      entries: Array<{ key: string; tracker: { status: string } }>;
+    };
+    expect(persistedUnknown.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: fileKey, tracker: expect.objectContaining({ status: "unknown" }) }),
+      expect.objectContaining({ key: migrationKey, tracker: expect.objectContaining({ status: "unknown" }) }),
+    ]));
+
+    const staleSnapshot = {
+      ...snapshotWithLibraryLabel(snapshot, "Stale cancellation snapshot applied"),
+      state_version: 2,
+      stale: true,
+      last_seen: Date.now() - 11 * 60 * 1_000,
+    };
+    const stateRequestsBeforeStale = fixture.stateRequests;
+    await fixture.publishSnapshot(staleSnapshot);
+    fixture.sockets[0]?.receive({
+      type: "invalidate",
+      database_epoch: TEST_DATABASE_EPOCH,
+      state_version: staleSnapshot.state_version,
+      reason: "state",
+    });
+    await vi.waitFor(() => {
+      expect(fixture.stateRequests).toBe(stateRequestsBeforeStale + 1);
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+      expect(element<HTMLElement>("#library-select").textContent).toContain("Stale cancellation snapshot applied");
+      expect(fileDismiss()).toBeDefined();
+      expect(migrationDismiss()).toBeDefined();
+    });
+    const persistedAfterStaleSnapshot = JSON.parse(storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null") as {
+      entries: Array<{ key: string; tracker: { status: string; seq: number | null } }>;
+    };
+    expect(persistedAfterStaleSnapshot.entries).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: fileKey, tracker: expect.objectContaining({ status: "unknown", seq: FILE_CANCEL_REQUEST_SEQ }) }),
+      expect.objectContaining({ key: migrationKey, tracker: expect.objectContaining({ status: "unknown", seq: MIGRATION_CANCEL_REQUEST_SEQ }) }),
+    ]));
+
+    fixture = await mountFileManagerFixture(staleSnapshot, storage);
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    await vi.waitFor(() => {
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+      expect(element<HTMLElement>("#waiting-count").textContent).toBe("2");
+      expect(fileDismiss()).toBeDefined();
+      expect(migrationDismiss()).toBeDefined();
+    });
+    Object.defineProperty(window.navigator, "onLine", { configurable: true, value: false });
+
+    failCancellationStorageWrite = true;
+    fileDismiss().click();
+    expect(element<HTMLElement>("#toast").textContent).toContain("could not be removed from browser storage");
+    expect(fileDismiss()).toBeDefined();
+    expect(migrationDismiss()).toBeDefined();
+    expect(element<HTMLElement>("#waiting-count").textContent).toBe("2");
+    expect(JSON.parse(storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null").entries.map((entry: { key: string }) => entry.key)).toEqual([fileKey, migrationKey].sort());
+    expect(fixture.actions).toHaveLength(0);
+
+    failCancellationStorageWrite = false;
+    fileDismiss().click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#waiting-count").textContent).toBe("1"));
+    expect(JSON.parse(storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null").entries.map((entry: { key: string }) => entry.key)).toEqual([migrationKey]);
+    migrationDismiss().click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#waiting-count").textContent).toBe("0"));
+    expect(storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY)).toBeNull();
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+
+    const reloaded = await mountFileManagerFixture(staleSnapshot, storage);
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#waiting-count").textContent).toBe("0"));
+    expect(document.querySelector("#review-navigation-list [data-preview-cancel-dismiss-kind]")).toBeNull();
+    expect(reloaded.actions).toHaveLength(0);
+  });
+
+  it("keeps exact pending, saturated pending, omission, stale, and incomplete histories blocked", async () => {
+    const storage = makeMemoryStorage();
+    storage.setItem(PREVIEW_CANCELLATION_STORAGE_KEY, cancellationTrackerEnvelope(acceptedCancellationTrackers()));
+    const saturated = saturatedCancellationSnapshot();
+    const submitted = acceptedCancellationTrackers();
+    const exactPendingRequests = submitted.map((tracker, index) => ({
+      seq: tracker.seq,
+      request_id: tracker.requestId,
+      kind: "preview_cancel",
+      status: "pending",
+      created_at: Math.floor(Date.now() / 1000),
+      payload: {
+        preview_kind: index === 0 ? "file_preview" : "library_migration_preview",
+        preview_seq: index === 0 ? FILE_CANCEL_PREVIEW_SEQ : MIGRATION_PREVIEW_SEQ,
+        preview_id: index === 0 ? FILE_CANCEL_PREVIEW_ID : MIGRATION_PREVIEW_ID,
+        revision: index === 0 ? FILE_CANCEL_PREVIEW_REVISION : MIGRATION_PREVIEW_REVISION,
+      },
+    }));
+    const initialSnapshot: MigrationPendingSnapshot = {
+      ...saturated,
+      state_version: 1,
+      pending_requests: exactPendingRequests,
+    };
+    const fixture = await mountFileManagerFixture(initialSnapshot, storage);
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    const expectNoDismissibleCancellation = () => {
+      expect(document.querySelector('[data-preview-cancel-dismiss-kind="file_preview"]')).toBeNull();
+      expect(document.querySelector('[data-preview-cancel-dismiss-kind="library_migration_preview"]')).toBeNull();
+    };
+    await vi.waitFor(() => {
+      expect(element<HTMLElement>("#waiting-list").textContent).toContain(`Waiting for computer · #${FILE_CANCEL_REQUEST_SEQ}`);
+      expect(element<HTMLElement>("#waiting-list").textContent).toContain(`Waiting for computer · #${MIGRATION_CANCEL_REQUEST_SEQ}`);
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+      expectNoDismissibleCancellation();
+    });
+
+    const publishAndCheck = async (
+      nextSnapshot: Record<string, any>,
+      appliedMarker: () => void = () => {},
+      pauseAfterRequest = false,
+    ) => {
+      const requestsBefore = fixture.stateRequests;
+      await fixture.publishSnapshot(nextSnapshot);
+      let liveSocket: MockWebSocket | undefined;
+      await vi.waitFor(() => {
+        liveSocket = fixture.sockets.find((socket) => socket.readyState === MockWebSocket.OPEN && socket.protocol === UPDATE_PROTOCOL);
+        expect(liveSocket).toBeDefined();
+      });
+      liveSocket!.receive({
+        type: "invalidate",
+        database_epoch: TEST_DATABASE_EPOCH,
+        state_version: nextSnapshot.state_version,
+        reason: "state",
+      });
+      await vi.waitFor(() => expect(fixture.stateRequests, `state_version ${nextSnapshot.state_version} must start a state fetch`).toBe(requestsBefore + 1));
+      if (pauseAfterRequest) Object.defineProperty(window.navigator, "onLine", { configurable: true, value: false });
+      await vi.waitFor(() => {
+        expect(fixture.stateRequests, `state_version ${nextSnapshot.state_version} must request the published snapshot`).toBe(requestsBefore + 1);
+        expect(element<HTMLElement>("#app-content").getAttribute("aria-busy"), `state_version ${nextSnapshot.state_version} must finish applying the snapshot`).toBe("false");
+        appliedMarker();
+        expectNoDismissibleCancellation();
+      });
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+    };
+    const saturatedPending = {
+      ...saturated,
+      state_version: 2,
+      pending_requests: Array.from({ length: 100 }, (_, index) => ({
+        seq: 2_000 + index,
+        request_id: `saturated-pending-${index}`,
+        kind: "library_scan",
+        status: "pending",
+        created_at: Math.floor(Date.now() / 1000),
+      })),
+    };
+    await publishAndCheck(saturatedPending, () => expect(element<HTMLElement>("#waiting-count").textContent).toBe("104"));
+
+    const omissionPlaceholder = {
+      preview_incomplete: true,
+      omitted_count: 2,
+      reason: "Two active preview identities were omitted from this fixture.",
+    };
+    const omittedSnapshot = {
+      ...saturated,
+      state_version: 3,
+      operations: newerHistoryOperations(1_000, 4),
+      pending_requests: [],
+      previews: [omissionPlaceholder],
+    };
+    await publishAndCheck(omittedSnapshot, () => expect(element<HTMLElement>("#preview-list").textContent).toContain("2 active previews were omitted"));
+
+    const staleSnapshot = {
+      ...saturated,
+      state_version: 4,
+      synced: true,
+      stale: true,
+      last_seen: Date.now() - 11 * 60 * 1_000,
+      operations: newerHistoryOperations(1_000, 4),
+      pending_requests: [],
+      previews: [],
+      library: {
+        ...saturated.library,
+        libraries: saturated.library.libraries.map((library: Record<string, any>) => (
+          library.id === LIBRARY_ID ? { ...library, name: "Stale history snapshot applied" } : library
+        )),
+      },
+    };
+    await publishAndCheck(staleSnapshot, () => {
+      expect(element<HTMLElement>("#library-select").textContent).toContain("Stale history snapshot applied");
+    });
+
+    const incompleteSnapshot: Record<string, any> = {
+      ...snapshotWithLibraryLabel(staleSnapshot, "Incomplete history snapshot applied"),
+      state_version: 5,
+      stale: false,
+      synced: true,
+      last_seen: Date.now(),
+      previews: [],
+    };
+    delete incompleteSnapshot.operations;
+    delete incompleteSnapshot.pending_requests;
+    delete incompleteSnapshot.previews;
+    await publishAndCheck(incompleteSnapshot, () => {
+      expect(element<HTMLElement>("#library-select").textContent).toContain("Stale history snapshot applied");
+    }, true);
+    expect(fixture.actions).toHaveLength(0);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+  });
+
+  it("keeps a known accepted sequence when its queue receipt replaces an unknown tracker without a sequence", async () => {
+    vi.stubGlobal("crypto", webcrypto);
+    const storage = makeMemoryStorage();
+    const requestId = "00000000-0000-4000-8000-000000000713";
+    const cancellationSeq = 905;
+    const payload = {
+      preview_kind: "file_preview",
+      preview_seq: FILE_CANCEL_PREVIEW_SEQ,
+      preview_id: FILE_CANCEL_PREVIEW_ID,
+      revision: FILE_CANCEL_PREVIEW_REVISION,
+    };
+    const queuedAction = createQueuedAction({
+      request_id: requestId,
+      kind: "preview_cancel",
+      payload,
+      surface: ACTION_SURFACE_FILE,
+    });
+    storage.setItem("file-manager.actions.v1", JSON.stringify([{
+      ...queuedAction,
+      delivery_outcome: "outcome_unknown",
+      delivery_error_code: "action_replay_window_unverifiable",
+      delivery_error: "The prior cancellation delivery is unknown.",
+    }]));
+    const fileTracker = {
+      key: previewCancellationStorageKey("file_preview", FILE_CANCEL_PREVIEW_SEQ, FILE_CANCEL_PREVIEW_ID, FILE_CANCEL_PREVIEW_REVISION),
+      requestId,
+      seq: null,
+      status: "unknown" as const,
+      error: "The prior cancellation delivery is unknown.",
+    };
+    storage.setItem(PREVIEW_CANCELLATION_STORAGE_KEY, cancellationTrackerEnvelope([fileTracker]));
+    const snapshot: MigrationPendingSnapshot = migrationCancellationPreviewSnapshot();
+    snapshot.pending_requests = [{
+      seq: cancellationSeq,
+      request_id: requestId,
+      kind: "preview_cancel",
+      status: "pending",
+      created_at: Math.floor(Date.now() / 1000),
+      payload,
+    }];
+    const fixture = await mountFileManagerFixture(snapshot, storage);
+
+    element<HTMLButtonElement>('[data-view="waiting"]').click();
+    await vi.waitFor(() => expect(element<HTMLElement>("#preview-list").textContent).toContain("The prior cancellation delivery is unknown."));
+    const receiptKey = `${ACTION_RECEIPT_STORAGE_PREFIX}${encodeURIComponent(requestId)}`;
+    const acceptedReceipt = JSON.stringify({
+      version: 1,
+      request_id: requestId,
+      surface: ACTION_SURFACE_FILE,
+      kind: "preview_cancel",
+      seq: cancellationSeq,
+      stored_at: Date.now(),
+    });
+    storage.setItem(receiptKey, acceptedReceipt);
+    window.dispatchEvent(new StorageEvent("storage", { key: receiptKey, newValue: acceptedReceipt }));
+
+    await vi.waitFor(() => {
+      expect(element<HTMLElement>("#waiting-list").textContent).toContain(`Waiting for computer · #${cancellationSeq}`);
+      expect(element<HTMLElement>("#preview-list").textContent).toContain(`Cancellation request #${cancellationSeq} was submitted. Waiting for your computer.`);
+      expect(document.querySelector(`[data-preview-cancel-dismiss-kind="file_preview"][data-preview-cancel-dismiss-id="${FILE_CANCEL_PREVIEW_ID}"]`)).toBeNull();
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+    });
+    expect(JSON.parse(storage.getItem(PREVIEW_CANCELLATION_STORAGE_KEY) ?? "null").entries).toContainEqual({
+      key: fileTracker.key,
+      tracker: { requestId, seq: cancellationSeq, status: "submitted", error: null },
+    });
+    expect(storage.getItem("file-manager.actions.v1")).toBe("[]");
+    expect(storage.getItem(receiptKey)).toBeNull();
+    expect(fixture.actions).toHaveLength(0);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
   });
 
   it("keeps unknown cancellations paused and preserves incomplete offline review identity", async () => {
@@ -1541,10 +2126,13 @@ describe("file manager UI flow", () => {
       state_version: 3,
       reason: "state",
     });
-    await vi.waitFor(() => expect(reloadedPage.stateRequests).toBeGreaterThan(stateRequestsBeforeTerminal));
-    await vi.waitFor(() => expect(document.querySelector('[data-preview-cancel-id="reload-cancel-preview"]')).toBeNull());
-    await vi.waitFor(() => expect(element<HTMLElement>("#history-count").textContent).toBe("2"));
-    expect(element<HTMLElement>("#waiting-count").textContent).toBe("0");
+    await vi.waitFor(() => {
+      expect(reloadedPage.stateRequests).toBeGreaterThan(stateRequestsBeforeTerminal);
+      expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false");
+      expect(element<HTMLElement>("#history-count").textContent).toBe("2");
+      expect(element<HTMLElement>("#waiting-count").textContent).toBe("0");
+      expect(document.querySelector('[data-preview-cancel-id="reload-cancel-preview"]')).toBeNull();
+    });
 
     element<HTMLButtonElement>('[data-view="history"]').click();
     expect(element<HTMLInputElement>("#history-search").value).toBe("");
