@@ -40,6 +40,8 @@ const INBOX_RECORD_VERSION: u32 = 1;
 const MAX_JS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PREVIEW_CANCEL_ID_BYTES: usize = 128;
 const MAX_PREVIEW_CANCEL_REVISION_BYTES: usize = 256;
+const PREVIEW_CANCELLED_RESULT_MARKER: &str = "_tvd_preview_cancelled_v1";
+const PREVIEW_CANCELLED_ERROR: &str = "This preview was cancelled before confirmation.";
 pub(crate) const MAX_CLOUD_STATE_VERSION: u64 = MAX_JS_SAFE_INTEGER;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_LEGACY_IMPORT_BYTES: usize = 256 * 1024;
@@ -1361,6 +1363,100 @@ fn inbox_preview_revision(record: &InboxRecord) -> Option<&str> {
     })
 }
 
+/// Keep the persisted status readable by versions that predate `InboxStatus::Cancelled`.
+/// The marker lives alongside the original result fields and is stripped by the matching
+/// runtime decoder, so snapshots and callers continue to see the original preview result.
+fn inbox_record_for_disk(record: &InboxRecord) -> Result<InboxRecord> {
+    if record.status != InboxStatus::Cancelled {
+        return Ok(record.clone());
+    }
+    if !matches!(
+        record.request.kind.as_str(),
+        "file_preview" | "library_migration_preview"
+    ) {
+        bail!("only a preview record can be persisted as cancelled");
+    }
+
+    let preview_id = inbox_preview_id(record)
+        .filter(|value| valid_preview_cancel_scalar(value, MAX_PREVIEW_CANCEL_ID_BYTES))
+        .ok_or_else(|| anyhow!("cancelled preview record has no valid preview id"))?;
+    let revision = inbox_preview_revision(record)
+        .filter(|value| valid_preview_cancel_scalar(value, MAX_PREVIEW_CANCEL_REVISION_BYTES))
+        .ok_or_else(|| anyhow!("cancelled preview record has no valid revision"))?;
+
+    let mut persisted = record.clone();
+    let result = persisted
+        .result
+        .as_mut()
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow!("cancelled preview record has no object result"))?;
+    if result.contains_key(PREVIEW_CANCELLED_RESULT_MARKER) {
+        bail!("cancelled preview result contains the reserved cancellation marker");
+    }
+    result.insert(
+        PREVIEW_CANCELLED_RESULT_MARKER.to_string(),
+        serde_json::json!({
+            "preview_seq": record.request.seq,
+            "preview_kind": record.request.kind,
+            "preview_id": preview_id,
+            "revision": revision,
+        }),
+    );
+    persisted.status = InboxStatus::Stale;
+    Ok(persisted)
+}
+
+/// Promote only the exact marker emitted by `inbox_record_for_disk`; unrelated stale previews
+/// and malformed or mismatched markers remain stale and cannot be presented as cancelled.
+fn inbox_record_from_disk(mut record: InboxRecord) -> InboxRecord {
+    if record.status != InboxStatus::Stale
+        || !matches!(
+            record.request.kind.as_str(),
+            "file_preview" | "library_migration_preview"
+        )
+    {
+        return record;
+    }
+
+    let Some(marker) = record
+        .result
+        .as_ref()
+        .and_then(|result| result.get(PREVIEW_CANCELLED_RESULT_MARKER))
+        .and_then(Value::as_object)
+    else {
+        return record;
+    };
+    if marker.len() != 4
+        || marker.get("preview_seq").and_then(Value::as_u64) != Some(record.request.seq)
+        || marker.get("preview_kind").and_then(Value::as_str) != Some(record.request.kind.as_str())
+        || marker.get("preview_id").and_then(Value::as_str) != inbox_preview_id(&record)
+        || marker.get("revision").and_then(Value::as_str) != inbox_preview_revision(&record)
+    {
+        return record;
+    }
+    let Some(preview_id) = inbox_preview_id(&record)
+        .filter(|value| valid_preview_cancel_scalar(value, MAX_PREVIEW_CANCEL_ID_BYTES))
+    else {
+        return record;
+    };
+    let Some(revision) = inbox_preview_revision(&record)
+        .filter(|value| valid_preview_cancel_scalar(value, MAX_PREVIEW_CANCEL_REVISION_BYTES))
+    else {
+        return record;
+    };
+    if marker.get("preview_id").and_then(Value::as_str) != Some(preview_id)
+        || marker.get("revision").and_then(Value::as_str) != Some(revision)
+    {
+        return record;
+    }
+
+    if let Some(result) = record.result.as_mut().and_then(Value::as_object_mut) {
+        result.remove(PREVIEW_CANCELLED_RESULT_MARKER);
+        record.status = InboxStatus::Cancelled;
+    }
+    record
+}
+
 fn terminal_confirmation_index_key(record: &InboxRecord) -> Option<String> {
     let preview_kind = match record.request.kind.as_str() {
         "file_confirm" => "file_preview",
@@ -2050,7 +2146,7 @@ impl CloudInbox {
             }
             record.status = InboxStatus::Cancelled;
             record.next_attempt_at = 0;
-            record.error = Some("This preview was cancelled before confirmation.".to_string());
+            record.error = Some(PREVIEW_CANCELLED_ERROR.to_string());
             Ok(())
         })
         .map(Some)
@@ -2253,7 +2349,7 @@ impl CloudInbox {
                 bail!("unsupported cloud inbox record version");
             }
             parsed.request.validate()?;
-            record = Some(parsed);
+            record = Some(inbox_record_from_disk(parsed));
             Ok(())
         };
         self.file_provider
@@ -2313,6 +2409,7 @@ impl CloudInbox {
                 bail!("unsupported cloud inbox record version");
             }
             record.request.validate()?;
+            let record = inbox_record_from_disk(record);
             result = Some(InboxRecordRead::Present {
                 record: Box::new(record),
                 entry,
@@ -2397,7 +2494,9 @@ impl CloudInbox {
     }
 
     fn write_record_path(&self, path: &Path, record: &InboxRecord) -> Result<()> {
-        let bytes = serde_json::to_vec(record).context("failed to encode cloud inbox record")?;
+        let persisted_record = inbox_record_for_disk(record)?;
+        let bytes =
+            serde_json::to_vec(&persisted_record).context("failed to encode cloud inbox record")?;
         if bytes.len() > MAX_REQUEST_BYTES + 64 * 1024 {
             bail!("cloud inbox record exceeds the local persistence limit");
         }
@@ -3909,18 +4008,28 @@ mod tests {
         );
 
         let write_fixture = |seq: u64, status: InboxStatus, kind: &str, updated_at: u64| {
-            let mut cloud_request = request(seq, "fixture");
-            cloud_request.kind = kind.to_string();
-            let record = InboxRecord {
-                schema_version: INBOX_RECORD_VERSION,
-                request: cloud_request,
-                status,
-                attempts: 0,
-                received_at: Some(updated_at),
-                updated_at,
-                next_attempt_at: 0,
-                error: None,
-                result: None,
+            let record = if status == InboxStatus::Cancelled {
+                let mut preview = preview_inbox_record(
+                    seq,
+                    &format!("expired-cancelled-preview-{seq}"),
+                    updated_at,
+                );
+                preview.status = InboxStatus::Cancelled;
+                preview
+            } else {
+                let mut cloud_request = request(seq, "fixture");
+                cloud_request.kind = kind.to_string();
+                InboxRecord {
+                    schema_version: INBOX_RECORD_VERSION,
+                    request: cloud_request,
+                    status,
+                    attempts: 0,
+                    received_at: Some(updated_at),
+                    updated_at,
+                    next_attempt_at: 0,
+                    error: None,
+                    result: None,
+                }
             };
             inbox.write_record_path(&inbox.record_path(seq), &record)
         };
@@ -5055,10 +5164,37 @@ mod tests {
             .expect("exact awaiting preview should be cancellable");
         assert_eq!(cancelled.status, InboxStatus::Cancelled);
         assert_eq!(cancelled.result, Some(original_result.clone()));
+        assert_eq!(cancelled.error.as_deref(), Some(PREVIEW_CANCELLED_ERROR));
+
+        let persisted: Value = serde_json::from_slice(
+            &fs::read(inbox.record_path_for_test(1)).expect("persisted preview should be readable"),
+        )
+        .expect("persisted preview should remain valid JSON");
+        assert_eq!(persisted["status"], "stale");
         assert_eq!(
-            cancelled.error.as_deref(),
-            Some("This preview was cancelled before confirmation.")
+            persisted["result"][PREVIEW_CANCELLED_RESULT_MARKER],
+            json!({
+                "preview_seq": 1,
+                "preview_kind": "file_preview",
+                "preview_id": "preview-cancel-exact",
+                "revision": "revision-1",
+            })
         );
+        assert_eq!(persisted["error"], PREVIEW_CANCELLED_ERROR);
+        let mut persisted_result = persisted["result"].clone();
+        assert_eq!(
+            persisted_result
+                .as_object_mut()
+                .expect("preview result should be an object")
+                .remove(PREVIEW_CANCELLED_RESULT_MARKER),
+            Some(json!({
+                "preview_seq": 1,
+                "preview_kind": "file_preview",
+                "preview_id": "preview-cancel-exact",
+                "revision": "revision-1",
+            }))
+        );
+        assert_eq!(persisted_result, original_result);
 
         let repeated = inbox
             .cancel_awaiting_preview("file_preview", 1, "preview-cancel-exact", "revision-1")
@@ -5086,6 +5222,119 @@ mod tests {
         assert_eq!(replayed.result, Some(original_result));
         drop(reopened);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_cancel_disk_marker_requires_exact_preview_identity_and_shape() {
+        let mut stale = preview_inbox_record(41, "preview-marker-contract", now_seconds());
+        stale.status = InboxStatus::Stale;
+        let original_result = stale.result.clone().expect("preview result should exist");
+        assert_eq!(
+            inbox_record_from_disk(stale.clone()).status,
+            InboxStatus::Stale,
+            "a stale preview without a marker must remain stale"
+        );
+        let valid_marker = json!({
+            "preview_seq": 41,
+            "preview_kind": "file_preview",
+            "preview_id": "preview-marker-contract",
+            "revision": "revision-1",
+        });
+
+        let mut marked = stale.clone();
+        marked
+            .result
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("preview result should be an object")
+            .insert(
+                PREVIEW_CANCELLED_RESULT_MARKER.to_string(),
+                valid_marker.clone(),
+            );
+        let restored = inbox_record_from_disk(marked);
+        assert_eq!(restored.status, InboxStatus::Cancelled);
+        assert_eq!(restored.result, Some(original_result.clone()));
+
+        let invalid_markers = [
+            json!({
+                "preview_seq": 42,
+                "preview_kind": "file_preview",
+                "preview_id": "preview-marker-contract",
+                "revision": "revision-1",
+            }),
+            json!({
+                "preview_seq": 41,
+                "preview_kind": "file_preview",
+                "preview_id": "preview-marker-contract",
+                "revision": "another-revision",
+            }),
+            json!({
+                "preview_seq": 41,
+                "preview_kind": "library_migration_preview",
+                "preview_id": "preview-marker-contract",
+                "revision": "revision-1",
+            }),
+            json!({
+                "preview_seq": 41,
+                "preview_kind": "file_preview",
+                "preview_id": "preview-marker-contract",
+                "revision": "revision-1",
+                "unknown": true,
+            }),
+        ];
+        for marker in invalid_markers {
+            let mut record = stale.clone();
+            record
+                .result
+                .as_mut()
+                .and_then(Value::as_object_mut)
+                .expect("preview result should be an object")
+                .insert(PREVIEW_CANCELLED_RESULT_MARKER.to_string(), marker);
+            let decoded = inbox_record_from_disk(record.clone());
+            assert_eq!(decoded.status, InboxStatus::Stale);
+            assert_eq!(decoded.result, record.result);
+        }
+
+        let mut missing_identity = stale.clone();
+        missing_identity
+            .result
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("preview result should be an object")
+            .insert(
+                PREVIEW_CANCELLED_RESULT_MARKER.to_string(),
+                json!({
+                    "preview_seq": 41,
+                    "preview_kind": "file_preview",
+                    "preview_id": "preview-marker-contract",
+                }),
+            );
+        let decoded = inbox_record_from_disk(missing_identity.clone());
+        assert_eq!(decoded.status, InboxStatus::Stale);
+        assert_eq!(decoded.result, missing_identity.result);
+
+        let mut conflicting = stale;
+        conflicting.status = InboxStatus::Cancelled;
+        conflicting
+            .result
+            .as_mut()
+            .and_then(Value::as_object_mut)
+            .expect("preview result should be an object")
+            .insert(
+                PREVIEW_CANCELLED_RESULT_MARKER.to_string(),
+                json!({"preexisting": "must not be overwritten"}),
+            );
+        assert!(
+            inbox_record_for_disk(&conflicting).is_err(),
+            "a conflicting reserved result field must fail closed"
+        );
+        assert_eq!(
+            conflicting
+                .result
+                .as_ref()
+                .expect("result should remain present")[PREVIEW_CANCELLED_RESULT_MARKER],
+            json!({"preexisting": "must not be overwritten"})
+        );
     }
 
     #[test]
