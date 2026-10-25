@@ -16,6 +16,7 @@ const REPLACEMENT_ROOT_BINDING = `v1:${"c".repeat(64)}`;
 const OTHER_LIBRARY_REVISION = "secondary-ui-r1";
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "metadata-recovery-ui", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
+const MOCK_REPORTED_AT_MS = Date.now();
 let originalWindowWebSocket: PropertyDescriptor | undefined;
 let mockDatabaseEpoch = TEST_DATABASE_EPOCH;
 const activeMockSockets: MockWebSocket[] = [];
@@ -86,7 +87,7 @@ class MockWebSocket extends EventTarget {
         database_epoch: mockDatabaseEpoch,
         status: "published",
         state_version: this.currentStateVersion(),
-        reported_at: Math.floor(Date.now() / 1_000),
+        reported_at: MOCK_REPORTED_AT_MS,
       }));
     }
   }
@@ -621,6 +622,8 @@ afterEach(async () => {
 describe("metadata recovery Mini App flow", () => {
   it("analyzes grouped results, previews chosen candidates at the report revision, and follows the next cursor", async () => {
     const { sentActions } = await mountApp();
+    expect(element<HTMLElement>("#sync-badge").textContent).toBe("Saved snapshot");
+    expect(element<HTMLElement>("#connection-label").textContent).toContain("Saved snapshot · Just now");
     element<HTMLButtonElement>('[data-view="needs"]').click();
     element<HTMLButtonElement>("#recover-library").click();
     await waitForRecoveryResult("Choose a match");

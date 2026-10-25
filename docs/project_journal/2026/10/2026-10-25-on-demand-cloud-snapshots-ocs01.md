@@ -5,7 +5,7 @@ status: completed
 created: 2026-10-25
 updated: 2026-10-25
 branch: "wip/on-demand-cloud-snapshots"
-pr: ""
+pr: "61"
 supersedes: []
 superseded_by: ""
 ---
@@ -148,7 +148,7 @@ Final local gates on Node.js 25.8.2, Wrangler 4.149.0 and Rust 1.99.1:
   16 ignored. Ignored tests were not executed as passing tests.
 - `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo check --all-targets` and the isolated release build passed.
-- All 359 ordinary Worker/D1/shared-helper tests and all 74 mounted UI tests
+- All 359 ordinary Worker/D1/shared-helper tests and all 78 mounted UI tests
   passed, including both apps' epoch-reset, held-read and dispatch-fencing cases.
 - `npm run typecheck` and `npm run build` passed. The build is a Wrangler
   deployment dry-run and reads 71 static assets; it does not deploy them.
@@ -159,6 +159,15 @@ The existing CI test commands discover the new regressions. These are local
 mock HTTP/Telegram, Miniflare D1 and DOM checks, not live Cloudflare quota,
 physical-device or production-deployment acceptance. Verification logs and
 intermediate diagnostics remain in ignored local task directories.
+
+PR review regressions also cover scan/import result subscriptions after durable
+receipt removes their retry-queue entries, and correct millisecond report-time
+display in both apps while retaining second-based file scan times. Sent refreshes
+settle as unavailable on a disconnected viewer; queued requests have a separate
+bounded wait, and the response deadline starts on successful send and ends on a
+correlated published result. A binding-only refresh clears stale unavailable
+warnings only for verified accessible libraries, preserves unrelated warnings and
+the cached file index, and does not trigger another scan.
 
 ## Frozen implementation contract
 

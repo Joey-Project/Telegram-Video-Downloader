@@ -6,6 +6,7 @@ const MAX_MESSAGE_LENGTH = 16 * 1_024;
 const CONNECT_TIMEOUT_MS = 10_000;
 const READY_TIMEOUT_MS = 10_000;
 const REFRESH_TIMEOUT_MS = 125_000;
+const REFRESH_QUEUE_TIMEOUT_MS = 125_000;
 const MAX_RETRY_MS = 60_000;
 const MAX_PENDING_REFRESHES = 32;
 const DATABASE_EPOCH_PATTERN = /^[0-9a-f]{32}$/u;
@@ -197,7 +198,8 @@ export function createSnapshotUpdates({
     if (!pendingRefreshes.has(entry.requestId)) return;
     pendingRefreshes.delete(entry.requestId);
     if (coalescedRefreshes.get(entry.coalesceKey) === entry) coalescedRefreshes.delete(entry.coalesceKey);
-    clearTimer(entry.timeout);
+    clearTimer(entry.queueTimeout);
+    clearTimer(entry.responseTimeout);
     entry.resolve(result);
   }
 
@@ -248,6 +250,20 @@ export function createSnapshotUpdates({
       if (!sendFrame(refreshFrame(entry))) continue;
       entry.epoch = databaseEpoch;
       entry.sent = true;
+      clearTimer(entry.queueTimeout);
+      entry.queueTimeout = 0;
+      entry.responseTimeout = setTimer(
+        () => settleRefresh(entry, { status: "failed", error_code: "timeout" }),
+        REFRESH_TIMEOUT_MS,
+      );
+    }
+  }
+
+  function settleSentRefreshesOnDisconnect() {
+    for (const entry of pendingRefreshes.values()) {
+      if (entry.sent && !entry.resultReceived) {
+        settleRefresh(entry, unavailableResult("transport_disconnected"));
+      }
     }
   }
 
@@ -334,6 +350,9 @@ export function createSnapshotUpdates({
     const entry = pendingRefreshes.get(message.request_id);
     if (!entry || entry.epoch !== message.database_epoch || !entry.sent) return;
     if (message.status === "published") {
+      entry.resultReceived = true;
+      clearTimer(entry.responseTimeout);
+      entry.responseTimeout = 0;
       void finishPublishedRefresh(entry, message);
       return;
     }
@@ -535,6 +554,7 @@ export function createSnapshotUpdates({
     sessionController = null;
     connecting = false;
     clearConnectionTimers();
+    settleSentRefreshesOnDisconnect();
     closeSocket();
     if (unsupportedRoute) {
       unsupported = true;
@@ -554,6 +574,7 @@ export function createSnapshotUpdates({
       return;
     }
     if (intentionallyClosed || !wasCurrent) return;
+    settleSentRefreshesOnDisconnect();
     socket = null;
     connecting = false;
     clearConnectionTimers();
@@ -705,11 +726,16 @@ export function createSnapshotUpdates({
       coalesceKey,
       epoch: null,
       sent: false,
+      resultReceived: false,
       resolve,
       promise,
-      timeout: 0,
+      queueTimeout: 0,
+      responseTimeout: 0,
     };
-    entry.timeout = setTimer(() => settleRefresh(entry, { status: "failed", error_code: "timeout" }), REFRESH_TIMEOUT_MS);
+    entry.queueTimeout = setTimer(
+      () => settleRefresh(entry, { status: "failed", error_code: "timeout" }),
+      REFRESH_QUEUE_TIMEOUT_MS,
+    );
     pendingRefreshes.set(requestId, entry);
     coalescedRefreshes.set(coalesceKey, entry);
     if (status === "live" && snapshotControlV1) flushUnsentRefreshes();

@@ -10,6 +10,7 @@ const ROOT_BINDING = `v1:${"a".repeat(64)}`;
 const ACTION_QUEUE_STORAGE_KEY = "file-manager.actions.v1";
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "settings-library-ui-flow", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
+const MOCK_REPORTED_AT_MS = Date.now();
 
 let originalWindowWebSocket: PropertyDescriptor | undefined;
 
@@ -62,7 +63,7 @@ class MockWebSocket extends EventTarget {
         database_epoch: this.currentDatabaseEpoch(),
         status: "published",
         state_version: this.currentStateVersion(),
-        reported_at: Math.floor(Date.now() / 1_000),
+        reported_at: MOCK_REPORTED_AT_MS,
       }));
     }
   }
@@ -256,7 +257,12 @@ describe("settings library UI flow", () => {
     expect(openRequest.request_id).toMatch(/^[0-9a-f-]{36}$/iu);
     await vi.waitFor(() => expect(stateRequests).toBe(2));
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
-    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("Desktop settings published"));
+    const formattedReportTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
+      .format(new Date(MOCK_REPORTED_AT_MS));
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent)
+      .toBe(`Desktop settings published at ${formattedReportTime}.`));
+    expect(element<HTMLElement>("#sync-badge").textContent).toBe("Saved snapshot");
+    expect(element<HTMLElement>("#sync-detail").textContent).toContain("Snapshot published Just now");
     expect(sockets).toHaveLength(1);
     expect(sockets[0]?.protocols).toEqual([UPDATE_PROTOCOL, syntheticCredentials.localSharedSecret.value]);
 
@@ -266,7 +272,9 @@ describe("settings library UI flow", () => {
     const card = element<HTMLElement>("#library-list .settings-library-card");
     expect(card.textContent).toContain("2 media items");
     expect(card.textContent).toContain("Default download category: Films");
-    expect(card.textContent).toMatch(/Last scan: (?!Not scanned)/u);
+    const formattedScanTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
+      .format(new Date(Number(ownerSnapshot.library.scanned_at) * 1_000));
+    expect(card.textContent).toContain(`Last scan: ${formattedScanTime}`);
     expect(element<HTMLInputElement>('[data-category-form="main-library"] input[name="default_category"]').value).toBe("Films");
     const scanButton = element<HTMLButtonElement>('[data-settings-action="library_scan"]');
     expect(scanButton.disabled).toBe(false);

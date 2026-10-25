@@ -531,9 +531,19 @@ async fn refresh_libraries_selected(
 
 pub(super) async fn refresh_library_bindings(runtime: &CloudBotRuntime) -> Result<()> {
     let queue = Arc::clone(&runtime.bot.queue);
-    tokio::task::spawn_blocking(move || queue.refresh_video_libraries())
-        .await
-        .context("media-library availability worker failed")?
+    let (library_ids, availability) = tokio::task::spawn_blocking(move || {
+        queue.refresh_video_libraries()?;
+        let library_ids = queue
+            .registry_snapshot()?
+            .libraries
+            .into_iter()
+            .map(|library| library.id)
+            .collect::<Vec<_>>();
+        Ok::<_, anyhow::Error>((library_ids, queue.video_library_statuses()?))
+    })
+    .await
+    .context("media-library availability worker failed")??;
+    reconcile_refreshed_library_bindings(runtime, &library_ids, &availability).await
 }
 
 pub(super) async fn refresh_library_binding(
@@ -542,9 +552,52 @@ pub(super) async fn refresh_library_binding(
 ) -> Result<()> {
     let queue = Arc::clone(&runtime.bot.queue);
     let library_id = library_id.to_string();
-    tokio::task::spawn_blocking(move || queue.refresh_video_library(&library_id))
-        .await
-        .context("selected media-library availability worker failed")?
+    let (library_ids, availability) = tokio::task::spawn_blocking(move || {
+        queue.refresh_video_library(&library_id)?;
+        Ok::<_, anyhow::Error>((vec![library_id], queue.video_library_statuses()?))
+    })
+    .await
+    .context("selected media-library availability worker failed")??;
+    reconcile_refreshed_library_bindings(runtime, &library_ids, &availability).await
+}
+
+async fn reconcile_refreshed_library_bindings(
+    runtime: &CloudBotRuntime,
+    refreshed_library_ids: &[String],
+    availability: &BTreeMap<String, crate::media_libraries::MediaLibraryStatus>,
+) -> Result<()> {
+    let default_library_id = runtime.bot.queue.registry_snapshot()?.default_library_id;
+    let default_refreshed = refreshed_library_ids
+        .iter()
+        .any(|library_id| library_id == &default_library_id);
+    let mut unavailable = runtime.library_unavailable.lock().await;
+    for library_id in refreshed_library_ids {
+        if availability
+            .get(library_id)
+            .is_some_and(|status| status.available)
+        {
+            unavailable.remove(library_id);
+        }
+    }
+    let default_warning = if default_refreshed
+        && availability
+            .get(&default_library_id)
+            .is_some_and(|status| status.available)
+    {
+        Some(unavailable.get(&default_library_id).cloned())
+    } else {
+        None
+    };
+    drop(unavailable);
+
+    // The legacy warning belongs to the default library. A selected refresh of another
+    // library must not clear it, while a verified default-root refresh can clear a stale
+    // warning even when no per-library entry was retained for older state.
+    if let Some(default_warning) = default_warning {
+        *runtime.library_scan_warning.lock().await = default_warning;
+    }
+    runtime.state_notify.notify_one();
+    Ok(())
 }
 
 pub(super) async fn unconfirmable_previews(

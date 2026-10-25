@@ -636,6 +636,84 @@ describe("snapshot updates browser flows", () => {
     controller.stop();
   });
 
+  it("settles a sent refresh when its viewer disconnects and does not replay it after reconnect", async () => {
+    vi.useFakeTimers();
+    const mockSockets = addMockWebSocket();
+    const api = vi.fn(async () => sessionResponse());
+    const controller = createSnapshotUpdates({
+      api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
+      readSnapshot: vi.fn(async () => ({ state_version: 1, database_epoch: TEST_DATABASE_EPOCH })),
+      surface: "settings",
+      environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, random: () => 0.5 },
+    });
+    controller.start();
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
+    const firstSocket = mockSockets.sockets[0]!;
+    await vi.waitFor(() => expect(sentFramesOfType(firstSocket, "interest")).toHaveLength(1));
+
+    const refresh = controller.requestMacRefresh({ reason: "manual", scope: "operations" });
+    await vi.waitFor(() => expect(sentFramesOfType(firstSocket, "refresh_request")).toHaveLength(1));
+    firstSocket.serverClose(1006, "Mock network interruption");
+
+    await expect(refresh).resolves.toMatchObject({
+      status: "unavailable",
+      error_code: "transport_disconnected",
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(2));
+    const reconnectedSocket = mockSockets.sockets[1]!;
+    await vi.waitFor(() => expect(sentFramesOfType(reconnectedSocket, "interest")).toHaveLength(1));
+    expect(sentFramesOfType(firstSocket, "refresh_request")).toHaveLength(1);
+    expect(sentFramesOfType(reconnectedSocket, "refresh_request")).toHaveLength(0);
+    controller.stop();
+  });
+
+  it("starts the response timeout after send and accepts a result near the 120-second server window", async () => {
+    vi.useFakeTimers();
+    const mockSockets = addMockWebSocket({ autoReady: false });
+    const sessionGate = deferred();
+    const api = vi.fn(async () => {
+      await sessionGate.promise;
+      sessionGate.markSettled();
+      return sessionResponse();
+    });
+    let resolveRead!: (value: { state_version: number; database_epoch: string }) => void;
+    const readGate = new Promise<{ state_version: number; database_epoch: string }>((resolve) => { resolveRead = resolve; });
+    const readSnapshot = vi.fn(async () => await readGate);
+    const controller = createSnapshotUpdates({
+      api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
+      readSnapshot,
+      surface: "settings",
+      environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, random: () => 0.5 },
+    });
+    controller.start();
+    const refresh = controller.requestMacRefresh({ reason: "manual", scope: "operations" });
+    let refreshSettled = false;
+    void refresh.then(() => { refreshSettled = true; });
+
+    await vi.advanceTimersByTimeAsync(9_000);
+    sessionGate.resolve();
+    await sessionGate.settled;
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
+    const socket = mockSockets.sockets[0]!;
+    await vi.waitFor(() => expect(socket.readyState).toBe(MockWebSocket.OPEN));
+    await vi.advanceTimersByTimeAsync(9_000);
+    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH, snapshot_control: "v1" });
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(1));
+    const request = sentFramesOfType(socket, "refresh_request")[0]!;
+
+    await vi.advanceTimersByTimeAsync(119_900);
+    expect(refreshSettled).toBe(false);
+    publishRefreshResult(socket, request, 2);
+    await vi.waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(refreshSettled).toBe(false);
+    resolveRead({ state_version: 2, database_epoch: TEST_DATABASE_EPOCH });
+    await expect(refresh).resolves.toMatchObject({ status: "published", state_version: 2 });
+    expect(readSnapshot).toHaveBeenCalledTimes(1);
+    controller.stop();
+  });
+
   it("keeps old viewers compatible and performs no idle reads for 24 hours", async () => {
     vi.useFakeTimers();
     const mockSockets = addMockWebSocket({ autoReady: false, snapshotControl: null });

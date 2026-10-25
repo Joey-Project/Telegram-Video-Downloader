@@ -40,6 +40,7 @@ const RECEIPT_FAILURE_PREVIEW_ID = "file-receipt-failure-preview";
 const RECEIPT_FAILURE_PREVIEW_REVISION = "file-receipt-failure-r1";
 const RECEIPT_FAILURE_PREVIEW_SEQ = 804;
 const SNAPSHOT_REFRESH_START_BUDGET_MS = 1_000;
+const MOCK_REPORTED_AT_MS = Date.now();
 const MOCK_INIT_DATA = new URLSearchParams({ query_id: "file-manager-ui-flow", auth_date: "0" }).toString();
 const UPDATE_PROTOCOL = "miniapp-updates-v1";
 const activeMockSockets: MockWebSocket[] = [];
@@ -264,7 +265,7 @@ class MockWebSocket extends EventTarget {
           database_epoch: this.currentDatabaseEpoch(),
           status: "published",
           state_version: this.currentStateVersion(),
-          reported_at: 1_800_000_001,
+          reported_at: MOCK_REPORTED_AT_MS,
         }));
     }
   }
@@ -967,7 +968,16 @@ describe("file manager UI flow", () => {
     expect(sockets[0]?.sentFrames).toEqual(expect.arrayContaining([expect.objectContaining({ type: "refresh_request", reason: "open" })]));
     await vi.waitFor(() => expect(stateRequests).toBe(2));
     await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+    const formattedReportTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
+      .format(new Date(MOCK_REPORTED_AT_MS));
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent)
+      .toBe(`Desktop snapshot published at ${formattedReportTime}.`));
     expect(Date.now() - firstReadAt).toBeLessThan(5 * 60 * 1_000);
+    expect(element<HTMLElement>("#sync-badge").textContent).toBe("Saved snapshot");
+    expect(element<HTMLElement>("#sync-detail").textContent).toContain("Snapshot published Just now");
+    const formattedScanTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" })
+      .format(new Date(Number(ownerSnapshot.library.scanned_at) * 1_000));
+    expect(element<HTMLElement>("#sync-detail").textContent).toContain(`Last scan ${formattedScanTime}`);
     expect(sockets).toHaveLength(1);
     expect(sockets[0]?.protocols).toEqual([UPDATE_PROTOCOL, syntheticCredentials.localSharedSecret.value]);
     expect(fetchMock).toHaveBeenCalledTimes(3 + manifest.library.chunks.length + manifest.state.chunks.length);
@@ -1065,6 +1075,51 @@ describe("file manager UI flow", () => {
     expect(css).toContain("env(safe-area-inset-bottom");
     expect(css).toMatch(/\.media-details\s*\{[^}]*min-height:\s*36px/su);
   });
+
+  it.each(["library_scan", "legacy_import"] as const)(
+    "keeps the foreground update watch active for %s until its terminal snapshot",
+    async (kind) => {
+      const fixture = await mountFileManagerFixture(ownerSnapshot, makeMemoryStorage());
+      const socket = latestOpenSocket(fixture.sockets);
+      if (!socket) throw new Error("Expected the file manager update socket to be open.");
+
+      if (kind === "library_scan") {
+        element<HTMLButtonElement>("#scan-button").click();
+      } else {
+        element<HTMLTextAreaElement>("#legacy-text").value = "Legacy metadata entry";
+        element<HTMLButtonElement>("#import-legacy").click();
+      }
+
+      await vi.waitFor(() => expect(fixture.actions).toHaveLength(1));
+      const action = fixture.actions[0]!;
+      expect(action.kind).toBe(kind);
+      await vi.waitFor(() => expect(JSON.parse(localStorage.getItem("file-manager.actions.v1") ?? "[]")).toEqual([]));
+      await vi.waitFor(() => expect(socket.watch).toBe(true));
+      expect(socket.sentFrames.filter((frame) => frame.type === "refresh_request")).toHaveLength(1);
+
+      const accepted = fixture.currentSnapshot.pending_requests.find((request: Record<string, any>) => request.request_id === action.request_id);
+      expect(accepted?.seq).toEqual(expect.any(Number));
+      const requestsBeforeTerminal = fixture.stateRequests;
+      const terminalSnapshot = {
+        ...fixture.currentSnapshot,
+        state_version: Number(fixture.currentSnapshot.state_version ?? 1) + 1,
+        operations: [{
+          seq: accepted.seq,
+          kind,
+          status: "completed",
+          result: kind === "legacy_import"
+            ? { library_id: LIBRARY_ID, root_binding: ROOT_BINDING, revision: "legacy-import-r1" }
+            : { revision: "library-scan-r2", scanned_at: Math.floor(Date.now() / 1_000) },
+        }],
+        pending_requests: [],
+      };
+      await fixture.publishSnapshot(terminalSnapshot);
+      socket.publishSnapshot(terminalSnapshot.state_version);
+      await vi.waitFor(() => expect(fixture.stateRequests).toBe(requestsBeforeTerminal + 1));
+      await vi.waitFor(() => expect(socket.watch).toBe(false));
+      expect(socket.sentFrames.filter((frame) => frame.type === "refresh_request")).toHaveLength(1);
+    },
+  );
 
   it("keeps the verified library visible and stale after a snapshot-format upgrade response", async () => {
     vi.useFakeTimers();
@@ -2025,6 +2080,7 @@ describe("file manager UI flow", () => {
       ...snapshotWithLibraryLabel(snapshot, "Stale cancellation snapshot applied"),
       state_version: 2,
       stale: true,
+      reported_at: Date.now() - 61 * 60 * 1_000,
       last_seen: Date.now() - 11 * 60 * 1_000,
     };
     const stateRequestsBeforeStale = fixture.stateRequests;
@@ -2186,6 +2242,7 @@ describe("file manager UI flow", () => {
       state_version: 4,
       synced: true,
       stale: true,
+      reported_at: Date.now() - 61 * 60 * 1_000,
       last_seen: Date.now() - 11 * 60 * 1_000,
       operations: newerHistoryOperations(1_000, 4),
       pending_requests: [],
@@ -2850,6 +2907,7 @@ describe("file manager UI flow", () => {
     };
     if (blocker === "stale owner snapshot") {
       snapshot.stale = true;
+      snapshot.reported_at = Date.now() - 61 * 60 * 1_000;
       snapshot.last_seen = Date.now() - 11 * 60 * 1_000;
     } else if (blocker === "exact pending cancellation") {
       snapshot.pending_requests = [{

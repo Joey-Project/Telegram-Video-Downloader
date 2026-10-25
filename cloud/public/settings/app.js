@@ -57,8 +57,9 @@ let applicationGeneration = 0;
 let snapshotFreshnessTimer = 0;
 
 const byId = (id) => document.getElementById(id);
-const formatTime = (value) => {
-  const date = new Date(Number(value) * 1000);
+const formatTime = (value, unit = "seconds") => {
+  const number = Number(value);
+  const date = new Date(unit === "seconds" ? number * 1000 : number);
   if (!Number.isFinite(date.getTime()) || date.getTime() <= 0) return "Not available";
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
 };
@@ -95,7 +96,7 @@ function refreshLocalSnapshotFreshness({ renderContent = true } = {}) {
   const snapshot = state.snapshot;
   if (!snapshot) return;
   const now = Date.now();
-  const freshnessTime = Number.isSafeInteger(snapshot.reported_at) ? snapshot.reported_at * 1000 : 0;
+  const freshnessTime = Number.isSafeInteger(snapshot.reported_at) ? snapshot.reported_at : 0;
   const stale = epochVerificationPending
     || snapshot.synced !== true
     || freshnessTime <= 0
@@ -112,7 +113,7 @@ function refreshLocalSnapshotFreshness({ renderContent = true } = {}) {
 
 function snapshotAgeLabel(snapshot) {
   const publishedAt = Number.isSafeInteger(snapshot?.reported_at) ? snapshot.reported_at : 0;
-  return publishedAt > 0 ? timeAgoSeconds(publishedAt) : "age unavailable";
+  return publishedAt > 0 ? timeAgoMilliseconds(publishedAt) : "age unavailable";
 }
 
 function setSnapshotRefreshStatus(message, mode = "") {
@@ -911,12 +912,12 @@ function refreshState({ reason = "manual", quiet = false } = {}) {
       if (applicationDisposed) return result;
       if (result.status === "published") {
         if (result.cache_read_failed) {
-          setSnapshotRefreshStatus(`Desktop snapshot published at ${formatTime(result.reported_at)}; the displayed saved settings could not be reloaded.`, "warning");
+          setSnapshotRefreshStatus(`Desktop snapshot published at ${formatTime(result.reported_at, "milliseconds")}; the displayed saved settings could not be reloaded.`, "warning");
           if (entry.notifyUser) showToast("The desktop published a snapshot, but settings could not reload it. The saved settings remain visible.");
         } else {
           mode = "success";
-          setSnapshotRefreshStatus(`Desktop settings published at ${formatTime(result.reported_at)}.`, "success");
-          if (entry.notifyUser) showToast(`Settings refreshed from the desktop at ${formatTime(result.reported_at)}.`);
+          setSnapshotRefreshStatus(`Desktop settings published at ${formatTime(result.reported_at, "milliseconds")}.`, "success");
+          if (entry.notifyUser) showToast(`Settings refreshed from the desktop at ${formatTime(result.reported_at, "milliseconds")}.`);
         }
       } else {
         const message = refreshErrorMessage(result.error_code);

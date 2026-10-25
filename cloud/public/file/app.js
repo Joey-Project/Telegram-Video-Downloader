@@ -1,4 +1,4 @@
-import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, actionBelongsToSurface, consumeRejectedActionReceipts, dispatchNextOwnedAction, persistQueuedActionAndDrain, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "./action-queue.js";
+import { ACTION_RECEIPT_STORAGE_PREFIX, ACTION_SURFACE_FILE, actionBelongsToSurface, actionReplayStatus, consumeRejectedActionReceipts, dispatchNextOwnedAction, persistQueuedActionAndDrain, recordActionReceipt, recoverActionReceipts, removeQueuedAction, restorePendingActions, shouldRetryActionFailure } from "./action-queue.js";
 import { buildLegacyMappingChoices, buildLegacyMetadataPatches, getOrCreateLegacySelection, LEGACY_MAPPING_PAGE_SIZE, paginateLegacyMappingChoices, selectLegacyImportForMapping, selectLegacyMappingChoice, updateLegacySelection } from "./legacy-mapping-state.js";
 import { hasMetadataPatchFields, hasMetadataPreviewChanges, metadataPreviewDetails } from "./metadata-preview.js";
 import { buildMetadataRecoveryPreviewPayload, buildOrganizationStatusPatch, groupMetadataRecoveryItems, metadataRecoveryOperationId, parseMetadataRecoveryReport } from "./metadata-recovery.js";
@@ -38,7 +38,7 @@ const MAX_DISPLAY_SNAPSHOT_AGE_MS = 60 * 60 * 1_000;
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
 const initialParams = new URLSearchParams(window.location.search);
-const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), view: "library", query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
+const state = { ownerVerified: false, privateUiVisible: false, canDispatchActions: false, snapshot: null, libraryId: initialParams.get("library_id") ?? "", selected: new Set(), groupSelectionLimitNotice: null, quarantinedActionIds: new Set(), unknownActionOutcomes: new Map(), awaitingOperationResults: new Map(), view: "library", query: "", historyQuery: "", libraryPage: 0, needsPage: 0, detailId: null, legacyOperation: null, legacyOperationKey: null, legacySelection: new Map(), legacyPage: 0, manualPickerKey: null, manualPickerQuery: "", toastTimer: 0, loading: false, draining: null, retryDelay: 1500, retryTimer: 0, downloadSubmission: null, downloadMessage: null, downloadFormOpened: false, metadataRecovery: null, metadataRecoveryPreviewRequest: null, previewCancellations: new Map(), previewCancellationAttempts: new Set(), dismissedRecoveryRequestIds: new Set(), recoveryHiddenThroughSeq: new Map(), migrationConflictDrafts: new Map(), migrationConflictInvalidated: new Set() };
 let snapshotUpdates = null;
 let snapshotUpdateStatus = "connecting";
 let snapshotRefreshPending = false;
@@ -964,7 +964,7 @@ function refreshLocalSnapshotFreshness({ renderContent = true } = {}) {
   const snapshot = state.snapshot;
   if (!snapshot) return;
   const now = Date.now();
-  const freshnessTime = Number.isSafeInteger(snapshot.reported_at) ? snapshot.reported_at * 1000 : 0;
+  const freshnessTime = Number.isSafeInteger(snapshot.reported_at) ? snapshot.reported_at : 0;
   const stale = epochVerificationPending
     || snapshot.synced !== true
     || freshnessTime <= 0
@@ -981,7 +981,7 @@ function refreshLocalSnapshotFreshness({ renderContent = true } = {}) {
 
 function snapshotAgeLabel(snapshot) {
   const publishedAt = Number.isSafeInteger(snapshot?.reported_at) ? snapshot.reported_at : 0;
-  return publishedAt > 0 ? timeAgo(publishedAt, "seconds") : "age unavailable";
+  return publishedAt > 0 ? timeAgo(publishedAt) : "age unavailable";
 }
 
 function setSnapshotRefreshStatus(message, mode = "") {
@@ -997,6 +997,7 @@ function setSnapshotRefreshStatus(message, mode = "") {
 
 function updateSnapshotInterest() {
   if (applicationDisposed || !snapshotUpdates) return;
+  restoreAwaitingOperationResults();
   const pendingQueuedAction = readActionQueue().some((action) => actionBelongsToSurface(action, ACTION_SURFACE_FILE)
     && action.delivery_outcome !== "outcome_unknown");
   const visibleResultView = state.view === "waiting" || state.view === "organizing";
@@ -1023,8 +1024,68 @@ function updateSnapshotInterest() {
   const awaitedLocalResult = downloadAwaitingResult
     || cancellationAwaitingResult
     || recoveryAwaitingResult
+    || state.awaitingOperationResults.size > 0
+    || activeSnapshotOperationAwaitingResult()
     || [...state.previewCancellationAttempts].length > 0;
   snapshotUpdates.setWatch(pendingQueuedAction || visibleResultView || awaitedLocalResult);
+}
+
+function restoreAwaitingOperationResults() {
+  const queue = readActionQueue().filter((action) => actionBelongsToSurface(action, ACTION_SURFACE_FILE));
+  const queuedById = new Map(queue.map((action) => [action.request_id, action]));
+  for (const [requestId, tracker] of state.awaitingOperationResults) {
+    if (Number.isSafeInteger(tracker.seq)) continue;
+    const action = queuedById.get(requestId);
+    if (!action || state.quarantinedActionIds.has(requestId)
+        || isUnknownDeliveryAction(action, state.unknownActionOutcomes)
+        || actionReplayStatus(action).status !== "valid") {
+      state.awaitingOperationResults.delete(requestId);
+    }
+  }
+  for (const action of queue) {
+    if (!["library_scan", "legacy_import"].includes(action.kind)
+        || state.quarantinedActionIds.has(action.request_id)
+        || isUnknownDeliveryAction(action, state.unknownActionOutcomes)
+        || actionReplayStatus(action).status !== "valid"
+        || state.awaitingOperationResults.has(action.request_id)) continue;
+    state.awaitingOperationResults.set(action.request_id, {
+      kind: action.kind,
+      seq: null,
+    });
+  }
+}
+
+function activeSnapshotOperationAwaitingResult() {
+  const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
+  return operations.some((operation) => ["library_scan", "legacy_import"].includes(operation?.kind)
+    && !SETTLED_OPERATION_STATUSES.has(String(operation?.status ?? "").toLowerCase()));
+}
+
+function reconcileAwaitingOperationResults(snapshot) {
+  if (!snapshot || state.awaitingOperationResults.size === 0) return false;
+  const operations = Array.isArray(snapshot.operations) ? snapshot.operations : [];
+  let changed = false;
+  for (const [requestId, tracker] of state.awaitingOperationResults) {
+    if (!Number.isSafeInteger(tracker.seq)) continue;
+    const operation = operations.find((entry) => entry?.seq === tracker.seq && entry?.kind === tracker.kind);
+    if (!operation || !SETTLED_OPERATION_STATUSES.has(String(operation.status ?? "").toLowerCase())) continue;
+    state.awaitingOperationResults.delete(requestId);
+    changed = true;
+  }
+  return changed;
+}
+
+function updateAwaitingOperationResultReceipt(action, receipt) {
+  const tracker = state.awaitingOperationResults.get(action?.request_id);
+  if (!tracker || action?.kind !== tracker.kind) return;
+  if (receipt?.outcome === "rejected") {
+    state.awaitingOperationResults.delete(action.request_id);
+    return;
+  }
+  if (Number.isSafeInteger(receipt?.seq) && receipt.seq > 0) {
+    tracker.seq = receipt.seq;
+    reconcileAwaitingOperationResults(state.snapshot);
+  }
 }
 
 function clearCachedSnapshot() {
@@ -1085,12 +1146,18 @@ function invalidateMetadataRecoveryForSnapshot(previousSnapshot, nextSnapshot) {
 }
 
 function acceptFreshSnapshot(snapshot) {
+  if (typeof state.snapshot?.database_epoch === "string"
+      && typeof snapshot?.database_epoch === "string"
+      && state.snapshot.database_epoch !== snapshot.database_epoch) {
+    state.awaitingOperationResults.clear();
+  }
   const identityChanged = clearFileIdentityScopedStateOnSnapshot(state, state.snapshot, snapshot);
   const recoveryChanged = invalidateMetadataRecoveryForSnapshot(state.snapshot, snapshot);
   if (identityChanged || recoveryChanged) {
     state.groupSelectionLimitNotice = null;
   }
   Object.assign(state, acceptOwnerSnapshot(snapshot, state));
+  reconcileAwaitingOperationResults(state.snapshot);
   restoreMetadataRecoveryPreviewRequest(state.snapshot);
   reconcileMetadataRecoveryPreviewRequest(state.snapshot);
   settleMigrationConflictRefreshes();
@@ -1305,12 +1372,12 @@ function refreshState({ reason = "manual", scope, libraryId, quiet = false } = {
       if (applicationDisposed) return result;
       if (result.status === "published") {
         if (result.cache_read_failed) {
-          setSnapshotRefreshStatus(`Desktop snapshot published at ${formatTime(result.reported_at, "seconds")}; the displayed saved view could not be reloaded.`, "warning");
+          setSnapshotRefreshStatus(`Desktop snapshot published at ${formatTime(result.reported_at)}; the displayed saved view could not be reloaded.`, "warning");
           if (entry.notifyUser) showToast("The desktop published a snapshot, but this view could not reload it. The saved view remains visible.");
         } else {
           mode = "success";
-          setSnapshotRefreshStatus(`Desktop snapshot published at ${formatTime(result.reported_at, "seconds")}.`, mode);
-          if (entry.notifyUser) showToast(`Snapshot refreshed from the desktop at ${formatTime(result.reported_at, "seconds")}.`);
+          setSnapshotRefreshStatus(`Desktop snapshot published at ${formatTime(result.reported_at)}.`, mode);
+          if (entry.notifyUser) showToast(`Snapshot refreshed from the desktop at ${formatTime(result.reported_at)}.`);
         }
       } else {
         const message = refreshErrorMessage(result.error_code);
@@ -1544,6 +1611,7 @@ function acknowledgeFileActionReceipt(action, _receipt, applied) {
 
 function settleRejectedFileAction(rejection, queueRemoved) {
   if (!rejection || typeof rejection.request_id !== "string") return;
+  state.awaitingOperationResults.delete(rejection.request_id);
   if (queueRemoved) state.quarantinedActionIds.delete(rejection.request_id);
   const message = typeof rejection.error === "string" ? rejection.error : "The request was rejected.";
   if (rejection.kind === "download_submit" && state.downloadSubmission?.request_id === rejection.request_id) {
@@ -1635,6 +1703,7 @@ async function drainActionQueue({ quiet = false } = {}) {
             beforeAcknowledge: acknowledgeFileActionReceipt,
           });
           if (applicationDisposed || pageGeneration !== applicationGeneration) return recorded;
+          updateAwaitingOperationResultReceipt(action, receipt);
           if (action?.kind === "preview_cancel" && recorded.acknowledgementBlocked) {
             state.quarantinedActionIds.add(action.request_id);
             renderQueueCount();
@@ -1718,6 +1787,9 @@ async function drainActionQueue({ quiet = false } = {}) {
           ? action
           : { ...action, delivery_outcome: "outcome_unknown", delivery_error_code: code, delivery_error: error };
         const updates = markUnknownFileAction(state, marked);
+        if (!Number.isSafeInteger(state.awaitingOperationResults.get(action?.request_id)?.seq)) {
+          state.awaitingOperationResults.delete(action?.request_id);
+        }
         if (action?.kind === "preview_cancel") persistPreviewCancellations();
         if (action?.kind === "metadata_recover" && state.metadataRecovery?.requestId === action.request_id) {
           state.metadataRecovery.deliveryUnknown = true;
@@ -1733,6 +1805,7 @@ async function drainActionQueue({ quiet = false } = {}) {
       }
       if (outcome.status === "rejected") {
         const { action, rejection, receiptUpdate } = outcome;
+        state.awaitingOperationResults.delete(action.request_id);
         if (receiptUpdate?.rejectedRequestIds?.includes(action.request_id)) {
           settleRejectedFileAction({ request_id: action.request_id, kind: action.kind, ...rejection }, true);
         }
@@ -1766,6 +1839,7 @@ async function drainActionQueue({ quiet = false } = {}) {
         state.quarantinedActionIds.add(action.request_id);
         const latestQueue = readActionQueue();
         if (!writeActionQueue(removeQueuedAction(latestQueue, action.request_id))) removalFailed = true;
+        state.awaitingOperationResults.delete(action.request_id);
         if (state.downloadSubmission?.request_id === action.request_id) {
           state.downloadSubmission = null;
           state.downloadMessage = typeof error?.message === "string" ? error.message : "The request was rejected before it reached your computer.";
@@ -1899,6 +1973,9 @@ async function submitAction(kind, payload, { onQueued, requestId: suppliedReques
     writeQueue: writeActionQueue,
     onQueued: (queuedAction) => {
       onQueued?.(queuedAction);
+      if (["library_scan", "legacy_import"].includes(kind)) {
+        state.awaitingOperationResults.set(queuedAction.request_id, { kind, seq: null });
+      }
       if (["file_preview", "library_migration_preview"].includes(kind) && state.view !== "waiting") {
         state.view = "waiting";
         render();
@@ -2258,7 +2335,7 @@ function statusText(value) {
 }
 
 const SETTLED_OPERATION_STATUSES = new Set([
-  "completed", "failed", "cancelled", "confirmed", "expired", "stale", "rejected",
+  "completed", "complete", "succeeded", "failed", "cancelled", "confirmed", "expired", "stale", "rejected",
   "uncertain", "partial_failure", "partial", "stopped", "superseded",
 ]);
 
@@ -4059,11 +4136,13 @@ function bindEvents() {
         showToast("The delivery notice could not be removed from browser storage. It remains paused here.");
         return;
       }
+      state.awaitingOperationResults.delete(requestId);
       if (state.metadataRecoveryPreviewRequest?.requestId === requestId) setMetadataRecoveryPreviewRequest(null);
       if (dismissed.downloadSubmission) renderDownloadStatus();
       if (dismissed.migrationConflictDrafts > 0) renderMigrations();
       renderWaiting();
       renderPreviewReviewCards();
+      updateSnapshotInterest();
       showToast("The delivery outcome is still unknown. The browser notice was dismissed; check your computer before resubmitting.");
       return;
     }

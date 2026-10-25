@@ -35,7 +35,7 @@ export async function makeChunkedSnapshot(
     library,
     database_epoch: snapshotDatabaseEpoch,
     state_version: stateVersion = 1,
-    reported_at: reportedAt = Math.floor(Date.now() / 1_000),
+    reported_at: reportedAt = Date.now(),
     synced = true,
     last_seen: lastSeen = Date.now(),
     stale = false,
