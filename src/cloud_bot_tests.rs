@@ -38,6 +38,7 @@ pub(super) struct FakeTelegramRequest {
     body: serde_json::Value,
     authorization: Option<String>,
     database_epoch: Option<String>,
+    snapshot_notify_viewers: Option<String>,
 }
 
 pub(super) fn take_cloud_test_telegram_requests(
@@ -56,6 +57,8 @@ struct FakeCloudApiState {
     rotate_epoch_to: StdMutex<Option<String>>,
     epoch_recovery_requests: StdMutex<Vec<serde_json::Value>>,
     fetch_count: AtomicUsize,
+    fetch_statuses: StdMutex<Vec<u16>>,
+    fetch_times: StdMutex<Vec<std::time::Instant>>,
     ack_count: AtomicUsize,
     ack_request_bodies: StdMutex<Vec<serde_json::Value>>,
     replace_pending_before_ack: StdMutex<Option<CloudRequest>>,
@@ -322,6 +325,11 @@ async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTel
         name.eq_ignore_ascii_case("x-cloud-database-epoch")
             .then_some(value.trim().to_string())
     });
+    let snapshot_notify_viewers = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("x-snapshot-notify-viewers")
+            .then_some(value.trim().to_string())
+    });
     let body_end = header_end.saturating_add(content_length);
     while bytes.len() < body_end {
         let mut chunk = [0_u8; 4_096];
@@ -352,6 +360,7 @@ async fn read_fake_http_request(stream: &mut TcpStream) -> Result<Option<FakeTel
         body,
         authorization,
         database_epoch,
+        snapshot_notify_viewers,
     }))
 }
 
@@ -494,6 +503,8 @@ async fn spawn_fake_cloud_api_with_epoch(
         rotate_epoch_to: StdMutex::new(None),
         epoch_recovery_requests: StdMutex::new(Vec::new()),
         fetch_count: AtomicUsize::new(0),
+        fetch_statuses: StdMutex::new(Vec::new()),
+        fetch_times: StdMutex::new(Vec::new()),
         ack_count: AtomicUsize::new(0),
         ack_request_bodies: StdMutex::new(Vec::new()),
         replace_pending_before_ack: StdMutex::new(None),
@@ -571,12 +582,32 @@ async fn spawn_fake_cloud_api_with_epoch(
                         }
                         "requests" => {
                             task_state.fetch_count.fetch_add(1, AtomicOrdering::SeqCst);
+                            task_state
+                                .fetch_times
+                                .lock()
+                                .expect("fake fetch-time lock should not poison")
+                                .push(std::time::Instant::now());
+                            let status = {
+                                let mut statuses = task_state
+                                    .fetch_statuses
+                                    .lock()
+                                    .expect("fake fetch-status lock should not poison");
+                                if statuses.is_empty() {
+                                    200
+                                } else {
+                                    statuses.remove(0)
+                                }
+                            };
                             let pending = task_state.pending.lock().expect("fake cloud state lock should not poison").clone();
                             let database_epoch = task_state.database_epoch
                                 .lock()
                                 .expect("fake database epoch lock should not poison")
                                 .clone();
-                            (200, serde_json::json!({"database_epoch": database_epoch, "requests": pending}))
+                            if (200..300).contains(&status) {
+                                (status, serde_json::json!({"database_epoch": database_epoch, "requests": pending}))
+                            } else {
+                                (status, serde_json::json!({"error":"simulated backlog fetch failure"}))
+                            }
                         }
                         "ack" => {
                             task_state.ack_count.fetch_add(1, AtomicOrdering::SeqCst);
@@ -800,6 +831,7 @@ async fn spawn_fake_cloud_api_with_epoch(
                             };
                             let summary = serde_json::json!({
                                 "status": status,
+                                "snapshot_notify_viewers": request.snapshot_notify_viewers,
                                 "wire_format": wire_format,
                                 "state_version": state_body["state_version"],
                                 "reported_at": state_body["reported_at"],
@@ -1021,6 +1053,7 @@ async fn fake_http_parser_rejects_nonempty_truncated_headers_and_bodies() {
     assert!(format!("{body_error:#}").contains("ended before body"));
 }
 
+#[allow(clippy::result_large_err)]
 async fn spawn_fake_cloud_websocket_api(
     inbox_root: PathBuf,
     websocket_request: CloudRequest,
@@ -1049,9 +1082,33 @@ async fn spawn_fake_cloud_websocket_api(
             .accept()
             .await
             .context("fake cloud WebSocket accept failed")?;
-        let mut socket = accept_async(websocket_stream)
+        let control_header = Arc::new(StdMutex::new(None));
+        let observed_header = Arc::clone(&control_header);
+        let mut socket =
+            tokio_tungstenite::accept_hdr_async(
+                websocket_stream,
+                move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                      response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                *observed_header
+                    .lock()
+                    .expect("WebSocket header capture should not poison") = request
+                    .headers()
+                    .get("X-Cloud-Snapshot-Control")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                Ok(response)
+                },
+            )
             .await
             .context("fake cloud WebSocket handshake failed")?;
+        anyhow::ensure!(
+            control_header
+                .lock()
+                .expect("WebSocket header capture should not poison")
+                .as_deref()
+                == Some("v1"),
+            "Mac WebSocket must opt in to snapshot control frames"
+        );
         server_events
             .lock()
             .expect("fake cloud event lock should not poison")
@@ -1198,21 +1255,29 @@ async fn wait_for_state_posts(
     state: &Arc<FakeCloudApiState>,
     count: usize,
 ) -> Vec<serde_json::Value> {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let observed = Arc::new(AtomicUsize::new(0));
+    let observed_during_wait = Arc::clone(&observed);
+    let result = tokio::time::timeout(Duration::from_secs(30), async move {
         loop {
             let posts = state
                 .state_posts
                 .lock()
                 .expect("fake state post lock should not poison")
                 .clone();
+            observed_during_wait.store(posts.len(), AtomicOrdering::SeqCst);
             if posts.len() >= count {
                 return posts;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("fake cloud API should receive the expected state posts")
+    .await;
+    result.unwrap_or_else(|_| {
+        panic!(
+            "fake cloud API should receive {count} state posts; observed {}",
+            observed.load(AtomicOrdering::SeqCst)
+        )
+    })
 }
 
 fn empty_cloud_test_library_snapshot(revision: &str) -> LibrarySnapshot {
@@ -1434,6 +1499,13 @@ pub(super) fn make_runtime(
         inbox,
         request_notify: Arc::new(Notify::new()),
         state_notify: Arc::new(Notify::new()),
+        snapshot_refreshes: Arc::new(Mutex::new(SnapshotRefreshQueue::default())),
+        viewer_interests: Arc::new(Mutex::new(BTreeMap::new())),
+        websocket_writer: Arc::new(Mutex::new(None)),
+        last_backlog_reconciled_at: Arc::new(Mutex::new(None)),
+        last_backlog_reconciled_notify: Arc::new(Notify::new()),
+        initial_library_scan_complete: Arc::new(AtomicBool::new(true)),
+        initial_library_scan_notify: Arc::new(Notify::new()),
         library_snapshot: Arc::new(Mutex::new(None)),
         library_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         library_unavailable: Arc::new(Mutex::new(BTreeMap::new())),

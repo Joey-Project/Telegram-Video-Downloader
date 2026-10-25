@@ -1,8 +1,32 @@
-export type SnapshotUpdatesStatus = "connecting" | "live" | "fallback" | "offline" | "paused" | "expired";
+export type SnapshotUpdatesStatus = "connecting" | "live" | "fallback" | "offline" | "paused" | "unavailable" | "expired";
+export type SnapshotRefreshReason = "open" | "manual" | "reference";
+export type SnapshotRefreshScope = "library" | "settings" | "operations" | "download";
+export type SnapshotRefreshOutcome = "published" | "failed" | "unavailable";
 
-export interface SnapshotUpdatesRefreshOptions {
-  /** Background refreshes are quiet; explicit calls default to false. */
-  quiet: boolean;
+export interface PublishedSnapshotReadOptions {
+  quiet: true;
+  /** Minimum state version required after a correlated Mac publication. */
+  minimumVersion?: number;
+  /** The owner snapshot is being reverified after the Cloud database epoch changed. */
+  epochChanged?: boolean;
+  /** Expected database epoch for this owner-verified cache read. */
+  expectedDatabaseEpoch?: string;
+}
+
+export interface SnapshotRefreshRequest {
+  reason: SnapshotRefreshReason;
+  scope: SnapshotRefreshScope;
+  libraryId?: string;
+}
+
+export interface SnapshotRefreshResult {
+  status: SnapshotRefreshOutcome;
+  request_id?: string;
+  database_epoch?: string;
+  state_version?: number;
+  reported_at?: number;
+  error_code?: string;
+  cache_read_failed?: boolean;
 }
 
 export interface SnapshotUpdatesEnvironment {
@@ -18,23 +42,29 @@ export interface SnapshotUpdatesEnvironment {
   };
   now?: () => number;
   random?: () => number;
+  randomUUID?: () => string;
   setTimeout?: typeof globalThis.setTimeout;
   clearTimeout?: typeof globalThis.clearTimeout;
 }
 
-export interface SnapshotUpdatesOptions {
+export interface SnapshotUpdatesOptions<TSnapshot = unknown> {
   api(path: string, options: { method: "POST"; signal?: AbortSignal }): Promise<unknown>;
-  refresh(options: SnapshotUpdatesRefreshOptions): Promise<unknown> | unknown;
+  readSnapshot(options: PublishedSnapshotReadOptions): Promise<TSnapshot> | TSnapshot;
+  surface: "file" | "settings";
   onAuthorizationExpired?: () => void;
+  onReady?: (event: { databaseEpoch: string; snapshotControl: "v1" | null }) => void;
+  onEpochChanged?: (event: { databaseEpoch: string }) => void;
   onStatus?: (status: SnapshotUpdatesStatus) => void;
   environment?: SnapshotUpdatesEnvironment;
 }
 
-export interface SnapshotUpdatesController {
+export interface SnapshotUpdatesController<TSnapshot = unknown> {
   start(): void;
   stop(): void;
-  /** Pass `{ quiet: true }` for background refreshes; omitted options remain user-visible. */
-  refresh(options?: Partial<SnapshotUpdatesRefreshOptions>): Promise<void>;
+  /** Set whether the visible Mini App is actively waiting for operation results. */
+  setWatch(watch: boolean): void;
+  /** Request a correlated publication from the Mac and then read its published snapshot. */
+  requestMacRefresh(request: SnapshotRefreshRequest): Promise<SnapshotRefreshResult & { snapshot?: TSnapshot }>;
 }
 
-export function createSnapshotUpdates(options: SnapshotUpdatesOptions): SnapshotUpdatesController;
+export function createSnapshotUpdates<TSnapshot = unknown>(options: SnapshotUpdatesOptions<TSnapshot>): SnapshotUpdatesController<TSnapshot>;

@@ -3131,6 +3131,47 @@ describe("Mini App identity and actions", () => {
 });
 
 describe("local client API and state snapshots", () => {
+  it("honors authenticated snapshot notification preferences without changing durable state rules", async () => {
+    const before = await listDurableObjectIds(testEnv.NOTIFIER);
+    const invalid = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: {
+        ...localHeaders(),
+        "content-type": "application/json",
+        "X-Snapshot-Notify-Viewers": "yes",
+      },
+      body: JSON.stringify(localSnapshot()),
+    }));
+    expect(invalid.status).toBe(400);
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS count FROM snapshot_meta").first<{ count: number }>())
+      .toEqual({ count: 0 });
+    expect(await listDurableObjectIds(testEnv.NOTIFIER)).toEqual(before);
+
+    const quiet = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: {
+        ...localHeaders(),
+        "content-type": "application/json",
+        "X-Snapshot-Notify-Viewers": "0",
+      },
+      body: JSON.stringify(localSnapshot({ state_version: 1 })),
+    }));
+    expect(quiet.status).toBe(200);
+    expect(await listDurableObjectIds(testEnv.NOTIFIER)).toEqual(before);
+
+    const notified = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: {
+        ...localHeaders(),
+        "content-type": "application/json",
+        "X-Snapshot-Notify-Viewers": "1",
+      },
+      body: JSON.stringify(localSnapshot({ state_version: 2 })),
+    }));
+    expect(notified.status).toBe(200);
+    expect(await listDurableObjectIds(testEnv.NOTIFIER)).toHaveLength(1);
+  });
+
   it("serves compact chunk manifests and owner-authenticated content chunks", async () => {
     const epoch = await getDatabaseEpoch(testEnv.DB);
     const upload = async (data: string) => {
@@ -3405,6 +3446,29 @@ describe("local client API and state snapshots", () => {
     expect(state.library.ready).toBe(false);
     expect(state.library.scanned_at).toBe(0);
     expect(state.last_seen).toBeGreaterThan(0);
+  });
+
+  it("keeps saved snapshots fresh for one hour and never rearms freshness on cache reads", async () => {
+    await storeSnapshot(testEnv.DB, localSnapshot() as unknown as LocalSnapshot);
+    const owner = await signInitData();
+    const underOneHour = Date.now() - 59 * 60_000;
+    await testEnv.DB.prepare("UPDATE snapshot_meta SET received_at = ? WHERE id = 1").bind(underOneHour).run();
+
+    const stateUnderHour = await responseJson<{ stale: boolean; last_seen: number }>(await ownerRequest("/api/state", owner));
+    const libraryUnderHour = await responseJson<{ stale: boolean; last_seen: number }>(await ownerRequest("/api/library", owner));
+    expect(stateUnderHour).toMatchObject({ stale: false, last_seen: underOneHour });
+    expect(libraryUnderHour).toMatchObject({ stale: false, last_seen: underOneHour });
+    expect((await testEnv.DB.prepare("SELECT received_at FROM snapshot_meta WHERE id = 1").first<{ received_at: number }>())
+      ?.received_at).toBe(underOneHour);
+
+    const overOneHour = Date.now() - 61 * 60_000;
+    await testEnv.DB.prepare("UPDATE snapshot_meta SET received_at = ? WHERE id = 1").bind(overOneHour).run();
+    const stateOverHour = await responseJson<{ stale: boolean; last_seen: number }>(await ownerRequest("/api/state", owner));
+    const libraryOverHour = await responseJson<{ stale: boolean; last_seen: number }>(await ownerRequest("/api/library", owner));
+    expect(stateOverHour).toMatchObject({ stale: true, last_seen: overOneHour });
+    expect(libraryOverHour).toMatchObject({ stale: true, last_seen: overOneHour });
+    expect((await testEnv.DB.prepare("SELECT received_at FROM snapshot_meta WHERE id = 1").first<{ received_at: number }>())
+      ?.received_at).toBe(overOneHour);
   });
 
   it("stores a valid library snapshot with more than 6,700 media items", async () => {

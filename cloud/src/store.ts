@@ -93,7 +93,7 @@ const SNAPSHOT_META_SELECT = `SELECT state_version, reported_at, received_at, li
        library_chunk_count, state_hash, state_chunk_count, transport, library_manifest_json, state_manifest_json
        FROM snapshot_meta WHERE id = 1`;
 const HEARTBEAT_WRITE_INTERVAL_MS = 30_000;
-const SNAPSHOT_STALE_AFTER_MS = 10 * 60_000;
+const SNAPSHOT_STALE_AFTER_MS = 60 * 60_000;
 // Keep acknowledged idempotency keys reserved for a bounded replay window.
 export const ACKED_INBOX_REPLAY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const ACKED_INBOX_PRUNE_BATCH_SIZE = 100;

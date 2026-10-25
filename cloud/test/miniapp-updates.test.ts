@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import type { D1Migration } from "@cloudflare/vitest-plugin";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { syntheticCredentials } from "./fixtures/synthetic-credentials";
+import snapshotControlFixtureJson from "./fixtures/snapshot-control.json";
 import { getDatabaseEpoch } from "../src/store";
 import { sha256Hex } from "../src/validation";
 import {
@@ -10,6 +11,8 @@ import {
   MINIAPP_UPDATES_PROTOCOL,
   MINIAPP_UPDATES_SESSION_PATH,
   MINIAPP_UPDATES_SOCKET_PATH,
+  SNAPSHOT_CONTROL_VERSION,
+  SNAPSHOT_NOTIFY_VIEWERS_HEADER,
 } from "../src/updates";
 
 const testEnv = env as typeof env & { TEST_MIGRATIONS: D1Migration[] };
@@ -31,10 +34,28 @@ interface SessionResponse {
 
 interface UpdateEvent {
   type: string;
+  viewer_id?: string;
+  request_id?: string;
   database_epoch?: string;
   state_version?: number;
   reason?: string;
+  status?: string;
+  error_code?: string;
+  expires_at?: number;
+  viewers?: Array<{ viewer_id: string; surface: string; watch: boolean; expires_at: number }>;
 }
+
+interface SnapshotControlFixture {
+  database_epoch: string;
+  viewer_id: string;
+  request_id: string;
+  clock_ms: number;
+  viewer_interest: { type: string; database_epoch: string; viewers: Array<Record<string, unknown>> };
+  snapshot_refresh: Record<string, unknown>;
+  refresh_result: Record<string, unknown>;
+}
+
+const snapshotControlFixture = snapshotControlFixtureJson as unknown as SnapshotControlFixture;
 
 function parseMessage(data: unknown): UpdateEvent | null {
   if (typeof data !== "string") return null;
@@ -143,18 +164,25 @@ async function createSession(initData?: string): Promise<Response> {
   }));
 }
 
-async function openViewer(ticket: string, path = MINIAPP_UPDATES_SOCKET_PATH): Promise<Response> {
+async function openViewer(
+  ticket: string,
+  path = MINIAPP_UPDATES_SOCKET_PATH,
+  extraHeaders: Record<string, string> = {},
+): Promise<Response> {
   return trackSocketResponse(await SELF.fetch(new Request(`${workerUrl}${path}`, {
     headers: {
       upgrade: "websocket",
       "sec-websocket-protocol": `${MINIAPP_UPDATES_PROTOCOL}, ${ticket}`,
+      ...extraHeaders,
     },
   })));
 }
 
-async function openLocalClient(): Promise<Response> {
+async function openLocalClient(snapshotControl?: "v1"): Promise<Response> {
+  const headers: Record<string, string> = { ...localHeaders(), upgrade: "websocket" };
+  if (snapshotControl !== undefined) headers["X-Cloud-Snapshot-Control"] = snapshotControl;
   return trackSocketResponse(await SELF.fetch(new Request(`${workerUrl}/api/local/ws`, {
-    headers: { ...localHeaders(), upgrade: "websocket" },
+    headers,
   })));
 }
 
@@ -283,11 +311,20 @@ describe("Mini App update capabilities", () => {
     const socket = connected.webSocket;
     expect(socket).not.toBeNull();
     const collector = collectMessages(socket!);
-    await collector.waitFor((event) => event.type === "ready");
-    const localConnection = await openLocalClient();
+    expect(await collector.waitFor((event) => event.type === "ready")).toMatchObject({ snapshot_control: "v1" });
+    const localConnection = await openLocalClient(SNAPSHOT_CONTROL_VERSION);
     expect(localConnection.status).toBe(101);
     const localSocket = localConnection.webSocket!;
     const localCollector = collectMessages(localSocket);
+    await localCollector.waitFor((event) => event.type === "viewer_interest" && event.viewers?.length === 0);
+    socket!.send(JSON.stringify({
+      type: "interest",
+      database_epoch: testDatabaseEpoch,
+      visible: true,
+      surface: "file",
+      watch: true,
+    }));
+    await localCollector.waitFor((event) => event.type === "viewer_interest" && event.viewers?.length === 1);
 
     const libraryText = JSON.stringify({ revision: "library-chunked", items: [] });
     const stateText = JSON.stringify({ previews: [], operations: [], tasks: [], settings: { download_dir: "/Videos" } });
@@ -416,6 +453,245 @@ describe("Mini App update capabilities", () => {
 
     socket!.close(1000, "Test complete");
     localSocket.close(1000, "Test complete");
+  });
+
+  it("negotiates local control frames without exposing them to legacy clients", async () => {
+    const unsupported = await SELF.fetch(new Request(`${workerUrl}/api/local/ws`, {
+      headers: { ...localHeaders(), upgrade: "websocket", "X-Cloud-Snapshot-Control": "v2" },
+    }));
+    expect(unsupported.status).toBe(400);
+
+    const legacyConnection = await openLocalClient();
+    expect(legacyConnection.status).toBe(101);
+    const legacySocket = legacyConnection.webSocket!;
+    const legacyCollector = collectMessages(legacySocket);
+
+    const session = await readJson<SessionResponse>(await createSession());
+    const viewerConnection = await openViewer(session.ticket, MINIAPP_UPDATES_SOCKET_PATH, {
+      "X-Cloud-Snapshot-Control": SNAPSHOT_CONTROL_VERSION,
+    });
+    expect(viewerConnection.status).toBe(101);
+    const viewerSocket = viewerConnection.webSocket!;
+    const viewerCollector = collectMessages(viewerSocket);
+    expect(await viewerCollector.waitFor((event) => event.type === "ready")).toMatchObject({
+      snapshot_control: SNAPSHOT_CONTROL_VERSION,
+    });
+
+    viewerSocket.send(JSON.stringify({
+      type: "interest",
+      database_epoch: testDatabaseEpoch,
+      visible: true,
+      surface: "settings",
+      watch: false,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(legacyCollector.messages.filter((event) => event.type === "viewer_interest" || event.type === "snapshot_refresh"))
+      .toEqual([]);
+
+    const requestId = crypto.randomUUID();
+    const unavailable = viewerCollector.waitFor((event) => event.type === "refresh_result" && event.request_id === requestId);
+    viewerSocket.send(JSON.stringify({
+      type: "refresh_request",
+      database_epoch: testDatabaseEpoch,
+      request_id: requestId,
+      reason: "open",
+      scope: "settings",
+    }));
+    expect(await unavailable).toMatchObject({
+      type: "refresh_result",
+      request_id: requestId,
+      database_epoch: testDatabaseEpoch,
+      status: "unavailable",
+      error_code: "local_unavailable",
+    });
+
+    const controlConnection = await openLocalClient(SNAPSHOT_CONTROL_VERSION);
+    expect(controlConnection.status).toBe(101);
+    const controlSocket = controlConnection.webSocket!;
+    const controlCollector = collectMessages(controlSocket);
+    const replay = await controlCollector.waitFor((event) => event.type === "viewer_interest");
+    expect(replay.viewers).toHaveLength(1);
+    expect(replay.viewers?.[0]).toMatchObject({
+      surface: "settings",
+      watch: false,
+      expires_at: session.expires_at,
+    });
+    expect(legacyCollector.messages.filter((event) => event.type === "viewer_interest" || event.type === "snapshot_refresh"))
+      .toEqual([]);
+
+    viewerSocket.close(1000, "Test complete");
+    legacySocket.close(1000, "Test complete");
+    controlSocket.close(1000, "Test complete");
+  });
+
+  it("matches the shared snapshot-control wire fixture and returns only a committed correlated result", async () => {
+    const session = await readJson<SessionResponse>(await createSession());
+    const viewerConnection = await openViewer(session.ticket);
+    expect(viewerConnection.status).toBe(101);
+    const viewerSocket = viewerConnection.webSocket!;
+    const viewerCollector = collectMessages(viewerSocket);
+    expect(await viewerCollector.waitFor((event) => event.type === "ready")).toMatchObject({
+      snapshot_control: SNAPSHOT_CONTROL_VERSION,
+      database_epoch: snapshotControlFixture.database_epoch,
+    });
+
+    const localConnection = await openLocalClient(SNAPSHOT_CONTROL_VERSION);
+    expect(localConnection.status).toBe(101);
+    const localSocket = localConnection.webSocket!;
+    const localCollector = collectMessages(localSocket);
+    expect(await localCollector.waitFor((event) => event.type === "viewer_interest"))
+      .toEqual({ ...snapshotControlFixture.viewer_interest, viewers: [] });
+
+    viewerSocket.send(JSON.stringify({
+      type: "interest",
+      database_epoch: snapshotControlFixture.database_epoch,
+      visible: true,
+      surface: "file",
+      watch: true,
+    }));
+    const interest = await localCollector.waitFor((event) => event.type === "viewer_interest" && event.viewers?.length === 1);
+    const viewerId = interest.viewers?.[0]?.viewer_id;
+    expect(viewerId).toMatch(/^[0-9a-f-]{36}$/iu);
+    if (viewerId === undefined) throw new Error("Viewer interest omitted its viewer ID");
+    expect(interest).toEqual({
+      ...snapshotControlFixture.viewer_interest,
+      viewers: [{
+        ...snapshotControlFixture.viewer_interest.viewers[0]!,
+        viewer_id: viewerId,
+        expires_at: session.expires_at,
+      }],
+    });
+
+    const requestStartedAt = Date.now();
+    viewerSocket.send(JSON.stringify({
+      type: "refresh_request",
+      database_epoch: snapshotControlFixture.database_epoch,
+      request_id: snapshotControlFixture.request_id,
+      reason: "manual",
+      scope: "library",
+    }));
+    const refresh = await localCollector.waitFor((event) => event.type === "snapshot_refresh");
+    expect(refresh).toMatchObject({
+      ...snapshotControlFixture.snapshot_refresh,
+      viewer_id: viewerId,
+      expires_at: refresh.expires_at,
+    });
+    expect(refresh.expires_at).toBeGreaterThanOrEqual(requestStartedAt + 119_000);
+    expect(refresh.expires_at).toBeLessThanOrEqual(Date.now() + 120_000);
+    expect(refresh.expires_at).toBeLessThanOrEqual(session.expires_at);
+
+    const reportedAt = Date.now();
+    const invalidation = viewerCollector.waitFor((event) =>
+      event.type === "invalidate" && event.reason === "state" && event.state_version === 42,
+    );
+    const published = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: {
+        ...localHeaders(),
+        "content-type": "application/json",
+        [SNAPSHOT_NOTIFY_VIEWERS_HEADER]: "1",
+      },
+      body: JSON.stringify({ ...localSnapshot(42), reported_at: reportedAt }),
+    }));
+    expect(published.status).toBe(200);
+    expect(await invalidation).toMatchObject({ reason: "state", state_version: 42 });
+
+    localSocket.send(JSON.stringify({
+      ...snapshotControlFixture.refresh_result,
+      viewer_id: viewerId,
+      request_id: "33333333-3333-4333-8333-333333333333",
+      database_epoch: snapshotControlFixture.database_epoch,
+      reported_at: reportedAt,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(viewerCollector.messages.some((event) => event.type === "refresh_result")).toBe(false);
+
+    const expectedResult = {
+      ...snapshotControlFixture.refresh_result,
+      viewer_id: viewerId,
+      reported_at: reportedAt,
+    };
+    const correlated = viewerCollector.waitFor((event) =>
+      event.type === "refresh_result" && event.request_id === snapshotControlFixture.request_id,
+    );
+    localSocket.send(JSON.stringify(expectedResult));
+    expect(await correlated).toEqual(expectedResult);
+
+    viewerSocket.send(JSON.stringify({
+      type: "refresh_request",
+      database_epoch: snapshotControlFixture.database_epoch,
+      request_id: snapshotControlFixture.request_id,
+      reason: "manual",
+      scope: "library",
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(localCollector.messages.filter((event) => event.type === "snapshot_refresh")).toHaveLength(1);
+
+    const hiddenRequestId = "44444444-4444-4444-8444-444444444444";
+    viewerSocket.send(JSON.stringify({
+      type: "refresh_request",
+      database_epoch: snapshotControlFixture.database_epoch,
+      request_id: hiddenRequestId,
+      reason: "reference",
+      scope: "settings",
+    }));
+    await localCollector.waitFor((event) => event.type === "snapshot_refresh" && event.request_id === hiddenRequestId);
+
+    viewerSocket.send(JSON.stringify({
+      type: "interest",
+      database_epoch: snapshotControlFixture.database_epoch,
+      visible: false,
+      surface: "file",
+      watch: false,
+    }));
+    const hidden = await localCollector.waitFor((event) => event.type === "viewer_interest" && event.viewers?.length === 0);
+    expect(hidden).toEqual({ ...snapshotControlFixture.viewer_interest, viewers: [] });
+
+    const visibleResultCount = viewerCollector.messages.filter((event) => event.type === "refresh_result").length;
+    localSocket.send(JSON.stringify({
+      type: "refresh_result",
+      viewer_id: viewerId,
+      request_id: hiddenRequestId,
+      database_epoch: snapshotControlFixture.database_epoch,
+      status: "failed",
+      error_code: "refresh_failed",
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(viewerCollector.messages.filter((event) => event.type === "refresh_result")).toHaveLength(visibleResultCount);
+
+    const hiddenIndex = viewerCollector.messages.length;
+    const hiddenPublication = await SELF.fetch(new Request(`${workerUrl}/api/local/state`, {
+      method: "POST",
+      headers: {
+        ...localHeaders(),
+        "content-type": "application/json",
+        [SNAPSHOT_NOTIFY_VIEWERS_HEADER]: "1",
+      },
+      body: JSON.stringify({ ...localSnapshot(43), reported_at: Date.now() }),
+    }));
+    expect(hiddenPublication.status).toBe(200);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(viewerCollector.messages.slice(hiddenIndex).some((event) => event.type === "invalidate")).toBe(false);
+
+    viewerSocket.close(1000, "Test complete");
+    localSocket.close(1000, "Test complete");
+  });
+
+  it("closes the viewer control socket on malformed or oversized frames", async () => {
+    const session = await readJson<SessionResponse>(await createSession());
+    const malformed = await openViewer(session.ticket);
+    const malformedCollector = collectMessages(malformed.webSocket!);
+    await malformedCollector.waitFor((event) => event.type === "ready");
+    const malformedClose = waitForClose(malformed.webSocket!, 2_000);
+    malformed.webSocket!.send("{");
+    expect((await malformedClose).code).toBe(1008);
+
+    const oversized = await openViewer(session.ticket);
+    const oversizedCollector = collectMessages(oversized.webSocket!);
+    await oversizedCollector.waitFor((event) => event.type === "ready");
+    const oversizedClose = waitForClose(oversized.webSocket!, 2_000);
+    oversized.webSocket!.send("x".repeat(4 * 1024 + 1));
+    expect((await oversizedClose).code).toBe(1008);
   });
 
   it("caps viewer sockets and closes a viewer when its attached auth expiry alarm runs", async () => {

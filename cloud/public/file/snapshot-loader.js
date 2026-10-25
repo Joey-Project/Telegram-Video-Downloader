@@ -266,6 +266,7 @@ async function loadOwnerSnapshotWithCache(fetchJson, cache) {
 
   const snapshot = {
     ...state,
+    database_epoch: manifest.databaseEpoch,
     synced: manifest.synced,
     state_version: manifest.stateVersion,
     reported_at: manifest.reportedAt,

@@ -834,7 +834,7 @@ fn default_poll_timeout_seconds() -> u64 {
 }
 
 fn default_cloud_fallback_poll_seconds() -> u64 {
-    30
+    3600
 }
 
 fn default_progress_update_seconds() -> u64 {
@@ -1031,6 +1031,19 @@ mod tests {
         assert!(!serialized.contains("codex_synth_v1_bearer_a"));
         assert!(!debug.contains("codex_synth_v1_bearer_a"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn cloud_fallback_default_is_hourly_and_legacy_values_still_deserialize() {
+        let omitted: CloudConfig = toml::from_str(r#"worker_url = "https://worker.example.test""#)
+            .expect("cloud config should deserialize with its default fallback value");
+        assert_eq!(omitted.fallback_poll_seconds, 3600);
+
+        let legacy: CloudConfig = toml::from_str(
+            "worker_url = \"https://worker.example.test\"\nfallback_poll_seconds = 30",
+        )
+        .expect("legacy explicit fallback values should remain accepted");
+        assert_eq!(legacy.fallback_poll_seconds, 30);
     }
 
     #[test]

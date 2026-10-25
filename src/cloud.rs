@@ -17,7 +17,7 @@ use crate::safe_fs::{
     BoundFile, EntryIdentity, RootedFs,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use futures_util::{SinkExt, StreamExt, stream};
+use futures_util::{StreamExt, stream};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -25,7 +25,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION as WS_AUTHORIZATION;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
@@ -44,6 +43,12 @@ const PREVIEW_CANCELLED_RESULT_MARKER: &str = "_tvd_preview_cancelled_v1";
 const PREVIEW_CANCELLED_ERROR: &str = "This preview was cancelled before confirmation.";
 pub(crate) const MAX_CLOUD_STATE_VERSION: u64 = MAX_JS_SAFE_INTEGER;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_CLOUD_CONTROL_FRAME_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_CLOUD_CONTROL_VIEWERS: usize = 32;
+pub(crate) const MAX_CLOUD_CLOCK_SKEW_MILLIS: u64 = 60_000;
+pub(crate) const MAX_SNAPSHOT_REFRESH_LIFETIME_MILLIS: u64 = 120_000;
+pub(crate) const MAX_VIEWER_INTEREST_LIFETIME_MILLIS: u64 =
+    6 * 60 * 60 * 1000 + MAX_CLOUD_CLOCK_SKEW_MILLIS;
 const MAX_LEGACY_IMPORT_BYTES: usize = 256 * 1024;
 const MAX_MANAGEMENT_STATE_RECORDS: usize = 100;
 const MAX_COMPLETED_LEGACY_IMPORT_RECORDS: usize = 100;
@@ -205,6 +210,226 @@ impl CloudRequest {
             bail!("cloud request exceeds the local persistence limit");
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRefreshReason {
+    Open,
+    Manual,
+    Reference,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotRefreshScope {
+    Library,
+    Settings,
+    Operations,
+    Download,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudViewerSurface {
+    File,
+    Settings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloudViewerInterest {
+    pub viewer_id: String,
+    pub surface: CloudViewerSurface,
+    pub watch: bool,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRefreshRequest {
+    pub viewer_id: String,
+    pub request_id: String,
+    pub database_epoch: String,
+    pub reason: SnapshotRefreshReason,
+    pub scope: SnapshotRefreshScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_id: Option<String>,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CloudSnapshotControl {
+    ViewerInterest {
+        database_epoch: String,
+        viewers: Vec<CloudViewerInterest>,
+    },
+    SnapshotRefresh(SnapshotRefreshRequest),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CloudWebSocketMessage {
+    Request(CloudRequest),
+    Control(CloudSnapshotControl),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CloudRefreshResult {
+    #[serde(rename = "type")]
+    pub message_type: String,
+    pub viewer_id: String,
+    pub request_id: String,
+    pub database_epoch: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reported_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+}
+
+impl CloudRefreshResult {
+    pub fn new(
+        request: &SnapshotRefreshRequest,
+        status: &str,
+        state_version: Option<u64>,
+        reported_at: Option<u64>,
+        error_code: Option<&str>,
+    ) -> Self {
+        Self {
+            message_type: "refresh_result".to_string(),
+            viewer_id: request.viewer_id.clone(),
+            request_id: request.request_id.clone(),
+            database_epoch: request.database_epoch.clone(),
+            status: status.to_string(),
+            state_version,
+            reported_at,
+            error_code: error_code.map(str::to_string),
+        }
+    }
+}
+
+impl CloudSnapshotControl {
+    pub fn validate_structure(&self) -> Result<()> {
+        match self {
+            Self::ViewerInterest {
+                database_epoch,
+                viewers,
+            } => {
+                if !valid_database_epoch(database_epoch) {
+                    bail!("viewer-interest control frame has an invalid database epoch");
+                }
+                if viewers.len() > MAX_CLOUD_CONTROL_VIEWERS {
+                    bail!("viewer-interest control frame exceeds the visible-viewer limit");
+                }
+                let mut unique = BTreeSet::new();
+                for viewer in viewers {
+                    if !is_uuid(&viewer.viewer_id) || !unique.insert(&viewer.viewer_id) {
+                        bail!(
+                            "viewer-interest control frame has an invalid or duplicate viewer ID"
+                        );
+                    }
+                }
+            }
+            Self::SnapshotRefresh(request) => request.validate_structure()?,
+        }
+        Ok(())
+    }
+}
+
+impl SnapshotRefreshRequest {
+    pub fn validate_structure(&self) -> Result<()> {
+        if !valid_database_epoch(&self.database_epoch) {
+            bail!("snapshot-refresh control frame has an invalid database epoch");
+        }
+        if !is_uuid(&self.viewer_id) || !is_uuid(&self.request_id) {
+            bail!("snapshot-refresh control frame requires UUID viewer and request IDs");
+        }
+        if let Some(library_id) = &self.library_id
+            && (library_id.is_empty()
+                || library_id.len() > 256
+                || library_id.chars().any(char::is_control))
+        {
+            bail!("snapshot-refresh library ID has an invalid shape");
+        }
+        if !matches!(
+            self.scope,
+            SnapshotRefreshScope::Library | SnapshotRefreshScope::Download
+        ) && self.library_id.is_some()
+        {
+            bail!("snapshot-refresh library ID is only valid for library or download scope");
+        }
+        Ok(())
+    }
+
+    pub fn validate_at(&self, expected_epoch: &str, now: u64) -> Result<()> {
+        self.validate_structure()?;
+        if self.database_epoch != expected_epoch {
+            bail!("snapshot-refresh control frame is bound to a different database epoch");
+        }
+        if self.expires_at <= now
+            || self.expires_at.saturating_sub(now)
+                > MAX_SNAPSHOT_REFRESH_LIFETIME_MILLIS + MAX_CLOUD_CLOCK_SKEW_MILLIS
+        {
+            bail!("snapshot-refresh control frame is expired or exceeds its deadline limit");
+        }
+        Ok(())
+    }
+}
+
+impl CloudViewerInterest {
+    pub fn validate_at(&self, now: u64) -> Result<bool> {
+        if !is_uuid(&self.viewer_id) {
+            bail!("viewer-interest control frame has an invalid viewer ID");
+        }
+        if self.expires_at <= now {
+            return Ok(false);
+        }
+        if self.expires_at.saturating_sub(now) > MAX_VIEWER_INTEREST_LIFETIME_MILLIS {
+            bail!("viewer-interest lease exceeds its expiry limit");
+        }
+        Ok(true)
+    }
+}
+
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn decode_cloud_websocket_json(bytes: &[u8]) -> Result<CloudWebSocketMessage> {
+    if bytes.len() > MAX_REQUEST_BYTES {
+        bail!("local cloud WebSocket frame exceeds the existing request limit");
+    }
+    let value: Value =
+        serde_json::from_slice(bytes).context("invalid JSON frame from local cloud WebSocket")?;
+    match value.get("type").and_then(Value::as_str) {
+        Some("viewer_interest" | "snapshot_refresh") => {
+            if bytes.len() > MAX_CLOUD_CONTROL_FRAME_BYTES {
+                bail!("cloud control frame exceeds the 4 KiB limit");
+            }
+            let control: CloudSnapshotControl =
+                serde_json::from_value(value).context("invalid cloud snapshot-control frame")?;
+            control.validate_structure()?;
+            Ok(CloudWebSocketMessage::Control(control))
+        }
+        _ => {
+            let request: CloudRequest = serde_json::from_value(value)
+                .context("invalid JSON frame from local cloud WebSocket")?;
+            request.validate()?;
+            Ok(CloudWebSocketMessage::Request(request))
+        }
     }
 }
 
@@ -408,13 +633,145 @@ pub struct CloudSettings<'a> {
     pub applied: Option<&'a Value>,
 }
 
+#[derive(Default)]
+struct AcknowledgedCloudStateChunks {
+    database_epoch: Option<String>,
+    staged: BTreeMap<(String, String), Instant>,
+    committed: Option<CommittedCloudStateChunks>,
+}
+
+struct CommittedCloudStateChunks {
+    database_epoch: String,
+    state_version: u64,
+    hashes: BTreeSet<String>,
+}
+
+impl AcknowledgedCloudStateChunks {
+    fn set_epoch(&mut self, database_epoch: &str) {
+        if self.database_epoch.as_deref() != Some(database_epoch) {
+            self.clear();
+            self.database_epoch = Some(database_epoch.to_string());
+        }
+    }
+
+    fn contains_at(&mut self, database_epoch: &str, sha256: &str, now: Instant) -> bool {
+        if self
+            .database_epoch
+            .as_deref()
+            .is_some_and(|current| current != database_epoch)
+        {
+            return false;
+        }
+        self.expire_staged_at(now);
+        self.committed.as_ref().is_some_and(|committed| {
+            committed.database_epoch == database_epoch && committed.hashes.contains(sha256)
+        }) || self
+            .staged
+            .contains_key(&(database_epoch.to_string(), sha256.to_string()))
+    }
+
+    fn remember_staged_at(&mut self, database_epoch: &str, sha256: &str, now: Instant) {
+        if self
+            .database_epoch
+            .as_deref()
+            .is_some_and(|current| current != database_epoch)
+        {
+            return;
+        }
+        if self.database_epoch.is_none() {
+            self.database_epoch = Some(database_epoch.to_string());
+        }
+        self.expire_staged_at(now);
+        if self.committed.as_ref().is_some_and(|committed| {
+            committed.database_epoch == database_epoch && committed.hashes.contains(sha256)
+        }) {
+            return;
+        }
+
+        let key = (database_epoch.to_string(), sha256.to_string());
+        while !self.staged.contains_key(&key)
+            && self.staged.len() >= CLOUD_STATE_CHUNK_ACK_CACHE_ENTRIES
+        {
+            let Some(oldest) = self
+                .staged
+                .iter()
+                .min_by_key(|(_, acknowledged_at)| **acknowledged_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.staged.remove(&oldest);
+        }
+        self.staged.insert(key, now);
+    }
+
+    fn pin_committed(
+        &mut self,
+        database_epoch: &str,
+        state_version: u64,
+        hashes: BTreeSet<String>,
+    ) {
+        if hashes.len() > MAX_CLOUD_STATE_CHUNKS {
+            return;
+        }
+        if self
+            .database_epoch
+            .as_deref()
+            .is_some_and(|current| current != database_epoch)
+        {
+            return;
+        }
+        if self.database_epoch.is_none() {
+            self.database_epoch = Some(database_epoch.to_string());
+        }
+        if let Some(committed) = &self.committed
+            && committed.database_epoch == database_epoch
+            && committed.state_version >= state_version
+        {
+            return;
+        }
+
+        self.staged.retain(|(cached_epoch, hash), _| {
+            cached_epoch != database_epoch || !hashes.contains(hash)
+        });
+        self.committed = Some(CommittedCloudStateChunks {
+            database_epoch: database_epoch.to_string(),
+            state_version,
+            hashes,
+        });
+    }
+
+    fn clear_epoch(&mut self, database_epoch: &str) {
+        self.staged
+            .retain(|(cached_epoch, _), _| cached_epoch != database_epoch);
+        if self
+            .committed
+            .as_ref()
+            .is_some_and(|committed| committed.database_epoch == database_epoch)
+        {
+            self.committed = None;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.staged.clear();
+        self.committed = None;
+    }
+
+    fn expire_staged_at(&mut self, now: Instant) {
+        self.staged.retain(|_, acknowledged_at| {
+            now.saturating_duration_since(*acknowledged_at) < CLOUD_STATE_CHUNK_ACK_CACHE_TTL
+        });
+    }
+}
+
 #[derive(Clone)]
 pub struct CloudClient {
     base_url: url::Url,
     client: Client,
     authorization: HeaderValue,
     database_epoch: Option<String>,
-    acknowledged_state_chunks: Arc<Mutex<BTreeMap<(String, String), Instant>>>,
+    acknowledged_state_chunks: Arc<Mutex<AcknowledgedCloudStateChunks>>,
 }
 
 fn parse_cloud_state_version_hint(bytes: &[u8]) -> Option<u64> {
@@ -502,7 +859,9 @@ impl CloudClient {
                 .context("failed to initialize local cloud client")?,
             authorization,
             database_epoch: None,
-            acknowledged_state_chunks: Arc::new(Mutex::new(BTreeMap::new())),
+            acknowledged_state_chunks: Arc::new(
+                Mutex::new(AcknowledgedCloudStateChunks::default()),
+            ),
         })
     }
 
@@ -515,6 +874,11 @@ impl CloudClient {
         if !valid_database_epoch(&epoch) {
             bail!("cloud database epoch must be 32 lowercase hexadecimal characters");
         }
+        if self.database_epoch.as_deref() != Some(epoch.as_str())
+            && let Ok(mut cache) = self.acknowledged_state_chunks.lock()
+        {
+            cache.set_epoch(&epoch);
+        }
         self.database_epoch = Some(epoch);
         Ok(self)
     }
@@ -524,41 +888,36 @@ impl CloudClient {
         let Ok(mut cache) = self.acknowledged_state_chunks.lock() else {
             return false;
         };
-        cache.retain(|_, acknowledged_at| {
-            now.saturating_duration_since(*acknowledged_at) < CLOUD_STATE_CHUNK_ACK_CACHE_TTL
-        });
-        cache.contains_key(&(epoch.to_string(), sha256.to_string()))
+        cache.contains_at(epoch, sha256, now)
     }
 
     fn remember_acknowledged_state_chunk(&self, epoch: &str, sha256: &str) {
-        let now = Instant::now();
         let Ok(mut cache) = self.acknowledged_state_chunks.lock() else {
             return;
         };
-        cache.retain(|_, acknowledged_at| {
-            now.saturating_duration_since(*acknowledged_at) < CLOUD_STATE_CHUNK_ACK_CACHE_TTL
-        });
-        let key = (epoch.to_string(), sha256.to_string());
-        if let Some(acknowledged_at) = cache.get_mut(&key) {
-            *acknowledged_at = now;
-            return;
-        }
-        while cache.len() >= CLOUD_STATE_CHUNK_ACK_CACHE_ENTRIES {
-            let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, acknowledged_at)| **acknowledged_at)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            cache.remove(&oldest);
-        }
-        cache.insert(key, now);
+        cache.remember_staged_at(epoch, sha256, Instant::now());
     }
 
     fn clear_acknowledged_state_chunks(&self, epoch: &str) {
         if let Ok(mut cache) = self.acknowledged_state_chunks.lock() {
-            cache.retain(|(cached_epoch, _), _| cached_epoch != epoch);
+            cache.clear_epoch(epoch);
+        }
+    }
+
+    fn clear_all_acknowledged_state_chunks(&self) {
+        if let Ok(mut cache) = self.acknowledged_state_chunks.lock() {
+            cache.clear();
+        }
+    }
+
+    fn pin_committed_state_chunks(
+        &self,
+        epoch: &str,
+        state_version: u64,
+        hashes: BTreeSet<String>,
+    ) {
+        if let Ok(mut cache) = self.acknowledged_state_chunks.lock() {
+            cache.pin_committed(epoch, state_version, hashes);
         }
     }
 
@@ -600,9 +959,6 @@ impl CloudClient {
                     expected: expected_epoch.to_string(),
                     actual,
                 });
-            }
-            if status == reqwest::StatusCode::PRECONDITION_REQUIRED {
-                self.clear_acknowledged_state_chunks(expected_epoch);
             }
             Err(CloudStatePostError::HttpStatus(status))
         }
@@ -658,6 +1014,7 @@ impl CloudClient {
             && let Some(actual) = database_epoch_from_header(response.headers())
             && actual != expected
         {
+            self.clear_all_acknowledged_state_chunks();
             return Err(CloudDatabaseEpochChanged {
                 expected: expected.to_string(),
                 actual,
@@ -684,6 +1041,7 @@ impl CloudClient {
         let expected = self.database_epoch()?.to_string();
         let request_list = self.fetch_request_list().await?;
         if request_list.database_epoch != expected {
+            self.clear_all_acknowledged_state_chunks();
             return Err(CloudDatabaseEpochChanged {
                 expected,
                 actual: request_list.database_epoch,
@@ -743,6 +1101,7 @@ impl CloudClient {
             && let Some(actual) = database_epoch_from_header(response.headers())
             && actual != expected
         {
+            self.clear_all_acknowledged_state_chunks();
             return Err(CloudDatabaseEpochChanged { expected, actual }.into());
         }
         if response.status() == reqwest::StatusCode::CONFLICT
@@ -800,6 +1159,7 @@ impl CloudClient {
             if let Some(actual) = database_epoch_from_header(response.headers())
                 && actual != expected
             {
+                self.clear_all_acknowledged_state_chunks();
                 return Err(CloudDatabaseEpochChanged { expected, actual }.into());
             }
             bail!("cloud epoch rotation conflict no longer matches the pending request");
@@ -817,6 +1177,7 @@ impl CloudClient {
         if rotation.database_epoch == expected {
             bail!("cloud epoch rotation did not change the database epoch");
         }
+        self.clear_all_acknowledged_state_chunks();
         Err(CloudDatabaseEpochChanged {
             expected,
             actual: rotation.database_epoch,
@@ -824,9 +1185,18 @@ impl CloudClient {
         .into())
     }
 
+    #[cfg(test)]
     pub async fn post_state(
         &self,
         state: &CloudState<'_>,
+    ) -> std::result::Result<(), CloudStatePostError> {
+        self.post_state_with_notify_viewers(state, None).await
+    }
+
+    pub async fn post_state_with_notify_viewers(
+        &self,
+        state: &CloudState<'_>,
+        notify_viewers: Option<bool>,
     ) -> std::result::Result<(), CloudStatePostError> {
         let expected = self
             .database_epoch()
@@ -853,24 +1223,69 @@ impl CloudClient {
             ));
         }
 
+        let committed_hashes = prepared
+            .chunks
+            .iter()
+            .map(|chunk| chunk.sha256.clone())
+            .collect::<BTreeSet<_>>();
         let upload_results = stream::iter(prepared.chunks)
             .map(|chunk| self.upload_state_chunk(&expected, chunk))
             .buffer_unordered(CLOUD_STATE_CHUNK_UPLOAD_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
+        let mut upload_error = None;
+        let mut epoch_error = None;
+        let mut clear_epoch_cache = false;
+        let mut clear_all_cache = false;
         for result in upload_results {
-            result?;
+            if let Err(error) = result {
+                let is_epoch_error =
+                    matches!(&error, CloudStatePostError::DatabaseEpochChanged { .. });
+                let is_precondition_error = matches!(
+                    &error,
+                    CloudStatePostError::HttpStatus(status)
+                        if *status == reqwest::StatusCode::PRECONDITION_REQUIRED
+                );
+                if is_epoch_error {
+                    clear_all_cache = true;
+                    if epoch_error.is_none() {
+                        epoch_error = Some(error);
+                    }
+                } else if is_precondition_error {
+                    clear_epoch_cache = true;
+                    if upload_error.is_none() {
+                        upload_error = Some(error);
+                    }
+                } else if upload_error.is_none() {
+                    upload_error = Some(error);
+                }
+            }
+        }
+        if clear_all_cache {
+            self.clear_all_acknowledged_state_chunks();
+        } else if clear_epoch_cache {
+            self.clear_acknowledged_state_chunks(&expected);
+        }
+        if let Some(error) = epoch_error.or(upload_error) {
+            return Err(error);
         }
 
         let url = self
             .api_url("api/local/state")
             .map_err(CloudStatePostError::Transport)?;
-        let response = self
+        let mut request = self
             .client
             .post(url)
             .header(AUTHORIZATION, self.authorization.clone())
             .header("X-Cloud-Database-Epoch", expected.as_str())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+        if let Some(notify_viewers) = notify_viewers {
+            request = request.header(
+                "X-Snapshot-Notify-Viewers",
+                if notify_viewers { "1" } else { "0" },
+            );
+        }
+        let response = request
             .body(prepared.manifest)
             .send()
             .await
@@ -881,6 +1296,7 @@ impl CloudClient {
             })?;
         let status = response.status();
         if status.is_success() {
+            self.pin_committed_state_chunks(&expected, state.state_version, committed_hashes);
             Ok(())
         } else if status == reqwest::StatusCode::PRECONDITION_REQUIRED {
             self.clear_acknowledged_state_chunks(&expected);
@@ -889,6 +1305,7 @@ impl CloudClient {
             if let Some(actual) = database_epoch_from_header(response.headers())
                 && actual != expected
             {
+                self.clear_all_acknowledged_state_chunks();
                 return Err(CloudStatePostError::DatabaseEpochChanged { expected, actual });
             }
             match response
@@ -923,6 +1340,9 @@ impl CloudClient {
         request
             .headers_mut()
             .insert(WS_AUTHORIZATION, self.authorization.clone());
+        request
+            .headers_mut()
+            .insert("X-Cloud-Snapshot-Control", HeaderValue::from_static("v1"));
         request.headers_mut().insert(
             "X-Cloud-Database-Epoch",
             HeaderValue::from_str(&expected).context("invalid cloud database epoch header")?,
@@ -1668,6 +2088,10 @@ impl InboxRecord {
 struct PersistedStateVersion {
     schema_version: u32,
     state_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_successful_publication_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_successful_watch_fingerprint: Option<String>,
 }
 
 struct InboxRecoveryScan {
@@ -2259,7 +2683,8 @@ impl CloudInbox {
             bail!("observed cloud state version is outside JavaScript's safe integer range");
         }
         let path = self.directory.join(CLOUD_STATE_VERSION_FILE);
-        let current = self.read_state_version(&path)?.unwrap_or(0);
+        let metadata = self.read_state_version_metadata(&path)?;
+        let current = metadata.as_ref().map_or(0, |state| state.state_version);
         let next = current
             .max(observed_version)
             .checked_add(1)
@@ -2267,8 +2692,76 @@ impl CloudInbox {
         if next > MAX_CLOUD_STATE_VERSION {
             return Err(CloudStateVersionExhausted.into());
         }
-        self.write_state_version(&path, next)?;
+        self.write_state_version_metadata(
+            &path,
+            PersistedStateVersion {
+                schema_version: INBOX_RECORD_VERSION,
+                state_version: next,
+                last_successful_publication_at: metadata
+                    .as_ref()
+                    .and_then(|state| state.last_successful_publication_at),
+                last_successful_watch_fingerprint: metadata
+                    .and_then(|state| state.last_successful_watch_fingerprint.clone()),
+            },
+        )?;
         Ok(next)
+    }
+
+    pub fn last_successful_publication_at(&self) -> Result<Option<u64>> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        self.require_initial_recovery_complete_before_write()?;
+        let path = self.directory.join(CLOUD_STATE_VERSION_FILE);
+        Ok(self
+            .read_state_version_metadata(&path)?
+            .and_then(|state| state.last_successful_publication_at))
+    }
+
+    pub fn last_successful_watch_fingerprint(&self) -> Result<Option<String>> {
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        self.require_initial_recovery_complete_before_write()?;
+        let path = self.directory.join(CLOUD_STATE_VERSION_FILE);
+        let Some(fingerprint) = self
+            .read_state_version_metadata(&path)?
+            .and_then(|state| state.last_successful_watch_fingerprint)
+        else {
+            return Ok(None);
+        };
+        if !is_sha256_hex(&fingerprint) {
+            bail!("persisted cloud watch fingerprint is not a SHA-256 digest");
+        }
+        Ok(Some(fingerprint))
+    }
+
+    pub fn record_successful_publication_at(
+        &self,
+        published_at: u64,
+        watch_fingerprint: &str,
+    ) -> Result<()> {
+        if !is_sha256_hex(watch_fingerprint) {
+            bail!("cloud watch fingerprint must be a lowercase SHA-256 digest");
+        }
+        let _guard = self
+            .operation_lock
+            .lock()
+            .map_err(|_| anyhow!("cloud inbox lock was poisoned"))?;
+        self.require_initial_recovery_complete_before_write()?;
+        let path = self.directory.join(CLOUD_STATE_VERSION_FILE);
+        let metadata = self.read_state_version_metadata(&path)?;
+        self.write_state_version_metadata(
+            &path,
+            PersistedStateVersion {
+                schema_version: INBOX_RECORD_VERSION,
+                state_version: metadata.as_ref().map_or(0, |state| state.state_version),
+                last_successful_publication_at: Some(published_at),
+                last_successful_watch_fingerprint: Some(watch_fingerprint.to_string()),
+            },
+        )
     }
 
     fn record_path(&self, seq: u64) -> PathBuf {
@@ -2425,14 +2918,21 @@ impl CloudInbox {
         result.ok_or_else(|| anyhow!("File Provider did not provide cloud inbox record access"))
     }
 
+    #[cfg(test)]
     fn read_state_version(&self, path: &Path) -> Result<Option<u64>> {
+        Ok(self
+            .read_state_version_metadata(path)?
+            .map(|state| state.state_version))
+    }
+
+    fn read_state_version_metadata(&self, path: &Path) -> Result<Option<PersistedStateVersion>> {
         match self.root.entry_identity(path) {
             Ok(Some(_)) => {}
             Ok(None) => return Ok(None),
             Err(error) if is_deadlock_error(&error) => {}
             Err(error) => return Err(error),
         }
-        let mut version = None;
+        let mut metadata = None;
         let mut read = |coordinated_path: &Path| -> Result<()> {
             let coordinated = coordinated_path_under_root(&self.root, coordinated_path)?;
             if coordinated != path {
@@ -2453,20 +2953,38 @@ impl CloudInbox {
             if state.schema_version != INBOX_RECORD_VERSION {
                 bail!("unsupported cloud state-version file version");
             }
-            version = Some(state.state_version);
+            metadata = Some(state);
             Ok(())
         };
         self.file_provider
             .coordinate_read(path, &mut read)
             .map_err(|error| classify_deadlock_error(path, "read", error))?;
-        Ok(version)
+        Ok(metadata)
     }
 
+    #[cfg(test)]
     fn write_state_version(&self, path: &Path, state_version: u64) -> Result<()> {
-        let bytes = serde_json::to_vec(&PersistedStateVersion {
-            schema_version: INBOX_RECORD_VERSION,
-            state_version,
-        })?;
+        let metadata = self.read_state_version_metadata(path)?;
+        self.write_state_version_metadata(
+            path,
+            PersistedStateVersion {
+                schema_version: INBOX_RECORD_VERSION,
+                state_version,
+                last_successful_publication_at: metadata
+                    .as_ref()
+                    .and_then(|state| state.last_successful_publication_at),
+                last_successful_watch_fingerprint: metadata
+                    .and_then(|state| state.last_successful_watch_fingerprint),
+            },
+        )
+    }
+
+    fn write_state_version_metadata(
+        &self,
+        path: &Path,
+        metadata: PersistedStateVersion,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(&metadata)?;
         let mut write = |coordinated_path: &Path| -> Result<()> {
             let coordinated = coordinated_path_under_root(&self.root, coordinated_path)?;
             if coordinated != path {
@@ -3376,35 +3894,6 @@ pub fn now_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-pub async fn next_websocket_request(socket: &mut CloudWebSocket) -> Result<Option<CloudRequest>> {
-    loop {
-        match socket.next().await {
-            Some(Ok(WsMessage::Text(text))) => {
-                let request: CloudRequest = serde_json::from_str(text.as_str())
-                    .context("invalid JSON frame from local cloud WebSocket")?;
-                request.validate()?;
-                return Ok(Some(request));
-            }
-            Some(Ok(WsMessage::Binary(bytes))) => {
-                let request: CloudRequest = serde_json::from_slice(&bytes)
-                    .context("invalid binary JSON frame from local cloud WebSocket")?;
-                request.validate()?;
-                return Ok(Some(request));
-            }
-            Some(Ok(WsMessage::Ping(payload))) => {
-                socket
-                    .send(WsMessage::Pong(payload))
-                    .await
-                    .context("failed to answer local cloud WebSocket ping")?;
-            }
-            Some(Ok(WsMessage::Pong(_))) => {}
-            Some(Ok(WsMessage::Close(_))) | None => return Ok(None),
-            Some(Ok(WsMessage::Frame(_))) => {}
-            Some(Err(error)) => return Err(anyhow!(error).context("local cloud WebSocket failed")),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -3836,6 +4325,70 @@ mod tests {
                 .next_state_version()
                 .expect("version should persist across restart"),
             3
+        );
+        drop(reopened);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn successful_publication_time_survives_version_advancement_and_restart() {
+        let root = temp_root("state-version-publication-time");
+        fs::create_dir_all(&root).expect("root should create");
+        let inbox = CloudInbox::open(&root).expect("inbox should open");
+        assert_eq!(inbox.last_successful_publication_at().unwrap(), None);
+        assert_eq!(inbox.next_state_version().unwrap(), 1);
+        let watch_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        inbox
+            .record_successful_publication_at(1_800_000_000_123, watch_fingerprint)
+            .expect("successful post time should persist");
+        assert_eq!(
+            inbox.last_successful_publication_at().unwrap(),
+            Some(1_800_000_000_123)
+        );
+        assert_eq!(
+            inbox
+                .last_successful_watch_fingerprint()
+                .unwrap()
+                .as_deref(),
+            Some(watch_fingerprint)
+        );
+        assert_eq!(inbox.next_state_version().unwrap(), 2);
+        assert_eq!(
+            inbox.last_successful_publication_at().unwrap(),
+            Some(1_800_000_000_123)
+        );
+        assert_eq!(
+            inbox
+                .last_successful_watch_fingerprint()
+                .unwrap()
+                .as_deref(),
+            Some(watch_fingerprint)
+        );
+        drop(inbox);
+
+        let reopened = CloudInbox::open(&root).expect("inbox should reopen");
+        assert_eq!(
+            reopened.last_successful_publication_at().unwrap(),
+            Some(1_800_000_000_123)
+        );
+        assert_eq!(
+            reopened
+                .last_successful_watch_fingerprint()
+                .unwrap()
+                .as_deref(),
+            Some(watch_fingerprint)
+        );
+        assert_eq!(reopened.next_state_version().unwrap(), 3);
+        assert_eq!(
+            reopened.last_successful_publication_at().unwrap(),
+            Some(1_800_000_000_123)
+        );
+        assert_eq!(
+            reopened
+                .last_successful_watch_fingerprint()
+                .unwrap()
+                .as_deref(),
+            Some(watch_fingerprint)
         );
         drop(reopened);
         let _ = fs::remove_dir_all(root);
@@ -6702,6 +7255,116 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_control_frames_match_the_shared_golden_wire_fixture() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../cloud/test/fixtures/snapshot-control.json"))
+                .expect("shared snapshot control fixture should be valid JSON");
+        let clock_ms = fixture["clock_ms"].as_u64().unwrap();
+        let viewer_interest = fixture["viewer_interest"].clone();
+        let decoded_interest = decode_cloud_websocket_json(
+            serde_json::to_string(&viewer_interest).unwrap().as_bytes(),
+        )
+        .expect("viewer-interest frame should decode");
+        let CloudWebSocketMessage::Control(CloudSnapshotControl::ViewerInterest {
+            viewers, ..
+        }) = &decoded_interest
+        else {
+            panic!("golden viewer-interest frame should decode as a control");
+        };
+        assert!(
+            viewers[0]
+                .validate_at(clock_ms)
+                .expect("viewer lease should be inside the auth lifetime")
+        );
+        assert_eq!(
+            serde_json::to_value(match decoded_interest {
+                CloudWebSocketMessage::Control(control) => control,
+                CloudWebSocketMessage::Request(_) => unreachable!(),
+            })
+            .unwrap(),
+            viewer_interest
+        );
+
+        let refresh = fixture["snapshot_refresh"].clone();
+        let decoded_refresh =
+            decode_cloud_websocket_json(serde_json::to_string(&refresh).unwrap().as_bytes())
+                .expect("snapshot-refresh frame should decode");
+        let CloudWebSocketMessage::Control(CloudSnapshotControl::SnapshotRefresh(request)) =
+            &decoded_refresh
+        else {
+            panic!("golden refresh frame should decode as a control");
+        };
+        request
+            .validate_at(fixture["database_epoch"].as_str().unwrap(), clock_ms)
+            .expect("golden refresh request should have a bounded deadline");
+        let result_request = request.clone();
+        assert_eq!(
+            serde_json::to_value(match decoded_refresh {
+                CloudWebSocketMessage::Control(control) => control,
+                CloudWebSocketMessage::Request(_) => unreachable!(),
+            })
+            .unwrap(),
+            refresh
+        );
+
+        let result =
+            CloudRefreshResult::new(&result_request, "published", Some(42), Some(clock_ms), None);
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            fixture["refresh_result"]
+        );
+    }
+
+    #[test]
+    fn control_frame_limit_does_not_shrink_durable_request_limit() {
+        let mut refresh = serde_json::from_str::<Value>(include_str!(
+            "../cloud/test/fixtures/snapshot-control.json"
+        ))
+        .unwrap()["snapshot_refresh"]
+            .clone();
+        refresh["padding"] = Value::String("x".repeat(MAX_CLOUD_CONTROL_FRAME_BYTES));
+        assert!(decode_cloud_websocket_json(&serde_json::to_vec(&refresh).unwrap()).is_err());
+
+        let request = CloudRequest {
+            seq: 1,
+            kind: "telegram".to_string(),
+            payload: json!({"text": "x".repeat(MAX_CLOUD_CONTROL_FRAME_BYTES + 32)}),
+            created_at: 1,
+            extra: Default::default(),
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert!(bytes.len() > MAX_CLOUD_CONTROL_FRAME_BYTES);
+        assert!(matches!(
+            decode_cloud_websocket_json(&bytes).unwrap(),
+            CloudWebSocketMessage::Request(_)
+        ));
+    }
+
+    #[test]
+    fn refresh_deadline_accepts_small_worker_clock_skew_but_stays_bounded() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../cloud/test/fixtures/snapshot-control.json"))
+                .unwrap();
+        let clock_ms = fixture["clock_ms"].as_u64().unwrap();
+        let epoch = fixture["database_epoch"].as_str().unwrap();
+        let mut request: SnapshotRefreshRequest =
+            serde_json::from_value(fixture["snapshot_refresh"].clone()).unwrap();
+
+        request.expires_at = clock_ms + MAX_SNAPSHOT_REFRESH_LIFETIME_MILLIS + 15_000;
+        assert!(request.validate_at(epoch, clock_ms).is_ok());
+
+        request.expires_at =
+            clock_ms + MAX_SNAPSHOT_REFRESH_LIFETIME_MILLIS + MAX_CLOUD_CLOCK_SKEW_MILLIS;
+        assert!(request.validate_at(epoch, clock_ms).is_ok());
+
+        request.expires_at += 1;
+        assert!(request.validate_at(epoch, clock_ms).is_err());
+
+        request.expires_at = clock_ms;
+        assert!(request.validate_at(epoch, clock_ms).is_err());
+    }
+
+    #[test]
     fn client_uses_header_auth_and_maps_secure_websocket_path() {
         let client = CloudClient::with_test_base_url("https://worker.example.test/")
             .expect("client should construct");
@@ -6719,3 +7382,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cloud_client_cache_tests.rs"]
+mod cloud_client_cache_tests;

@@ -68,4 +68,5 @@ command_idle_timeout_seconds = 300
 # [cloud]
 # worker_url = "https://your-worker.your-subdomain.workers.dev"
 # shared_secret = ""
-# fallback_poll_seconds = 30
+# Legacy setting retained for compatibility; effective idle reconciliation is hourly.
+# fallback_poll_seconds = 3600

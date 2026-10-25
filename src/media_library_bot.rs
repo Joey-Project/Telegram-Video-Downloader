@@ -420,16 +420,62 @@ pub(super) fn same_root(left: &Path, right: &Path) -> bool {
 }
 
 pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
+    refresh_libraries_selected(runtime, None).await
+}
+
+pub(super) async fn refresh_library(
+    runtime: &CloudBotRuntime,
+    library_id: Option<&str>,
+) -> Result<()> {
+    let settings = runtime.bot.queue.registry_snapshot()?;
+    let selected_id = library_id
+        .unwrap_or(&settings.default_library_id)
+        .to_string();
+    refresh_libraries_selected(runtime, Some(vec![selected_id])).await
+}
+
+async fn refresh_libraries_selected(
+    runtime: &CloudBotRuntime,
+    selected_library_ids: Option<Vec<String>>,
+) -> Result<()> {
+    let propagate_scan_errors = selected_library_ids.is_some();
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; media-library refresh is stopped");
     }
-    refresh_library_bindings(runtime).await?;
+    match selected_library_ids.as_deref() {
+        Some(ids) => {
+            for id in ids {
+                refresh_library_binding(runtime, id).await?;
+            }
+        }
+        None => refresh_library_bindings(runtime).await?,
+    }
     if runtime.epoch_fatal.is_signaled() {
         bail!("cloud database epoch changed; media-library refresh is stopped");
     }
     let settings = runtime.bot.queue.registry_snapshot()?;
     let default_id = settings.default_library_id.clone();
-    for library in settings.libraries {
+    let libraries = match selected_library_ids {
+        None => settings.libraries,
+        Some(selected_ids) => {
+            let mut selected =
+                Vec::<crate::media_libraries::MediaLibrary>::with_capacity(selected_ids.len());
+            for selected_id in selected_ids {
+                let library = settings
+                    .libraries
+                    .iter()
+                    .find(|library| library.id == selected_id)
+                    .with_context(|| {
+                        format!("media library {selected_id} is no longer registered")
+                    })?;
+                if !selected.iter().any(|existing| existing.id == library.id) {
+                    selected.push(library.clone());
+                }
+            }
+            selected
+        }
+    };
+    for library in libraries {
         if runtime.epoch_fatal.is_signaled() {
             bail!("cloud database epoch changed; media-library refresh is stopped");
         }
@@ -445,10 +491,22 @@ pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
         if runtime.epoch_fatal.is_signaled() {
             bail!("cloud database epoch changed; media-library refresh is stopped");
         }
+        #[cfg(test)]
+        let test_refresh_failure = Arc::clone(&runtime.test_library_refresh_failure);
         let result = run_cloud_library_refresh_operation(
             &scoped,
             "media-library refresh worker failed",
-            |context, inbox| Ok(((), scan_cloud_library(&context, inbox)?)),
+            move |context, inbox| {
+                #[cfg(test)]
+                if let Some(message) = test_refresh_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    bail!("{message}");
+                }
+                Ok(((), scan_cloud_library(&context, inbox)?))
+            },
         )
         .await;
         if let Err(error) = result {
@@ -456,6 +514,9 @@ pub(super) async fn refresh_libraries(runtime: &CloudBotRuntime) -> Result<()> {
                 return Err(error);
             }
             warn!(library_id = %library.id, error = %redact_sensitive_text(&format!("{error:#}")), "media-library refresh failed");
+            if propagate_scan_errors {
+                return Err(error);
+            }
         }
     }
     *runtime.library_scan_warning.lock().await = runtime
@@ -473,6 +534,17 @@ pub(super) async fn refresh_library_bindings(runtime: &CloudBotRuntime) -> Resul
     tokio::task::spawn_blocking(move || queue.refresh_video_libraries())
         .await
         .context("media-library availability worker failed")?
+}
+
+pub(super) async fn refresh_library_binding(
+    runtime: &CloudBotRuntime,
+    library_id: &str,
+) -> Result<()> {
+    let queue = Arc::clone(&runtime.bot.queue);
+    let library_id = library_id.to_string();
+    tokio::task::spawn_blocking(move || queue.refresh_video_library(&library_id))
+        .await
+        .context("selected media-library availability worker failed")?
 }
 
 pub(super) async fn unconfirmable_previews(
