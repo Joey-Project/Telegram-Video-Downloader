@@ -7,6 +7,7 @@ const CONNECT_TIMEOUT_MS = 10_000;
 const READY_TIMEOUT_MS = 10_000;
 const REFRESH_TIMEOUT_MS = 125_000;
 const REFRESH_QUEUE_TIMEOUT_MS = 125_000;
+const PUBLISHED_CACHE_READ_TIMEOUT_MS = 25_000;
 const MAX_RETRY_MS = 60_000;
 const MAX_PENDING_REFRESHES = 32;
 const DATABASE_EPOCH_PATTERN = /^[0-9a-f]{32}$/u;
@@ -144,6 +145,8 @@ export function createSnapshotUpdates({
   let retryDelay = 1_000;
   let desiredWatch = false;
   let snapshotReadPromise = null;
+  let snapshotReadController = null;
+  let snapshotReadDeadlineTimer = 0;
   let snapshotReadAgain = false;
   let snapshotReadMinimumVersion = 0;
   let snapshotReadEpochChanged = false;
@@ -180,6 +183,24 @@ export function createSnapshotUpdates({
 
   function clearTimer(timer) {
     if (timer) clearTimerFn(timer);
+  }
+
+  function clearSnapshotReadDeadline() {
+    clearTimer(snapshotReadDeadlineTimer);
+    snapshotReadDeadlineTimer = 0;
+  }
+
+  function abortSnapshotRead() {
+    clearSnapshotReadDeadline();
+    snapshotReadController?.abort();
+  }
+
+  function boundPublishedCacheRead() {
+    if (!snapshotReadController || snapshotReadDeadlineTimer) return;
+    snapshotReadDeadlineTimer = setTimer(() => {
+      snapshotReadDeadlineTimer = 0;
+      snapshotReadController?.abort();
+    }, PUBLISHED_CACHE_READ_TIMEOUT_MS);
   }
 
   function clearConnectionTimers() {
@@ -267,7 +288,7 @@ export function createSnapshotUpdates({
     }
   }
 
-  function requestSnapshotRead(minimumVersion = 0, { epochChanged = false, expectedEpoch = databaseEpoch } = {}) {
+  function requestSnapshotRead(minimumVersion = 0, { epochChanged = false, expectedEpoch = databaseEpoch, publishedResult = false } = {}) {
     const requestedEpoch = typeof expectedEpoch === "string" ? expectedEpoch : null;
     if (snapshotReadExpectedEpoch !== requestedEpoch) {
       snapshotReadExpectedEpoch = requestedEpoch;
@@ -277,7 +298,18 @@ export function createSnapshotUpdates({
     }
     snapshotReadAgain = true;
     snapshotReadEpochChanged ||= epochChanged;
-    if (snapshotReadPromise) return snapshotReadPromise;
+    if (snapshotReadPromise) {
+      if (publishedResult) boundPublishedCacheRead();
+      return snapshotReadPromise;
+    }
+
+    const readController = new AbortControllerConstructor();
+    snapshotReadController = readController;
+    let rejectAbortedRead;
+    const abortedRead = new Promise((_, reject) => { rejectAbortedRead = reject; });
+    const rejectOnAbort = () => rejectAbortedRead(new Error("The published snapshot read was cancelled."));
+    readController.signal.addEventListener("abort", rejectOnAbort, { once: true });
+    if (publishedResult) boundPublishedCacheRead();
 
     snapshotReadPromise = (async () => {
       let snapshot;
@@ -289,12 +321,14 @@ export function createSnapshotUpdates({
         snapshotReadMinimumVersion = 0;
         const reverifyEpoch = snapshotReadEpochChanged;
         snapshotReadEpochChanged = false;
-        snapshot = await readSnapshot({
+        snapshot = await Promise.race([readSnapshot({
           quiet: true,
           minimumVersion: minimum,
+          signal: readController.signal,
           ...(readEpoch ? { expectedDatabaseEpoch: readEpoch } : {}),
           ...(reverifyEpoch ? { epochChanged: true } : {}),
-        });
+        }), abortedRead]);
+        if (readController.signal.aborted) throw new Error("The published snapshot read was cancelled.");
         const latestExpectedEpoch = snapshotReadExpectedEpoch;
         if (readEpoch !== latestExpectedEpoch && snapshot?.database_epoch !== latestExpectedEpoch) {
           snapshotReadAgain = true;
@@ -330,6 +364,9 @@ export function createSnapshotUpdates({
       }
       return snapshot;
     })().finally(() => {
+      readController.signal.removeEventListener("abort", rejectOnAbort);
+      clearSnapshotReadDeadline();
+      if (snapshotReadController === readController) snapshotReadController = null;
       snapshotReadPromise = null;
     });
     return snapshotReadPromise;
@@ -337,7 +374,7 @@ export function createSnapshotUpdates({
 
   async function finishPublishedRefresh(entry, message) {
     try {
-      const snapshot = await requestSnapshotRead(message.state_version);
+      const snapshot = await requestSnapshotRead(message.state_version, { publishedResult: true });
       settleRefresh(entry, { ...message, snapshot });
     } catch {
       // Publication is independently confirmed by the correlated Mac result.
@@ -452,6 +489,7 @@ export function createSnapshotUpdates({
     sendInterest(false);
     started = false;
     stopTransport();
+    abortSnapshotRead();
     clearExpiryTimer();
     cancelPendingRefreshes("stopped");
     removeLifecycleListeners();
@@ -464,6 +502,7 @@ export function createSnapshotUpdates({
     expired = true;
     started = false;
     stopTransport();
+    abortSnapshotRead();
     clearExpiryTimer();
     cancelPendingRefreshes("authorization_expired");
     removeLifecycleListeners();

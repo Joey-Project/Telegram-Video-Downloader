@@ -247,6 +247,34 @@ async function waitForClose(socket: WebSocket, timeoutMs: number): Promise<Close
   });
 }
 
+function waitForAnyMessage(
+  sockets: WebSocket[],
+  predicate: (event: UpdateEvent) => boolean,
+  timeoutMs: number,
+): Promise<{ socket: WebSocket; event: UpdateEvent }> {
+  return new Promise((resolve, reject) => {
+    const listeners: Array<{ socket: WebSocket; listener: (event: MessageEvent) => void }> = [];
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      for (const { socket, listener } of listeners) socket.removeEventListener("message", listener);
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timed out waiting for a Mini App update on any socket"));
+    }, timeoutMs);
+    for (const socket of sockets) {
+      const listener = (message: MessageEvent): void => {
+        const event = parseMessage(message.data);
+        if (event === null || !predicate(event)) return;
+        cleanup();
+        resolve({ socket, event });
+      };
+      listeners.push({ socket, listener });
+      socket.addEventListener("message", listener);
+    }
+  });
+}
+
 afterEach(async () => {
   const closing: Array<Promise<CloseEvent | undefined>> = [];
   for (const socket of testSockets) {
@@ -301,6 +329,53 @@ describe("Mini App update capabilities", () => {
     const stale = await openViewer(session.ticket);
     expect(stale.status).toBe(409);
     expect(stale.headers.get("X-Cloud-Database-Epoch")).toBe(staleEpoch);
+  });
+
+  it("notifies and closes an authorized old-epoch tab with the reconnectable epoch code", async () => {
+    const oldSession = await readJson<SessionResponse>(await createSession());
+    const oldConnection = await openViewer(oldSession.ticket);
+    expect(oldConnection.status).toBe(101);
+    const oldSocket = oldConnection.webSocket!;
+    const oldCollector = collectMessages(oldSocket);
+    await oldCollector.waitFor((event) => event.type === "ready");
+    const oldClose = waitForClose(oldSocket, 2_000);
+
+    const nextEpoch = "fedcba9876543210fedcba9876543210";
+    await testEnv.DB.prepare("UPDATE cloud_database_meta SET epoch = ? WHERE id = 1").bind(nextEpoch).run();
+    const newSession = await readJson<SessionResponse>(await createSession());
+    expect(newSession.database_epoch).toBe(nextEpoch);
+    const newConnection = await openViewer(newSession.ticket);
+    expect(newConnection.status).toBe(101);
+    const newSocket = newConnection.webSocket!;
+    const newCollector = collectMessages(newSocket);
+    await expect(newCollector.waitFor((event) => event.type === "ready"))
+      .resolves.toMatchObject({ database_epoch: nextEpoch });
+
+    await expect(oldCollector.waitFor((event) => event.type === "invalidate" && event.reason === "epoch"))
+      .resolves.toMatchObject({ database_epoch: nextEpoch });
+    expect((await oldClose).code).toBe(4409);
+    newSocket.close(1000, "Test complete");
+
+    const shortAuthExpiry = Date.now() + 500;
+    const expiringTicket = await issueMiniAppUpdatesTicket(
+      botToken,
+      String(ownerId),
+      nextEpoch,
+      shortAuthExpiry,
+    );
+    const expiringConnection = await openViewer(expiringTicket.ticket);
+    expect(expiringConnection.status).toBe(101);
+    const expiringSocket = expiringConnection.webSocket!;
+    const expiringCollector = collectMessages(expiringSocket);
+    await expiringCollector.waitFor((event) => event.type === "ready");
+    const expiredAndStaleClose = waitForClose(expiringSocket, 2_000);
+    const thirdEpoch = "11111111222233334444555566667777";
+    await testEnv.DB.prepare("UPDATE cloud_database_meta SET epoch = ? WHERE id = 1").bind(thirdEpoch).run();
+    expect((await expiredAndStaleClose).code).toBe(4401);
+    expect(expiringCollector.messages.some((event) => event.type === "invalidate" && event.reason === "epoch"))
+      .toBe(false);
+    await testEnv.DB.prepare("UPDATE cloud_database_meta SET epoch = ? WHERE id = 1")
+      .bind(testDatabaseEpoch).run();
   });
 
   it("keeps viewer notifications separate from local inbox payloads and only notifies after snapshot commit, enqueue, and ack", async () => {
@@ -522,6 +597,134 @@ describe("Mini App update capabilities", () => {
     viewerSocket.close(1000, "Test complete");
     legacySocket.close(1000, "Test complete");
     controlSocket.close(1000, "Test complete");
+  });
+
+  it("fails refreshes routed to a closed local connection without penalizing other connections", async () => {
+    const localConnections: Array<{ socket: WebSocket; collector: ReturnType<typeof collectMessages> }> = [];
+    for (let index = 0; index < 3; index += 1) {
+      const connection = await openLocalClient(SNAPSHOT_CONTROL_VERSION);
+      expect(connection.status).toBe(101);
+      const socket = connection.webSocket!;
+      localConnections.push({ socket, collector: collectMessages(socket) });
+    }
+
+    const session = await readJson<SessionResponse>(await createSession());
+    const viewerConnection = await openViewer(session.ticket);
+    expect(viewerConnection.status).toBe(101);
+    const viewerSocket = viewerConnection.webSocket!;
+    const viewerCollector = collectMessages(viewerSocket);
+    await viewerCollector.waitFor((event) => event.type === "ready");
+
+    viewerSocket.send(JSON.stringify({
+      type: "interest",
+      database_epoch: testDatabaseEpoch,
+      visible: true,
+      surface: "file",
+      watch: true,
+    }));
+    await Promise.all(localConnections.map(({ collector }) =>
+      collector.waitFor((event) => event.type === "viewer_interest" && event.viewers?.length === 1)));
+
+    const requestId = crypto.randomUUID();
+    const forwardedRequest = waitForAnyMessage(
+      localConnections.map(({ socket }) => socket),
+      (event) => event.type === "snapshot_refresh" && event.request_id === requestId,
+      2_000,
+    );
+    viewerSocket.send(JSON.stringify({
+      type: "refresh_request",
+      database_epoch: testDatabaseEpoch,
+      request_id: requestId,
+      reason: "manual",
+      scope: "library",
+    }));
+    const forwarded = await forwardedRequest;
+    const recipient = localConnections.find(({ socket }) => socket === forwarded.socket);
+    if (recipient === undefined || forwarded.event.viewer_id === undefined) {
+      throw new Error("Forwarded refresh omitted its local recipient or viewer ID");
+    }
+
+    const nonRecipient = localConnections.find(({ socket }) => socket !== recipient.socket);
+    if (nonRecipient === undefined) throw new Error("Test setup omitted another local connection");
+    const responseStart = viewerCollector.messages.length;
+    nonRecipient.socket.close(1000, "Non-recipient closed");
+    await expect(viewerCollector.waitFor(
+      (event) => event.type === "refresh_result" && event.request_id === requestId,
+      responseStart,
+      150,
+    )).rejects.toThrow("Timed out waiting for a Mini App update");
+
+    const stillPending = viewerCollector.waitFor(
+      (event) => event.type === "refresh_result" && event.request_id === requestId,
+      responseStart,
+    );
+    recipient.socket.send(JSON.stringify({
+      type: "refresh_result",
+      viewer_id: forwarded.event.viewer_id,
+      request_id: requestId,
+      database_epoch: testDatabaseEpoch,
+      status: "failed",
+      error_code: "refresh_failed",
+    }));
+    await expect(stillPending).resolves.toMatchObject({ status: "failed", error_code: "refresh_failed" });
+
+    const failedRequestId = crypto.randomUUID();
+    const failedForward = waitForAnyMessage(
+      localConnections.map(({ socket }) => socket),
+      (event) => event.type === "snapshot_refresh" && event.request_id === failedRequestId,
+      2_000,
+    );
+    const closeResultStart = viewerCollector.messages.length;
+    viewerSocket.send(JSON.stringify({
+      type: "refresh_request",
+      database_epoch: testDatabaseEpoch,
+      request_id: failedRequestId,
+      reason: "manual",
+      scope: "library",
+    }));
+    const failedForwarded = await failedForward;
+    const closeResult = viewerCollector.waitFor(
+      (event) => event.type === "refresh_result" && event.request_id === failedRequestId,
+      closeResultStart,
+      1_500,
+    );
+    const closeStartedAt = Date.now();
+    failedForwarded.socket.close(1000, "Recipient closed");
+    await expect(closeResult).resolves.toMatchObject({
+      status: "unavailable",
+      error_code: "local_unavailable",
+    });
+    expect(Date.now() - closeStartedAt).toBeLessThan(1_000);
+
+    const recoveredRequestId = crypto.randomUUID();
+    const recoveredForward = waitForAnyMessage(
+      localConnections.map(({ socket }) => socket),
+      (event) => event.type === "snapshot_refresh" && event.request_id === recoveredRequestId,
+      2_000,
+    );
+    const recoveredResultStart = viewerCollector.messages.length;
+    viewerSocket.send(JSON.stringify({
+      type: "refresh_request",
+      database_epoch: testDatabaseEpoch,
+      request_id: recoveredRequestId,
+      reason: "manual",
+      scope: "library",
+    }));
+    const recovered = await recoveredForward;
+    expect(recovered.socket.readyState).toBe(WebSocket.OPEN);
+    const recoveredResult = viewerCollector.waitFor(
+      (event) => event.type === "refresh_result" && event.request_id === recoveredRequestId,
+      recoveredResultStart,
+    );
+    recovered.socket.send(JSON.stringify({
+      type: "refresh_result",
+      viewer_id: recovered.event.viewer_id,
+      request_id: recoveredRequestId,
+      database_epoch: testDatabaseEpoch,
+      status: "failed",
+      error_code: "refresh_failed",
+    }));
+    await expect(recoveredResult).resolves.toMatchObject({ status: "failed", error_code: "refresh_failed" });
   });
 
   it("matches the shared snapshot-control wire fixture and returns only a committed correlated result", async () => {

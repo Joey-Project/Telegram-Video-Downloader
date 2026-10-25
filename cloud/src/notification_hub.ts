@@ -35,6 +35,8 @@ type RefreshReason = "open" | "manual" | "reference";
 interface PendingRefresh {
   request_id: string;
   expires_at: number;
+  // Optional for attachments written by versions that predate local-connection tracking.
+  local_connection_id?: string;
 }
 
 interface SeenRefresh {
@@ -60,6 +62,8 @@ interface LocalAttachment {
   role: "local-client";
   database_epoch: string;
   snapshot_control: "v1" | null;
+  // Optional so hibernated connections from an older worker remain readable.
+  connection_id?: string;
   event_sequence: number;
 }
 
@@ -148,7 +152,9 @@ function isViewerAttachment(value: unknown): value is ViewerAttachment {
     value.pending_refreshes.length <= MAX_PENDING_REFRESHES_PER_VIEWER &&
     value.pending_refreshes.every((entry) => isRecord(entry) && typeof entry.request_id === "string" &&
       UUID_PATTERN.test(entry.request_id) && typeof entry.expires_at === "number" &&
-      Number.isSafeInteger(entry.expires_at) && entry.expires_at > 0) &&
+      Number.isSafeInteger(entry.expires_at) && entry.expires_at > 0 &&
+      (entry.local_connection_id === undefined ||
+        (typeof entry.local_connection_id === "string" && UUID_PATTERN.test(entry.local_connection_id)))) &&
     Array.isArray(value.seen_refresh_ids) && value.seen_refresh_ids.length <= MAX_RECENT_REFRESH_IDS_PER_VIEWER &&
     value.seen_refresh_ids.every((entry) => isRecord(entry) && typeof entry.request_id === "string" &&
       UUID_PATTERN.test(entry.request_id) && typeof entry.expires_at === "number" &&
@@ -161,6 +167,8 @@ function isLocalAttachment(value: unknown): value is LocalAttachment {
   return value.role === "local-client" && typeof value.database_epoch === "string" &&
     isDatabaseEpoch(value.database_epoch) &&
     (value.snapshot_control === null || value.snapshot_control === SNAPSHOT_CONTROL_VERSION) &&
+    (value.connection_id === undefined ||
+      (typeof value.connection_id === "string" && UUID_PATTERN.test(value.connection_id))) &&
     typeof value.event_sequence === "number" && Number.isSafeInteger(value.event_sequence) && value.event_sequence >= 0;
 }
 
@@ -271,6 +279,7 @@ export class NotificationHub extends DurableObject<Env> {
       role: "local-client",
       database_epoch: databaseEpoch,
       snapshot_control: snapshotControl === SNAPSHOT_CONTROL_VERSION ? SNAPSHOT_CONTROL_VERSION : null,
+      connection_id: crypto.randomUUID(),
       event_sequence: 0,
     } satisfies LocalAttachment);
     if (snapshotControl === SNAPSHOT_CONTROL_VERSION) {
@@ -427,12 +436,21 @@ export class NotificationHub extends DurableObject<Env> {
   }
 
   async webSocketClose(socket: WebSocket, code: number, reason: string): Promise<void> {
-    const initial = this.readViewerAttachment(socket);
+    const localAttachment = this.readLocalAttachment(socket);
     try {
       socket.close(code, reason);
     } catch {
       // The close handshake may already be complete.
     }
+    await this.handleWebSocketClosed(socket, localAttachment);
+  }
+
+  async webSocketError(socket: WebSocket, _error: unknown): Promise<void> {
+    await this.handleWebSocketClosed(socket);
+  }
+
+  private async handleWebSocketClosed(socket: WebSocket, initialLocal?: LocalAttachment | null): Promise<void> {
+    const initial = this.readViewerAttachment(socket);
     if (initial !== null) {
       let hadInterest = false;
       let databaseEpoch = initial.database_epoch;
@@ -453,6 +471,12 @@ export class NotificationHub extends DurableObject<Env> {
       });
       if (hadInterest) await this.notifyViewerInterest(databaseEpoch);
       await this.scheduleViewerExpiry();
+      return;
+    }
+
+    const localAttachment = initialLocal ?? this.readLocalAttachment(socket);
+    if (localAttachment?.snapshot_control === SNAPSHOT_CONTROL_VERSION) {
+      await this.failRefreshesForClosedLocalClient(socket, localAttachment);
     }
   }
 
@@ -472,15 +496,20 @@ export class NotificationHub extends DurableObject<Env> {
         const attachment = this.readViewerAttachment(socket);
         if (attachment === null) return;
         const staleEpoch = currentEpoch !== null && attachment.database_epoch !== currentEpoch;
-        if (attachment.owner_user_id !== this.env.OWNER_USER_ID || attachment.auth_expires_at <= now || staleEpoch) {
+        const expiredAuth = attachment.auth_expires_at <= now;
+        const wrongOwner = attachment.owner_user_id !== this.env.OWNER_USER_ID;
+        if (wrongOwner || expiredAuth || staleEpoch) {
           if (attachment.visible) interestChanged = true;
           attachment.visible = false;
           attachment.watch = false;
           attachment.pending_refreshes = [];
           attachment.event_sequence += 1;
           socket.serializeAttachment(attachment);
-          if (staleEpoch && currentEpoch !== null) this.sendEpochInvalidation(socket, currentEpoch);
-          this.closeExpiredViewer(socket);
+          if (staleEpoch && !expiredAuth && !wrongOwner && currentEpoch !== null) {
+            this.closeViewerForEpoch(socket, currentEpoch);
+          } else {
+            this.closeExpiredViewer(socket);
+          }
           return;
         }
 
@@ -575,12 +604,7 @@ export class NotificationHub extends DurableObject<Env> {
         return;
       }
       if (currentEpoch !== latest.database_epoch) {
-        this.sendEpochInvalidation(socket, currentEpoch);
-        try {
-          socket.close(VIEWER_EPOCH_CLOSE_CODE, "Cloud database epoch changed");
-        } catch {
-          // A closed socket is removed by the runtime.
-        }
+        this.closeViewerForEpoch(socket, currentEpoch);
         return;
       }
 
@@ -649,6 +673,14 @@ export class NotificationHub extends DurableObject<Env> {
         await this.scheduleViewerExpiry();
         return;
       }
+      const localConnectionId = this.ensureLocalConnectionId(localSocket);
+      if (localConnectionId === null) {
+        latest.event_sequence += 1;
+        socket.serializeAttachment(latest);
+        this.sendViewerResult(socket, latest, refresh.request_id, "unavailable", "local_unavailable");
+        await this.scheduleViewerExpiry();
+        return;
+      }
 
       const controlFrame = {
         type: "snapshot_refresh",
@@ -660,7 +692,11 @@ export class NotificationHub extends DurableObject<Env> {
         ...(refresh.library_id === undefined ? {} : { library_id: refresh.library_id }),
         expires_at: expiresAt,
       };
-      latest.pending_refreshes.push({ request_id: refresh.request_id, expires_at: expiresAt });
+      latest.pending_refreshes.push({
+        request_id: refresh.request_id,
+        expires_at: expiresAt,
+        local_connection_id: localConnectionId,
+      });
       latest.event_sequence += 1;
       socket.serializeAttachment(latest);
       try {
@@ -783,8 +819,11 @@ export class NotificationHub extends DurableObject<Env> {
       }
       await this.withViewerMutation(initial.viewer_id, () => {
         const attachment = this.readViewerAttachment(socket);
+        const staleEpoch = attachment !== null && attachment.database_epoch !== databaseEpoch;
+        const expiredAuth = attachment !== null && attachment.auth_expires_at <= now;
+        const wrongOwner = attachment !== null && attachment.owner_user_id !== ownerUserId;
         if (attachment === null || attachment.owner_user_id !== ownerUserId ||
-          attachment.auth_expires_at <= now || attachment.database_epoch !== databaseEpoch) {
+          expiredAuth || staleEpoch) {
           if (attachment?.visible) interestChanged = true;
           if (attachment !== null) {
             attachment.visible = false;
@@ -793,7 +832,11 @@ export class NotificationHub extends DurableObject<Env> {
             attachment.event_sequence += 1;
             socket.serializeAttachment(attachment);
           }
-          this.closeExpiredViewer(socket);
+          if (staleEpoch && !expiredAuth && !wrongOwner) {
+            this.closeViewerForEpoch(socket, databaseEpoch);
+          } else {
+            this.closeExpiredViewer(socket);
+          }
         } else if (socket.readyState !== WebSocket.CLOSED) {
           active += 1;
         }
@@ -869,6 +912,63 @@ export class NotificationHub extends DurableObject<Env> {
     return null;
   }
 
+  private ensureLocalConnectionId(socket: WebSocket): string | null {
+    const attachment = this.readLocalAttachment(socket);
+    if (attachment === null || attachment.snapshot_control !== SNAPSHOT_CONTROL_VERSION ||
+      socket.readyState !== WebSocket.OPEN) {
+      return null;
+    }
+    if (attachment.connection_id !== undefined) return attachment.connection_id;
+    attachment.connection_id = crypto.randomUUID();
+    try {
+      socket.serializeAttachment(attachment);
+      return attachment.connection_id;
+    } catch {
+      return null;
+    }
+  }
+
+  private async failRefreshesForClosedLocalClient(socket: WebSocket, local: LocalAttachment): Promise<void> {
+    const hasReplacement = this.ctx.getWebSockets(LOCAL_CLIENT_TAG).some((candidate) => {
+      if (candidate === socket || candidate.readyState !== WebSocket.OPEN) return false;
+      const attachment = this.readLocalAttachment(candidate);
+      return attachment !== null && attachment.snapshot_control === SNAPSHOT_CONTROL_VERSION &&
+        attachment.database_epoch === local.database_epoch;
+    });
+    const now = Date.now();
+    let changed = false;
+    for (const viewer of this.ctx.getWebSockets(MINIAPP_VIEWER_TAG)) {
+      const initial = this.readViewerAttachment(viewer);
+      if (initial === null || initial.database_epoch !== local.database_epoch) continue;
+      await this.withViewerMutation(initial.viewer_id, () => {
+        const attachment = this.readViewerAttachment(viewer);
+        if (attachment === null || attachment.viewer_id !== initial.viewer_id ||
+          attachment.database_epoch !== local.database_epoch) {
+          return;
+        }
+        const failed = attachment.pending_refreshes.filter((pending) =>
+          (local.connection_id !== undefined && pending.local_connection_id === local.connection_id) ||
+          (pending.local_connection_id === undefined && !hasReplacement));
+        if (failed.length === 0) return;
+        const failedIds = new Set(failed.map((pending) => pending.request_id));
+        attachment.pending_refreshes = attachment.pending_refreshes.filter((pending) => !failedIds.has(pending.request_id));
+        attachment.event_sequence += 1;
+        try {
+          viewer.serializeAttachment(attachment);
+        } catch {
+          return;
+        }
+        changed = true;
+        if (attachment.visible && attachment.auth_expires_at > now && viewer.readyState === WebSocket.OPEN) {
+          for (const pending of failed) {
+            this.sendViewerResult(viewer, attachment, pending.request_id, "unavailable", "local_unavailable");
+          }
+        }
+      });
+    }
+    if (changed) await this.scheduleViewerExpiry();
+  }
+
   private sendViewerResult(
     socket: WebSocket,
     attachment: ViewerAttachment,
@@ -896,6 +996,15 @@ export class NotificationHub extends DurableObject<Env> {
       } catch {
         // A closed socket is removed by the runtime.
       }
+    }
+  }
+
+  private closeViewerForEpoch(socket: WebSocket, databaseEpoch: string): void {
+    this.sendEpochInvalidation(socket, databaseEpoch);
+    try {
+      socket.close(VIEWER_EPOCH_CLOSE_CODE, "Cloud database epoch changed");
+    } catch {
+      // A closed socket is removed by the runtime.
     }
   }
 

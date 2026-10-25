@@ -901,6 +901,43 @@ afterEach(async () => {
 });
 
 describe("file manager UI flow", () => {
+  it("watches cloud-pending scans and imports after reload, then stops at terminal state", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const initialSnapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      pending_requests: [
+        { seq: 811, kind: "library_scan", status: "waiting_for_local", created_at: Math.floor(Date.now() / 1_000) },
+        { seq: 812, kind: "legacy_import", status: "waiting_for_local", created_at: Math.floor(Date.now() / 1_000) },
+      ],
+      operations: [],
+    };
+    const fixture = await mountFileManagerFixture(initialSnapshot, makeMemoryStorage());
+    const socket = latestOpenSocket(fixture.sockets);
+    expect(socket).toBeDefined();
+    await vi.waitFor(() => expect(socket?.sentFrames.some((frame) => frame.type === "interest" && frame.watch === true)).toBe(true));
+    expect(fixture.actions).toHaveLength(0);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+    expect(socket?.sentFrames.filter((frame) => frame.type === "refresh_request")).toHaveLength(1);
+
+    const requestsBeforeTerminal = fixture.stateRequests;
+    await fixture.publishSnapshot({
+      ...initialSnapshot,
+      state_version: 2,
+      pending_requests: [],
+      operations: [
+        { seq: 811, kind: "library_scan", status: "completed", updated_at: Math.floor(Date.now() / 1_000) },
+        { seq: 812, kind: "legacy_import", status: "failed", updated_at: Math.floor(Date.now() / 1_000), error: "The local import could not be applied." },
+      ],
+    });
+    socket?.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
+    await vi.waitFor(() => expect(fixture.stateRequests).toBe(requestsBeforeTerminal + 1));
+    await vi.waitFor(() => expect(socket?.sentFrames.filter((frame) => frame.type === "interest").at(-1)?.watch).toBe(false));
+    expect(socket?.sentFrames.filter((frame) => frame.type === "refresh_request")).toHaveLength(1);
+    expect(fixture.fetchMock.mock.calls.filter(([input]) => String(input) === "/api/actions")).toHaveLength(0);
+  });
+
   it("shows and clears selected items, navigates to the move card, and exposes mobile Details", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);
@@ -957,6 +994,7 @@ describe("file manager UI flow", () => {
     vi.stubGlobal("fetch", fetchMock);
     window.fetch = fetchMock as typeof window.fetch;
 
+    vi.resetModules();
     const firstReadAt = Date.now();
     // The browser entry has no declarations because it is executed for its side effects.
     // @ts-expect-error The JavaScript browser entry is intentionally declaration-free.

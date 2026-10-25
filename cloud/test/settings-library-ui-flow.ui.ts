@@ -327,6 +327,189 @@ describe("settings library UI flow", () => {
     expect(element<HTMLInputElement>('[data-category-form="main-library"] input[name="default_category"]').value).toBe("Shows");
   });
 
+  it("restores settings watch from cloud inbox and active operations after reload, then stops at terminal state", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const initialSnapshot = {
+      ...ownerSnapshot,
+      state_version: 1,
+      pending_requests: [{ seq: 41, kind: "library_scan", status: "waiting_for_local", created_at: Math.floor(Date.now() / 1_000) }],
+      operations: [{ seq: 40, kind: "library_rename", status: "processing", updated_at: Math.floor(Date.now() / 1_000) }],
+    };
+    const initialBundle = await makeChunkedSnapshot(initialSnapshot);
+    let currentManifest = initialBundle.manifest;
+    const responseChunks = new Map(initialBundle.chunks);
+    const sockets = installMockWebSocket(() => currentManifest.state_version ?? 0);
+    let stateRequests = 0;
+    let actionRequests = 0;
+    const stored = new Map<string, string>();
+
+    const html = await readFile(resolve(process.cwd(), "public/settings/index.html"), "utf8");
+    const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
+    expect(body).toBeDefined();
+    document.body.innerHTML = body!;
+    Object.defineProperty(window, "Telegram", {
+      configurable: true,
+      value: { WebApp: { initData: MOCK_INIT_DATA, ready: vi.fn(), expand: vi.fn() } },
+    });
+    Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => stored.get(key) ?? null,
+      setItem: (key: string, value: string) => stored.set(key, String(value)),
+      removeItem: (key: string) => stored.delete(key),
+    });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/api/updates/session") return { ok: true, status: 200, json: async () => updateSession() } as Response;
+      if (path === "/api/state") {
+        stateRequests += 1;
+        return { ok: true, status: 200, json: async () => currentManifest } as Response;
+      }
+      const chunkPath = path.match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
+      if (chunkPath) return { ok: true, status: 200, json: async () => ({ sha256: chunkPath[1], data: responseChunks.get(chunkPath[1]!) }) } as Response;
+      if (path === "/api/actions") {
+        actionRequests += 1;
+        return { ok: true, status: 200, json: async () => ({ seq: 42 }) } as Response;
+      }
+      throw new Error(`Unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.fetch = fetchMock as typeof window.fetch;
+
+    vi.resetModules();
+    // @ts-expect-error The browser entry has no declarations because it is executed for its side effects.
+    await import("../public/settings/app.js");
+    await vi.waitFor(() => expect(stateRequests).toBe(2));
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").classList.contains("hidden")).toBe(false));
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("Desktop settings published"));
+    const socket = sockets[0]!;
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "interest").some((frame) => frame.watch === true)).toBe(true));
+    expect(stored.get(ACTION_QUEUE_STORAGE_KEY) ?? null).toBeNull();
+    expect(actionRequests).toBe(0);
+    expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(1);
+
+    const terminalBundle = await makeChunkedSnapshot({
+      ...initialSnapshot,
+      state_version: 2,
+      pending_requests: [],
+      operations: [
+        { seq: 40, kind: "library_rename", status: "completed", updated_at: Math.floor(Date.now() / 1_000) },
+        { seq: 41, kind: "library_scan", status: "completed", updated_at: Math.floor(Date.now() / 1_000) },
+      ],
+    });
+    currentManifest = terminalBundle.manifest;
+    for (const [sha256, data] of terminalBundle.chunks) responseChunks.set(sha256, data);
+    socket.receive({ type: "invalidate", database_epoch: TEST_DATABASE_EPOCH, state_version: 2, reason: "state" });
+    await vi.waitFor(() => expect(stateRequests).toBe(3));
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "interest").at(-1)?.watch).toBe(false));
+    expect(element<HTMLElement>("#operations-list").textContent).toContain("Completed");
+    expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(1);
+    expect(actionRequests).toBe(0);
+  });
+
+  it("settles a hung published cache read and ignores its late private snapshot response", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("crypto", webcrypto);
+    const initialBundle = await makeChunkedSnapshot(ownerSnapshot);
+    const lateSnapshot = {
+      ...ownerSnapshot,
+      state_version: 2,
+      settings: {
+        ...ownerSnapshot.settings,
+        applied: {
+          ...ownerSnapshot.settings.applied,
+          libraries: ownerSnapshot.settings.applied.libraries.map((library) => ({ ...library, default_category: "Shows" })),
+        },
+      },
+    };
+    const lateBundle = await makeChunkedSnapshot(lateSnapshot);
+    let currentManifest = initialBundle.manifest;
+    const responseChunks = new Map([...initialBundle.chunks, ...lateBundle.chunks]);
+    const sockets = installMockWebSocket(() => currentManifest.state_version ?? 0);
+    let stateRequests = 0;
+    let shouldHoldState = false;
+    let stateGate: Promise<void> | null = null;
+    let releaseStateGate: (() => void) | null = null;
+    let heldReadSignal: AbortSignal | null = null;
+    const currentHeldReadSignal = (): AbortSignal | null => heldReadSignal;
+    const releaseHeldStateRead = () => releaseStateGate?.();
+
+    const html = await readFile(resolve(process.cwd(), "public/settings/index.html"), "utf8");
+    const body = html.match(/<body>([\s\S]*?)<\/body>/iu)?.[1];
+    expect(body).toBeDefined();
+    document.body.innerHTML = body!;
+    Object.defineProperty(window, "Telegram", {
+      configurable: true,
+      value: { WebApp: { initData: MOCK_INIT_DATA, ready: vi.fn(), expand: vi.fn() } },
+    });
+    Object.defineProperty(window.navigator, "onLine", { configurable: true, value: true });
+    vi.stubGlobal("localStorage", { getItem: () => null, setItem: vi.fn(), removeItem: vi.fn() });
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path === "/api/updates/session") return { ok: true, status: 200, json: async () => updateSession() } as Response;
+      if (path === "/api/state") {
+        stateRequests += 1;
+        if (shouldHoldState) {
+          shouldHoldState = false;
+          heldReadSignal = init?.signal ?? null;
+          const gate = stateGate;
+          if (gate) await gate;
+        }
+        return { ok: true, status: 200, json: async () => currentManifest } as Response;
+      }
+      const chunkPath = path.match(/^\/api\/snapshot\/chunks\/([0-9a-f]{64})$/u);
+      if (chunkPath) return { ok: true, status: 200, json: async () => ({ sha256: chunkPath[1], data: responseChunks.get(chunkPath[1]!) }) } as Response;
+      throw new Error(`Unexpected request ${path}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.fetch = fetchMock as typeof window.fetch;
+
+    vi.resetModules();
+    // @ts-expect-error The browser entry has no declarations because it is executed for its side effects.
+    await import("../public/settings/app.js");
+    await vi.waitFor(() => expect(stateRequests).toBe(2));
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false"));
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("Desktop settings published"));
+    expect(element<HTMLInputElement>('[data-category-form="main-library"] input[name="default_category"]').value).toBe("Films");
+
+    stateGate = new Promise<void>((resolve) => { releaseStateGate = resolve; });
+    shouldHoldState = true;
+    element<HTMLButtonElement>("#refresh-button").click();
+    await vi.waitFor(() => expect(sentFramesOfType(sockets[0]!, "refresh_request")).toHaveLength(2));
+    await vi.waitFor(() => expect(stateRequests).toBe(3));
+    await vi.waitFor(() => expect(heldReadSignal).not.toBeNull());
+
+    await vi.advanceTimersByTimeAsync(25_000);
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("could not be reloaded"));
+    expect(element<HTMLButtonElement>("#refresh-button").disabled).toBe(false);
+    expect(currentHeldReadSignal()?.aborted).toBe(true);
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false"));
+
+    element<HTMLButtonElement>("#refresh-button").click();
+    await vi.waitFor(() => expect(sentFramesOfType(sockets[0]!, "refresh_request")).toHaveLength(3));
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0]!.readyState).toBe(MockWebSocket.OPEN);
+    const secondManualRequest = sentFramesOfType(sockets[0]!, "refresh_request").at(-1)!;
+    expect(secondManualRequest.request_id).toMatch(/^[0-9a-f-]{36}$/iu);
+    sockets[0]!.receive({
+      type: "refresh_result",
+      request_id: secondManualRequest.request_id,
+      database_epoch: TEST_DATABASE_EPOCH,
+      status: "published",
+      state_version: 1,
+      reported_at: MOCK_REPORTED_AT_MS,
+    });
+    await vi.waitFor(() => expect(element<HTMLElement>("#snapshot-refresh-status").textContent).not.toContain("Requesting current settings"));
+    await vi.waitFor(() => expect(stateRequests).toBe(4));
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false"));
+
+    currentManifest = lateBundle.manifest;
+    releaseHeldStateRead();
+    await vi.waitFor(() => expect(element<HTMLElement>("#app-content").getAttribute("aria-busy")).toBe("false"));
+    expect(element<HTMLInputElement>('[data-category-form="main-library"] input[name="default_category"]').value).toBe("Films");
+    expect(element<HTMLElement>("#snapshot-refresh-status").textContent).toContain("Desktop settings published at");
+  });
+
   it("keeps settings private when a chunk does not match its manifest", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("crypto", webcrypto);

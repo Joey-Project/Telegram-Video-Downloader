@@ -144,11 +144,11 @@ commits/uploads, missing-chunk recovery and epoch changes.
 
 Final local gates on Node.js 25.8.2, Wrangler 4.149.0 and Rust 1.99.1:
 
-- Rust default-parallel `cargo test --all-targets`: 1,325 passed, zero failed,
+- Rust default-parallel `cargo test --all-targets`: 1,326 passed, zero failed,
   16 ignored. Ignored tests were not executed as passing tests.
 - `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo check --all-targets` and the isolated release build passed.
-- All 359 ordinary Worker/D1/shared-helper tests and all 78 mounted UI tests
+- All 362 ordinary Worker/D1/shared-helper tests and all 82 mounted UI tests
   passed, including both apps' epoch-reset, held-read and dispatch-fencing cases.
 - `npm run typecheck` and `npm run build` passed. The build is a Wrangler
   deployment dry-run and reads 71 static assets; it does not deploy them.
@@ -168,6 +168,22 @@ bounded wait, and the response deadline starts on successful send and ends on a
 correlated published result. A binding-only refresh clears stale unavailable
 warnings only for verified accessible libraries, preserves unrelated warnings and
 the cached file index, and does not trigger another scan.
+
+Forwarded refreshes retain their recipient connection identity in bounded
+hibernation attachments. Disconnecting that desktop settles its pending requests;
+another connection's closure does not fail an unrelated request. Retiring an
+authorized viewer from an older database epoch sends the current epoch and uses
+the epoch close code rather than treating it as expired authentication.
+
+An unreadable or exhausted local state-version record completes explicit refresh
+requests with correlated failures, including failure during the HTTP 413
+size-reduction retry. Repair and later publication preserve monotonic versions.
+
+Reloaded pages infer operation interest from active saved operations and accepted
+cloud requests. Published-snapshot reads have a separate 25-second deadline and
+abort signal. Cancelled loads leave the shared read queue and use an isolated
+cache generation, allowing a later refresh before an uncooperative old response
+returns; that late response cannot replace the current cache or private view.
 
 ## Frozen implementation contract
 

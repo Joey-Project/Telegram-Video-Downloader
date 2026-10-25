@@ -34,6 +34,8 @@ const CACHE_KEY = "file-manager.snapshot.v1";
 const ACTION_QUEUE_KEY = "file-manager.actions.v1";
 const MAX_LEGACY_BYTES = 256 * 1024;
 const MAX_DISPLAY_SNAPSHOT_AGE_MS = 60 * 60 * 1_000;
+const RELOAD_PENDING_OPERATION_KINDS = new Set(["library_scan", "legacy_import"]);
+const SNAPSHOT_PENDING_OPERATION_STATUSES = new Set(["pending", "processing", "retryable"]);
 
 const telegram = window.Telegram?.WebApp;
 const initData = telegram?.initData ?? "";
@@ -47,6 +49,7 @@ const snapshotRefreshRequests = new Map();
 let snapshotReadInFlight = null;
 let snapshotReadInFlightGeneration = -1;
 let snapshotReadInFlightEpoch = null;
+let snapshotReadAbortController = null;
 let snapshotReadSerial = 0;
 let snapshotReadActiveToken = 0;
 let epochVerificationPending = false;
@@ -1026,6 +1029,7 @@ function updateSnapshotInterest() {
     || recoveryAwaitingResult
     || state.awaitingOperationResults.size > 0
     || activeSnapshotOperationAwaitingResult()
+    || activeCloudOperationAwaitingLocalWork()
     || [...state.previewCancellationAttempts].length > 0;
   snapshotUpdates.setWatch(pendingQueuedAction || visibleResultView || awaitedLocalResult);
 }
@@ -1057,8 +1061,14 @@ function restoreAwaitingOperationResults() {
 
 function activeSnapshotOperationAwaitingResult() {
   const operations = Array.isArray(state.snapshot?.operations) ? state.snapshot.operations : [];
-  return operations.some((operation) => ["library_scan", "legacy_import"].includes(operation?.kind)
-    && !SETTLED_OPERATION_STATUSES.has(String(operation?.status ?? "").toLowerCase()));
+  return operations.some((operation) => RELOAD_PENDING_OPERATION_KINDS.has(operation?.kind)
+    && SNAPSHOT_PENDING_OPERATION_STATUSES.has(String(operation?.status ?? "").toLowerCase()));
+}
+
+function activeCloudOperationAwaitingLocalWork() {
+  const requests = Array.isArray(state.snapshot?.pending_requests) ? state.snapshot.pending_requests : [];
+  return requests.some((request) => RELOAD_PENDING_OPERATION_KINDS.has(request?.kind)
+    && request?.status === "waiting_for_local");
 }
 
 function reconcileAwaitingOperationResults(snapshot) {
@@ -1217,6 +1227,48 @@ function markEpochVerificationPending(databaseEpoch = null) {
   if (mayUsePrivateSnapshot(state)) render();
 }
 
+function linkSnapshotReadAbort(signal) {
+  if (!signal || !snapshotReadAbortController) return () => {};
+  const controller = snapshotReadAbortController;
+  const abort = () => controller.abort();
+  if (signal.aborted) abort();
+  else signal.addEventListener("abort", abort, { once: true });
+  return () => signal.removeEventListener("abort", abort);
+}
+
+function createSnapshotReadAbortController() {
+  const Controller = window.AbortController ?? globalThis.AbortController;
+  return typeof Controller === "function" ? new Controller() : null;
+}
+
+function settleSnapshotReadOnAbort(read, signal, onAbort = () => {}) {
+  if (!signal) return read;
+  if (signal.aborted) {
+    onAbort();
+    return Promise.resolve(state.snapshot);
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      callback(value);
+    };
+    const abort = () => {
+      if (settled) return;
+      onAbort();
+      finish(resolve, state.snapshot);
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+    Promise.resolve(read).then(
+      (value) => finish(resolve, value),
+      (error) => finish(reject, error),
+    );
+  });
+}
+
 function performRefreshState(options = {}) {
   if (options.epochChanged === true) markEpochVerificationPending(options.expectedDatabaseEpoch);
   const generation = epochVerificationGeneration;
@@ -1228,8 +1280,9 @@ function performRefreshState(options = {}) {
     const inFlight = snapshotReadInFlight;
     const inFlightGeneration = snapshotReadInFlightGeneration;
     const inFlightEpoch = snapshotReadInFlightEpoch;
+    const unlinkAbort = linkSnapshotReadAbort(options.signal);
     return inFlight.then((snapshot) => {
-      if (applicationDisposed) return state.snapshot;
+      if (applicationDisposed || options.signal?.aborted) return state.snapshot;
       const version = Number.isSafeInteger(snapshot?.state_version) ? snapshot.state_version : 0;
       const epochReadRequired = epochVerificationPending && (
         inFlightGeneration !== epochVerificationGeneration
@@ -1239,14 +1292,27 @@ function performRefreshState(options = {}) {
       return minimumVersion > version && sameEpoch || epochReadRequired
         ? performRefreshState({ ...options, epochChanged: false, ...(expectedDatabaseEpoch ? { expectedDatabaseEpoch } : {}) })
         : snapshot;
-    });
+    }).finally(unlinkAbort);
   }
-  const inFlight = performRefreshStateOnce({ ...options, epochGeneration: generation, expectedDatabaseEpoch });
+  const readController = createSnapshotReadAbortController();
+  snapshotReadAbortController = readController;
+  const unlinkAbort = linkSnapshotReadAbort(options.signal);
+  const readSignal = readController?.signal ?? options.signal ?? null;
+  const read = performRefreshStateOnce({ ...options, signal: readSignal, epochGeneration: generation, expectedDatabaseEpoch });
+  const readToken = snapshotReadActiveToken;
+  const inFlight = settleSnapshotReadOnAbort(read, readSignal, () => {
+    if (snapshotReadActiveToken !== readToken) return;
+    snapshotReadActiveToken = 0;
+    state.loading = false;
+    if (!applicationDisposed) byId("app-content")?.setAttribute("aria-busy", "false");
+  });
   const trackedRead = inFlight.finally(() => {
+    unlinkAbort();
     if (snapshotReadInFlight === trackedRead) {
       snapshotReadInFlight = null;
       snapshotReadInFlightGeneration = -1;
       snapshotReadInFlightEpoch = null;
+      snapshotReadAbortController = null;
     }
   });
   snapshotReadInFlight = trackedRead;
@@ -1255,8 +1321,8 @@ function performRefreshState(options = {}) {
   return trackedRead;
 }
 
-async function performRefreshStateOnce({ quiet = false, minimumVersion = 0, epochGeneration = -1, expectedDatabaseEpoch = null } = {}) {
-  if (!initData || privateAccessExpired || applicationDisposed) return state.snapshot;
+async function performRefreshStateOnce({ quiet = false, minimumVersion = 0, epochGeneration = -1, expectedDatabaseEpoch = null, signal = null } = {}) {
+  if (!initData || privateAccessExpired || applicationDisposed || signal?.aborted) return state.snapshot;
   const pageGeneration = applicationGeneration;
   const readToken = ++snapshotReadSerial;
   snapshotReadActiveToken = readToken;
@@ -1264,7 +1330,8 @@ async function performRefreshStateOnce({ quiet = false, minimumVersion = 0, epoc
   state.loading = true;
   byId("app-content")?.setAttribute("aria-busy", "true");
   try {
-    const fresh = await loadOwnerSnapshot((path, headers) => api(path, { headers }));
+    const fresh = await loadOwnerSnapshot((path, headers) => api(path, { headers, signal }), { signal });
+    if (signal?.aborted) return state.snapshot;
     if (applicationDisposed || pageGeneration !== applicationGeneration || epochGeneration !== epochVerificationGeneration) return state.snapshot;
     if (privateAccessExpired) return;
     if (expectedDatabaseEpoch && fresh.database_epoch !== expectedDatabaseEpoch) {
@@ -1300,6 +1367,7 @@ async function performRefreshStateOnce({ quiet = false, minimumVersion = 0, epoc
     ).catch(() => {});
     return fresh;
   } catch (error) {
+    if (signal?.aborted) return state.snapshot;
     if (applicationDisposed || pageGeneration !== applicationGeneration || epochGeneration !== epochVerificationGeneration) return state.snapshot;
     const transition = applySnapshotFailure(error?.status);
     if (transition.authorizationRejected) {

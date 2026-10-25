@@ -315,7 +315,7 @@ function publishRefreshResult(socket: MockWebSocket, request: Record<string, unk
     database_epoch: TEST_DATABASE_EPOCH,
     status: "published",
     state_version: stateVersion,
-    reported_at: Math.floor(Date.now() / 1_000),
+    reported_at: Date.now(),
   });
 }
 
@@ -557,7 +557,7 @@ describe("snapshot updates browser flows", () => {
       },
     };
     const initial = await makeChunkedSnapshot(ownerSnapshot({
-      reportedAt: Math.floor(Date.now() / 1_000),
+      reportedAt: Date.now(),
       operations: [historicalOperation],
     }));
     const server = createSnapshotServer(initial);
@@ -711,6 +711,56 @@ describe("snapshot updates browser flows", () => {
     resolveRead({ state_version: 2, database_epoch: TEST_DATABASE_EPOCH });
     await expect(refresh).resolves.toMatchObject({ status: "published", state_version: 2 });
     expect(readSnapshot).toHaveBeenCalledTimes(1);
+    controller.stop();
+  });
+
+  it("bounds a published cache read, aborts it, and ignores a late cache result", async () => {
+    vi.useFakeTimers();
+    const mockSockets = addMockWebSocket({ autoReady: false });
+    const api = vi.fn(async () => sessionResponse());
+    let resolveRead!: (value: { state_version: number; database_epoch: string }) => void;
+    let readSignal: AbortSignal | undefined;
+    let readStartedAt = 0;
+    const readGate = new Promise<{ state_version: number; database_epoch: string }>((resolve) => { resolveRead = resolve; });
+    const readSnapshot = vi.fn(async ({ signal }: { signal?: AbortSignal }) => {
+      readStartedAt = Date.now();
+      readSignal = signal;
+      return await readGate;
+    });
+    const controller = createSnapshotUpdates({
+      api: api as unknown as (path: string, options: { method: "POST"; signal?: AbortSignal }) => Promise<unknown>,
+      readSnapshot,
+      surface: "settings",
+      environment: { WebSocket: mockSockets.WebSocket as unknown as typeof WebSocket, random: () => 0.5 },
+    });
+    controller.start();
+    await vi.waitFor(() => expect(mockSockets.sockets).toHaveLength(1));
+    const socket = mockSockets.sockets[0]!;
+    await vi.waitFor(() => expect(socket.readyState).toBe(MockWebSocket.OPEN));
+    socket.receive({ type: "ready", database_epoch: TEST_DATABASE_EPOCH, snapshot_control: "v1" });
+
+    const refresh = controller.requestMacRefresh({ reason: "manual", scope: "settings" });
+    await vi.waitFor(() => expect(sentFramesOfType(socket, "refresh_request")).toHaveLength(1));
+    const request = sentFramesOfType(socket, "refresh_request")[0]!;
+    publishRefreshResult(socket, request, 2);
+    await vi.waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1));
+    expect(readSignal?.aborted).toBe(false);
+    let settled: unknown;
+    void refresh.then((value) => { settled = value; });
+
+    await vi.advanceTimersByTimeAsync(Math.max(0, 24_999 - (Date.now() - readStartedAt)));
+    expect(settled).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(refresh).resolves.toMatchObject({
+      status: "published",
+      state_version: 2,
+      cache_read_failed: true,
+    });
+    expect(readSignal?.aborted).toBe(true);
+
+    resolveRead({ state_version: 2, database_epoch: TEST_DATABASE_EPOCH });
+    await Promise.resolve();
+    expect(readSignal?.aborted).toBe(true);
     controller.stop();
   });
 

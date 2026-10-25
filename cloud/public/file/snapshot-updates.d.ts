@@ -7,6 +7,8 @@ export interface PublishedSnapshotReadOptions {
   quiet: true;
   /** Minimum state version required after a correlated Mac publication. */
   minimumVersion?: number;
+  /** Aborted when the bounded post-publication cache read expires or this controller stops. */
+  signal: AbortSignal;
   /** The owner snapshot is being reverified after the Cloud database epoch changed. */
   epochChanged?: boolean;
   /** Expected database epoch for this owner-verified cache read. */

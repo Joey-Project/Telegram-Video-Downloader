@@ -2216,6 +2216,16 @@ async fn cloud_state_reporter_with_retry_policy(
                                 error = %format!("{error:#}"),
                                 "failed to allocate local cloud state version; reconcile the local counter or remote snapshot version if exhausted"
                             );
+                            fail_snapshot_refresh_requests(
+                                &runtime,
+                                &trigger,
+                                if exhausted {
+                                    "state_version_exhausted"
+                                } else {
+                                    "state_version_unavailable"
+                                },
+                            )
+                            .await;
                             sleep(if exhausted {
                                 version_exhausted_backoff
                             } else {
@@ -2355,6 +2365,16 @@ async fn cloud_state_reporter_with_retry_policy(
                                         error = %format!("{version_error:#}"),
                                         "failed to allocate a new version for the reduced cloud snapshot; reconcile the local counter or remote snapshot version if exhausted"
                                     );
+                                    fail_pending_snapshot_refreshes(
+                                        &runtime,
+                                        &rejected,
+                                        if exhausted {
+                                            "state_version_exhausted"
+                                        } else {
+                                            "state_version_unavailable"
+                                        },
+                                    )
+                                    .await;
                                     sleep(if exhausted {
                                         version_exhausted_backoff
                                     } else {

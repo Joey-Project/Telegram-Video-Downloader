@@ -16,8 +16,16 @@ export interface OwnerSnapshot {
   [key: string]: unknown;
 }
 
+export interface OwnerSnapshotLoaderOptions {
+  /** Aborting abandons this loader generation so late cache work cannot block or affect a later read. */
+  signal?: AbortSignal;
+}
+
 /** Request chunked-v1 when loading an owner snapshot, while accepting legacy full responses. */
 export function loadOwnerSnapshot(fetchJson: SnapshotJsonFetcher): Promise<OwnerSnapshot>;
 
 /** Create a page-local loader with bounded, verified, in-memory chunk reuse. */
-export function createOwnerSnapshotLoader(): (fetchJson: SnapshotJsonFetcher) => Promise<OwnerSnapshot>;
+export function createOwnerSnapshotLoader(): (
+  fetchJson: SnapshotJsonFetcher,
+  options?: OwnerSnapshotLoaderOptions,
+) => Promise<OwnerSnapshot>;
