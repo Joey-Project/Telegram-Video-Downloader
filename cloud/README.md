@@ -15,6 +15,12 @@ npm run build
 
 `build` runs Wrangler's deploy dry-run and does not deploy. `npm run dev` starts a local Worker with local D1 storage. The Wrangler file intentionally uses a placeholder D1 ID and owner ID; configure real resource values only through the separately coordinated environment setup.
 
+## Observability
+
+The tracked Wrangler config enables Workers Logs and traces with independent head-based sampling: 10% of requests contribute invocation and custom logs, including error details emitted for sampled requests, and 1% of requests are traced. Logs and traces can still be limited by platform ingestion, so this does not guarantee that every error appears in retained logs. Workers request and error metrics are reported separately from sampled logs and traces. See [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/), [Workers Traces](https://developers.cloudflare.com/workers/observability/traces/), and [Workers metrics and analytics](https://developers.cloudflare.com/workers/observability/metrics-and-analytics/).
+
+Increase trace sampling only for a bounded debugging window, then restore the tracked rate. The private production config must mirror this policy at deploy time; validate the settings on the deployed Worker afterward.
+
 ## Runtime configuration
 
 The Worker needs these bindings:
